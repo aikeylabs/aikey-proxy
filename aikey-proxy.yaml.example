@@ -1,0 +1,49 @@
+# aikey-proxy configuration
+# Copy this file to aikey-proxy.yaml and modify as needed.
+
+listen:
+  host: "127.0.0.1"
+  port: 27200
+
+vault:
+  path: "~/.aikey/vault.db"
+
+# Virtual keys: map each virtual key token to a provider + vault entry.
+# Clients use virtual keys instead of real provider keys.
+virtual_keys:
+  - id: "vk_dev_openai"
+    token: "aikey_vk_openai_dev_001"
+    provider: "openai"
+    base_url: "https://api.openai.com"
+    key_alias: "openai:default"
+    allowed_models:
+      - "gpt-4o-mini"
+      - "gpt-4.1-mini"
+      - "gpt-4.1"
+
+  - id: "vk_dev_anthropic"
+    token: "aikey_vk_anthropic_dev_001"
+    provider: "anthropic"
+    base_url: "https://api.anthropic.com"
+    key_alias: "anthropic:default"
+    allowed_models:
+      - "claude-sonnet-4-5-20250929"
+      - "claude-haiku-4-5-20251001"
+
+# Provider protocol configuration.
+providers:
+  openai:
+    protocol: "openai"
+    timeout: 120s
+  anthropic:
+    protocol: "anthropic"
+    timeout: 120s
+
+# Events (usage tracking) configuration.
+events:
+  db_path: "~/.aikey/events.db"
+  batch_size: 100
+  flush_interval: 5s
+
+log:
+  level: "info"   # debug, info, warn, error

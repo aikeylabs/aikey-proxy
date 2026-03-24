@@ -1,0 +1,53 @@
+# golangci-lint configuration for aikey-proxy
+# Run: golangci-lint run ./...
+
+run:
+  timeout: 3m
+  go: "1.26.1"
+
+linters:
+  enable:
+    - errcheck
+    - gosimple
+    - govet
+    - ineffassign
+    - staticcheck
+    - unused
+    - bodyclose
+    - durationcheck
+    - errorlint
+    - exhaustive
+    - gocritic
+    - gosec
+    - misspell
+    - noctx
+    - prealloc
+    - unconvert
+    - unparam
+
+linters-settings:
+  errcheck:
+    check-type-assertions: true
+  govet:
+    enable-all: true
+  gosec:
+    excludes:
+      - G104  # Allow unhandled errors in deferred Close() calls
+  gocritic:
+    enabled-tags:
+      - diagnostic
+      - style
+      - performance
+  misspell:
+    locale: US
+
+issues:
+  exclude-rules:
+    # Allow dot imports in test files.
+    - path: _test\.go
+      linters:
+        - gocritic
+    # Allow unchecked errors in test files.
+    - path: _test\.go
+      linters:
+        - errcheck
