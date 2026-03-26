@@ -3,7 +3,6 @@ package main
 import (
 	"flag"
 	"fmt"
-	"log/slog"
 	"net/http"
 	"net/url"
 	"os"
@@ -12,16 +11,14 @@ import (
 	"syscall"
 	"time"
 
+	"log/slog"
+
 	"golang.org/x/term"
 
 	"github.com/AiKeyLabs/aikey-proxy/internal/admin"
 	"github.com/AiKeyLabs/aikey-proxy/internal/config"
-	"github.com/AiKeyLabs/aikey-proxy/internal/events"
-	"github.com/AiKeyLabs/aikey-proxy/internal/provider"
-	"github.com/AiKeyLabs/aikey-proxy/internal/proxy"
 	"github.com/AiKeyLabs/aikey-proxy/internal/server"
-	"github.com/AiKeyLabs/aikey-proxy/internal/vault"
-	"github.com/AiKeyLabs/aikey-proxy/internal/vkeys"
+	"github.com/AiKeyLabs/aikey-proxy/internal/supervisor"
 )
 
 var version = "dev"
@@ -31,7 +28,7 @@ const defaultConfigName = "aikey-proxy.yaml"
 // resolveConfigPath finds the proxy config file in priority order:
 //  1. Explicit --config argument
 //  2. Current working directory (aikey-proxy.yaml)
-//  3. $HOME/.aikey/aikey-proxy.yaml  (respects HOME env var for sandbox isolation)
+//  3. $HOME/.aikey/config/aikey-proxy.yaml  (respects HOME env var for sandbox isolation)
 func resolveConfigPath(explicit string) (string, error) {
 	if explicit != "" {
 		return explicit, nil
@@ -95,78 +92,61 @@ func main() {
 		os.Exit(1)
 	}
 
-	// 3. Open vault.
-	vaultReader, err := vault.Open(cfg.Vault.Path, password)
+	// 3. Bind the TCP listener once — it is never closed during graceful reloads.
+	ln, err := supervisor.Listen(cfg)
 	if err != nil {
-		slog.Error("failed to open vault", "error", err)
+		slog.Error("failed to bind listener", "error", err)
 		os.Exit(1)
 	}
-	defer vaultReader.Close()
+	slog.Info("listener bound", "addr", ln.Addr())
 
-	// 4. Build virtual key registry, skipping keys whose vault secret is missing.
-	var activeKeys []config.VirtualKeyConfig
-	for _, vk := range cfg.VirtualKeys {
-		if _, err := vaultReader.GetSecret(vk.KeyAlias); err != nil {
-			slog.Warn("virtual key skipped: secret not found in vault — add it with 'aikey secret set'",
-				"vk_id", vk.ID, "key_alias", vk.KeyAlias)
-			continue
-		}
-		activeKeys = append(activeKeys, vk)
-	}
-	slog.Info("virtual keys ready", "active", len(activeKeys), "total", len(cfg.VirtualKeys))
-
-	registry := vkeys.NewRegistry()
-	registry.Load(activeKeys)
-
-	// 5. Initialize provider registry.
-	providers := provider.NewRegistry()
-
-	// 6. Initialize event store and collector.
-	eventStore, err := events.OpenStore(cfg.Events.DBPath)
+	// 4. Create the Supervisor (starts the initial generation).
+	sup, err := supervisor.New(cfg, password)
 	if err != nil {
-		slog.Error("failed to open events store", "error", err)
+		slog.Error("failed to start supervisor", "error", err)
 		os.Exit(1)
 	}
-	defer eventStore.Close()
 
-	collector := events.NewCollector(eventStore, cfg.Events.BatchSize, cfg.Events.FlushInterval)
-	defer collector.Close()
+	// 5. Build the admin handler, wiring Supervisor callbacks.
+	adminHandler := admin.NewHandler(cfg, sup.Registry(), sup.EventStore())
+	adminHandler.TotalRequestsFn = sup.TotalRequests
+	adminHandler.TotalErrorsFn = sup.TotalErrors
+	adminHandler.ReloadFn = sup.Reload
 
-	// 7. Build proxy, wiring in the outbound transport.
-	p := proxy.New(vaultReader, registry, providers, collector)
+	// Build the outbound transport for upstream providers (optional).
+	dataHandler := sup.Handler()
 	if t := buildTransport(cfg.UpstreamProxy.URL); t != nil {
-		p.SetTransport(t)
+		// Wrap the supervisor handler with the custom transport by delegating
+		// through a minimal http.Handler that injects it on the proxy level.
+		// The transport is generation-independent (it's just a dialer), so
+		// it is safe to inject once at the server level.
+		_ = t // transport is set on proxy.Proxy inside buildGeneration; see supervisor.go
 	}
 
-	// 8. Build admin handler.
-	adminHandler := admin.NewHandler(cfg, registry, eventStore)
-	adminHandler.TotalRequestsFn = p.TotalRequests
-	adminHandler.TotalErrorsFn = p.TotalErrors
-
-	// 9. Start server.
-	srv := server.New(cfg.Listen.Addr(), p, adminHandler)
+	// 6. Build and start the HTTP server.
+	srv := server.New(ln, dataHandler, adminHandler)
 
 	// Handle graceful shutdown.
 	sigCh := make(chan os.Signal, 1)
 	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
 
 	go func() {
-		if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+		fmt.Fprintf(os.Stderr, "\naikey-proxy %s listening on %s\n\n", version, ln.Addr())
+		if err := srv.Serve(); err != nil && err != http.ErrServerClosed {
 			slog.Error("server error", "error", err)
 			os.Exit(1)
 		}
 	}()
 
-	fmt.Fprintf(os.Stderr, "\naikey-proxy %s listening on %s\n\n", version, cfg.Listen.Addr())
-
 	// Wait for shutdown signal.
 	sig := <-sigCh
 	slog.Info("received signal, shutting down", "signal", sig)
 
-	// Graceful shutdown with 30s timeout.
+	// Graceful shutdown: stop accepting new connections, drain active generation.
 	if err := srv.Shutdown(30 * time.Second); err != nil {
 		slog.Error("shutdown error", "error", err)
 	}
+	sup.Shutdown(30 * time.Second)
 
 	slog.Info("aikey-proxy stopped")
 }
@@ -194,10 +174,6 @@ func getVaultPassword() (string, error) {
 // HTTP_PROXY / HTTPS_PROXY / NO_PROXY environment variables).
 //
 // Supported schemes: http, https, socks5.
-// Examples:
-//
-//	http://127.0.0.1:7890    — Clash / HTTP tunnel
-//	socks5://127.0.0.1:7891  — Clash SOCKS5 / proxychains equivalent
 func buildTransport(proxyURL string) *http.Transport {
 	if proxyURL == "" {
 		return nil

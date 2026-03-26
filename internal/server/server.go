@@ -3,47 +3,54 @@ package server
 import (
 	"context"
 	"log/slog"
+	"net"
 	"net/http"
 	"time"
 
 	"github.com/AiKeyLabs/aikey-proxy/internal/admin"
-	"github.com/AiKeyLabs/aikey-proxy/internal/proxy"
 )
 
 // Server manages the HTTP server lifecycle.
+// It accepts a pre-created net.Listener so the TCP port is never released
+// during graceful reloads — only the request handler is swapped.
 type Server struct {
+	ln         net.Listener
 	httpServer *http.Server
 }
 
-// New creates a new Server with the given address, proxy, and admin handler.
-func New(addr string, p *proxy.Proxy, adminHandler *admin.Handler) *Server {
+// New creates a new Server.
+//
+//   - ln is the already-bound TCP listener (held by the caller across reloads).
+//   - dataHandler is the http.Handler for the AI proxy endpoints; the Supervisor
+//     returns a stable wrapper that atomically delegates to the active generation.
+//   - adminHandler serves /health, /status, /metrics, and /admin/reload.
+func New(ln net.Listener, dataHandler http.Handler, adminHandler *admin.Handler) *Server {
 	mux := http.NewServeMux()
 
 	// Data plane: proxy endpoints.
-	mux.HandleFunc("POST /v1/chat/completions", p.Handle)
-	mux.HandleFunc("POST /v1/messages", p.Handle)
-
-	// Also handle without explicit method for broader compatibility.
-	// Some clients may send OPTIONS or other methods.
+	mux.Handle("POST /v1/chat/completions", dataHandler)
+	mux.Handle("POST /v1/messages", dataHandler)
 
 	// Control plane: admin endpoints.
 	mux.HandleFunc("GET /health", adminHandler.Health)
 	mux.HandleFunc("GET /status", adminHandler.Status)
 	mux.HandleFunc("GET /metrics", adminHandler.Metrics)
+	mux.HandleFunc("POST /admin/reload", adminHandler.Reload)
 
 	return &Server{
+		ln: ln,
 		httpServer: &http.Server{
-			Addr:              addr,
 			Handler:           mux,
 			ReadHeaderTimeout: 30 * time.Second,
 		},
 	}
 }
 
-// ListenAndServe starts the HTTP server. It blocks until the server is stopped.
-func (s *Server) ListenAndServe() error {
-	slog.Info("starting server", "addr", s.httpServer.Addr)
-	return s.httpServer.ListenAndServe()
+// Serve starts accepting connections on the pre-bound listener. It blocks
+// until the server is stopped.
+func (s *Server) Serve() error {
+	slog.Info("starting server", "addr", s.ln.Addr())
+	return s.httpServer.Serve(s.ln)
 }
 
 // Shutdown gracefully shuts down the server with a timeout.

@@ -1,6 +1,7 @@
 package admin
 
 import (
+	"context"
 	"encoding/json"
 	"net/http"
 	"time"
@@ -22,6 +23,10 @@ type Handler struct {
 	// Injected from proxy for live metrics.
 	TotalRequestsFn func() int64
 	TotalErrorsFn   func() int64
+
+	// ReloadFn triggers a graceful reload of the active runtime generation.
+	// Set by main.go after wiring the Supervisor.
+	ReloadFn func(ctx context.Context) error
 }
 
 // NewHandler creates admin handlers.
@@ -111,6 +116,34 @@ func (h *Handler) Metrics(w http.ResponseWriter, r *http.Request) {
 		RequestsByVKey:     byVKey,
 		RequestsByProvider: byProvider,
 	})
+}
+
+// Reload triggers a graceful runtime reload without closing the TCP listener.
+// The new generation opens a fresh vault snapshot; once it passes the readiness
+// gate, all new requests are routed to it and the old generation is drained.
+//
+// Returns 200 OK when the new generation is active, 503 if ReloadFn is not
+// wired, or 500 on reload failure.
+func (h *Handler) Reload(w http.ResponseWriter, r *http.Request) {
+	if h.ReloadFn == nil {
+		writeJSON(w, http.StatusServiceUnavailable, map[string]string{
+			"error": "reload not supported",
+		})
+		return
+	}
+
+	// Give the reload up to 30 s to build the new generation.
+	ctx, cancel := context.WithTimeout(r.Context(), 30*time.Second)
+	defer cancel()
+
+	if err := h.ReloadFn(ctx); err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]string{
+			"error": err.Error(),
+		})
+		return
+	}
+
+	writeJSON(w, http.StatusOK, map[string]string{"status": "reloaded"})
 }
 
 func writeJSON(w http.ResponseWriter, status int, v any) {
