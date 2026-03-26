@@ -88,8 +88,10 @@ case "$REMOTE_UNAME" in
         fi
         TARGET_ARCH=$(ssh "$REMOTE_HOST" 'uname -m' 2>/dev/null || echo "x86_64")
         TARGET_GOOS="linux"
-        TARGET_GOARCH="amd64"
-        if [ "$TARGET_ARCH" = "aarch64" ]; then TARGET_GOARCH="arm64"; fi
+        case "$TARGET_ARCH" in
+            aarch64|arm64) TARGET_GOARCH="arm64" ;;
+            *)             TARGET_GOARCH="amd64" ;;
+        esac
         ;;
     Darwin)
         REMOTE_OS="macos"

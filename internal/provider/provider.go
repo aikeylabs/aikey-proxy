@@ -28,6 +28,7 @@ func NewRegistry() *Registry {
 	}
 	r.Register(&OpenAI{})
 	r.Register(&Anthropic{})
+	r.Register(&Kimi{})
 	r.Register(&Generic{})
 	return r
 }

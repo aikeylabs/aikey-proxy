@@ -5,8 +5,10 @@ import (
 	"fmt"
 	"log/slog"
 	"net/http"
+	"net/url"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"syscall"
 	"time"
 
@@ -24,8 +26,34 @@ import (
 
 var version = "dev"
 
+const defaultConfigName = "aikey-proxy.yaml"
+
+// resolveConfigPath finds the proxy config file in priority order:
+//  1. Explicit --config argument
+//  2. Current working directory (aikey-proxy.yaml)
+//  3. $HOME/.aikey/aikey-proxy.yaml  (respects HOME env var for sandbox isolation)
+func resolveConfigPath(explicit string) (string, error) {
+	if explicit != "" {
+		return explicit, nil
+	}
+	// cwd
+	if _, err := os.Stat(defaultConfigName); err == nil {
+		return defaultConfigName, nil
+	}
+	// $HOME/.aikey/config/
+	if home, err := os.UserHomeDir(); err == nil {
+		p := filepath.Join(home, ".aikey", "config", defaultConfigName)
+		if _, err := os.Stat(p); err == nil {
+			return p, nil
+		}
+	}
+	return "", fmt.Errorf(
+		"%s not found. Searched: current directory, ~/.aikey/config/. "+
+			"Use --config to specify explicitly.", defaultConfigName)
+}
+
 func main() {
-	configPath := flag.String("config", "aikey-proxy.yaml", "path to config file")
+	configPath := flag.String("config", "", "path to config file (default: search cwd then ~/.aikey/)")
 	showVersion := flag.Bool("version", false, "print version and exit")
 	flag.Parse()
 
@@ -39,8 +67,13 @@ func main() {
 		Level: slog.LevelInfo,
 	})))
 
-	// 1. Load config.
-	cfg, err := config.Load(*configPath)
+	// 1. Resolve and load config.
+	resolvedPath, err := resolveConfigPath(*configPath)
+	if err != nil {
+		slog.Error("config not found", "error", err)
+		os.Exit(1)
+	}
+	cfg, err := config.Load(resolvedPath)
 	if err != nil {
 		slog.Error("failed to load config", "error", err)
 		os.Exit(1)
@@ -99,8 +132,11 @@ func main() {
 	collector := events.NewCollector(eventStore, cfg.Events.BatchSize, cfg.Events.FlushInterval)
 	defer collector.Close()
 
-	// 7. Build proxy.
+	// 7. Build proxy, wiring in the outbound transport.
 	p := proxy.New(vaultReader, registry, providers, collector)
+	if t := buildTransport(cfg.UpstreamProxy.URL); t != nil {
+		p.SetTransport(t)
+	}
 
 	// 8. Build admin handler.
 	adminHandler := admin.NewHandler(cfg, registry, eventStore)
@@ -150,6 +186,36 @@ func getVaultPassword() (string, error) {
 	}
 
 	return string(pw), nil
+}
+
+// buildTransport returns a custom http.Transport that routes outbound provider
+// requests through proxyURL. Returns nil when proxyURL is empty, which makes
+// httputil.ReverseProxy fall back to http.DefaultTransport (itself honouring
+// HTTP_PROXY / HTTPS_PROXY / NO_PROXY environment variables).
+//
+// Supported schemes: http, https, socks5.
+// Examples:
+//
+//	http://127.0.0.1:7890    — Clash / HTTP tunnel
+//	socks5://127.0.0.1:7891  — Clash SOCKS5 / proxychains equivalent
+func buildTransport(proxyURL string) *http.Transport {
+	if proxyURL == "" {
+		return nil
+	}
+	parsed, err := url.Parse(proxyURL)
+	if err != nil {
+		slog.Warn("upstream_proxy.url is invalid, falling back to env vars", "url", proxyURL, "error", err)
+		return nil
+	}
+	t := &http.Transport{
+		Proxy:               http.ProxyURL(parsed),
+		ForceAttemptHTTP2:   false, // keep HTTP/1.1 for widest proxy compat
+		MaxIdleConns:        100,
+		IdleConnTimeout:     90 * time.Second,
+		TLSHandshakeTimeout: 10 * time.Second,
+	}
+	slog.Info("upstream proxy configured", "url", proxyURL)
+	return t
 }
 
 func setupLogging(level string) {

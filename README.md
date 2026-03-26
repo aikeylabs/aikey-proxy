@@ -143,6 +143,50 @@ curl -X POST http://127.0.0.1:27200/v1/messages \
   -d '{"model":"claude-sonnet-4-5-20250929","max_tokens":1024,"messages":[{"role":"user","content":"Hello"}]}'
 ```
 
+## Outbound Proxy (VPN / Clash / proxychains)
+
+aikey-proxy supports routing outbound AI provider requests through a local proxy.
+
+### Option 1 — Config file (recommended)
+
+```yaml
+upstream_proxy:
+  url: "http://127.0.0.1:7890"    # Clash HTTP mode
+  # url: "socks5://127.0.0.1:7891"  # Clash SOCKS5 mode
+```
+
+Supported schemes: `http`, `https`, `socks5`.
+
+### Option 2 — Environment variables
+
+Go's standard library reads these automatically; no config change needed:
+
+```bash
+export HTTPS_PROXY=http://127.0.0.1:7890   # Clash HTTP
+export HTTPS_PROXY=socks5://127.0.0.1:7891 # Clash SOCKS5
+export NO_PROXY=127.0.0.1,localhost         # don't proxy local admin API
+./bin/aikey-proxy --config aikey-proxy.yaml
+```
+
+### Option 3 — proxychains (Linux)
+
+proxychains intercepts at the OS syscall level; no configuration in aikey-proxy is required:
+
+```bash
+proxychains4 ./bin/aikey-proxy --config aikey-proxy.yaml
+```
+
+### Priority
+
+`upstream_proxy.url` (config) > `HTTPS_PROXY` env var > direct connection.
+
+| Scenario | Recommended method |
+|----------|--------------------|
+| Clash for Windows (HTTP) | `upstream_proxy.url: http://127.0.0.1:7890` |
+| Clash SOCKS5 | `upstream_proxy.url: socks5://127.0.0.1:7891` |
+| System VPN (all traffic tunnelled) | No config needed — works transparently |
+| proxychains on Linux | Run with `proxychains4`, no config needed |
+
 ## Admin API
 
 | Endpoint | Description |

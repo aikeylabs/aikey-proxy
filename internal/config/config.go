@@ -12,12 +12,13 @@ import (
 
 // Config is the top-level aikey-proxy configuration.
 type Config struct {
-	Listen      ListenConfig              `yaml:"listen"`
-	Vault       VaultConfig               `yaml:"vault"`
-	VirtualKeys []VirtualKeyConfig        `yaml:"virtual_keys"`
-	Providers   map[string]ProviderConfig `yaml:"providers"`
-	Events      EventsConfig              `yaml:"events"`
-	Log         LogConfig                 `yaml:"log"`
+	Listen        ListenConfig              `yaml:"listen"`
+	Vault         VaultConfig               `yaml:"vault"`
+	VirtualKeys   []VirtualKeyConfig        `yaml:"virtual_keys"`
+	Providers     map[string]ProviderConfig `yaml:"providers"`
+	Events        EventsConfig              `yaml:"events"`
+	Log           LogConfig                 `yaml:"log"`
+	UpstreamProxy UpstreamProxyConfig       `yaml:"upstream_proxy"`
 }
 
 type ListenConfig struct {
@@ -55,6 +56,16 @@ type EventsConfig struct {
 
 type LogConfig struct {
 	Level string `yaml:"level"`
+}
+
+// UpstreamProxyConfig configures the outbound proxy used when connecting to AI providers.
+// Supports HTTP, HTTPS, and SOCKS5 proxy URLs.
+// If empty, the standard HTTP_PROXY / HTTPS_PROXY / NO_PROXY environment variables are used.
+type UpstreamProxyConfig struct {
+	// URL is the proxy endpoint, e.g.:
+	//   http://127.0.0.1:7890   (Clash HTTP mode)
+	//   socks5://127.0.0.1:7891 (Clash SOCKS5 / proxychains)
+	URL string `yaml:"url"`
 }
 
 // Load reads and parses a YAML config file, applying defaults.
@@ -140,7 +151,7 @@ func (c *Config) validate() error {
 
 	for name, p := range c.Providers {
 		switch p.Protocol {
-		case "openai", "anthropic":
+		case "openai", "anthropic", "kimi", "generic":
 		default:
 			return fmt.Errorf("providers[%s].protocol must be 'openai' or 'anthropic', got %q", name, p.Protocol)
 		}

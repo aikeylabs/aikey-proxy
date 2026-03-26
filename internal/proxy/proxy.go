@@ -28,9 +28,15 @@ type Proxy struct {
 	registry  *vkeys.Registry
 	providers *provider.Registry
 	collector *events.Collector
+	transport http.RoundTripper // nil → http.DefaultTransport (reads env vars)
 	requests  atomic.Int64
 	errors    atomic.Int64
 }
+
+// SetTransport sets a custom RoundTripper for outbound requests to AI providers.
+// Must be called before serving requests. A nil value restores the default
+// behaviour (http.DefaultTransport, which honours HTTP_PROXY / HTTPS_PROXY env vars).
+func (p *Proxy) SetTransport(t http.RoundTripper) { p.transport = t }
 
 // New creates a new Proxy.
 func New(v VaultGetter, reg *vkeys.Registry, prov *provider.Registry, coll *events.Collector) *Proxy {
@@ -112,6 +118,7 @@ func (p *Proxy) Handle(w http.ResponseWriter, r *http.Request) {
 
 	// 8. Build and execute reverse proxy.
 	rp := &httputil.ReverseProxy{
+		Transport: p.transport, // nil → http.DefaultTransport (honours HTTP_PROXY / HTTPS_PROXY)
 		Director: func(req *http.Request) {
 			if err := prov.RewriteRequest(req, realKey, route.BaseURL); err != nil {
 				slog.Error("rewrite request failed", "error", err)
