@@ -32,6 +32,7 @@ import (
 
 	"github.com/AiKeyLabs/aikey-proxy/internal/config"
 	"github.com/AiKeyLabs/aikey-proxy/internal/events"
+	"github.com/AiKeyLabs/aikey-proxy/internal/observability"
 	"github.com/AiKeyLabs/aikey-proxy/internal/provider"
 	"github.com/AiKeyLabs/aikey-proxy/internal/proxy"
 	"github.com/AiKeyLabs/aikey-proxy/internal/vault"
@@ -100,21 +101,39 @@ func (g *generation) close() {
 
 // drain signals this generation to stop accepting new requests, then waits
 // until all in-flight requests complete or the timeout is reached.
-func (g *generation) drain(timeout time.Duration) {
+func (g *generation) drain(timeout time.Duration, reloadID string) {
 	g.draining.Store(true)
-	if g.inflight.Load() == 0 {
+	inflight := g.inflight.Load()
+
+	slog.Info("generation draining",
+		"event.name", observability.EventProxyGenerationDraining,
+		"generation_id", g.id,
+		"reload_id", reloadID,
+		"inflight", inflight,
+	)
+
+	if inflight == 0 {
 		select {
 		case <-g.drained:
 		default:
 			close(g.drained)
 		}
-		return
 	}
+
 	select {
 	case <-g.drained:
-		slog.Info("generation drained", "id", g.id)
+		slog.Info("generation drained",
+			"event.name", observability.EventProxyGenerationDrained,
+			"generation_id", g.id,
+			"reload_id", reloadID,
+		)
 	case <-time.After(timeout):
-		slog.Warn("generation drain timed out, forcing close", "id", g.id, "inflight", g.inflight.Load())
+		slog.Warn("generation drain timed out, forcing close",
+			"event.name", observability.EventProxyGenerationDrainTimeout,
+			"generation_id", g.id,
+			"reload_id", reloadID,
+			"inflight", g.inflight.Load(),
+		)
 	}
 }
 
@@ -123,20 +142,35 @@ type Supervisor struct {
 	cfg      *config.Config
 	password string
 
-	active   atomic.Pointer[generation]
-	reloadMu sync.Mutex // serialise concurrent reload requests
-	genID    atomic.Int64
+	active    atomic.Pointer[generation]
+	reloadMu  sync.Mutex // serialise concurrent reload requests
+	genID     atomic.Int64
+	startedAt time.Time
+
+	// ctx / cancel bound the lifetime of all detached upstream calls.
+	// Cancelled in Shutdown() to stop any in-flight upstream requests.
+	ctx    context.Context
+	cancel context.CancelFunc
 }
 
 // New creates a Supervisor and starts the initial generation.
 func New(cfg *config.Config, password string) (*Supervisor, error) {
-	s := &Supervisor{cfg: cfg, password: password}
+	ctx, cancel := context.WithCancel(context.Background())
+	s := &Supervisor{
+		cfg:       cfg,
+		password:  password,
+		startedAt: time.Now(),
+		ctx:       ctx,
+		cancel:    cancel,
+	}
 	gen, err := s.buildGeneration()
 	if err != nil {
 		return nil, fmt.Errorf("initial generation failed: %w", err)
 	}
 	s.active.Store(gen)
-	slog.Info("supervisor started", "gen", gen.id)
+	slog.Info("supervisor started",
+		"generation_id", gen.id,
+	)
 	return s, nil
 }
 
@@ -148,7 +182,7 @@ func (s *Supervisor) Handler() http.Handler {
 	})
 }
 
-// AdminHandler returns the current generation's event store (for admin metrics).
+// EventStore returns the current generation's event store (for admin metrics).
 func (s *Supervisor) EventStore() *events.Store {
 	return s.active.Load().eventStore
 }
@@ -168,6 +202,37 @@ func (s *Supervisor) TotalErrors() int64 {
 	return s.active.Load().proxy.TotalErrors()
 }
 
+// InflightRequests returns the number of in-flight requests in the active generation.
+func (s *Supervisor) InflightRequests() int64 {
+	return s.active.Load().inflight.Load()
+}
+
+// HealthSnapshot returns a point-in-time health summary for logging.
+func (s *Supervisor) HealthSnapshot() observability.HealthSnapshot {
+	gen := s.active.Load()
+	snap := observability.HealthSnapshot{
+		Status:           "ok",
+		GenerationID:     gen.id,
+		InflightRequests: gen.inflight.Load(),
+		TotalRequests:    gen.proxy.TotalRequests(),
+		TotalErrors:      gen.proxy.TotalErrors(),
+		UptimeSeconds:    time.Since(s.startedAt).Seconds(),
+	}
+	if vaultSeq, err := vault.ReadConfigU64LE(s.cfg.Vault.Path, VaultChangeSeqKey); err == nil {
+		snap.VaultChangeSeq = vaultSeq
+	}
+	if loadedSeq, err := vault.ReadConfigU64LE(s.cfg.Vault.Path, ProxyLoadedSeqKey); err == nil {
+		snap.ProxyLoadedSeq = loadedSeq
+	}
+	if snap.TotalErrors > 0 && snap.TotalRequests > 0 {
+		errRate := float64(snap.TotalErrors) / float64(snap.TotalRequests)
+		if errRate > 0.1 { // >10% error rate → degraded
+			snap.Status = "degraded"
+		}
+	}
+	return snap
+}
+
 // Reload builds a new generation, swaps it as active if the readiness gate
 // passes, drains the old generation, and records the loaded vault change_seq.
 // It serialises concurrent calls: a second Reload waits for the first to finish.
@@ -175,33 +240,56 @@ func (s *Supervisor) Reload(ctx context.Context) error {
 	s.reloadMu.Lock()
 	defer s.reloadMu.Unlock()
 
-	slog.Info("reload: building new generation")
+	reloadID := observability.NewID()
+	old := s.active.Load()
+
+	slog.Info("reload: building new generation",
+		"event.name", observability.EventProxyReloadStarted,
+		"reload_id", reloadID,
+		"old_generation_id", old.id,
+	)
+
 	newGen, err := s.buildGeneration()
 	if err != nil {
+		slog.Error("reload: build generation failed",
+			"event.name", observability.EventProxyReloadFailed,
+			"reload_id", reloadID,
+			"error.message", err.Error(),
+		)
 		return fmt.Errorf("reload: build generation failed: %w", err)
 	}
 
-	old := s.active.Load()
-
 	// Swap to new generation — new requests go to newGen from this point.
 	s.active.Store(newGen)
-	slog.Info("reload: new generation active", "gen", newGen.id)
+	slog.Info("reload: new generation active",
+		"event.name", observability.EventProxyReloadCompleted,
+		"reload_id", reloadID,
+		"generation_id", newGen.id,
+	)
 
 	// Record which vault snapshot the new generation loaded.
 	if vaultSeq, err := vault.ReadConfigU64LE(s.cfg.Vault.Path, VaultChangeSeqKey); err == nil {
 		if werr := vault.WriteConfigU64LE(s.cfg.Vault.Path, ProxyLoadedSeqKey, vaultSeq); werr != nil {
-			slog.Warn("reload: failed to write loaded_vault_change_seq", "error", werr)
+			slog.Warn("reload: failed to write loaded_vault_change_seq",
+				"reload_id", reloadID,
+				"error", werr,
+			)
 		} else {
-			slog.Info("reload: wrote loaded_vault_change_seq", "seq", vaultSeq)
+			slog.Info("reload: wrote loaded_vault_change_seq",
+				"reload_id", reloadID,
+				"seq", vaultSeq,
+			)
 		}
 	}
 
 	// Drain the old generation asynchronously so the reload call returns promptly.
 	go func() {
-		slog.Info("reload: draining old generation", "gen", old.id)
-		old.drain(drainTimeoutStreaming)
+		old.drain(drainTimeoutStreaming, reloadID)
 		old.close()
-		slog.Info("reload: old generation closed", "gen", old.id)
+		slog.Info("reload: old generation closed",
+			"reload_id", reloadID,
+			"generation_id", old.id,
+		)
 	}()
 
 	return nil
@@ -209,9 +297,11 @@ func (s *Supervisor) Reload(ctx context.Context) error {
 
 // Shutdown drains the active generation and closes all resources.
 func (s *Supervisor) Shutdown(timeout time.Duration) {
+	// Cancel the proxy lifecycle context to abort any detached upstream calls.
+	s.cancel()
 	gen := s.active.Load()
-	slog.Info("supervisor shutting down", "gen", gen.id)
-	gen.drain(timeout)
+	slog.Info("supervisor shutting down", "generation_id", gen.id)
+	gen.drain(timeout, "shutdown")
 	gen.close()
 }
 
@@ -252,8 +342,10 @@ func (s *Supervisor) buildGeneration() (*generation, error) {
 	}
 	collector := events.NewCollector(eventStore, s.cfg.Events.BatchSize, s.cfg.Events.FlushInterval)
 
-	// Build the proxy handler.
-	p := proxy.New(vaultReader, registry, providers, collector)
+	// Build the proxy handler with configured thresholds.
+	p := proxy.New(vaultReader, registry, providers, collector, s.ctx)
+	p.SlowRequestMs = int64(s.cfg.Log.SlowRequestMs)
+	p.VerySlowRequestMs = int64(s.cfg.Log.VerySlowRequestMs)
 
 	return &generation{
 		id:         id,

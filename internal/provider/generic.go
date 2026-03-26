@@ -6,6 +6,12 @@ import (
 	"net/url"
 )
 
+// ExtractTokens delegates to the OpenAI-compatible implementation
+// since Generic follows the same response format convention.
+func (g *Generic) ExtractTokens(data []byte, streaming bool) (int, int) {
+	return (&OpenAI{}).ExtractTokens(data, streaming)
+}
+
 // Generic implements a generic OpenAI-compatible provider protocol.
 // This is a fallback for any provider that follows the OpenAI API convention.
 type Generic struct{}

@@ -1,6 +1,7 @@
 package proxy
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -69,7 +70,7 @@ func setupTestProxy(t *testing.T, upstreamURL string) *Proxy {
 	collector := events.NewCollector(&mockEventStore{}, 100, 5*time.Second)
 	t.Cleanup(func() { collector.Close() })
 
-	return New(v, registry, providers, collector)
+	return New(v, registry, providers, collector, context.Background())
 }
 
 func TestProxy_OpenAI_KeyReplacement(t *testing.T) {

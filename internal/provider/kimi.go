@@ -6,6 +6,12 @@ import (
 	"net/url"
 )
 
+// ExtractTokens delegates to the OpenAI-compatible implementation
+// since Kimi follows the same response format.
+func (k *Kimi) ExtractTokens(data []byte, streaming bool) (int, int) {
+	return (&OpenAI{}).ExtractTokens(data, streaming)
+}
+
 // Kimi implements the Moonshot AI (Kimi) provider protocol.
 // Kimi is fully OpenAI-compatible; the only difference is the default base URL.
 //

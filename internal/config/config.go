@@ -56,6 +56,15 @@ type EventsConfig struct {
 
 type LogConfig struct {
 	Level string `yaml:"level"`
+	// Dir is the directory for runtime JSONL log files.
+	// Defaults to ~/.aikey/logs/aikey-proxy/
+	Dir string `yaml:"dir"`
+	// SlowRequestMs is the threshold in milliseconds above which a request is
+	// logged as a slow request (proxy.request.slow). Default: 2000 ms.
+	SlowRequestMs int `yaml:"slow_request_ms"`
+	// VerySlowRequestMs is the threshold above which a WARN-level slow-request
+	// log is emitted with higher urgency. Default: 10000 ms.
+	VerySlowRequestMs int `yaml:"very_slow_request_ms"`
 }
 
 // UpstreamProxyConfig configures the outbound proxy used when connecting to AI providers.
@@ -113,6 +122,15 @@ func (c *Config) applyDefaults() {
 	if c.Log.Level == "" {
 		c.Log.Level = DefaultLogLevel
 	}
+	if c.Log.Dir == "" {
+		c.Log.Dir = DefaultLogDir
+	}
+	if c.Log.SlowRequestMs == 0 {
+		c.Log.SlowRequestMs = DefaultSlowRequestMs
+	}
+	if c.Log.VerySlowRequestMs == 0 {
+		c.Log.VerySlowRequestMs = DefaultVerySlowRequestMs
+	}
 	for name, p := range c.Providers {
 		if p.Timeout == 0 {
 			p.Timeout = DefaultProviderTimeout
@@ -163,6 +181,7 @@ func (c *Config) validate() error {
 func (c *Config) expandPaths() {
 	c.Vault.Path = expandHome(c.Vault.Path)
 	c.Events.DBPath = expandHome(c.Events.DBPath)
+	c.Log.Dir = expandHome(c.Log.Dir)
 }
 
 func expandHome(path string) string {

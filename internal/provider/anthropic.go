@@ -1,6 +1,8 @@
 package provider
 
 import (
+	"bytes"
+	"encoding/json"
 	"fmt"
 	"net/http"
 	"net/url"
@@ -34,4 +36,59 @@ func (a *Anthropic) RewriteRequest(req *http.Request, realKey string, baseURL st
 	}
 
 	return nil
+}
+
+// ExtractTokens parses Anthropic token usage.
+//
+// Non-streaming response body:
+//
+//	{"usage": {"input_tokens": N, "output_tokens": N}}
+//
+// Streaming SSE contains two relevant events:
+//
+//	data: {"type":"message_start","message":{"usage":{"input_tokens":N}}}
+//	data: {"type":"message_delta","usage":{"output_tokens":N}}
+func (a *Anthropic) ExtractTokens(data []byte, streaming bool) (int, int) {
+	if !streaming {
+		var resp struct {
+			Usage struct {
+				InputTokens  int `json:"input_tokens"`
+				OutputTokens int `json:"output_tokens"`
+			} `json:"usage"`
+		}
+		if json.Unmarshal(data, &resp) == nil {
+			return resp.Usage.InputTokens, resp.Usage.OutputTokens
+		}
+		return 0, 0
+	}
+
+	// Streaming: scan SSE lines.
+	var inputTokens, outputTokens int
+	for _, line := range bytes.Split(data, []byte("\n")) {
+		line = bytes.TrimPrefix(bytes.TrimSpace(line), []byte("data: "))
+		if len(line) == 0 || line[0] != '{' {
+			continue
+		}
+		var event struct {
+			Type    string `json:"type"`
+			Message struct {
+				Usage struct {
+					InputTokens int `json:"input_tokens"`
+				} `json:"usage"`
+			} `json:"message"`
+			Usage struct {
+				OutputTokens int `json:"output_tokens"`
+			} `json:"usage"`
+		}
+		if json.Unmarshal(line, &event) != nil {
+			continue
+		}
+		switch event.Type {
+		case "message_start":
+			inputTokens = event.Message.Usage.InputTokens
+		case "message_delta":
+			outputTokens = event.Usage.OutputTokens
+		}
+	}
+	return inputTokens, outputTokens
 }

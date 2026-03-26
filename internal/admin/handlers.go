@@ -3,11 +3,13 @@ package admin
 import (
 	"context"
 	"encoding/json"
+	"log/slog"
 	"net/http"
 	"time"
 
 	"github.com/AiKeyLabs/aikey-proxy/internal/config"
 	"github.com/AiKeyLabs/aikey-proxy/internal/events"
+	"github.com/AiKeyLabs/aikey-proxy/internal/observability"
 	"github.com/AiKeyLabs/aikey-proxy/internal/vkeys"
 )
 
@@ -46,6 +48,11 @@ type healthResponse struct {
 
 // Health returns basic health status.
 func (h *Handler) Health(w http.ResponseWriter, r *http.Request) {
+	tc := observability.ExtractOrCreate(r)
+	slog.Debug("admin: health check",
+		"trace_id", tc.TraceID,
+		"request_id", tc.RequestID,
+	)
 	writeJSON(w, http.StatusOK, healthResponse{
 		Status:  "ok",
 		Version: Version,
@@ -66,6 +73,12 @@ type statusResponse struct {
 
 // Status returns detailed proxy status.
 func (h *Handler) Status(w http.ResponseWriter, r *http.Request) {
+	tc := observability.ExtractOrCreate(r)
+	slog.Debug("admin: status requested",
+		"trace_id", tc.TraceID,
+		"request_id", tc.RequestID,
+	)
+
 	var totalReqs, totalErrs int64
 	if h.TotalRequestsFn != nil {
 		totalReqs = h.TotalRequestsFn()
@@ -125,24 +138,37 @@ func (h *Handler) Metrics(w http.ResponseWriter, r *http.Request) {
 // Returns 200 OK when the new generation is active, 503 if ReloadFn is not
 // wired, or 500 on reload failure.
 func (h *Handler) Reload(w http.ResponseWriter, r *http.Request) {
+	tc := observability.ExtractOrCreate(r)
+	logger := slog.With(
+		"trace_id", tc.TraceID,
+		"request_id", tc.RequestID,
+	)
+
 	if h.ReloadFn == nil {
+		logger.Warn("admin: reload not supported")
 		writeJSON(w, http.StatusServiceUnavailable, map[string]string{
 			"error": "reload not supported",
 		})
 		return
 	}
 
+	logger.Info("admin: reload requested")
+
 	// Give the reload up to 30 s to build the new generation.
 	ctx, cancel := context.WithTimeout(r.Context(), 30*time.Second)
 	defer cancel()
 
 	if err := h.ReloadFn(ctx); err != nil {
+		logger.Error("admin: reload failed",
+			"error.message", err.Error(),
+		)
 		writeJSON(w, http.StatusInternalServerError, map[string]string{
 			"error": err.Error(),
 		})
 		return
 	}
 
+	logger.Info("admin: reload completed successfully")
 	writeJSON(w, http.StatusOK, map[string]string{"status": "reloaded"})
 }
 

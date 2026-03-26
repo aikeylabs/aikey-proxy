@@ -3,6 +3,7 @@ package main
 import (
 	"flag"
 	"fmt"
+	"log/slog"
 	"net/http"
 	"net/url"
 	"os"
@@ -11,12 +12,11 @@ import (
 	"syscall"
 	"time"
 
-	"log/slog"
-
 	"golang.org/x/term"
 
 	"github.com/AiKeyLabs/aikey-proxy/internal/admin"
 	"github.com/AiKeyLabs/aikey-proxy/internal/config"
+	"github.com/AiKeyLabs/aikey-proxy/internal/observability"
 	"github.com/AiKeyLabs/aikey-proxy/internal/server"
 	"github.com/AiKeyLabs/aikey-proxy/internal/supervisor"
 )
@@ -59,7 +59,7 @@ func main() {
 		os.Exit(0)
 	}
 
-	// Setup structured logging.
+	// Minimal stderr-only logger until config is loaded and log dir is known.
 	slog.SetDefault(slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{
 		Level: slog.LevelInfo,
 	})))
@@ -76,38 +76,54 @@ func main() {
 		os.Exit(1)
 	}
 
-	// Set log level from config.
-	setupLogging(cfg.Log.Level)
+	// 2. Initialise structured logging: stderr text + async JSONL file.
+	logLevel := parseLogLevel(cfg.Log.Level)
+	logWriter, err := observability.SetupLogger(cfg.Log.Dir, "aikey-proxy", version, logLevel)
+	if err != nil {
+		// Non-fatal: fall back to text-only stderr logging.
+		slog.Warn("failed to initialise JSONL log writer, falling back to stderr only", "error", err)
+		setupTextLogging(logLevel)
+	}
 
 	slog.Info("config loaded",
+		"event.name", observability.EventProxyConfigLoaded,
 		"listen", cfg.Listen.Addr(),
 		"vault", cfg.Vault.Path,
 		"virtual_keys", len(cfg.VirtualKeys),
 	)
 
-	// 2. Get vault password.
+	// 3. Get vault password.
 	password, err := getVaultPassword()
 	if err != nil {
 		slog.Error("failed to get vault password", "error", err)
 		os.Exit(1)
 	}
 
-	// 3. Bind the TCP listener once — it is never closed during graceful reloads.
+	// 4. Bind the TCP listener once — it is never closed during graceful reloads.
 	ln, err := supervisor.Listen(cfg)
 	if err != nil {
 		slog.Error("failed to bind listener", "error", err)
 		os.Exit(1)
 	}
-	slog.Info("listener bound", "addr", ln.Addr())
+	slog.Info("listener bound",
+		"event.name", observability.EventProxyListenerBound,
+		"addr", ln.Addr(),
+	)
 
-	// 4. Create the Supervisor (starts the initial generation).
+	// 5. Create the Supervisor (starts the initial generation).
 	sup, err := supervisor.New(cfg, password)
 	if err != nil {
 		slog.Error("failed to start supervisor", "error", err)
 		os.Exit(1)
 	}
 
-	// 5. Build the admin handler, wiring Supervisor callbacks.
+	slog.Info("aikey-proxy started",
+		"event.name", observability.EventProxyProcessStarted,
+		"version", version,
+		"listen", ln.Addr(),
+	)
+
+	// 6. Build the admin handler, wiring Supervisor callbacks.
 	adminHandler := admin.NewHandler(cfg, sup.Registry(), sup.EventStore())
 	adminHandler.TotalRequestsFn = sup.TotalRequests
 	adminHandler.TotalErrorsFn = sup.TotalErrors
@@ -116,14 +132,10 @@ func main() {
 	// Build the outbound transport for upstream providers (optional).
 	dataHandler := sup.Handler()
 	if t := buildTransport(cfg.UpstreamProxy.URL); t != nil {
-		// Wrap the supervisor handler with the custom transport by delegating
-		// through a minimal http.Handler that injects it on the proxy level.
-		// The transport is generation-independent (it's just a dialer), so
-		// it is safe to inject once at the server level.
 		_ = t // transport is set on proxy.Proxy inside buildGeneration; see supervisor.go
 	}
 
-	// 6. Build and start the HTTP server.
+	// 7. Build and start the HTTP server.
 	srv := server.New(ln, dataHandler, adminHandler)
 
 	// Handle graceful shutdown.
@@ -148,7 +160,15 @@ func main() {
 	}
 	sup.Shutdown(30 * time.Second)
 
-	slog.Info("aikey-proxy stopped")
+	slog.Info("aikey-proxy stopped",
+		"event.name", observability.EventProxyProcessStopped,
+	)
+
+	// Flush the async log writer before exiting so no records are lost.
+	if logWriter != nil {
+		logWriter.Flush(3 * time.Second)
+		_ = logWriter.Close()
+	}
 }
 
 // getVaultPassword reads the vault password from AIKEY_VAULT_PASSWORD env var
@@ -194,20 +214,24 @@ func buildTransport(proxyURL string) *http.Transport {
 	return t
 }
 
-func setupLogging(level string) {
-	var logLevel slog.Level
+// parseLogLevel converts a config string to a slog.Level.
+func parseLogLevel(level string) slog.Level {
 	switch level {
 	case "debug":
-		logLevel = slog.LevelDebug
+		return slog.LevelDebug
 	case "warn":
-		logLevel = slog.LevelWarn
+		return slog.LevelWarn
 	case "error":
-		logLevel = slog.LevelError
+		return slog.LevelError
 	default:
-		logLevel = slog.LevelInfo
+		return slog.LevelInfo
 	}
+}
 
+// setupTextLogging configures the global logger to write text to stderr only
+// (fallback when the JSONL writer cannot be initialised).
+func setupTextLogging(level slog.Level) {
 	slog.SetDefault(slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{
-		Level: logLevel,
+		Level: level,
 	})))
 }

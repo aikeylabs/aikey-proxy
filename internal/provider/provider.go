@@ -14,6 +14,12 @@ type Provider interface {
 	// - Sets the real API key in the appropriate header
 	// - Sets the correct Host and URL
 	RewriteRequest(req *http.Request, realKey string, baseURL string) error
+
+	// ExtractTokens parses token counts from a provider response.
+	// For non-streaming requests, data is the full JSON response body.
+	// For streaming requests, data is the full accumulated SSE stream.
+	// Returns (inputTokens, outputTokens); returns (0, 0) if unavailable.
+	ExtractTokens(data []byte, streaming bool) (inputTokens, outputTokens int)
 }
 
 // Registry maps protocol names to provider implementations.

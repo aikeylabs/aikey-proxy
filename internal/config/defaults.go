@@ -11,4 +11,7 @@ const (
 	DefaultEventsBatchSize = 100
 	DefaultEventsFlushInterval = 5 * time.Second
 	DefaultLogLevel      = "info"
+	DefaultLogDir        = "~/.aikey/logs/aikey-proxy"
+	DefaultSlowRequestMs      = 2000
+	DefaultVerySlowRequestMs  = 10000
 )
