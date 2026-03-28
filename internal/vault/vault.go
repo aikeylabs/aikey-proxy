@@ -120,6 +120,65 @@ func (r *Reader) ListAliases() ([]string, error) {
 	return aliases, rows.Err()
 }
 
+// ManagedKey holds a team-managed virtual key resolved from managed_virtual_keys_cache.
+// The PlaintextKey field contains the decrypted real provider key; it must be
+// treated with the same care as a regular vault secret.
+type ManagedKey struct {
+	VirtualKeyID string
+	ProviderCode string
+	ProtocolType string
+	BaseURL      string
+	PlaintextKey string
+}
+
+// GetActiveManagedKeys reads all rows from managed_virtual_keys_cache where
+// local_state = 'active' and provider_key_ciphertext IS NOT NULL, then decrypts
+// each provider key using the vault AES key derived at Open time.
+//
+// Keys that fail to decrypt are skipped with a warning (e.g. written by a
+// different vault password or corrupted data) so a single bad entry does not
+// block the proxy from starting.
+func (r *Reader) GetActiveManagedKeys() ([]ManagedKey, error) {
+	rows, err := r.db.Query(`
+		SELECT virtual_key_id, provider_code, protocol_type, base_url,
+		       provider_key_nonce, provider_key_ciphertext
+		FROM managed_virtual_keys_cache
+		WHERE local_state = 'active'
+		  AND provider_key_ciphertext IS NOT NULL
+	`)
+	if err != nil {
+		// Table may not exist on older vaults — treat as empty, not an error.
+		return nil, nil //nolint:nilerr
+	}
+	defer rows.Close()
+
+	var keys []ManagedKey
+	for rows.Next() {
+		var vkID, provCode, protType, baseURL string
+		var nonce, ciphertext []byte
+		if err := rows.Scan(&vkID, &provCode, &protType, &baseURL, &nonce, &ciphertext); err != nil {
+			slog.Warn("managed key: scan error, skipping", "error", err)
+			continue
+		}
+		plaintext, err := Decrypt(r.derivedKey, nonce, ciphertext)
+		if err != nil {
+			slog.Warn("managed key: decryption failed, skipping", "vk_id", vkID, "error", err)
+			continue
+		}
+		keys = append(keys, ManagedKey{
+			VirtualKeyID: vkID,
+			ProviderCode: provCode,
+			ProtocolType: protType,
+			BaseURL:      baseURL,
+			PlaintextKey: string(plaintext),
+		})
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("managed keys scan: %w", err)
+	}
+	return keys, nil
+}
+
 // Close releases resources and clears cached secrets.
 func (r *Reader) Close() error {
 	r.cache.clear()

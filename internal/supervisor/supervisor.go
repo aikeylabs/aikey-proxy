@@ -51,6 +51,11 @@ const (
 	// requests before being forcibly closed.
 	drainTimeoutNormal    = 30 * time.Second
 	drainTimeoutStreaming = 5 * time.Minute
+
+	// managedKeySyncInterval is how often the background goroutine checks
+	// whether the vault's change_seq has advanced and, if so, merges any
+	// newly-active managed keys into the live registry without a full reload.
+	managedKeySyncInterval = 5 * time.Second
 )
 
 // generation holds all per-reload state: vault reader, virtual key registry,
@@ -153,7 +158,8 @@ type Supervisor struct {
 	cancel context.CancelFunc
 }
 
-// New creates a Supervisor and starts the initial generation.
+// New creates a Supervisor, starts the initial generation, and launches the
+// background managed-key sync goroutine.
 func New(cfg *config.Config, password string) (*Supervisor, error) {
 	ctx, cancel := context.WithCancel(context.Background())
 	s := &Supervisor{
@@ -171,7 +177,82 @@ func New(cfg *config.Config, password string) (*Supervisor, error) {
 	slog.Info("supervisor started",
 		"generation_id", gen.id,
 	)
+	go s.managedKeySyncLoop()
 	return s, nil
+}
+
+// managedKeySyncLoop runs in a background goroutine and periodically merges
+// newly-active managed keys into the live registry without a full reload.
+//
+// It compares runtime.vault.change_seq against the seq last recorded by the
+// active generation. When they differ it reads managed_virtual_keys_cache from
+// the vault and calls registry.Merge with any new or updated active routes.
+// This means aikey key use takes effect within managedKeySyncInterval without
+// requiring aikey proxy restart or POST /admin/reload.
+func (s *Supervisor) managedKeySyncLoop() {
+	ticker := time.NewTicker(managedKeySyncInterval)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-s.ctx.Done():
+			return
+		case <-ticker.C:
+			s.syncManagedKeys()
+		}
+	}
+}
+
+// syncManagedKeys checks the vault change_seq and, if it has advanced since
+// the active generation was built, merges current active managed keys into the
+// live registry.
+func (s *Supervisor) syncManagedKeys() {
+	gen := s.active.Load()
+
+	vaultSeq, err := vault.ReadConfigU64LE(s.cfg.Vault.Path, VaultChangeSeqKey)
+	if err != nil {
+		return // vault not yet written or unavailable — no-op
+	}
+	loadedSeq, err := vault.ReadConfigU64LE(s.cfg.Vault.Path, ProxyLoadedSeqKey)
+	if err != nil {
+		loadedSeq = 0 // first run or missing key: treat as stale
+	}
+	if vaultSeq == loadedSeq {
+		return // nothing changed
+	}
+
+	// Re-use the active generation's already-open vault reader instead of
+	// calling vault.Open() (which re-runs the full Argon2id KDF on every tick).
+	managedKeys, err := gen.vault.GetActiveManagedKeys()
+	if err != nil || len(managedKeys) == 0 {
+		// Update loaded seq even if no keys, so we don't retry on every tick.
+		_ = vault.WriteConfigU64LE(s.cfg.Vault.Path, ProxyLoadedSeqKey, vaultSeq)
+		return
+	}
+
+	managedRoutes := make(map[string]*vkeys.ResolvedRoute, len(managedKeys))
+	for _, mk := range managedKeys {
+		token := "aikey_vk_" + mk.VirtualKeyID
+		managedRoutes[token] = &vkeys.ResolvedRoute{
+			VirtualKeyID: mk.VirtualKeyID,
+			Provider:     mk.ProtocolType, // protocol type resolves to provider adapter (e.g. "openai_compatible" → openai)
+			BaseURL:      mk.BaseURL,
+			PlaintextKey: mk.PlaintextKey,
+		}
+	}
+
+	// Merge into the active generation's live registry — zero downtime, no reload.
+	gen.registry.Merge(managedRoutes)
+
+	// Record that we've caught up to this seq.
+	if werr := vault.WriteConfigU64LE(s.cfg.Vault.Path, ProxyLoadedSeqKey, vaultSeq); werr != nil {
+		slog.Warn("managed key sync: failed to write loaded_vault_change_seq", "error", werr)
+	} else {
+		slog.Info("managed key sync: merged active managed keys",
+			"count", len(managedRoutes),
+			"vault_seq", vaultSeq,
+		)
+	}
 }
 
 // Handler returns an http.Handler that always delegates to the active generation.
@@ -315,7 +396,8 @@ func (s *Supervisor) buildGeneration() (*generation, error) {
 		return nil, fmt.Errorf("open vault: %w", err)
 	}
 
-	// Build virtual key registry, skip keys whose vault secret is missing.
+	// Build virtual key registry from static YAML config.
+	// Skip entries whose vault secret is missing (prevents proxy crash on misconfiguration).
 	var activeKeys []config.VirtualKeyConfig
 	for _, vk := range s.cfg.VirtualKeys {
 		if _, err := vaultReader.GetSecret(vk.KeyAlias); err != nil {
@@ -325,10 +407,29 @@ func (s *Supervisor) buildGeneration() (*generation, error) {
 		}
 		activeKeys = append(activeKeys, vk)
 	}
-	slog.Info("virtual keys ready", "active", len(activeKeys), "total", len(s.cfg.VirtualKeys))
+	slog.Info("static virtual keys ready", "active", len(activeKeys), "total", len(s.cfg.VirtualKeys))
 
 	registry := vkeys.NewRegistry()
 	registry.Load(activeKeys)
+
+	// Also load team-managed virtual keys from managed_virtual_keys_cache.
+	// These are keys accepted via `aikey key accept` and activated via `aikey key use`.
+	// The bearer token clients use is: "aikey_vk_" + virtual_key_id.
+	if managedKeys, err := vaultReader.GetActiveManagedKeys(); err != nil {
+		slog.Warn("could not load managed virtual keys", "error", err)
+	} else if len(managedKeys) > 0 {
+		managedRoutes := make(map[string]*vkeys.ResolvedRoute, len(managedKeys))
+		for _, mk := range managedKeys {
+			token := "aikey_vk_" + mk.VirtualKeyID
+			managedRoutes[token] = &vkeys.ResolvedRoute{
+				VirtualKeyID: mk.VirtualKeyID,
+				Provider:     mk.ProtocolType, // protocol type resolves to provider adapter (e.g. "openai_compatible" → openai)
+				BaseURL:      mk.BaseURL,
+				PlaintextKey: mk.PlaintextKey,
+			}
+		}
+		registry.Merge(managedRoutes)
+	}
 
 	// Provider registry.
 	providers := provider.NewRegistry()

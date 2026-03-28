@@ -130,19 +130,27 @@ func (p *Proxy) Handle(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	// 4. Get real key from vault.
-	realKey, err := p.vault.GetSecret(route.KeyAlias)
-	if err != nil {
-		p.errors.Add(1)
-		logger.Error("vault lookup failed",
-			"event.name", observability.EventProxyRequestVaultFailed,
-			"error.code", observability.ErrCodeSecretNotConfigured,
-			"error.message", err.Error(),
-			"key_alias", route.KeyAlias,
-		)
-		writeJSONError(w, http.StatusServiceUnavailable, "server_error", "SECRET_NOT_CONFIGURED",
-			"Provider secret '"+route.KeyAlias+"' is not in the vault. Run: aikey secret set "+route.KeyAlias+" --from-stdin")
-		return
+	// 4. Get real key — either from the pre-decrypted managed cache or from vault.
+	var realKey string
+	if route.PlaintextKey != "" {
+		// Team-managed virtual key: provider key was decrypted from
+		// managed_virtual_keys_cache at proxy startup. Use it directly.
+		realKey = route.PlaintextKey
+	} else {
+		var err error
+		realKey, err = p.vault.GetSecret(route.KeyAlias)
+		if err != nil {
+			p.errors.Add(1)
+			logger.Error("vault lookup failed",
+				"event.name", observability.EventProxyRequestVaultFailed,
+				"error.code", observability.ErrCodeSecretNotConfigured,
+				"error.message", err.Error(),
+				"key_alias", route.KeyAlias,
+			)
+			writeJSONError(w, http.StatusServiceUnavailable, "server_error", "SECRET_NOT_CONFIGURED",
+				"Provider secret '"+route.KeyAlias+"' is not in the vault. Run: aikey secret set "+route.KeyAlias+" --from-stdin")
+			return
+		}
 	}
 
 	// 5. Get provider adapter.
@@ -163,25 +171,54 @@ func (p *Proxy) Handle(w http.ResponseWriter, r *http.Request) {
 	streaming := isStreamingRequest(r)
 
 	// 7. Store metadata in context for post-processing.
-	ctx := context.WithValue(r.Context(), ctxKeyRoute, route)
+	// For streaming requests, bridge the HTTP/1.1 close-notifier to a context
+	// so the streamDrainer can abort the upstream call when the client
+	// disconnects mid-stream (HTTP/1.1 does not cancel r.Context() until
+	// ServeHTTP returns, which is too late to interrupt upstream.Read).
+	reqBase := r.Context()
+	if streaming {
+		//nolint:staticcheck // CloseNotifier is the only reliable HTTP/1.1 disconnect signal
+		if cn, ok := w.(http.CloseNotifier); ok {
+			cancelCtx, cancel := context.WithCancel(reqBase)
+			defer cancel()
+			go func() {
+				select {
+				case <-cn.CloseNotify(): //nolint:staticcheck
+					cancel()
+				case <-cancelCtx.Done():
+				}
+			}()
+			reqBase = cancelCtx
+		}
+	}
+	ctx := context.WithValue(reqBase, ctxKeyRoute, route)
 	ctx = context.WithValue(ctx, ctxKeyStartTime, startTime)
 	ctx = context.WithValue(ctx, ctxKeyIsStreaming, streaming)
 	r = r.WithContext(ctx)
 
-	// 8. Build inner transport: wrap with detachedTransport so the upstream
-	// call is not cancelled when the client disconnects.
+	// 8. Build inner transport.
+	// Non-streaming: detach from the client context so the upstream call
+	// completes even if the client disconnects — the provider has already
+	// started generating and will charge for it regardless.
+	// Streaming: keep the client context. When the client disconnects the
+	// upstream TCP connection is released so the provider stops generation
+	// and stops billing. Partial token usage is still recorded by the drainer.
 	inner := p.transport
 	if inner == nil {
 		inner = http.DefaultTransport
 	}
-
-	// 9. Build and execute reverse proxy.
-	rp := &httputil.ReverseProxy{
-		Transport: &detachedTransport{
+	var transport http.RoundTripper = inner
+	if !streaming {
+		transport = &detachedTransport{
 			inner:      inner,
 			proxyCtx:   p.proxyCtx,
 			maxTimeout: p.UpstreamTimeout,
-		},
+		}
+	}
+
+	// 9. Build and execute reverse proxy.
+	rp := &httputil.ReverseProxy{
+		Transport: transport,
 		Director: func(req *http.Request) {
 			if err := prov.RewriteRequest(req, realKey, route.BaseURL); err != nil {
 				logger.Error("rewrite request failed", "error", err)
@@ -215,7 +252,7 @@ func (p *Proxy) Handle(w http.ResponseWriter, r *http.Request) {
 				// full SSE stream and records token usage when it ends, regardless
 				// of whether the client stays connected.
 				baseEvent := p.buildBaseEvent(r, resp, startTime, route, true)
-				resp.Body = newStreamDrainer(resp.Body, baseEvent, prov, p.collector, p.proxyCtx)
+				resp.Body = newStreamDrainer(resp.Body, baseEvent, prov, p.collector, p.proxyCtx, r.Context())
 			}
 			return nil
 		},

@@ -45,7 +45,11 @@ func (r *Registry) Register(p Provider) {
 }
 
 // Get returns the provider for the given protocol name.
+// "openai_compatible" is accepted as an alias for "openai".
 func (r *Registry) Get(name string) (Provider, error) {
+	if name == "openai_compatible" {
+		name = "openai"
+	}
 	p, ok := r.providers[name]
 	if !ok {
 		return nil, fmt.Errorf("unknown provider protocol %q", name)

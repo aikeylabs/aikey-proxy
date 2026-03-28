@@ -174,20 +174,27 @@ func (w *AsyncWriter) run() {
 }
 
 // drainAll empties the channel after it has been closed.
+// Must use the two-value receive to detect a closed+empty channel;
+// a single-value receive on a closed channel always succeeds immediately
+// (returning the zero value), which would cause an infinite loop.
 func (w *AsyncWriter) drainAll() {
+loop:
 	for {
 		select {
-		case b := <-w.ch:
+		case b, ok := <-w.ch:
+			if !ok {
+				break loop // channel closed and drained
+			}
 			w.writeBytes(b)
 		default:
-			w.mu.Lock()
-			if w.file != nil {
-				_ = w.file.Sync()
-			}
-			w.mu.Unlock()
-			return
+			break loop // channel open but empty
 		}
 	}
+	w.mu.Lock()
+	if w.file != nil {
+		_ = w.file.Sync()
+	}
+	w.mu.Unlock()
 }
 
 // writeBytes appends b to the current log file and rotates if the file

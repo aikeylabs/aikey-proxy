@@ -44,7 +44,9 @@ type VirtualKeyConfig struct {
 }
 
 type ProviderConfig struct {
-	Protocol string        `yaml:"protocol"` // "openai" or "anthropic"
+	// Protocol selects the provider adapter.
+	// Accepted values: "openai", "openai_compatible" (alias for "openai"), "anthropic".
+	Protocol string        `yaml:"protocol"`
 	Timeout  time.Duration `yaml:"timeout"`
 }
 
@@ -169,9 +171,9 @@ func (c *Config) validate() error {
 
 	for name, p := range c.Providers {
 		switch p.Protocol {
-		case "openai", "anthropic", "kimi", "generic":
+		case "openai", "openai_compatible", "anthropic", "kimi", "generic":
 		default:
-			return fmt.Errorf("providers[%s].protocol must be 'openai' or 'anthropic', got %q", name, p.Protocol)
+			return fmt.Errorf("providers[%s].protocol must be 'openai', 'openai_compatible', or 'anthropic', got %q", name, p.Protocol)
 		}
 	}
 

@@ -39,6 +39,13 @@ func (m *mockEventStore) Close() error                                          
 
 func setupTestProxy(t *testing.T, upstreamURL string) *Proxy {
 	t.Helper()
+	return setupTestProxyWithStore(t, upstreamURL, &mockEventStore{})
+}
+
+// setupTestProxyWithStore creates a Proxy wired to a custom EventInserter,
+// useful for tests that need to capture and assert on recorded events.
+func setupTestProxyWithStore(t *testing.T, upstreamURL string, store events.EventInserter) *Proxy {
+	t.Helper()
 
 	v := &mockVault{
 		secrets: map[string]string{
@@ -67,7 +74,8 @@ func setupTestProxy(t *testing.T, upstreamURL string) *Proxy {
 	})
 
 	providers := provider.NewRegistry()
-	collector := events.NewCollector(&mockEventStore{}, 100, 5*time.Second)
+	// batchSize=1 + short flush so events are immediately visible in tests.
+	collector := events.NewCollector(store, 1, 5*time.Millisecond)
 	t.Cleanup(func() { collector.Close() })
 
 	return New(v, registry, providers, collector, context.Background())
@@ -266,5 +274,149 @@ func TestExtractVirtualKey_NoKey(t *testing.T) {
 	req := httptest.NewRequest("POST", "/", nil)
 	if token := extractVirtualKey(req); token != "" {
 		t.Fatalf("expected empty, got %q", token)
+	}
+}
+
+// ---- Token recording integration tests -------------------------------------
+
+// TestProxy_NonStreaming_RecordsTokens verifies that a non-streaming response
+// is parsed for token usage and a UsageEvent is recorded with correct counts.
+func TestProxy_NonStreaming_RecordsTokens_OpenAI(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.Write([]byte(`{
+			"id": "chatcmpl-test",
+			"choices": [{"message": {"content": "hello"}}],
+			"usage": {"prompt_tokens": 12, "completion_tokens": 34, "total_tokens": 46}
+		}`))
+	}))
+	defer upstream.Close()
+
+	store := newCapturingStore()
+	p := setupTestProxyWithStore(t, upstream.URL, store)
+
+	body := `{"model":"gpt-4o-mini","messages":[{"role":"user","content":"hi"}]}`
+	req := httptest.NewRequest("POST", "/v1/chat/completions", strings.NewReader(body))
+	req.Header.Set("Authorization", "Bearer aikey_vk_openai_test")
+	req.Header.Set("Content-Type", "application/json")
+
+	p.Handle(httptest.NewRecorder(), req)
+
+	ev := store.waitEvent(t, 2*time.Second)
+	if ev.InputTokens != 12 {
+		t.Errorf("InputTokens = %d, want 12", ev.InputTokens)
+	}
+	if ev.OutputTokens != 34 {
+		t.Errorf("OutputTokens = %d, want 34", ev.OutputTokens)
+	}
+	if ev.IsStreaming {
+		t.Error("IsStreaming should be false for non-streaming request")
+	}
+	if ev.StatusCode != 200 {
+		t.Errorf("StatusCode = %d, want 200", ev.StatusCode)
+	}
+}
+
+func TestProxy_NonStreaming_RecordsTokens_Anthropic(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.Write([]byte(`{
+			"type": "message",
+			"content": [{"type": "text", "text": "hello"}],
+			"usage": {"input_tokens": 8, "output_tokens": 20}
+		}`))
+	}))
+	defer upstream.Close()
+
+	store := newCapturingStore()
+	p := setupTestProxyWithStore(t, upstream.URL, store)
+
+	body := `{"model":"claude-sonnet-4-5-20250929","messages":[{"role":"user","content":"hi"}]}`
+	req := httptest.NewRequest("POST", "/v1/messages", strings.NewReader(body))
+	req.Header.Set("x-api-key", "aikey_vk_anthropic_test")
+	req.Header.Set("Content-Type", "application/json")
+
+	p.Handle(httptest.NewRecorder(), req)
+
+	ev := store.waitEvent(t, 2*time.Second)
+	if ev.InputTokens != 8 {
+		t.Errorf("InputTokens = %d, want 8", ev.InputTokens)
+	}
+	if ev.OutputTokens != 20 {
+		t.Errorf("OutputTokens = %d, want 20", ev.OutputTokens)
+	}
+}
+
+// TestProxy_Streaming_RecordsTokens verifies that a streaming SSE response
+// is parsed for token usage via streamDrainer and a UsageEvent is recorded
+// with the correct counts once the stream ends.
+func TestProxy_Streaming_RecordsTokens_Anthropic(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		flusher := w.(http.Flusher)
+		chunks := []string{
+			`data: {"type":"message_start","message":{"usage":{"input_tokens":6,"output_tokens":0}}}`,
+			`data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"hi"}}`,
+			`data: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":18}}`,
+			"data: [DONE]",
+		}
+		for _, c := range chunks {
+			w.Write([]byte(c + "\n\n"))
+			flusher.Flush()
+		}
+	}))
+	defer upstream.Close()
+
+	store := newCapturingStore()
+	p := setupTestProxyWithStore(t, upstream.URL, store)
+
+	body := `{"model":"claude-sonnet-4-5-20250929","messages":[{"role":"user","content":"hi"}],"stream":true}`
+	req := httptest.NewRequest("POST", "/v1/messages", strings.NewReader(body))
+	req.Header.Set("x-api-key", "aikey_vk_anthropic_test")
+	req.Header.Set("Content-Type", "application/json")
+
+	p.Handle(httptest.NewRecorder(), req)
+
+	ev := store.waitEvent(t, 3*time.Second)
+	if ev.InputTokens != 6 {
+		t.Errorf("InputTokens = %d, want 6", ev.InputTokens)
+	}
+	if ev.OutputTokens != 18 {
+		t.Errorf("OutputTokens = %d, want 18", ev.OutputTokens)
+	}
+	if !ev.IsStreaming {
+		t.Error("IsStreaming should be true")
+	}
+}
+
+// TestProxy_ErrorResponse_NoTokens verifies that error responses are recorded
+// with zero tokens and the correct error type.
+func TestProxy_ErrorResponse_NoTokens(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(429)
+		w.Write([]byte(`{"error":{"type":"rate_limit_error","message":"rate limited"}}`))
+	}))
+	defer upstream.Close()
+
+	store := newCapturingStore()
+	p := setupTestProxyWithStore(t, upstream.URL, store)
+
+	body := `{"model":"gpt-4o-mini","messages":[{"role":"user","content":"hi"}]}`
+	req := httptest.NewRequest("POST", "/v1/chat/completions", strings.NewReader(body))
+	req.Header.Set("Authorization", "Bearer aikey_vk_openai_test")
+	req.Header.Set("Content-Type", "application/json")
+
+	p.Handle(httptest.NewRecorder(), req)
+
+	ev := store.waitEvent(t, 2*time.Second)
+	if ev.InputTokens != 0 || ev.OutputTokens != 0 {
+		t.Errorf("error response should have no tokens, got (%d,%d)", ev.InputTokens, ev.OutputTokens)
+	}
+	if ev.StatusCode != 429 {
+		t.Errorf("StatusCode = %d, want 429", ev.StatusCode)
+	}
+	if ev.ErrorType == "" {
+		t.Error("ErrorType should be set for error responses")
 	}
 }

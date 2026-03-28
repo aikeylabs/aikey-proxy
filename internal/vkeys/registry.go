@@ -42,6 +42,18 @@ func (r *Registry) Load(keys []config.VirtualKeyConfig) {
 	slog.Info("virtual key registry loaded", "count", len(newMap))
 }
 
+// Merge adds pre-resolved routes to the registry without replacing existing ones.
+// Used to register team-managed virtual keys loaded from managed_virtual_keys_cache.
+// Tokens that already exist in the registry are overwritten (managed key wins).
+func (r *Registry) Merge(routes map[string]*ResolvedRoute) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	for token, route := range routes {
+		r.byToken[token] = route
+	}
+	slog.Info("managed virtual keys merged into registry", "count", len(routes))
+}
+
 // Resolve looks up a virtual key token and returns the route, or nil.
 func (r *Registry) Resolve(token string) *ResolvedRoute {
 	r.mu.RLock()
