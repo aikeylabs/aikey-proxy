@@ -8,12 +8,14 @@ import (
 	"log/slog"
 	"net/http"
 	"net/http/httputil"
+	"strings"
 	"sync/atomic"
 	"time"
 
 	"github.com/AiKeyLabs/aikey-proxy/internal/events"
 	"github.com/AiKeyLabs/aikey-proxy/internal/observability"
 	"github.com/AiKeyLabs/aikey-proxy/internal/provider"
+	"github.com/AiKeyLabs/aikey-proxy/internal/vault"
 	"github.com/AiKeyLabs/aikey-proxy/internal/vkeys"
 )
 
@@ -22,17 +24,28 @@ type VaultGetter interface {
 	GetSecret(alias string) (string, error)
 }
 
+// ActiveKeyReader extends VaultGetter with active-key lookups used by
+// path-prefix routing (/anthropic/v1/..., /openai/v1/...).
+// Implemented by *vault.Reader when the vault supports managed and personal keys.
+type ActiveKeyReader interface {
+	VaultGetter
+	GetActiveKeyConfig() (*vault.ActiveKeyConfig, error)
+	GetActiveTeamKeyByProvider(providerCode string) (*vault.ManagedKey, error)
+	GetPersonalKeyByAlias(alias string) (plaintext, providerCode, baseURL string, err error)
+}
+
 // Proxy is the core reverse proxy that handles virtual key resolution
 // and request forwarding.
 type Proxy struct {
-	vault     VaultGetter
-	registry  *vkeys.Registry
-	providers *provider.Registry
-	collector *events.Collector
-	transport http.RoundTripper // nil → http.DefaultTransport (reads env vars)
-	proxyCtx  context.Context   // cancelled when the proxy shuts down
-	requests  atomic.Int64
-	errors    atomic.Int64
+	vault        VaultGetter
+	activeReader ActiveKeyReader // non-nil when vault implements ActiveKeyReader
+	registry     *vkeys.Registry
+	providers    *provider.Registry
+	collector    *events.Collector
+	transport    http.RoundTripper // nil → http.DefaultTransport (reads env vars)
+	proxyCtx     context.Context   // cancelled when the proxy shuts down
+	requests     atomic.Int64
+	errors       atomic.Int64
 
 	// Configurable slow-request thresholds (milliseconds).
 	SlowRequestMs     int64
@@ -50,8 +63,9 @@ func (p *Proxy) SetTransport(t http.RoundTripper) { p.transport = t }
 
 // New creates a new Proxy. ctx is the proxy lifecycle context; cancelling it
 // stops all detached upstream calls (called on proxy shutdown).
+// If v also implements ActiveKeyReader, path-prefix routing is enabled automatically.
 func New(v VaultGetter, reg *vkeys.Registry, prov *provider.Registry, coll *events.Collector, ctx context.Context) *Proxy {
-	return &Proxy{
+	p := &Proxy{
 		vault:             v,
 		registry:          reg,
 		providers:         prov,
@@ -61,6 +75,10 @@ func New(v VaultGetter, reg *vkeys.Registry, prov *provider.Registry, coll *even
 		VerySlowRequestMs: 10000,
 		UpstreamTimeout:   defaultUpstreamTimeout,
 	}
+	if ar, ok := v.(ActiveKeyReader); ok {
+		p.activeReader = ar
+	}
+	return p
 }
 
 // TotalRequests returns the total number of proxied requests.
@@ -81,6 +99,14 @@ func (p *Proxy) Handle(w http.ResponseWriter, r *http.Request) {
 		"span_id", tc.SpanID,
 		"request_id", tc.RequestID,
 	)
+
+	// 0. Path-prefix routing: /anthropic/v1/... or /openai/v1/...
+	// Takes precedence over token-based routing when the path starts with a
+	// known provider prefix. Uses the active key config from the vault.
+	if providerCode, strippedPath := extractProviderFromPath(r.URL.Path); providerCode != "" {
+		p.handlePathPrefixRoute(w, r, providerCode, strippedPath, startTime, logger)
+		return
+	}
 
 	// 1. Extract virtual key.
 	token := extractVirtualKey(r)
@@ -167,6 +193,130 @@ func (p *Proxy) Handle(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	p.serveRoute(w, r, route, prov, realKey, startTime, logger)
+}
+
+// handlePathPrefixRoute resolves the active key for providerCode and forwards
+// the request with the provider prefix stripped from the path.
+// Called when the request path starts with a known provider prefix
+// (e.g., /anthropic/v1/messages → strip /anthropic → forward to Anthropic API).
+func (p *Proxy) handlePathPrefixRoute(w http.ResponseWriter, r *http.Request, providerCode, strippedPath string, startTime time.Time, logger *slog.Logger) {
+	logger = logger.With("provider", providerCode, "routing", "path-prefix")
+
+	if p.activeReader == nil {
+		p.errors.Add(1)
+		writeJSONError(w, http.StatusServiceUnavailable, "server_error", "ACTIVE_KEY_NOT_SUPPORTED",
+			"Path-prefix routing is not available (vault does not support active key config).")
+		return
+	}
+
+	var realKey, baseURL, protocolType, virtualKeyID string
+
+	// Normalise brand aliases ("claude" → "anthropic") before vault lookup so
+	// the query matches the provider_code stored by the server.
+	canonicalCode := providerCanonicalCode(providerCode)
+
+	// Try active team key first.
+	mk, err := p.activeReader.GetActiveTeamKeyByProvider(canonicalCode)
+	if err != nil {
+		p.errors.Add(1)
+		logger.Error("vault: active team key lookup failed", "error", err)
+		writeJSONError(w, http.StatusServiceUnavailable, "server_error", "VAULT_ERROR", err.Error())
+		return
+	}
+
+	if mk != nil {
+		realKey = mk.PlaintextKey
+		protocolType = mk.ProtocolType
+		virtualKeyID = mk.VirtualKeyID
+		// Use provider-specific base URL if available; fall back to primary slot's base_url.
+		// ProviderBaseURLs is keyed by provider_code as stored in the vault
+		// (may be "Claude", "claude", or "anthropic") — try canonical first.
+		if url, ok := mk.ProviderBaseURLs[canonicalCode]; ok && url != "" {
+			baseURL = url
+		} else if url, ok := mk.ProviderBaseURLs[providerCode]; ok && url != "" {
+			baseURL = url
+		} else {
+			baseURL = mk.BaseURL
+		}
+	} else {
+		// Fall back to active personal key if its provider matches.
+		cfg, err := p.activeReader.GetActiveKeyConfig()
+		if err != nil {
+			p.errors.Add(1)
+			logger.Error("vault: active key config read failed", "error", err)
+			writeJSONError(w, http.StatusServiceUnavailable, "server_error", "VAULT_ERROR", err.Error())
+			return
+		}
+		if cfg != nil && cfg.KeyType == "personal" {
+			supported := len(cfg.Providers) == 0
+			for _, code := range cfg.Providers {
+				// Match by canonical code so "claude" matches "anthropic" and vice-versa.
+				if strings.EqualFold(providerCanonicalCode(code), canonicalCode) {
+					supported = true
+					break
+				}
+			}
+			if supported {
+				plaintext, pcode, entryBaseURL, err := p.activeReader.GetPersonalKeyByAlias(cfg.KeyRef)
+				if err != nil {
+					p.errors.Add(1)
+					logger.Error("vault: personal key read failed", "alias", cfg.KeyRef, "error", err)
+					writeJSONError(w, http.StatusServiceUnavailable, "server_error", "VAULT_ERROR", err.Error())
+					return
+				}
+				realKey = plaintext
+				virtualKeyID = "personal:" + cfg.KeyRef
+				protocolType = providerToProtocol(pcode)
+				// Use user-set base_url if available; fall back to provider default.
+				if entryBaseURL != "" {
+					baseURL = entryBaseURL
+				} else {
+					baseURL = providerDefaultBaseURL(pcode)
+				}
+			}
+		}
+	}
+
+	if realKey == "" {
+		p.errors.Add(1)
+		logger.Warn("no active key for provider")
+		writeJSONError(w, http.StatusServiceUnavailable, "server_error", "NO_ACTIVE_KEY",
+			"No active key for '"+providerCode+"'. Run 'aikey use <key>'.")
+		return
+	}
+
+	// Resolve provider adapter by protocol type, falling back to provider code.
+	prov, err := p.providers.Get(protocolType)
+	if err != nil {
+		prov, err = p.providers.Get(providerCode)
+		if err != nil {
+			p.errors.Add(1)
+			writeJSONError(w, http.StatusBadGateway, "server_error", "PROVIDER_ERROR",
+				"Unknown provider: "+providerCode)
+			return
+		}
+	}
+
+	// Strip provider prefix from path before forwarding.
+	r.URL.Path = strippedPath
+	if r.URL.RawPath != "" {
+		r.URL.RawPath = strippedPath
+	}
+
+	route := &vkeys.ResolvedRoute{
+		VirtualKeyID: virtualKeyID,
+		Provider:     providerCode,
+		BaseURL:      baseURL,
+		PlaintextKey: realKey,
+	}
+
+	p.serveRoute(w, r, route, prov, realKey, startTime, logger)
+}
+
+// serveRoute executes the forwarding pipeline (streaming detection, transport
+// selection, reverse proxy) shared by token-based and path-prefix routing.
+func (p *Proxy) serveRoute(w http.ResponseWriter, r *http.Request, route *vkeys.ResolvedRoute, prov provider.Provider, realKey string, startTime time.Time, logger *slog.Logger) {
 	// 6. Detect streaming.
 	streaming := isStreamingRequest(r)
 

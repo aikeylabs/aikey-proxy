@@ -52,6 +52,11 @@ else
     mkdir -p "$AIKEY_BIN" "$AIKEY_CONFIG"
     install -m755 "${BIN_DIR}/aikey-proxy"      "${AIKEY_BIN}/aikey-proxy"
     install -m644 "${BIN_DIR}/aikey-proxy.yaml" "${AIKEY_CONFIG}/aikey-proxy.yaml"
+    # macOS: remove provenance xattr and ad-hoc re-sign so Gatekeeper won't SIGKILL.
+    if [ "$(uname -s)" = "Darwin" ]; then
+        xattr -d com.apple.provenance "${AIKEY_BIN}/aikey-proxy" 2>/dev/null || true
+        codesign -fs - "${AIKEY_BIN}/aikey-proxy" 2>/dev/null || true
+    fi
     info "Installed (deploy project not found; shell registration skipped)"
 fi
 

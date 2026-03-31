@@ -2,11 +2,29 @@ package vault
 
 import (
 	"database/sql"
+	"encoding/json"
 	"fmt"
 	"log/slog"
+	"strings"
 
 	_ "modernc.org/sqlite"
 )
+
+// providerCodeAliases returns all lowercase aliases for a given provider code so
+// that vault lookups match regardless of how the server stored the code
+// (e.g. "Claude", "claude", or "anthropic" all refer to the same provider).
+func providerCodeAliases(code string) []string {
+	switch strings.ToLower(code) {
+	case "anthropic", "claude":
+		return []string{"anthropic", "claude"}
+	case "openai", "gpt", "chatgpt":
+		return []string{"openai", "gpt", "chatgpt"}
+	case "google", "gemini":
+		return []string{"google", "gemini"}
+	default:
+		return []string{strings.ToLower(code)}
+	}
+}
 
 // Reader provides read-only access to the Rust-compatible AiKey vault.
 type Reader struct {
@@ -129,6 +147,10 @@ type ManagedKey struct {
 	ProtocolType string
 	BaseURL      string
 	PlaintextKey string
+	// ProviderBaseURLs maps provider_code → admin-configured upstream base URL for each
+	// provider slot in the delivery payload. Use for path-prefix routing to get the
+	// correct per-provider URL instead of only the primary slot URL.
+	ProviderBaseURLs map[string]string
 }
 
 // GetActiveManagedKeys reads all rows from managed_virtual_keys_cache where
@@ -141,9 +163,10 @@ type ManagedKey struct {
 func (r *Reader) GetActiveManagedKeys() ([]ManagedKey, error) {
 	rows, err := r.db.Query(`
 		SELECT virtual_key_id, provider_code, protocol_type, base_url,
-		       provider_key_nonce, provider_key_ciphertext
+		       provider_key_nonce, provider_key_ciphertext, provider_base_urls
 		FROM managed_virtual_keys_cache
 		WHERE local_state = 'active'
+		  AND key_status  = 'active'
 		  AND provider_key_ciphertext IS NOT NULL
 	`)
 	if err != nil {
@@ -156,7 +179,8 @@ func (r *Reader) GetActiveManagedKeys() ([]ManagedKey, error) {
 	for rows.Next() {
 		var vkID, provCode, protType, baseURL string
 		var nonce, ciphertext []byte
-		if err := rows.Scan(&vkID, &provCode, &protType, &baseURL, &nonce, &ciphertext); err != nil {
+		var providerBaseURLsJSON *string
+		if err := rows.Scan(&vkID, &provCode, &protType, &baseURL, &nonce, &ciphertext, &providerBaseURLsJSON); err != nil {
 			slog.Warn("managed key: scan error, skipping", "error", err)
 			continue
 		}
@@ -165,18 +189,185 @@ func (r *Reader) GetActiveManagedKeys() ([]ManagedKey, error) {
 			slog.Warn("managed key: decryption failed, skipping", "vk_id", vkID, "error", err)
 			continue
 		}
+		providerBaseURLs := make(map[string]string)
+		if providerBaseURLsJSON != nil && *providerBaseURLsJSON != "" {
+			_ = json.Unmarshal([]byte(*providerBaseURLsJSON), &providerBaseURLs)
+		}
 		keys = append(keys, ManagedKey{
-			VirtualKeyID: vkID,
-			ProviderCode: provCode,
-			ProtocolType: protType,
-			BaseURL:      baseURL,
-			PlaintextKey: string(plaintext),
+			VirtualKeyID:     vkID,
+			ProviderCode:     provCode,
+			ProtocolType:     protType,
+			BaseURL:          baseURL,
+			PlaintextKey:     string(plaintext),
+			ProviderBaseURLs: providerBaseURLs,
 		})
 	}
 	if err := rows.Err(); err != nil {
 		return nil, fmt.Errorf("managed keys scan: %w", err)
 	}
 	return keys, nil
+}
+
+// GetPersonalKeyByAlias returns the plaintext key, provider_code, and custom base_url
+// for a personal key stored in the `entries` table.  Uses the derivedKey already held
+// in memory from vault.Open — no additional authentication is needed.
+//
+// baseURL is empty when the user did not set a custom URL (proxy uses provider default).
+// Returns an error if the entry is not found or decryption fails.
+func (r *Reader) GetPersonalKeyByAlias(alias string) (plaintext, providerCode, baseURL string, err error) {
+	var nonce, ciphertext []byte
+	var code, url *string
+	// base_url column was added in v0.7 — use a fallback query for older vaults.
+	err = r.db.QueryRow(
+		"SELECT nonce, ciphertext, provider_code, base_url FROM entries WHERE alias = ?", alias,
+	).Scan(&nonce, &ciphertext, &code, &url)
+	if err == sql.ErrNoRows {
+		return "", "", "", fmt.Errorf("personal key %q not found in vault", alias)
+	}
+	if err != nil {
+		// Retry without base_url for vaults that predate the column migration.
+		var code2 *string
+		err2 := r.db.QueryRow(
+			"SELECT nonce, ciphertext, provider_code FROM entries WHERE alias = ?", alias,
+		).Scan(&nonce, &ciphertext, &code2)
+		if err2 != nil {
+			return "", "", "", fmt.Errorf("query personal key %q: %w", alias, err2)
+		}
+		code = code2
+	}
+
+	plain, decErr := Decrypt(r.derivedKey, nonce, ciphertext)
+	if decErr != nil {
+		return "", "", "", fmt.Errorf("decrypt personal key %q: %w", alias, decErr)
+	}
+
+	if code != nil {
+		providerCode = *code
+	}
+	if url != nil {
+		baseURL = *url
+	}
+	return string(plain), providerCode, baseURL, nil
+}
+
+// ActiveKeyConfig represents the globally-active key selection written by `aikey use`.
+// It mirrors the three config table rows: active_key_type, active_key_ref, active_key_providers.
+type ActiveKeyConfig struct {
+	// KeyType is "team", "personal", or "" (nothing active).
+	KeyType string
+	// KeyRef is the virtual_key_id (team) or alias (personal) of the active key.
+	KeyRef string
+	// Providers is the list of provider codes the active key supports (e.g. ["anthropic"]).
+	Providers []string
+}
+
+// GetActiveKeyConfig reads the active key configuration from the config table.
+// Returns nil if no key is currently active (active_key_type is missing or empty).
+func (r *Reader) GetActiveKeyConfig() (*ActiveKeyConfig, error) {
+	readText := func(key string) (string, error) {
+		row := r.db.QueryRow("SELECT CAST(value AS TEXT) FROM config WHERE key = ?", key)
+		var val string
+		if err := row.Scan(&val); err == sql.ErrNoRows {
+			return "", nil
+		} else if err != nil {
+			return "", fmt.Errorf("read config %q: %w", key, err)
+		}
+		return val, nil
+	}
+
+	keyType, err := readText("active_key_type")
+	if err != nil {
+		return nil, err
+	}
+	if keyType == "" {
+		return nil, nil // no active key
+	}
+
+	keyRef, err := readText("active_key_ref")
+	if err != nil {
+		return nil, err
+	}
+
+	providersJSON, err := readText("active_key_providers")
+	if err != nil {
+		return nil, err
+	}
+
+	var providers []string
+	if providersJSON != "" {
+		if err := json.Unmarshal([]byte(providersJSON), &providers); err != nil {
+			slog.Warn("vault: failed to decode active_key_providers", "error", err)
+			providers = nil
+		}
+	}
+
+	return &ActiveKeyConfig{
+		KeyType:   keyType,
+		KeyRef:    keyRef,
+		Providers: providers,
+	}, nil
+}
+
+// GetActiveTeamKeyByProvider returns the decrypted team key for the given provider code.
+//
+// Matches on managed_virtual_keys_cache rows where local_state = 'active'
+// AND provider_code = providerCode (case-insensitive prefix match on the first active entry).
+// Returns nil if no active team key exists for that provider.
+func (r *Reader) GetActiveTeamKeyByProvider(providerCode string) (*ManagedKey, error) {
+	// Expand the provider code to all known aliases so that e.g. "anthropic"
+	// also matches rows stored as "Claude" or "claude" by the server.
+	aliases := providerCodeAliases(providerCode)
+	placeholders := make([]string, len(aliases))
+	args := make([]any, len(aliases))
+	for i, a := range aliases {
+		placeholders[i] = "?"
+		args[i] = a
+	}
+	query := fmt.Sprintf(`
+		SELECT virtual_key_id, provider_code, protocol_type, base_url,
+		       provider_key_nonce, provider_key_ciphertext, provider_base_urls
+		FROM managed_virtual_keys_cache
+		WHERE local_state = 'active'
+		  AND key_status  = 'active'
+		  AND provider_key_ciphertext IS NOT NULL
+		  AND LOWER(provider_code) IN (%s)
+		LIMIT 1
+	`, strings.Join(placeholders, ","))
+	rows, err := r.db.Query(query, args...)
+	if err != nil {
+		return nil, nil //nolint:nilerr // table may not exist on older vaults
+	}
+	defer rows.Close()
+
+	if !rows.Next() {
+		return nil, rows.Err()
+	}
+
+	var vkID, provCode, protType, baseURL string
+	var nonce, ciphertext []byte
+	var providerBaseURLsJSON *string
+	if err := rows.Scan(&vkID, &provCode, &protType, &baseURL, &nonce, &ciphertext, &providerBaseURLsJSON); err != nil {
+		return nil, fmt.Errorf("scan managed key: %w", err)
+	}
+
+	plaintext, err := Decrypt(r.derivedKey, nonce, ciphertext)
+	if err != nil {
+		return nil, fmt.Errorf("decrypt managed key %s: %w", vkID, err)
+	}
+
+	providerBaseURLs := make(map[string]string)
+	if providerBaseURLsJSON != nil && *providerBaseURLsJSON != "" {
+		_ = json.Unmarshal([]byte(*providerBaseURLsJSON), &providerBaseURLs)
+	}
+
+	return &ManagedKey{
+		VirtualKeyID:     vkID,
+		ProviderCode:     provCode,
+		ProtocolType:     protType,
+		BaseURL:          baseURL,
+		PlaintextKey:     string(plaintext),
+		ProviderBaseURLs: providerBaseURLs,
+	}, nil
 }
 
 // Close releases resources and clears cached secrets.

@@ -62,6 +62,67 @@ func extractVirtualKey(req *http.Request) string {
 	return ""
 }
 
+// extractProviderFromPath checks if path starts with a known provider prefix
+// (e.g., "/anthropic/v1/messages") and returns the provider code and the
+// stripped path (e.g., "anthropic", "/v1/messages"). Returns ("", "") if no
+// prefix matched.
+func extractProviderFromPath(path string) (providerCode, strippedPath string) {
+	// List covers both canonical codes and common brand-name aliases that may
+	// appear in base URLs written by older CLI versions or non-normalised keys.
+	known := []string{"anthropic", "claude", "openai", "google", "kimi", "deepseek", "moonshot"}
+	for _, code := range known {
+		prefix := "/" + code
+		if strings.HasPrefix(path, prefix+"/") || path == prefix {
+			return code, strings.TrimPrefix(path, prefix)
+		}
+	}
+	return "", ""
+}
+
+// providerToProtocol maps a provider code (or brand alias) to its proxy protocol name.
+func providerToProtocol(providerCode string) string {
+	switch strings.ToLower(providerCode) {
+	case "anthropic", "claude":
+		return "anthropic"
+	default:
+		return "openai_compatible"
+	}
+}
+
+// providerDefaultBaseURL returns the default upstream base URL for a provider.
+// Accepts both canonical codes ("anthropic") and brand aliases ("claude").
+func providerDefaultBaseURL(providerCode string) string {
+	switch strings.ToLower(providerCode) {
+	case "anthropic", "claude":
+		return "https://api.anthropic.com"
+	case "openai", "gpt", "chatgpt":
+		return "https://api.openai.com"
+	case "google", "gemini":
+		return "https://generativelanguage.googleapis.com"
+	case "kimi", "moonshot":
+		return "https://api.moonshot.cn"
+	case "deepseek":
+		return "https://api.deepseek.com"
+	default:
+		return ""
+	}
+}
+
+// providerCanonicalCode maps a brand alias back to the canonical provider code
+// used in vault queries (e.g. "claude" → "anthropic").
+func providerCanonicalCode(providerCode string) string {
+	switch strings.ToLower(providerCode) {
+	case "claude":
+		return "anthropic"
+	case "gpt", "chatgpt":
+		return "openai"
+	case "gemini":
+		return "google"
+	default:
+		return strings.ToLower(providerCode)
+	}
+}
+
 // writeJSONError writes a JSON error response in OpenAI-compatible format.
 func writeJSONError(w http.ResponseWriter, statusCode int, errType, code, message string) {
 	w.Header().Set("Content-Type", "application/json")

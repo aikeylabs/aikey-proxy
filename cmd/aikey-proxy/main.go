@@ -128,6 +128,7 @@ func main() {
 	adminHandler.TotalRequestsFn = sup.TotalRequests
 	adminHandler.TotalErrorsFn = sup.TotalErrors
 	adminHandler.ReloadFn = sup.Reload
+	adminHandler.KeyChecksFn = sup.GetKeyCheckTargets
 
 	// Build the outbound transport for upstream providers (optional).
 	dataHandler := sup.Handler()

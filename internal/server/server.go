@@ -27,12 +27,20 @@ type Server struct {
 func New(ln net.Listener, dataHandler http.Handler, adminHandler *admin.Handler) *Server {
 	mux := http.NewServeMux()
 
-	// Data plane: proxy endpoints.
-	mux.Handle("POST /v1/chat/completions", dataHandler)
-	mux.Handle("POST /v1/messages", dataHandler)
+	// Data plane: catch-all — forwards every request not claimed by the admin routes
+	// above to the proxy handler. Proxy.Handle internally decides between:
+	//   - path-prefix routing  (/anthropic/v1/..., /openai/v1/..., etc.)
+	//   - token-based routing  (/v1/messages, /v1/chat/completions, etc.)
+	// Using a wildcard here means no server.go change is needed when new provider
+	// prefixes are added. Go 1.22+ ServeMux gives more-specific patterns priority,
+	// so the admin routes above always win.
+	mux.Handle("/{path...}", dataHandler)
 
 	// Control plane: admin endpoints.
 	mux.HandleFunc("GET /health", adminHandler.Health)
+	mux.HandleFunc("GET /health/provider-targets", adminHandler.HealthProviderTargets)
+	mux.HandleFunc("GET /health/providers", adminHandler.HealthProviders)
+	mux.HandleFunc("GET /health/keys", adminHandler.HealthKeys)
 	mux.HandleFunc("GET /status", adminHandler.Status)
 	mux.HandleFunc("GET /metrics", adminHandler.Metrics)
 	mux.HandleFunc("POST /admin/reload", adminHandler.Reload)

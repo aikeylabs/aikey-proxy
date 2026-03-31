@@ -26,10 +26,12 @@ import (
 	"log/slog"
 	"net"
 	"net/http"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
 
+	"github.com/AiKeyLabs/aikey-proxy/internal/admin"
 	"github.com/AiKeyLabs/aikey-proxy/internal/config"
 	"github.com/AiKeyLabs/aikey-proxy/internal/events"
 	"github.com/AiKeyLabs/aikey-proxy/internal/observability"
@@ -312,6 +314,106 @@ func (s *Supervisor) HealthSnapshot() observability.HealthSnapshot {
 		}
 	}
 	return snap
+}
+
+// GetKeyCheckTargets resolves the active key's decrypted credentials for each
+// provider it supports. Used by GET /health/keys to probe key validity.
+// Returns nil (no error) when no key is active.
+func (s *Supervisor) GetKeyCheckTargets() ([]admin.KeyCheckTarget, error) {
+	gen := s.active.Load()
+	if gen == nil {
+		return nil, nil
+	}
+	cfg, err := gen.vault.GetActiveKeyConfig()
+	if err != nil || cfg == nil {
+		return nil, nil
+	}
+
+	var targets []admin.KeyCheckTarget
+	switch cfg.KeyType {
+	case "team":
+		for _, providerCode := range cfg.Providers {
+			mk, err := gen.vault.GetActiveTeamKeyByProvider(providerCode)
+			if err != nil || mk == nil {
+				continue
+			}
+			baseURL := mk.BaseURL
+			if baseURL == "" {
+				if u, ok := mk.ProviderBaseURLs[providerCode]; ok && u != "" {
+					baseURL = u
+				}
+			}
+			targets = append(targets, admin.KeyCheckTarget{
+				Provider: providerCode,
+				Protocol: mk.ProtocolType,
+				BaseURL:  baseURL,
+				APIKey:   mk.PlaintextKey,
+				KeyRef:   cfg.KeyRef,
+			})
+		}
+	case "personal":
+		plaintext, storedCode, baseURL, err := gen.vault.GetPersonalKeyByAlias(cfg.KeyRef)
+		if err != nil {
+			return nil, fmt.Errorf("resolve personal key: %w", err)
+		}
+		// Build the provider list: prefer cfg.Providers (written by `aikey use`); fall back to
+		// the stored provider_code; final fallback is "openai" for generic gateways.
+		providerList := cfg.Providers
+		if len(providerList) == 0 {
+			if storedCode != "" {
+				providerList = []string{storedCode}
+			} else {
+				providerList = []string{"openai"}
+			}
+		}
+		for _, pcode := range providerList {
+			// Each provider may have its own default base URL; use the stored URL if set
+			// (custom gateways share one URL across all protocols).
+			burl := baseURL
+			if burl == "" {
+				burl = personalProviderBaseURL(pcode)
+			}
+			targets = append(targets, admin.KeyCheckTarget{
+				Provider: pcode,
+				Protocol: providerProtocol(pcode),
+				BaseURL:  burl,
+				APIKey:   plaintext,
+				KeyRef:   cfg.KeyRef,
+			})
+		}
+	}
+	return targets, nil
+}
+
+// personalProviderBaseURL returns the default upstream base URL for a known provider code.
+// Used when a personal key entry has no custom base_url stored.
+func personalProviderBaseURL(code string) string {
+	switch strings.ToLower(code) {
+	case "anthropic", "claude":
+		return "https://api.anthropic.com"
+	case "openai":
+		return "https://api.openai.com"
+	case "google", "gemini":
+		return "https://generativelanguage.googleapis.com"
+	case "kimi", "moonshot":
+		return "https://api.moonshot.cn"
+	case "deepseek":
+		return "https://api.deepseek.com"
+	default:
+		return ""
+	}
+}
+
+// providerProtocol maps a provider code to its auth/wire protocol name.
+func providerProtocol(code string) string {
+	switch strings.ToLower(code) {
+	case "anthropic", "claude":
+		return "anthropic"
+	case "google", "gemini":
+		return "google"
+	default:
+		return "openai"
+	}
 }
 
 // Reload builds a new generation, swaps it as active if the readiness gate

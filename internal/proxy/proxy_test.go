@@ -14,6 +14,7 @@ import (
 	"github.com/AiKeyLabs/aikey-proxy/internal/config"
 	"github.com/AiKeyLabs/aikey-proxy/internal/events"
 	"github.com/AiKeyLabs/aikey-proxy/internal/provider"
+	"github.com/AiKeyLabs/aikey-proxy/internal/vault"
 	"github.com/AiKeyLabs/aikey-proxy/internal/vkeys"
 )
 
@@ -418,5 +419,208 @@ func TestProxy_ErrorResponse_NoTokens(t *testing.T) {
 	}
 	if ev.ErrorType == "" {
 		t.Error("ErrorType should be set for error responses")
+	}
+}
+
+// ── extractProviderFromPath unit tests ───────────────────────────────────────
+
+func TestExtractProviderFromPath(t *testing.T) {
+	tests := []struct {
+		path             string
+		wantProvider     string
+		wantStrippedPath string
+	}{
+		{"/anthropic/v1/messages", "anthropic", "/v1/messages"},
+		{"/openai/v1/chat/completions", "openai", "/v1/chat/completions"},
+		{"/deepseek/v1/chat/completions", "deepseek", "/v1/chat/completions"},
+		{"/kimi/v1/chat/completions", "kimi", "/v1/chat/completions"},
+		{"/moonshot/v1/chat/completions", "moonshot", "/v1/chat/completions"},
+		{"/google/v1/models", "google", "/v1/models"},
+		{"/anthropic", "anthropic", ""},
+		{"/v1/messages", "", ""},
+		{"/anthropicX/v1", "", ""},
+		{"/", "", ""},
+		{"", "", ""},
+	}
+	for _, tt := range tests {
+		t.Run(tt.path, func(t *testing.T) {
+			gotProvider, gotStripped := extractProviderFromPath(tt.path)
+			if gotProvider != tt.wantProvider {
+				t.Errorf("provider = %q, want %q", gotProvider, tt.wantProvider)
+			}
+			if gotStripped != tt.wantStrippedPath {
+				t.Errorf("stripped = %q, want %q", gotStripped, tt.wantStrippedPath)
+			}
+		})
+	}
+}
+
+// ── Path-prefix routing integration tests ────────────────────────────────────
+
+// mockActiveVault implements both VaultGetter and ActiveKeyReader for testing.
+type mockActiveVault struct {
+	secrets         map[string]string
+	activeKeyConfig *vault.ActiveKeyConfig
+	activeTeamKeys  map[string]*vault.ManagedKey // keyed by lowercase provider code
+	personalAlias   string
+	personalText    string
+	personalProv    string
+}
+
+func (m *mockActiveVault) GetSecret(alias string) (string, error) {
+	s, ok := m.secrets[alias]
+	if !ok {
+		return "", fmt.Errorf("not found: %s", alias)
+	}
+	return s, nil
+}
+
+func (m *mockActiveVault) GetActiveKeyConfig() (*vault.ActiveKeyConfig, error) {
+	return m.activeKeyConfig, nil
+}
+
+func (m *mockActiveVault) GetActiveTeamKeyByProvider(providerCode string) (*vault.ManagedKey, error) {
+	if m.activeTeamKeys == nil {
+		return nil, nil
+	}
+	mk, ok := m.activeTeamKeys[strings.ToLower(providerCode)]
+	if !ok {
+		return nil, nil
+	}
+	return mk, nil
+}
+
+func (m *mockActiveVault) GetPersonalKeyByAlias(alias string) (string, string, error) {
+	if alias == m.personalAlias {
+		return m.personalText, m.personalProv, nil
+	}
+	return "", "", fmt.Errorf("personal key %q not found", alias)
+}
+
+func setupTestProxyWithActive(t *testing.T, av *mockActiveVault) *Proxy {
+	t.Helper()
+	prov := provider.NewRegistry()
+	coll := events.NewCollector(&mockEventStore{}, 1, 5*time.Millisecond)
+	t.Cleanup(func() { coll.Close() })
+	reg := vkeys.NewRegistry()
+	return New(av, reg, prov, coll, context.Background())
+}
+
+func TestHandlePathPrefix_NoActiveReader(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer upstream.Close()
+
+	// Plain mockVault does not implement ActiveKeyReader → path-prefix routing disabled.
+	p := setupTestProxy(t, upstream.URL)
+
+	req := httptest.NewRequest(http.MethodPost, "/anthropic/v1/messages", strings.NewReader(`{}`))
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+	p.Handle(w, req)
+
+	if w.Code != http.StatusServiceUnavailable {
+		t.Errorf("expected 503, got %d", w.Code)
+	}
+	if !strings.Contains(w.Body.String(), "ACTIVE_KEY_NOT_SUPPORTED") {
+		t.Errorf("expected ACTIVE_KEY_NOT_SUPPORTED, got: %s", w.Body.String())
+	}
+}
+
+func TestHandlePathPrefix_TeamKey(t *testing.T) {
+	var capturedPath string
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		capturedPath = r.URL.Path
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		w.Write([]byte(`{"id":"msg","type":"message","content":[],"model":"claude-3","stop_reason":"end_turn","usage":{"input_tokens":1,"output_tokens":1}}`))
+	}))
+	defer upstream.Close()
+
+	av := &mockActiveVault{
+		activeTeamKeys: map[string]*vault.ManagedKey{
+			"anthropic": {
+				VirtualKeyID:     "aikey_vk_test",
+				ProviderCode:     "anthropic",
+				ProtocolType:     "anthropic",
+				BaseURL:          upstream.URL,
+				PlaintextKey:     "sk-ant-test",
+				ProviderBaseURLs: map[string]string{"anthropic": upstream.URL},
+			},
+		},
+	}
+	p := setupTestProxyWithActive(t, av)
+
+	body := `{"model":"claude-3","messages":[{"role":"user","content":"hi"}],"max_tokens":10}`
+	req := httptest.NewRequest(http.MethodPost, "/anthropic/v1/messages", strings.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+	p.Handle(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Errorf("expected 200, got %d — body: %s", w.Code, w.Body.String())
+	}
+	if capturedPath != "/v1/messages" {
+		t.Errorf("upstream path = %q, want /v1/messages", capturedPath)
+	}
+}
+
+func TestHandlePathPrefix_NoActiveKey(t *testing.T) {
+	av := &mockActiveVault{
+		activeTeamKeys:  map[string]*vault.ManagedKey{},
+		activeKeyConfig: nil,
+	}
+	p := setupTestProxyWithActive(t, av)
+
+	req := httptest.NewRequest(http.MethodPost, "/anthropic/v1/messages", strings.NewReader(`{}`))
+	w := httptest.NewRecorder()
+	p.Handle(w, req)
+
+	if w.Code != http.StatusServiceUnavailable {
+		t.Errorf("expected 503, got %d", w.Code)
+	}
+	if !strings.Contains(w.Body.String(), "NO_ACTIVE_KEY") {
+		t.Errorf("expected NO_ACTIVE_KEY, got: %s", w.Body.String())
+	}
+}
+
+func TestHandlePathPrefix_ProviderBaseURLUsed(t *testing.T) {
+	// Verifies that ProviderBaseURLs takes precedence over BaseURL for the specific provider.
+	var capturedPath string
+	upstreamAnthropicCustom := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		capturedPath = r.URL.Path
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		w.Write([]byte(`{"id":"m","type":"message","content":[],"model":"c","stop_reason":"end_turn","usage":{"input_tokens":1,"output_tokens":1}}`))
+	}))
+	defer upstreamAnthropicCustom.Close()
+
+	// BaseURL points to a different server; ProviderBaseURLs["anthropic"] points to our test server.
+	av := &mockActiveVault{
+		activeTeamKeys: map[string]*vault.ManagedKey{
+			"anthropic": {
+				VirtualKeyID:     "aikey_vk_multi",
+				ProviderCode:     "anthropic",
+				ProtocolType:     "anthropic",
+				BaseURL:          "http://wrong-server.invalid",
+				PlaintextKey:     "sk-ant-real",
+				ProviderBaseURLs: map[string]string{"anthropic": upstreamAnthropicCustom.URL},
+			},
+		},
+	}
+	p := setupTestProxyWithActive(t, av)
+
+	body := `{"model":"claude-3","messages":[{"role":"user","content":"hi"}],"max_tokens":5}`
+	req := httptest.NewRequest(http.MethodPost, "/anthropic/v1/messages", strings.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+	p.Handle(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Errorf("expected 200, got %d — body: %s", w.Code, w.Body.String())
+	}
+	if capturedPath != "/v1/messages" {
+		t.Errorf("upstream path = %q, want /v1/messages", capturedPath)
 	}
 }
