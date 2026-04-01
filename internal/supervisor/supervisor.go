@@ -148,6 +148,7 @@ func (g *generation) drain(timeout time.Duration, reloadID string) {
 type Supervisor struct {
 	cfg      *config.Config
 	password string
+	version  string // build version, passed to proxy for audit metadata
 
 	active    atomic.Pointer[generation]
 	reloadMu  sync.Mutex // serialise concurrent reload requests
@@ -162,11 +163,12 @@ type Supervisor struct {
 
 // New creates a Supervisor, starts the initial generation, and launches the
 // background managed-key sync goroutine.
-func New(cfg *config.Config, password string) (*Supervisor, error) {
+func New(cfg *config.Config, password, version string) (*Supervisor, error) {
 	ctx, cancel := context.WithCancel(context.Background())
 	s := &Supervisor{
 		cfg:       cfg,
 		password:  password,
+		version:   version,
 		startedAt: time.Now(),
 		ctx:       ctx,
 		cancel:    cancel,
@@ -236,10 +238,18 @@ func (s *Supervisor) syncManagedKeys() {
 	for _, mk := range managedKeys {
 		token := "aikey_vk_" + mk.VirtualKeyID
 		managedRoutes[token] = &vkeys.ResolvedRoute{
-			VirtualKeyID: mk.VirtualKeyID,
-			Provider:     mk.ProtocolType, // protocol type resolves to provider adapter (e.g. "openai_compatible" → openai)
-			BaseURL:      mk.BaseURL,
-			PlaintextKey: mk.PlaintextKey,
+			VirtualKeyID:       mk.VirtualKeyID,
+			Provider:           mk.ProtocolType, // protocol type resolves to provider adapter (e.g. "openai_compatible" → openai)
+			BaseURL:            mk.BaseURL,
+			PlaintextKey:       mk.PlaintextKey,
+			OrgID:              mk.OrgID,
+			AccountID:          mk.OwnerAccountID,
+			SeatID:             mk.SeatID,
+			ProviderCode:       mk.ProviderCode,
+			ProtocolType:       mk.ProtocolType,
+			CredentialID:       mk.CredentialID,
+			CredentialRevision: mk.CredentialRevision,
+			VirtualKeyRevision: mk.VirtualKeyRevision,
 		}
 	}
 
@@ -524,10 +534,18 @@ func (s *Supervisor) buildGeneration() (*generation, error) {
 		for _, mk := range managedKeys {
 			token := "aikey_vk_" + mk.VirtualKeyID
 			managedRoutes[token] = &vkeys.ResolvedRoute{
-				VirtualKeyID: mk.VirtualKeyID,
-				Provider:     mk.ProtocolType, // protocol type resolves to provider adapter (e.g. "openai_compatible" → openai)
-				BaseURL:      mk.BaseURL,
-				PlaintextKey: mk.PlaintextKey,
+				VirtualKeyID:       mk.VirtualKeyID,
+				Provider:           mk.ProtocolType, // protocol type resolves to provider adapter (e.g. "openai_compatible" → openai)
+				BaseURL:            mk.BaseURL,
+				PlaintextKey:       mk.PlaintextKey,
+				OrgID:              mk.OrgID,
+				AccountID:          mk.OwnerAccountID,
+				SeatID:             mk.SeatID,
+				ProviderCode:       mk.ProviderCode,
+				ProtocolType:       mk.ProtocolType,
+				CredentialID:       mk.CredentialID,
+				CredentialRevision: mk.CredentialRevision,
+				VirtualKeyRevision: mk.VirtualKeyRevision,
 			}
 		}
 		registry.Merge(managedRoutes)
@@ -549,6 +567,25 @@ func (s *Supervisor) buildGeneration() (*generation, error) {
 	p := proxy.New(vaultReader, registry, providers, collector, s.ctx)
 	p.SlowRequestMs = int64(s.cfg.Log.SlowRequestMs)
 	p.VerySlowRequestMs = int64(s.cfg.Log.VerySlowRequestMs)
+
+	// Attach usage reporter if collector_url is configured.
+	if s.cfg.Events.CollectorURL != "" {
+		reporter, err := events.NewReporter(events.ReporterConfig{
+			CollectorURL:    s.cfg.Events.CollectorURL,
+			CollectorToken:  s.cfg.Events.CollectorToken,
+			QueueCapacity:   s.cfg.Events.QueueCapacity,
+			BatchSize:       s.cfg.Events.UploadBatchSize,
+			UploadInterval:  s.cfg.Events.UploadInterval,
+			WALDir:          s.cfg.Events.WALDir,
+			ProxyInstanceID: fmt.Sprintf("proxy-%d", id),
+		})
+		if err != nil {
+			slog.Warn("reporter init failed, usage reporting disabled", "error", err)
+		} else {
+			p.SetReporter(reporter, fmt.Sprintf("proxy-%d", id), s.version)
+			slog.Info("usage reporter enabled", "collector_url", s.cfg.Events.CollectorURL)
+		}
+	}
 
 	return &generation{
 		id:         id,

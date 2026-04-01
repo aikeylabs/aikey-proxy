@@ -54,6 +54,14 @@ type EventsConfig struct {
 	DBPath        string        `yaml:"db_path"`
 	BatchSize     int           `yaml:"batch_size"`
 	FlushInterval time.Duration `yaml:"flush_interval"`
+
+	// Usage reporting to collector-service
+	CollectorURL   string        `yaml:"collector_url"`    // e.g. "http://localhost:27300"
+	CollectorToken string        `yaml:"collector_token"`  // Bearer token for auth
+	QueueCapacity  int           `yaml:"queue_capacity"`   // bounded queue size (default 10000)
+	UploadBatchSize int          `yaml:"upload_batch_size"` // events per upload (default 100)
+	UploadInterval time.Duration `yaml:"upload_interval"`  // max time between uploads (default 5s)
+	WALDir         string        `yaml:"wal_dir"`          // JSONL WAL directory
 }
 
 type LogConfig struct {

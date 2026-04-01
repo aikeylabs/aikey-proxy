@@ -41,7 +41,7 @@ Runs on the developer's local machine, receives requests with **virtual keys**, 
 │       │           │ collector    │──→ SQLite │
 │       │           └──────────────┘   WAL    │
 └───────┼──────────────────────────────────────┘
-        │  Reads ~/.aikey/vault.db (read-only)
+        │  Reads ~/.aikey/data/vault.db (read-only)
         ▼
 ┌──────────────────┐        ┌──────────────────┐
 │  AiKey Vault     │        │  AI Provider     │
@@ -103,7 +103,7 @@ Client                    aikey-proxy                Vault          Provider
 | Memory | ~20 MB RSS (idle), scales with concurrent requests |
 | Network | Localhost only (127.0.0.1:27200 by default) |
 | Dependencies | None at runtime (single static binary) |
-| Prerequisite | AiKey vault (`~/.aikey/vault.db`) created by `aikey-cli` |
+| Prerequisite | AiKey vault (`~/.aikey/data/vault.db`) created by `aikey-cli` |
 
 ## Quick Start
 

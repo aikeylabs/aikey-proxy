@@ -41,7 +41,7 @@ AiKey 本地代理 — 阶段 2 MVP 的核心执行点。
 │       │           │ collector    │──→ SQLite │
 │       │           └──────────────┘   WAL    │
 └───────┼──────────────────────────────────────┘
-        │  读取 ~/.aikey/vault.db (只读)
+        │  读取 ~/.aikey/data/vault.db (只读)
         ▼
 ┌──────────────────┐        ┌──────────────────┐
 │  AiKey Vault     │        │  AI Provider     │
@@ -103,7 +103,7 @@ Client                    aikey-proxy                Vault          Provider
 | 内存 | ~20 MB RSS（空闲），随并发请求数线性增长 |
 | 网络 | 仅本地监听（默认 127.0.0.1:27200） |
 | 运行时依赖 | 无（单一静态二进制） |
-| 前置条件 | 由 `aikey-cli` 创建的 AiKey vault（`~/.aikey/vault.db`） |
+| 前置条件 | 由 `aikey-cli` 创建的 AiKey vault（`~/.aikey/data/vault.db`） |
 
 ## 快速开始
 

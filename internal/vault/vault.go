@@ -151,6 +151,14 @@ type ManagedKey struct {
 	// provider slot in the delivery payload. Use for path-prefix routing to get the
 	// correct per-provider URL instead of only the primary slot URL.
 	ProviderBaseURLs map[string]string
+
+	// Anchor fields for usage reporting (D3 naming).
+	OrgID              string
+	SeatID             string
+	CredentialID       string
+	CredentialRevision string
+	VirtualKeyRevision string
+	OwnerAccountID     string
 }
 
 // GetActiveManagedKeys reads all rows from managed_virtual_keys_cache where
@@ -163,7 +171,9 @@ type ManagedKey struct {
 func (r *Reader) GetActiveManagedKeys() ([]ManagedKey, error) {
 	rows, err := r.db.Query(`
 		SELECT virtual_key_id, provider_code, protocol_type, base_url,
-		       provider_key_nonce, provider_key_ciphertext, provider_base_urls
+		       provider_key_nonce, provider_key_ciphertext, provider_base_urls,
+		       org_id, seat_id, credential_id, credential_revision,
+		       virtual_key_revision, owner_account_id
 		FROM managed_virtual_keys_cache
 		WHERE local_state = 'active'
 		  AND key_status  = 'active'
@@ -180,7 +190,10 @@ func (r *Reader) GetActiveManagedKeys() ([]ManagedKey, error) {
 		var vkID, provCode, protType, baseURL string
 		var nonce, ciphertext []byte
 		var providerBaseURLsJSON *string
-		if err := rows.Scan(&vkID, &provCode, &protType, &baseURL, &nonce, &ciphertext, &providerBaseURLsJSON); err != nil {
+		var orgID, seatID, credID, credRev, vkRev string
+		var ownerAccountID *string
+		if err := rows.Scan(&vkID, &provCode, &protType, &baseURL, &nonce, &ciphertext, &providerBaseURLsJSON,
+			&orgID, &seatID, &credID, &credRev, &vkRev, &ownerAccountID); err != nil {
 			slog.Warn("managed key: scan error, skipping", "error", err)
 			continue
 		}
@@ -193,13 +206,23 @@ func (r *Reader) GetActiveManagedKeys() ([]ManagedKey, error) {
 		if providerBaseURLsJSON != nil && *providerBaseURLsJSON != "" {
 			_ = json.Unmarshal([]byte(*providerBaseURLsJSON), &providerBaseURLs)
 		}
+		var accountID string
+		if ownerAccountID != nil {
+			accountID = *ownerAccountID
+		}
 		keys = append(keys, ManagedKey{
-			VirtualKeyID:     vkID,
-			ProviderCode:     provCode,
-			ProtocolType:     protType,
-			BaseURL:          baseURL,
-			PlaintextKey:     string(plaintext),
-			ProviderBaseURLs: providerBaseURLs,
+			VirtualKeyID:       vkID,
+			ProviderCode:       provCode,
+			ProtocolType:       protType,
+			BaseURL:            baseURL,
+			PlaintextKey:       string(plaintext),
+			ProviderBaseURLs:   providerBaseURLs,
+			OrgID:              orgID,
+			SeatID:             seatID,
+			CredentialID:       credID,
+			CredentialRevision: credRev,
+			VirtualKeyRevision: vkRev,
+			OwnerAccountID:     accountID,
 		})
 	}
 	if err := rows.Err(); err != nil {

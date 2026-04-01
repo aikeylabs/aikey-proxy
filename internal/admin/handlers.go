@@ -35,6 +35,9 @@ type Handler struct {
 	// KeyChecksFn resolves the active key's decrypted credentials for each provider.
 	// Injected by the Supervisor. Used by GET /health/keys.
 	KeyChecksFn func() ([]KeyCheckTarget, error)
+
+	// ReporterMetricsFn returns usage reporter counters (nil = reporter disabled).
+	ReporterMetricsFn func() *events.ReporterMetrics
 }
 
 // KeyCheckTarget holds decrypted credentials for one provider, used by GET /health/keys.
@@ -128,10 +131,11 @@ func (h *Handler) Status(w http.ResponseWriter, r *http.Request) {
 }
 
 type metricsResponse struct {
-	TotalRequests      int64            `json:"total_requests"`
-	TotalErrors        int64            `json:"total_errors"`
-	RequestsByVKey     map[string]int64 `json:"requests_by_vkey"`
-	RequestsByProvider map[string]int64 `json:"requests_by_provider"`
+	TotalRequests      int64                  `json:"total_requests"`
+	TotalErrors        int64                  `json:"total_errors"`
+	RequestsByVKey     map[string]int64       `json:"requests_by_vkey"`
+	RequestsByProvider map[string]int64       `json:"requests_by_provider"`
+	Reporter           *events.ReporterMetrics `json:"reporter,omitempty"`
 }
 
 // Metrics returns aggregated usage metrics.
@@ -150,11 +154,17 @@ func (h *Handler) Metrics(w http.ResponseWriter, r *http.Request) {
 		byProvider = make(map[string]int64)
 	}
 
+	var reporterMetrics *events.ReporterMetrics
+	if h.ReporterMetricsFn != nil {
+		reporterMetrics = h.ReporterMetricsFn()
+	}
+
 	writeJSON(w, http.StatusOK, metricsResponse{
 		TotalRequests:      totalReqs,
 		TotalErrors:        totalErrs,
 		RequestsByVKey:     byVKey,
 		RequestsByProvider: byProvider,
+		Reporter:           reporterMetrics,
 	})
 }
 

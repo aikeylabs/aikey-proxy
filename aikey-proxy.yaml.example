@@ -6,7 +6,7 @@ listen:
   port: 27200
 
 vault:
-  path: "~/.aikey/vault.db"
+  path: "~/.aikey/data/vault.db"
 
 # Virtual keys: map each virtual key token to a provider + vault entry.
 # Clients use virtual keys instead of real provider keys.
@@ -57,6 +57,16 @@ events:
   db_path: "~/.aikey/events.db"
   batch_size: 100
   flush_interval: 5s
+
+  # Usage reporting to collector-service (optional).
+  # When collector_url is set, team-managed key usage events are uploaded
+  # to the data service for org-level analytics.
+  # collector_url: "http://localhost:27300"
+  # collector_token: "changeme"
+  # queue_capacity: 10000
+  # upload_batch_size: 100
+  # upload_interval: 5s
+  # wal_dir: "~/.aikey/data/usage-wal"
 
 log:
   level: "info"   # debug, info, warn, error

@@ -42,8 +42,11 @@ type Proxy struct {
 	registry     *vkeys.Registry
 	providers    *provider.Registry
 	collector    *events.Collector
+	reporter     *events.Reporter // usage reporting to collector-service (nil = disabled)
 	transport    http.RoundTripper // nil → http.DefaultTransport (reads env vars)
 	proxyCtx     context.Context   // cancelled when the proxy shuts down
+	proxyInstanceID string
+	clientVersion   string // build version for audit metadata in usage events
 	requests     atomic.Int64
 	errors       atomic.Int64
 
@@ -79,6 +82,14 @@ func New(v VaultGetter, reg *vkeys.Registry, prov *provider.Registry, coll *even
 		p.activeReader = ar
 	}
 	return p
+}
+
+// SetReporter sets the usage reporter for collector-service upload.
+// clientVersion is the proxy build version (e.g. "0.1.0"), used as audit metadata.
+func (p *Proxy) SetReporter(r *events.Reporter, instanceID, clientVersion string) {
+	p.reporter = r
+	p.proxyInstanceID = instanceID
+	p.clientVersion = clientVersion
 }
 
 // TotalRequests returns the total number of proxied requests.
@@ -193,7 +204,7 @@ func (p *Proxy) Handle(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	p.serveRoute(w, r, route, prov, realKey, startTime, logger)
+	p.serveRoute(w, r, route, prov, realKey, token, startTime, logger)
 }
 
 // handlePathPrefixRoute resolves the active key for providerCode and forwards
@@ -311,12 +322,12 @@ func (p *Proxy) handlePathPrefixRoute(w http.ResponseWriter, r *http.Request, pr
 		PlaintextKey: realKey,
 	}
 
-	p.serveRoute(w, r, route, prov, realKey, startTime, logger)
+	p.serveRoute(w, r, route, prov, realKey, "aikey_vk_"+virtualKeyID, startTime, logger)
 }
 
 // serveRoute executes the forwarding pipeline (streaming detection, transport
 // selection, reverse proxy) shared by token-based and path-prefix routing.
-func (p *Proxy) serveRoute(w http.ResponseWriter, r *http.Request, route *vkeys.ResolvedRoute, prov provider.Provider, realKey string, startTime time.Time, logger *slog.Logger) {
+func (p *Proxy) serveRoute(w http.ResponseWriter, r *http.Request, route *vkeys.ResolvedRoute, prov provider.Provider, realKey string, bearerToken string, startTime time.Time, logger *slog.Logger) {
 	// 6. Detect streaming.
 	streaming := isStreamingRequest(r)
 
@@ -379,7 +390,7 @@ func (p *Proxy) serveRoute(w http.ResponseWriter, r *http.Request, route *vkeys.
 		ModifyResponse: func(resp *http.Response) error {
 			if resp.StatusCode >= 400 {
 				// Error response: record immediately without token counts.
-				p.recordEvent(r, resp, startTime, route, streaming)
+				p.recordEvent(r, resp, startTime, route, bearerToken, streaming)
 				return nil
 			}
 			if !streaming {
@@ -397,12 +408,19 @@ func (p *Proxy) serveRoute(w http.ResponseWriter, r *http.Request, route *vkeys.
 				ev.InputTokens = in
 				ev.OutputTokens = out
 				p.collector.Record(ev)
+				p.reportUsage(route, bearerToken, ev.Model, startTime, resp.StatusCode, in, out, "", realKey)
 			} else {
 				// Streaming success: wrap body — background goroutine drains the
 				// full SSE stream and records token usage when it ends, regardless
 				// of whether the client stays connected.
 				baseEvent := p.buildBaseEvent(r, resp, startTime, route, true)
-				resp.Body = newStreamDrainer(resp.Body, baseEvent, prov, p.collector, p.proxyCtx, r.Context())
+				var cb reporterCallback
+				if p.reporter != nil && route.OrgID != "" {
+					cb = func(inTok, outTok int) {
+						p.reportUsage(route, bearerToken, baseEvent.Model, startTime, resp.StatusCode, inTok, outTok, "", realKey)
+					}
+				}
+				resp.Body = newStreamDrainer(resp.Body, baseEvent, prov, p.collector, p.proxyCtx, r.Context(), cb)
 			}
 			return nil
 		},
@@ -459,13 +477,42 @@ func (p *Proxy) buildBaseEvent(req *http.Request, resp *http.Response, startTime
 }
 
 // recordEvent records a usage event for error responses (no token counts).
-func (p *Proxy) recordEvent(req *http.Request, resp *http.Response, startTime time.Time, route *vkeys.ResolvedRoute, streaming bool) {
+func (p *Proxy) recordEvent(req *http.Request, resp *http.Response, startTime time.Time, route *vkeys.ResolvedRoute, bearerToken string, streaming bool) {
 	ev := p.buildBaseEvent(req, resp, startTime, route, streaming)
 	if resp.StatusCode >= 400 {
 		p.errors.Add(1)
 		ev.ErrorType = http.StatusText(resp.StatusCode)
 	}
 	p.collector.Record(ev)
+	p.reportUsage(route, bearerToken, ev.Model, startTime, resp.StatusCode, 0, 0, ev.ErrorType, "")
+}
+
+// reportUsage sends a usage event to the collector-service reporter (if configured).
+func (p *Proxy) reportUsage(route *vkeys.ResolvedRoute, bearerToken, model string, startTime time.Time, statusCode, inTokens, outTokens int, errorType, realKey string) {
+	if p.reporter == nil {
+		return
+	}
+	// Only report team-managed keys (with org_id)
+	if route.OrgID == "" {
+		return
+	}
+	ev := events.BuildReportableEvent(events.ReportOpts{
+		EventID:         observability.NewID(),
+		ProxyInstanceID: p.proxyInstanceID,
+		Route:           route,
+		BearerToken:     bearerToken,
+		Model:           model,
+		StartTime:       startTime,
+		FinishedAt:      time.Now(),
+		StatusCode:      statusCode,
+		InputTokens:     inTokens,
+		OutputTokens:    outTokens,
+		ErrorType:       errorType,
+		RealKey:         realKey,
+		ClientVersion:   p.clientVersion,
+		SourceVersion:   p.clientVersion,
+	})
+	p.reporter.Report(ev)
 }
 
 // extractModel reads the request body to find the "model" field.

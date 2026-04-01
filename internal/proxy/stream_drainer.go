@@ -51,6 +51,10 @@ func (d *streamDrainer) Close() error {
 //
 // reqCtx is cancelled when the client disconnects (or proxyCtx when shutting
 // down).  Either cancellation closes upstream and unblocks the drainer.
+// reporterCallback is called when the stream ends to report usage.
+// Nil means no reporting.
+type reporterCallback func(inputTokens, outputTokens int)
+
 func newStreamDrainer(
 	upstream io.ReadCloser,
 	baseEvent events.UsageEvent,
@@ -58,6 +62,7 @@ func newStreamDrainer(
 	collector *events.Collector,
 	proxyCtx context.Context,
 	reqCtx context.Context,
+	onComplete reporterCallback,
 ) *streamDrainer {
 	pr, pw := io.Pipe()
 
@@ -117,6 +122,9 @@ func newStreamDrainer(
 		ev.OutputTokens = outputTokens
 		ev.DurationMs = time.Since(baseEvent.Timestamp).Milliseconds()
 		collector.Record(ev)
+		if onComplete != nil {
+			onComplete(inputTokens, outputTokens)
+		}
 	}()
 
 	return &streamDrainer{pr: pr, upstream: upstream}

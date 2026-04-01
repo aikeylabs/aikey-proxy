@@ -8,7 +8,7 @@
 #
 # Prerequisites:
 #   - Go >= 1.26.1 installed and in PATH
-#   - AiKey vault (~/.aikey/vault.db) created by aikey-cli
+#   - AiKey vault (~/.aikey/data/vault.db) created by aikey-cli
 
 set -euo pipefail
 
@@ -70,7 +70,7 @@ else
 fi
 
 # --- 5. Check vault ---
-VAULT_PATH="${HOME}/.aikey/vault.db"
+VAULT_PATH="${HOME}/.aikey/data/vault.db"
 if [ -f "$VAULT_PATH" ]; then
     info "Vault found: ${VAULT_PATH}"
 else
