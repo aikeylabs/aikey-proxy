@@ -193,7 +193,7 @@ func (p *Proxy) Handle(w http.ResponseWriter, r *http.Request) {
 				"key_alias", route.KeyAlias,
 			)
 			writeJSONError(w, http.StatusServiceUnavailable, "server_error", "SECRET_NOT_CONFIGURED",
-				"Provider secret '"+route.KeyAlias+"' is not in the vault. Run: aikey secret set "+route.KeyAlias+" --from-stdin")
+				"Provider API Key '"+route.KeyAlias+"' is not in the vault. Run: aikey add "+route.KeyAlias)
 			return
 		}
 	}

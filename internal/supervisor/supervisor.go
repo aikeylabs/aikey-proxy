@@ -513,7 +513,7 @@ func (s *Supervisor) buildGeneration() (*generation, error) {
 	var activeKeys []config.VirtualKeyConfig
 	for _, vk := range s.cfg.VirtualKeys {
 		if _, err := vaultReader.GetSecret(vk.KeyAlias); err != nil {
-			slog.Warn("virtual key skipped: secret not found in vault — add it with 'aikey secret set'",
+			slog.Warn("virtual key skipped: API Key not found in vault — add it with 'aikey add'",
 				"vk_id", vk.ID, "key_alias", vk.KeyAlias)
 			continue
 		}

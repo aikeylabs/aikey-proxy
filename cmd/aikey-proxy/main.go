@@ -179,7 +179,7 @@ func getVaultPassword() (string, error) {
 		return pw, nil
 	}
 
-	fmt.Fprint(os.Stderr, "Enter vault password: ")
+	fmt.Fprint(os.Stderr, "Enter Master Password: ")
 	pw, err := term.ReadPassword(int(syscall.Stdin))
 	fmt.Fprintln(os.Stderr) // newline after password input
 	if err != nil {
