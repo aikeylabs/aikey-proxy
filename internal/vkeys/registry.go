@@ -32,6 +32,9 @@ func (r *Registry) Load(keys []config.VirtualKeyConfig) {
 			BaseURL:       k.BaseURL,
 			KeyAlias:      k.KeyAlias,
 			AllowedModels: k.AllowedModels,
+			// For static YAML keys the provider field IS the protocol type
+			// (e.g. "anthropic", "openai"). Managed keys set this separately.
+			ProtocolType: k.Provider,
 		}
 	}
 

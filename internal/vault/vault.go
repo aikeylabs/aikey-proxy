@@ -88,6 +88,17 @@ func Open(dbPath string, password string) (*Reader, error) {
 	}, nil
 }
 
+// GetLoggedInAccountID returns the account_id of the currently logged-in user
+// from the platform_account table, or empty string if not logged in.
+func (r *Reader) GetLoggedInAccountID() string {
+	var accountID string
+	err := r.db.QueryRow("SELECT account_id FROM platform_account WHERE id = 1").Scan(&accountID)
+	if err != nil {
+		return ""
+	}
+	return accountID
+}
+
 // GetSecret retrieves and decrypts a secret by its alias.
 // Results are cached in memory for subsequent calls.
 func (r *Reader) GetSecret(alias string) (string, error) {

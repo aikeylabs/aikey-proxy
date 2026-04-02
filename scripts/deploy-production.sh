@@ -1,4 +1,7 @@
 #!/usr/bin/env bash
+# DEPRECATED: Use workflow/CD/installer/local-install.sh or server-install.sh instead.
+# This script is kept for backward compatibility and reference.
+#
 # deploy-production.sh — Cross-platform production deployment for aikey-proxy.
 #
 # Supports deploying to:

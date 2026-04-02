@@ -490,11 +490,11 @@ func (m *mockActiveVault) GetActiveTeamKeyByProvider(providerCode string) (*vaul
 	return mk, nil
 }
 
-func (m *mockActiveVault) GetPersonalKeyByAlias(alias string) (string, string, error) {
+func (m *mockActiveVault) GetPersonalKeyByAlias(alias string) (string, string, string, error) {
 	if alias == m.personalAlias {
-		return m.personalText, m.personalProv, nil
+		return m.personalText, m.personalProv, "", nil
 	}
-	return "", "", fmt.Errorf("personal key %q not found", alias)
+	return "", "", "", fmt.Errorf("personal key %q not found", alias)
 }
 
 func setupTestProxyWithActive(t *testing.T, av *mockActiveVault) *Proxy {

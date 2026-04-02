@@ -45,8 +45,11 @@ type Proxy struct {
 	reporter     *events.Reporter // usage reporting to collector-service (nil = disabled)
 	transport    http.RoundTripper // nil → http.DefaultTransport (reads env vars)
 	proxyCtx     context.Context   // cancelled when the proxy shuts down
-	proxyInstanceID string
-	clientVersion   string // build version for audit metadata in usage events
+	proxyInstanceID    string
+	clientVersion      string // build version for audit metadata in usage events
+	proxyConfigVersion string // generation ID or config revision
+	loadedControlSeq   int64  // vault change_seq loaded at generation build time
+	loggedInAccountID  string // current platform_account.account_id (for personal key events)
 	requests     atomic.Int64
 	errors       atomic.Int64
 
@@ -86,10 +89,15 @@ func New(v VaultGetter, reg *vkeys.Registry, prov *provider.Registry, coll *even
 
 // SetReporter sets the usage reporter for collector-service upload.
 // clientVersion is the proxy build version (e.g. "0.1.0"), used as audit metadata.
-func (p *Proxy) SetReporter(r *events.Reporter, instanceID, clientVersion string) {
+// configVersion identifies the proxy generation/config revision.
+// loadedControlSeq is the vault change_seq the proxy loaded at startup.
+func (p *Proxy) SetReporter(r *events.Reporter, instanceID, clientVersion, configVersion string, loadedControlSeq int64, loggedInAccountID string) {
 	p.reporter = r
 	p.proxyInstanceID = instanceID
 	p.clientVersion = clientVersion
+	p.proxyConfigVersion = configVersion
+	p.loadedControlSeq = loadedControlSeq
+	p.loggedInAccountID = loggedInAccountID
 }
 
 // TotalRequests returns the total number of proxied requests.
@@ -236,9 +244,13 @@ func (p *Proxy) handlePathPrefixRoute(w http.ResponseWriter, r *http.Request, pr
 		return
 	}
 
+	// Protocol type is determined by the URL path provider code — the user's
+	// intent is explicit (e.g. /anthropic/v1/messages → Anthropic protocol).
+	// This is authoritative for both team and personal keys.
+	protocolType = providerToProtocol(canonicalCode)
+
 	if mk != nil {
 		realKey = mk.PlaintextKey
-		protocolType = mk.ProtocolType
 		virtualKeyID = mk.VirtualKeyID
 		// Use provider-specific base URL if available; fall back to primary slot's base_url.
 		// ProviderBaseURLs is keyed by provider_code as stored in the vault
@@ -278,12 +290,15 @@ func (p *Proxy) handlePathPrefixRoute(w http.ResponseWriter, r *http.Request, pr
 				}
 				realKey = plaintext
 				virtualKeyID = "personal:" + cfg.KeyRef
-				protocolType = providerToProtocol(pcode)
 				// Use user-set base_url if available; fall back to provider default.
+				// When pcode is empty, use the URL path's canonicalCode for
+				// base URL resolution too.
 				if entryBaseURL != "" {
 					baseURL = entryBaseURL
-				} else {
+				} else if pcode != "" {
 					baseURL = providerDefaultBaseURL(pcode)
+				} else {
+					baseURL = providerDefaultBaseURL(canonicalCode)
 				}
 			}
 		}
@@ -297,16 +312,13 @@ func (p *Proxy) handlePathPrefixRoute(w http.ResponseWriter, r *http.Request, pr
 		return
 	}
 
-	// Resolve provider adapter by protocol type, falling back to provider code.
+	// Resolve provider adapter by protocol type (derived from URL path).
 	prov, err := p.providers.Get(protocolType)
 	if err != nil {
-		prov, err = p.providers.Get(providerCode)
-		if err != nil {
-			p.errors.Add(1)
-			writeJSONError(w, http.StatusBadGateway, "server_error", "PROVIDER_ERROR",
-				"Unknown provider: "+providerCode)
-			return
-		}
+		p.errors.Add(1)
+		writeJSONError(w, http.StatusBadGateway, "server_error", "PROVIDER_ERROR",
+			"Unknown provider protocol: "+protocolType+" (from path: "+providerCode+")")
+		return
 	}
 
 	// Strip provider prefix from path before forwarding.
@@ -320,6 +332,8 @@ func (p *Proxy) handlePathPrefixRoute(w http.ResponseWriter, r *http.Request, pr
 		Provider:     providerCode,
 		BaseURL:      baseURL,
 		PlaintextKey: realKey,
+		ProviderCode: canonicalCode,
+		ProtocolType: protocolType,
 	}
 
 	p.serveRoute(w, r, route, prov, realKey, "aikey_vk_"+virtualKeyID, startTime, logger)
@@ -415,7 +429,7 @@ func (p *Proxy) serveRoute(w http.ResponseWriter, r *http.Request, route *vkeys.
 				// of whether the client stays connected.
 				baseEvent := p.buildBaseEvent(r, resp, startTime, route, true)
 				var cb reporterCallback
-				if p.reporter != nil && route.OrgID != "" {
+				if p.reporter != nil {
 					cb = func(inTok, outTok int) {
 						p.reportUsage(route, bearerToken, baseEvent.Model, startTime, resp.StatusCode, inTok, outTok, "", realKey)
 					}
@@ -492,10 +506,6 @@ func (p *Proxy) reportUsage(route *vkeys.ResolvedRoute, bearerToken, model strin
 	if p.reporter == nil {
 		return
 	}
-	// Only report team-managed keys (with org_id)
-	if route.OrgID == "" {
-		return
-	}
 	ev := events.BuildReportableEvent(events.ReportOpts{
 		EventID:         observability.NewID(),
 		ProxyInstanceID: p.proxyInstanceID,
@@ -509,8 +519,11 @@ func (p *Proxy) reportUsage(route *vkeys.ResolvedRoute, bearerToken, model strin
 		OutputTokens:    outTokens,
 		ErrorType:       errorType,
 		RealKey:         realKey,
-		ClientVersion:   p.clientVersion,
-		SourceVersion:   p.clientVersion,
+		ClientVersion:      p.clientVersion,
+		SourceVersion:      p.clientVersion,
+		ProxyConfigVersion: p.proxyConfigVersion,
+		LoadedControlSeq:   p.loadedControlSeq,
+		LoggedInAccountID:  p.loggedInAccountID,
 	})
 	p.reporter.Report(ev)
 }

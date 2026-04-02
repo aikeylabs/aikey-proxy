@@ -582,7 +582,11 @@ func (s *Supervisor) buildGeneration() (*generation, error) {
 		if err != nil {
 			slog.Warn("reporter init failed, usage reporting disabled", "error", err)
 		} else {
-			p.SetReporter(reporter, fmt.Sprintf("proxy-%d", id), s.version)
+			var loadedSeq int64
+			if seq, err := vault.ReadConfigU64LE(s.cfg.Vault.Path, VaultChangeSeqKey); err == nil {
+				loadedSeq = int64(seq)
+			}
+			p.SetReporter(reporter, fmt.Sprintf("proxy-%d", id), s.version, fmt.Sprintf("gen-%d", id), loadedSeq, vaultReader.GetLoggedInAccountID())
 			slog.Info("usage reporter enabled", "collector_url", s.cfg.Events.CollectorURL)
 		}
 	}

@@ -54,15 +54,25 @@ providers:
 
 # Events (usage tracking) configuration.
 events:
-  db_path: "~/.aikey/events.db"
+  db_path: "~/.aikey/data/events.db"
   batch_size: 100
   flush_interval: 5s
 
   # Usage reporting to collector-service (optional).
   # When collector_url is set, team-managed key usage events are uploaded
   # to the data service for org-level analytics.
-  # collector_url: "http://localhost:27300"
-  # collector_token: "changeme"
+  #
+  # Leave collector_url empty or commented out for standalone-local mode
+  # (personal BYOK only, no server). Enable it when a Control Service is
+  # available and you want org-level usage tracking.
+  #
+  # Environment-specific defaults:
+  #   Local dev / local server:   http://127.0.0.1:27300
+  #   Private deployment:         http://<server-ip>:27300
+  #   SaaS (future):              https://collector.aikey.dev
+  #
+  # collector_url: ""
+  # collector_token: ""
   # queue_capacity: 10000
   # upload_batch_size: 100
   # upload_interval: 5s

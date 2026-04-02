@@ -191,6 +191,7 @@ func (c *Config) validate() error {
 func (c *Config) expandPaths() {
 	c.Vault.Path = expandHome(c.Vault.Path)
 	c.Events.DBPath = expandHome(c.Events.DBPath)
+	c.Events.WALDir = expandHome(c.Events.WALDir)
 	c.Log.Dir = expandHome(c.Log.Dir)
 }
 

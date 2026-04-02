@@ -45,5 +45,13 @@ events:
   batch_size: 100
   flush_interval: 5s
 
+  # Usage reporting to collector-service
+  collector_url: "http://localhost:27300"
+  collector_token: "dev-token"
+  queue_capacity: 10000
+  upload_batch_size: 5
+  upload_interval: 5s
+  wal_dir: "~/.aikey/data/usage-wal"
+
 log:
   level: "info"   # debug, info, warn, error

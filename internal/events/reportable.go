@@ -81,8 +81,11 @@ type ReportOpts struct {
 	OutputTokens    int
 	ErrorType       string
 	RealKey         string // decrypted provider key (for hashing only, never stored)
-	SourceVersion   string
-	ClientVersion   string
+	SourceVersion      string
+	ClientVersion      string
+	ProxyConfigVersion string
+	LoadedControlSeq   int64
+	LoggedInAccountID  string // fallback account_id for personal keys
 }
 
 // BuildReportableEvent creates a ReportableEvent from the proxy request context.
@@ -101,8 +104,13 @@ func BuildReportableEvent(opts ReportOpts) ReportableEvent {
 	}
 
 	routeSource := "personal"
-	if route.OrgID != "" {
+	orgID := route.OrgID
+	if orgID != "" {
 		routeSource = "team_managed"
+	} else {
+		// Personal keys have no org — use "personal" as a sentinel so the
+		// event passes ingest validation (org_id is required).
+		orgID = "personal"
 	}
 
 	// virtual_key_hash: hash the bearer token, not just the ID.
@@ -120,17 +128,30 @@ func BuildReportableEvent(opts ReportOpts) ReportableEvent {
 		EventID:         opts.EventID,
 		ProxyInstanceID: opts.ProxyInstanceID,
 		SchemaVersion:   1,
-		SourceVersion:   opts.SourceVersion,
-		ClientVersion:   opts.ClientVersion,
+		SourceVersion:      opts.SourceVersion,
+		ClientVersion:      opts.ClientVersion,
+		ProxyConfigVersion: opts.ProxyConfigVersion,
+		ProxyLoadedControlSeq: func() *int64 {
+			if opts.LoadedControlSeq == 0 {
+				return nil
+			}
+			v := opts.LoadedControlSeq
+			return &v
+		}(),
 
 		EventTime:  now,
 		OccurredAt: now,
 		StartedAt:  &opts.StartTime,
 		FinishedAt: &now,
 
-		OrgID:     route.OrgID,
-		AccountID: route.AccountID,
-		SeatID:    route.SeatID,
+		OrgID: orgID,
+		AccountID: func() string {
+			if route.AccountID != "" {
+				return route.AccountID
+			}
+			return opts.LoggedInAccountID // fallback for personal keys
+		}(),
+		SeatID: route.SeatID,
 
 		VirtualKeyID:          route.VirtualKeyID,
 		VirtualKeyRevision:    route.VirtualKeyRevision,
