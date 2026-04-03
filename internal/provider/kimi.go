@@ -1,9 +1,7 @@
 package provider
 
 import (
-	"fmt"
 	"net/http"
-	"net/url"
 )
 
 // ExtractTokens delegates to the OpenAI-compatible implementation
@@ -23,16 +21,9 @@ type Kimi struct{}
 func (k *Kimi) Name() string { return "kimi" }
 
 func (k *Kimi) RewriteRequest(req *http.Request, realKey string, baseURL string) error {
-	target, err := url.Parse(baseURL)
-	if err != nil {
-		return fmt.Errorf("parse base_url: %w", err)
+	if err := applyBaseURL(req, baseURL); err != nil {
+		return err
 	}
-
-	req.URL.Scheme = target.Scheme
-	req.URL.Host = target.Host
-	req.Host = target.Host
-
 	req.Header.Set("Authorization", "Bearer "+realKey)
-
 	return nil
 }

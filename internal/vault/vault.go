@@ -35,8 +35,10 @@ type Reader struct {
 
 // Open opens the vault database and verifies the password.
 func Open(dbPath string, password string) (*Reader, error) {
-	// Open in read-only mode — aikey-proxy never writes to the vault.
-	db, err := sql.Open("sqlite", dbPath+"?mode=ro")
+	// Open in read-write mode so the WAL reader can see latest CLI writes.
+	// aikey-proxy does not write to the vault, but read-only mode on WAL
+	// databases may return stale data if the WAL has not been checkpointed.
+	db, err := sql.Open("sqlite", dbPath)
 	if err != nil {
 		return nil, fmt.Errorf("open vault db: %w", err)
 	}
@@ -76,7 +78,7 @@ func Open(dbPath string, password string) (*Reader, error) {
 
 	if !VerifyKey(derivedKey, storedHash) {
 		db.Close()
-		return nil, fmt.Errorf("invalid vault password")
+		return nil, fmt.Errorf("invalid master password")
 	}
 
 	slog.Info("vault opened successfully", "path", dbPath)
@@ -177,7 +179,7 @@ type ManagedKey struct {
 // each provider key using the vault AES key derived at Open time.
 //
 // Keys that fail to decrypt are skipped with a warning (e.g. written by a
-// different vault password or corrupted data) so a single bad entry does not
+// different master password or corrupted data) so a single bad entry does not
 // block the proxy from starting.
 func (r *Reader) GetActiveManagedKeys() ([]ManagedKey, error) {
 	rows, err := r.db.Query(`
@@ -359,7 +361,8 @@ func (r *Reader) GetActiveTeamKeyByProvider(providerCode string) (*ManagedKey, e
 	}
 	query := fmt.Sprintf(`
 		SELECT virtual_key_id, provider_code, protocol_type, base_url,
-		       provider_key_nonce, provider_key_ciphertext, provider_base_urls
+		       provider_key_nonce, provider_key_ciphertext, provider_base_urls,
+		       org_id, seat_id, owner_account_id
 		FROM managed_virtual_keys_cache
 		WHERE local_state = 'active'
 		  AND key_status  = 'active'
@@ -380,7 +383,10 @@ func (r *Reader) GetActiveTeamKeyByProvider(providerCode string) (*ManagedKey, e
 	var vkID, provCode, protType, baseURL string
 	var nonce, ciphertext []byte
 	var providerBaseURLsJSON *string
-	if err := rows.Scan(&vkID, &provCode, &protType, &baseURL, &nonce, &ciphertext, &providerBaseURLsJSON); err != nil {
+	var orgID, seatID string
+	var ownerAccountID *string
+	if err := rows.Scan(&vkID, &provCode, &protType, &baseURL, &nonce, &ciphertext, &providerBaseURLsJSON,
+		&orgID, &seatID, &ownerAccountID); err != nil {
 		return nil, fmt.Errorf("scan managed key: %w", err)
 	}
 
@@ -394,12 +400,20 @@ func (r *Reader) GetActiveTeamKeyByProvider(providerCode string) (*ManagedKey, e
 		_ = json.Unmarshal([]byte(*providerBaseURLsJSON), &providerBaseURLs)
 	}
 
+	var accountID string
+	if ownerAccountID != nil {
+		accountID = *ownerAccountID
+	}
+
 	return &ManagedKey{
 		VirtualKeyID:     vkID,
 		ProviderCode:     provCode,
 		ProtocolType:     protType,
 		BaseURL:          baseURL,
 		PlaintextKey:     string(plaintext),
+		OrgID:            orgID,
+		SeatID:           seatID,
+		OwnerAccountID:   accountID,
 		ProviderBaseURLs: providerBaseURLs,
 	}, nil
 }

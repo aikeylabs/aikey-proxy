@@ -175,15 +175,15 @@ $deployScript = {
         Write-Info "Vault installed: $vaultDest"
     }
 
-    # Create vault password env file if missing.
+    # Create master password env file if missing.
     $envFile = Join-Path $ConfigDir "env.ps1"
     if (-not (Test-Path $envFile)) {
         @'
-# Set the vault password for aikey-proxy.
+# Set the master password for aikey-proxy (AIKEY_MASTER_PASSWORD).
 # This file is loaded by the service wrapper. Keep it protected.
-$env:AIKEY_VAULT_PASSWORD = ""
+$env:AIKEY_MASTER_PASSWORD = ""
 '@ | Set-Content $envFile -Encoding UTF8
-        Write-Warn "IMPORTANT: Set AIKEY_VAULT_PASSWORD in $envFile before starting the service."
+        Write-Warn "IMPORTANT: Set AIKEY_MASTER_PASSWORD in $envFile before starting the service."
     }
 
     # Create a service wrapper script (loads env then starts proxy).

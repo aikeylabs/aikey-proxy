@@ -205,10 +205,10 @@ fi
 
 # Create env file if missing.
 if [ ! -f ${config_dir}/env ]; then
-    echo "AIKEY_VAULT_PASSWORD=" | sudo tee ${config_dir}/env > /dev/null
+    echo "AIKEY_MASTER_PASSWORD=" | sudo tee ${config_dir}/env > /dev/null
     sudo chmod 600 ${config_dir}/env
     sudo chown root:aikey ${config_dir}/env
-    warn "IMPORTANT: Set vault password in ${config_dir}/env before starting the service."
+    warn "IMPORTANT: Set master password in ${config_dir}/env before starting the service."
 fi
 
 # Install systemd unit.
@@ -317,13 +317,13 @@ fi
 
 # Create env file if missing.
 if [ ! -f ${config_dir}/env ]; then
-    echo "AIKEY_VAULT_PASSWORD=" | sudo tee ${config_dir}/env > /dev/null
+    echo "AIKEY_MASTER_PASSWORD=" | sudo tee ${config_dir}/env > /dev/null
     sudo chmod 600 ${config_dir}/env
-    warn "IMPORTANT: Set vault password in ${config_dir}/env before starting."
+    warn "IMPORTANT: Set master password in ${config_dir}/env before starting."
 fi
 
 # Load env file values for plist (launchd doesn't support EnvironmentFile).
-VAULT_PW=\$(grep '^AIKEY_VAULT_PASSWORD=' ${config_dir}/env 2>/dev/null | cut -d= -f2- || echo "")
+VAULT_PW=\$(grep '^AIKEY_MASTER_PASSWORD=' ${config_dir}/env 2>/dev/null | cut -d= -f2- || echo "")
 
 # Install launchd plist.
 sudo tee ${plist} > /dev/null <<PLIST
@@ -342,7 +342,7 @@ sudo tee ${plist} > /dev/null <<PLIST
     </array>
     <key>EnvironmentVariables</key>
     <dict>
-        <key>AIKEY_VAULT_PASSWORD</key>
+        <key>AIKEY_MASTER_PASSWORD</key>
         <string>\${VAULT_PW}</string>
     </dict>
     <key>UserName</key>

@@ -116,7 +116,7 @@ cp aikey-proxy.yaml.example aikey-proxy.yaml
 # 编辑 virtual_keys 映射
 
 # 启动（需要 vault 密码）
-export AIKEY_VAULT_PASSWORD="your-password"
+export AIKEY_MASTER_PASSWORD="your-password"
 ./bin/aikey-proxy --config aikey-proxy.yaml
 
 # 或交互式输入密码

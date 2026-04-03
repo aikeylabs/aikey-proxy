@@ -92,10 +92,10 @@ func main() {
 		"virtual_keys", len(cfg.VirtualKeys),
 	)
 
-	// 3. Get vault password.
+	// 3. Get master password.
 	password, err := getVaultPassword()
 	if err != nil {
-		slog.Error("failed to get vault password", "error", err)
+		slog.Error("failed to get master password", "error", err)
 		os.Exit(1)
 	}
 
@@ -172,10 +172,10 @@ func main() {
 	}
 }
 
-// getVaultPassword reads the vault password from AIKEY_VAULT_PASSWORD env var
+// getVaultPassword reads the master password from AIKEY_MASTER_PASSWORD env var
 // or prompts on stdin.
 func getVaultPassword() (string, error) {
-	if pw := os.Getenv("AIKEY_VAULT_PASSWORD"); pw != "" {
+	if pw := os.Getenv("AIKEY_MASTER_PASSWORD"); pw != "" {
 		return pw, nil
 	}
 

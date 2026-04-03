@@ -3,7 +3,35 @@ package provider
 import (
 	"fmt"
 	"net/http"
+	"net/url"
+	"strings"
 )
+
+// applyBaseURL sets the scheme, host, and prepends the base URL's path prefix
+// to the request path. For example:
+//
+//	baseURL = "https://api.moonshot.cn/v1", req.URL.Path = "/chat/completions"
+//	→ req.URL = "https://api.moonshot.cn/v1/chat/completions"
+func applyBaseURL(req *http.Request, baseURL string) error {
+	target, err := url.Parse(baseURL)
+	if err != nil {
+		return fmt.Errorf("parse base_url: %w", err)
+	}
+
+	req.URL.Scheme = target.Scheme
+	req.URL.Host = target.Host
+	req.Host = target.Host
+
+	// Prepend base URL path prefix (e.g., /v1) if present.
+	if target.Path != "" && target.Path != "/" {
+		req.URL.Path = strings.TrimRight(target.Path, "/") + req.URL.Path
+		if req.URL.RawPath != "" {
+			req.URL.RawPath = strings.TrimRight(target.Path, "/") + req.URL.RawPath
+		}
+	}
+
+	return nil
+}
 
 // Provider adapts requests for a specific AI provider protocol.
 type Provider interface {

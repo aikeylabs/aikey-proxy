@@ -115,8 +115,8 @@ make build
 cp aikey-proxy.yaml.example aikey-proxy.yaml
 # Edit virtual_keys mappings
 
-# Start (requires vault password)
-export AIKEY_VAULT_PASSWORD="your-password"
+# Start (requires master password)
+export AIKEY_MASTER_PASSWORD="your-password"
 ./bin/aikey-proxy --config aikey-proxy.yaml
 
 # Or enter password interactively

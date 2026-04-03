@@ -100,9 +100,9 @@ deploy_local() {
 
     # Create env file template if not exists.
     if [ ! -f "${CONFIG_DIR}/env" ]; then
-        echo "AIKEY_VAULT_PASSWORD=" | sudo tee "${CONFIG_DIR}/env" > /dev/null
+        echo "AIKEY_MASTER_PASSWORD=" | sudo tee "${CONFIG_DIR}/env" > /dev/null
         sudo chmod 600 "${CONFIG_DIR}/env"
-        warn "Set vault password in ${CONFIG_DIR}/env"
+        warn "Set master password in ${CONFIG_DIR}/env"
     fi
 
     sudo cp "$UNIT_FILE" "/etc/systemd/system/${SERVICE_NAME}.service"
@@ -134,7 +134,7 @@ elif [ ! -f ${CONFIG_DIR}/aikey-proxy.yaml ]; then
     echo "WARNING: No config file. Copy one to ${CONFIG_DIR}/aikey-proxy.yaml"
 fi
 if [ ! -f ${CONFIG_DIR}/env ]; then
-    echo "AIKEY_VAULT_PASSWORD=" | sudo tee ${CONFIG_DIR}/env > /dev/null
+    echo "AIKEY_MASTER_PASSWORD=" | sudo tee ${CONFIG_DIR}/env > /dev/null
     sudo chmod 600 ${CONFIG_DIR}/env
 fi
 sudo mv /tmp/${SERVICE_NAME}.service /etc/systemd/system/${SERVICE_NAME}.service

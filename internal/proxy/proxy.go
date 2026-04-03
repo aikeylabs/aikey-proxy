@@ -335,6 +335,12 @@ func (p *Proxy) handlePathPrefixRoute(w http.ResponseWriter, r *http.Request, pr
 		ProviderCode: canonicalCode,
 		ProtocolType: protocolType,
 	}
+	// Populate org/account/seat from managed key so usage events carry the correct org_id.
+	if mk != nil {
+		route.OrgID = mk.OrgID
+		route.AccountID = mk.OwnerAccountID
+		route.SeatID = mk.SeatID
+	}
 
 	p.serveRoute(w, r, route, prov, realKey, "aikey_vk_"+virtualKeyID, startTime, logger)
 }
