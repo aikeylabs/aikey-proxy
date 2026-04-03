@@ -1,0 +1,16 @@
+# Build output
+bin/
+target/
+
+# Runtime config (use aikey-proxy.yaml.example as template)
+# aikey-proxy.yaml is committed intentionally as the default config template
+
+# Environment files
+.env
+
+# Go test cache
+*.test
+*.out
+
+# OS
+.DS_Store
