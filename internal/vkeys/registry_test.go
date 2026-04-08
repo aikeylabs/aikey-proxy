@@ -15,7 +15,7 @@ func TestRegistry_ResolveAndLoad(t *testing.T) {
 			ID:       "vk1",
 			Token:    "aikey_vk_abc",
 			Provider: "openai",
-			BaseURL:  "https://api.openai.com",
+			BaseURL:  "https://api.openai.com/v1",
 			KeyAlias: "openai:default",
 		},
 		{

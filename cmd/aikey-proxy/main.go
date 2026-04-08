@@ -111,7 +111,7 @@ func main() {
 	)
 
 	// 5. Create the Supervisor (starts the initial generation).
-	sup, err := supervisor.New(cfg, password, version)
+	sup, err := supervisor.New(cfg, resolvedPath, password, version)
 	if err != nil {
 		slog.Error("failed to start supervisor", "error", err)
 		os.Exit(1)

@@ -96,13 +96,13 @@ func providerDefaultBaseURL(providerCode string) string {
 	case "anthropic", "claude":
 		return "https://api.anthropic.com"
 	case "openai", "gpt", "chatgpt":
-		return "https://api.openai.com"
+		return "https://api.openai.com/v1"
 	case "google", "gemini":
 		return "https://generativelanguage.googleapis.com"
 	case "kimi", "moonshot":
-		return "https://api.moonshot.cn"
+		return "https://api.moonshot.cn/v1"
 	case "deepseek":
-		return "https://api.deepseek.com"
+		return "https://api.deepseek.com/v1"
 	default:
 		return ""
 	}

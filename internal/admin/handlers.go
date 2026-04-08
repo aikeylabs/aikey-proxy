@@ -55,9 +55,9 @@ var knownProviders = []struct {
 	baseURL string
 }{
 	{"anthropic", "https://api.anthropic.com"},
-	{"openai", "https://api.openai.com"},
-	{"deepseek", "https://api.deepseek.com"},
-	{"kimi", "https://api.moonshot.cn"},
+	{"openai", "https://api.openai.com/v1"},
+	{"deepseek", "https://api.deepseek.com/v1"},
+	{"kimi", "https://api.moonshot.cn/v1"},
 	{"google", "https://generativelanguage.googleapis.com"},
 }
 
@@ -355,6 +355,10 @@ func probeKey(client *http.Client, t KeyCheckTarget) (int, error) {
 	if baseURL == "" {
 		baseURL = providerDefaultBaseURL(t.Provider)
 	}
+	// Strip /v1 suffix: probe functions append their own versioned paths
+	// (e.g. /v1/chat/completions). Without this, base_urls like
+	// "https://api.openai.com/v1" would produce double /v1/v1/... paths.
+	baseURL = strings.TrimSuffix(baseURL, "/v1")
 
 	switch t.Protocol {
 	case "anthropic":
@@ -437,13 +441,13 @@ func providerDefaultBaseURL(code string) string {
 	case "anthropic", "claude":
 		return "https://api.anthropic.com"
 	case "openai":
-		return "https://api.openai.com"
+		return "https://api.openai.com/v1"
 	case "google", "gemini":
 		return "https://generativelanguage.googleapis.com"
 	case "kimi", "moonshot":
-		return "https://api.moonshot.cn"
+		return "https://api.moonshot.cn/v1"
 	case "deepseek":
-		return "https://api.deepseek.com"
+		return "https://api.deepseek.com/v1"
 	default:
 		return ""
 	}

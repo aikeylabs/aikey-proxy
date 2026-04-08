@@ -71,6 +71,7 @@ type generation struct {
 	proxy      *proxy.Proxy
 	collector  *events.Collector
 	eventStore *events.Store
+	reporter   *events.Reporter // usage reporter (nil when collector_url is not configured)
 
 	// Drain tracking: incremented when a request enters Handle, decremented on exit.
 	inflight atomic.Int64
@@ -95,6 +96,11 @@ func (g *generation) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 // close releases all resources held by this generation.
 func (g *generation) close() {
+	// Close the reporter first so its upload loop flushes before the
+	// collector and event store are torn down.
+	if g.reporter != nil {
+		_ = g.reporter.Close()
+	}
 	if g.collector != nil {
 		_ = g.collector.Close()
 	}
@@ -146,9 +152,10 @@ func (g *generation) drain(timeout time.Duration, reloadID string) {
 
 // Supervisor manages the proxy lifecycle and exposes the data-plane handler.
 type Supervisor struct {
-	cfg      *config.Config
-	password string
-	version  string // build version, passed to proxy for audit metadata
+	cfg        *config.Config
+	configPath string // path to the YAML config file, re-read on reload
+	password   string
+	version    string // build version, passed to proxy for audit metadata
 
 	active    atomic.Pointer[generation]
 	reloadMu  sync.Mutex // serialise concurrent reload requests
@@ -163,15 +170,19 @@ type Supervisor struct {
 
 // New creates a Supervisor, starts the initial generation, and launches the
 // background managed-key sync goroutine.
-func New(cfg *config.Config, password, version string) (*Supervisor, error) {
+// configPath is the filesystem path to aikey-proxy.yaml; it is re-read on
+// every Reload so that changes to collector_url, collector_token, etc. take
+// effect without a full stop+start cycle.
+func New(cfg *config.Config, configPath, password, version string) (*Supervisor, error) {
 	ctx, cancel := context.WithCancel(context.Background())
 	s := &Supervisor{
-		cfg:       cfg,
-		password:  password,
-		version:   version,
-		startedAt: time.Now(),
-		ctx:       ctx,
-		cancel:    cancel,
+		cfg:        cfg,
+		configPath: configPath,
+		password:   password,
+		version:    version,
+		startedAt:  time.Now(),
+		ctx:        ctx,
+		cancel:     cancel,
 	}
 	gen, err := s.buildGeneration()
 	if err != nil {
@@ -402,13 +413,13 @@ func personalProviderBaseURL(code string) string {
 	case "anthropic", "claude":
 		return "https://api.anthropic.com"
 	case "openai":
-		return "https://api.openai.com"
+		return "https://api.openai.com/v1"
 	case "google", "gemini":
 		return "https://generativelanguage.googleapis.com"
 	case "kimi", "moonshot":
-		return "https://api.moonshot.cn"
+		return "https://api.moonshot.cn/v1"
 	case "deepseek":
-		return "https://api.deepseek.com"
+		return "https://api.deepseek.com/v1"
 	default:
 		return ""
 	}
@@ -441,6 +452,28 @@ func (s *Supervisor) Reload(ctx context.Context) error {
 		"reload_id", reloadID,
 		"old_generation_id", old.id,
 	)
+
+	// Re-read the config file so that changes to collector_url,
+	// collector_token, virtual_keys, etc. are picked up on reload
+	// instead of requiring a full stop+start cycle.  (Issue #19)
+	if s.configPath != "" {
+		newCfg, err := config.Load(s.configPath)
+		if err != nil {
+			slog.Error("reload: failed to re-read config, using previous config",
+				"reload_id", reloadID,
+				"config_path", s.configPath,
+				"error.message", err.Error(),
+			)
+			// Continue with existing s.cfg — a config parse error should not
+			// block a vault-only reload.
+		} else {
+			s.cfg = newCfg
+			slog.Info("reload: config re-read",
+				"reload_id", reloadID,
+				"collector_url", s.cfg.Events.CollectorURL,
+			)
+		}
+	}
 
 	newGen, err := s.buildGeneration()
 	if err != nil {
@@ -569,8 +602,10 @@ func (s *Supervisor) buildGeneration() (*generation, error) {
 	p.VerySlowRequestMs = int64(s.cfg.Log.VerySlowRequestMs)
 
 	// Attach usage reporter if collector_url is configured.
+	var reporter *events.Reporter
 	if s.cfg.Events.CollectorURL != "" {
-		reporter, err := events.NewReporter(events.ReporterConfig{
+		var err error
+		reporter, err = events.NewReporter(events.ReporterConfig{
 			CollectorURL:    s.cfg.Events.CollectorURL,
 			CollectorToken:  s.cfg.Events.CollectorToken,
 			QueueCapacity:   s.cfg.Events.QueueCapacity,
@@ -581,6 +616,7 @@ func (s *Supervisor) buildGeneration() (*generation, error) {
 		})
 		if err != nil {
 			slog.Warn("reporter init failed, usage reporting disabled", "error", err)
+			reporter = nil
 		} else {
 			var loadedSeq int64
 			if seq, err := vault.ReadConfigU64LE(s.cfg.Vault.Path, VaultChangeSeqKey); err == nil {
@@ -600,6 +636,7 @@ func (s *Supervisor) buildGeneration() (*generation, error) {
 		proxy:      p,
 		collector:  collector,
 		eventStore: eventStore,
+		reporter:   reporter,
 		drained:    make(chan struct{}),
 	}, nil
 }
