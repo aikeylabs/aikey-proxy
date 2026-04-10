@@ -32,6 +32,10 @@ type ActiveKeyReader interface {
 	GetActiveKeyConfig() (*vault.ActiveKeyConfig, error)
 	GetActiveTeamKeyByProvider(providerCode string) (*vault.ManagedKey, error)
 	GetPersonalKeyByAlias(alias string) (plaintext, providerCode, baseURL string, err error)
+	// v1.0.2: provider-level binding from user_profile_provider_bindings.
+	GetProviderBinding(providerCode string) (*vault.ProviderBinding, error)
+	// v1.0.2: resolve team key by exact virtual_key_id (no local_state filter).
+	GetTeamKeyByID(virtualKeyID string) (*vault.ManagedKey, error)
 }
 
 // Proxy is the core reverse proxy that handles virtual key resolution
@@ -65,7 +69,12 @@ type Proxy struct {
 // SetTransport sets a custom RoundTripper for outbound requests to AI providers.
 // Must be called before serving requests. A nil value restores the default
 // behaviour (http.DefaultTransport, which honours HTTP_PROXY / HTTPS_PROXY env vars).
-func (p *Proxy) SetTransport(t http.RoundTripper) { p.transport = t }
+func (p *Proxy) SetTransport(t http.RoundTripper) {
+	p.transport = t
+	if t != nil {
+		slog.Info("proxy: custom transport set")
+	}
+}
 
 // New creates a new Proxy. ctx is the proxy lifecycle context; cancelling it
 // stops all detached upstream calls (called on proxy shutdown).
@@ -230,75 +239,112 @@ func (p *Proxy) handlePathPrefixRoute(w http.ResponseWriter, r *http.Request, pr
 	}
 
 	var realKey, baseURL, protocolType, virtualKeyID string
+	var mk *vault.ManagedKey // populated when resolved via team key (for org metadata)
 
 	// Normalise brand aliases ("claude" → "anthropic") before vault lookup so
 	// the query matches the provider_code stored by the server.
 	canonicalCode := providerCanonicalCode(providerCode)
-
-	// Try active team key first.
-	mk, err := p.activeReader.GetActiveTeamKeyByProvider(canonicalCode)
-	if err != nil {
-		p.errors.Add(1)
-		logger.Error("vault: active team key lookup failed", "error", err)
-		writeJSONError(w, http.StatusServiceUnavailable, "server_error", "VAULT_ERROR", err.Error())
-		return
-	}
 
 	// Protocol type is determined by the URL path provider code — the user's
 	// intent is explicit (e.g. /anthropic/v1/messages → Anthropic protocol).
 	// This is authoritative for both team and personal keys.
 	protocolType = providerToProtocol(canonicalCode)
 
-	if mk != nil {
-		realKey = mk.PlaintextKey
-		virtualKeyID = mk.VirtualKeyID
-		// Use provider-specific base URL if available; fall back to primary slot's base_url.
-		// ProviderBaseURLs is keyed by provider_code as stored in the vault
-		// (may be "Claude", "claude", or "anthropic") — try canonical first.
-		if url, ok := mk.ProviderBaseURLs[canonicalCode]; ok && url != "" {
-			baseURL = url
-		} else if url, ok := mk.ProviderBaseURLs[providerCode]; ok && url != "" {
-			baseURL = url
+	// ── v1.0.2: try provider binding first ─────────────────────────────────
+	// The new model stores per-provider primary key selection in
+	// user_profile_provider_bindings.  If a binding exists, resolve directly.
+	binding, _ := p.activeReader.GetProviderBinding(canonicalCode)
+	if binding != nil {
+		if binding.KeySourceType == "team" {
+			var err error
+			mk, err = p.activeReader.GetTeamKeyByID(binding.KeySourceRef)
+			if err != nil {
+				logger.Warn("vault: team key lookup via binding failed", "vk_id", binding.KeySourceRef, "error", err)
+			}
+			if mk != nil {
+				realKey = mk.PlaintextKey
+				virtualKeyID = mk.VirtualKeyID
+				if url, ok := mk.ProviderBaseURLs[canonicalCode]; ok && url != "" {
+					baseURL = url
+				} else if url, ok := mk.ProviderBaseURLs[providerCode]; ok && url != "" {
+					baseURL = url
+				} else {
+					baseURL = mk.BaseURL
+				}
+			}
 		} else {
-			baseURL = mk.BaseURL
+			// personal key
+			plaintext, _, entryBaseURL, err := p.activeReader.GetPersonalKeyByAlias(binding.KeySourceRef)
+			if err != nil {
+				logger.Warn("vault: personal key lookup via binding failed", "alias", binding.KeySourceRef, "error", err)
+			} else {
+				realKey = plaintext
+				virtualKeyID = "personal:" + binding.KeySourceRef
+				if entryBaseURL != "" {
+					baseURL = entryBaseURL
+				} else {
+					baseURL = providerDefaultBaseURL(canonicalCode)
+				}
+			}
 		}
-	} else {
-		// Fall back to active personal key if its provider matches.
-		cfg, err := p.activeReader.GetActiveKeyConfig()
+	}
+
+	// ── Legacy fallback: active team key → active personal key ─────────────
+	// For backward compatibility with pre-v1.0.2 vaults that don't have the
+	// user_profile_provider_bindings table.
+	if realKey == "" {
+		var err error
+		mk, err = p.activeReader.GetActiveTeamKeyByProvider(canonicalCode)
 		if err != nil {
 			p.errors.Add(1)
-			logger.Error("vault: active key config read failed", "error", err)
+			logger.Error("vault: active team key lookup failed", "error", err)
 			writeJSONError(w, http.StatusServiceUnavailable, "server_error", "VAULT_ERROR", err.Error())
 			return
 		}
-		if cfg != nil && cfg.KeyType == "personal" {
-			supported := len(cfg.Providers) == 0
-			for _, code := range cfg.Providers {
-				// Match by canonical code so "claude" matches "anthropic" and vice-versa.
-				if strings.EqualFold(providerCanonicalCode(code), canonicalCode) {
-					supported = true
-					break
-				}
+
+		if mk != nil {
+			realKey = mk.PlaintextKey
+			virtualKeyID = mk.VirtualKeyID
+			if url, ok := mk.ProviderBaseURLs[canonicalCode]; ok && url != "" {
+				baseURL = url
+			} else if url, ok := mk.ProviderBaseURLs[providerCode]; ok && url != "" {
+				baseURL = url
+			} else {
+				baseURL = mk.BaseURL
 			}
-			if supported {
-				plaintext, pcode, entryBaseURL, err := p.activeReader.GetPersonalKeyByAlias(cfg.KeyRef)
-				if err != nil {
-					p.errors.Add(1)
-					logger.Error("vault: personal key read failed", "alias", cfg.KeyRef, "error", err)
-					writeJSONError(w, http.StatusServiceUnavailable, "server_error", "VAULT_ERROR", err.Error())
-					return
+		} else {
+			cfg, err := p.activeReader.GetActiveKeyConfig()
+			if err != nil {
+				p.errors.Add(1)
+				logger.Error("vault: active key config read failed", "error", err)
+				writeJSONError(w, http.StatusServiceUnavailable, "server_error", "VAULT_ERROR", err.Error())
+				return
+			}
+			if cfg != nil && cfg.KeyType == "personal" {
+				supported := len(cfg.Providers) == 0
+				for _, code := range cfg.Providers {
+					if strings.EqualFold(providerCanonicalCode(code), canonicalCode) {
+						supported = true
+						break
+					}
 				}
-				realKey = plaintext
-				virtualKeyID = "personal:" + cfg.KeyRef
-				// Use user-set base_url if available; fall back to provider default.
-				// When pcode is empty, use the URL path's canonicalCode for
-				// base URL resolution too.
-				if entryBaseURL != "" {
-					baseURL = entryBaseURL
-				} else if pcode != "" {
-					baseURL = providerDefaultBaseURL(pcode)
-				} else {
-					baseURL = providerDefaultBaseURL(canonicalCode)
+				if supported {
+					plaintext, pcode, entryBaseURL, err := p.activeReader.GetPersonalKeyByAlias(cfg.KeyRef)
+					if err != nil {
+						p.errors.Add(1)
+						logger.Error("vault: personal key read failed", "alias", cfg.KeyRef, "error", err)
+						writeJSONError(w, http.StatusServiceUnavailable, "server_error", "VAULT_ERROR", err.Error())
+						return
+					}
+					realKey = plaintext
+					virtualKeyID = "personal:" + cfg.KeyRef
+					if entryBaseURL != "" {
+						baseURL = entryBaseURL
+					} else if pcode != "" {
+						baseURL = providerDefaultBaseURL(pcode)
+					} else {
+						baseURL = providerDefaultBaseURL(canonicalCode)
+					}
 				}
 			}
 		}
@@ -387,6 +433,9 @@ func (p *Proxy) serveRoute(w http.ResponseWriter, r *http.Request, route *vkeys.
 	inner := p.transport
 	if inner == nil {
 		inner = http.DefaultTransport
+		logger.Debug("using default transport (no custom transport set)")
+	} else {
+		logger.Debug("using custom transport (upstream proxy)")
 	}
 	var transport http.RoundTripper = inner
 	if !streaming {
@@ -396,6 +445,8 @@ func (p *Proxy) serveRoute(w http.ResponseWriter, r *http.Request, route *vkeys.
 			maxTimeout: p.UpstreamTimeout,
 		}
 	}
+
+	logger.Debug("forwarding request", "base_url", route.BaseURL, "path", r.URL.Path, "provider_code", route.ProviderCode)
 
 	// 9. Build and execute reverse proxy.
 	rp := &httputil.ReverseProxy{

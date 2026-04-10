@@ -133,7 +133,7 @@ func main() {
 	// Build the outbound transport for upstream providers (optional).
 	dataHandler := sup.Handler()
 	if t := buildTransport(cfg.UpstreamProxy.URL); t != nil {
-		_ = t // transport is set on proxy.Proxy inside buildGeneration; see supervisor.go
+		sup.SetTransport(t)
 	}
 
 	// 7. Build and start the HTTP server.

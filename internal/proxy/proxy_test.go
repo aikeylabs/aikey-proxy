@@ -459,12 +459,14 @@ func TestExtractProviderFromPath(t *testing.T) {
 
 // mockActiveVault implements both VaultGetter and ActiveKeyReader for testing.
 type mockActiveVault struct {
-	secrets         map[string]string
-	activeKeyConfig *vault.ActiveKeyConfig
-	activeTeamKeys  map[string]*vault.ManagedKey // keyed by lowercase provider code
-	personalAlias   string
-	personalText    string
-	personalProv    string
+	secrets          map[string]string
+	activeKeyConfig  *vault.ActiveKeyConfig
+	activeTeamKeys   map[string]*vault.ManagedKey // keyed by lowercase provider code
+	personalAlias    string
+	personalText     string
+	personalProv     string
+	personalBaseURL  string
+	providerBindings map[string]*vault.ProviderBinding // keyed by lowercase provider code
 }
 
 func (m *mockActiveVault) GetSecret(alias string) (string, error) {
@@ -492,9 +494,32 @@ func (m *mockActiveVault) GetActiveTeamKeyByProvider(providerCode string) (*vaul
 
 func (m *mockActiveVault) GetPersonalKeyByAlias(alias string) (string, string, string, error) {
 	if alias == m.personalAlias {
-		return m.personalText, m.personalProv, "", nil
+		return m.personalText, m.personalProv, m.personalBaseURL, nil
 	}
 	return "", "", "", fmt.Errorf("personal key %q not found", alias)
+}
+
+func (m *mockActiveVault) GetTeamKeyByID(virtualKeyID string) (*vault.ManagedKey, error) {
+	// Search all team keys for the specific ID.
+	for _, mk := range m.activeTeamKeys {
+		if mk.VirtualKeyID == virtualKeyID {
+			return mk, nil
+		}
+	}
+	return nil, nil
+}
+
+func (m *mockActiveVault) GetProviderBinding(providerCode string) (*vault.ProviderBinding, error) {
+	// v1.0.2: mock returns nil by default to exercise the legacy fallback path.
+	// Tests that want to exercise binding-based routing can set providerBindings.
+	if m.providerBindings == nil {
+		return nil, nil
+	}
+	b, ok := m.providerBindings[strings.ToLower(providerCode)]
+	if !ok {
+		return nil, nil
+	}
+	return b, nil
 }
 
 func setupTestProxyWithActive(t *testing.T, av *mockActiveVault) *Proxy {
@@ -622,5 +647,128 @@ func TestHandlePathPrefix_ProviderBaseURLUsed(t *testing.T) {
 	}
 	if capturedPath != "/v1/messages" {
 		t.Errorf("upstream path = %q, want /v1/messages", capturedPath)
+	}
+}
+
+// ── v1.0.2: Provider binding-based routing tests ─────────────────────────────
+
+func TestHandlePathPrefix_BindingPersonalKey(t *testing.T) {
+	var capturedAuth string
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		capturedAuth = r.Header.Get("x-api-key")
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		w.Write([]byte(`{"id":"m","type":"message","content":[],"model":"c","stop_reason":"end_turn","usage":{"input_tokens":1,"output_tokens":1}}`))
+	}))
+	defer upstream.Close()
+
+	av := &mockActiveVault{
+		activeKeyConfig: nil,
+		activeTeamKeys:  map[string]*vault.ManagedKey{},
+		personalAlias:   "my-claude",
+		personalText:    "sk-ant-binding-test",
+		personalProv:    "anthropic",
+		personalBaseURL: upstream.URL,
+		providerBindings: map[string]*vault.ProviderBinding{
+			"anthropic": {
+				ProviderCode:  "anthropic",
+				KeySourceType: "personal",
+				KeySourceRef:  "my-claude",
+			},
+		},
+	}
+	p := setupTestProxyWithActive(t, av)
+
+	body2 := `{"model":"claude-3","messages":[{"role":"user","content":"hi"}],"max_tokens":10}`
+	req := httptest.NewRequest(http.MethodPost, "/anthropic/v1/messages", strings.NewReader(body2))
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+	p.Handle(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Errorf("expected 200, got %d — body: %s", w.Code, w.Body.String())
+	}
+	if capturedAuth != "sk-ant-binding-test" {
+		t.Errorf("upstream x-api-key = %q, want sk-ant-binding-test", capturedAuth)
+	}
+}
+
+func TestHandlePathPrefix_BindingTeamKey(t *testing.T) {
+	var capturedPath2 string
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		capturedPath2 = r.URL.Path
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		w.Write([]byte(`{"id":"m","type":"message","content":[],"model":"c","stop_reason":"end_turn","usage":{"input_tokens":1,"output_tokens":1}}`))
+	}))
+	defer upstream.Close()
+
+	av := &mockActiveVault{
+		activeKeyConfig: nil,
+		activeTeamKeys: map[string]*vault.ManagedKey{
+			"anthropic": {
+				VirtualKeyID:     "vk_team_abc",
+				ProviderCode:     "anthropic",
+				ProtocolType:     "anthropic",
+				BaseURL:          upstream.URL,
+				PlaintextKey:     "sk-ant-team-real",
+				ProviderBaseURLs: map[string]string{"anthropic": upstream.URL},
+			},
+		},
+		providerBindings: map[string]*vault.ProviderBinding{
+			"anthropic": {
+				ProviderCode:  "anthropic",
+				KeySourceType: "team",
+				KeySourceRef:  "vk_team_abc",
+			},
+		},
+	}
+	p := setupTestProxyWithActive(t, av)
+
+	body2 := `{"model":"claude-3","messages":[{"role":"user","content":"hi"}],"max_tokens":10}`
+	req := httptest.NewRequest(http.MethodPost, "/anthropic/v1/messages", strings.NewReader(body2))
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+	p.Handle(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Errorf("expected 200, got %d — body: %s", w.Code, w.Body.String())
+	}
+	if capturedPath2 != "/v1/messages" {
+		t.Errorf("upstream path = %q, want /v1/messages", capturedPath2)
+	}
+}
+
+func TestHandlePathPrefix_BindingFallsBackToLegacy(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		w.Write([]byte(`{"id":"m","type":"message","content":[],"model":"c","stop_reason":"end_turn","usage":{"input_tokens":1,"output_tokens":1}}`))
+	}))
+	defer upstream.Close()
+
+	av := &mockActiveVault{
+		providerBindings: nil, // no bindings — should use legacy path
+		activeTeamKeys: map[string]*vault.ManagedKey{
+			"anthropic": {
+				VirtualKeyID:     "vk_legacy",
+				ProviderCode:     "anthropic",
+				ProtocolType:     "anthropic",
+				BaseURL:          upstream.URL,
+				PlaintextKey:     "sk-ant-legacy",
+				ProviderBaseURLs: map[string]string{"anthropic": upstream.URL},
+			},
+		},
+	}
+	p := setupTestProxyWithActive(t, av)
+
+	body2 := `{"model":"claude-3","messages":[{"role":"user","content":"hi"}],"max_tokens":10}`
+	req := httptest.NewRequest(http.MethodPost, "/anthropic/v1/messages", strings.NewReader(body2))
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+	p.Handle(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Errorf("expected 200, got %d — body: %s", w.Code, w.Body.String())
 	}
 }

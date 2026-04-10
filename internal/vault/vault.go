@@ -418,6 +418,105 @@ func (r *Reader) GetActiveTeamKeyByProvider(providerCode string) (*ManagedKey, e
 	}, nil
 }
 
+// GetTeamKeyByID returns the decrypted team key for a specific virtual_key_id.
+// Unlike GetActiveTeamKeyByProvider, this does not filter by local_state — the
+// provider binding already tells us which key to use.
+// Returns nil if the key is not found or has no ciphertext.
+func (r *Reader) GetTeamKeyByID(virtualKeyID string) (*ManagedKey, error) {
+	var provCode, protType, baseURL string
+	var nonce, ciphertext []byte
+	var providerBaseURLsJSON *string
+	var orgID, seatID string
+	var ownerAccountID *string
+
+	err := r.db.QueryRow(`
+		SELECT provider_code, protocol_type, base_url,
+		       provider_key_nonce, provider_key_ciphertext, provider_base_urls,
+		       org_id, seat_id, owner_account_id
+		FROM managed_virtual_keys_cache
+		WHERE virtual_key_id = ?
+		  AND key_status = 'active'
+		  AND provider_key_ciphertext IS NOT NULL
+	`, virtualKeyID).Scan(
+		&provCode, &protType, &baseURL, &nonce, &ciphertext, &providerBaseURLsJSON,
+		&orgID, &seatID, &ownerAccountID,
+	)
+	if err == sql.ErrNoRows {
+		return nil, nil
+	}
+	if err != nil {
+		// Table may not exist on older vaults.
+		if strings.Contains(err.Error(), "no such table") {
+			return nil, nil
+		}
+		return nil, fmt.Errorf("query team key %q: %w", virtualKeyID, err)
+	}
+
+	plaintext, decErr := Decrypt(r.derivedKey, nonce, ciphertext)
+	if decErr != nil {
+		return nil, fmt.Errorf("decrypt team key %s: %w", virtualKeyID, decErr)
+	}
+
+	providerBaseURLs := make(map[string]string)
+	if providerBaseURLsJSON != nil && *providerBaseURLsJSON != "" {
+		_ = json.Unmarshal([]byte(*providerBaseURLsJSON), &providerBaseURLs)
+	}
+
+	var accountID string
+	if ownerAccountID != nil {
+		accountID = *ownerAccountID
+	}
+
+	return &ManagedKey{
+		VirtualKeyID:     virtualKeyID,
+		ProviderCode:     provCode,
+		ProtocolType:     protType,
+		BaseURL:          baseURL,
+		PlaintextKey:     string(plaintext),
+		OrgID:            orgID,
+		SeatID:           seatID,
+		OwnerAccountID:   accountID,
+		ProviderBaseURLs: providerBaseURLs,
+	}, nil
+}
+
+// ProviderBinding represents a row from user_profile_provider_bindings (v1.0.2).
+// It maps a provider to the key source that is currently Primary for the
+// implicit default profile.
+type ProviderBinding struct {
+	ProviderCode  string
+	KeySourceType string // "personal" or "team"
+	KeySourceRef  string // alias (personal) or virtual_key_id (team)
+}
+
+// GetProviderBinding reads the current provider binding for the given provider
+// from user_profile_provider_bindings (profile_id = 'default').
+// Returns nil if no binding exists for that provider or the table does not exist.
+func (r *Reader) GetProviderBinding(providerCode string) (*ProviderBinding, error) {
+	var sourceType, sourceRef string
+	err := r.db.QueryRow(
+		`SELECT key_source_type, key_source_ref
+		   FROM user_profile_provider_bindings
+		  WHERE profile_id = 'default' AND provider_code = ?`,
+		providerCode,
+	).Scan(&sourceType, &sourceRef)
+	if err == sql.ErrNoRows {
+		return nil, nil
+	}
+	if err != nil {
+		// Table may not exist on pre-v1.0.2 vaults — treat as "no binding".
+		if strings.Contains(err.Error(), "no such table") {
+			return nil, nil
+		}
+		return nil, fmt.Errorf("read provider binding for %q: %w", providerCode, err)
+	}
+	return &ProviderBinding{
+		ProviderCode:  providerCode,
+		KeySourceType: sourceType,
+		KeySourceRef:  sourceRef,
+	}, nil
+}
+
 // Close releases resources and clears cached secrets.
 func (r *Reader) Close() error {
 	r.cache.clear()

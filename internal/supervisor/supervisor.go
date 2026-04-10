@@ -157,6 +157,8 @@ type Supervisor struct {
 	password   string
 	version    string // build version, passed to proxy for audit metadata
 
+	transport http.RoundTripper // optional upstream proxy transport; nil = default
+
 	active    atomic.Pointer[generation]
 	reloadMu  sync.Mutex // serialise concurrent reload requests
 	genID     atomic.Int64
@@ -194,6 +196,16 @@ func New(cfg *config.Config, configPath, password, version string) (*Supervisor,
 	)
 	go s.managedKeySyncLoop()
 	return s, nil
+}
+
+// SetTransport sets the outbound RoundTripper used by all generations.
+// Must be called before any requests are served (right after New).
+func (s *Supervisor) SetTransport(t http.RoundTripper) {
+	s.transport = t
+	// Also apply to the already-running initial generation.
+	if gen := s.active.Load(); gen != nil {
+		gen.proxy.SetTransport(t)
+	}
 }
 
 // managedKeySyncLoop runs in a background goroutine and periodically merges
@@ -600,6 +612,9 @@ func (s *Supervisor) buildGeneration() (*generation, error) {
 	p := proxy.New(vaultReader, registry, providers, collector, s.ctx)
 	p.SlowRequestMs = int64(s.cfg.Log.SlowRequestMs)
 	p.VerySlowRequestMs = int64(s.cfg.Log.VerySlowRequestMs)
+	if s.transport != nil {
+		p.SetTransport(s.transport)
+	}
 
 	// Attach usage reporter if collector_url is configured.
 	var reporter *events.Reporter
