@@ -429,7 +429,7 @@ func personalProviderBaseURL(code string) string {
 	case "google", "gemini":
 		return "https://generativelanguage.googleapis.com"
 	case "kimi", "moonshot":
-		return "https://api.moonshot.cn/v1"
+		return "https://api.kimi.com/coding"
 	case "deepseek":
 		return "https://api.deepseek.com/v1"
 	default:

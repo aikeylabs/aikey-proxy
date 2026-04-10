@@ -57,7 +57,7 @@ var knownProviders = []struct {
 	{"anthropic", "https://api.anthropic.com"},
 	{"openai", "https://api.openai.com/v1"},
 	{"deepseek", "https://api.deepseek.com/v1"},
-	{"kimi", "https://api.moonshot.cn/v1"},
+	{"kimi", "https://api.kimi.com/coding"},
 	{"google", "https://generativelanguage.googleapis.com"},
 }
 
@@ -445,7 +445,7 @@ func providerDefaultBaseURL(code string) string {
 	case "google", "gemini":
 		return "https://generativelanguage.googleapis.com"
 	case "kimi", "moonshot":
-		return "https://api.moonshot.cn/v1"
+		return "https://api.kimi.com/coding"
 	case "deepseek":
 		return "https://api.deepseek.com/v1"
 	default:

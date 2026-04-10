@@ -23,10 +23,18 @@ func applyBaseURL(req *http.Request, baseURL string) error {
 	req.Host = target.Host
 
 	// Prepend base URL path prefix (e.g., /v1) if present.
+	// Why: skip prepend if request path already starts with the prefix to avoid
+	// double-prefix like /v1/v1/chat/completions. This happens when path-prefix
+	// routing strips "/openai" from "/openai/v1/..." leaving "/v1/..." and the
+	// base_url is "https://api.openai.com/v1".
+	// Ref: bugfix/20260406-ux-feedback-p0-p1-fixes.md
 	if target.Path != "" && target.Path != "/" {
-		req.URL.Path = strings.TrimRight(target.Path, "/") + req.URL.Path
-		if req.URL.RawPath != "" {
-			req.URL.RawPath = strings.TrimRight(target.Path, "/") + req.URL.RawPath
+		prefix := strings.TrimRight(target.Path, "/")
+		if !strings.HasPrefix(req.URL.Path, prefix+"/") && req.URL.Path != prefix {
+			req.URL.Path = prefix + req.URL.Path
+			if req.URL.RawPath != "" {
+				req.URL.RawPath = prefix + req.URL.RawPath
+			}
 		}
 	}
 

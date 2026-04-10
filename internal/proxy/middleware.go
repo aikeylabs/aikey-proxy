@@ -96,13 +96,21 @@ func providerDefaultBaseURL(providerCode string) string {
 	case "anthropic", "claude":
 		return "https://api.anthropic.com"
 	case "openai", "gpt", "chatgpt":
-		return "https://api.openai.com"
+		// Why: OpenAI SDK clients (including Codex) treat base_url as already
+		// containing /v1, sending paths like /responses or /chat/completions
+		// without the /v1 prefix. Without /v1 here, requests hit wrong endpoints.
+		// Ref: bugfix/20260406-ux-feedback-p0-p1-fixes.md
+		return "https://api.openai.com/v1"
 	case "google", "gemini":
 		return "https://generativelanguage.googleapis.com"
 	case "kimi", "moonshot":
-		return "https://api.moonshot.cn"
+		// Why: Kimi Coding CLI uses api.kimi.com/coding/v1 (not api.moonshot.cn).
+		// Base URL excludes /v1 because Kimi CLI sends paths like /v1/chat/completions
+		// and applyBaseURL() will prepend /coding → /coding/v1/chat/completions.
+		return "https://api.kimi.com/coding"
 	case "deepseek":
-		return "https://api.deepseek.com"
+		// Why: same reason as openai — deepseek SDK expects /v1 in base_url.
+		return "https://api.deepseek.com/v1"
 	default:
 		return ""
 	}
