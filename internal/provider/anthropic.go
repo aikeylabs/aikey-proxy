@@ -57,7 +57,9 @@ func (a *Anthropic) ExtractTokens(data []byte, streaming bool) (int, int) {
 	// Streaming: scan SSE lines.
 	var inputTokens, outputTokens int
 	for _, line := range bytes.Split(data, []byte("\n")) {
-		line = bytes.TrimPrefix(bytes.TrimSpace(line), []byte("data: "))
+		line = bytes.TrimSpace(line)
+		line = bytes.TrimPrefix(line, []byte("data: "))
+		line = bytes.TrimPrefix(line, []byte("data:"))
 		if len(line) == 0 || line[0] != '{' {
 			continue
 		}

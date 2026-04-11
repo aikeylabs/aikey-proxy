@@ -111,6 +111,19 @@ func TestKimi_ExtractTokens_DelegatesToOpenAI(t *testing.T) {
 	}
 }
 
+func TestOpenAI_ExtractTokens_Streaming_NoSpaceAfterData(t *testing.T) {
+	// KIMI/Moonshot sends "data:{...}" without space after colon.
+	sse := "" +
+		"data:{\"id\":\"chatcmpl-1\",\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}\n\n" +
+		"data:{\"id\":\"chatcmpl-1\",\"choices\":[],\"usage\":{\"prompt_tokens\":9,\"completion_tokens\":5}}\n\n" +
+		"data: [DONE]\n\n"
+
+	in, out := (&OpenAI{}).ExtractTokens([]byte(sse), true)
+	if in != 9 || out != 5 {
+		t.Fatalf("got (%d,%d), want (9,5)", in, out)
+	}
+}
+
 func TestOpenAI_ExtractTokens_Streaming_ZeroPromptTokens(t *testing.T) {
 	// Edge case: prompt_tokens=0 (e.g. fully cached request).
 	// Must still extract completion_tokens, not return (0,0).

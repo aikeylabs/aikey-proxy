@@ -50,7 +50,13 @@ func (o *OpenAI) ExtractTokens(data []byte, streaming bool) (int, int) {
 	// The usage object appears in the final data chunk before [DONE]
 	// (requires stream_options.include_usage=true in the request).
 	for _, line := range bytes.Split(data, []byte("\n")) {
-		line = bytes.TrimPrefix(bytes.TrimSpace(line), []byte("data: "))
+		line = bytes.TrimSpace(line)
+		// Strip SSE "data:" prefix. Some providers use "data: " (with space,
+		// per SSE spec), others use "data:" (no space, e.g. KIMI/Moonshot).
+		// Why both: SSE spec says the space after colon is optional;
+		// TrimPrefix("data: ") misses "data:{" leaving the line unparsed.
+		line = bytes.TrimPrefix(line, []byte("data: "))
+		line = bytes.TrimPrefix(line, []byte("data:"))
 		if len(line) == 0 || line[0] != '{' {
 			continue
 		}
