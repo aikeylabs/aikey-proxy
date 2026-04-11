@@ -111,6 +111,28 @@ func TestKimi_ExtractTokens_DelegatesToOpenAI(t *testing.T) {
 	}
 }
 
+func TestOpenAI_ExtractTokens_Streaming_ZeroPromptTokens(t *testing.T) {
+	// Edge case: prompt_tokens=0 (e.g. fully cached request).
+	// Must still extract completion_tokens, not return (0,0).
+	sse := "" +
+		"data: {\"id\":\"chatcmpl-1\",\"choices\":[{\"delta\":{\"content\":\"cached\"}}]}\n\n" +
+		"data: {\"id\":\"chatcmpl-1\",\"choices\":[],\"usage\":{\"prompt_tokens\":0,\"completion_tokens\":8}}\n\n" +
+		"data: [DONE]\n\n"
+
+	in, out := (&OpenAI{}).ExtractTokens([]byte(sse), true)
+	if in != 0 || out != 8 {
+		t.Fatalf("got (%d,%d), want (0,8)", in, out)
+	}
+}
+
+func TestOpenAI_ExtractTokens_NonStreaming_ZeroPromptTokens(t *testing.T) {
+	body := []byte(`{"usage":{"prompt_tokens":0,"completion_tokens":5}}`)
+	in, out := (&OpenAI{}).ExtractTokens(body, false)
+	if in != 0 || out != 5 {
+		t.Fatalf("got (%d,%d), want (0,5)", in, out)
+	}
+}
+
 // ---- Generic delegates to OpenAI ----
 
 func TestGeneric_ExtractTokens_DelegatesToOpenAI(t *testing.T) {

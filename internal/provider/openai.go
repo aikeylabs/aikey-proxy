@@ -29,28 +29,36 @@ func (o *OpenAI) RewriteRequest(req *http.Request, realKey string, baseURL strin
 // Streaming: requires stream_options.include_usage=true; the last data chunk
 // before [DONE] carries the same usage object.
 func (o *OpenAI) ExtractTokens(data []byte, streaming bool) (int, int) {
-	type usagePayload struct {
-		Usage struct {
-			PromptTokens     int `json:"prompt_tokens"`
-			CompletionTokens int `json:"completion_tokens"`
-		} `json:"usage"`
+	// usageChunk uses a pointer for Usage so we can distinguish "field absent"
+	// (nil) from "field present with zero values" (e.g. prompt_tokens: 0).
+	type usageData struct {
+		PromptTokens     int `json:"prompt_tokens"`
+		CompletionTokens int `json:"completion_tokens"`
+	}
+	type usageChunk struct {
+		Usage *usageData `json:"usage"`
 	}
 	if !streaming {
-		var resp usagePayload
-		if json.Unmarshal(data, &resp) == nil {
+		var resp usageChunk
+		if json.Unmarshal(data, &resp) == nil && resp.Usage != nil {
 			return resp.Usage.PromptTokens, resp.Usage.CompletionTokens
 		}
 		return 0, 0
 	}
 
 	// Streaming: scan SSE lines for a chunk that contains usage.
+	// The usage object appears in the final data chunk before [DONE]
+	// (requires stream_options.include_usage=true in the request).
 	for _, line := range bytes.Split(data, []byte("\n")) {
 		line = bytes.TrimPrefix(bytes.TrimSpace(line), []byte("data: "))
 		if len(line) == 0 || line[0] != '{' {
 			continue
 		}
-		var chunk usagePayload
-		if json.Unmarshal(line, &chunk) == nil && chunk.Usage.PromptTokens > 0 {
+		var chunk usageChunk
+		// Why pointer check (Usage != nil) instead of PromptTokens > 0:
+		// some providers return prompt_tokens=0 for fully cached requests;
+		// the old > 0 check silently dropped those as "no usage".
+		if json.Unmarshal(line, &chunk) == nil && chunk.Usage != nil {
 			return chunk.Usage.PromptTokens, chunk.Usage.CompletionTokens
 		}
 	}

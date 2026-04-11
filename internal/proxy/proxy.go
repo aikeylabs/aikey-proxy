@@ -397,6 +397,14 @@ func (p *Proxy) serveRoute(w http.ResponseWriter, r *http.Request, route *vkeys.
 	// 6. Detect streaming.
 	streaming := isStreamingRequest(r)
 
+	// 6a. Inject stream_options.include_usage=true for OpenAI-compatible providers.
+	// Why: OpenAI-compatible streaming responses only include token usage in the
+	// final SSE chunk when this option is set. Without it, all token counts are 0.
+	// Anthropic uses a different mechanism and does not need this injection.
+	if streaming && prov.Name() != "anthropic" {
+		injectStreamUsageOption(r)
+	}
+
 	// 7. Store metadata in context for post-processing.
 	// For streaming requests, bridge the HTTP/1.1 close-notifier to a context
 	// so the streamDrainer can abort the upstream call when the client
