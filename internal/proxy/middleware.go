@@ -104,9 +104,10 @@ func providerDefaultBaseURL(providerCode string) string {
 	case "google", "gemini":
 		return "https://generativelanguage.googleapis.com"
 	case "kimi", "moonshot":
-		// Why: Kimi Coding CLI uses api.kimi.com/coding/v1 (not api.moonshot.cn).
-		// Base URL excludes /v1 because Kimi CLI sends paths like /v1/chat/completions
-		// and applyBaseURL() will prepend /coding → /coding/v1/chat/completions.
+		// Why no /v1: path-prefix routing strips "/kimi" leaving "/v1/chat/completions".
+		// applyBaseURL prepends the base path, so /coding + /v1/... = /coding/v1/...
+		// If we used /coding/v1 here, it would become /coding/v1/v1/... (double v1)
+		// because the duplicate-prefix check only matches identical prefixes.
 		return "https://api.kimi.com/coding"
 	case "deepseek":
 		// Why: same reason as openai — deepseek SDK expects /v1 in base_url.

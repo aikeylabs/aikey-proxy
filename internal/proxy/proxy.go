@@ -397,11 +397,12 @@ func (p *Proxy) serveRoute(w http.ResponseWriter, r *http.Request, route *vkeys.
 	// 6. Detect streaming.
 	streaming := isStreamingRequest(r)
 
-	// 6a. Inject stream_options.include_usage=true for OpenAI-compatible providers.
+	// 6a. Inject stream_options.include_usage=true for /chat/completions only.
 	// Why: OpenAI-compatible streaming responses only include token usage in the
 	// final SSE chunk when this option is set. Without it, all token counts are 0.
-	// Anthropic uses a different mechanism and does not need this injection.
-	if streaming && prov.Name() != "anthropic" {
+	// Only /chat/completions supports this; newer endpoints like /responses
+	// (used by Codex) reject it as unknown_parameter.
+	if streaming && prov.Name() != "anthropic" && strings.HasSuffix(r.URL.Path, "/chat/completions") {
 		injectStreamUsageOption(r)
 	}
 
