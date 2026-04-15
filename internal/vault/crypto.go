@@ -3,9 +3,11 @@ package vault
 import (
 	"crypto/aes"
 	"crypto/cipher"
+	"crypto/rand"
 	"crypto/subtle"
 	"encoding/binary"
 	"fmt"
+	"io"
 
 	"golang.org/x/crypto/argon2"
 )
@@ -64,6 +66,33 @@ func Decrypt(key []byte, nonce []byte, ciphertext []byte) ([]byte, error) {
 	}
 
 	return plaintext, nil
+}
+
+// Encrypt encrypts plaintext using AES-256-GCM with a random nonce.
+// Returns (nonce, ciphertext) for storage. The caller stores both.
+// Symmetric to Decrypt(): Decrypt(key, nonce, ciphertext) recovers plaintext.
+func Encrypt(key []byte, plaintext []byte) (nonce []byte, ciphertext []byte, err error) {
+	if len(key) != KeySize {
+		return nil, nil, fmt.Errorf("key must be %d bytes, got %d", KeySize, len(key))
+	}
+
+	block, err := aes.NewCipher(key)
+	if err != nil {
+		return nil, nil, fmt.Errorf("create cipher: %w", err)
+	}
+
+	gcm, err := cipher.NewGCM(block)
+	if err != nil {
+		return nil, nil, fmt.Errorf("create GCM: %w", err)
+	}
+
+	nonce = make([]byte, gcm.NonceSize()) // 12 bytes
+	if _, err := io.ReadFull(rand.Reader, nonce); err != nil {
+		return nil, nil, fmt.Errorf("generate nonce: %w", err)
+	}
+
+	ciphertext = gcm.Seal(nil, nonce, plaintext, nil)
+	return nonce, ciphertext, nil
 }
 
 // ParseU32LE reads a little-endian uint32 from a byte slice (for KDF params stored in vault).

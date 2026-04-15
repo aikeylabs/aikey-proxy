@@ -195,6 +195,25 @@ proxychains4 ./bin/aikey-proxy --config aikey-proxy.yaml
 | `GET /status` | Uptime, virtual key count, vault status |
 | `GET /metrics` | Per virtual-key / provider request statistics |
 
+## OAuth API (via [aikey-auth-broker](../aikey-auth-broker/README.md))
+
+Provider OAuth account management — login, token lifecycle, credential resolution.
+
+| Endpoint | Method | Description |
+|----------|--------|-------------|
+| `/oauth/login` | POST | Start login (returns auth_url) or submit code (returns account) |
+| `/oauth/status` | GET | Poll login session status |
+| `/oauth/poll` | POST | Poll Device Code completion (Kimi) |
+| `/oauth/logout` | POST | Remove account and tokens |
+| `/oauth/accounts` | GET | List all OAuth accounts |
+| `/oauth/accounts/{id}/health` | GET | Token health (valid/expiring/expired) |
+| `/oauth/accounts/{id}/display-identity` | POST | Set display name (Kimi: no email) |
+
+OAuth credentials inject provider-specific persona headers during proxy forwarding:
+- **Claude**: `anthropic-beta` + `X-Stainless-*` + `X-Claude-Code-Session-Id` + `metadata.user_id`
+- **Codex**: `originator: opencode` + `ChatGPT-Account-Id`
+- **Kimi**: `X-Msh-Platform: kimi_cli` + `User-Agent: KimiCLI/1.24.0`
+
 ## Error Codes
 
 | Code | HTTP | Description |
@@ -204,6 +223,9 @@ proxychains4 ./bin/aikey-proxy --config aikey-proxy.yaml
 | `POLICY_MODEL_FORBIDDEN` | 403 | Model not in allowlist |
 | `VAULT_ERROR` | 502 | Cannot find matching real key in vault |
 | `UPSTREAM_ERROR` | 502 | Cannot connect to upstream provider |
+| `OAUTH_NOT_AVAILABLE` | 503 | OAuth broker not initialized |
+| `OAUTH_TOKEN_EXPIRED` | 401 | OAuth token expired, re-login required |
+| `OAUTH_RESOLVE_FAILED` | 503 | Cannot resolve OAuth credential |
 
 ## Project Structure
 
@@ -211,7 +233,7 @@ proxychains4 ./bin/aikey-proxy --config aikey-proxy.yaml
 cmd/aikey-proxy/main.go      Entry point, component wiring, graceful shutdown
 internal/
   config/                    YAML config parsing and validation
-  vault/                     Rust vault compatible reader (read-only)
+  vault/                     Rust vault compatible reader + OAuth token/account stores
   vkeys/                     Virtual key registry (RWMutex)
   provider/                  OpenAI / Anthropic / Generic adapters
   proxy/                     Core reverse proxy

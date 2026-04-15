@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"flag"
 	"fmt"
 	"log/slog"
@@ -17,8 +18,12 @@ import (
 	"github.com/AiKeyLabs/aikey-proxy/internal/admin"
 	"github.com/AiKeyLabs/aikey-proxy/internal/config"
 	"github.com/AiKeyLabs/aikey-proxy/internal/observability"
+	"github.com/AiKeyLabs/aikey-proxy/internal/proxy"
 	"github.com/AiKeyLabs/aikey-proxy/internal/server"
 	"github.com/AiKeyLabs/aikey-proxy/internal/supervisor"
+	"github.com/AiKeyLabs/aikey-proxy/internal/vault"
+
+	broker "github.com/AiKeyLabs/aikey-auth-broker"
 )
 
 var version = "dev"
@@ -123,6 +128,26 @@ func main() {
 		"listen", ln.Addr(),
 	)
 
+	// 5b. Build OAuth broker (embedded, uses vault stores).
+	//     Reuse the supervisor's vault connection to avoid double-open conflicts.
+	brokerVault := sup.VaultReader()
+	var oauthHandler server.RouteRegistrar
+	if brokerVault != nil {
+		tokenStore := vault.NewTokenStore(brokerVault.DB(), brokerVault.DerivedKey())
+		accountStore := vault.NewAccountStore(brokerVault.DB())
+
+		// Inject ImpersonateChrome HTTP client for Claude token endpoint (Cloudflare bypass).
+		broker.SetHTTPClient(vault.NewImpersonateChromeHTTPClient())
+
+		brk := broker.NewEmbedded(tokenStore, accountStore)
+		oauthHandler = broker.NewHandler(brk)
+		// Wire broker into supervisor so all proxy generations can resolve OAuth credentials
+		sup.SetBroker(&brokerAdapter{brk})
+		slog.Info("OAuth broker initialized")
+	} else {
+		slog.Warn("OAuth broker disabled: vault not available")
+	}
+
 	// 6. Build the admin handler, wiring Supervisor callbacks.
 	adminHandler := admin.NewHandler(cfg, sup.Registry(), sup.EventStore())
 	adminHandler.TotalRequestsFn = sup.TotalRequests
@@ -137,7 +162,7 @@ func main() {
 	}
 
 	// 7. Build and start the HTTP server.
-	srv := server.New(ln, dataHandler, adminHandler)
+	srv := server.New(ln, dataHandler, adminHandler, oauthHandler)
 
 	// Handle graceful shutdown.
 	sigCh := make(chan os.Signal, 1)
@@ -235,4 +260,33 @@ func setupTextLogging(level slog.Level) {
 	slog.SetDefault(slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{
 		Level: level,
 	})))
+}
+
+// brokerAdapter adapts broker.EmbeddedBroker to proxy.OAuthBroker interface.
+// Needed because broker uses typed AccountStatus while proxy uses plain string.
+type brokerAdapter struct {
+	inner *broker.EmbeddedBroker
+}
+
+func (a *brokerAdapter) EnsureFresh(ctx context.Context, accountID string) error {
+	return a.inner.EnsureFresh(ctx, accountID)
+}
+
+func (a *brokerAdapter) ResolveCredential(ctx context.Context, accountID string) (*proxy.OAuthCredential, error) {
+	cred, err := a.inner.ResolveCredential(ctx, accountID)
+	if err != nil {
+		return nil, err
+	}
+	return &proxy.OAuthCredential{
+		AccessToken: cred.AccessToken,
+		Provider:    cred.Provider,
+		AccountID:   cred.AccountID,
+		ExpiresAt:   cred.ExpiresAt,
+		Identity:    cred.Identity,
+	}, nil
+}
+
+func (a *brokerAdapter) GetAccountStatus(ctx context.Context, accountID string) (string, error) {
+	status, err := a.inner.GetAccountStatus(ctx, accountID)
+	return string(status), err
 }

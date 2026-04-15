@@ -8,6 +8,7 @@ import (
 	"log/slog"
 	"net/http"
 	"net/http/httputil"
+	"net/url"
 	"strings"
 	"sync/atomic"
 	"time"
@@ -38,11 +39,34 @@ type ActiveKeyReader interface {
 	GetTeamKeyByID(virtualKeyID string) (*vault.ManagedKey, error)
 }
 
+// OAuthBroker is the minimal interface the proxy data-plane needs from the broker.
+// Defined here (not imported from broker module) to keep proxy decoupled from
+// broker implementation. The broker.EmbeddedBroker satisfies this interface.
+type OAuthBroker interface {
+	// EnsureFresh ensures the token for accountID is valid (refreshes if needed).
+	EnsureFresh(ctx context.Context, accountID string) error
+	// ResolveCredential returns the decrypted access_token for request injection.
+	ResolveCredential(ctx context.Context, accountID string) (*OAuthCredential, error)
+	// GetAccountStatus returns the lifecycle status (active/reauth_required/...).
+	GetAccountStatus(ctx context.Context, accountID string) (string, error)
+}
+
+// OAuthCredential is the resolved OAuth credential for injection.
+// Mirrors broker.ResolvedCredential but defined locally to avoid import dependency.
+type OAuthCredential struct {
+	AccessToken string
+	Provider    string
+	AccountID   string
+	ExpiresAt   int64
+	Identity    string // Email or display name (for logging only, never sent upstream)
+}
+
 // Proxy is the core reverse proxy that handles virtual key resolution
 // and request forwarding.
 type Proxy struct {
 	vault        VaultGetter
 	activeReader ActiveKeyReader // non-nil when vault implements ActiveKeyReader
+	broker       OAuthBroker     // OAuth credential provider (nil = OAuth not available)
 	registry     *vkeys.Registry
 	providers    *provider.Registry
 	collector    *events.Collector
@@ -94,6 +118,12 @@ func New(v VaultGetter, reg *vkeys.Registry, prov *provider.Registry, coll *even
 		p.activeReader = ar
 	}
 	return p
+}
+
+// SetBroker injects the OAuth broker for credential resolution.
+// Must be called before the proxy handles any OAuth-credential requests.
+func (p *Proxy) SetBroker(b OAuthBroker) {
+	p.broker = b
 }
 
 // SetReporter sets the usage reporter for collector-service upload.
@@ -255,7 +285,51 @@ func (p *Proxy) handlePathPrefixRoute(w http.ResponseWriter, r *http.Request, pr
 	// user_profile_provider_bindings.  If a binding exists, resolve directly.
 	binding, _ := p.activeReader.GetProviderBinding(canonicalCode)
 	if binding != nil {
-		if binding.KeySourceType == "team" {
+		if binding.KeySourceType == "personal_oauth_account" {
+			// OAuth account — resolve via broker, not vault
+			if p.broker == nil {
+				p.errors.Add(1)
+				writeJSONError(w, http.StatusServiceUnavailable, "server_error", "OAUTH_NOT_AVAILABLE",
+					"OAuth is not configured. Restart proxy or use API Key instead.")
+				return
+			}
+
+			// EnsureFresh: broker handles token refresh internally
+			if err := p.broker.EnsureFresh(r.Context(), binding.KeySourceRef); err != nil {
+				logger.Warn("oauth: EnsureFresh failed", "account_id", binding.KeySourceRef, "error", err)
+				p.errors.Add(1)
+				writeJSONError(w, http.StatusUnauthorized, "auth_error", "OAUTH_TOKEN_EXPIRED",
+					err.Error()+"\n  Run: aikey auth login "+providerCode)
+				return
+			}
+
+			// Resolve decrypted credential
+			cred, err := p.broker.ResolveCredential(r.Context(), binding.KeySourceRef)
+			if err != nil {
+				logger.Error("oauth: ResolveCredential failed", "account_id", binding.KeySourceRef, "error", err)
+				p.errors.Add(1)
+				writeJSONError(w, http.StatusServiceUnavailable, "server_error", "OAUTH_RESOLVE_FAILED", err.Error())
+				return
+			}
+
+			// Inject OAuth credential via provider-specific injector
+			baseURL = providerDefaultBaseURL(canonicalCode)
+			oauthInject(r, cred, canonicalCode)
+
+			identityTag := cred.Identity
+			if identityTag == "" {
+				identityTag = binding.KeySourceRef
+			}
+			logger.Info("oauth: forwarding request",
+				"provider", canonicalCode,
+				"identity", identityTag,
+				"account_id", binding.KeySourceRef,
+			)
+
+			realKey = "__oauth__" // sentinel — not used for header injection (injector handles it)
+			virtualKeyID = "oauth:" + binding.KeySourceRef
+
+		} else if binding.KeySourceType == "team" {
 			var err error
 			mk, err = p.activeReader.GetTeamKeyByID(binding.KeySourceRef)
 			if err != nil {
@@ -461,8 +535,22 @@ func (p *Proxy) serveRoute(w http.ResponseWriter, r *http.Request, route *vkeys.
 	rp := &httputil.ReverseProxy{
 		Transport: transport,
 		Director: func(req *http.Request) {
-			if err := prov.RewriteRequest(req, realKey, route.BaseURL); err != nil {
-				logger.Error("rewrite request failed", "error", err)
+			if realKey == "__oauth__" {
+				// OAuth: headers already injected by oauthInject() — only set upstream URL.
+				// BaseURL may contain a path prefix (e.g. https://api.kimi.com/coding)
+				// that must be prepended to the request path.
+				if u, err := url.Parse(route.BaseURL); err == nil {
+					req.URL.Scheme = u.Scheme
+					req.URL.Host = u.Host
+					req.Host = u.Host
+					if u.Path != "" && u.Path != "/" {
+						req.URL.Path = strings.TrimRight(u.Path, "/") + req.URL.Path
+					}
+				}
+			} else {
+				if err := prov.RewriteRequest(req, realKey, route.BaseURL); err != nil {
+					logger.Error("rewrite request failed", "error", err)
+				}
 			}
 			// Remove hop-by-hop headers the proxy shouldn't forward.
 			req.Header.Del("X-Forwarded-For")

@@ -24,7 +24,13 @@ type Server struct {
 //   - dataHandler is the http.Handler for the AI proxy endpoints; the Supervisor
 //     returns a stable wrapper that atomically delegates to the active generation.
 //   - adminHandler serves /health, /status, /metrics, and /admin/reload.
-func New(ln net.Listener, dataHandler http.Handler, adminHandler *admin.Handler) *Server {
+// RouteRegistrar can register HTTP routes on a ServeMux.
+// Used by the broker handler to register /oauth/* routes without tight coupling.
+type RouteRegistrar interface {
+	RegisterRoutes(mux *http.ServeMux)
+}
+
+func New(ln net.Listener, dataHandler http.Handler, adminHandler *admin.Handler, extraHandlers ...RouteRegistrar) *Server {
 	mux := http.NewServeMux()
 
 	// Data plane: catch-all — forwards every request not claimed by the admin routes
@@ -44,6 +50,11 @@ func New(ln net.Listener, dataHandler http.Handler, adminHandler *admin.Handler)
 	mux.HandleFunc("GET /status", adminHandler.Status)
 	mux.HandleFunc("GET /metrics", adminHandler.Metrics)
 	mux.HandleFunc("POST /admin/reload", adminHandler.Reload)
+
+	// Extra route registrars (e.g., OAuth broker handler)
+	for _, h := range extraHandlers {
+		h.RegisterRoutes(mux)
+	}
 
 	return &Server{
 		ln: ln,

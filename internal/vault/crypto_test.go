@@ -99,6 +99,64 @@ func TestDecrypt_WrongKey(t *testing.T) {
 	}
 }
 
+func TestEncrypt_RoundTrip(t *testing.T) {
+	key := make([]byte, KeySize)
+	rand.Read(key)
+
+	plaintext := []byte("OAuth access_token for Claude Pro")
+
+	// Encrypt with our new function.
+	nonce, ciphertext, err := Encrypt(key, plaintext)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(nonce) != NonceSize {
+		t.Fatalf("nonce size = %d, want %d", len(nonce), NonceSize)
+	}
+	if bytes.Equal(ciphertext, plaintext) {
+		t.Fatal("ciphertext should not equal plaintext")
+	}
+
+	// Decrypt with existing function.
+	got, err := Decrypt(key, nonce, ciphertext)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(got, plaintext) {
+		t.Fatalf("roundtrip failed: expected %q, got %q", plaintext, got)
+	}
+}
+
+func TestEncrypt_DifferentNonces(t *testing.T) {
+	key := make([]byte, KeySize)
+	rand.Read(key)
+	plaintext := []byte("same plaintext")
+
+	nonce1, ct1, _ := Encrypt(key, plaintext)
+	nonce2, ct2, _ := Encrypt(key, plaintext)
+
+	if bytes.Equal(nonce1, nonce2) {
+		t.Fatal("two encryptions should produce different nonces")
+	}
+	if bytes.Equal(ct1, ct2) {
+		t.Fatal("two encryptions of same plaintext should produce different ciphertext")
+	}
+
+	// Both should decrypt to the same plaintext.
+	p1, _ := Decrypt(key, nonce1, ct1)
+	p2, _ := Decrypt(key, nonce2, ct2)
+	if !bytes.Equal(p1, p2) || !bytes.Equal(p1, plaintext) {
+		t.Fatal("both should decrypt to original plaintext")
+	}
+}
+
+func TestEncrypt_BadKeySize(t *testing.T) {
+	_, _, err := Encrypt([]byte("short"), []byte("data"))
+	if err == nil {
+		t.Fatal("expected error with wrong key size")
+	}
+}
+
 func TestDecrypt_BadNonceSize(t *testing.T) {
 	key := make([]byte, KeySize)
 	_, err := Decrypt(key, []byte("short"), []byte("data"))

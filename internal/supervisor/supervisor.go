@@ -158,6 +158,7 @@ type Supervisor struct {
 	version    string // build version, passed to proxy for audit metadata
 
 	transport http.RoundTripper // optional upstream proxy transport; nil = default
+	broker    proxy.OAuthBroker // OAuth broker (set via SetBroker); nil = OAuth disabled
 
 	active    atomic.Pointer[generation]
 	reloadMu  sync.Mutex // serialise concurrent reload requests
@@ -168,6 +169,16 @@ type Supervisor struct {
 	// Cancelled in Shutdown() to stop any in-flight upstream requests.
 	ctx    context.Context
 	cancel context.CancelFunc
+}
+
+// VaultReader opens a vault connection for use by the OAuth broker.
+// Returns nil if the vault cannot be opened (broker should degrade gracefully).
+func (s *Supervisor) VaultReader() *vault.Reader {
+	r, err := vault.Open(s.cfg.Vault.Path, s.password)
+	if err != nil {
+		return nil
+	}
+	return r
 }
 
 // New creates a Supervisor, starts the initial generation, and launches the
@@ -200,6 +211,14 @@ func New(cfg *config.Config, configPath, password, version string) (*Supervisor,
 
 // SetTransport sets the outbound RoundTripper used by all generations.
 // Must be called before any requests are served (right after New).
+// SetBroker sets the OAuth broker for all proxy generations.
+func (s *Supervisor) SetBroker(b proxy.OAuthBroker) {
+	s.broker = b
+	if gen := s.active.Load(); gen != nil {
+		gen.proxy.SetBroker(b)
+	}
+}
+
 func (s *Supervisor) SetTransport(t http.RoundTripper) {
 	s.transport = t
 	// Also apply to the already-running initial generation.
@@ -614,6 +633,9 @@ func (s *Supervisor) buildGeneration() (*generation, error) {
 	p.VerySlowRequestMs = int64(s.cfg.Log.VerySlowRequestMs)
 	if s.transport != nil {
 		p.SetTransport(s.transport)
+	}
+	if s.broker != nil {
+		p.SetBroker(s.broker)
 	}
 
 	// Attach usage reporter if collector_url is configured.

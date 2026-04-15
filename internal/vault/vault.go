@@ -90,6 +90,14 @@ func Open(dbPath string, password string) (*Reader, error) {
 	}, nil
 }
 
+// DB returns the underlying database connection for constructing broker stores.
+// The caller must not close this connection — it is owned by the Reader.
+func (r *Reader) DB() *sql.DB { return r.db }
+
+// DerivedKey returns the AES-256 key derived from the master password.
+// Used by VaultTokenStore for token encryption.
+func (r *Reader) DerivedKey() []byte { return r.derivedKey }
+
 // GetLoggedInAccountID returns the account_id of the currently logged-in user
 // from the platform_account table, or empty string if not logged in.
 func (r *Reader) GetLoggedInAccountID() string {
