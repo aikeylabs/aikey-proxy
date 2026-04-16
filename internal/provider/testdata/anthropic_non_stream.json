@@ -1,0 +1,1 @@
+{"id":"msg_01","type":"message","role":"assistant","content":[{"type":"text","text":"Hello world"}],"model":"claude-sonnet-4-20250514","stop_reason":"end_turn","usage":{"input_tokens":150,"output_tokens":80}}

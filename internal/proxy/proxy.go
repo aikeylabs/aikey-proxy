@@ -269,7 +269,8 @@ func (p *Proxy) handlePathPrefixRoute(w http.ResponseWriter, r *http.Request, pr
 	}
 
 	var realKey, baseURL, protocolType, virtualKeyID string
-	var mk *vault.ManagedKey // populated when resolved via team key (for org metadata)
+	var mk *vault.ManagedKey      // populated when resolved via team key (for org metadata)
+	var oauthIdentity, oauthAccountID string // populated when resolved via OAuth account
 
 	// Normalise brand aliases ("claude" → "anthropic") before vault lookup so
 	// the query matches the provider_code stored by the server.
@@ -328,6 +329,8 @@ func (p *Proxy) handlePathPrefixRoute(w http.ResponseWriter, r *http.Request, pr
 
 			realKey = "__oauth__" // sentinel — not used for header injection (injector handles it)
 			virtualKeyID = "oauth:" + binding.KeySourceRef
+			oauthIdentity = identityTag
+			oauthAccountID = binding.KeySourceRef
 
 		} else if binding.KeySourceType == "team" {
 			var err error
@@ -460,6 +463,11 @@ func (p *Proxy) handlePathPrefixRoute(w http.ResponseWriter, r *http.Request, pr
 		route.OrgID = mk.OrgID
 		route.AccountID = mk.OwnerAccountID
 		route.SeatID = mk.SeatID
+	}
+	// OAuth: carry identity + account_id so usage events can identify the account.
+	if oauthAccountID != "" {
+		route.AccountID = oauthAccountID
+		route.OAuthIdentity = oauthIdentity
 	}
 
 	p.serveRoute(w, r, route, prov, realKey, "aikey_vk_"+virtualKeyID, startTime, logger)

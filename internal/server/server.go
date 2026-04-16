@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/AiKeyLabs/aikey-proxy/internal/admin"
+	"github.com/AiKeyLabs/pkg/buildinfo"
 )
 
 // Server manages the HTTP server lifecycle.
@@ -41,6 +42,12 @@ func New(ln net.Listener, dataHandler http.Handler, adminHandler *admin.Handler,
 	// prefixes are added. Go 1.22+ ServeMux gives more-specific patterns priority,
 	// so the admin routes above always win.
 	mux.Handle("/{path...}", dataHandler)
+
+	// Build info: unauthenticated, returns build metadata only.
+	mux.HandleFunc("GET /version", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.Write(buildinfo.Get().JSON())
+	})
 
 	// Control plane: admin endpoints.
 	mux.HandleFunc("GET /health", adminHandler.Health)

@@ -1,14 +1,30 @@
 MODULE     := github.com/AiKeyLabs/aikey-proxy
-VERSION    := 0.1.0
-LDFLAGS    := -ldflags "-X main.version=$(VERSION)"
+VERSION    ?= dev
+PKG        := github.com/AiKeyLabs/pkg/buildinfo
+GIT_REVISION  = $(shell git rev-parse --short=12 HEAD 2>/dev/null || echo "unknown")
+GIT_DIRTY     = $(shell test -z "$$(git status --porcelain --untracked-files=normal 2>/dev/null)" && echo "" || echo "-dirty")
+BUILD_ID     ?= $(shell head -c 2 /dev/urandom 2>/dev/null | xxd -p 2>/dev/null \
+                  || powershell -NoProfile -C "'{0:x4}' -f (Get-Random -Max 65535)" 2>/dev/null \
+                  || echo "0000")
+BUILD_TIME    = $(shell date -u +%Y-%m-%dT%H:%M:%SZ 2>/dev/null \
+                  || powershell -NoProfile -C "(Get-Date).ToUniversalTime().ToString('yyyy-MM-ddTHH:mm:ssZ')" 2>/dev/null \
+                  || echo "unknown")
+LDFLAGS    := -ldflags "\
+  -X $(PKG).Version=$(VERSION) \
+  -X $(PKG).Revision=$(GIT_REVISION)$(GIT_DIRTY) \
+  -X $(PKG).BuildID=$(BUILD_ID) \
+  -X $(PKG).BuildTime=$(BUILD_TIME)"
 CONFIG     := aikey-proxy.yaml
 # Installation directory — override with: make install INSTALL_DIR=/your/path
 INSTALL_DIR ?= $(HOME)/.aikey/bin
+# Go workspace — needed for local aikey-auth-broker dependency
+GOWORK     ?= $(shell cd .. && pwd)/go.work
+export GOWORK
 
-.PHONY: build test run install uninstall clean lint cross-compile
+.PHONY: build test run install uninstall restart clean lint cross-compile
 
 build:
-	go build $(LDFLAGS) -o bin/aikey-proxy ./cmd/aikey-proxy
+	@go build $(LDFLAGS) -o bin/aikey-proxy ./cmd/aikey-proxy
 	@cp $(CONFIG) bin/$(CONFIG)
 
 test:
@@ -22,7 +38,15 @@ install: build
 	@echo "Installing aikey-proxy to $(INSTALL_DIR)..."
 	@install -Dm755 bin/aikey-proxy $(INSTALL_DIR)/aikey-proxy
 	@echo "Installed: $(INSTALL_DIR)/aikey-proxy"
-	@echo "Run 'aikey proxy start' to start the proxy."
+
+## Build, install, and restart the running proxy process.
+## Why pkill + aikey proxy start: proxy requires vault master password via session
+## cache, so it must be started through the CLI (not nohup directly).
+restart: install
+	@echo "Restarting aikey-proxy..."
+	@pkill -f "aikey-proxy --config" 2>/dev/null || true
+	@sleep 1
+	@echo "Binary updated. Run: aikey proxy start"
 
 ## Remove aikey-proxy from INSTALL_DIR
 uninstall:

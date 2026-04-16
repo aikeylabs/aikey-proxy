@@ -1,0 +1,1 @@
+{"id":"chatcmpl-abc","object":"chat.completion","choices":[{"index":0,"message":{"role":"assistant","content":"Hello world"},"finish_reason":"stop"}],"usage":{"prompt_tokens":120,"completion_tokens":60,"total_tokens":180}}

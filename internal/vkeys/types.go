@@ -13,10 +13,13 @@ type ResolvedRoute struct {
 	// bypassing the per-request vault alias lookup.
 	PlaintextKey string
 
-	// Anchor fields for usage reporting — only populated for team-managed keys.
+	// Anchor fields for usage reporting.
+	// For team-managed keys: populated from ManagedKey metadata.
+	// For OAuth accounts: OAuthIdentity is the email/display name (for audit only).
 	OrgID              string
 	AccountID          string
 	SeatID             string
+	OAuthIdentity      string // Email or display name (OAuth only, for audit/usage reporting)
 	BindingID          string // empty if not available in local cache (schema gap)
 	ProviderID         string // empty if not available in local cache (schema gap)
 	ProviderCode       string

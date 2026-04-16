@@ -46,6 +46,7 @@ type ReportableEvent struct {
 	RealKeyHash                string `json:"real_key_hash,omitempty"`        // SHA-256 of decrypted provider key
 	CredentialFingerprint      string `json:"credential_fingerprint,omitempty"` // SHA-256 of credential_id+revision
 	ProviderAccountFingerprint string `json:"provider_account_fingerprint,omitempty"`
+	OAuthIdentity              string `json:"oauth_identity,omitempty"` // Email/display name for OAuth accounts (personal)
 
 	// provider / protocol
 	ProviderID   string `json:"provider_id,omitempty"`
@@ -162,10 +163,11 @@ func BuildReportableEvent(opts ReportOpts) ReportableEvent {
 		RealKeyHash:           hashIfNotEmpty(opts.RealKey),
 		CredentialFingerprint: credFP,
 
-		ProviderID:   route.ProviderID,
-		ProviderCode: route.ProviderCode,
-		ProtocolType: route.ProtocolType,
-		RouteSource:  routeSource,
+		ProviderID:    route.ProviderID,
+		ProviderCode:  route.ProviderCode,
+		ProtocolType:  route.ProtocolType,
+		RouteSource:   routeSource,
+		OAuthIdentity: route.OAuthIdentity,
 
 		Model:        opts.Model,
 		RequestCount: 1,

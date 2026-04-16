@@ -3,11 +3,14 @@ module github.com/AiKeyLabs/aikey-proxy
 go 1.26.1
 
 require (
+	github.com/AiKeyLabs/pkg/buildinfo v0.0.0
 	golang.org/x/crypto v0.49.0
 	golang.org/x/term v0.41.0
 	gopkg.in/yaml.v3 v3.0.1
 	modernc.org/sqlite v1.47.0
 )
+
+replace github.com/AiKeyLabs/pkg/buildinfo => ../pkg/buildinfo
 
 require (
 	github.com/andybalholm/brotli v1.2.0 // indirect

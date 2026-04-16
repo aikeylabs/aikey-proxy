@@ -1,0 +1,6 @@
+data: {"id":"chatcmpl-abc","choices":[{"index":0,"delta":{"content":"hi"},"finish_reason":null}]}
+
+data: {"id":"chatcmpl-abc","choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}
+
+data: [DONE]
+

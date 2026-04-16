@@ -24,9 +24,8 @@ import (
 	"github.com/AiKeyLabs/aikey-proxy/internal/vault"
 
 	broker "github.com/AiKeyLabs/aikey-auth-broker"
+	"github.com/AiKeyLabs/pkg/buildinfo"
 )
-
-var version = "dev"
 
 const defaultConfigName = "aikey-proxy.yaml"
 
@@ -55,12 +54,23 @@ func resolveConfigPath(explicit string) (string, error) {
 }
 
 func main() {
+	// Handle "version" subcommand before flag parsing (flags expect --config etc.)
+	if len(os.Args) > 1 && os.Args[1] == "version" {
+		bi := buildinfo.Get()
+		if len(os.Args) > 2 && (os.Args[2] == "--json" || os.Args[2] == "-j") {
+			fmt.Println(string(bi.JSON()))
+		} else {
+			fmt.Println("aikey-proxy", bi.String())
+		}
+		os.Exit(0)
+	}
+
 	configPath := flag.String("config", "", "path to config file (default: search cwd then ~/.aikey/)")
 	showVersion := flag.Bool("version", false, "print version and exit")
 	flag.Parse()
 
 	if *showVersion {
-		fmt.Println("aikey-proxy", version)
+		fmt.Println("aikey-proxy", buildinfo.Get().String())
 		os.Exit(0)
 	}
 
@@ -83,7 +93,7 @@ func main() {
 
 	// 2. Initialise structured logging: stderr text + async JSONL file.
 	logLevel := parseLogLevel(cfg.Log.Level)
-	logWriter, err := observability.SetupLogger(cfg.Log.Dir, "aikey-proxy", version, logLevel)
+	logWriter, err := observability.SetupLogger(cfg.Log.Dir, "aikey-proxy", buildinfo.Get().String(), logLevel)
 	if err != nil {
 		// Non-fatal: fall back to text-only stderr logging.
 		slog.Warn("failed to initialise JSONL log writer, falling back to stderr only", "error", err)
@@ -116,7 +126,7 @@ func main() {
 	)
 
 	// 5. Create the Supervisor (starts the initial generation).
-	sup, err := supervisor.New(cfg, resolvedPath, password, version)
+	sup, err := supervisor.New(cfg, resolvedPath, password, buildinfo.Get().Version)
 	if err != nil {
 		slog.Error("failed to start supervisor", "error", err)
 		os.Exit(1)
@@ -124,7 +134,7 @@ func main() {
 
 	slog.Info("aikey-proxy started",
 		"event.name", observability.EventProxyProcessStarted,
-		"version", version,
+		"version", buildinfo.Get().String(),
 		"listen", ln.Addr(),
 	)
 
@@ -169,7 +179,7 @@ func main() {
 	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
 
 	go func() {
-		fmt.Fprintf(os.Stderr, "\naikey-proxy %s listening on %s\n\n", version, ln.Addr())
+		fmt.Fprintf(os.Stderr, "\naikey-proxy %s listening on %s\n\n", buildinfo.Get().String(), ln.Addr())
 		if err := srv.Serve(); err != nil && err != http.ErrServerClosed {
 			slog.Error("server error", "error", err)
 			os.Exit(1)
