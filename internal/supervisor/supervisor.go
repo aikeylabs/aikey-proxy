@@ -22,6 +22,7 @@ package supervisor
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"net"
@@ -40,6 +41,36 @@ import (
 	"github.com/AiKeyLabs/aikey-proxy/internal/vault"
 	"github.com/AiKeyLabs/aikey-proxy/internal/vkeys"
 )
+
+// providerToProtocol maps a provider code to its proxy protocol name.
+// Duplicated from proxy/middleware.go (unexported) to avoid cross-package dependency.
+func providerToProtocol(providerCode string) string {
+	switch strings.ToLower(providerCode) {
+	case "anthropic", "claude":
+		return "anthropic"
+	default:
+		return "openai_compatible"
+	}
+}
+
+// providerDefaultBaseURL returns the default upstream base URL for a provider.
+// Duplicated from proxy/middleware.go (unexported).
+func providerDefaultBaseURL(providerCode string) string {
+	switch strings.ToLower(providerCode) {
+	case "anthropic", "claude":
+		return "https://api.anthropic.com"
+	case "openai", "gpt", "chatgpt":
+		return "https://api.openai.com/v1"
+	case "google", "gemini":
+		return "https://generativelanguage.googleapis.com"
+	case "kimi", "moonshot":
+		return "https://api.kimi.com/coding"
+	case "deepseek":
+		return "https://api.deepseek.com/v1"
+	default:
+		return ""
+	}
+}
 
 const (
 	// ProxyLoadedSeqKey is the vault config key that records which vault
@@ -71,7 +102,8 @@ type generation struct {
 	proxy      *proxy.Proxy
 	collector  *events.Collector
 	eventStore *events.Store
-	reporter   *events.Reporter // usage reporter (nil when collector_url is not configured)
+	reporter   *events.Reporter      // usage reporter (nil when collector_url is not configured)
+	canary     *events.CanaryProbe  // synthetic canary probe (nil when reporter or control_url is not configured)
 
 	// Drain tracking: incremented when a request enters Handle, decremented on exit.
 	inflight atomic.Int64
@@ -96,7 +128,11 @@ func (g *generation) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 // close releases all resources held by this generation.
 func (g *generation) close() {
-	// Close the reporter first so its upload loop flushes before the
+	// Close canary probe first (it uses the reporter).
+	if g.canary != nil {
+		g.canary.Close()
+	}
+	// Close the reporter so its upload loop flushes before the
 	// collector and event store are torn down.
 	if g.reporter != nil {
 		_ = g.reporter.Close()
@@ -267,21 +303,34 @@ func (s *Supervisor) syncManagedKeys() {
 		return // nothing changed
 	}
 
-	// Re-use the active generation's already-open vault reader instead of
-	// calling vault.Open() (which re-runs the full Argon2id KDF on every tick).
-	managedKeys, err := gen.vault.GetActiveManagedKeys()
-	if err != nil || len(managedKeys) == 0 {
-		// Update loaded seq even if no keys, so we don't retry on every tick.
-		_ = vault.WriteConfigU64LE(s.cfg.Vault.Path, ProxyLoadedSeqKey, vaultSeq)
-		return
+	// Full rebuild: load all token sources and atomically replace the registry.
+	// Why ReplaceAll instead of Merge: deleted/revoked tokens must be removed
+	// immediately. Merge is additive and cannot remove stale entries.
+	allRoutes := make(map[string]*vkeys.ResolvedRoute)
+
+	// 1. Static YAML keys (from config, always present)
+	for _, k := range s.cfg.VirtualKeys {
+		if k.Token != "" {
+			allRoutes[k.Token] = &vkeys.ResolvedRoute{
+				VirtualKeyID: k.ID,
+				Provider:     k.Provider,
+				BaseURL:      k.BaseURL,
+				KeyAlias:     k.KeyAlias,
+				ProtocolType: k.Provider,
+			}
+		}
 	}
 
-	managedRoutes := make(map[string]*vkeys.ResolvedRoute, len(managedKeys))
+	// 2. Team managed keys
+	managedKeys, err := gen.vault.GetActiveManagedKeys()
+	if err != nil {
+		slog.Warn("managed key sync: GetActiveManagedKeys failed", "error", err)
+	}
 	for _, mk := range managedKeys {
 		token := "aikey_vk_" + mk.VirtualKeyID
-		managedRoutes[token] = &vkeys.ResolvedRoute{
+		allRoutes[token] = &vkeys.ResolvedRoute{
 			VirtualKeyID:       mk.VirtualKeyID,
-			Provider:           mk.ProtocolType, // protocol type resolves to provider adapter (e.g. "openai_compatible" → openai)
+			Provider:           mk.ProtocolType,
 			BaseURL:            mk.BaseURL,
 			PlaintextKey:       mk.PlaintextKey,
 			OrgID:              mk.OrgID,
@@ -295,15 +344,49 @@ func (s *Supervisor) syncManagedKeys() {
 		}
 	}
 
-	// Merge into the active generation's live registry — zero downtime, no reload.
-	gen.registry.Merge(managedRoutes)
+	// 3. Personal key route tokens
+	if personalTokens, ptErr := gen.vault.GetAllPersonalRouteTokens(); ptErr == nil {
+		for _, pt := range personalTokens {
+			allRoutes[pt.RouteToken] = &vkeys.ResolvedRoute{
+				VirtualKeyID: "personal:" + pt.Alias,
+				Provider:     pt.ProviderCode,
+				BaseURL:      pt.BaseURL,
+				KeyAlias:     pt.Alias,
+				ProviderCode: pt.ProviderCode,
+				ProtocolType: providerToProtocol(pt.ProviderCode),
+			}
+		}
+	} else if !errors.Is(ptErr, vault.ErrMissingRouteTokenColumn) {
+		slog.Warn("managed key sync: GetAllPersonalRouteTokens failed", "error", ptErr)
+	}
+
+	// 4. OAuth account route tokens
+	if oauthTokens, otErr := gen.vault.GetAllOAuthRouteTokens(); otErr == nil {
+		for _, ot := range oauthTokens {
+			allRoutes[ot.RouteToken] = &vkeys.ResolvedRoute{
+				VirtualKeyID:  "oauth:" + ot.AccountID,
+				Provider:      ot.Provider,
+				BaseURL:       providerDefaultBaseURL(ot.Provider),
+				KeyAlias:      "__oauth__",
+				ProviderCode:  ot.Provider,
+				ProtocolType:  providerToProtocol(ot.Provider),
+				AccountID:     ot.AccountID,
+				OAuthIdentity: ot.Identity,
+			}
+		}
+	} else if !errors.Is(otErr, vault.ErrMissingRouteTokenColumn) {
+		slog.Warn("managed key sync: GetAllOAuthRouteTokens failed", "error", otErr)
+	}
+
+	// Atomic replace — deleted/revoked tokens disappear immediately.
+	gen.registry.ReplaceAll(allRoutes)
 
 	// Record that we've caught up to this seq.
 	if werr := vault.WriteConfigU64LE(s.cfg.Vault.Path, ProxyLoadedSeqKey, vaultSeq); werr != nil {
 		slog.Warn("managed key sync: failed to write loaded_vault_change_seq", "error", werr)
 	} else {
-		slog.Info("managed key sync: merged active managed keys",
-			"count", len(managedRoutes),
+		slog.Info("managed key sync: registry rebuilt",
+			"total_routes", len(allRoutes),
 			"vault_seq", vaultSeq,
 		)
 	}
@@ -346,6 +429,20 @@ func (s *Supervisor) ReporterMetrics() *events.ReporterMetrics {
 	}
 	m := gen.reporter.Metrics()
 	return &m
+}
+
+// CanaryResult returns the latest canary probe result from the active generation.
+// Returns nil if canary probe is not configured.
+func (s *Supervisor) CanaryResult() *events.CanaryResult {
+	gen := s.active.Load()
+	if gen.canary == nil {
+		return nil
+	}
+	r := gen.canary.LastResult()
+	if r.EventID == "" {
+		return nil // no probe has run yet
+	}
+	return &r
 }
 
 // InflightRequests returns the number of in-flight requests in the active generation.
@@ -626,6 +723,50 @@ func (s *Supervisor) buildGeneration() (*generation, error) {
 		registry.Merge(managedRoutes)
 	}
 
+	// Load personal key route tokens (v1.0.4+).
+	// These are random aikey_vk_ tokens generated by CLI for personal API keys,
+	// allowing third-party clients (Cursor, OpenCode) to route through the proxy.
+	if personalTokens, err := vaultReader.GetAllPersonalRouteTokens(); errors.Is(err, vault.ErrMissingRouteTokenColumn) {
+		slog.Warn("vault missing route_token column, personal key routing disabled. Run any aikey CLI command to migrate.")
+	} else if err != nil {
+		slog.Warn("could not load personal route tokens", "error", err)
+	} else if len(personalTokens) > 0 {
+		personalRoutes := make(map[string]*vkeys.ResolvedRoute, len(personalTokens))
+		for _, pt := range personalTokens {
+			personalRoutes[pt.RouteToken] = &vkeys.ResolvedRoute{
+				VirtualKeyID: "personal:" + pt.Alias,
+				Provider:     pt.ProviderCode,
+				BaseURL:      pt.BaseURL,
+				KeyAlias:     pt.Alias,
+				ProviderCode: pt.ProviderCode,
+				ProtocolType: providerToProtocol(pt.ProviderCode),
+			}
+		}
+		registry.Merge(personalRoutes)
+	}
+
+	// Load OAuth account route tokens (v1.0.4+).
+	if oauthTokens, err := vaultReader.GetAllOAuthRouteTokens(); errors.Is(err, vault.ErrMissingRouteTokenColumn) {
+		slog.Warn("vault missing route_token column, oauth routing disabled. Run any aikey CLI command to migrate.")
+	} else if err != nil {
+		slog.Warn("could not load oauth route tokens", "error", err)
+	} else if len(oauthTokens) > 0 {
+		oauthRoutes := make(map[string]*vkeys.ResolvedRoute, len(oauthTokens))
+		for _, ot := range oauthTokens {
+			oauthRoutes[ot.RouteToken] = &vkeys.ResolvedRoute{
+				VirtualKeyID:  "oauth:" + ot.AccountID,
+				Provider:      ot.Provider,
+				BaseURL:       providerDefaultBaseURL(ot.Provider),
+				KeyAlias:      "__oauth__", // sentinel — broker handles credential injection
+				ProviderCode:  ot.Provider,
+				ProtocolType:  providerToProtocol(ot.Provider),
+				AccountID:     ot.AccountID,
+				OAuthIdentity: ot.Identity,
+			}
+		}
+		registry.Merge(oauthRoutes)
+	}
+
 	// Provider registry.
 	providers := provider.NewRegistry()
 
@@ -651,6 +792,7 @@ func (s *Supervisor) buildGeneration() (*generation, error) {
 
 	// Attach usage reporter if collector_url is configured.
 	var reporter *events.Reporter
+	var canary *events.CanaryProbe
 	if s.cfg.Events.CollectorURL != "" {
 		var err error
 		reporter, err = events.NewReporter(events.ReporterConfig{
@@ -661,6 +803,8 @@ func (s *Supervisor) buildGeneration() (*generation, error) {
 			UploadInterval:  s.cfg.Events.UploadInterval,
 			WALDir:          s.cfg.Events.WALDir,
 			ProxyInstanceID: fmt.Sprintf("proxy-%d", id),
+			ConfigHash:      s.cfg.PipelineConfigHash(),
+			DBPath:          s.cfg.Events.DBPath,
 		})
 		if err != nil {
 			slog.Warn("reporter init failed, usage reporting disabled", "error", err)
@@ -672,6 +816,20 @@ func (s *Supervisor) buildGeneration() (*generation, error) {
 			}
 			p.SetReporter(reporter, fmt.Sprintf("proxy-%d", id), s.version, fmt.Sprintf("gen-%d", id), loadedSeq, vaultReader.GetLoggedInAccountID())
 			slog.Info("usage reporter enabled", "collector_url", s.cfg.Events.CollectorURL)
+
+			// Start canary probe: diagnostics endpoint is on the control plane
+			// (trial-server or control-service), NOT the collector-service.
+			// Why control_url, not collector_url: /internal/canary-check is
+			// registered on the control plane. In trial mode they're the same
+			// port; in server mode collector_url points to a standalone collector
+			// that doesn't have diagnostics endpoints.
+			diagURL := s.cfg.Events.ControlURL
+			if diagURL == "" {
+				diagURL = s.cfg.Events.CollectorURL // fallback for trial mode
+			}
+			canary = events.NewCanaryProbe(reporter, events.CanaryConfig{
+				DiagnosticsURL: diagURL,
+			})
 		}
 	}
 
@@ -685,6 +843,7 @@ func (s *Supervisor) buildGeneration() (*generation, error) {
 		collector:  collector,
 		eventStore: eventStore,
 		reporter:   reporter,
+		canary:     canary,
 		drained:    make(chan struct{}),
 	}, nil
 }

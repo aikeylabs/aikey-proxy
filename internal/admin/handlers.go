@@ -38,6 +38,8 @@ type Handler struct {
 
 	// ReporterMetricsFn returns usage reporter counters (nil = reporter disabled).
 	ReporterMetricsFn func() *events.ReporterMetrics
+	// CanaryResultFn returns the latest canary probe result (nil = canary disabled).
+	CanaryResultFn func() *events.CanaryResult
 }
 
 // KeyCheckTarget holds decrypted credentials for one provider, used by GET /health/keys.
@@ -136,6 +138,7 @@ type metricsResponse struct {
 	RequestsByVKey     map[string]int64       `json:"requests_by_vkey"`
 	RequestsByProvider map[string]int64       `json:"requests_by_provider"`
 	Reporter           *events.ReporterMetrics `json:"reporter,omitempty"`
+	Canary             *events.CanaryResult    `json:"canary,omitempty"`
 }
 
 // Metrics returns aggregated usage metrics.
@@ -158,6 +161,10 @@ func (h *Handler) Metrics(w http.ResponseWriter, r *http.Request) {
 	if h.ReporterMetricsFn != nil {
 		reporterMetrics = h.ReporterMetricsFn()
 	}
+	var canaryResult *events.CanaryResult
+	if h.CanaryResultFn != nil {
+		canaryResult = h.CanaryResultFn()
+	}
 
 	writeJSON(w, http.StatusOK, metricsResponse{
 		TotalRequests:      totalReqs,
@@ -165,6 +172,7 @@ func (h *Handler) Metrics(w http.ResponseWriter, r *http.Request) {
 		RequestsByVKey:     byVKey,
 		RequestsByProvider: byProvider,
 		Reporter:           reporterMetrics,
+		Canary:             canaryResult,
 	})
 }
 

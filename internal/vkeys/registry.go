@@ -57,6 +57,16 @@ func (r *Registry) Merge(routes map[string]*ResolvedRoute) {
 	slog.Info("managed virtual keys merged into registry", "count", len(routes))
 }
 
+// ReplaceAll atomically replaces the entire registry with a new set of routes.
+// Unlike Merge (additive), this removes tokens no longer present in the new map.
+// Used by reload-registry to ensure deleted/revoked tokens are immediately invalidated.
+func (r *Registry) ReplaceAll(routes map[string]*ResolvedRoute) {
+	r.mu.Lock()
+	r.byToken = routes
+	r.mu.Unlock()
+	slog.Info("virtual key registry replaced", "count", len(routes))
+}
+
 // Resolve looks up a virtual key token and returns the route, or nil.
 func (r *Registry) Resolve(token string) *ResolvedRoute {
 	r.mu.RLock()

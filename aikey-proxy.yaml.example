@@ -76,7 +76,11 @@ events:
   # queue_capacity: 10000
   # upload_batch_size: 100
   # upload_interval: 5s
-  # wal_dir: "~/.aikey/data/usage-wal"
+
+  # WAL directory for usage event durability and dead letter storage.
+  # Always set this — dead_letter.jsonl is written here for terminal upload failures.
+  # If omitted, falls back to the events db_path directory (~/.aikey/data/).
+  wal_dir: "~/.aikey/data/usage-wal"
 
 log:
   level: "info"   # debug, info, warn, error

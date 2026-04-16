@@ -281,6 +281,115 @@ func (p *Proxy) handlePathPrefixRoute(w http.ResponseWriter, r *http.Request, pr
 	// This is authoritative for both team and personal keys.
 	protocolType = providerToProtocol(canonicalCode)
 
+	// ── v1.0.4: Per-request route token resolution ─────────────────────────
+	// If the client sends an aikey_vk_ token, resolve it via Registry.
+	// Non-aikey_vk_ auth headers (e.g. native provider tokens from Claude CLI,
+	// Cursor, etc.) fall through to the default binding — the proxy replaces
+	// them with the real key from the vault binding.
+	rawAuthValue := extractRawAuthValue(r)
+	if rawAuthValue != "" && strings.HasPrefix(rawAuthValue, "aikey_vk_") {
+		route := p.registry.Resolve(rawAuthValue)
+		if route == nil {
+			p.errors.Add(1)
+			logger.Warn("aikey_vk_ token not in registry",
+				"event.name", observability.EventProxyRequestAuthFailed,
+			)
+			writeJSONError(w, http.StatusUnauthorized, "authentication_error", "TOKEN_INVALID",
+				"Route token not found in registry. Run 'aikey route' to see available tokens.")
+			return
+		}
+
+		// Provider compatibility check: token's provider must match path's provider.
+		if !isProviderCompatible(route, canonicalCode) {
+			p.errors.Add(1)
+			writeJSONError(w, http.StatusForbidden, "permission_error", "PROVIDER_MISMATCH",
+				"Route token is bound to provider '"+route.ProviderCode+
+					"', but request path indicates '"+canonicalCode+
+					"'. Use the correct path prefix or a different token.")
+			return
+		}
+
+		// Strip provider prefix from path.
+		r.URL.Path = strippedPath
+		if r.URL.RawPath != "" {
+			r.URL.RawPath = strippedPath
+		}
+
+		// Resolve real key.
+		var tokenRealKey string
+		if route.PlaintextKey != "" {
+			tokenRealKey = route.PlaintextKey
+		} else if route.KeyAlias == "__oauth__" {
+			// OAuth route token — broker handles credential injection in serveRoute.
+			tokenRealKey = "__oauth__"
+			oauthIdentity = route.OAuthIdentity
+			oauthAccountID = route.AccountID
+		} else {
+			var err error
+			tokenRealKey, err = p.vault.GetSecret(route.KeyAlias)
+			if err != nil {
+				p.errors.Add(1)
+				writeJSONError(w, http.StatusServiceUnavailable, "server_error", "SECRET_NOT_CONFIGURED",
+					"Provider API Key '"+route.KeyAlias+"' is not in the vault. Run: aikey add "+route.KeyAlias)
+				return
+			}
+		}
+
+		// Override baseURL from path's provider default if route doesn't specify one.
+		tokenBaseURL := route.BaseURL
+		if tokenBaseURL == "" {
+			tokenBaseURL = providerDefaultBaseURL(canonicalCode)
+		}
+
+		prov, err := p.providers.Get(protocolType)
+		if err != nil {
+			p.errors.Add(1)
+			writeJSONError(w, http.StatusBadGateway, "server_error", "PROVIDER_ERROR",
+				"Unknown provider protocol: "+protocolType)
+			return
+		}
+
+		tokenRoute := &vkeys.ResolvedRoute{
+			VirtualKeyID:  route.VirtualKeyID,
+			Provider:      providerCode,
+			BaseURL:       tokenBaseURL,
+			PlaintextKey:  tokenRealKey,
+			ProviderCode:  canonicalCode,
+			ProtocolType:  protocolType,
+			OrgID:         route.OrgID,
+			AccountID:     route.AccountID,
+			SeatID:        route.SeatID,
+			OAuthIdentity: oauthIdentity,
+		}
+
+		// Handle OAuth credential injection if this is an OAuth route token.
+		if tokenRealKey == "__oauth__" && oauthAccountID != "" && p.broker != nil {
+			if err := p.broker.EnsureFresh(r.Context(), oauthAccountID); err != nil {
+				p.errors.Add(1)
+				writeJSONError(w, http.StatusUnauthorized, "auth_error", "OAUTH_TOKEN_EXPIRED",
+					err.Error()+"\n  Run: aikey auth login "+providerCode)
+				return
+			}
+			cred, err := p.broker.ResolveCredential(r.Context(), oauthAccountID)
+			if err != nil {
+				p.errors.Add(1)
+				writeJSONError(w, http.StatusServiceUnavailable, "server_error", "OAUTH_RESOLVE_FAILED", err.Error())
+				return
+			}
+			// Why override for openai: Codex OAuth uses chatgpt.com/backend-api/codex
+			// (Responses API), NOT api.openai.com/v1 (Chat Completions API).
+			if canonicalCode == "openai" {
+				tokenRoute.BaseURL = "https://chatgpt.com/backend-api/codex"
+			}
+			oauthInject(r, cred, canonicalCode)
+		}
+
+		p.serveRoute(w, r, tokenRoute, prov, tokenRealKey, rawAuthValue, startTime, logger)
+		return
+	}
+
+	// ── No auth header: fall through to default binding ────────────────────
+
 	// ── v1.0.2: try provider binding first ─────────────────────────────────
 	// The new model stores per-provider primary key selection in
 	// user_profile_provider_bindings.  If a binding exists, resolve directly.
@@ -313,8 +422,16 @@ func (p *Proxy) handlePathPrefixRoute(w http.ResponseWriter, r *http.Request, pr
 				return
 			}
 
-			// Inject OAuth credential via provider-specific injector
-			baseURL = providerDefaultBaseURL(canonicalCode)
+			// Inject OAuth credential via provider-specific injector.
+			// Why override for openai: Codex OAuth uses chatgpt.com/backend-api/codex
+			// (Responses API), NOT api.openai.com/v1 (Chat Completions API).
+			// API key users hit api.openai.com; OAuth users hit chatgpt.com.
+			// Ref: workflow/CI/researchs/oauth-codex-test/main.go
+			if canonicalCode == "openai" {
+				baseURL = "https://chatgpt.com/backend-api/codex"
+			} else {
+				baseURL = providerDefaultBaseURL(canonicalCode)
+			}
 			oauthInject(r, cred, canonicalCode)
 
 			identityTag := cred.Identity

@@ -26,9 +26,8 @@ type CanaryResult struct {
 	SentAt       time.Time `json:"sent_at"`
 	ODSReceived  bool      `json:"ods_received"`
 	DWDProjected bool      `json:"dwd_projected"`
-	QueryVisible bool      `json:"query_visible"`
-	Status       string    `json:"status"`       // "ok" | "partial" | "failed"
-	FailedStage  string    `json:"failed_stage"` // "" | "ingest" | "projection" | "query"
+	Status       string    `json:"status"`       // "ok" | "partial" | "failed" | "unavailable"
+	FailedStage  string    `json:"failed_stage"` // "" | "ingest" | "projection" | "diagnostics_unreachable"
 	RoundTripMs  int64     `json:"round_trip_ms"`
 }
 
@@ -158,6 +157,14 @@ func (p *CanaryProbe) probe() {
 				"previous_failures", p.consecutiveFailures)
 		}
 		p.consecutiveFailures = 0
+	} else if result.Status == "unavailable" {
+		// Diagnostics endpoint not available (server-mode without endpoints).
+		// Don't count as failure — log once then suppress.
+		if p.consecutiveFailures == 0 {
+			slog.Info("canary probe: diagnostics endpoint not available, probe results limited to reporter metrics",
+				"diagnostics_url", p.cfg.DiagnosticsURL)
+		}
+		// Keep consecutiveFailures at 0 — "unavailable" is not a pipeline fault.
 	} else {
 		p.consecutiveFailures++
 		slog.Warn("canary probe failed",
@@ -178,13 +185,22 @@ func (p *CanaryProbe) checkArrival(eventID string, sentAt time.Time) CanaryResul
 	url := fmt.Sprintf("%s/internal/canary-check?event_id=%s", p.cfg.DiagnosticsURL, eventID)
 	resp, err := p.client.Get(url)
 	if err != nil {
-		result.Status = "failed"
-		result.FailedStage = "ingest"
-		slog.Debug("canary check: diagnostics unreachable", "error", err)
+		// Diagnostics endpoint unreachable — this is expected in server-mode where
+		// control-service doesn't have /internal/canary-check yet (P2/P3).
+		// Mark as "unavailable" (not "failed") to avoid false alarms.
+		result.Status = "unavailable"
+		result.FailedStage = "diagnostics_unreachable"
+		slog.Debug("canary check: diagnostics unreachable", "url", url, "error", err)
 		return result
 	}
 	defer resp.Body.Close()
 
+	if resp.StatusCode == http.StatusNotFound {
+		// Endpoint not registered on this server (server-mode without diagnostics).
+		result.Status = "unavailable"
+		result.FailedStage = "diagnostics_unreachable"
+		return result
+	}
 	if resp.StatusCode != http.StatusOK {
 		result.Status = "failed"
 		result.FailedStage = "ingest"
@@ -194,7 +210,6 @@ func (p *CanaryProbe) checkArrival(eventID string, sentAt time.Time) CanaryResul
 	var check struct {
 		ODSReceived  bool `json:"ods_received"`
 		DWDProjected bool `json:"dwd_projected"`
-		QueryVisible bool `json:"query_visible"`
 	}
 	if err := json.NewDecoder(resp.Body).Decode(&check); err != nil {
 		result.Status = "failed"
@@ -204,9 +219,11 @@ func (p *CanaryProbe) checkArrival(eventID string, sentAt time.Time) CanaryResul
 
 	result.ODSReceived = check.ODSReceived
 	result.DWDProjected = check.DWDProjected
-	result.QueryVisible = check.QueryVisible
 	result.RoundTripMs = time.Since(sentAt).Milliseconds()
 
+	// Canary only checks ODS and DWD — no "query" stage.
+	// Why: query-service doesn't have /internal/canary-check yet (P2/P3).
+	// Claiming "query ok" when we only checked DWD would be a false positive.
 	switch {
 	case !check.ODSReceived:
 		result.Status = "failed"
@@ -214,9 +231,6 @@ func (p *CanaryProbe) checkArrival(eventID string, sentAt time.Time) CanaryResul
 	case !check.DWDProjected:
 		result.Status = "partial"
 		result.FailedStage = "projection"
-	case !check.QueryVisible:
-		result.Status = "partial"
-		result.FailedStage = "query"
 	default:
 		result.Status = "ok"
 	}

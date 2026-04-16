@@ -62,6 +62,37 @@ func extractVirtualKey(req *http.Request) string {
 	return ""
 }
 
+// extractRawAuthValue extracts the raw API key/token value from request headers,
+// regardless of prefix.  Returns "" if no auth header is present.
+// Used by path-prefix routing to implement three-phase auth handling:
+//   1. Non-empty + aikey_vk_ prefix → Registry resolve
+//   2. Non-empty + non-aikey_vk_ → 401 TOKEN_INVALID_FORMAT
+//   3. Empty (no auth header) → fallback to default binding
+func extractRawAuthValue(req *http.Request) string {
+	// Check x-api-key first (Anthropic-style, most common for path-prefix)
+	if apiKey := req.Header.Get("x-api-key"); apiKey != "" {
+		return strings.TrimSpace(apiKey)
+	}
+	// Check Authorization: Bearer <token> (OpenAI-style)
+	if auth := req.Header.Get("Authorization"); auth != "" {
+		if token, ok := strings.CutPrefix(auth, "Bearer "); ok {
+			return strings.TrimSpace(token)
+		}
+	}
+	return ""
+}
+
+// isProviderCompatible checks if a route token's provider matches the request path's provider.
+// Returns true if they match exactly, or if the route has ProviderBaseURLs containing the target.
+func isProviderCompatible(route *vkeys.ResolvedRoute, canonicalCode string) bool {
+	if route.ProviderCode == canonicalCode {
+		return true
+	}
+	// Team managed keys with ProviderBaseURLs support multiple providers.
+	// TODO: when ProviderBaseURLs is added to ResolvedRoute, check it here.
+	return false
+}
+
 // extractProviderFromPath checks if path starts with a known provider prefix
 // (e.g., "/anthropic/v1/messages") and returns the provider code and the
 // stripped path (e.g., "anthropic", "/v1/messages"). Returns ("", "") if no

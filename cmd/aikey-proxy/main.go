@@ -165,6 +165,7 @@ func main() {
 	adminHandler.ReloadFn = sup.Reload
 	adminHandler.KeyChecksFn = sup.GetKeyCheckTargets
 	adminHandler.ReporterMetricsFn = sup.ReporterMetrics
+	adminHandler.CanaryResultFn = sup.CanaryResult
 
 	// Build the outbound transport for upstream providers (optional).
 	dataHandler := sup.Handler()

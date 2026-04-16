@@ -6,6 +6,8 @@ import (
 	"fmt"
 	"log/slog"
 	"net/http"
+	"os"
+	"path/filepath"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -21,6 +23,7 @@ type ReporterConfig struct {
 	WALDir          string        // JSONL WAL directory
 	ProxyInstanceID string
 	ConfigHash      string // pipeline config hash for dead letter diagnostics
+	DBPath          string // events DB path, used as dead letter fallback dir
 }
 
 // batchRequest mirrors the collector-service ingest API request body.
@@ -87,9 +90,23 @@ func NewReporter(cfg ReporterConfig) (*Reporter, error) {
 		}
 	}
 
+	// dead_letter.jsonl is always enabled when collector is configured,
+	// even if WAL is not. Dead letters are critical for diagnosing terminal
+	// upload failures — they must not be silently dropped.
 	var dlw *deadLetterWriter
-	if cfg.WALDir != "" {
-		dlw = newDeadLetterWriter(cfg.WALDir)
+	dlDir := cfg.WALDir
+	if dlDir == "" {
+		// Default: same directory as events DB, or ~/.aikey/data/
+		if cfg.DBPath != "" {
+			dlDir = filepath.Dir(cfg.DBPath)
+		} else {
+			home, _ := os.UserHomeDir()
+			dlDir = filepath.Join(home, ".aikey", "data")
+		}
+	}
+	if dlDir != "" {
+		os.MkdirAll(dlDir, 0o755)
+		dlw = newDeadLetterWriter(dlDir)
 	}
 
 	r := &Reporter{

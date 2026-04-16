@@ -588,6 +588,112 @@ func ReadConfigU64LE(dbPath string, key string) (uint64, error) {
 	return v, nil
 }
 
+// ---------------------------------------------------------------------------
+// Route token reading (personal keys and OAuth accounts)
+// ---------------------------------------------------------------------------
+
+// ErrMissingRouteTokenColumn indicates the vault has not been migrated to
+// include the route_token column.  Callers should degrade gracefully (skip
+// personal/OAuth route token loading) rather than failing.
+var ErrMissingRouteTokenColumn = fmt.Errorf("vault: route_token column not found, run CLI to migrate")
+
+// PersonalRouteToken represents a personal key's route token for Registry registration.
+type PersonalRouteToken struct {
+	Alias        string
+	RouteToken   string
+	ProviderCode string
+	BaseURL      string // custom base URL (may be empty)
+}
+
+// OAuthRouteToken represents an OAuth account's route token for Registry registration.
+type OAuthRouteToken struct {
+	AccountID    string
+	RouteToken   string
+	Provider     string
+	Identity     string // display identity (email or display name)
+}
+
+// hasColumn checks if a column exists on a table (via PRAGMA table_info).
+func hasColumn(db *sql.DB, table, column string) bool {
+	var count int
+	err := db.QueryRow(
+		fmt.Sprintf("SELECT COUNT(*) FROM pragma_table_info('%s') WHERE name=?", table), column,
+	).Scan(&count)
+	return err == nil && count > 0
+}
+
+// GetAllPersonalRouteTokens returns all personal key entries that have a
+// non-NULL route_token.  Returns ErrMissingRouteTokenColumn if the column
+// does not exist (old vault not yet migrated by CLI).
+func (r *Reader) GetAllPersonalRouteTokens() ([]PersonalRouteToken, error) {
+	if !hasColumn(r.db, "entries", "route_token") {
+		return nil, ErrMissingRouteTokenColumn
+	}
+
+	rows, err := r.db.Query(
+		"SELECT alias, route_token, provider_code, base_url FROM entries WHERE route_token IS NOT NULL",
+	)
+	if err != nil {
+		return nil, fmt.Errorf("query personal route tokens: %w", err)
+	}
+	defer rows.Close()
+
+	var result []PersonalRouteToken
+	for rows.Next() {
+		var t PersonalRouteToken
+		var code, url *string
+		if err := rows.Scan(&t.Alias, &t.RouteToken, &code, &url); err != nil {
+			slog.Warn("skip personal route token row", "error", err)
+			continue
+		}
+		if code != nil {
+			t.ProviderCode = *code
+		}
+		if url != nil {
+			t.BaseURL = *url
+		}
+		result = append(result, t)
+	}
+	return result, rows.Err()
+}
+
+// GetAllOAuthRouteTokens returns all active OAuth accounts that have a
+// non-NULL route_token.  Returns ErrMissingRouteTokenColumn if the column
+// does not exist.
+func (r *Reader) GetAllOAuthRouteTokens() ([]OAuthRouteToken, error) {
+	// provider_accounts table may not exist (v1.0.3+ only).
+	if !hasColumn(r.db, "provider_accounts", "provider_account_id") {
+		return nil, nil // no table = no accounts, not an error
+	}
+	if !hasColumn(r.db, "provider_accounts", "route_token") {
+		return nil, ErrMissingRouteTokenColumn
+	}
+
+	rows, err := r.db.Query(
+		"SELECT provider_account_id, route_token, provider, display_identity " +
+			"FROM provider_accounts WHERE route_token IS NOT NULL AND status = 'active'",
+	)
+	if err != nil {
+		return nil, fmt.Errorf("query oauth route tokens: %w", err)
+	}
+	defer rows.Close()
+
+	var result []OAuthRouteToken
+	for rows.Next() {
+		var t OAuthRouteToken
+		var identity *string
+		if err := rows.Scan(&t.AccountID, &t.RouteToken, &t.Provider, &identity); err != nil {
+			slog.Warn("skip oauth route token row", "error", err)
+			continue
+		}
+		if identity != nil {
+			t.Identity = *identity
+		}
+		result = append(result, t)
+	}
+	return result, rows.Err()
+}
+
 // WriteConfigU64LE writes a uint64 as an 8-byte little-endian BLOB into the
 // vault config table (INSERT OR REPLACE).  Opens its own connection so it can
 // be called independently of an existing Reader.

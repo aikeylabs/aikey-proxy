@@ -65,6 +65,12 @@ type EventsConfig struct {
 	UploadBatchSize int          `yaml:"upload_batch_size"` // events per upload (default 100)
 	UploadInterval time.Duration `yaml:"upload_interval"`  // max time between uploads (default 5s)
 	WALDir         string        `yaml:"wal_dir"`          // JSONL WAL directory
+
+	// Control service URL — used for diagnostics/canary-check queries.
+	// In trial mode: same as collector_url (both on trial-server).
+	// In server mode: points to control-service (not collector).
+	ControlURL   string `yaml:"control_url"`
+	ServiceToken string `yaml:"service_token"`
 }
 
 type LogConfig struct {
