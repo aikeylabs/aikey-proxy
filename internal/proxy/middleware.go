@@ -64,10 +64,11 @@ func extractVirtualKey(req *http.Request) string {
 
 // extractRawAuthValue extracts the raw API key/token value from request headers,
 // regardless of prefix.  Returns "" if no auth header is present.
-// Used by path-prefix routing to implement three-phase auth handling:
-//   1. Non-empty + aikey_vk_ prefix → Registry resolve
-//   2. Non-empty + non-aikey_vk_ → 401 TOKEN_INVALID_FORMAT
-//   3. Empty (no auth header) → fallback to default binding
+// Used by path-prefix routing for two-phase auth handling:
+//   1. aikey_vk_ prefix → route token Registry resolve
+//   2. Anything else (incl. native provider tokens from CLI tools) → fallback to default binding
+// Why non-aikey_vk_ is NOT rejected: CLI tools (claude, cursor, openai) send their own
+// auth headers through the proxy; the binding logic replaces them with the real key.
 func extractRawAuthValue(req *http.Request) string {
 	// Check x-api-key first (Anthropic-style, most common for path-prefix)
 	if apiKey := req.Header.Get("x-api-key"); apiKey != "" {
@@ -83,9 +84,10 @@ func extractRawAuthValue(req *http.Request) string {
 }
 
 // isProviderCompatible checks if a route token's provider matches the request path's provider.
-// Returns true if they match exactly, or if the route has ProviderBaseURLs containing the target.
+// Compares canonical codes so broker aliases (claude→anthropic, codex→openai) match correctly.
 func isProviderCompatible(route *vkeys.ResolvedRoute, canonicalCode string) bool {
-	if route.ProviderCode == canonicalCode {
+	routeCanonical := providerCanonicalCode(route.ProviderCode)
+	if routeCanonical == canonicalCode {
 		return true
 	}
 	// Team managed keys with ProviderBaseURLs support multiple providers.

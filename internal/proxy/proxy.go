@@ -57,6 +57,7 @@ type OAuthCredential struct {
 	AccessToken string
 	Provider    string
 	AccountID   string
+	ExternalID  string // Account UUID from OAuth provider (e.g. Claude account.uuid)
 	ExpiresAt   int64
 	Identity    string // Email or display name (for logging only, never sent upstream)
 }

@@ -40,45 +40,64 @@ func oauthInject(req *http.Request, cred *OAuthCredential, providerCode string) 
 
 // injectClaudeOAuth injects the full Claude Code persona.
 //
-// CRITICAL (2026-04-14 verified):
+// CRITICAL (2026-04-16 verified):
 //   Bearer token alone → 401 "OAuth authentication not supported"
+//   + ?beta=true + anthropic-version → accepted as OAuth
 //   + anthropic-beta + X-Stainless-* → 429 business rejection (no X-RateLimit-Reset)
 //   + metadata.user_id + X-Claude-Code-Session-Id → 200 success
 //
-// All three layers are required. Missing any one triggers rejection.
+// All layers are required. Missing any one triggers rejection.
 func injectClaudeOAuth(req *http.Request, cred *OAuthCredential) {
 	// 1. Bearer token
 	req.Header.Set("Authorization", "Bearer "+cred.AccessToken)
 
-	// 2. Claude Code fingerprint headers
+	// 2. anthropic-version — required for all Anthropic API calls.
+	// Why here: OAuth path skips provider.RewriteRequest (which normally sets this).
+	// Without it, Anthropic returns 400 "missing anthropic-version header".
+	setIfAbsent(req, "anthropic-version", "2023-06-01")
+
+	// 3. ?beta=true query parameter — required for OAuth token access.
+	// Why: research test verified that API URL must include ?beta=true.
+	// Without it, Anthropic returns 401 "OAuth authentication not supported".
+	// Ref: workflow/CI/researchs/oauth-token-exchange-test/main.go line 59-60
+	q := req.URL.Query()
+	if q.Get("beta") == "" {
+		q.Set("beta", "true")
+		req.URL.RawQuery = q.Encode()
+	}
+
+	// 4. Claude Code fingerprint headers
 	// Why preserve existing: Claude Code CLI sets its own anthropic-beta, User-Agent,
 	// and X-Stainless-* headers. We only add oauth-specific beta flag and ensure
 	// the critical persona headers exist. Overwriting would break newer CLI versions
 	// that add new beta flags (e.g. context_management requires a specific beta).
 
-	// Append oauth beta to existing anthropic-beta (don't overwrite)
+	// Append oauth beta to existing anthropic-beta (don't overwrite existing flags)
 	existingBeta := req.Header.Get("anthropic-beta")
 	if existingBeta != "" {
 		if !strings.Contains(existingBeta, "oauth-2025-04-20") {
 			req.Header.Set("anthropic-beta", existingBeta+",oauth-2025-04-20")
 		}
 	} else {
-		// No existing beta — set full fingerprint (direct API call, not via Claude Code CLI)
-		req.Header.Set("anthropic-beta", "claude-code-20250219,oauth-2025-04-20,interleaved-thinking-2025-05-14")
-		req.Header.Set("User-Agent", "claude-cli/2.1.22 (external, cli)")
-		req.Header.Set("X-App", "cli")
-		req.Header.Set("Anthropic-Dangerous-Direct-Browser-Access", "true")
-		req.Header.Set("X-Stainless-Lang", "js")
-		req.Header.Set("X-Stainless-Package-Version", "0.70.0")
-		req.Header.Set("X-Stainless-OS", "Linux")
-		req.Header.Set("X-Stainless-Arch", "arm64")
-		req.Header.Set("X-Stainless-Runtime", "node")
-		req.Header.Set("X-Stainless-Runtime-Version", "v24.13.0")
-		req.Header.Set("X-Stainless-Retry-Count", "0")
-		req.Header.Set("X-Stainless-Timeout", "600")
+		setIfAbsent(req, "anthropic-beta", "claude-code-20250219,oauth-2025-04-20,interleaved-thinking-2025-05-14")
 	}
 
-	// 3. Claude Code session persona (CRITICAL: completes the persona)
+	// Claude Code persona headers — each guarded independently.
+	// Why per-header: a client may set some but not all (e.g. User-Agent without
+	// X-Stainless-*). Blanket overwrite would destroy client-set values.
+	setIfAbsent(req, "User-Agent", "claude-cli/2.1.22 (external, cli)")
+	setIfAbsent(req, "X-App", "cli")
+	setIfAbsent(req, "Anthropic-Dangerous-Direct-Browser-Access", "true")
+	setIfAbsent(req, "X-Stainless-Lang", "js")
+	setIfAbsent(req, "X-Stainless-Package-Version", "0.70.0")
+	setIfAbsent(req, "X-Stainless-OS", "Linux")
+	setIfAbsent(req, "X-Stainless-Arch", "arm64")
+	setIfAbsent(req, "X-Stainless-Runtime", "node")
+	setIfAbsent(req, "X-Stainless-Runtime-Version", "v24.13.0")
+	setIfAbsent(req, "X-Stainless-Retry-Count", "0")
+	setIfAbsent(req, "X-Stainless-Timeout", "600")
+
+	// 5. Claude Code session persona (CRITICAL: completes the persona)
 	// Why conditional: Claude Code CLI already sets these when running via proxy.
 	// Other tools (Cursor, Cline) don't — proxy injects them only when absent.
 	// Overwriting CLI's session_id would break session tracking.
@@ -86,11 +105,16 @@ func injectClaudeOAuth(req *http.Request, cred *OAuthCredential) {
 		sessionID := generateUUID()
 		req.Header.Set("X-Claude-Code-Session-Id", sessionID)
 
-		// 4. metadata.user_id — only inject if CLI didn't set it
+		// 6. metadata.user_id — only inject if CLI didn't set it
 		// (checked inside injectMetadataUserIDIfAbsent)
+		// Why: Anthropic requires metadata.user_id with format:
+		//   user_<64hex_device_id>_account_<account_uuid>_session_<session_uuid>
+		// Missing account_uuid → 429 business rejection (not real rate limit).
+		// Ref: workflow/CI/researchs/oauth-token-exchange-test/main.go line 16-17
 		deviceHash := sha256.Sum256([]byte(cred.AccountID))
 		deviceID := hex.EncodeToString(deviceHash[:])
-		userID := fmt.Sprintf("user_%s_account__session_%s", deviceID, sessionID)
+		accountUUID := cred.ExternalID // OAuth provider's account UUID
+		userID := fmt.Sprintf("user_%s_account_%s_session_%s", deviceID, accountUUID, sessionID)
 		injectMetadataUserIDIfAbsent(req, userID)
 	}
 }

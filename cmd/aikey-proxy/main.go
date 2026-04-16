@@ -152,7 +152,7 @@ func main() {
 		brk := broker.NewEmbedded(tokenStore, accountStore)
 		oauthHandler = broker.NewHandler(brk)
 		// Wire broker into supervisor so all proxy generations can resolve OAuth credentials
-		sup.SetBroker(&brokerAdapter{brk})
+		sup.SetBroker(&brokerAdapter{inner: brk, accounts: accountStore})
 		slog.Info("OAuth broker initialized")
 	} else {
 		slog.Warn("OAuth broker disabled: vault not available")
@@ -277,7 +277,8 @@ func setupTextLogging(level slog.Level) {
 // brokerAdapter adapts broker.EmbeddedBroker to proxy.OAuthBroker interface.
 // Needed because broker uses typed AccountStatus while proxy uses plain string.
 type brokerAdapter struct {
-	inner *broker.EmbeddedBroker
+	inner    *broker.EmbeddedBroker
+	accounts *vault.VaultAccountStore // for ExternalID lookup
 }
 
 func (a *brokerAdapter) EnsureFresh(ctx context.Context, accountID string) error {
@@ -289,10 +290,20 @@ func (a *brokerAdapter) ResolveCredential(ctx context.Context, accountID string)
 	if err != nil {
 		return nil, err
 	}
+	// Look up ExternalID (account UUID from OAuth provider) for persona injection.
+	// Why: Claude OAuth requires metadata.user_id with the real account UUID.
+	// Without it, Anthropic returns 429 business rejection.
+	var externalID string
+	if a.accounts != nil {
+		if acct, err := a.accounts.GetByID(ctx, accountID); err == nil && acct != nil {
+			externalID = acct.ExternalID
+		}
+	}
 	return &proxy.OAuthCredential{
 		AccessToken: cred.AccessToken,
 		Provider:    cred.Provider,
 		AccountID:   cred.AccountID,
+		ExternalID:  externalID,
 		ExpiresAt:   cred.ExpiresAt,
 		Identity:    cred.Identity,
 	}, nil
