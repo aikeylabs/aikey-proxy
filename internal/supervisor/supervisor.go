@@ -337,6 +337,17 @@ func (s *Supervisor) TotalErrors() int64 {
 	return s.active.Load().proxy.TotalErrors()
 }
 
+// ReporterMetrics returns usage reporter counters from the active generation.
+// Returns nil if reporter is not configured (no collector_url).
+func (s *Supervisor) ReporterMetrics() *events.ReporterMetrics {
+	gen := s.active.Load()
+	if gen.reporter == nil {
+		return nil
+	}
+	m := gen.reporter.Metrics()
+	return &m
+}
+
 // InflightRequests returns the number of in-flight requests in the active generation.
 func (s *Supervisor) InflightRequests() int64 {
 	return s.active.Load().inflight.Load()
