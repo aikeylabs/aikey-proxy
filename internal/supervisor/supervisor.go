@@ -309,14 +309,17 @@ func (s *Supervisor) syncManagedKeys() {
 	allRoutes := make(map[string]*vkeys.ResolvedRoute)
 
 	// 1. Static YAML keys (from config, always present)
+	// Why: must mirror registry.Load() fields exactly — AllowedModels was
+	// previously missing here, causing model restrictions to vanish after reload.
 	for _, k := range s.cfg.VirtualKeys {
 		if k.Token != "" {
 			allRoutes[k.Token] = &vkeys.ResolvedRoute{
-				VirtualKeyID: k.ID,
-				Provider:     k.Provider,
-				BaseURL:      k.BaseURL,
-				KeyAlias:     k.KeyAlias,
-				ProtocolType: k.Provider,
+				VirtualKeyID:  k.ID,
+				Provider:      k.Provider,
+				BaseURL:       k.BaseURL,
+				KeyAlias:      k.KeyAlias,
+				AllowedModels: k.AllowedModels,
+				ProtocolType:  k.Provider,
 			}
 		}
 	}

@@ -361,6 +361,7 @@ func (p *Proxy) handlePathPrefixRoute(w http.ResponseWriter, r *http.Request, pr
 			AccountID:     route.AccountID,
 			SeatID:        route.SeatID,
 			OAuthIdentity: oauthIdentity,
+			AllowedModels: route.AllowedModels, // Why: serveRoute checks this field for model allowlist enforcement
 		}
 
 		// Handle OAuth credential injection if this is an OAuth route token.
