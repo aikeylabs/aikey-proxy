@@ -20,10 +20,16 @@ type ReporterConfig struct {
 	QueueCapacity   int           // bounded queue size (default 10000)
 	BatchSize       int           // events per upload batch (default 100)
 	UploadInterval  time.Duration // max time between uploads (default 5s)
-	WALDir          string        // JSONL WAL directory
+	WALDir          string        // JSONL WAL directory (used only when SharedWAL is nil)
 	ProxyInstanceID string
 	ConfigHash      string // pipeline config hash for dead letter diagnostics
 	DBPath          string // events DB path, used as dead letter fallback dir
+
+	// SharedWAL, when non-nil, takes precedence over WALDir.  This lets the
+	// supervisor create a single WALWriter shared with the proxy — so even
+	// when the reporter is disabled (no collector_url) the proxy can still
+	// append to the same WAL for local consumers (statusline / watch).
+	SharedWAL *WALWriter
 }
 
 // batchRequest mirrors the collector-service ingest API request body.
@@ -81,8 +87,13 @@ func NewReporter(cfg ReporterConfig) (*Reporter, error) {
 		cfg.UploadInterval = 5 * time.Second
 	}
 
+	// Prefer a shared writer owned by the caller.  Falls back to creating one
+	// from WALDir to stay compatible with existing callers.
 	var wal *WALWriter
-	if cfg.WALDir != "" {
+	switch {
+	case cfg.SharedWAL != nil:
+		wal = cfg.SharedWAL
+	case cfg.WALDir != "":
 		var err error
 		wal, err = NewWALWriter(cfg.WALDir)
 		if err != nil {

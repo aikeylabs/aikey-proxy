@@ -52,8 +52,14 @@ func (d *streamDrainer) Close() error {
 // reqCtx is cancelled when the client disconnects (or proxyCtx when shutting
 // down).  Either cancellation closes upstream and unblocks the drainer.
 // reporterCallback is called when the stream ends to report usage.
+// completion captures how the stream terminated:
+//   - "complete":    upstream reached normal EOF and we forwarded all bytes
+//   - "partial":     client disconnected before EOF; recorded tokens reflect
+//                    only the prefix we successfully forwarded
+//   - "interrupted": proxy was shutting down (proxyCtx cancelled) or the
+//                    upstream read errored mid-stream
 // Nil means no reporting.
-type reporterCallback func(inputTokens, outputTokens int)
+type reporterCallback func(inputTokens, outputTokens int, completion string)
 
 func newStreamDrainer(
 	upstream io.ReadCloser,
@@ -84,14 +90,25 @@ func newStreamDrainer(
 		var acc bytes.Buffer
 		buf := make([]byte, 32*1024)
 
+		// Default to "complete"; the loop below downgrades to "partial" or
+		// "interrupted" when it detects the corresponding exit paths.
+		completion := "complete"
+
 	outer:
 		for {
 			// Proxy shutdown or client disconnect: abort between reads.
 			select {
 			case <-proxyCtx.Done():
 				pw.CloseWithError(proxyCtx.Err())
+				if onComplete != nil {
+					// Early exit without token recording — still emit a
+					// callback so callers know the request never finished.
+					onComplete(0, 0, "interrupted")
+				}
 				return
 			case <-reqCtx.Done():
+				// Client disconnected between reads.
+				completion = "partial"
 				break outer
 			default:
 			}
@@ -99,15 +116,22 @@ func newStreamDrainer(
 			n, readErr := upstream.Read(buf)
 			if n > 0 {
 				if _, writeErr := pw.Write(buf[:n]); writeErr != nil {
-					// Client disconnected. Stop draining immediately so the upstream
-					// TCP connection is released and the provider stops generation.
-					// Token usage accumulated so far is still recorded below.
+					// Client disconnected mid-write. Stop draining immediately
+					// so the upstream TCP connection is released and the
+					// provider stops generation. Token usage accumulated so
+					// far is still recorded below.
+					completion = "partial"
 					break outer
 				}
 				// Only accumulate bytes that were successfully forwarded.
 				acc.Write(buf[:n])
 			}
 			if readErr != nil {
+				// io.EOF is the happy path and leaves completion as "complete".
+				// Any other error means upstream cut us off mid-stream.
+				if readErr != io.EOF {
+					completion = "interrupted"
+				}
 				break outer
 			}
 		}
@@ -123,7 +147,7 @@ func newStreamDrainer(
 		ev.DurationMs = time.Since(baseEvent.Timestamp).Milliseconds()
 		collector.Record(ev)
 		if onComplete != nil {
-			onComplete(inputTokens, outputTokens)
+			onComplete(inputTokens, outputTokens, completion)
 		}
 	}()
 

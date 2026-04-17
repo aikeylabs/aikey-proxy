@@ -35,6 +35,7 @@ func (r *Registry) Load(keys []config.VirtualKeyConfig) {
 			// For static YAML keys the provider field IS the protocol type
 			// (e.g. "anthropic", "openai"). Managed keys set this separately.
 			ProtocolType: k.Provider,
+			RouteSource:  "personal_byok",
 		}
 	}
 

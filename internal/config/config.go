@@ -66,11 +66,19 @@ type EventsConfig struct {
 	UploadInterval time.Duration `yaml:"upload_interval"`  // max time between uploads (default 5s)
 	WALDir         string        `yaml:"wal_dir"`          // JSONL WAL directory
 
-	// Control service URL — used for diagnostics/canary-check queries.
-	// In trial mode: same as collector_url (both on trial-server).
-	// In server mode: points to control-service (not collector).
+	// Control service URL — historically used for diagnostics/canary-check
+	// queries. As of 2026-04-17 diagnostics live on collector-service, so
+	// CanaryProbe prefers CollectorURL and only falls back here when it is
+	// empty (older trial configs). Kept for backward compatibility.
 	ControlURL   string `yaml:"control_url"`
 	ServiceToken string `yaml:"service_token"`
+
+	// QueryURL, when set, enables the query-stage canary probe. Canary hits
+	// GET {QueryURL}/internal/canary-check to verify query-service can read
+	// the projector-acked ODS row. Leave empty in trial (single-port, shared
+	// DB — the collector-side DWD ack is already the signal). Set in
+	// production to the query-service base URL for full end-to-end coverage.
+	QueryURL string `yaml:"query_url"`
 }
 
 type LogConfig struct {

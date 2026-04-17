@@ -11,9 +11,19 @@ import (
 
 // CanaryConfig configures the synthetic canary probe.
 type CanaryConfig struct {
-	// DiagnosticsURL is the control/trial server base URL for canary-check queries.
-	// e.g. "http://127.0.0.1:8090"
+	// DiagnosticsURL is the collector-service base URL used to check if an
+	// event reached ODS and was acked by the projector. In trial mode this
+	// collapses with the control URL on a single port; in production it
+	// points to the collector-service container.
+	//   e.g. "http://127.0.0.1:8090" (trial)
+	//        "http://collector.aikey.internal:27300" (production)
 	DiagnosticsURL string
+	// QueryURL, if set, enables a third-stage query-side check by calling
+	// GET {QueryURL}/internal/canary-check on query-service. Empty means
+	// "skip query stage" — which is the correct choice for trial where
+	// collector and query are the same process; production should set it
+	// to the query-service URL for full end-to-end coverage.
+	QueryURL string
 	// Interval between canary probes. Default: 5 minutes.
 	Interval time.Duration
 	// CheckDelay is how long to wait after sending before checking arrival. Default: 15s.
@@ -22,13 +32,14 @@ type CanaryConfig struct {
 
 // CanaryResult holds the outcome of the most recent canary probe.
 type CanaryResult struct {
-	EventID      string    `json:"event_id"`
-	SentAt       time.Time `json:"sent_at"`
-	ODSReceived  bool      `json:"ods_received"`
-	DWDProjected bool      `json:"dwd_projected"`
-	Status       string    `json:"status"`       // "ok" | "partial" | "failed" | "unavailable"
-	FailedStage  string    `json:"failed_stage"` // "" | "ingest" | "projection" | "diagnostics_unreachable"
-	RoundTripMs  int64     `json:"round_trip_ms"`
+	EventID       string    `json:"event_id"`
+	SentAt        time.Time `json:"sent_at"`
+	ODSReceived   bool      `json:"ods_received"`
+	DWDProjected  bool      `json:"dwd_projected"`
+	QueryReadable bool      `json:"query_readable"`
+	Status        string    `json:"status"`       // "ok" | "partial" | "failed" | "unavailable"
+	FailedStage   string    `json:"failed_stage"` // "" | "ingest" | "projection" | "query" | "diagnostics_unreachable"
+	RoundTripMs   int64     `json:"round_trip_ms"`
 }
 
 // CanaryProbe sends periodic synthetic events through the pipeline and verifies arrival.
@@ -185,9 +196,9 @@ func (p *CanaryProbe) checkArrival(eventID string, sentAt time.Time) CanaryResul
 	url := fmt.Sprintf("%s/internal/canary-check?event_id=%s", p.cfg.DiagnosticsURL, eventID)
 	resp, err := p.client.Get(url)
 	if err != nil {
-		// Diagnostics endpoint unreachable — this is expected in server-mode where
-		// control-service doesn't have /internal/canary-check yet (P2/P3).
-		// Mark as "unavailable" (not "failed") to avoid false alarms.
+		// Diagnostics endpoint unreachable — deployment/network issue rather
+		// than a pipeline fault. Mark as "unavailable" (not "failed") so the
+		// probe doesn't count this toward consecutiveFailures.
 		result.Status = "unavailable"
 		result.FailedStage = "diagnostics_unreachable"
 		slog.Debug("canary check: diagnostics unreachable", "url", url, "error", err)
@@ -196,7 +207,11 @@ func (p *CanaryProbe) checkArrival(eventID string, sentAt time.Time) CanaryResul
 	defer resp.Body.Close()
 
 	if resp.StatusCode == http.StatusNotFound {
-		// Endpoint not registered on this server (server-mode without diagnostics).
+		// Endpoint not registered. As of 2026-04-17 this is no longer the
+		// "feature not implemented" case — /internal/canary-check lives in
+		// collector-service. 404 here means DiagnosticsURL is pointing at the
+		// wrong service (misconfiguration) or an older binary without the
+		// endpoint.
 		result.Status = "unavailable"
 		result.FailedStage = "diagnostics_unreachable"
 		return result
@@ -221,19 +236,57 @@ func (p *CanaryProbe) checkArrival(eventID string, sentAt time.Time) CanaryResul
 	result.DWDProjected = check.DWDProjected
 	result.RoundTripMs = time.Since(sentAt).Milliseconds()
 
-	// Canary only checks ODS and DWD — no "query" stage.
-	// Why: query-service doesn't have /internal/canary-check yet (P2/P3).
-	// Claiming "query ok" when we only checked DWD would be a false positive.
+	// Short-circuit on failures before attempting the query-stage probe:
+	// there's no point verifying "can query-service see the canary" if the
+	// projector hasn't even acked it.
 	switch {
 	case !check.ODSReceived:
 		result.Status = "failed"
 		result.FailedStage = "ingest"
+		return result
 	case !check.DWDProjected:
 		result.Status = "partial"
 		result.FailedStage = "projection"
-	default:
-		result.Status = "ok"
+		return result
 	}
 
+	// Optional query-stage probe (P2/P3 → landed 2026-04-17). Skipped when
+	// QueryURL is empty (trial single-port deployments) because collector
+	// and query share a DB — a positive DWD ack already implies the query
+	// side can read it. Production should set QueryURL to cover the case
+	// where query-service is a separate container with its own DB connection.
+	if p.cfg.QueryURL != "" {
+		queryURL := fmt.Sprintf("%s/internal/canary-check?event_id=%s", p.cfg.QueryURL, eventID)
+		qResp, qErr := p.client.Get(queryURL)
+		if qErr != nil || qResp.StatusCode != http.StatusOK {
+			// Query-service unreachable or error. Don't demote the overall
+			// status to "failed" — collector side is fine. Report "partial"
+			// with query as the failed stage so operators know where to look.
+			if qResp != nil {
+				qResp.Body.Close()
+			}
+			result.Status = "partial"
+			result.FailedStage = "query"
+			slog.Debug("canary query-stage probe failed", "url", queryURL, "error", qErr)
+			return result
+		}
+		defer qResp.Body.Close()
+		var qCheck struct {
+			QueryReadable bool `json:"query_readable"`
+		}
+		if err := json.NewDecoder(qResp.Body).Decode(&qCheck); err != nil {
+			result.Status = "partial"
+			result.FailedStage = "query"
+			return result
+		}
+		result.QueryReadable = qCheck.QueryReadable
+		if !qCheck.QueryReadable {
+			result.Status = "partial"
+			result.FailedStage = "query"
+			return result
+		}
+	}
+
+	result.Status = "ok"
 	return result
 }

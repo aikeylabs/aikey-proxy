@@ -320,6 +320,7 @@ func (s *Supervisor) syncManagedKeys() {
 				KeyAlias:      k.KeyAlias,
 				AllowedModels: k.AllowedModels,
 				ProtocolType:  k.Provider,
+				RouteSource:   "personal_byok",
 			}
 		}
 	}
@@ -344,6 +345,7 @@ func (s *Supervisor) syncManagedKeys() {
 			CredentialID:       mk.CredentialID,
 			CredentialRevision: mk.CredentialRevision,
 			VirtualKeyRevision: mk.VirtualKeyRevision,
+			RouteSource:        "team",
 		}
 	}
 
@@ -357,6 +359,7 @@ func (s *Supervisor) syncManagedKeys() {
 				KeyAlias:     pt.Alias,
 				ProviderCode: pt.ProviderCode,
 				ProtocolType: providerToProtocol(pt.ProviderCode),
+				RouteSource:  "personal",
 			}
 		}
 	} else if !errors.Is(ptErr, vault.ErrMissingRouteTokenColumn) {
@@ -375,6 +378,7 @@ func (s *Supervisor) syncManagedKeys() {
 				ProtocolType:  providerToProtocol(ot.Provider),
 				AccountID:     ot.AccountID,
 				OAuthIdentity: ot.Identity,
+				RouteSource:   "oauth",
 			}
 		}
 	} else if !errors.Is(otErr, vault.ErrMissingRouteTokenColumn) {
@@ -793,6 +797,33 @@ func (s *Supervisor) buildGeneration() (*generation, error) {
 		p.SetBroker(s.broker)
 	}
 
+	// Create the local WAL writer unconditionally whenever WALDir is set.
+	// This is the canonical event log used by `aikey statusline` / `aikey watch`,
+	// and it must exist even in standalone (no collector_url) deployments —
+	// the reporter is only one of several consumers.  When the reporter is
+	// also created below we hand it this shared instance so there is only a
+	// single writer touching the directory.
+	var sharedWAL *events.WALWriter
+	if s.cfg.Events.WALDir != "" {
+		if w, werr := events.NewWALWriter(s.cfg.Events.WALDir); werr != nil {
+			slog.Warn("local wal init failed, offline usage log disabled", "error", werr)
+		} else {
+			sharedWAL = w
+			// Always attach to proxy.  When reporter is nil this is the only
+			// sink; when reporter is non-nil the proxy skips direct append
+			// (reporter.Report handles it via the shared instance).
+			p.SetWAL(sharedWAL)
+			// Thread proxy identity fields that reportUsage needs even in
+			// the offline path.  SetReporter below would overwrite these
+			// with the same values when a reporter is present.
+			var loadedSeq int64
+			if seq, err := vault.ReadConfigU64LE(s.cfg.Vault.Path, VaultChangeSeqKey); err == nil {
+				loadedSeq = int64(seq)
+			}
+			p.SetReporter(nil, fmt.Sprintf("proxy-%d", id), s.version, fmt.Sprintf("gen-%d", id), loadedSeq, vaultReader.GetLoggedInAccountID())
+		}
+	}
+
 	// Attach usage reporter if collector_url is configured.
 	var reporter *events.Reporter
 	var canary *events.CanaryProbe
@@ -805,6 +836,7 @@ func (s *Supervisor) buildGeneration() (*generation, error) {
 			BatchSize:       s.cfg.Events.UploadBatchSize,
 			UploadInterval:  s.cfg.Events.UploadInterval,
 			WALDir:          s.cfg.Events.WALDir,
+			SharedWAL:       sharedWAL,
 			ProxyInstanceID: fmt.Sprintf("proxy-%d", id),
 			ConfigHash:      s.cfg.PipelineConfigHash(),
 			DBPath:          s.cfg.Events.DBPath,
@@ -820,18 +852,22 @@ func (s *Supervisor) buildGeneration() (*generation, error) {
 			p.SetReporter(reporter, fmt.Sprintf("proxy-%d", id), s.version, fmt.Sprintf("gen-%d", id), loadedSeq, vaultReader.GetLoggedInAccountID())
 			slog.Info("usage reporter enabled", "collector_url", s.cfg.Events.CollectorURL)
 
-			// Start canary probe: diagnostics endpoint is on the control plane
-			// (trial-server or control-service), NOT the collector-service.
-			// Why control_url, not collector_url: /internal/canary-check is
-			// registered on the control plane. In trial mode they're the same
-			// port; in server mode collector_url points to a standalone collector
-			// that doesn't have diagnostics endpoints.
-			diagURL := s.cfg.Events.ControlURL
+			// Start canary probe. As of 2026-04-17 diagnostics live on the
+			// collector-service (/v1/diagnostics/pipeline, /internal/canary-check),
+			// not the control plane. Prefer CollectorURL; fall back to
+			// ControlURL for backward compatibility with older trial configs
+			// where control_url was set and collector_url was not.
+			//
+			// QueryURL, when configured, enables the query-stage probe so the
+			// canary covers the full ODS → projector-ack → query chain. Trial
+			// deployments typically leave it empty (single-port, shared DB).
+			diagURL := s.cfg.Events.CollectorURL
 			if diagURL == "" {
-				diagURL = s.cfg.Events.CollectorURL // fallback for trial mode
+				diagURL = s.cfg.Events.ControlURL
 			}
 			canary = events.NewCanaryProbe(reporter, events.CanaryConfig{
 				DiagnosticsURL: diagURL,
+				QueryURL:       s.cfg.Events.QueryURL,
 			})
 		}
 	}

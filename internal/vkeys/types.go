@@ -27,6 +27,13 @@ type ResolvedRoute struct {
 	CredentialID       string
 	CredentialRevision string
 	VirtualKeyRevision string
+
+	// RouteSource is the origin classification set at registry construction
+	// time: "personal_byok" (static YAML), "team" (managed cache),
+	// "personal" (vault personal route token), "oauth" (vault OAuth token).
+	// Used by downstream consumers (WAL event, CLI status line, watch) to
+	// derive user-facing labels without fragile prefix parsing on VirtualKeyID.
+	RouteSource string
 }
 
 // IsModelAllowed checks if the given model is permitted by this route.

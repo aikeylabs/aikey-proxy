@@ -66,6 +66,21 @@ type ReportableEvent struct {
 	HTTPStatusCode *int   `json:"http_status_code,omitempty"`
 	ErrorCode      string `json:"error_code,omitempty"`
 	ErrorMessage   string `json:"error_message,omitempty"`
+
+	// UI anchor fields (费用小票/仪表盘).  omitempty so downstream consumers
+	// expecting the pre-v5 schema continue to parse.
+	//
+	// SessionID: X-Claude-Code-Session-Id header value.  Populated only for
+	//   Claude Code originated requests; empty for Kimi CLI / curl / others.
+	// KeyLabel:  user-friendly name for the underlying credential derived
+	//   from RouteSource (OAuth email / team or personal alias / id prefix).
+	//   Lets CLI consumers render a receipt without vault lookups.
+	// Completion: transport-level completion state.  "complete" is the happy
+	//   path; "partial" means the client disconnected mid-stream and we
+	//   recorded whatever tokens arrived; "interrupted" is an upstream error.
+	SessionID  string `json:"session_id,omitempty"`
+	KeyLabel   string `json:"key_label,omitempty"`
+	Completion string `json:"completion,omitempty"`
 }
 
 // ReportOpts collects all context needed to build a ReportableEvent.
@@ -87,6 +102,12 @@ type ReportOpts struct {
 	ProxyConfigVersion string
 	LoadedControlSeq   int64
 	LoggedInAccountID  string // fallback account_id for personal keys
+
+	// UI anchor fields (see ReportableEvent docs for semantics).
+	// SessionID comes from the X-Claude-Code-Session-Id request header.
+	// Completion defaults to "complete" if left empty.
+	SessionID  string
+	Completion string
 }
 
 // BuildReportableEvent creates a ReportableEvent from the proxy request context.
@@ -104,11 +125,20 @@ func BuildReportableEvent(opts ReportOpts) ReportableEvent {
 		status = "error"
 	}
 
-	routeSource := "personal"
+	// Prefer the route-carried RouteSource (set at registry construction time)
+	// for authoritative classification.  Fall back to OrgID-based inference
+	// only when the legacy caller hasn't populated it yet, to stay compatible
+	// with older data paths until the cutover is complete.
+	routeSource := route.RouteSource
 	orgID := route.OrgID
-	if orgID != "" {
-		routeSource = "team_managed"
-	} else {
+	if routeSource == "" {
+		if orgID != "" {
+			routeSource = "team_managed"
+		} else {
+			routeSource = "personal"
+		}
+	}
+	if orgID == "" {
 		// Personal keys have no org — use "personal" as a sentinel so the
 		// event passes ingest validation (org_id is required).
 		orgID = "personal"
@@ -178,8 +208,54 @@ func BuildReportableEvent(opts ReportOpts) ReportableEvent {
 		RequestStatus:  status,
 		HTTPStatusCode: &opts.StatusCode,
 		ErrorCode:      opts.ErrorType,
+
+		SessionID:  opts.SessionID,
+		KeyLabel:   deriveKeyLabel(route),
+		Completion: completionOrDefault(opts.Completion),
 	}
 	return ev
+}
+
+// deriveKeyLabel returns a user-facing identifier for the credential based on
+// its route_source classification.  For OAuth accounts the display_identity
+// (email or session id) is most meaningful; for team / personal keys the
+// alias is what the user sees in `aikey list`; otherwise we truncate the
+// virtual_key_id as a last resort so the UI always has something to render.
+func deriveKeyLabel(route *vkeys.ResolvedRoute) string {
+	if route == nil {
+		return ""
+	}
+	switch route.RouteSource {
+	case "oauth":
+		if route.OAuthIdentity != "" {
+			return route.OAuthIdentity
+		}
+	case "team", "personal", "personal_byok":
+		if route.KeyAlias != "" && route.KeyAlias != "__oauth__" {
+			return route.KeyAlias
+		}
+	}
+	// Fallback: first 12 chars of virtual_key_id.  Stable enough to identify
+	// the row in the WAL even when more specific labels are unavailable.
+	if vk := route.VirtualKeyID; vk != "" {
+		if len(vk) > 12 {
+			return vk[:12]
+		}
+		return vk
+	}
+	return ""
+}
+
+// completionOrDefault normalizes the transport completion state.  "complete"
+// is assumed when the caller hasn't set anything explicitly; the stream
+// drainer fills in "partial" / "interrupted" when it detects those cases.
+func completionOrDefault(c string) string {
+	switch c {
+	case "complete", "partial", "interrupted":
+		return c
+	default:
+		return "complete"
+	}
 }
 
 // hashIfNotEmpty returns a SHA-256 hex digest, or empty string.

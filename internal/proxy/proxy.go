@@ -72,6 +72,7 @@ type Proxy struct {
 	providers    *provider.Registry
 	collector    *events.Collector
 	reporter     *events.Reporter // usage reporting to collector-service (nil = disabled)
+	wal          *events.WALWriter // local JSONL WAL (shared with reporter when both set; sole writer when reporter is nil)
 	transport    http.RoundTripper // nil → http.DefaultTransport (reads env vars)
 	proxyCtx     context.Context   // cancelled when the proxy shuts down
 	proxyInstanceID    string
@@ -138,6 +139,16 @@ func (p *Proxy) SetReporter(r *events.Reporter, instanceID, clientVersion, confi
 	p.proxyConfigVersion = configVersion
 	p.loadedControlSeq = loadedControlSeq
 	p.loggedInAccountID = loggedInAccountID
+}
+
+// SetWAL attaches a local WAL writer for offline-mode usage events.
+// When a reporter is configured the WAL is shared with it (set once at
+// supervisor level) and the reporter performs the append.  When the reporter
+// is nil, reportUsage falls back to appending directly via this writer so
+// local consumers (aikey statusline / watch) always see events — even without
+// a collector_url.
+func (p *Proxy) SetWAL(w *events.WALWriter) {
+	p.wal = w
 }
 
 // TotalRequests returns the total number of proxied requests.
@@ -703,16 +714,22 @@ func (p *Proxy) serveRoute(w http.ResponseWriter, r *http.Request, route *vkeys.
 				ev.InputTokens = in
 				ev.OutputTokens = out
 				p.collector.Record(ev)
-				p.reportUsage(route, bearerToken, ev.Model, startTime, resp.StatusCode, in, out, "", realKey)
+				// Non-streaming always terminates atomically — the response is
+				// either the full JSON or it's an error we surface elsewhere.
+				sessionID := r.Header.Get("X-Claude-Code-Session-Id")
+				p.reportUsage(route, bearerToken, ev.Model, startTime, resp.StatusCode, in, out, "", realKey, sessionID, "complete")
 			} else {
 				// Streaming success: wrap body — background goroutine drains the
 				// full SSE stream and records token usage when it ends, regardless
 				// of whether the client stays connected.
 				baseEvent := p.buildBaseEvent(r, resp, startTime, route, true)
+				// Capture session_id from the request now; by callback time
+				// the request's header map may have been recycled.
+				sessionID := r.Header.Get("X-Claude-Code-Session-Id")
 				var cb reporterCallback
 				if p.reporter != nil {
-					cb = func(inTok, outTok int) {
-						p.reportUsage(route, bearerToken, baseEvent.Model, startTime, resp.StatusCode, inTok, outTok, "", realKey)
+					cb = func(inTok, outTok int, completion string) {
+						p.reportUsage(route, bearerToken, baseEvent.Model, startTime, resp.StatusCode, inTok, outTok, "", realKey, sessionID, completion)
 					}
 				}
 				resp.Body = newStreamDrainer(resp.Body, baseEvent, prov, p.collector, p.proxyCtx, r.Context(), cb)
@@ -779,12 +796,21 @@ func (p *Proxy) recordEvent(req *http.Request, resp *http.Response, startTime ti
 		ev.ErrorType = http.StatusText(resp.StatusCode)
 	}
 	p.collector.Record(ev)
-	p.reportUsage(route, bearerToken, ev.Model, startTime, resp.StatusCode, 0, 0, ev.ErrorType, "")
+	// Error responses are treated as interrupted — the client never got a
+	// usable result even though the request finished "fast" from our POV.
+	sessionID := req.Header.Get("X-Claude-Code-Session-Id")
+	p.reportUsage(route, bearerToken, ev.Model, startTime, resp.StatusCode, 0, 0, ev.ErrorType, "", sessionID, "interrupted")
 }
 
-// reportUsage sends a usage event to the collector-service reporter (if configured).
-func (p *Proxy) reportUsage(route *vkeys.ResolvedRoute, bearerToken, model string, startTime time.Time, statusCode, inTokens, outTokens int, errorType, realKey string) {
-	if p.reporter == nil {
+// reportUsage builds a ReportableEvent and emits it to whichever sinks are
+// configured:
+//   - reporter present → Report() handles WAL append + async upload
+//   - reporter nil but WAL present → append directly (offline standalone mode)
+//   - neither → no-op
+// sessionID is the value of X-Claude-Code-Session-Id (empty for non-Claude-Code clients).
+// completion is the transport-level outcome: "complete" | "partial" | "interrupted".
+func (p *Proxy) reportUsage(route *vkeys.ResolvedRoute, bearerToken, model string, startTime time.Time, statusCode, inTokens, outTokens int, errorType, realKey, sessionID, completion string) {
+	if p.reporter == nil && p.wal == nil {
 		return
 	}
 	ev := events.BuildReportableEvent(events.ReportOpts{
@@ -805,8 +831,18 @@ func (p *Proxy) reportUsage(route *vkeys.ResolvedRoute, bearerToken, model strin
 		ProxyConfigVersion: p.proxyConfigVersion,
 		LoadedControlSeq:   p.loadedControlSeq,
 		LoggedInAccountID:  p.loggedInAccountID,
+		SessionID:          sessionID,
+		Completion:         completion,
 	})
-	p.reporter.Report(ev)
+	if p.reporter != nil {
+		// Reporter writes WAL + enqueues upload; when wal is the shared
+		// instance no duplicate append happens.
+		p.reporter.Report(ev)
+		return
+	}
+	// Offline path: no collector_url, but WAL is still desired so local
+	// statusline / watch can consume it.
+	p.wal.Append(ev)
 }
 
 // extractModel reads the request body to find the "model" field.
