@@ -159,62 +159,65 @@ func setIfAbsent(req *http.Request, key, value string) {
 	}
 }
 
+// setRequestBody atomically replaces req.Body AND req.ContentLength,
+// guaranteeing they stay in sync. This is critical: a mismatch between
+// Body and ContentLength causes upstream to read partial/corrupt data.
+func setRequestBody(req *http.Request, bodyBytes []byte) {
+	req.Body = io.NopCloser(bytes.NewReader(bodyBytes))
+	req.ContentLength = int64(len(bodyBytes))
+}
+
 // injectMetadataUserIDIfAbsent reads the request body JSON and injects
 // metadata.user_id only if it's not already set. This preserves the CLI's
 // own user_id when proxying Claude Code requests (forward compatibility).
 func injectMetadataUserIDIfAbsent(req *http.Request, userID string) {
-	if req.Body == nil {
-		return
-	}
-	bodyBytes, err := io.ReadAll(req.Body)
-	if err != nil {
-		return
-	}
-	req.Body.Close()
-
-	var body map[string]any
-	if err := json.Unmarshal(bodyBytes, &body); err != nil {
-		req.Body = io.NopCloser(bytes.NewReader(bodyBytes))
-		req.ContentLength = int64(len(bodyBytes))
-		return
-	}
-
-	// Check if metadata.user_id already exists — if so, leave it untouched
-	if metadata, ok := body["metadata"].(map[string]any); ok {
-		if _, exists := metadata["user_id"]; exists {
-			req.Body = io.NopCloser(bytes.NewReader(bodyBytes))
-			req.ContentLength = int64(len(bodyBytes))
-			return
+	mutateJSONBody(req, func(body map[string]any) bool {
+		// Skip if metadata.user_id already present.
+		if metadata, ok := body["metadata"].(map[string]any); ok {
+			if _, exists := metadata["user_id"]; exists {
+				return false
+			}
 		}
-	}
-
-	// Not present — inject it
-	metadata, ok := body["metadata"].(map[string]any)
-	if !ok {
-		metadata = make(map[string]any)
-	}
-	metadata["user_id"] = userID
-	body["metadata"] = metadata
-
-	newBody, err := json.Marshal(body)
-	if err != nil {
-		req.Body = io.NopCloser(bytes.NewReader(bodyBytes))
-		req.ContentLength = int64(len(bodyBytes))
-		return
-	}
-
-	req.Body = io.NopCloser(bytes.NewReader(newBody))
-	req.ContentLength = int64(len(newBody))
+		metadata, ok := body["metadata"].(map[string]any)
+		if !ok {
+			metadata = make(map[string]any)
+		}
+		metadata["user_id"] = userID
+		body["metadata"] = metadata
+		return true
+	})
 }
 
-// injectMetadataUserID reads the request body JSON, injects/overwrites
-// metadata.user_id, then rewrites the body.
+// injectMetadataUserID reads the request body JSON and injects/overwrites
+// metadata.user_id.
 func injectMetadataUserID(req *http.Request, userID string) {
+	mutateJSONBody(req, func(body map[string]any) bool {
+		metadata, ok := body["metadata"].(map[string]any)
+		if !ok {
+			metadata = make(map[string]any)
+		}
+		metadata["user_id"] = userID
+		body["metadata"] = metadata
+		return true
+	})
+}
+
+// mutateJSONBody applies `mutate` to the request's JSON body.
+// `mutate` returns true if the body was changed (re-marshal required),
+// false to keep the original body.
+//
+// Guarantees (critical for upstream correctness):
+//   - req.Body and req.ContentLength are always updated together
+//   - On any error path, the original body is restored (not dropped)
+//   - Never leaves req.Body as a consumed reader
+func mutateJSONBody(req *http.Request, mutate func(body map[string]any) bool) {
 	if req.Body == nil {
 		return
 	}
 	bodyBytes, err := io.ReadAll(req.Body)
 	if err != nil {
+		// Body read failure: can't recover content — leave req.Body as-is
+		// (reverse-proxy will treat this request as failed on next read).
 		return
 	}
 	req.Body.Close()
@@ -222,28 +225,23 @@ func injectMetadataUserID(req *http.Request, userID string) {
 	var body map[string]any
 	if err := json.Unmarshal(bodyBytes, &body); err != nil {
 		// Not JSON — restore original body unchanged
-		req.Body = io.NopCloser(bytes.NewReader(bodyBytes))
-		req.ContentLength = int64(len(bodyBytes))
+		setRequestBody(req, bodyBytes)
 		return
 	}
 
-	// Inject or overwrite metadata.user_id
-	metadata, ok := body["metadata"].(map[string]any)
-	if !ok {
-		metadata = make(map[string]any)
+	changed := mutate(body)
+	if !changed {
+		setRequestBody(req, bodyBytes)
+		return
 	}
-	metadata["user_id"] = userID
-	body["metadata"] = metadata
 
 	newBody, err := json.Marshal(body)
 	if err != nil {
-		req.Body = io.NopCloser(bytes.NewReader(bodyBytes))
-		req.ContentLength = int64(len(bodyBytes))
+		// Re-marshal failed (shouldn't happen for map[string]any) — restore original
+		setRequestBody(req, bodyBytes)
 		return
 	}
-
-	req.Body = io.NopCloser(bytes.NewReader(newBody))
-	req.ContentLength = int64(len(newBody))
+	setRequestBody(req, newBody)
 }
 
 // generateUUID generates a random UUID v4.
