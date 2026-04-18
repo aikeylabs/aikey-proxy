@@ -348,35 +348,13 @@ func (s *Supervisor) syncManagedKeys() {
 	}
 	for _, mk := range managedKeys {
 		token := "aikey_vk_" + mk.VirtualKeyID
-		allRoutes[token] = &vkeys.ResolvedRoute{
-			VirtualKeyID:       mk.VirtualKeyID,
-			Provider:           mk.ProtocolType,
-			BaseURL:            mk.BaseURL,
-			PlaintextKey:       mk.PlaintextKey,
-			OrgID:              mk.OrgID,
-			AccountID:          mk.OwnerAccountID,
-			SeatID:             mk.SeatID,
-			ProviderCode:       mk.ProviderCode,
-			ProtocolType:       mk.ProtocolType,
-			CredentialID:       mk.CredentialID,
-			CredentialRevision: mk.CredentialRevision,
-			VirtualKeyRevision: mk.VirtualKeyRevision,
-			RouteSource:        "team",
-		}
+		allRoutes[token] = managedKeyToRoute(mk)
 	}
 
 	// 3. Personal key route tokens
 	if personalTokens, ptErr := gen.vault.GetAllPersonalRouteTokens(); ptErr == nil {
 		for _, pt := range personalTokens {
-			allRoutes[pt.RouteToken] = &vkeys.ResolvedRoute{
-				VirtualKeyID: "personal:" + pt.Alias,
-				Provider:     pt.ProviderCode,
-				BaseURL:      pt.BaseURL,
-				KeyAlias:     pt.Alias,
-				ProviderCode: pt.ProviderCode,
-				ProtocolType: providerToProtocol(pt.ProviderCode),
-				RouteSource:  "personal",
-			}
+			allRoutes[pt.RouteToken] = personalTokenToRoute(pt)
 		}
 	} else if !errors.Is(ptErr, vault.ErrMissingRouteTokenColumn) {
 		slog.Warn("managed key sync: GetAllPersonalRouteTokens failed", "error", ptErr)
@@ -385,17 +363,7 @@ func (s *Supervisor) syncManagedKeys() {
 	// 4. OAuth account route tokens
 	if oauthTokens, otErr := gen.vault.GetAllOAuthRouteTokens(); otErr == nil {
 		for _, ot := range oauthTokens {
-			allRoutes[ot.RouteToken] = &vkeys.ResolvedRoute{
-				VirtualKeyID:  "oauth:" + ot.AccountID,
-				Provider:      ot.Provider,
-				BaseURL:       providerDefaultBaseURL(ot.Provider),
-				KeyAlias:      "__oauth__",
-				ProviderCode:  ot.Provider,
-				ProtocolType:  providerToProtocol(ot.Provider),
-				AccountID:     ot.AccountID,
-				OAuthIdentity: ot.Identity,
-				RouteSource:   "oauth",
-			}
+			allRoutes[ot.RouteToken] = oauthTokenToRoute(ot)
 		}
 	} else if !errors.Is(otErr, vault.ErrMissingRouteTokenColumn) {
 		slog.Warn("managed key sync: GetAllOAuthRouteTokens failed", "error", otErr)
@@ -728,20 +696,7 @@ func (s *Supervisor) buildGeneration() (*generation, error) {
 		managedRoutes := make(map[string]*vkeys.ResolvedRoute, len(managedKeys))
 		for _, mk := range managedKeys {
 			token := "aikey_vk_" + mk.VirtualKeyID
-			managedRoutes[token] = &vkeys.ResolvedRoute{
-				VirtualKeyID:       mk.VirtualKeyID,
-				Provider:           mk.ProtocolType, // protocol type resolves to provider adapter (e.g. "openai_compatible" → openai)
-				BaseURL:            mk.BaseURL,
-				PlaintextKey:       mk.PlaintextKey,
-				OrgID:              mk.OrgID,
-				AccountID:          mk.OwnerAccountID,
-				SeatID:             mk.SeatID,
-				ProviderCode:       mk.ProviderCode,
-				ProtocolType:       mk.ProtocolType,
-				CredentialID:       mk.CredentialID,
-				CredentialRevision: mk.CredentialRevision,
-				VirtualKeyRevision: mk.VirtualKeyRevision,
-			}
+			managedRoutes[token] = managedKeyToRoute(mk)
 		}
 		registry.Merge(managedRoutes)
 	}
@@ -756,14 +711,7 @@ func (s *Supervisor) buildGeneration() (*generation, error) {
 	} else if len(personalTokens) > 0 {
 		personalRoutes := make(map[string]*vkeys.ResolvedRoute, len(personalTokens))
 		for _, pt := range personalTokens {
-			personalRoutes[pt.RouteToken] = &vkeys.ResolvedRoute{
-				VirtualKeyID: "personal:" + pt.Alias,
-				Provider:     pt.ProviderCode,
-				BaseURL:      pt.BaseURL,
-				KeyAlias:     pt.Alias,
-				ProviderCode: pt.ProviderCode,
-				ProtocolType: providerToProtocol(pt.ProviderCode),
-			}
+			personalRoutes[pt.RouteToken] = personalTokenToRoute(pt)
 		}
 		registry.Merge(personalRoutes)
 	}
@@ -776,24 +724,7 @@ func (s *Supervisor) buildGeneration() (*generation, error) {
 	} else if len(oauthTokens) > 0 {
 		oauthRoutes := make(map[string]*vkeys.ResolvedRoute, len(oauthTokens))
 		for _, ot := range oauthTokens {
-			oauthRoutes[ot.RouteToken] = &vkeys.ResolvedRoute{
-				VirtualKeyID:  "oauth:" + ot.AccountID,
-				Provider:      ot.Provider,
-				BaseURL:       providerDefaultBaseURL(ot.Provider),
-				KeyAlias:      "__oauth__", // sentinel — broker handles credential injection
-				ProviderCode:  ot.Provider,
-				ProtocolType:  providerToProtocol(ot.Provider),
-				AccountID:     ot.AccountID,
-				OAuthIdentity: ot.Identity,
-				// Why: reportable.go's deriveKeyLabel() reads RouteSource to
-				// decide whether to show OAuthIdentity (email) vs a KeyAlias.
-				// The managed-key-sync path below sets this correctly; this
-				// startup-time path was missed in the earlier fix, so after
-				// every proxy reload OAuth events were mis-classified as
-				// "personal" until the next vault sync. Keep the two paths
-				// in lock-step.
-				RouteSource: "oauth",
-			}
+			oauthRoutes[ot.RouteToken] = oauthTokenToRoute(ot)
 		}
 		registry.Merge(oauthRoutes)
 	}
