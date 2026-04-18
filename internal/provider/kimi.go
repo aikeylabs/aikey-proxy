@@ -10,6 +10,12 @@ func (k *Kimi) ExtractTokens(data []byte, streaming bool) (int, int) {
 	return (&OpenAI{}).ExtractTokens(data, streaming)
 }
 
+// ExtractTokenBreakdown delegates to the OpenAI implementation; Kimi has no
+// provider-specific cache semantics beyond what OpenAI exposes.
+func (k *Kimi) ExtractTokenBreakdown(data []byte, streaming bool) TokenBreakdown {
+	return (&OpenAI{}).ExtractTokenBreakdown(data, streaming)
+}
+
 // Kimi implements the Moonshot AI (Kimi) provider protocol.
 // Kimi is fully OpenAI-compatible; the only difference is the default base URL.
 //

@@ -373,6 +373,12 @@ func (p *Proxy) handlePathPrefixRoute(w http.ResponseWriter, r *http.Request, pr
 			SeatID:        route.SeatID,
 			OAuthIdentity: oauthIdentity,
 			AllowedModels: route.AllowedModels, // Why: serveRoute checks this field for model allowlist enforcement
+			// Why: route_source drives deriveKeyLabel's classification — OAuth
+			// routes pick OAuthIdentity (user's email), personal/team pick
+			// KeyAlias. Without this copy, reportable.go's OrgID-based fallback
+			// mis-classifies OAuth as "personal" and the UI shows a truncated
+			// VK id like `oauth:sessio` instead of the user's email.
+			RouteSource: route.RouteSource,
 		}
 
 		// Handle OAuth credential injection if this is an OAuth route token.
@@ -599,6 +605,20 @@ func (p *Proxy) handlePathPrefixRoute(w http.ResponseWriter, r *http.Request, pr
 		route.AccountID = oauthAccountID
 		route.OAuthIdentity = oauthIdentity
 	}
+	// Why: classify so reportable.go's deriveKeyLabel picks the right label
+	// field (OAuthIdentity for oauth, KeyAlias for team/personal). Without
+	// this, the OrgID fallback in reportable.go mis-classifies OAuth personal
+	// requests as "personal" and produces truncated labels like `oauth:sessio`
+	// instead of the user's email. Order matters: OAuth wins even when a team
+	// managed-key lookup happens to side-populate mk for the same account.
+	switch {
+	case oauthAccountID != "":
+		route.RouteSource = "oauth"
+	case mk != nil:
+		route.RouteSource = "team"
+	default:
+		route.RouteSource = "personal"
+	}
 
 	p.serveRoute(w, r, route, prov, realKey, "aikey_vk_"+virtualKeyID, startTime, logger)
 }
@@ -606,6 +626,14 @@ func (p *Proxy) handlePathPrefixRoute(w http.ResponseWriter, r *http.Request, pr
 // serveRoute executes the forwarding pipeline (streaming detection, transport
 // selection, reverse proxy) shared by token-based and path-prefix routing.
 func (p *Proxy) serveRoute(w http.ResponseWriter, r *http.Request, route *vkeys.ResolvedRoute, prov provider.Provider, realKey string, bearerToken string, startTime time.Time, logger *slog.Logger) {
+	// Why: extractModel also stashes the parsed model into the `x-aikey-model`
+	// request header, which buildBaseEvent later reads to populate ev.Model.
+	// Historically this was only called inside the allowlist check (`len(route.AllowedModels) > 0`),
+	// so OAuth / personal routes without an allowlist left `ev.Model` empty
+	// and the UI showed `model: null`. Call unconditionally — it's cheap
+	// (single JSON decode of an already-buffered body).
+	_ = extractModel(r)
+
 	// 6. Detect streaming.
 	streaming := isStreamingRequest(r)
 
@@ -692,6 +720,16 @@ func (p *Proxy) serveRoute(w http.ResponseWriter, r *http.Request, route *vkeys.
 			}
 			// Remove hop-by-hop headers the proxy shouldn't forward.
 			req.Header.Del("X-Forwarded-For")
+			// Why: tell upstream we only accept identity (uncompressed) so the
+			// drainer and non-streaming token extractor can parse the body
+			// directly. Anthropic's OAuth endpoint in particular returns
+			// Content-Encoding: gzip for SSE streams, which made
+			// ExtractTokens see gzip magic bytes (1f8b08...) and return 0/0.
+			// Trade-off: slightly more bandwidth on the proxy-upstream hop,
+			// but we're usually local loopback or a fast VPC so this is fine,
+			// and unambiguous token counting is more valuable than saving a
+			// few KB per request.
+			req.Header.Set("Accept-Encoding", "identity")
 		},
 		ModifyResponse: func(resp *http.Response) error {
 			if resp.StatusCode >= 400 {
@@ -709,15 +747,15 @@ func (p *Proxy) serveRoute(w http.ResponseWriter, r *http.Request, route *vkeys.
 				resp.Body = io.NopCloser(bytes.NewReader(body))
 				resp.ContentLength = int64(len(body))
 
-				in, out := prov.ExtractTokens(body, false)
+				breakdown := prov.ExtractTokenBreakdown(body, false)
 				ev := p.buildBaseEvent(r, resp, startTime, route, false)
-				ev.InputTokens = in
-				ev.OutputTokens = out
+				ev.InputTokens = breakdown.InputTokens
+				ev.OutputTokens = breakdown.OutputTokens
 				p.collector.Record(ev)
 				// Non-streaming always terminates atomically — the response is
 				// either the full JSON or it's an error we surface elsewhere.
 				sessionID := r.Header.Get("X-Claude-Code-Session-Id")
-				p.reportUsage(route, bearerToken, ev.Model, startTime, resp.StatusCode, in, out, "", realKey, sessionID, "complete")
+				p.reportUsage(route, bearerToken, ev.Model, startTime, resp.StatusCode, breakdown, "", realKey, sessionID, "complete")
 			} else {
 				// Streaming success: wrap body — background goroutine drains the
 				// full SSE stream and records token usage when it ends, regardless
@@ -728,8 +766,8 @@ func (p *Proxy) serveRoute(w http.ResponseWriter, r *http.Request, route *vkeys.
 				sessionID := r.Header.Get("X-Claude-Code-Session-Id")
 				var cb reporterCallback
 				if p.reporter != nil {
-					cb = func(inTok, outTok int, completion string) {
-						p.reportUsage(route, bearerToken, baseEvent.Model, startTime, resp.StatusCode, inTok, outTok, "", realKey, sessionID, completion)
+					cb = func(br provider.TokenBreakdown, completion string) {
+						p.reportUsage(route, bearerToken, baseEvent.Model, startTime, resp.StatusCode, br, "", realKey, sessionID, completion)
 					}
 				}
 				resp.Body = newStreamDrainer(resp.Body, baseEvent, prov, p.collector, p.proxyCtx, r.Context(), cb)
@@ -799,7 +837,7 @@ func (p *Proxy) recordEvent(req *http.Request, resp *http.Response, startTime ti
 	// Error responses are treated as interrupted — the client never got a
 	// usable result even though the request finished "fast" from our POV.
 	sessionID := req.Header.Get("X-Claude-Code-Session-Id")
-	p.reportUsage(route, bearerToken, ev.Model, startTime, resp.StatusCode, 0, 0, ev.ErrorType, "", sessionID, "interrupted")
+	p.reportUsage(route, bearerToken, ev.Model, startTime, resp.StatusCode, provider.TokenBreakdown{}, ev.ErrorType, "", sessionID, "interrupted")
 }
 
 // reportUsage builds a ReportableEvent and emits it to whichever sinks are
@@ -809,7 +847,9 @@ func (p *Proxy) recordEvent(req *http.Request, resp *http.Response, startTime ti
 //   - neither → no-op
 // sessionID is the value of X-Claude-Code-Session-Id (empty for non-Claude-Code clients).
 // completion is the transport-level outcome: "complete" | "partial" | "interrupted".
-func (p *Proxy) reportUsage(route *vkeys.ResolvedRoute, bearerToken, model string, startTime time.Time, statusCode, inTokens, outTokens int, errorType, realKey, sessionID, completion string) {
+// breakdown carries the optional cache split (zeroed for providers that don't
+// surface it, e.g. OpenAI/Kimi).
+func (p *Proxy) reportUsage(route *vkeys.ResolvedRoute, bearerToken, model string, startTime time.Time, statusCode int, breakdown provider.TokenBreakdown, errorType, realKey, sessionID, completion string) {
 	if p.reporter == nil && p.wal == nil {
 		return
 	}
@@ -822,8 +862,10 @@ func (p *Proxy) reportUsage(route *vkeys.ResolvedRoute, bearerToken, model strin
 		StartTime:       startTime,
 		FinishedAt:      time.Now(),
 		StatusCode:      statusCode,
-		InputTokens:     inTokens,
-		OutputTokens:    outTokens,
+		InputTokens:     breakdown.InputTokens,
+		OutputTokens:    breakdown.OutputTokens,
+		CacheReadInputTokens:     breakdown.CacheReadInputTokens,
+		CacheCreationInputTokens: breakdown.CacheCreationInputTokens,
 		ErrorType:       errorType,
 		RealKey:         realKey,
 		ClientVersion:      p.clientVersion,

@@ -59,7 +59,7 @@ func (d *streamDrainer) Close() error {
 //   - "interrupted": proxy was shutting down (proxyCtx cancelled) or the
 //                    upstream read errored mid-stream
 // Nil means no reporting.
-type reporterCallback func(inputTokens, outputTokens int, completion string)
+type reporterCallback func(breakdown provider.TokenBreakdown, completion string)
 
 func newStreamDrainer(
 	upstream io.ReadCloser,
@@ -103,7 +103,7 @@ func newStreamDrainer(
 				if onComplete != nil {
 					// Early exit without token recording — still emit a
 					// callback so callers know the request never finished.
-					onComplete(0, 0, "interrupted")
+					onComplete(provider.TokenBreakdown{}, "interrupted")
 				}
 				return
 			case <-reqCtx.Done():
@@ -140,14 +140,14 @@ func newStreamDrainer(
 		pw.Close()
 
 		// Record token usage from however much of the stream was received.
-		inputTokens, outputTokens := prov.ExtractTokens(acc.Bytes(), true)
+		breakdown := prov.ExtractTokenBreakdown(acc.Bytes(), true)
 		ev := baseEvent
-		ev.InputTokens = inputTokens
-		ev.OutputTokens = outputTokens
+		ev.InputTokens = breakdown.InputTokens
+		ev.OutputTokens = breakdown.OutputTokens
 		ev.DurationMs = time.Since(baseEvent.Timestamp).Milliseconds()
 		collector.Record(ev)
 		if onComplete != nil {
-			onComplete(inputTokens, outputTokens, completion)
+			onComplete(breakdown, completion)
 		}
 	}()
 

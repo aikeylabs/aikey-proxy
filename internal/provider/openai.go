@@ -70,3 +70,14 @@ func (o *OpenAI) ExtractTokens(data []byte, streaming bool) (int, int) {
 	}
 	return 0, 0
 }
+
+// ExtractTokenBreakdown delegates to ExtractTokens. OpenAI-compatible
+// providers don't expose a separate cache bucket in the way Anthropic does
+// — `prompt_tokens` already reflects the full billable input, cached or not.
+// A future enhancement could surface `prompt_tokens_details.cached_tokens`
+// via the CacheReadInputTokens field, but the UI consumer treats zero as
+// "no cache info" which is the correct default today.
+func (o *OpenAI) ExtractTokenBreakdown(data []byte, streaming bool) TokenBreakdown {
+	in, out := o.ExtractTokens(data, streaming)
+	return TokenBreakdown{InputTokens: in, OutputTokens: out}
+}

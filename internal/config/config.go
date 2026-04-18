@@ -208,8 +208,32 @@ func (c *Config) validate() error {
 func (c *Config) expandPaths() {
 	c.Vault.Path = expandHome(c.Vault.Path)
 	c.Events.DBPath = expandHome(c.Events.DBPath)
+	// Why: WAL is the v5 canonical event log consumed by `aikey statusline`
+	// and `aikey watch`. Historically the template had `wal_dir` commented
+	// out, so upgrades from those versions carry an empty WALDir forward
+	// and silently lose local usage tracking. Default to the well-known
+	// CLI read path (usage_wal::default_wal_dir) so the UI never goes dark
+	// because of config rot. Operators who want WAL off must set it to
+	// "/dev/null" explicitly — empty means "use the conventional default".
+	if c.Events.WALDir == "" {
+		c.Events.WALDir = defaultUsageWALDir()
+	}
 	c.Events.WALDir = expandHome(c.Events.WALDir)
 	c.Log.Dir = expandHome(c.Log.Dir)
+}
+
+// defaultUsageWALDir returns `~/.aikey/data/usage-wal` expanded, matching the
+// CLI reader in aikey-cli/src/usage_wal.rs::default_wal_dir. Both must agree
+// or the statusline/watch readers won't find the events the proxy writes.
+func defaultUsageWALDir() string {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		// Fall back to the un-expanded form; expandHome won't handle it but
+		// the reporter's NewWALWriter will at least surface a clear error
+		// rather than silently no-op.
+		return "~/.aikey/data/usage-wal"
+	}
+	return filepath.Join(home, ".aikey", "data", "usage-wal")
 }
 
 func expandHome(path string) string {

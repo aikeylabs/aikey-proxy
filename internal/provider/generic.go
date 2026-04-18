@@ -10,6 +10,12 @@ func (g *Generic) ExtractTokens(data []byte, streaming bool) (int, int) {
 	return (&OpenAI{}).ExtractTokens(data, streaming)
 }
 
+// ExtractTokenBreakdown delegates to the OpenAI implementation; generic
+// providers inherit whatever breakdown OpenAI surfaces (currently none).
+func (g *Generic) ExtractTokenBreakdown(data []byte, streaming bool) TokenBreakdown {
+	return (&OpenAI{}).ExtractTokenBreakdown(data, streaming)
+}
+
 // Generic implements a generic OpenAI-compatible provider protocol.
 // This is a fallback for any provider that follows the OpenAI API convention.
 type Generic struct{}

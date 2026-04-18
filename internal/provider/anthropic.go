@@ -32,24 +32,34 @@ func (a *Anthropic) RewriteRequest(req *http.Request, realKey string, baseURL st
 
 // ExtractTokens parses Anthropic token usage.
 //
-// Non-streaming response body:
+// Non-streaming response body (with prompt caching):
 //
-//	{"usage": {"input_tokens": N, "output_tokens": N}}
+//	{"usage": {
+//	  "input_tokens": N,                   // fresh/uncached input
+//	  "cache_creation_input_tokens": N,    // written to cache this turn
+//	  "cache_read_input_tokens": N,        // replayed from cache
+//	  "output_tokens": N
+//	}}
 //
-// Streaming SSE contains two relevant events:
+// Streaming SSE:
 //
-//	data: {"type":"message_start","message":{"usage":{"input_tokens":N}}}
+//	data: {"type":"message_start","message":{"usage":{"input_tokens":N,"cache_read_input_tokens":N,...}}}
 //	data: {"type":"message_delta","usage":{"output_tokens":N}}
+//
+// Why sum all three input-side fields: Anthropic's `input_tokens` excludes
+// cached reads and cache writes. Claude Code's in-prompt counter ("43.4k
+// tokens") reflects the total context being sent, so a statusline that
+// reports only `input_tokens` looks broken (↑1 vs ~43k) for any conversation
+// that has filled the cache. Summing into the returned input preserves the
+// "how much did I send" semantics; a later cost-accounting pass can re-split
+// the fields with their respective price multipliers (~1.25x write / ~0.1x read).
 func (a *Anthropic) ExtractTokens(data []byte, streaming bool) (int, int) {
 	if !streaming {
 		var resp struct {
-			Usage struct {
-				InputTokens  int `json:"input_tokens"`
-				OutputTokens int `json:"output_tokens"`
-			} `json:"usage"`
+			Usage anthropicUsage `json:"usage"`
 		}
 		if json.Unmarshal(data, &resp) == nil {
-			return resp.Usage.InputTokens, resp.Usage.OutputTokens
+			return resp.Usage.totalInput(), resp.Usage.OutputTokens
 		}
 		return 0, 0
 	}
@@ -66,23 +76,86 @@ func (a *Anthropic) ExtractTokens(data []byte, streaming bool) (int, int) {
 		var event struct {
 			Type    string `json:"type"`
 			Message struct {
-				Usage struct {
-					InputTokens int `json:"input_tokens"`
-				} `json:"usage"`
+				Usage anthropicUsage `json:"usage"`
 			} `json:"message"`
-			Usage struct {
-				OutputTokens int `json:"output_tokens"`
-			} `json:"usage"`
+			Usage anthropicUsage `json:"usage"`
 		}
 		if json.Unmarshal(line, &event) != nil {
 			continue
 		}
 		switch event.Type {
 		case "message_start":
-			inputTokens = event.Message.Usage.InputTokens
+			inputTokens = event.Message.Usage.totalInput()
 		case "message_delta":
 			outputTokens = event.Usage.OutputTokens
 		}
 	}
 	return inputTokens, outputTokens
+}
+
+// anthropicUsage mirrors the fields we care about in Anthropic's usage object.
+// Cache fields are `omitempty` from upstream for API key requests that don't
+// use caching, so unmarshal zero-defaults them and totalInput() is still correct.
+type anthropicUsage struct {
+	InputTokens              int `json:"input_tokens"`
+	CacheCreationInputTokens int `json:"cache_creation_input_tokens"`
+	CacheReadInputTokens     int `json:"cache_read_input_tokens"`
+	OutputTokens             int `json:"output_tokens"`
+}
+
+func (u anthropicUsage) totalInput() int {
+	return u.InputTokens + u.CacheCreationInputTokens + u.CacheReadInputTokens
+}
+
+// ExtractTokenBreakdown returns the same totals as ExtractTokens plus the
+// per-bucket split that Anthropic exposes when prompt caching is in use.
+// The streaming parser mirrors ExtractTokens exactly; only the output struct
+// differs, so a future consolidation could collapse the two — left as-is for
+// now to keep the interface-stable ExtractTokens untouched.
+func (a *Anthropic) ExtractTokenBreakdown(data []byte, streaming bool) TokenBreakdown {
+	if !streaming {
+		var resp struct {
+			Usage anthropicUsage `json:"usage"`
+		}
+		if json.Unmarshal(data, &resp) == nil {
+			u := resp.Usage
+			return TokenBreakdown{
+				InputTokens:              u.totalInput(),
+				OutputTokens:             u.OutputTokens,
+				CacheReadInputTokens:     u.CacheReadInputTokens,
+				CacheCreationInputTokens: u.CacheCreationInputTokens,
+			}
+		}
+		return TokenBreakdown{}
+	}
+
+	var br TokenBreakdown
+	for _, line := range bytes.Split(data, []byte("\n")) {
+		line = bytes.TrimSpace(line)
+		line = bytes.TrimPrefix(line, []byte("data: "))
+		line = bytes.TrimPrefix(line, []byte("data:"))
+		if len(line) == 0 || line[0] != '{' {
+			continue
+		}
+		var event struct {
+			Type    string `json:"type"`
+			Message struct {
+				Usage anthropicUsage `json:"usage"`
+			} `json:"message"`
+			Usage anthropicUsage `json:"usage"`
+		}
+		if json.Unmarshal(line, &event) != nil {
+			continue
+		}
+		switch event.Type {
+		case "message_start":
+			u := event.Message.Usage
+			br.InputTokens = u.totalInput()
+			br.CacheReadInputTokens = u.CacheReadInputTokens
+			br.CacheCreationInputTokens = u.CacheCreationInputTokens
+		case "message_delta":
+			br.OutputTokens = event.Usage.OutputTokens
+		}
+	}
+	return br
 }

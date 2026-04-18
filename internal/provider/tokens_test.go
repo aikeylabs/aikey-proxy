@@ -59,6 +59,33 @@ func TestAnthropic_ExtractTokens_Streaming_EmptyStream(t *testing.T) {
 	}
 }
 
+// With prompt caching, Anthropic splits input into three fields. The total
+// input we report must include all three or statusline will show a tiny
+// value (e.g. ↑1) while Claude Code's own counter shows the full ~43k
+// context. Regression test for 2026-04-18 diagnosis.
+func TestAnthropic_ExtractTokens_Streaming_WithCacheFields(t *testing.T) {
+	sse := "" +
+		`data: {"type":"message_start","message":{"usage":` +
+		`{"input_tokens":1,"cache_creation_input_tokens":200,` +
+		`"cache_read_input_tokens":43000}}}` + "\n\n" +
+		`data: {"type":"message_delta","usage":{"output_tokens":463}}` + "\n\n"
+
+	in, out := (&Anthropic{}).ExtractTokens([]byte(sse), true)
+	want := 1 + 200 + 43000
+	if in != want || out != 463 {
+		t.Fatalf("got (%d,%d), want (%d,463)", in, out, want)
+	}
+}
+
+func TestAnthropic_ExtractTokens_NonStreaming_WithCacheFields(t *testing.T) {
+	body := []byte(`{"usage":{"input_tokens":5,"cache_creation_input_tokens":0,` +
+		`"cache_read_input_tokens":40000,"output_tokens":150}}`)
+	in, out := (&Anthropic{}).ExtractTokens(body, false)
+	if in != 40005 || out != 150 {
+		t.Fatalf("got (%d,%d), want (40005,150)", in, out)
+	}
+}
+
 // ---- OpenAI ----
 
 func TestOpenAI_ExtractTokens_NonStreaming(t *testing.T) {

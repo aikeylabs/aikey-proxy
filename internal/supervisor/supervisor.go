@@ -105,6 +105,14 @@ type generation struct {
 	reporter   *events.Reporter      // usage reporter (nil when collector_url is not configured)
 	canary     *events.CanaryProbe  // synthetic canary probe (nil when reporter or control_url is not configured)
 
+	// standaloneWAL is only populated when this generation created the
+	// local WAL writer AND no reporter consumed it — i.e. collector_url is
+	// empty. When a reporter is present it owns the WAL and its Close()
+	// closes it, so we leave standaloneWAL nil to avoid double-close. This
+	// split is what keeps `generation.close()` from leaking file handles
+	// on every reload in offline/standalone deployments.
+	standaloneWAL *events.WALWriter
+
 	// Drain tracking: incremented when a request enters Handle, decremented on exit.
 	inflight atomic.Int64
 	draining atomic.Bool
@@ -133,9 +141,17 @@ func (g *generation) close() {
 		g.canary.Close()
 	}
 	// Close the reporter so its upload loop flushes before the
-	// collector and event store are torn down.
+	// collector and event store are torn down. Reporter owns its WAL when
+	// one is attached, so this also closes the shared WAL in the common
+	// case.
 	if g.reporter != nil {
 		_ = g.reporter.Close()
+	}
+	// Standalone WAL (collector_url empty): generation owns the writer and
+	// must close it explicitly, otherwise every reload leaks a file handle
+	// on offline-mode deployments. Only non-nil when reporter is nil.
+	if g.standaloneWAL != nil {
+		_ = g.standaloneWAL.Close()
 	}
 	if g.collector != nil {
 		_ = g.collector.Close()
@@ -769,6 +785,14 @@ func (s *Supervisor) buildGeneration() (*generation, error) {
 				ProtocolType:  providerToProtocol(ot.Provider),
 				AccountID:     ot.AccountID,
 				OAuthIdentity: ot.Identity,
+				// Why: reportable.go's deriveKeyLabel() reads RouteSource to
+				// decide whether to show OAuthIdentity (email) vs a KeyAlias.
+				// The managed-key-sync path below sets this correctly; this
+				// startup-time path was missed in the earlier fix, so after
+				// every proxy reload OAuth events were mis-classified as
+				// "personal" until the next vault sync. Keep the two paths
+				// in lock-step.
+				RouteSource: "oauth",
 			}
 		}
 		registry.Merge(oauthRoutes)
@@ -872,18 +896,27 @@ func (s *Supervisor) buildGeneration() (*generation, error) {
 		}
 	}
 
+	// Only hand the WAL to the generation when nobody else closes it. If a
+	// reporter was attached it owns (and closes) the shared writer — passing
+	// it here too would double-close on reload.
+	var ownedWAL *events.WALWriter
+	if reporter == nil {
+		ownedWAL = sharedWAL
+	}
+
 	return &generation{
-		id:         id,
-		vaultPath:  s.cfg.Vault.Path,
-		vault:      vaultReader,
-		registry:   registry,
-		providers:  providers,
-		proxy:      p,
-		collector:  collector,
-		eventStore: eventStore,
-		reporter:   reporter,
-		canary:     canary,
-		drained:    make(chan struct{}),
+		id:            id,
+		vaultPath:     s.cfg.Vault.Path,
+		vault:         vaultReader,
+		registry:      registry,
+		providers:     providers,
+		proxy:         p,
+		collector:     collector,
+		eventStore:    eventStore,
+		reporter:      reporter,
+		canary:        canary,
+		standaloneWAL: ownedWAL,
+		drained:       make(chan struct{}),
 	}, nil
 }
 

@@ -61,6 +61,14 @@ type ReportableEvent struct {
 	OutputTokens *int64 `json:"output_tokens,omitempty"`
 	TotalTokens  *int64 `json:"total_tokens,omitempty"`
 
+	// Cache-aware input breakdown. Populated by Anthropic; zero (and omitted)
+	// for providers that don't expose prompt caching. InputTokens remains the
+	// authoritative total — these are diagnostic splits for UI rendering and
+	// (later) cost estimation. Adding as new fields keeps pre-v5 consumers
+	// parsing correctly via json:",omitempty".
+	CacheReadInputTokens     *int64 `json:"cache_read_input_tokens,omitempty"`
+	CacheCreationInputTokens *int64 `json:"cache_creation_input_tokens,omitempty"`
+
 	// result
 	RequestStatus  string `json:"request_status"`
 	HTTPStatusCode *int   `json:"http_status_code,omitempty"`
@@ -95,6 +103,10 @@ type ReportOpts struct {
 	StatusCode      int
 	InputTokens     int
 	OutputTokens    int
+	// Optional cache breakdown. Leave zero for providers without caching;
+	// BuildReportableEvent will omit these fields from the JSON event.
+	CacheReadInputTokens     int
+	CacheCreationInputTokens int
 	ErrorType       string
 	RealKey         string // decrypted provider key (for hashing only, never stored)
 	SourceVersion      string
@@ -204,6 +216,12 @@ func BuildReportableEvent(opts ReportOpts) ReportableEvent {
 		InputTokens:  &inTok,
 		OutputTokens: &outTok,
 		TotalTokens:  &totalTok,
+		// Only surface cache pointers when the upstream actually returned
+		// nonzero values. Keeping them nil for OpenAI/Kimi ensures omitempty
+		// drops the keys from the JSON, which matches the pre-v5 event shape
+		// consumers still parse today.
+		CacheReadInputTokens:     int64PtrIfNonZero(opts.CacheReadInputTokens),
+		CacheCreationInputTokens: int64PtrIfNonZero(opts.CacheCreationInputTokens),
 
 		RequestStatus:  status,
 		HTTPStatusCode: &opts.StatusCode,
@@ -256,6 +274,17 @@ func completionOrDefault(c string) string {
 	default:
 		return "complete"
 	}
+}
+
+// int64PtrIfNonZero returns a pointer to the int64 value when non-zero, or nil.
+// Used to let json:",omitempty" drop optional counters (cache splits) from the
+// event when the provider didn't populate them.
+func int64PtrIfNonZero(n int) *int64 {
+	if n == 0 {
+		return nil
+	}
+	v := int64(n)
+	return &v
 }
 
 // hashIfNotEmpty returns a SHA-256 hex digest, or empty string.

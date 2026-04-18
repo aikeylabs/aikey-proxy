@@ -41,6 +41,29 @@ func applyBaseURL(req *http.Request, baseURL string) error {
 	return nil
 }
 
+// TokenBreakdown is the richer counterpart of ExtractTokens's (in, out) pair.
+// It separates cached input into its two Anthropic-native buckets so the UI
+// can show a breakdown like "↑70K ↓150 · (↑53K ↓32 cached)". OpenAI-style
+// providers fill only InputTokens / OutputTokens and leave the cache fields
+// zero. Why not widen ExtractTokens directly: external tests and several
+// call sites rely on the (int, int) shape — adding a parallel method is
+// cheaper than churning them.
+type TokenBreakdown struct {
+	// InputTokens is the *total* input charged against context — for
+	// Anthropic this equals input + cache_creation + cache_read. Callers
+	// that want to split it must use the *InputTokens fields below.
+	InputTokens int
+	// OutputTokens is the model's generated output in tokens.
+	OutputTokens int
+	// CacheReadInputTokens is the portion of InputTokens that was replayed
+	// from the provider's cache (Anthropic prompt-caching "read"). Zero when
+	// the provider has no cache or the client didn't opt in.
+	CacheReadInputTokens int
+	// CacheCreationInputTokens is the portion of InputTokens that was
+	// written to the cache this turn. Zero under the same conditions.
+	CacheCreationInputTokens int
+}
+
 // Provider adapts requests for a specific AI provider protocol.
 type Provider interface {
 	// Name returns the provider protocol name ("openai", "anthropic").
@@ -56,6 +79,12 @@ type Provider interface {
 	// For streaming requests, data is the full accumulated SSE stream.
 	// Returns (inputTokens, outputTokens); returns (0, 0) if unavailable.
 	ExtractTokens(data []byte, streaming bool) (inputTokens, outputTokens int)
+
+	// ExtractTokenBreakdown is the richer sibling of ExtractTokens. It returns
+	// the same input/output totals plus provider-specific cache details. The
+	// default implementation for OpenAI-family providers simply delegates to
+	// ExtractTokens and leaves the cache fields at zero.
+	ExtractTokenBreakdown(data []byte, streaming bool) TokenBreakdown
 }
 
 // Registry maps protocol names to provider implementations.
