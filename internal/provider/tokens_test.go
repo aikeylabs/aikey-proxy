@@ -182,3 +182,96 @@ func TestGeneric_ExtractTokens_DelegatesToOpenAI(t *testing.T) {
 		t.Fatalf("got (%d,%d), want (3,9)", in, out)
 	}
 }
+
+// ---------------------------------------------------------------------------
+// StopReason extraction — Anthropic
+// ---------------------------------------------------------------------------
+
+func TestAnthropic_StopReason_Streaming_MessageDelta(t *testing.T) {
+	sse := "" +
+		"data: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":10}}}\n\n" +
+		"data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":20}}\n\n"
+	br := (&Anthropic{}).ExtractTokenBreakdown([]byte(sse), true)
+	if br.StopReason != "end_turn" {
+		t.Fatalf("StopReason = %q, want end_turn", br.StopReason)
+	}
+}
+
+func TestAnthropic_StopReason_Streaming_MaxTokens(t *testing.T) {
+	sse := "" +
+		"data: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":5}}}\n\n" +
+		"data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"max_tokens\"},\"usage\":{\"output_tokens\":100}}\n\n"
+	br := (&Anthropic{}).ExtractTokenBreakdown([]byte(sse), true)
+	if br.StopReason != "max_tokens" {
+		t.Fatalf("StopReason = %q, want max_tokens", br.StopReason)
+	}
+}
+
+func TestAnthropic_StopReason_NonStreaming(t *testing.T) {
+	body := []byte(`{"usage":{"input_tokens":15,"output_tokens":42},"stop_reason":"tool_use"}`)
+	br := (&Anthropic{}).ExtractTokenBreakdown(body, false)
+	if br.StopReason != "tool_use" {
+		t.Fatalf("StopReason = %q, want tool_use", br.StopReason)
+	}
+}
+
+func TestAnthropic_StopReason_Missing(t *testing.T) {
+	// message_delta without stop_reason → StopReason stays empty (not "" sentinel, not a default).
+	sse := "data: {\"type\":\"message_delta\",\"usage\":{\"output_tokens\":1}}\n\n"
+	br := (&Anthropic{}).ExtractTokenBreakdown([]byte(sse), true)
+	if br.StopReason != "" {
+		t.Fatalf("StopReason should be empty, got %q", br.StopReason)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// StopReason extraction — OpenAI / Kimi
+// ---------------------------------------------------------------------------
+
+func TestOpenAI_StopReason_NonStreaming(t *testing.T) {
+	body := []byte(`{"usage":{"prompt_tokens":10,"completion_tokens":5},"choices":[{"finish_reason":"stop"}]}`)
+	br := (&OpenAI{}).ExtractTokenBreakdown(body, false)
+	if br.StopReason != "stop" {
+		t.Fatalf("StopReason = %q, want stop", br.StopReason)
+	}
+}
+
+func TestOpenAI_StopReason_Streaming_ToolCalls(t *testing.T) {
+	sse := "" +
+		"data: {\"choices\":[{\"delta\":{\"content\":\"partial\"}}]}\n\n" +
+		"data: {\"choices\":[{\"finish_reason\":\"tool_calls\"}],\"usage\":{\"prompt_tokens\":20,\"completion_tokens\":30}}\n\n" +
+		"data: [DONE]\n\n"
+	br := (&OpenAI{}).ExtractTokenBreakdown([]byte(sse), true)
+	if br.StopReason != "tool_calls" {
+		t.Fatalf("StopReason = %q, want tool_calls", br.StopReason)
+	}
+}
+
+func TestOpenAI_StopReason_Streaming_LastReasonWins(t *testing.T) {
+	// If multiple chunks somehow carry finish_reason (shouldn't normally
+	// happen), the last non-empty wins — consistent with "final chunk
+	// defines the turn outcome".
+	sse := "" +
+		"data: {\"choices\":[{\"finish_reason\":\"stop\"}]}\n\n" +
+		"data: {\"choices\":[{\"finish_reason\":\"length\"}]}\n\n"
+	br := (&OpenAI{}).ExtractTokenBreakdown([]byte(sse), true)
+	if br.StopReason != "length" {
+		t.Fatalf("StopReason = %q, want length (last wins)", br.StopReason)
+	}
+}
+
+func TestOpenAI_StopReason_Missing(t *testing.T) {
+	body := []byte(`{"usage":{"prompt_tokens":10,"completion_tokens":5},"choices":[{}]}`)
+	br := (&OpenAI{}).ExtractTokenBreakdown(body, false)
+	if br.StopReason != "" {
+		t.Fatalf("StopReason should be empty, got %q", br.StopReason)
+	}
+}
+
+func TestKimi_StopReason_DelegatesToOpenAI(t *testing.T) {
+	body := []byte(`{"usage":{"prompt_tokens":3,"completion_tokens":9},"choices":[{"finish_reason":"length"}]}`)
+	br := (&Kimi{}).ExtractTokenBreakdown(body, false)
+	if br.StopReason != "length" {
+		t.Fatalf("StopReason = %q, want length (kimi delegates to openai)", br.StopReason)
+	}
+}

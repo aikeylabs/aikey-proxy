@@ -112,10 +112,14 @@ func (u anthropicUsage) totalInput() int {
 // The streaming parser mirrors ExtractTokens exactly; only the output struct
 // differs, so a future consolidation could collapse the two — left as-is for
 // now to keep the interface-stable ExtractTokens untouched.
+//
+// StopReason is populated from `stop_reason`: top-level for non-streaming
+// responses, or `message_delta.delta.stop_reason` for streaming.
 func (a *Anthropic) ExtractTokenBreakdown(data []byte, streaming bool) TokenBreakdown {
 	if !streaming {
 		var resp struct {
-			Usage anthropicUsage `json:"usage"`
+			Usage      anthropicUsage `json:"usage"`
+			StopReason string         `json:"stop_reason"`
 		}
 		if json.Unmarshal(data, &resp) == nil {
 			u := resp.Usage
@@ -124,6 +128,7 @@ func (a *Anthropic) ExtractTokenBreakdown(data []byte, streaming bool) TokenBrea
 				OutputTokens:             u.OutputTokens,
 				CacheReadInputTokens:     u.CacheReadInputTokens,
 				CacheCreationInputTokens: u.CacheCreationInputTokens,
+				StopReason:               resp.StopReason,
 			}
 		}
 		return TokenBreakdown{}
@@ -142,6 +147,9 @@ func (a *Anthropic) ExtractTokenBreakdown(data []byte, streaming bool) TokenBrea
 			Message struct {
 				Usage anthropicUsage `json:"usage"`
 			} `json:"message"`
+			Delta struct {
+				StopReason string `json:"stop_reason"`
+			} `json:"delta"`
 			Usage anthropicUsage `json:"usage"`
 		}
 		if json.Unmarshal(line, &event) != nil {
@@ -155,6 +163,9 @@ func (a *Anthropic) ExtractTokenBreakdown(data []byte, streaming bool) TokenBrea
 			br.CacheCreationInputTokens = u.CacheCreationInputTokens
 		case "message_delta":
 			br.OutputTokens = event.Usage.OutputTokens
+			if event.Delta.StopReason != "" {
+				br.StopReason = event.Delta.StopReason
+			}
 		}
 	}
 	return br

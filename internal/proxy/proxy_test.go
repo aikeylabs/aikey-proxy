@@ -1,6 +1,7 @@
 package proxy
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -770,5 +771,91 @@ func TestHandlePathPrefix_BindingFallsBackToLegacy(t *testing.T) {
 
 	if w.Code != http.StatusOK {
 		t.Errorf("expected 200, got %d — body: %s", w.Code, w.Body.String())
+	}
+}
+
+// ---------------------------------------------------------------------------
+// extractModel + Kimi session extraction contract tests.
+//
+// Why: extractModel is the single body-once-read step that feeds both the
+// model allowlist check and the downstream session_id stash. Regressing
+// either extraction breaks feature correctness silently (turn aggregation
+// uses the wrong session, statusline shows wrong model). These tests pin
+// the current contract so a future refactor doesn't quietly drop either.
+// ---------------------------------------------------------------------------
+
+func TestExtractModel_StashesModelAndKimiSession(t *testing.T) {
+	body := []byte(`{"model":"kimi-k2.5","messages":[{"role":"user","content":"hi"}],"prompt_cache_key":"sess-abc-123","stream":true}`)
+	req := httptest.NewRequest(http.MethodPost, "/kimi/v1/chat/completions", bytes.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+
+	model := extractModel(req)
+
+	if model != "kimi-k2.5" {
+		t.Fatalf("model return = %q, want kimi-k2.5", model)
+	}
+	if got := req.Header.Get("x-aikey-model"); got != "kimi-k2.5" {
+		t.Errorf("x-aikey-model header = %q, want kimi-k2.5", got)
+	}
+	if got := req.Header.Get("x-aikey-kimi-session"); got != "sess-abc-123" {
+		t.Errorf("x-aikey-kimi-session header = %q, want sess-abc-123", got)
+	}
+
+	// Critical: body must be re-buffered so upstream forwarding works. Read
+	// it again and assert we see the original bytes.
+	rebuffered, _ := io.ReadAll(req.Body)
+	if !bytes.Equal(rebuffered, body) {
+		t.Errorf("body not re-buffered; got %q", rebuffered)
+	}
+}
+
+func TestExtractModel_NoPromptCacheKey_LeavesKimiHeaderUnset(t *testing.T) {
+	body := []byte(`{"model":"claude-sonnet-4-6","messages":[]}`)
+	req := httptest.NewRequest(http.MethodPost, "/anthropic/v1/messages", bytes.NewReader(body))
+
+	extractModel(req)
+
+	if got := req.Header.Get("x-aikey-kimi-session"); got != "" {
+		t.Errorf("x-aikey-kimi-session should be empty for non-Kimi body, got %q", got)
+	}
+	if got := req.Header.Get("x-aikey-model"); got != "claude-sonnet-4-6" {
+		t.Errorf("x-aikey-model = %q, want claude-sonnet-4-6", got)
+	}
+}
+
+func TestExtractModel_StreamingRequest_StillExtractsKimiSession(t *testing.T) {
+	// Regression guard for third-party review round 3 Finding 1 —
+	// streaming requests must still pick up prompt_cache_key from body
+	// (extractModel runs at serveRoute entry before any streaming split).
+	body := []byte(`{"stream":true,"model":"kimi-k2.5","prompt_cache_key":"streaming-sess-xyz"}`)
+	req := httptest.NewRequest(http.MethodPost, "/kimi/v1/chat/completions", bytes.NewReader(body))
+
+	extractModel(req)
+
+	if got := req.Header.Get("x-aikey-kimi-session"); got != "streaming-sess-xyz" {
+		t.Fatalf("streaming request lost prompt_cache_key: header = %q", got)
+	}
+}
+
+func TestResolveSessionID_ClaudeHeaderWins(t *testing.T) {
+	h := http.Header{}
+	h.Set("X-Claude-Code-Session-Id", "claude-sess-1")
+	h.Set("x-aikey-kimi-session", "kimi-sess-should-lose")
+	if got := resolveSessionID(h); got != "claude-sess-1" {
+		t.Errorf("want Claude header to win, got %q", got)
+	}
+}
+
+func TestResolveSessionID_KimiFallback(t *testing.T) {
+	h := http.Header{}
+	h.Set("x-aikey-kimi-session", "kimi-sess-only")
+	if got := resolveSessionID(h); got != "kimi-sess-only" {
+		t.Errorf("want kimi fallback, got %q", got)
+	}
+}
+
+func TestResolveSessionID_BothMissing(t *testing.T) {
+	if got := resolveSessionID(http.Header{}); got != "" {
+		t.Errorf("want empty for no headers, got %q", got)
 	}
 }

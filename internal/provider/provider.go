@@ -62,6 +62,15 @@ type TokenBreakdown struct {
 	// CacheCreationInputTokens is the portion of InputTokens that was
 	// written to the cache this turn. Zero under the same conditions.
 	CacheCreationInputTokens int
+	// StopReason is the raw termination reason emitted by the provider in
+	// the final response chunk. Values are provider-specific and passed
+	// through un-normalized so consumers can pattern-match against the
+	// canonical set each provider documents. Examples:
+	//   - Anthropic: "end_turn" | "tool_use" | "max_tokens" | "stop_sequence"
+	//   - OpenAI/Kimi: "stop" | "tool_calls" | "length" | "content_filter"
+	// Empty string when the upstream response did not carry it (error, or
+	// stream cut before the usage/finish frame arrived).
+	StopReason string
 }
 
 // Provider adapts requests for a specific AI provider protocol.

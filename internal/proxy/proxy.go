@@ -283,6 +283,11 @@ func (p *Proxy) handlePathPrefixRoute(w http.ResponseWriter, r *http.Request, pr
 	var realKey, baseURL, protocolType, virtualKeyID string
 	var mk *vault.ManagedKey      // populated when resolved via team key (for org metadata)
 	var oauthIdentity, oauthAccountID string // populated when resolved via OAuth account
+	// keyAlias carries the vault-entry alias for personal / BYOK routes so the
+	// reporter's deriveKeyLabel shows "my-kimi-key" instead of a truncated
+	// virtual_key_id like "personal:my-…". Team keys have no per-binary alias
+	// (ManagedKey stores VK id, not label); OAuth uses OAuthIdentity instead.
+	var keyAlias string
 
 	// Normalise brand aliases ("claude" → "anthropic") before vault lookup so
 	// the query matches the provider_code stored by the server.
@@ -373,6 +378,18 @@ func (p *Proxy) handlePathPrefixRoute(w http.ResponseWriter, r *http.Request, pr
 			SeatID:        route.SeatID,
 			OAuthIdentity: oauthIdentity,
 			AllowedModels: route.AllowedModels, // Why: serveRoute checks this field for model allowlist enforcement
+			// Why: KeyAlias is the user-facing label for team/personal/BYOK
+			// routes (see deriveKeyLabel in reportable.go). Without copying
+			// it through, path-prefix receipts degrade to a truncated
+			// virtual_key_id like `vk_abc…` instead of the key's alias.
+			// OAuth uses OAuthIdentity instead so we skip KeyAlias for the
+			// sentinel __oauth__ value.
+			KeyAlias: func() string {
+				if route.KeyAlias == "__oauth__" {
+					return ""
+				}
+				return route.KeyAlias
+			}(),
 			// Why: route_source drives deriveKeyLabel's classification — OAuth
 			// routes pick OAuthIdentity (user's email), personal/team pick
 			// KeyAlias. Without this copy, reportable.go's OrgID-based fallback
@@ -493,6 +510,7 @@ func (p *Proxy) handlePathPrefixRoute(w http.ResponseWriter, r *http.Request, pr
 			} else {
 				realKey = plaintext
 				virtualKeyID = "personal:" + binding.KeySourceRef
+				keyAlias = binding.KeySourceRef
 				if entryBaseURL != "" {
 					baseURL = entryBaseURL
 				} else {
@@ -551,6 +569,7 @@ func (p *Proxy) handlePathPrefixRoute(w http.ResponseWriter, r *http.Request, pr
 					}
 					realKey = plaintext
 					virtualKeyID = "personal:" + cfg.KeyRef
+					keyAlias = cfg.KeyRef
 					if entryBaseURL != "" {
 						baseURL = entryBaseURL
 					} else if pcode != "" {
@@ -593,6 +612,13 @@ func (p *Proxy) handlePathPrefixRoute(w http.ResponseWriter, r *http.Request, pr
 		PlaintextKey: realKey,
 		ProviderCode: canonicalCode,
 		ProtocolType: protocolType,
+		// Why: for personal/BYOK path-prefix routes, keyAlias was captured
+		// above at vault-lookup time. Without this field, reportable.go's
+		// deriveKeyLabel falls back to truncating VirtualKeyID (e.g.
+		// "personal:my-kimi-…" instead of "my-kimi-key"). Team & OAuth
+		// paths leave this empty because they label via different fields
+		// (ManagedKey has no alias; OAuth uses OAuthIdentity).
+		KeyAlias: keyAlias,
 	}
 	// Populate org/account/seat from managed key so usage events carry the correct org_id.
 	if mk != nil {
@@ -754,7 +780,7 @@ func (p *Proxy) serveRoute(w http.ResponseWriter, r *http.Request, route *vkeys.
 				p.collector.Record(ev)
 				// Non-streaming always terminates atomically — the response is
 				// either the full JSON or it's an error we surface elsewhere.
-				sessionID := r.Header.Get("X-Claude-Code-Session-Id")
+				sessionID := resolveSessionID(r.Header)
 				p.reportUsage(route, bearerToken, ev.Model, startTime, resp.StatusCode, breakdown, "", realKey, sessionID, "complete")
 			} else {
 				// Streaming success: wrap body — background goroutine drains the
@@ -763,7 +789,7 @@ func (p *Proxy) serveRoute(w http.ResponseWriter, r *http.Request, route *vkeys.
 				baseEvent := p.buildBaseEvent(r, resp, startTime, route, true)
 				// Capture session_id from the request now; by callback time
 				// the request's header map may have been recycled.
-				sessionID := r.Header.Get("X-Claude-Code-Session-Id")
+				sessionID := resolveSessionID(r.Header)
 				var cb reporterCallback
 				if p.reporter != nil {
 					cb = func(br provider.TokenBreakdown, completion string) {
@@ -836,7 +862,7 @@ func (p *Proxy) recordEvent(req *http.Request, resp *http.Response, startTime ti
 	p.collector.Record(ev)
 	// Error responses are treated as interrupted — the client never got a
 	// usable result even though the request finished "fast" from our POV.
-	sessionID := req.Header.Get("X-Claude-Code-Session-Id")
+	sessionID := resolveSessionID(req.Header)
 	p.reportUsage(route, bearerToken, ev.Model, startTime, resp.StatusCode, provider.TokenBreakdown{}, ev.ErrorType, "", sessionID, "interrupted")
 }
 
@@ -866,6 +892,7 @@ func (p *Proxy) reportUsage(route *vkeys.ResolvedRoute, bearerToken, model strin
 		OutputTokens:    breakdown.OutputTokens,
 		CacheReadInputTokens:     breakdown.CacheReadInputTokens,
 		CacheCreationInputTokens: breakdown.CacheCreationInputTokens,
+		StopReason:               breakdown.StopReason,
 		ErrorType:       errorType,
 		RealKey:         realKey,
 		ClientVersion:      p.clientVersion,
@@ -887,9 +914,36 @@ func (p *Proxy) reportUsage(route *vkeys.ResolvedRoute, bearerToken, model strin
 	p.wal.Append(ev)
 }
 
+// resolveSessionID picks the request's session identifier from whichever
+// source the upstream client populated:
+//   - `X-Claude-Code-Session-Id` header (Claude Code native)
+//   - `x-aikey-kimi-session` header (we stash it from body `prompt_cache_key`
+//     in extractModel; only Kimi's kimi-cli populates that field)
+//
+// Header order is "Claude first" so Claude's current behaviour is unchanged
+// when both happen to be set (which shouldn't occur in practice since one
+// vk corresponds to one provider).
+func resolveSessionID(h http.Header) string {
+	if v := h.Get("X-Claude-Code-Session-Id"); v != "" {
+		return v
+	}
+	return h.Get("x-aikey-kimi-session")
+}
+
 // extractModel reads the request body to find the "model" field.
 // It re-buffers the body for upstream forwarding and stores the model
 // in a custom header for later use.
+//
+// This also extracts `prompt_cache_key` in the same body-parse pass —
+// Kimi's kimi-cli stashes its session_id in that field (see the Kimi
+// receipt integration design doc). Doing both extractions here is the
+// only correct spot: once the ReverseProxy forwards the request, the
+// body stream has been consumed and downstream code (including the
+// streaming drainer's ModifyResponse branch) can't re-read it.
+//
+// The extracted Kimi session is stored in the `x-aikey-kimi-session`
+// request header; buildBaseEvent/reportUsage prefer the Claude header
+// `X-Claude-Code-Session-Id` and fall back to this one.
 func extractModel(r *http.Request) string {
 	if r.Body == nil {
 		return ""
@@ -902,12 +956,21 @@ func extractModel(r *http.Request) string {
 	r.ContentLength = int64(len(bodyBytes))
 
 	var partial struct {
-		Model string `json:"model"`
+		Model          string `json:"model"`
+		PromptCacheKey string `json:"prompt_cache_key"`
 	}
-	if json.Unmarshal(bodyBytes, &partial) == nil && partial.Model != "" {
+	if err := json.Unmarshal(bodyBytes, &partial); err != nil {
+		// Body isn't JSON we understand — leave both headers unset.
+		return ""
+	}
+	if partial.Model != "" {
 		// Store in a custom header so we can read it later without re-parsing.
 		r.Header.Set("x-aikey-model", partial.Model)
-		return partial.Model
 	}
-	return ""
+	if partial.PromptCacheKey != "" {
+		// Kimi-only, but harmless if other providers ever set it:
+		// session_id wiring is gated on provider_code == "kimi" downstream.
+		r.Header.Set("x-aikey-kimi-session", partial.PromptCacheKey)
+	}
+	return partial.Model
 }

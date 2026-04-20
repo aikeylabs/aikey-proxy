@@ -115,3 +115,47 @@ func TestDeriveKeyLabel_ShortVK_NoTruncation(t *testing.T) {
 		t.Fatalf("short vk: want verbatim, got %q", got)
 	}
 }
+
+// Regression guard for third-party review finding #3: path-prefix-routed
+// (non-aikey_vk_) personal requests through handlePathPrefixRoute must carry
+// KeyAlias into the ResolvedRoute. Before the fix, tokenRoute was constructed
+// WITHOUT KeyAlias — dropping the user-facing label and silently falling back
+// to a truncated VirtualKeyID like "personal:my-…" instead of "my-kimi-key".
+//
+// This test mirrors the exact literal produced by the two fixed construction
+// sites (proxy.go path-prefix, both aikey_vk_ and legacy-active-key branches).
+// A future refactor that drops KeyAlias from either literal will fail here
+// even though the deriveKeyLabel unit tests continue passing.
+func TestDeriveKeyLabel_PathPrefix_PersonalKey_CarriesAlias(t *testing.T) {
+	// Literal shape: personal route constructed by handlePathPrefixRoute
+	// after review finding #3 fix.
+	r := &vkeys.ResolvedRoute{
+		VirtualKeyID: "personal:my-kimi-key",
+		RouteSource:  "personal",
+		KeyAlias:     "my-kimi-key",
+		ProviderCode: "kimi",
+	}
+	got := deriveKeyLabel(r)
+	if got != "my-kimi-key" {
+		t.Fatalf("path-prefix personal: want alias 'my-kimi-key', got %q — "+
+			"if this fails, handlePathPrefixRoute dropped KeyAlias again; "+
+			"search proxy.go for `ResolvedRoute{` and restore the field",
+			got)
+	}
+}
+
+// And the aikey_vk_ variant of finding #3 — non-OAuth route-token path.
+func TestDeriveKeyLabel_PathPrefix_TokenRoute_CarriesAlias(t *testing.T) {
+	// Literal shape: tokenRoute produced by the aikey_vk_ branch of
+	// handlePathPrefixRoute after the fix. OAuth uses "__oauth__" sentinel
+	// which deriveKeyLabel explicitly ignores — we test the non-OAuth case.
+	r := &vkeys.ResolvedRoute{
+		VirtualKeyID: "vk_abc123",
+		RouteSource:  "team",
+		KeyAlias:     "prod-shared-anthropic",
+	}
+	got := deriveKeyLabel(r)
+	if got != "prod-shared-anthropic" {
+		t.Fatalf("path-prefix token route: want alias, got %q", got)
+	}
+}

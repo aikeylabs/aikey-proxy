@@ -69,6 +69,13 @@ type ReportableEvent struct {
 	CacheReadInputTokens     *int64 `json:"cache_read_input_tokens,omitempty"`
 	CacheCreationInputTokens *int64 `json:"cache_creation_input_tokens,omitempty"`
 
+	// StopReason is the raw provider-specific termination reason (Anthropic
+	// `stop_reason` or OpenAI/Kimi `choices[0].finish_reason`), passed
+	// through un-normalized. Used by UI to hint at "max_tokens"/"length"
+	// truncation; also reserved as a fallback turn-boundary signal for
+	// clients without a Stop hook (see 费用小票-Kimi集成方案 §0.2).
+	StopReason string `json:"stop_reason,omitempty"`
+
 	// result
 	RequestStatus  string `json:"request_status"`
 	HTTPStatusCode *int   `json:"http_status_code,omitempty"`
@@ -107,6 +114,10 @@ type ReportOpts struct {
 	// BuildReportableEvent will omit these fields from the JSON event.
 	CacheReadInputTokens     int
 	CacheCreationInputTokens int
+	// StopReason is the raw termination string from the provider; pass
+	// through un-normalized. BuildReportableEvent omits the JSON field
+	// when empty.
+	StopReason string
 	ErrorType       string
 	RealKey         string // decrypted provider key (for hashing only, never stored)
 	SourceVersion      string
@@ -222,6 +233,8 @@ func BuildReportableEvent(opts ReportOpts) ReportableEvent {
 		// consumers still parse today.
 		CacheReadInputTokens:     int64PtrIfNonZero(opts.CacheReadInputTokens),
 		CacheCreationInputTokens: int64PtrIfNonZero(opts.CacheCreationInputTokens),
+
+		StopReason: opts.StopReason,
 
 		RequestStatus:  status,
 		HTTPStatusCode: &opts.StatusCode,
