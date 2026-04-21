@@ -57,6 +57,12 @@ func New(ln net.Listener, dataHandler http.Handler, adminHandler *admin.Handler,
 	mux.HandleFunc("GET /status", adminHandler.Status)
 	mux.HandleFunc("GET /metrics", adminHandler.Metrics)
 	mux.HandleFunc("POST /admin/reload", adminHandler.Reload)
+	// Connectivity probe endpoint — used by `aikey test` / `aikey doctor` /
+	// `aikey add` to measure reachability + latency from the proxy's network
+	// context to upstream providers. Respects config.upstream_proxy.url and
+	// standard HTTPS_PROXY / HTTP_PROXY / ALL_PROXY env vars — essential for
+	// the China-network deployment where direct TCP to upstream is blocked.
+	mux.HandleFunc("POST /admin/probe/ping", adminHandler.ProbePing)
 
 	// Extra route registrars (e.g., OAuth broker handler)
 	for _, h := range extraHandlers {
@@ -66,7 +72,12 @@ func New(ln net.Listener, dataHandler http.Handler, adminHandler *admin.Handler,
 	return &Server{
 		ln: ln,
 		httpServer: &http.Server{
-			Handler:           mux,
+			// Wrap the mux with a panic-recover middleware so one bad handler
+			// cannot take down the whole proxy. net/http's default recover
+			// silently swallows panics without logging or crash-dump — that
+			// made the 2026-04-22 stream-drainer nil-collector crash
+			// undiagnosable from logs alone.
+			Handler:           recoverMiddleware(mux),
 			ReadHeaderTimeout: 30 * time.Second,
 		},
 	}

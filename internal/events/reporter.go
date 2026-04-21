@@ -11,6 +11,8 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+
+	"github.com/AiKeyLabs/aikey-proxy/internal/observability"
 )
 
 // ReporterConfig configures the usage reporter.
@@ -131,7 +133,9 @@ func NewReporter(cfg ReporterConfig) (*Reporter, error) {
 
 	if cfg.CollectorURL != "" {
 		r.wg.Add(1)
-		go r.uploadLoop()
+		// Fatal: reporter upload loop silently dying means usage events pile
+		// up in the queue and get dropped — direct billing correctness risk.
+		observability.GoSafe("events.reporter.upload_loop", observability.Fatal, r.uploadLoop)
 	}
 
 	return r, nil

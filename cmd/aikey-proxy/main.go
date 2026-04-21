@@ -100,6 +100,16 @@ func main() {
 		setupTextLogging(logLevel)
 	}
 
+	// Wire GoSafe / HTTP recover to the same log directory so panic dumps
+	// live alongside current.jsonl, and register a flush hook so Fatal-mode
+	// goroutine panics drain the async writer before exit(2).
+	observability.SetCrashDumpDir(cfg.Log.Dir)
+	if logWriter != nil {
+		observability.SetFatalFlushHook(func() {
+			logWriter.Flush(2 * time.Second)
+		})
+	}
+
 	slog.Info("config loaded",
 		"event.name", observability.EventProxyConfigLoaded,
 		"listen", cfg.Listen.Addr(),
@@ -180,13 +190,16 @@ func main() {
 	sigCh := make(chan os.Signal, 1)
 	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
 
-	go func() {
+	// Fatal: server.Serve is the process's reason for being. If it dies the
+	// proxy cannot serve requests, so exit(2) and let the OS supervisor
+	// restart us rather than lingering as a zombie that accepts nothing.
+	observability.GoSafe("main.server.serve", observability.Fatal, func() {
 		fmt.Fprintf(os.Stderr, "\naikey-proxy %s listening on %s\n\n", buildinfo.Get().String(), ln.Addr())
 		if err := srv.Serve(); err != nil && err != http.ErrServerClosed {
 			slog.Error("server error", "error", err)
 			os.Exit(1)
 		}
-	}()
+	})
 
 	// Wait for shutdown signal.
 	sig := <-sigCh

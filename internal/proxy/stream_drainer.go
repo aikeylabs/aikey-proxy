@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/AiKeyLabs/aikey-proxy/internal/events"
+	"github.com/AiKeyLabs/aikey-proxy/internal/observability"
 	"github.com/AiKeyLabs/aikey-proxy/internal/provider"
 )
 
@@ -75,16 +76,21 @@ func newStreamDrainer(
 	// Watcher: close upstream as soon as the client disconnects or the proxy
 	// shuts down. Complements the Close() path for cases where the ReverseProxy
 	// does not call Close() before the context is cancelled.
-	go func() {
+	// Isolated: per-stream goroutine; a panic here must not kill the whole
+	// proxy for every other caller.
+	observability.GoSafe("proxy.stream_drainer.watcher", observability.Isolated, func() {
 		select {
 		case <-reqCtx.Done():
 			upstream.Close()
 		case <-proxyCtx.Done():
 			upstream.Close()
 		}
-	}()
+	})
 
-	go func() {
+	// Isolated: per-stream SSE drainer. The 2026-04-22 nil-collector panic
+	// here crashed the entire proxy process; with GoSafe the panic is now
+	// logged + dumped and the rest of the proxy keeps serving.
+	observability.GoSafe("proxy.stream_drainer.run", observability.Isolated, func() {
 		defer upstream.Close() // idempotent: safe if already closed above
 
 		var acc bytes.Buffer
@@ -145,11 +151,18 @@ func newStreamDrainer(
 		ev.InputTokens = breakdown.InputTokens
 		ev.OutputTokens = breakdown.OutputTokens
 		ev.DurationMs = time.Since(baseEvent.Timestamp).Milliseconds()
-		collector.Record(ev)
+		// Collector is nil for probe traffic (see proxy.go::Handle stream branch):
+		// X-Aikey-Probe: 1 requests shouldn't produce usage events. Without
+		// this guard, nil deref here crashes the whole proxy process AFTER
+		// a successful streaming response — observed as "chat ok" in CLI
+		// followed by connection-refused on the next request (2026-04-22).
+		if collector != nil {
+			collector.Record(ev)
+		}
 		if onComplete != nil {
 			onComplete(breakdown, completion)
 		}
-	}()
+	})
 
 	return &streamDrainer{pr: pr, upstream: upstream}
 }

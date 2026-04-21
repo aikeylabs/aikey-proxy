@@ -5,7 +5,9 @@ import (
 	"encoding/json"
 	"fmt"
 	"log/slog"
+	"net"
 	"net/http"
+	"net/url"
 	"strings"
 	"time"
 
@@ -459,6 +461,246 @@ func providerDefaultBaseURL(code string) string {
 	default:
 		return ""
 	}
+}
+
+// ----------------------------------------------------------------------------
+// Probe endpoints — connectivity test primitives used by `aikey test` / doctor.
+//
+// Why "probe" vs the existing /health/* surface: /health/* reports health for
+// the active config. The probe endpoints exist for per-target pre-flight
+// checks (e.g. `aikey test <alias>` testing a specific key that may or may
+// not be active) and for fast standalone latency measurement from the
+// proxy's network viewpoint.
+//
+// POST /admin/probe/ping body: { "provider": "anthropic" }
+//   → TCP connect from proxy to the provider's upstream host:443
+//
+// API and Chat probes reuse the existing data plane — CLI sends them to
+// /<provider>/v1/... with the bearer it already uses at runtime. The
+// `X-Aikey-Probe: 1` header (see reportable.go / middleware) suppresses
+// usage-event recording for that traffic so pre-flight tests don't pollute
+// reporter counters or bill the user twice.
+// ----------------------------------------------------------------------------
+
+// ProbePingRequest is the POST body for /admin/probe/ping.
+type ProbePingRequest struct {
+	Provider string `json:"provider"` // canonical code: "anthropic", "openai", "kimi", ...
+	BaseURL  string `json:"base_url,omitempty"` // optional override; empty → default for provider
+}
+
+// ProbePingResponse is what the CLI reads back. `OK` is true iff the TCP
+// handshake completed within the timeout — no HTTP call, no authentication.
+type ProbePingResponse struct {
+	OK        bool   `json:"ok"`
+	LatencyMs int64  `json:"latency_ms"`
+	Host      string `json:"host,omitempty"`  // echoed back for debugging
+	Error     string `json:"error,omitempty"`
+}
+
+// ProbePing handles POST /admin/probe/ping.
+//
+// Measures reachability + latency from the proxy's network context to the
+// upstream provider. Two modes:
+//
+//  1. No upstream proxy configured (neither config.upstream_proxy.url nor
+//     HTTPS_PROXY / HTTP_PROXY / ALL_PROXY env var): raw TCP connect to
+//     `host:port`. Fastest; measures pure network RTT.
+//
+//  2. Upstream proxy configured: TCP connect to the provider host will be
+//     blocked in restricted networks. Fall through to an HTTP HEAD that
+//     rides the same proxy the data plane uses at runtime — otherwise the
+//     ping fails even though the real proxied requests succeed (the bug
+//     the user's China-network deployment was reporting).
+//
+// Always returns 200 OK so the CLI can read the structured result even on
+// network failure. Transport errors go into the Error field.
+func (h *Handler) ProbePing(w http.ResponseWriter, r *http.Request) {
+	tc := observability.ExtractOrCreate(r)
+	logger := slog.With(
+		"trace_id", tc.TraceID,
+		"request_id", tc.RequestID,
+	)
+
+	var req ProbePingRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{
+			"error": "invalid request body: " + err.Error(),
+		})
+		return
+	}
+	if req.Provider == "" && req.BaseURL == "" {
+		writeJSON(w, http.StatusBadRequest, map[string]string{
+			"error": "provider or base_url required",
+		})
+		return
+	}
+
+	// Resolve target host:port. Override wins; otherwise fall back to the
+	// well-known default URL for the provider code.
+	baseURL := req.BaseURL
+	if baseURL == "" {
+		baseURL = providerDefaultBaseURL(req.Provider)
+	}
+	if baseURL == "" {
+		writeJSON(w, http.StatusOK, ProbePingResponse{
+			OK:    false,
+			Error: fmt.Sprintf("unknown provider %q and no base_url supplied", req.Provider),
+		})
+		return
+	}
+
+	host, port := extractHostPort(baseURL)
+	if host == "" {
+		writeJSON(w, http.StatusOK, ProbePingResponse{
+			OK:    false,
+			Error: "could not extract host from base_url",
+		})
+		return
+	}
+
+	// 3s is enough for a functional check. Longer would punish the user on a
+	// bad network more than the signal is worth.
+	const probeTimeout = 3 * time.Second
+
+	// Resolve upstream proxy for THIS specific target. Precedence:
+	//   1. config.upstream_proxy.url — explicit config wins.
+	//   2. HTTPS_PROXY / HTTP_PROXY env via Go's ProxyFromEnvironment —
+	//      honours NO_PROXY automatically, so targets like 127.0.0.1 or
+	//      localhost correctly bypass the HTTP proxy even when the shell
+	//      has `https_proxy=...` set (the 2026-04-21 test-flake scenario
+	//      from the user's Clash-configured shell).
+	//   3. Neither → direct TCP.
+	proxyURL := ""
+	if h.cfg != nil && h.cfg.UpstreamProxy.URL != "" {
+		proxyURL = h.cfg.UpstreamProxy.URL
+	} else {
+		// Build a synthetic request so ProxyFromEnvironment can apply
+		// NO_PROXY matching against the actual target URL.
+		if probeReq, perr := http.NewRequest(http.MethodHead, baseURL, nil); perr == nil {
+			if p, _ := http.ProxyFromEnvironment(probeReq); p != nil {
+				proxyURL = p.String()
+			}
+		}
+	}
+
+	start := time.Now()
+	var err error
+	if proxyURL == "" {
+		// Direct TCP connect — fastest path, accurate RTT measurement.
+		var conn net.Conn
+		conn, err = net.DialTimeout("tcp", net.JoinHostPort(host, fmt.Sprintf("%d", port)), probeTimeout)
+		if conn != nil {
+			conn.Close()
+		}
+	} else {
+		// Proxied path: HTTP HEAD through the configured proxy. TCP-level
+		// ping can't traverse HTTP proxies, so this is the only option.
+		// Any non-5xx response (200/301/401/403/404/etc.) counts as "reached
+		// upstream" — we're testing reachability, not authentication.
+		err = httpHeadViaProxy(baseURL, proxyURL, probeTimeout)
+	}
+	latency := time.Since(start).Milliseconds()
+
+	if err != nil {
+		logger.Debug("probe ping failed",
+			"provider", req.Provider,
+			"host", host,
+			"via_proxy", proxyURL != "",
+			"error.message", err.Error(),
+		)
+		writeJSON(w, http.StatusOK, ProbePingResponse{
+			OK:        false,
+			LatencyMs: latency,
+			Host:      host,
+			Error:     classifyNetError(err),
+		})
+		return
+	}
+
+	writeJSON(w, http.StatusOK, ProbePingResponse{
+		OK:        true,
+		LatencyMs: latency,
+		Host:      host,
+	})
+}
+
+// httpHeadViaProxy sends an HTTP HEAD to `targetURL` through the given
+// proxy URL (supports http/https/socks5 schemes via net/http's default
+// Proxy hook). Returns nil on any HTTP response (including 4xx/5xx — we
+// only care about "reachable vs not"); a non-nil error means the request
+// never got a response.
+func httpHeadViaProxy(targetURL, proxyURL string, timeout time.Duration) error {
+	pURL, err := url.Parse(proxyURL)
+	if err != nil {
+		return fmt.Errorf("invalid proxy URL: %w", err)
+	}
+	transport := &http.Transport{
+		Proxy: http.ProxyURL(pURL),
+	}
+	client := &http.Client{
+		Transport: transport,
+		Timeout:   timeout,
+		// Don't follow redirects — we only care about "did we talk to upstream".
+		CheckRedirect: func(_ *http.Request, _ []*http.Request) error {
+			return http.ErrUseLastResponse
+		},
+	}
+	// Some upstreams 405 on HEAD /; that still proves reachability. A
+	// transport-level failure is what we want to detect, not HTTP status.
+	req, err := http.NewRequest(http.MethodHead, targetURL, nil)
+	if err != nil {
+		return fmt.Errorf("build request: %w", err)
+	}
+	resp, err := client.Do(req)
+	if err != nil {
+		return err
+	}
+	resp.Body.Close()
+	return nil
+}
+
+// extractHostPort parses a URL-ish string "https://host:port/..." into
+// (host, port). Defaults to 443 (https) / 80 (http) when port is absent.
+// Returns ("", 0) on malformed input.
+func extractHostPort(rawURL string) (string, int) {
+	trimmed := strings.TrimPrefix(rawURL, "https://")
+	isHTTP := false
+	if trimmed == rawURL {
+		trimmed = strings.TrimPrefix(rawURL, "http://")
+		isHTTP = trimmed != rawURL
+	}
+	if trimmed == rawURL {
+		// No scheme — assume https.
+		trimmed = rawURL
+	}
+	// Strip path.
+	if i := strings.Index(trimmed, "/"); i >= 0 {
+		trimmed = trimmed[:i]
+	}
+	if trimmed == "" {
+		return "", 0
+	}
+	// Parse optional :port.
+	if i := strings.LastIndex(trimmed, ":"); i >= 0 {
+		host := trimmed[:i]
+		portStr := trimmed[i+1:]
+		port := 0
+		for _, c := range portStr {
+			if c < '0' || c > '9' {
+				port = 0
+				break
+			}
+			port = port*10 + int(c-'0')
+		}
+		if port == 0 {
+			port = 443
+		}
+		return host, port
+	}
+	if isHTTP {
+		return trimmed, 80
+	}
+	return trimmed, 443
 }
 
 // classifyNetError converts a Go net error into a short human-readable message.

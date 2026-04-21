@@ -4,6 +4,8 @@ import (
 	"log/slog"
 	"sync"
 	"time"
+
+	"github.com/AiKeyLabs/aikey-proxy/internal/observability"
 )
 
 // EventInserter is the interface for batch-inserting events.
@@ -33,7 +35,10 @@ func NewCollector(store EventInserter, batchSize int, flushInterval time.Duratio
 		done:          make(chan struct{}),
 	}
 	c.wg.Add(1)
-	go c.run()
+	// Fatal: if the collector loop dies, usage events silently stop being
+	// persisted — a visible billing correctness risk. Exit(2) and let the
+	// supervisor restart.
+	observability.GoSafe("events.collector.run", observability.Fatal, c.run)
 	return c
 }
 

@@ -257,7 +257,10 @@ func New(cfg *config.Config, configPath, password, version string) (*Supervisor,
 	slog.Info("supervisor started",
 		"generation_id", gen.id,
 	)
-	go s.managedKeySyncLoop()
+	// Fatal: silent death of the managed-key sync loop means server-side
+	// updates to provider keys never reach this proxy. That's a
+	// long-lived correctness/security risk, not a per-request issue.
+	observability.GoSafe("supervisor.managed_key_sync_loop", observability.Fatal, s.managedKeySyncLoop)
 	return s, nil
 }
 
@@ -639,14 +642,17 @@ func (s *Supervisor) Reload(ctx context.Context) error {
 	}
 
 	// Drain the old generation asynchronously so the reload call returns promptly.
-	go func() {
+	// Isolated: if the drain panics the old generation leaks (FDs, memory),
+	// which is bad but not immediately fatal — the new generation is already
+	// serving. Keep the proxy up and emit a crash dump for post-mortem.
+	observability.GoSafe("supervisor.reload.drain_old", observability.Isolated, func() {
 		old.drain(drainTimeoutStreaming, reloadID)
 		old.close()
 		slog.Info("reload: old generation closed",
 			"reload_id", reloadID,
 			"generation_id", old.id,
 		)
-	}()
+	})
 
 	return nil
 }

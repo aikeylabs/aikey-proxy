@@ -36,6 +36,22 @@ func isStreamingFromContext(ctx context.Context) bool {
 	return v
 }
 
+// isAikeyProbe returns true when the caller (typically `aikey test` / doctor /
+// add) has marked the request as a connectivity probe via `X-Aikey-Probe: 1`.
+//
+// Probe traffic flows through the regular data plane for credential injection
+// + forwarding, but must NOT be recorded into reporter / WAL / collector —
+// otherwise pre-flight tests inflate usage counters and (for OAuth/team keys
+// with upstream billing) look like real work to the provider.
+//
+// Keep this helper next to the other header extractors so every emission site
+// in proxy.go / recordEvent / streaming callback shares one definition.
+const headerAikeyProbe = "X-Aikey-Probe"
+
+func isAikeyProbe(r *http.Request) bool {
+	return r != nil && r.Header.Get(headerAikeyProbe) == "1"
+}
+
 // extractVirtualKey extracts the virtual key token from the request.
 // It looks for tokens with the "aikey_vk_" prefix in:
 // 1. Authorization: Bearer <token>

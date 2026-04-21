@@ -285,3 +285,56 @@ func TestStreamDrainer_DurationRecorded(t *testing.T) {
 		t.Errorf("DurationMs should be ≥ 0, got %d", ev.DurationMs)
 	}
 }
+
+// TestStreamDrainer_NilCollectorDoesNotPanic pins the 2026-04-22 probe-mode
+// crash fix.
+//
+// Background: the X-Aikey-Probe: 1 request path in Handle() passes a nil
+// collector to newStreamDrainer so probe traffic doesn't inflate usage
+// counters. Before the fix, the drainer goroutine called
+// `collector.Record(ev)` unconditionally → nil deref → whole proxy process
+// panicked AFTER returning the streaming response. The CLI saw "chat ok"
+// for the probe but then got connection-refused on the very next request.
+//
+// Guard: when collector is nil, the Record call is skipped.
+func TestStreamDrainer_NilCollectorDoesNotPanic(t *testing.T) {
+	sse := anthropicSSE(5, 10, 2)
+	upstream := io.NopCloser(strings.NewReader(sse))
+
+	baseEvent := events.UsageEvent{
+		Timestamp:    time.Now(),
+		VirtualKeyID: "vk_probe",
+		Provider:     "anthropic",
+	}
+
+	// onComplete MUST still fire even when collector is nil — the reporter
+	// callback handles its own probe gating upstream (in proxy.go::Handle),
+	// and nil-collector means "skip collector recording", NOT "skip all
+	// post-stream bookkeeping".
+	completed := make(chan struct{}, 1)
+	cb := func(_ provider.TokenBreakdown, _ string) {
+		completed <- struct{}{}
+	}
+
+	// Pass nil for the collector — this is the probe path.
+	drainer := newStreamDrainer(
+		upstream, baseEvent, &provider.Anthropic{},
+		nil, // ← the nil that used to panic
+		context.Background(), context.Background(),
+		cb,
+	)
+
+	// Drain fully. The drainer's post-stream goroutine runs in parallel;
+	// the test deadline below catches a goroutine panic via the channel.
+	if _, err := io.ReadAll(drainer); err != nil {
+		t.Fatalf("ReadAll error: %v", err)
+	}
+	drainer.Close()
+
+	select {
+	case <-completed:
+		// Good — drainer goroutine finished cleanly and invoked onComplete.
+	case <-time.After(2 * time.Second):
+		t.Fatal("onComplete never fired — drainer goroutine likely panicked on nil collector")
+	}
+}

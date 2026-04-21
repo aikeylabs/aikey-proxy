@@ -64,7 +64,10 @@ func NewAsyncWriter(dir string) (*AsyncWriter, error) {
 	if err := w.openFileLocked(); err != nil {
 		return nil, err
 	}
-	go w.run()
+	// Fatal: if the log writer goroutine dies silently we lose all
+	// diagnostic visibility. Treat it as a proxy-level fault and let the
+	// OS supervisor restart the process.
+	GoSafe("observability.writer.run", Fatal, w.run)
 	return w, nil
 }
 

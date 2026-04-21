@@ -683,13 +683,15 @@ func (p *Proxy) serveRoute(w http.ResponseWriter, r *http.Request, route *vkeys.
 		if cn, ok := w.(http.CloseNotifier); ok {
 			cancelCtx, cancel := context.WithCancel(reqBase)
 			defer cancel()
-			go func() {
+			// Isolated: per-request disconnect watcher. A panic here only
+			// breaks one streaming request's mid-stream cancel behavior.
+			observability.GoSafe("proxy.request.close_notifier", observability.Isolated, func() {
 				select {
 				case <-cn.CloseNotify(): //nolint:staticcheck
 					cancel()
 				case <-cancelCtx.Done():
 				}
-			}()
+			})
 			reqBase = cancelCtx
 		}
 	}
@@ -777,26 +779,37 @@ func (p *Proxy) serveRoute(w http.ResponseWriter, r *http.Request, route *vkeys.
 				ev := p.buildBaseEvent(r, resp, startTime, route, false)
 				ev.InputTokens = breakdown.InputTokens
 				ev.OutputTokens = breakdown.OutputTokens
-				p.collector.Record(ev)
-				// Non-streaming always terminates atomically — the response is
-				// either the full JSON or it's an error we surface elsewhere.
-				sessionID := resolveSessionID(r.Header, route.ProviderCode)
-				p.reportUsage(route, bearerToken, ev.Model, startTime, resp.StatusCode, breakdown, "", realKey, sessionID, "complete")
+				// Probe traffic is forwarded normally so the CLI gets a truthful
+				// status code, but must not inflate usage counters or trigger
+				// reporter uploads (it'd be double-counting our own self-tests).
+				if !isAikeyProbe(r) {
+					p.collector.Record(ev)
+					// Non-streaming always terminates atomically — the response is
+					// either the full JSON or it's an error we surface elsewhere.
+					sessionID := resolveSessionID(r.Header, route.ProviderCode)
+					p.reportUsage(route, bearerToken, ev.Model, startTime, resp.StatusCode, breakdown, "", realKey, sessionID, "complete")
+				}
 			} else {
 				// Streaming success: wrap body — background goroutine drains the
 				// full SSE stream and records token usage when it ends, regardless
 				// of whether the client stays connected.
 				baseEvent := p.buildBaseEvent(r, resp, startTime, route, true)
-				// Capture session_id from the request now; by callback time
-				// the request's header map may have been recycled.
+				// Capture probe flag + session_id from the request now; by
+				// callback time the request's header map may have been recycled.
+				probe := isAikeyProbe(r)
 				sessionID := resolveSessionID(r.Header, route.ProviderCode)
 				var cb reporterCallback
-				if p.reporter != nil {
+				if p.reporter != nil && !probe {
 					cb = func(br provider.TokenBreakdown, completion string) {
 						p.reportUsage(route, bearerToken, baseEvent.Model, startTime, resp.StatusCode, br, "", realKey, sessionID, completion)
 					}
 				}
-				resp.Body = newStreamDrainer(resp.Body, baseEvent, prov, p.collector, p.proxyCtx, r.Context(), cb)
+				// For probe traffic skip the collector entirely by passing nil.
+				collector := p.collector
+				if probe {
+					collector = nil
+				}
+				resp.Body = newStreamDrainer(resp.Body, baseEvent, prov, collector, p.proxyCtx, r.Context(), cb)
 			}
 			return nil
 		},
@@ -858,6 +871,12 @@ func (p *Proxy) recordEvent(req *http.Request, resp *http.Response, startTime ti
 	if resp.StatusCode >= 400 {
 		p.errors.Add(1)
 		ev.ErrorType = http.StatusText(resp.StatusCode)
+	}
+	// Probe traffic bypasses all sinks — see isAikeyProbe rationale in
+	// middleware.go. Keep p.errors.Add(1) above so the /metrics view still
+	// shows "N requests returned 4xx/5xx" even for self-tests.
+	if isAikeyProbe(req) {
+		return
 	}
 	p.collector.Record(ev)
 	// Error responses are treated as interrupted — the client never got a

@@ -7,6 +7,8 @@ import (
 	"net/http"
 	"sync"
 	"time"
+
+	"github.com/AiKeyLabs/aikey-proxy/internal/observability"
 )
 
 // CanaryConfig configures the synthetic canary probe.
@@ -75,7 +77,9 @@ func NewCanaryProbe(reporter *Reporter, cfg CanaryConfig) *CanaryProbe {
 	}
 
 	p.wg.Add(1)
-	go p.loop()
+	// Fatal: canary probe is the pipeline's self-test. A silent death here
+	// means "everything looks fine" while nothing is actually checked.
+	observability.GoSafe("events.canary.loop", observability.Fatal, p.loop)
 	slog.Info("canary probe started", "interval", cfg.Interval, "diagnostics_url", cfg.DiagnosticsURL)
 	return p
 }
