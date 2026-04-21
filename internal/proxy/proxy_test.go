@@ -1016,20 +1016,22 @@ func TestResolveSessionID_NonKimiProviderIgnoresKimiHeader(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
-// F1c regression: extractModel performance/safety under large bodies.
+// extractModel body-size semantics (simplified 2026-04-21 from the prior
+// streaming-prefix design):
 //   - Huge bodies (> extractBodyHardLimit) must be skipped entirely so we
-//     never OOM on multimodal payloads.
-//   - Mid-sized bodies (> extractPrefixScan, <= hard limit) must extract
-//     top-level fields via the streaming path without materialising the
-//     full body in memory.
-//   - Body replay must survive both paths so upstream still sees the full
+//     never OOM on multimodal payloads (review finding #1).
+//   - All other bodies — including "fields at the tail after a huge
+//     messages array" shape that Kimi 1.36 uses — must be fully parsed
+//     so we pick up `model` and `prompt_cache_key` regardless of where
+//     they sit in the JSON.
+//   - Body replay must always survive so upstream still sees the full
 //     payload unchanged.
 // ---------------------------------------------------------------------------
 
 func TestExtractModel_HugeBody_SkipsParsingAndLeavesBodyAlone(t *testing.T) {
-	// Simulate a multimodal payload just past the hard limit: huge JSON
-	// array of strings. We don't actually construct 4MB here — we lie
-	// about ContentLength, which is enough to trigger the guard.
+	// Simulate a multimodal payload just past the hard limit: body contents
+	// are irrelevant since we're testing the size fence. We lie about
+	// ContentLength (> hard limit) which is enough to trigger the guard.
 	body := []byte(`{"model":"kimi-k2.5","messages":[]}`)
 	req := httptest.NewRequest(http.MethodPost, "/kimi/v1/chat/completions", bytes.NewReader(body))
 	req.ContentLength = extractBodyHardLimit + 1
@@ -1052,28 +1054,32 @@ func TestExtractModel_HugeBody_SkipsParsingAndLeavesBodyAlone(t *testing.T) {
 	}
 }
 
-func TestExtractModel_LargeBody_StreamScansPrefix(t *testing.T) {
-	// Build a body whose top-level `model` and `prompt_cache_key` sit at
-	// the front, followed by a large `messages` array that exceeds
-	// extractPrefixScan. Streaming path should find both fields without
-	// materialising the large array.
+// Regression guard for 2026-04-21 bug: Kimi 1.36.0 serialises `messages`
+// as the first top-level field (huge system prompt + tools + history) and
+// `prompt_cache_key` only after it. An earlier streaming-prefix design
+// that only scanned the first 16 KB missed the session id, so every Kimi
+// turn landed in WAL with empty session_id and the receipt hook never
+// fired. This test pins the "fields-after-messages" shape and verifies
+// the simplified full-buffer path captures both fields regardless of
+// body size up to the hard limit.
+func TestExtractModel_KimiShape_FieldsAfterLargeMessagesArray(t *testing.T) {
 	var payload bytes.Buffer
-	payload.WriteString(`{"model":"kimi-k2.5","prompt_cache_key":"large-sess-9","messages":[`)
-	// ~20 KB of filler strings in the messages array, pushing total body
-	// past the 16 KB prefix scan limit.
+	// Kimi body shape: messages FIRST (big), model + prompt_cache_key LAST.
+	payload.WriteString(`{"messages":[`)
+	// Fill the messages array with ~50 KB of content — bigger than any
+	// reasonable prefix-scan window, smaller than the hard limit.
 	for i := 0; i < 200; i++ {
 		if i > 0 {
 			payload.WriteByte(',')
 		}
 		payload.WriteString(`{"role":"user","content":"`)
-		payload.WriteString(strings.Repeat("x", 100))
+		payload.WriteString(strings.Repeat("x", 250))
 		payload.WriteString(`"}`)
 	}
-	payload.WriteString(`]}`)
+	payload.WriteString(`],"model":"kimi-k2.5","prompt_cache_key":"tail-sess-z"}`)
 	bodyBytes := payload.Bytes()
-	if len(bodyBytes) <= extractPrefixScan {
-		t.Fatalf("test fixture too small — want > %d bytes, got %d",
-			extractPrefixScan, len(bodyBytes))
+	if len(bodyBytes) < 32*1024 {
+		t.Fatalf("fixture too small — the whole point is to dwarf any prefix window; got %d bytes", len(bodyBytes))
 	}
 
 	req := httptest.NewRequest(http.MethodPost, "/kimi/v1/chat/completions",
@@ -1083,51 +1089,15 @@ func TestExtractModel_LargeBody_StreamScansPrefix(t *testing.T) {
 	model := extractModel(req)
 
 	if model != "kimi-k2.5" {
-		t.Errorf("large body: want model=kimi-k2.5, got %q", model)
+		t.Errorf("Kimi shape: want model=kimi-k2.5, got %q — has the full-buffer path been replaced with a prefix scanner again?", model)
 	}
-	if got := req.Header.Get("x-aikey-kimi-session"); got != "large-sess-9" {
-		t.Errorf("large body: want session=large-sess-9, got %q", got)
+	if got := req.Header.Get("x-aikey-kimi-session"); got != "tail-sess-z" {
+		t.Errorf("Kimi shape: want session=tail-sess-z, got %q — prompt_cache_key at body tail must still be captured", got)
 	}
 
-	// Critical: body replay. Upstream must see every byte.
 	rebuffered, _ := io.ReadAll(req.Body)
 	if !bytes.Equal(rebuffered, bodyBytes) {
-		t.Errorf("large body: replay mismatch; len(got)=%d, len(want)=%d",
+		t.Errorf("Kimi shape: body replay mismatch; len(got)=%d, len(want)=%d",
 			len(rebuffered), len(bodyBytes))
-	}
-}
-
-func TestScanTopLevelStringFields_SkipsNestedValues(t *testing.T) {
-	// Direct unit test of the token-stream skipper: a deeply nested
-	// object before `model` must not break extraction, and the function
-	// must not allocate memory proportional to the nested value.
-	body := `{"messages":[{"role":"user","content":[{"type":"text","text":"hi"}]}],"model":"m1","prompt_cache_key":"s1"}`
-	m, s := scanTopLevelStringFields(strings.NewReader(body), "model", "prompt_cache_key")
-	if m != "m1" || s != "s1" {
-		t.Errorf("want (m1,s1), got (%q,%q)", m, s)
-	}
-}
-
-func TestScanTopLevelStringFields_EarlyExitAfterBothFound(t *testing.T) {
-	// If model + prompt_cache_key both appear before other fields, the
-	// scanner must stop — later junk (even malformed JSON) shouldn't
-	// matter. This is the load-bearing optimisation for huge-messages
-	// payloads.
-	body := `{"model":"m","prompt_cache_key":"s","junk":`
-	m, s := scanTopLevelStringFields(strings.NewReader(body), "model", "prompt_cache_key")
-	if m != "m" || s != "s" {
-		t.Errorf("early exit failed: (%q,%q)", m, s)
-	}
-}
-
-func TestScanTopLevelStringFields_NonObjectReturnsEmpty(t *testing.T) {
-	// Body that isn't a JSON object (array, scalar, garbage) returns
-	// empty strings — no panic, no partial state.
-	cases := []string{`[]`, `"just a string"`, `42`, `not json at all`, ``}
-	for _, c := range cases {
-		m, s := scanTopLevelStringFields(strings.NewReader(c), "model", "prompt_cache_key")
-		if m != "" || s != "" {
-			t.Errorf("input %q: want empty, got (%q,%q)", c, m, s)
-		}
 	}
 }

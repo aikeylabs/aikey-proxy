@@ -1056,63 +1056,45 @@ func resolveSessionID(h http.Header, providerCode string) string {
 	return ""
 }
 
-// extractModel reads the request body to find the "model" field and
-// Kimi's `prompt_cache_key` (= session id). It stashes both into custom
-// x-aikey-* request headers so buildBaseEvent / reportUsage can later
-// read them without re-parsing the body.
+// extractModel reads the request body to find the top-level `model` field
+// and Kimi's `prompt_cache_key` (= session id). It stashes both into
+// custom x-aikey-* request headers so buildBaseEvent / reportUsage can
+// read them later without re-parsing the body.
 //
 // Why both in one pass: once ReverseProxy forwards the request the body
 // stream is consumed — ModifyResponse can't reach back into it. Parsing
 // here is the only correct timing.
 //
-// Performance model (see also review finding 2026-04-20 #1):
+// Memory model (simplified 2026-04-21 from the prior streaming-prefix
+// design):
 //
-//	Small bodies (≤ extractPrefixScan): fully buffered, full json.Unmarshal.
-//	  Identical to pre-fix behaviour; preserves edge cases around JSON
-//	  with keys in any order.
-//	Large bodies (> extractPrefixScan, ≤ extractBodyHardLimit): stream-scan
-//	  only the first extractPrefixScan bytes via json.Decoder token stream.
-//	  Every SDK we've observed (Anthropic, OpenAI, Kimi) places `model`
-//	  and `prompt_cache_key` at the top level near the start of the body,
-//	  so the prefix almost always captures them. Memory bound: 16 KB
-//	  regardless of total body size. Downstream still sees the full body
-//	  via MultiReader replay.
-//	Huge bodies (> extractBodyHardLimit): skip parsing entirely — ev.Model
-//	  stays empty (UI handles that gracefully) and the body passes through
-//	  untouched. Protects against OOM on multimodal payloads with base64
-//	  images (can legitimately be 10+ MB).
-const (
-	extractPrefixScan    = 16 * 1024        // 16 KB  — per-request memory ceiling for streaming path
-	extractBodyHardLimit = 4 * 1024 * 1024  // 4 MB   — refuse to buffer beyond this
-)
+//	Body ≤ extractBodyHardLimit (4 MB): full io.ReadAll + json.Unmarshal.
+//	  Typical Claude/Kimi/OpenAI text bodies sit at 10 KB – 500 KB, well
+//	  within this budget. Concurrency on a single-user local proxy is
+//	  low, so the instantaneous memory cost is tiny.
+//	Body > extractBodyHardLimit: skip parsing entirely. ev.Model stays
+//	  empty (UI handles the empty case via fallback paths). This fence
+//	  protects against OOM on multimodal payloads with base64 images
+//	  (legitimately 10+ MB).
+//
+// Earlier a 16 KB streaming-prefix scan was added to reduce memory for
+// mid-size bodies, but it turned out to break real Kimi CLI 1.36.0
+// traffic: kosong's Python SDK serialises `messages` (huge array) as the
+// first top-level key and spreads `prompt_cache_key` via `**kwargs` AFTER
+// it. The prefix scan never reached the session id field, so Kimi WAL
+// events landed with empty session_id and the receipt hook did not fire.
+// The fence alone preserves the OOM protection that review finding #1
+// asked for, without the field-order fragility.
+const extractBodyHardLimit = 4 * 1024 * 1024 // 4 MB
 
 func extractModel(r *http.Request) string {
 	if r.Body == nil {
 		return ""
 	}
-
-	// Fence 1: huge bodies bypass parsing entirely. No buffering, no parse,
-	// no headers stashed. ev.Model will be empty for these but the
-	// downstream path is unaffected.
 	if r.ContentLength > extractBodyHardLimit {
 		return ""
 	}
 
-	// Small or known-small bodies: keep the full-buffer + full-Unmarshal
-	// path. Content-Length <= 0 means "unknown" (chunked), which we treat
-	// as potentially large and route to the streaming path.
-	if r.ContentLength > 0 && r.ContentLength <= int64(extractPrefixScan) {
-		return extractModelFullBuffer(r)
-	}
-
-	// Streaming prefix scan for mid/large/unknown-length bodies.
-	return extractModelStreamScan(r)
-}
-
-// extractModelFullBuffer is the pre-2026-04-20 behaviour, kept for small
-// bodies so tests exercising edge cases (fields near the end, odd JSON
-// shapes) continue to work identically.
-func extractModelFullBuffer(r *http.Request) string {
 	bodyBytes, err := io.ReadAll(r.Body)
 	if err != nil {
 		return ""
@@ -1125,37 +1107,12 @@ func extractModelFullBuffer(r *http.Request) string {
 		PromptCacheKey string `json:"prompt_cache_key"`
 	}
 	if err := json.Unmarshal(bodyBytes, &partial); err != nil {
+		// Body isn't JSON we understand — leave both headers unset.
 		return ""
 	}
+
 	stashExtractedFields(r, partial.Model, partial.PromptCacheKey)
 	return partial.Model
-}
-
-// extractModelStreamScan reads at most extractPrefixScan bytes from the
-// body using a json.Decoder token stream, extracts top-level `model` and
-// `prompt_cache_key` string fields if present, and replays captured bytes
-// plus the unread remainder back onto r.Body so the upstream forwarder
-// still sees the full payload.
-//
-// Memory bound: extractPrefixScan (prefix buffer) + the json.Decoder's
-// own buffering (also bounded by the LimitReader). Worst case ~32 KB
-// regardless of total body size.
-func extractModelStreamScan(r *http.Request) string {
-	// Capture every byte the scanner consumes so we can prepend it back.
-	var prefix bytes.Buffer
-	prefix.Grow(extractPrefixScan)
-	limited := io.LimitReader(r.Body, int64(extractPrefixScan))
-	tee := io.TeeReader(limited, &prefix)
-
-	model, pck := scanTopLevelStringFields(tee, "model", "prompt_cache_key")
-
-	// Replay: [captured prefix] + [unread remainder of original body].
-	// Content-Length is NOT changed — we haven't modified any bytes, only
-	// consumed and replayed them.
-	r.Body = io.NopCloser(io.MultiReader(bytes.NewReader(prefix.Bytes()), r.Body))
-
-	stashExtractedFields(r, model, pck)
-	return model
 }
 
 func stashExtractedFields(r *http.Request, model, promptCacheKey string) {
@@ -1168,110 +1125,4 @@ func stashExtractedFields(r *http.Request, model, promptCacheKey string) {
 		// accidentally inject a session_id into WAL (review finding #3).
 		r.Header.Set("x-aikey-kimi-session", promptCacheKey)
 	}
-}
-
-// scanTopLevelStringFields walks the JSON token stream from r looking for
-// the named top-level string fields. Values for unrelated fields are
-// skipped at the token level — we never materialise a large nested value
-// (e.g. a huge `messages` array) into memory. Returns empty strings for
-// any field not found before the reader is exhausted or the JSON ends.
-//
-// Treats any parse error as "no more fields" and returns what was found
-// so far. This is the right contract for our use case: a body we can't
-// parse just leaves ev.Model / session_id empty; it's not a hard error.
-func scanTopLevelStringFields(r io.Reader, field1, field2 string) (v1, v2 string) {
-	dec := json.NewDecoder(r)
-	dec.UseNumber() // cheaper than float64 conversion on skipped numbers
-
-	tok, err := dec.Token()
-	if err != nil {
-		return
-	}
-	if delim, ok := tok.(json.Delim); !ok || delim != '{' {
-		return
-	}
-
-	for dec.More() {
-		// Field name.
-		tok, err = dec.Token()
-		if err != nil {
-			return
-		}
-		key, ok := tok.(string)
-		if !ok {
-			return
-		}
-
-		switch key {
-		case field1, field2:
-			// Read the value — it must be a string for the fields we care
-			// about (model / prompt_cache_key are always strings in every
-			// provider SDK we support). A non-string value is treated as
-			// "field missing" for robustness.
-			vtok, err := dec.Token()
-			if err != nil {
-				return
-			}
-			if s, ok := vtok.(string); ok {
-				if key == field1 {
-					v1 = s
-				} else {
-					v2 = s
-				}
-			} else if d, ok := vtok.(json.Delim); ok {
-				// Value is an object/array — not what we want; skip it.
-				if err := skipJSONDelimValue(dec, d); err != nil {
-					return
-				}
-			}
-		default:
-			if err := skipJSONValue(dec); err != nil {
-				return
-			}
-		}
-
-		// Early exit: both fields captured.
-		if v1 != "" && v2 != "" {
-			return
-		}
-	}
-	return
-}
-
-// skipJSONValue consumes and discards a single JSON value from the
-// decoder without materialising it. Handles scalars (token-consumed
-// already) and containers (recursively drains to matching close delim).
-func skipJSONValue(dec *json.Decoder) error {
-	tok, err := dec.Token()
-	if err != nil {
-		return err
-	}
-	if d, ok := tok.(json.Delim); ok {
-		return skipJSONDelimValue(dec, d)
-	}
-	// Scalar — already consumed.
-	return nil
-}
-
-// skipJSONDelimValue drains tokens until the matching close delimiter
-// for `open` ({ → }, [ → ]). Must be called after the opener has already
-// been consumed by a prior Token() call.
-func skipJSONDelimValue(dec *json.Decoder, open json.Delim) error {
-	depth := 1
-	for depth > 0 {
-		tok, err := dec.Token()
-		if err != nil {
-			return err
-		}
-		if d, ok := tok.(json.Delim); ok {
-			switch d {
-			case '{', '[':
-				depth++
-			case '}', ']':
-				depth--
-			}
-		}
-	}
-	_ = open // documented input; not needed at runtime
-	return nil
 }
