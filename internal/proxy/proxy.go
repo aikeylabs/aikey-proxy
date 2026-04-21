@@ -424,6 +424,93 @@ func (p *Proxy) handlePathPrefixRoute(w http.ResponseWriter, r *http.Request, pr
 		return
 	}
 
+	// ── aikey_personal_alias_<alias> sentinel ─────────────────────────────
+	//
+	// Introduced 2026-04-22 (Stage 3 of connectivity-probe-through-proxy).
+	//
+	// Why: `aikey test <alias>` and the shell wrapper preflight (called
+	// before every `claude` / `codex`) must probe a specific personal API
+	// key without the CLI touching the vault. The CLI cannot ask for the
+	// master password on every invocation — that's terrible UX for a
+	// wrapper that runs on every command. Proxy already holds the vault
+	// derived key in memory from its own startup password prompt, so it
+	// can decrypt any personal alias on demand.
+	//
+	// Unlike the no-bearer fallback below — which resolves whichever
+	// personal/team/OAuth binding is ACTIVE for canonicalCode — this
+	// sentinel tests EXACTLY the alias the caller named. That fixes the
+	// 2026-04-22 caveat where probing an inactive personal key silently
+	// exercised the active one.
+	//
+	// Security: proxy is bound to 127.0.0.1, so any caller already has
+	// local-host equivalence — this is the same trust boundary that lets
+	// `claude` runtime hit `127.0.0.1:<port>/anthropic/v1/...` without
+	// presenting credentials. No new attack surface.
+	if rawAuthValue != "" && strings.HasPrefix(rawAuthValue, "aikey_personal_alias_") {
+		alias := strings.TrimPrefix(rawAuthValue, "aikey_personal_alias_")
+		if alias == "" {
+			p.errors.Add(1)
+			writeJSONError(w, http.StatusUnauthorized, "authentication_error", "TOKEN_INVALID",
+				"aikey_personal_alias_ sentinel missing alias suffix")
+			return
+		}
+		plaintext, entryProviderCode, entryBaseURL, err := p.activeReader.GetPersonalKeyByAlias(alias)
+		if err != nil {
+			p.errors.Add(1)
+			logger.Warn("personal-alias sentinel: vault lookup failed",
+				"alias", alias, "error", err,
+				"event.name", observability.EventProxyRequestVaultFailed,
+			)
+			writeJSONError(w, http.StatusServiceUnavailable, "server_error", "SECRET_NOT_CONFIGURED",
+				"Personal key '"+alias+"' not found or could not be decrypted. Run: aikey list")
+			return
+		}
+
+		// Derive baseURL: entry's custom URL > entry's stored provider default >
+		// path-prefix canonical default. The last rung matters for personal
+		// keys that are bound to multiple providers (one alias, several
+		// provider_code rows via the bindings table) — path prefix
+		// disambiguates at probe time.
+		resolvedBase := entryBaseURL
+		if resolvedBase == "" && entryProviderCode != "" {
+			resolvedBase = providerDefaultBaseURL(entryProviderCode)
+		}
+		if resolvedBase == "" {
+			resolvedBase = providerDefaultBaseURL(canonicalCode)
+		}
+
+		prov, err := p.providers.Get(protocolType)
+		if err != nil {
+			p.errors.Add(1)
+			writeJSONError(w, http.StatusBadGateway, "server_error", "PROVIDER_ERROR",
+				"Unknown provider protocol: "+protocolType)
+			return
+		}
+
+		// Strip provider prefix (e.g. /anthropic/v1/messages → /v1/messages)
+		// before forwarding, matching the aikey_vk_ branch's behaviour.
+		r.URL.Path = strippedPath
+		if r.URL.RawPath != "" {
+			r.URL.RawPath = strippedPath
+		}
+
+		aliasRoute := &vkeys.ResolvedRoute{
+			VirtualKeyID: "personal:" + alias,
+			Provider:     providerCode,
+			BaseURL:      resolvedBase,
+			PlaintextKey: plaintext,
+			ProviderCode: canonicalCode,
+			ProtocolType: protocolType,
+			KeyAlias:     alias,
+			// RouteSource = "personal" matches what personalTokenToRoute uses
+			// so reportable.go's label classification stays consistent
+			// regardless of which path produced the route.
+			RouteSource: "personal",
+		}
+		p.serveRoute(w, r, aliasRoute, prov, plaintext, rawAuthValue, startTime, logger)
+		return
+	}
+
 	// ── No auth header: fall through to default binding ────────────────────
 
 	// ── v1.0.2: try provider binding first ─────────────────────────────────

@@ -694,6 +694,139 @@ func TestHandlePathPrefix_BindingPersonalKey(t *testing.T) {
 	}
 }
 
+// ── aikey_personal_alias_ sentinel tests (2026-04-22) ──────────────────────
+//
+// Why this whole cluster: Stage 3 of the connectivity-probe-through-proxy
+// fix introduced a sentinel bearer so `aikey test <alias>` and the shell
+// wrapper preflight can probe a specific personal key without the CLI
+// touching the vault. Before this, personal-key probes decrypted in the
+// CLI (prompting for master password) — unacceptable for a preflight that
+// runs before every `claude` / `codex` invocation. The tests below pin
+// the contract so a future regression that silently falls back to the
+// active-binding resolver fails fast.
+
+func TestHandlePathPrefix_PersonalAliasSentinel(t *testing.T) {
+	var capturedAuth string
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		capturedAuth = r.Header.Get("x-api-key")
+		w.WriteHeader(http.StatusOK)
+		w.Write([]byte(`{"ok":true}`))
+	}))
+	defer upstream.Close()
+
+	av := &mockActiveVault{
+		personalAlias:   "my-claude",
+		personalText:    "sk-ant-from-vault",
+		personalProv:    "anthropic",
+		personalBaseURL: upstream.URL,
+		// No providerBindings / activeTeamKeys — proves the sentinel does NOT
+		// depend on any active binding having been set up. This is the
+		// "wrapper preflight before the user has activated anything" case.
+	}
+	p := setupTestProxyWithActive(t, av)
+
+	req := httptest.NewRequest(http.MethodGet, "/anthropic/v1/models", nil)
+	req.Header.Set("Authorization", "Bearer aikey_personal_alias_my-claude")
+	w := httptest.NewRecorder()
+	p.Handle(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d — body: %s", w.Code, w.Body.String())
+	}
+	if capturedAuth != "sk-ant-from-vault" {
+		t.Errorf("upstream x-api-key = %q, want sk-ant-from-vault "+
+			"(proxy should decrypt the personal alias and inject the real key)",
+			capturedAuth)
+	}
+}
+
+func TestHandlePathPrefix_PersonalAliasSentinel_NotActive(t *testing.T) {
+	// Regression guard for the 2026-04-22 caveat: before this sentinel,
+	// probing an inactive personal key fell through to "active binding
+	// lookup" and inadvertently exercised the active one. The sentinel
+	// must test EXACTLY the alias named, regardless of what's active.
+	var capturedAuth string
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		capturedAuth = r.Header.Get("x-api-key")
+		w.WriteHeader(http.StatusOK)
+		w.Write([]byte(`{"ok":true}`))
+	}))
+	defer upstream.Close()
+
+	av := &mockActiveVault{
+		personalAlias:   "inactive-key",
+		personalText:    "sk-ant-inactive",
+		personalProv:    "anthropic",
+		personalBaseURL: upstream.URL,
+		// Active binding points at a DIFFERENT alias/team key — this is
+		// what the fallback resolver would pick. The sentinel must ignore it.
+		providerBindings: map[string]*vault.ProviderBinding{
+			"anthropic": {
+				ProviderCode:  "anthropic",
+				KeySourceType: "personal",
+				KeySourceRef:  "some-other-active-alias",
+			},
+		},
+	}
+	p := setupTestProxyWithActive(t, av)
+
+	req := httptest.NewRequest(http.MethodGet, "/anthropic/v1/models", nil)
+	req.Header.Set("Authorization", "Bearer aikey_personal_alias_inactive-key")
+	w := httptest.NewRecorder()
+	p.Handle(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d — body: %s", w.Code, w.Body.String())
+	}
+	if capturedAuth != "sk-ant-inactive" {
+		t.Errorf("upstream x-api-key = %q, want sk-ant-inactive "+
+			"(sentinel must test the NAMED alias, not whichever is active)",
+			capturedAuth)
+	}
+}
+
+func TestHandlePathPrefix_PersonalAliasSentinel_UnknownAlias(t *testing.T) {
+	av := &mockActiveVault{
+		personalAlias: "only-this-one",
+		personalText:  "sk-real",
+		personalProv:  "anthropic",
+	}
+	p := setupTestProxyWithActive(t, av)
+
+	req := httptest.NewRequest(http.MethodGet, "/anthropic/v1/models", nil)
+	req.Header.Set("Authorization", "Bearer aikey_personal_alias_nonexistent")
+	w := httptest.NewRecorder()
+	p.Handle(w, req)
+
+	if w.Code != http.StatusServiceUnavailable {
+		t.Errorf("expected 503 for unknown alias, got %d — body: %s",
+			w.Code, w.Body.String())
+	}
+	// Body must hint at the fix so a preflight wrapper can surface it.
+	if body := w.Body.String(); !strings.Contains(body, "aikey list") {
+		t.Errorf("error body should point user at `aikey list`, got: %s", body)
+	}
+}
+
+func TestHandlePathPrefix_PersonalAliasSentinel_EmptySuffix(t *testing.T) {
+	av := &mockActiveVault{
+		personalAlias: "any",
+		personalText:  "sk",
+		personalProv:  "anthropic",
+	}
+	p := setupTestProxyWithActive(t, av)
+
+	req := httptest.NewRequest(http.MethodGet, "/anthropic/v1/models", nil)
+	// Trailing-underscore-only sentinel: malformed caller.
+	req.Header.Set("Authorization", "Bearer aikey_personal_alias_")
+	w := httptest.NewRecorder()
+	p.Handle(w, req)
+
+	if w.Code != http.StatusUnauthorized {
+		t.Errorf("expected 401 for empty alias suffix, got %d", w.Code)
+	}
+}
+
 func TestHandlePathPrefix_BindingTeamKey(t *testing.T) {
 	var capturedPath2 string
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
