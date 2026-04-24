@@ -6,6 +6,7 @@ import (
 	"time"
 
 	"github.com/AiKeyLabs/aikey-proxy/internal/vkeys"
+	"github.com/AiKeyLabs/pkg/aikeytime"
 )
 
 // ReportableEvent contains all anchor fields required by collector-service.
@@ -25,11 +26,15 @@ type ReportableEvent struct {
 	ProxyConfigVersion string `json:"proxy_config_version,omitempty"`
 	ProxyLoadedControlSeq *int64 `json:"proxy_loaded_control_seq,omitempty"`
 
-	// timestamps (D4: event_time is local client time)
-	EventTime  time.Time  `json:"event_time"`
-	OccurredAt time.Time  `json:"occurred_at"`
-	StartedAt  *time.Time `json:"started_at,omitempty"`
-	FinishedAt *time.Time `json:"finished_at,omitempty"`
+	// timestamps: int64 Unix epoch milliseconds (UTC). Wire format switched
+	// from RFC3339 strings in v1.0.3-alpha — see the design doc at
+	// roadmap20260320/技术实现/update/20260424-时间戳统一为int64毫秒-data-service.md.
+	// Why: SQLite storage of time.Time via Go's default String format
+	// broke strftime-based hour bucketing on the query side.
+	EventTime  aikeytime.Millis  `json:"event_time"`
+	OccurredAt aikeytime.Millis  `json:"occurred_at"`
+	StartedAt  *aikeytime.Millis `json:"started_at,omitempty"`
+	FinishedAt *aikeytime.Millis `json:"finished_at,omitempty"`
 
 	// ownership (D3 naming)
 	OrgID     string `json:"org_id"`
@@ -137,6 +142,8 @@ type ReportOpts struct {
 func BuildReportableEvent(opts ReportOpts) ReportableEvent {
 	route := opts.Route
 	now := opts.FinishedAt
+	nowMs := aikeytime.FromTime(now)
+	startMs := aikeytime.FromTime(opts.StartTime)
 
 	var inTok, outTok, totalTok int64
 	inTok = int64(opts.InputTokens)
@@ -193,10 +200,10 @@ func BuildReportableEvent(opts ReportOpts) ReportableEvent {
 			return &v
 		}(),
 
-		EventTime:  now,
-		OccurredAt: now,
-		StartedAt:  &opts.StartTime,
-		FinishedAt: &now,
+		EventTime:  nowMs,
+		OccurredAt: nowMs,
+		StartedAt:  &startMs,
+		FinishedAt: &nowMs,
 
 		OrgID: orgID,
 		AccountID: func() string {

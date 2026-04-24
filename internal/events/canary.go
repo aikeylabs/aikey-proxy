@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/AiKeyLabs/aikey-proxy/internal/observability"
+	"github.com/AiKeyLabs/pkg/aikeytime"
 )
 
 // CanaryConfig configures the synthetic canary probe.
@@ -133,13 +134,14 @@ func (p *CanaryProbe) loop() {
 func (p *CanaryProbe) probe() {
 	eventID := fmt.Sprintf("canary-%d", time.Now().Unix())
 	sentAt := time.Now()
+	sentAtMs := aikeytime.FromTime(sentAt)
 
 	// Send canary event through the normal Reporter channel.
 	ev := ReportableEvent{
 		EventID:       eventID,
 		SchemaVersion: 1,
-		EventTime:     sentAt,
-		OccurredAt:    sentAt,
+		EventTime:     sentAtMs,
+		OccurredAt:    sentAtMs,
 		OrgID:         "__canary__",
 		VirtualKeyID:  "__canary__",
 		RequestCount:  1,

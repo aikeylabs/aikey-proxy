@@ -7,6 +7,8 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
+
+	"github.com/AiKeyLabs/pkg/aikeytime"
 )
 
 func TestReporter_ReportAndUpload(t *testing.T) {
@@ -40,8 +42,8 @@ func TestReporter_ReportAndUpload(t *testing.T) {
 		reporter.Report(ReportableEvent{
 			EventID:       "e" + string(rune('0'+i)),
 			OrgID:         "org1",
-			EventTime:     time.Now(),
-			OccurredAt:    time.Now(),
+			EventTime:     aikeytime.Now(),
+			OccurredAt:    aikeytime.Now(),
 			RequestStatus: "success",
 			RequestCount:  1,
 		})
@@ -82,8 +84,8 @@ func TestReporter_DropWhenQueueFull(t *testing.T) {
 		reporter.Report(ReportableEvent{
 			EventID:       "e" + string(rune('0'+i)),
 			OrgID:         "org1",
-			EventTime:     time.Now(),
-			OccurredAt:    time.Now(),
+			EventTime:     aikeytime.Now(),
+			OccurredAt:    aikeytime.Now(),
 			RequestStatus: "success",
 			RequestCount:  1,
 		})
@@ -109,8 +111,8 @@ func TestWALWriter_Append(t *testing.T) {
 	wal.Append(ReportableEvent{
 		EventID:       "e1",
 		OrgID:         "org1",
-		EventTime:     time.Now(),
-		OccurredAt:    time.Now(),
+		EventTime:     aikeytime.Now(),
+		OccurredAt:    aikeytime.Now(),
 		RequestStatus: "success",
 		RequestCount:  1,
 	})
@@ -118,8 +120,8 @@ func TestWALWriter_Append(t *testing.T) {
 	wal.Append(ReportableEvent{
 		EventID:       "e2",
 		OrgID:         "org1",
-		EventTime:     time.Now(),
-		OccurredAt:    time.Now(),
+		EventTime:     aikeytime.Now(),
+		OccurredAt:    aikeytime.Now(),
 		RequestStatus: "success",
 		RequestCount:  1,
 	})
