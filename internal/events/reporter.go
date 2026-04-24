@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/AiKeyLabs/aikey-proxy/internal/observability"
+	"github.com/AiKeyLabs/pkg/aikeytime"
 )
 
 // ReporterConfig configures the usage reporter.
@@ -194,21 +195,28 @@ func (r *Reporter) Metrics() ReporterMetrics {
 		QueueDepth:    int64(len(r.ch)),
 		WALAppendFail: r.walAppendFailed(),
 
-		// delivery state
+		// delivery state — internal fields remain time.Time (hot-path
+		// monotonic clock math is easier); converted to Millis at the
+		// Metrics boundary so the JSON exposes int64.
 		ConsecutiveFailures: r.consecutiveFailures,
-		LastUploadAt:        r.lastUploadAt,
+		LastUploadAt:        aikeytime.FromTime(r.lastUploadAt),
 		LastUploadStatus:    r.lastUploadStatus,
 		LastErrorCode:       r.lastErrorCode,
-		LastErrorAt:         r.lastErrorAt,
+		LastErrorAt:         aikeytime.FromTime(r.lastErrorAt),
 		TerminalFailCount:   r.terminalFailCount.Load(),
-		LastBusinessEventAt: r.lastBusinessEventAt,
-		LastCanaryEventAt:   r.lastCanaryEventAt,
+		LastBusinessEventAt: aikeytime.FromTime(r.lastBusinessEventAt),
+		LastCanaryEventAt:   aikeytime.FromTime(r.lastCanaryEventAt),
 	}
 	r.mu.RUnlock()
 	return m
 }
 
 // ReporterMetrics holds observable counters and delivery state.
+//
+// All *At fields are int64 Unix epoch milliseconds (UTC). The metrics
+// endpoint exposes them for monitoring — keeping them in the same
+// format as every other pipeline timestamp lets automation parse
+// once without a format-detection step (bugfix 20260424).
 type ReporterMetrics struct {
 	// counters
 	Generated     int64 `json:"usage_events_generated_total"`
@@ -220,14 +228,14 @@ type ReporterMetrics struct {
 	WALAppendFail int64 `json:"usage_wal_append_failed_total"`
 
 	// delivery state
-	ConsecutiveFailures int       `json:"consecutive_failures"`
-	LastUploadAt        time.Time `json:"last_upload_at,omitempty"`
-	LastUploadStatus    string    `json:"last_upload_status,omitempty"`
-	LastErrorCode       int       `json:"last_error_code,omitempty"`
-	LastErrorAt         time.Time `json:"last_error_at,omitempty"`
-	TerminalFailCount   int64     `json:"terminal_fail_count"`
-	LastBusinessEventAt time.Time `json:"latest_business_event_at,omitempty"`
-	LastCanaryEventAt   time.Time `json:"latest_canary_event_at,omitempty"`
+	ConsecutiveFailures int              `json:"consecutive_failures"`
+	LastUploadAt        aikeytime.Millis `json:"last_upload_at,omitempty"`
+	LastUploadStatus    string           `json:"last_upload_status,omitempty"`
+	LastErrorCode       int              `json:"last_error_code,omitempty"`
+	LastErrorAt         aikeytime.Millis `json:"last_error_at,omitempty"`
+	TerminalFailCount   int64            `json:"terminal_fail_count"`
+	LastBusinessEventAt aikeytime.Millis `json:"latest_business_event_at,omitempty"`
+	LastCanaryEventAt   aikeytime.Millis `json:"latest_canary_event_at,omitempty"`
 }
 
 func (r *Reporter) walAppendFailed() int64 {

@@ -34,15 +34,19 @@ type CanaryConfig struct {
 }
 
 // CanaryResult holds the outcome of the most recent canary probe.
+//
+// SentAt is int64 Unix epoch milliseconds (UTC) — consistent with
+// ReportableEvent.EventTime, so downstream diagnostics consumers
+// don't need a second format parser (bugfix 20260424).
 type CanaryResult struct {
-	EventID       string    `json:"event_id"`
-	SentAt        time.Time `json:"sent_at"`
-	ODSReceived   bool      `json:"ods_received"`
-	DWDProjected  bool      `json:"dwd_projected"`
-	QueryReadable bool      `json:"query_readable"`
-	Status        string    `json:"status"`       // "ok" | "partial" | "failed" | "unavailable"
-	FailedStage   string    `json:"failed_stage"` // "" | "ingest" | "projection" | "query" | "diagnostics_unreachable"
-	RoundTripMs   int64     `json:"round_trip_ms"`
+	EventID       string           `json:"event_id"`
+	SentAt        aikeytime.Millis `json:"sent_at"`
+	ODSReceived   bool             `json:"ods_received"`
+	DWDProjected  bool             `json:"dwd_projected"`
+	QueryReadable bool             `json:"query_readable"`
+	Status        string           `json:"status"`       // "ok" | "partial" | "failed" | "unavailable"
+	FailedStage   string           `json:"failed_stage"` // "" | "ingest" | "projection" | "query" | "diagnostics_unreachable"
+	RoundTripMs   int64            `json:"round_trip_ms"`
 }
 
 // CanaryProbe sends periodic synthetic events through the pipeline and verifies arrival.
@@ -196,7 +200,7 @@ func (p *CanaryProbe) probe() {
 func (p *CanaryProbe) checkArrival(eventID string, sentAt time.Time) CanaryResult {
 	result := CanaryResult{
 		EventID: eventID,
-		SentAt:  sentAt,
+		SentAt:  aikeytime.FromTime(sentAt),
 	}
 
 	url := fmt.Sprintf("%s/internal/canary-check?event_id=%s", p.cfg.DiagnosticsURL, eventID)

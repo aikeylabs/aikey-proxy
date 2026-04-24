@@ -8,8 +8,8 @@ import (
 	"os"
 	"path/filepath"
 	"sync"
-	"time"
 
+	"github.com/AiKeyLabs/pkg/aikeytime"
 	"github.com/AiKeyLabs/pkg/buildinfo"
 )
 
@@ -60,8 +60,11 @@ func readTruncated(r io.Reader, maxBytes int) string {
 
 // deadLetterEntry is a single record in dead_letter.jsonl.
 // Contains full diagnostic context for remote troubleshooting.
+//
+// DeadAt is int64 Unix epoch milliseconds (UTC) — consistent with the
+// rest of the usage pipeline's timestamp format (bugfix 20260424).
 type deadLetterEntry struct {
-	DeadAt       time.Time         `json:"dead_at"`
+	DeadAt       aikeytime.Millis  `json:"dead_at"`
 	Reason       string            `json:"reason"` // "terminal" or "exhausted"
 	ErrorCode    int               `json:"error_code"`
 	ErrorMsg     string            `json:"error_msg"`
@@ -127,7 +130,7 @@ func (r *Reporter) writeDeadLetter(batch []ReportableEvent, reason string, upErr
 	}
 
 	entry := deadLetterEntry{
-		DeadAt:        time.Now(),
+		DeadAt:        aikeytime.Now(),
 		Reason:        reason,
 		ErrorCode:     upErr.StatusCode,
 		ErrorMsg:      upErr.Error(),

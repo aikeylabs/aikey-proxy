@@ -140,11 +140,22 @@ func providerToProtocol(providerCode string) string {
 
 // providerDefaultBaseURL returns the default upstream base URL for a provider.
 // Accepts both canonical codes ("anthropic") and brand aliases ("claude").
+//
+// ⚠️  CROSS-LANGUAGE DRIFT RISK — MUST STAY IN SYNC WITH Rust registry.
+//
+// This table mirrors `aikey-cli/data/provider_registry.yaml`. Any new
+// provider added there MUST get a matching branch here (and in
+// providerCanonicalCode below). See the YAML's top-of-file comment for the
+// long-term codegen plan; until that lands, adding a provider is a
+// two-language change.
+//
+// Last synced (2026-04-24): added P0 (groq / xai / openrouter / perplexity)
+// + P1 (zhipu / qwen / doubao / siliconflow) alongside the original 6.
 func providerDefaultBaseURL(providerCode string) string {
 	switch strings.ToLower(providerCode) {
 	case "anthropic", "claude":
 		return "https://api.anthropic.com"
-	case "openai", "gpt", "chatgpt":
+	case "openai", "gpt", "chatgpt", "codex":
 		// Why: OpenAI SDK clients (including Codex) treat base_url as already
 		// containing /v1, sending paths like /responses or /chat/completions
 		// without the /v1 prefix. Without /v1 here, requests hit wrong endpoints.
@@ -161,6 +172,27 @@ func providerDefaultBaseURL(providerCode string) string {
 	case "deepseek":
 		// Why: same reason as openai — deepseek SDK expects /v1 in base_url.
 		return "https://api.deepseek.com/v1"
+
+	// ── P0 (2026-04-24) ── OpenAI-compatible Western providers ──
+	case "groq":
+		return "https://api.groq.com/openai/v1"
+	case "xai", "grok", "xai_grok":
+		return "https://api.x.ai/v1"
+	case "openrouter":
+		return "https://openrouter.ai/api/v1"
+	case "perplexity", "pplx":
+		return "https://api.perplexity.ai/v1"
+
+	// ── P1 (2026-04-24) ── China-market providers ──
+	case "zhipu", "glm", "zhipuai":
+		return "https://open.bigmodel.cn/api/paas/v4"
+	case "qwen", "dashscope", "tongyi":
+		return "https://dashscope.aliyuncs.com/compatible-mode/v1"
+	case "doubao", "ark", "volcengine":
+		return "https://ark.cn-beijing.volces.com/api/v3"
+	case "siliconflow":
+		return "https://api.siliconflow.cn/v1"
+
 	default:
 		return ""
 	}
@@ -168,14 +200,30 @@ func providerDefaultBaseURL(providerCode string) string {
 
 // providerCanonicalCode maps a brand alias back to the canonical provider code
 // used in vault queries (e.g. "claude" → "anthropic").
+//
+// ⚠️ Same cross-language drift warning as providerDefaultBaseURL — keep in
+// sync with Rust's `provider_registry::canonical()` / the YAML oauth_aliases.
 func providerCanonicalCode(providerCode string) string {
 	switch strings.ToLower(providerCode) {
 	case "claude":
 		return "anthropic"
-	case "gpt", "chatgpt":
+	case "gpt", "chatgpt", "codex":
 		return "openai"
 	case "gemini":
 		return "google"
+
+	// ── P0/P1 additions (2026-04-24) ──
+	case "grok", "xai_grok":
+		return "xai"
+	case "pplx":
+		return "perplexity"
+	case "glm", "zhipuai":
+		return "zhipu"
+	case "dashscope", "tongyi":
+		return "qwen"
+	case "ark", "volcengine":
+		return "doubao"
+
 	default:
 		return strings.ToLower(providerCode)
 	}

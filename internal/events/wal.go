@@ -9,14 +9,21 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+
+	"github.com/AiKeyLabs/pkg/aikeytime"
 )
 
 // WALEntry wraps a reportable event with WAL metadata.
+//
+// WrittenAt is int64 Unix epoch milliseconds (UTC) — same format as
+// every other timestamp in the usage pipeline, so consumers that
+// parse the WAL envelope (e.g. the CLI's usage_wal.rs) don't need a
+// second format path. See bugfix 20260424 chain-consistency round.
 type WALEntry struct {
-	WALSeq        int64           `json:"wal_seq"`
-	WrittenAt     time.Time       `json:"written_at"`
-	SchemaVersion int             `json:"schema_version"`
-	EventJSON     ReportableEvent `json:"event_json"`
+	WALSeq        int64            `json:"wal_seq"`
+	WrittenAt     aikeytime.Millis `json:"written_at"`
+	SchemaVersion int              `json:"schema_version"`
+	EventJSON     ReportableEvent  `json:"event_json"`
 }
 
 // WALWriter appends usage events to JSONL files, rotated hourly.
@@ -43,7 +50,7 @@ func NewWALWriter(dir string) (*WALWriter, error) {
 func (w *WALWriter) Append(ev ReportableEvent) {
 	entry := WALEntry{
 		WALSeq:        w.seq.Add(1),
-		WrittenAt:     time.Now(),
+		WrittenAt:     aikeytime.Now(),
 		SchemaVersion: 1,
 		EventJSON:     ev,
 	}
