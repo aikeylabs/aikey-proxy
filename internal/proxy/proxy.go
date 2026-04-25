@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"net/http/httputil"
 	"net/url"
+	"os"
 	"strings"
 	"sync/atomic"
 	"time"
@@ -750,6 +751,13 @@ func (p *Proxy) serveRoute(w http.ResponseWriter, r *http.Request, route *vkeys.
 	// 6. Detect streaming.
 	streaming := isStreamingRequest(r)
 
+	// 6b. Optional: stash raw request body for the 4xx debug-capture path
+	// (gated by AIKEY_PROXY_DEBUG_4XX_BODIES). No-op when flag is off, so
+	// hot path stays untouched. Must run AFTER extractModel — extractModel
+	// has already re-buffered r.Body once, our stash reads from the buffer
+	// and re-buffers again.
+	stashRequestBodyForDebug(r)
+
 	// 6a. Inject stream_options.include_usage=true for /chat/completions only.
 	// Why: OpenAI-compatible streaming responses only include token usage in the
 	// final SSE chunk when this option is set. Without it, all token counts are 0.
@@ -848,6 +856,35 @@ func (p *Proxy) serveRoute(w http.ResponseWriter, r *http.Request, route *vkeys.
 		},
 		ModifyResponse: func(resp *http.Response) error {
 			if resp.StatusCode >= 400 {
+				// Optional debug capture: when AIKEY_PROXY_DEBUG_4XX_BODIES
+				// is set, drain the upstream body, log it together with the
+				// stashed request body, and re-buffer so the client still
+				// gets the original payload. Truncated to debug4xxBodyCap
+				// to keep the jsonl line bounded.
+				//
+				// Why log only for 4xx (not 5xx): 5xx is usually upstream
+				// infrastructure (timeouts, gateway errors); the response
+				// body is rarely informative. 4xx is where provider-side
+				// validation rejects something specific in the request,
+				// which is exactly what this capture exists to inspect.
+				if debug4xxEnabled() && resp.StatusCode < 500 {
+					respBody, _ := io.ReadAll(resp.Body)
+					_ = resp.Body.Close()
+					resp.Body = io.NopCloser(bytes.NewReader(respBody))
+					resp.ContentLength = int64(len(respBody))
+					reqBody := debugRequestBodyFromContext(r.Context())
+					logger.Warn("upstream 4xx body capture",
+						"event.name", "proxy.request.4xx_body_capture",
+						"status_code", resp.StatusCode,
+						"upstream_request_id", extractUpstreamRequestID(resp),
+						"provider", route.ProviderCode,
+						"request_path", r.URL.Path,
+						"request_content_type", r.Header.Get("Content-Type"),
+						"response_content_type", resp.Header.Get("Content-Type"),
+						"request_body", truncateBodyForLog(reqBody),
+						"response_body", truncateBodyForLog(respBody),
+					)
+				}
 				// Error response: record immediately without token counts.
 				p.recordEvent(r, resp, startTime, route, bearerToken, streaming)
 				return nil
@@ -874,7 +911,8 @@ func (p *Proxy) serveRoute(w http.ResponseWriter, r *http.Request, route *vkeys.
 					// Non-streaming always terminates atomically — the response is
 					// either the full JSON or it's an error we surface elsewhere.
 					sessionID := resolveSessionID(r.Header, route.ProviderCode)
-					p.reportUsage(route, bearerToken, ev.Model, startTime, resp.StatusCode, breakdown, "", realKey, sessionID, "complete")
+					upstreamReqID := extractUpstreamRequestID(resp)
+					p.reportUsage(route, bearerToken, ev.Model, startTime, resp.StatusCode, breakdown, "", realKey, sessionID, "complete", upstreamReqID)
 				}
 			} else {
 				// Streaming success: wrap body — background goroutine drains the
@@ -885,10 +923,14 @@ func (p *Proxy) serveRoute(w http.ResponseWriter, r *http.Request, route *vkeys.
 				// callback time the request's header map may have been recycled.
 				probe := isAikeyProbe(r)
 				sessionID := resolveSessionID(r.Header, route.ProviderCode)
+				// Capture upstreamReqID NOW (response headers are stable from
+				// here onward; the streaming body keeps draining in a goroutine
+				// but headers are already finalised by upstream).
+				upstreamReqID := extractUpstreamRequestID(resp)
 				var cb reporterCallback
 				if p.reporter != nil && !probe {
 					cb = func(br provider.TokenBreakdown, completion string) {
-						p.reportUsage(route, bearerToken, baseEvent.Model, startTime, resp.StatusCode, br, "", realKey, sessionID, completion)
+						p.reportUsage(route, bearerToken, baseEvent.Model, startTime, resp.StatusCode, br, "", realKey, sessionID, completion, upstreamReqID)
 					}
 				}
 				// For probe traffic skip the collector entirely by passing nil.
@@ -969,7 +1011,88 @@ func (p *Proxy) recordEvent(req *http.Request, resp *http.Response, startTime ti
 	// Error responses are treated as interrupted — the client never got a
 	// usable result even though the request finished "fast" from our POV.
 	sessionID := resolveSessionID(req.Header, route.ProviderCode)
-	p.reportUsage(route, bearerToken, ev.Model, startTime, resp.StatusCode, provider.TokenBreakdown{}, ev.ErrorType, "", sessionID, "interrupted")
+	upstreamReqID := extractUpstreamRequestID(resp)
+	p.reportUsage(route, bearerToken, ev.Model, startTime, resp.StatusCode, provider.TokenBreakdown{}, ev.ErrorType, "", sessionID, "interrupted", upstreamReqID)
+}
+
+// debug4xxEnabled reports whether AIKEY_PROXY_DEBUG_4XX_BODIES is set to a
+// truthy value. Read on every request — getenv is cheap and lets operators
+// flip the flag at runtime via an EnvironmentFile reload (no proxy restart
+// required) when chasing a sporadic 4xx in production.
+//
+// Why opt-in (not always on): the request body for chat completions is
+// often a few KB of conversation history; logging it for every 4xx adds
+// disk pressure and surfaces user prompts into developer-facing logs. The
+// flag scopes that exposure to deliberate diagnostic windows.
+func debug4xxEnabled() bool {
+	v := os.Getenv("AIKEY_PROXY_DEBUG_4XX_BODIES")
+	return v == "1" || strings.EqualFold(v, "true") || strings.EqualFold(v, "yes")
+}
+
+// debug4xxBodyCap caps how many bytes of each side we log. 4 KB is enough
+// for typical provider error envelopes (anthropic Bad Request bodies are
+// usually <500 bytes; Claude Code request bodies that trigger them sit
+// around 1-3 KB). Larger payloads get a `...<truncated>` marker so the
+// reader knows there was more.
+const debug4xxBodyCap = 4 * 1024
+
+// stashRequestBodyForDebug reads r.Body fully, stores the bytes in request
+// context for ModifyResponse to retrieve later, and re-buffers r.Body for
+// the actual upstream call. No-op when the flag is off, the body is empty,
+// or the body exceeds extractBodyHardLimit.
+//
+// Why context (not a header): bodies can be megabytes of conversation; cramming
+// them into headers would break upstream forwarding (header size limits,
+// inadvertent leaks via mirrored response headers).
+func stashRequestBodyForDebug(r *http.Request) {
+	if !debug4xxEnabled() || r.Body == nil {
+		return
+	}
+	if r.ContentLength > extractBodyHardLimit {
+		return
+	}
+	body, err := io.ReadAll(r.Body)
+	if err != nil {
+		return
+	}
+	r.Body = io.NopCloser(bytes.NewReader(body))
+	r.ContentLength = int64(len(body))
+	*r = *r.WithContext(context.WithValue(r.Context(), ctxKeyDebugReqBody, body))
+}
+
+// debugRequestBodyFromContext fetches the stashed request body. Returns nil
+// when the flag was off or the request was too large to stash.
+func debugRequestBodyFromContext(ctx context.Context) []byte {
+	b, _ := ctx.Value(ctxKeyDebugReqBody).([]byte)
+	return b
+}
+
+// truncateBodyForLog renders body bytes as a string, capping at
+// debug4xxBodyCap and appending an explicit truncation marker so the reader
+// knows the captured snippet is incomplete.
+func truncateBodyForLog(b []byte) string {
+	if len(b) <= debug4xxBodyCap {
+		return string(b)
+	}
+	return string(b[:debug4xxBodyCap]) + "...<truncated>"
+}
+
+// extractUpstreamRequestID pulls the provider's own request id out of the
+// response headers. Anthropic uses `request-id` (their docs explicitly call
+// it out as the audit-log pivot), OpenAI / Codex / Azure-OpenAI use
+// `x-request-id` or the legacy `openai-request-id`, and most other gateways
+// follow one of those two conventions. Returns the first non-empty value;
+// callers treat empty as "upstream did not surface one".
+func extractUpstreamRequestID(resp *http.Response) string {
+	if resp == nil {
+		return ""
+	}
+	for _, h := range []string{"request-id", "x-request-id", "openai-request-id"} {
+		if v := resp.Header.Get(h); v != "" {
+			return v
+		}
+	}
+	return ""
 }
 
 // reportUsage builds a ReportableEvent and emits it to whichever sinks are
@@ -981,7 +1104,9 @@ func (p *Proxy) recordEvent(req *http.Request, resp *http.Response, startTime ti
 // completion is the transport-level outcome: "complete" | "partial" | "interrupted".
 // breakdown carries the optional cache split (zeroed for providers that don't
 // surface it, e.g. OpenAI/Kimi).
-func (p *Proxy) reportUsage(route *vkeys.ResolvedRoute, bearerToken, model string, startTime time.Time, statusCode int, breakdown provider.TokenBreakdown, errorType, realKey, sessionID, completion string) {
+// upstreamReqID is the provider-side request id (anthropic `req_xxx` / openai
+// `req_xxx`) extracted from response headers; empty when upstream omitted it.
+func (p *Proxy) reportUsage(route *vkeys.ResolvedRoute, bearerToken, model string, startTime time.Time, statusCode int, breakdown provider.TokenBreakdown, errorType, realKey, sessionID, completion, upstreamReqID string) {
 	if p.reporter == nil && p.wal == nil {
 		return
 	}
@@ -1008,6 +1133,7 @@ func (p *Proxy) reportUsage(route *vkeys.ResolvedRoute, bearerToken, model strin
 		LoggedInAccountID:  p.loggedInAccountID,
 		SessionID:          sessionID,
 		Completion:         completion,
+		UpstreamRequestID:  upstreamReqID,
 	})
 	if p.reporter != nil {
 		// Reporter writes WAL + enqueues upload; when wal is the shared

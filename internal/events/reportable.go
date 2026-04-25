@@ -18,6 +18,12 @@ type ReportableEvent struct {
 	TraceID         string    `json:"trace_id,omitempty"`
 	ProxyInstanceID string    `json:"proxy_instance_id,omitempty"`
 	DeviceID        string    `json:"device_id,omitempty"`
+	// UpstreamRequestID carries the provider's own request id (e.g. anthropic's
+	// `req_011CaQVp...` / openai's `req_xxx` / kimi's `cid-xxx`). Captured from
+	// response headers when present so support can correlate a 4xx/5xx in our
+	// ODS with the provider's audit log without us having to log full bodies.
+	// Always populated for both success + error paths when upstream sets it.
+	UpstreamRequestID string `json:"upstream_request_id,omitempty"`
 
 	// schema + source metadata
 	SchemaVersion      int    `json:"schema_version"`
@@ -136,6 +142,12 @@ type ReportOpts struct {
 	// Completion defaults to "complete" if left empty.
 	SessionID  string
 	Completion string
+
+	// UpstreamRequestID is the provider's own request id from response headers
+	// (anthropic: `request-id`, openai/kimi: `x-request-id` or
+	// `openai-request-id`). Carried through so support can pivot from a local
+	// ODS row to provider-side logs.
+	UpstreamRequestID string
 }
 
 // BuildReportableEvent creates a ReportableEvent from the proxy request context.
@@ -186,9 +198,10 @@ func BuildReportableEvent(opts ReportOpts) ReportableEvent {
 	}
 
 	ev := ReportableEvent{
-		EventID:         opts.EventID,
-		ProxyInstanceID: opts.ProxyInstanceID,
-		SchemaVersion:   1,
+		EventID:           opts.EventID,
+		UpstreamRequestID: opts.UpstreamRequestID,
+		ProxyInstanceID:   opts.ProxyInstanceID,
+		SchemaVersion:     1,
 		SourceVersion:      opts.SourceVersion,
 		ClientVersion:      opts.ClientVersion,
 		ProxyConfigVersion: opts.ProxyConfigVersion,

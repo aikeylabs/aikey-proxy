@@ -16,6 +16,11 @@ const (
 	ctxKeyRoute contextKey = iota
 	ctxKeyStartTime
 	ctxKeyIsStreaming
+	// ctxKeyDebugReqBody stores the raw request body bytes for the 4xx
+	// debug-capture path. Populated only when AIKEY_PROXY_DEBUG_4XX_BODIES
+	// is enabled (see proxy.go); absent on the hot path so we don't pay
+	// the read+stash cost for every successful request.
+	ctxKeyDebugReqBody
 )
 
 // routeFromContext retrieves the resolved route from request context.
