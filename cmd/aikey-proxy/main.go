@@ -110,6 +110,12 @@ func main() {
 		})
 	}
 
+	// Stable, debug-only sentinel used by E2E cond18 (config-split
+	// system+user §6 Phase 1 S2) to prove AIKEY_PROXY_LOG_LEVEL=debug
+	// actually reached the handler. slog drops Debug-level events when
+	// the handler is at Info, so the sentinel only appears under debug.
+	// Operators can also tail it as a "is my debug actually on" check.
+	slog.Debug("debug logging enabled")
 	slog.Info("config loaded",
 		"event.name", observability.EventProxyConfigLoaded,
 		"listen", cfg.Listen.Addr(),
