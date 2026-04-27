@@ -327,22 +327,8 @@ func (s *Supervisor) syncManagedKeys() {
 	// immediately. Merge is additive and cannot remove stale entries.
 	allRoutes := make(map[string]*vkeys.ResolvedRoute)
 
-	// 1. Static YAML keys (from config, always present)
-	// Why: must mirror registry.Load() fields exactly — AllowedModels was
-	// previously missing here, causing model restrictions to vanish after reload.
-	for _, k := range s.cfg.VirtualKeys {
-		if k.Token != "" {
-			allRoutes[k.Token] = &vkeys.ResolvedRoute{
-				VirtualKeyID:  k.ID,
-				Provider:      k.Provider,
-				BaseURL:       k.BaseURL,
-				KeyAlias:      k.KeyAlias,
-				AllowedModels: k.AllowedModels,
-				ProtocolType:  k.Provider,
-				RouteSource:   "personal_byok",
-			}
-		}
-	}
+	// Source 1 (static YAML virtual_keys[]) was removed in Stage C-2.c.
+	// All routes now come from vault — see workflow/CD/templates/removed-registry.yaml.
 
 	// 2. Team managed keys
 	managedKeys, err := gen.vault.GetActiveManagedKeys()
@@ -677,23 +663,14 @@ func (s *Supervisor) buildGeneration() (*generation, error) {
 		return nil, fmt.Errorf("open vault: %w", err)
 	}
 
-	// Build virtual key registry from static YAML config.
-	// Skip entries whose vault secret is missing (prevents proxy crash on misconfiguration).
-	var activeKeys []config.VirtualKeyConfig
-	for _, vk := range s.cfg.VirtualKeys {
-		if _, err := vaultReader.GetSecret(vk.KeyAlias); err != nil {
-			slog.Warn("virtual key skipped: API Key not found in vault — add it with 'aikey add'",
-				"vk_id", vk.ID, "key_alias", vk.KeyAlias)
-			continue
-		}
-		activeKeys = append(activeKeys, vk)
-	}
-	slog.Info("static virtual keys ready", "active", len(activeKeys), "total", len(s.cfg.VirtualKeys))
-
+	// Build virtual key registry. Stage C-2.c removed the static-yaml
+	// loading path (was: iterate s.cfg.VirtualKeys → registry.Load).
+	// All routes now flow in via Merge / ReplaceAll from vault-backed
+	// sources (managed_virtual_keys_cache, personal_route_token,
+	// oauth_route_token). See workflow/CD/templates/removed-registry.yaml.
 	registry := vkeys.NewRegistry()
-	registry.Load(activeKeys)
 
-	// Also load team-managed virtual keys from managed_virtual_keys_cache.
+	// Load team-managed virtual keys from managed_virtual_keys_cache.
 	// These are keys accepted via `aikey key accept` and activated via `aikey key use`.
 	// The bearer token clients use is: "aikey_vk_" + virtual_key_id.
 	if managedKeys, err := vaultReader.GetActiveManagedKeys(); err != nil {

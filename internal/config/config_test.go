@@ -7,6 +7,31 @@ import (
 	"testing"
 )
 
+// TC-B6: AIKEY_PROXY_LOG_LEVEL env override takes effect after defaults
+// have been applied, even without a user file. Stage C-3 of scheme §9
+// step 10 — log level归 system per scheme v8 SR8, but operators need a
+// way to bump verbosity without editing yaml.
+func TestApplyEnvOverrides_LogLevel(t *testing.T) {
+	t.Setenv("AIKEY_PROXY_LOG_LEVEL", "debug")
+	cfg := &Config{}
+	cfg.applyDefaults()
+	cfg.applyEnvOverrides()
+	if cfg.Log.Level != "debug" {
+		t.Errorf("AIKEY_PROXY_LOG_LEVEL not honored: got %q, want debug", cfg.Log.Level)
+	}
+}
+
+// Empty/unset env preserves the yaml/default value.
+func TestApplyEnvOverrides_LogLevelUnsetKeepsDefault(t *testing.T) {
+	t.Setenv("AIKEY_PROXY_LOG_LEVEL", "")
+	cfg := &Config{}
+	cfg.applyDefaults()
+	cfg.applyEnvOverrides()
+	if cfg.Log.Level != DefaultLogLevel {
+		t.Errorf("empty env should preserve default %q, got %q", DefaultLogLevel, cfg.Log.Level)
+	}
+}
+
 // Why: templates used to leave `wal_dir` commented which silently disabled
 // the v5 canonical event log. This regression test ensures that when a
 // rendered config omits `wal_dir`, the proxy still ends up with a sane

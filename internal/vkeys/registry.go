@@ -3,8 +3,6 @@ package vkeys
 import (
 	"log/slog"
 	"sync"
-
-	"github.com/AiKeyLabs/aikey-proxy/internal/config"
 )
 
 // Registry maps virtual key tokens to resolved routes.
@@ -21,30 +19,10 @@ func NewRegistry() *Registry {
 	}
 }
 
-// Load replaces the entire registry from config.
-// Used at startup and on config reload.
-func (r *Registry) Load(keys []config.VirtualKeyConfig) {
-	newMap := make(map[string]*ResolvedRoute, len(keys))
-	for _, k := range keys {
-		newMap[k.Token] = &ResolvedRoute{
-			VirtualKeyID:  k.ID,
-			Provider:      k.Provider,
-			BaseURL:       k.BaseURL,
-			KeyAlias:      k.KeyAlias,
-			AllowedModels: k.AllowedModels,
-			// For static YAML keys the provider field IS the protocol type
-			// (e.g. "anthropic", "openai"). Managed keys set this separately.
-			ProtocolType: k.Provider,
-			RouteSource:  "personal_byok",
-		}
-	}
-
-	r.mu.Lock()
-	r.byToken = newMap
-	r.mu.Unlock()
-
-	slog.Info("virtual key registry loaded", "count", len(newMap))
-}
+// Registry.Load (taking []config.VirtualKeyConfig) was removed in
+// Stage C-2.c along with VirtualKeyConfig itself — its only caller was
+// the supervisor's static-yaml loader, also removed. Routes now flow in
+// exclusively via Merge / ReplaceAll from vault-backed sources.
 
 // Merge adds pre-resolved routes to the registry without replacing existing ones.
 // Used to register team-managed virtual keys loaded from managed_virtual_keys_cache.

@@ -12,7 +12,6 @@ import (
 	"testing"
 	"time"
 
-	"github.com/AiKeyLabs/aikey-proxy/internal/config"
 	"github.com/AiKeyLabs/aikey-proxy/internal/events"
 	"github.com/AiKeyLabs/aikey-proxy/internal/provider"
 	"github.com/AiKeyLabs/aikey-proxy/internal/vault"
@@ -56,22 +55,28 @@ func setupTestProxyWithStore(t *testing.T, upstreamURL string, store events.Even
 		},
 	}
 
+	// Stage C-2.c: Registry.Load (taking []config.VirtualKeyConfig) was
+	// removed alongside VirtualKeyConfig itself. Tests now seed routes
+	// directly via Merge, matching the production path where vault is
+	// the only source of routes.
 	registry := vkeys.NewRegistry()
-	registry.Load([]config.VirtualKeyConfig{
-		{
-			ID:       "vk_openai",
-			Token:    "aikey_vk_openai_test",
-			Provider: "openai",
-			BaseURL:  upstreamURL,
-			KeyAlias: "openai:test",
+	registry.Merge(map[string]*vkeys.ResolvedRoute{
+		"aikey_vk_openai_test": {
+			VirtualKeyID: "vk_openai",
+			Provider:     "openai",
+			BaseURL:      upstreamURL,
+			KeyAlias:     "openai:test",
+			ProtocolType: "openai",
+			RouteSource:  "personal_byok", // historical label kept for test parity
 		},
-		{
-			ID:            "vk_anthropic",
-			Token:         "aikey_vk_anthropic_test",
+		"aikey_vk_anthropic_test": {
+			VirtualKeyID:  "vk_anthropic",
 			Provider:      "anthropic",
 			BaseURL:       upstreamURL,
 			KeyAlias:      "anthropic:test",
 			AllowedModels: []string{"claude-sonnet-4-5-20250929"},
+			ProtocolType:  "anthropic",
+			RouteSource:   "personal_byok",
 		},
 	})
 

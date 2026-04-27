@@ -114,7 +114,6 @@ func main() {
 		"event.name", observability.EventProxyConfigLoaded,
 		"listen", cfg.Listen.Addr(),
 		"vault", cfg.Vault.Path,
-		"virtual_keys", len(cfg.VirtualKeys),
 	)
 
 	// 3. Get master password.

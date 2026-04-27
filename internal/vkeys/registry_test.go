@@ -3,34 +3,33 @@ package vkeys
 import (
 	"sync"
 	"testing"
-
-	"github.com/AiKeyLabs/aikey-proxy/internal/config"
 )
 
-func TestRegistry_ResolveAndLoad(t *testing.T) {
-	reg := NewRegistry()
+// Helpers for tests after Stage C-2.c removed Registry.Load (which took
+// []config.VirtualKeyConfig). These tests now seed the registry via
+// Merge / ReplaceAll using ResolvedRoute directly — the same path
+// production code uses now that vault is the only route source.
 
-	keys := []config.VirtualKeyConfig{
-		{
-			ID:       "vk1",
-			Token:    "aikey_vk_abc",
-			Provider: "openai",
-			BaseURL:  "https://api.openai.com/v1",
-			KeyAlias: "openai:default",
-		},
-		{
-			ID:            "vk2",
-			Token:         "aikey_vk_def",
-			Provider:      "anthropic",
-			BaseURL:       "https://api.anthropic.com",
-			KeyAlias:      "anthropic:default",
-			AllowedModels: []string{"claude-sonnet-4-5-20250929"},
-		},
+// seedRoute builds a ResolvedRoute for tests. The bearer token is the
+// map key in the registry, not a struct field, so it isn't included here.
+func seedRoute(id, provider string) *ResolvedRoute {
+	return &ResolvedRoute{
+		VirtualKeyID: id,
+		Provider:     provider,
+		BaseURL:      "https://api." + provider + ".test/v1",
+		KeyAlias:     provider + ":default",
+		ProtocolType: provider,
+		RouteSource:  "managed", // any non-deprecated source works for these tests
 	}
+}
 
-	reg.Load(keys)
+func TestRegistry_ResolveAfterMerge(t *testing.T) {
+	reg := NewRegistry()
+	reg.Merge(map[string]*ResolvedRoute{
+		"aikey_vk_abc": seedRoute("vk1", "openai"),
+		"aikey_vk_def": withModels(seedRoute("vk2", "anthropic"), "claude-sonnet-4-5-20250929"),
+	})
 
-	// Resolve known token.
 	route := reg.Resolve("aikey_vk_abc")
 	if route == nil {
 		t.Fatal("expected route for aikey_vk_abc")
@@ -42,7 +41,6 @@ func TestRegistry_ResolveAndLoad(t *testing.T) {
 		t.Fatalf("expected vk1, got %s", route.VirtualKeyID)
 	}
 
-	// Resolve another known token.
 	route2 := reg.Resolve("aikey_vk_def")
 	if route2 == nil {
 		t.Fatal("expected route for aikey_vk_def")
@@ -51,45 +49,38 @@ func TestRegistry_ResolveAndLoad(t *testing.T) {
 		t.Fatalf("expected provider anthropic, got %s", route2.Provider)
 	}
 
-	// Unknown token returns nil.
 	if reg.Resolve("aikey_vk_unknown") != nil {
 		t.Fatal("expected nil for unknown token")
 	}
-
-	// Count.
 	if reg.Count() != 2 {
 		t.Fatalf("expected count 2, got %d", reg.Count())
 	}
 }
 
-func TestRegistry_Reload(t *testing.T) {
+func TestRegistry_ReplaceAllRotatesEntries(t *testing.T) {
 	reg := NewRegistry()
-
-	reg.Load([]config.VirtualKeyConfig{
-		{ID: "vk1", Token: "token_a", Provider: "openai", BaseURL: "http://x", KeyAlias: "a"},
+	reg.Merge(map[string]*ResolvedRoute{
+		"token_a": seedRoute("vk1", "openai"),
 	})
-
 	if reg.Resolve("token_a") == nil {
 		t.Fatal("expected route for token_a")
 	}
 
-	// Reload with different keys.
-	reg.Load([]config.VirtualKeyConfig{
-		{ID: "vk2", Token: "token_b", Provider: "anthropic", BaseURL: "http://y", KeyAlias: "b"},
+	reg.ReplaceAll(map[string]*ResolvedRoute{
+		"token_b": seedRoute("vk2", "anthropic"),
 	})
-
 	if reg.Resolve("token_a") != nil {
-		t.Fatal("old token should be gone after reload")
+		t.Fatal("old token should be gone after ReplaceAll")
 	}
 	if reg.Resolve("token_b") == nil {
-		t.Fatal("expected route for token_b after reload")
+		t.Fatal("expected route for token_b after ReplaceAll")
 	}
 }
 
 func TestRegistry_ConcurrentReads(t *testing.T) {
 	reg := NewRegistry()
-	reg.Load([]config.VirtualKeyConfig{
-		{ID: "vk1", Token: "aikey_vk_concurrent", Provider: "openai", BaseURL: "http://x", KeyAlias: "a"},
+	reg.Merge(map[string]*ResolvedRoute{
+		"aikey_vk_concurrent": seedRoute("vk1", "openai"),
 	})
 
 	var wg sync.WaitGroup
@@ -97,8 +88,7 @@ func TestRegistry_ConcurrentReads(t *testing.T) {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			route := reg.Resolve("aikey_vk_concurrent")
-			if route == nil {
+			if reg.Resolve("aikey_vk_concurrent") == nil {
 				t.Error("expected route")
 			}
 		}()
@@ -121,9 +111,13 @@ func TestResolvedRoute_IsModelAllowed(t *testing.T) {
 		t.Fatal("gpt-4o should not be allowed")
 	}
 
-	// Empty allowlist means all allowed.
 	routeAll := &ResolvedRoute{}
 	if !routeAll.IsModelAllowed("anything") {
 		t.Fatal("empty allowlist should allow all")
 	}
+}
+
+func withModels(r *ResolvedRoute, models ...string) *ResolvedRoute {
+	r.AllowedModels = models
+	return r
 }

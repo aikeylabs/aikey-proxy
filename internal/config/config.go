@@ -14,10 +14,15 @@ import (
 )
 
 // Config is the top-level aikey-proxy configuration.
+//
+// Stage C-2.c removed the VirtualKeys / VirtualKeyConfig field. Static
+// virtual_keys[] in yaml was the legacy "personal_byok" RouteSource —
+// fully superseded by vault-backed routes (managed_virtual_keys_cache,
+// personal_route_token, oauth_route_token). Removal record:
+// workflow/CD/templates/removed-registry.yaml entry "virtual_keys".
 type Config struct {
 	Listen        ListenConfig              `yaml:"listen"`
 	Vault         VaultConfig               `yaml:"vault"`
-	VirtualKeys   []VirtualKeyConfig        `yaml:"virtual_keys"`
 	Providers     map[string]ProviderConfig `yaml:"providers"`
 	Events        EventsConfig              `yaml:"events"`
 	Log           LogConfig                 `yaml:"log"`
@@ -35,15 +40,6 @@ func (l ListenConfig) Addr() string {
 
 type VaultConfig struct {
 	Path string `yaml:"path"`
-}
-
-type VirtualKeyConfig struct {
-	ID            string   `yaml:"id"`
-	Token         string   `yaml:"token"`
-	Provider      string   `yaml:"provider"`
-	BaseURL       string   `yaml:"base_url"`
-	KeyAlias      string   `yaml:"key_alias"`
-	AllowedModels []string `yaml:"allowed_models"`
 }
 
 type ProviderConfig struct {
@@ -117,6 +113,7 @@ func Load(path string) (*Config, error) {
 	}
 
 	cfg.applyDefaults()
+	cfg.applyEnvOverrides()
 
 	if err := cfg.validate(); err != nil {
 		return nil, fmt.Errorf("validate config: %w", err)
@@ -125,6 +122,17 @@ func Load(path string) (*Config, error) {
 	cfg.expandPaths()
 
 	return cfg, nil
+}
+
+// applyEnvOverrides honours selected env vars after yaml + defaults
+// have been applied. Currently only AIKEY_PROXY_LOG_LEVEL is supported
+// (Stage C-3 scheme §9 step 10) — log level is归 system per scheme v8
+// SR8, but ad-hoc debug needs a way to bump verbosity without editing
+// the yaml + restart cycle.
+func (c *Config) applyEnvOverrides() {
+	if v := os.Getenv("AIKEY_PROXY_LOG_LEVEL"); v != "" {
+		c.Log.Level = v
+	}
 }
 
 func (c *Config) applyDefaults() {
@@ -174,25 +182,9 @@ func (c *Config) validate() error {
 		return fmt.Errorf("listen.port must be 1-65535, got %d", c.Listen.Port)
 	}
 
-	tokens := make(map[string]bool)
-	for i, vk := range c.VirtualKeys {
-		if vk.Token == "" {
-			return fmt.Errorf("virtual_keys[%d].token is required", i)
-		}
-		if vk.Provider == "" {
-			return fmt.Errorf("virtual_keys[%d].provider is required", i)
-		}
-		if vk.BaseURL == "" {
-			return fmt.Errorf("virtual_keys[%d].base_url is required", i)
-		}
-		if vk.KeyAlias == "" {
-			return fmt.Errorf("virtual_keys[%d].key_alias is required", i)
-		}
-		if tokens[vk.Token] {
-			return fmt.Errorf("virtual_keys[%d].token is duplicate", i)
-		}
-		tokens[vk.Token] = true
-	}
+	// virtual_keys[] validation removed in Stage C-2.c. All routes now
+	// flow through vault (managed_virtual_keys_cache / personal_route_token /
+	// oauth_route_token); see workflow/CD/templates/removed-registry.yaml.
 
 	for name, p := range c.Providers {
 		switch p.Protocol {
