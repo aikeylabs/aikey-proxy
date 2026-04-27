@@ -46,6 +46,28 @@ aikey-proxy
 curl http://127.0.0.1:27200/health
 ```
 
+## 配置文件
+
+aikey-proxy 读取 `aikey-proxy.yaml`（系统态）+ 可选的 `aikey-user.yaml`（用户态）。两个文件位于同一配置目录：
+
+| 操作系统 | 默认目录 |
+|---|---|
+| Linux / macOS | `~/.aikey/config/` |
+| Windows | `%LOCALAPPDATA%\Aikey\config\` |
+
+`aikey-user.yaml` 仅在首次 trial 安装或 `local-install.sh --with-console` 时创建；纯 Personal（CLI + proxy 无控制台）不写 user 文件，因为 proxy section 当前无 user 字段。服务启动时会做 system + user 合并（同字段冲突 user 优先）。
+
+### 通过环境变量调整日志级别（无需改 yaml）
+
+```bash
+AIKEY_PROXY_LOG_LEVEL=debug ./bin/aikey-proxy --config aikey-proxy.yaml
+```
+
+env 优先于 system yaml 中的 `log.level`，适合一次性调试，不需要改文件 + 重装流程。
+
+完整方案（system/user 拆分、migrate-config-split 升级、removed-registry、deprecation 规则）：
+`roadmap20260320/技术实现/开源版本方案/config-split-system-user.md`
+
 ## 许可证
 
 Apache-2.0

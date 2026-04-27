@@ -162,6 +162,36 @@ curl -X POST http://127.0.0.1:27200/v1/messages \
   -d '{"model":"claude-sonnet-4-5-20250929","max_tokens":1024,"messages":[{"role":"user","content":"Hello"}]}'
 ```
 
+## Configuration files
+
+aikey-proxy reads `aikey-proxy.yaml` (system) plus optionally an
+`aikey-user.yaml` (user-owned) from the same directory:
+
+| OS | Default config dir |
+|---|---|
+| Linux / macOS | `~/.aikey/config/` |
+| Windows | `%LOCALAPPDATA%\Aikey\config\` |
+
+`aikey-user.yaml` is created on first trial install or when running
+`local-install.sh --with-console`. Personal-only installs (CLI + proxy
+without console) don't write a user file — proxy section currently has
+no user-owned fields. Service loads run a system + user merge in memory
+(user values win on field collision).
+
+### Adjusting log level without editing yaml
+
+```bash
+AIKEY_PROXY_LOG_LEVEL=debug ./bin/aikey-proxy --config aikey-proxy.yaml
+```
+
+The env var takes precedence over `log.level` in the system yaml. Useful
+for one-off debugging without touching files or restarting the install
+flow.
+
+Full design (system / user split, migrate-config-split upgrade flow,
+removed-registry, deprecation rules):
+`roadmap20260320/技术实现/开源版本方案/config-split-system-user.md`.
+
 ## Outbound Proxy (VPN / Clash / proxychains)
 
 aikey-proxy supports routing outbound AI provider requests through a local proxy.
