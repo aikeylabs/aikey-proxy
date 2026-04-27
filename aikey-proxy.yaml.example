@@ -8,37 +8,11 @@ listen:
 vault:
   path: "~/.aikey/data/vault.db"
 
-# Virtual keys: map each virtual key token to a provider + vault entry.
-# Clients use virtual keys instead of real provider keys.
-virtual_keys:
-  - id: "vk_dev_openai"
-    token: "aikey_vk_openai_dev_001"
-    provider: "openai"
-    base_url: "https://api.openai.com/v1"
-    key_alias: "openai:default"
-    allowed_models:
-      - "gpt-4o-mini"
-      - "gpt-4.1-mini"
-      - "gpt-4.1"
-
-  - id: "vk_dev_anthropic"
-    token: "aikey_vk_anthropic_dev_001"
-    provider: "anthropic"
-    base_url: "https://api.anthropic.com"
-    key_alias: "anthropic:default"
-    allowed_models:
-      - "claude-sonnet-4-5-20250929"
-      - "claude-haiku-4-5-20251001"
-
-  - id: "vk_dev_kimi"
-    token: "aikey_vk_kimi_dev_001"
-    provider: "kimi"
-    base_url: "https://api.moonshot.cn/v1"
-    key_alias: "kimi:default"
-    allowed_models:
-      - "moonshot-v1-8k"
-      - "moonshot-v1-32k"
-      - "moonshot-v1-128k"
+# Virtual keys are delivered via vault (managed_virtual_keys_cache or
+# personal_route_token columns). Add keys with `aikey add <alias>
+# --provider <name>`, then `aikey list` / `aikey route` for the bearer
+# token. Static virtual_keys[] declarations were removed; see
+# workflow/CD/templates/removed-registry.yaml for the removal record.
 
 # Provider protocol configuration.
 providers:

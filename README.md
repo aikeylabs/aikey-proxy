@@ -113,7 +113,8 @@ make build
 
 # Prepare config (see aikey-proxy.yaml.example)
 cp aikey-proxy.yaml.example aikey-proxy.yaml
-# Edit virtual_keys mappings
+# Adjust listen / vault / events sections as needed; virtual keys come
+# from vault (see "Get a virtual-key bearer token" below).
 
 # Start (requires master password)
 export AIKEY_MASTER_PASSWORD="your-password"
@@ -126,18 +127,36 @@ export AIKEY_MASTER_PASSWORD="your-password"
 curl http://127.0.0.1:27200/health
 ```
 
+## Get a virtual-key bearer token
+
+Virtual keys are issued by `aikey-cli` and stored in the vault. The proxy
+loads them at startup (managed-keys cache + personal route tokens).
+
+```bash
+# Add a personal API key (alias is positional, provider is the flag)
+aikey add openai:default --provider openai
+
+# List all keys; the route_token column is the bearer to use in requests
+aikey list
+
+# Print proxy-friendly client config (URL + bearer)
+aikey route openai:default
+```
+
 ## Usage Examples
+
+Replace `<route_token>` with the value from `aikey list` / `aikey route`.
 
 ```bash
 # OpenAI compatible
 curl -X POST http://127.0.0.1:27200/v1/chat/completions \
-  -H "Authorization: Bearer aikey_vk_openai_dev_001" \
+  -H "Authorization: Bearer <route_token>" \
   -H "Content-Type: application/json" \
   -d '{"model":"gpt-4o-mini","messages":[{"role":"user","content":"Hello"}]}'
 
 # Anthropic compatible
 curl -X POST http://127.0.0.1:27200/v1/messages \
-  -H "x-api-key: aikey_vk_anthropic_dev_001" \
+  -H "x-api-key: <route_token>" \
   -H "Content-Type: application/json" \
   -H "anthropic-version: 2023-06-01" \
   -d '{"model":"claude-sonnet-4-5-20250929","max_tokens":1024,"messages":[{"role":"user","content":"Hello"}]}'
