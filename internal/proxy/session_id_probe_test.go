@@ -61,7 +61,7 @@ func TestSessionIDHeaderPropagatedToWAL(t *testing.T) {
 	const probeSession = "probe-sess-f47ac10b-58cc-4372-a567-0e02b2c3d479"
 	body := `{"model":"gpt-4o-mini","messages":[{"role":"user","content":"hi"}]}`
 	req := httptest.NewRequest("POST", "/v1/chat/completions", strings.NewReader(body))
-	req.Header.Set("Authorization", "Bearer aikey_vk_openai_test")
+	req.Header.Set("Authorization", "Bearer aikey_team_openai_test")
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("X-Claude-Code-Session-Id", probeSession)
 
@@ -125,7 +125,7 @@ func TestSessionIDEmptyWhenHeaderAbsent(t *testing.T) {
 
 	body := `{"model":"gpt-4o-mini","messages":[{"role":"user","content":"hi"}]}`
 	req := httptest.NewRequest("POST", "/v1/chat/completions", strings.NewReader(body))
-	req.Header.Set("Authorization", "Bearer aikey_vk_openai_test")
+	req.Header.Set("Authorization", "Bearer aikey_team_openai_test")
 	req.Header.Set("Content-Type", "application/json")
 	// Deliberately NOT setting X-Claude-Code-Session-Id.
 

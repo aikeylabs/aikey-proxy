@@ -65,7 +65,7 @@ func TestDeriveKeyLabel_Personal_UsesAlias(t *testing.T) {
 func TestDeriveKeyLabel_PersonalBYOK_UsesAlias(t *testing.T) {
 	r := &vkeys.ResolvedRoute{
 		RouteSource:  "personal_byok",
-		VirtualKeyID: "aikey_vk_xxx",
+		VirtualKeyID: "aikey_team_xxx",
 		KeyAlias:     "anthropic-dev",
 	}
 	if got := deriveKeyLabel(r); got != "anthropic-dev" {
@@ -117,13 +117,13 @@ func TestDeriveKeyLabel_ShortVK_NoTruncation(t *testing.T) {
 }
 
 // Regression guard for third-party review finding #3: path-prefix-routed
-// (non-aikey_vk_) personal requests through handlePathPrefixRoute must carry
+// (non-aikey_-namespace) personal requests through handlePathPrefixRoute must carry
 // KeyAlias into the ResolvedRoute. Before the fix, tokenRoute was constructed
 // WITHOUT KeyAlias — dropping the user-facing label and silently falling back
 // to a truncated VirtualKeyID like "personal:my-…" instead of "my-kimi-key".
 //
 // This test mirrors the exact literal produced by the two fixed construction
-// sites (proxy.go path-prefix, both aikey_vk_ and legacy-active-key branches).
+// sites (proxy.go path-prefix, both aikey_team_/aikey_personal_ and legacy-active-key branches).
 // A future refactor that drops KeyAlias from either literal will fail here
 // even though the deriveKeyLabel unit tests continue passing.
 func TestDeriveKeyLabel_PathPrefix_PersonalKey_CarriesAlias(t *testing.T) {
@@ -144,9 +144,9 @@ func TestDeriveKeyLabel_PathPrefix_PersonalKey_CarriesAlias(t *testing.T) {
 	}
 }
 
-// And the aikey_vk_ variant of finding #3 — non-OAuth route-token path.
+// And the aikey-namespace variant of finding #3 — non-OAuth route-token path.
 func TestDeriveKeyLabel_PathPrefix_TokenRoute_CarriesAlias(t *testing.T) {
-	// Literal shape: tokenRoute produced by the aikey_vk_ branch of
+	// Literal shape: tokenRoute produced by the namespace-authority dispatch branch of
 	// handlePathPrefixRoute after the fix. OAuth uses "__oauth__" sentinel
 	// which deriveKeyLabel explicitly ignores — we test the non-OAuth case.
 	r := &vkeys.ResolvedRoute{

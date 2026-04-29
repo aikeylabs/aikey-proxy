@@ -26,13 +26,13 @@ func seedRoute(id, provider string) *ResolvedRoute {
 func TestRegistry_ResolveAfterMerge(t *testing.T) {
 	reg := NewRegistry()
 	reg.Merge(map[string]*ResolvedRoute{
-		"aikey_vk_abc": seedRoute("vk1", "openai"),
-		"aikey_vk_def": withModels(seedRoute("vk2", "anthropic"), "claude-sonnet-4-5-20250929"),
+		"aikey_team_abc": seedRoute("vk1", "openai"),
+		"aikey_team_def": withModels(seedRoute("vk2", "anthropic"), "claude-sonnet-4-5-20250929"),
 	})
 
-	route := reg.Resolve("aikey_vk_abc")
+	route := reg.Resolve("aikey_team_abc")
 	if route == nil {
-		t.Fatal("expected route for aikey_vk_abc")
+		t.Fatal("expected route for aikey_team_abc")
 	}
 	if route.Provider != "openai" {
 		t.Fatalf("expected provider openai, got %s", route.Provider)
@@ -41,15 +41,15 @@ func TestRegistry_ResolveAfterMerge(t *testing.T) {
 		t.Fatalf("expected vk1, got %s", route.VirtualKeyID)
 	}
 
-	route2 := reg.Resolve("aikey_vk_def")
+	route2 := reg.Resolve("aikey_team_def")
 	if route2 == nil {
-		t.Fatal("expected route for aikey_vk_def")
+		t.Fatal("expected route for aikey_team_def")
 	}
 	if route2.Provider != "anthropic" {
 		t.Fatalf("expected provider anthropic, got %s", route2.Provider)
 	}
 
-	if reg.Resolve("aikey_vk_unknown") != nil {
+	if reg.Resolve("aikey_team_unknown") != nil {
 		t.Fatal("expected nil for unknown token")
 	}
 	if reg.Count() != 2 {
@@ -80,7 +80,7 @@ func TestRegistry_ReplaceAllRotatesEntries(t *testing.T) {
 func TestRegistry_ConcurrentReads(t *testing.T) {
 	reg := NewRegistry()
 	reg.Merge(map[string]*ResolvedRoute{
-		"aikey_vk_concurrent": seedRoute("vk1", "openai"),
+		"aikey_team_concurrent": seedRoute("vk1", "openai"),
 	})
 
 	var wg sync.WaitGroup
@@ -88,7 +88,7 @@ func TestRegistry_ConcurrentReads(t *testing.T) {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			if reg.Resolve("aikey_vk_concurrent") == nil {
+			if reg.Resolve("aikey_team_concurrent") == nil {
 				t.Error("expected route")
 			}
 		}()

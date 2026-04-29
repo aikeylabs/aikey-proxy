@@ -114,7 +114,7 @@ type ReportOpts struct {
 	EventID         string
 	ProxyInstanceID string
 	Route           *vkeys.ResolvedRoute
-	BearerToken     string // the full "aikey_vk_..." token from the request
+	BearerToken     string // the full aikey-namespace bearer token from the request (aikey_team_* / aikey_personal_* etc.)
 	Model           string
 	StartTime       time.Time
 	FinishedAt      time.Time

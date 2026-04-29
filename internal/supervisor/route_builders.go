@@ -1,6 +1,9 @@
 package supervisor
 
 import (
+	"errors"
+	"log/slog"
+
 	"github.com/AiKeyLabs/aikey-proxy/internal/vault"
 	"github.com/AiKeyLabs/aikey-proxy/internal/vkeys"
 )
@@ -79,5 +82,112 @@ func oauthTokenToRoute(ot vault.OAuthRouteToken) *vkeys.ResolvedRoute {
 		AccountID:     ot.AccountID,
 		OAuthIdentity: ot.Identity,
 		RouteSource:   "oauth",
+	}
+}
+
+// ── Filtered route-set builders (single source of truth for both startup
+//    `buildGeneration` and reload `syncManagedKeys` paths) ─────────────────
+//
+// Why these wrappers exist (third-party review #5 [中], 2026-04-29):
+// Initial-load and sync paths previously had different filter logic — sync
+// rejected non-strict `aikey_personal_<64-hex>` route tokens with a WARN,
+// but `buildGeneration` blindly registered whatever the loader returned.
+// The vault-layer filter (review #4 [低]) catches most cases, but the two
+// supervisor paths LOOKED different at the source level — exactly the
+// drift this file's header docstring warns against. Centralizing here
+// makes "skip non-strict + WARN with hint" a compile-time-shared shape;
+// any future contributor adding a third call site gets the same behavior
+// for free.
+
+// buildPersonalRoutesFiltered converts personal-key route-token records
+// into a `route → ResolvedRoute` map, skipping (with WARN) any record
+// whose `RouteToken` is not a strict `aikey_personal_<64-lowercase-hex>`.
+// Used by both startup and sync paths.
+func buildPersonalRoutesFiltered(tokens []vault.PersonalRouteToken) map[string]*vkeys.ResolvedRoute {
+	out := make(map[string]*vkeys.ResolvedRoute, len(tokens))
+	for _, pt := range tokens {
+		if !isStrictPersonalRouteToken(pt.RouteToken) {
+			slog.Warn("registry load: skipping legacy/malformed personal route token; run `aikey db upgrade` to migrate",
+				"alias", pt.Alias,
+				"token_prefix", tokenPrefixForLog(pt.RouteToken))
+			continue
+		}
+		out[pt.RouteToken] = personalTokenToRoute(pt)
+	}
+	return out
+}
+
+// buildOAuthRoutesFiltered is the OAuth-table counterpart to
+// buildPersonalRoutesFiltered. Same form filter (post-2026-04-29 personal
+// /OAuth bearer is `aikey_personal_<64-lowercase-hex>` regardless of
+// credential source).
+func buildOAuthRoutesFiltered(tokens []vault.OAuthRouteToken) map[string]*vkeys.ResolvedRoute {
+	out := make(map[string]*vkeys.ResolvedRoute, len(tokens))
+	for _, ot := range tokens {
+		if !isStrictPersonalRouteToken(ot.RouteToken) {
+			slog.Warn("registry load: skipping legacy/malformed oauth route token; run `aikey db upgrade` to migrate",
+				"account_id", ot.AccountID,
+				"token_prefix", tokenPrefixForLog(ot.RouteToken))
+			continue
+		}
+		out[ot.RouteToken] = oauthTokenToRoute(ot)
+	}
+	return out
+}
+
+// vaultRouteTokenReader is the minimal vault-reader surface that
+// loadVaultRoutesIntoRegistry depends on. Defined as an interface so
+// tests can inject a fake without spinning up a real vault file —
+// `*vault.Reader` satisfies this naturally.
+type vaultRouteTokenReader interface {
+	GetAllPersonalRouteTokens() ([]vault.PersonalRouteToken, error)
+	GetAllOAuthRouteTokens() ([]vault.OAuthRouteToken, error)
+}
+
+// loadVaultRoutesIntoRegistry merges all strict-form personal + OAuth
+// route tokens from a vault into the given registry. Non-strict / legacy
+// (`aikey_vk_*` and similar) shapes are WARN-skipped via the shared
+// build*RoutesFiltered helpers — same eligibility rule as the reload
+// (syncManagedKeys) path.
+//
+// Why this exists as its own function (third-party review #5 [中],
+// 2026-04-29 — second pass): factoring the startup load step out of
+// `buildGeneration` makes the filter wiring directly testable. Reviewers
+// can read this 20-line function instead of scanning a 200-line
+// `buildGeneration` to confirm "yes, the startup path filters legacy".
+//
+// Returns silently on nil registry / nil reader (defensive — exercised
+// only in tests). `ErrMissingRouteTokenColumn` is logged with the
+// established hint text (CLI hasn't migrated the vault yet) so operators
+// see a clear escalation path rather than an opaque silent skip.
+func loadVaultRoutesIntoRegistry(reg *vkeys.Registry, vaultReader vaultRouteTokenReader) {
+	if reg == nil || vaultReader == nil {
+		return
+	}
+
+	// Personal-key bearers (entries.route_token).
+	personalTokens, perr := vaultReader.GetAllPersonalRouteTokens()
+	switch {
+	case errors.Is(perr, vault.ErrMissingRouteTokenColumn):
+		slog.Warn("vault missing route_token column, personal key routing disabled. Run any aikey CLI command to migrate.")
+	case perr != nil:
+		slog.Warn("could not load personal route tokens", "error", perr)
+	case len(personalTokens) > 0:
+		if routes := buildPersonalRoutesFiltered(personalTokens); len(routes) > 0 {
+			reg.Merge(routes)
+		}
+	}
+
+	// OAuth bearers (provider_accounts.route_token). Same shared filter.
+	oauthTokens, oerr := vaultReader.GetAllOAuthRouteTokens()
+	switch {
+	case errors.Is(oerr, vault.ErrMissingRouteTokenColumn):
+		slog.Warn("vault missing route_token column, oauth routing disabled. Run any aikey CLI command to migrate.")
+	case oerr != nil:
+		slog.Warn("could not load oauth route tokens", "error", oerr)
+	case len(oauthTokens) > 0:
+		if routes := buildOAuthRoutesFiltered(oauthTokens); len(routes) > 0 {
+			reg.Merge(routes)
+		}
 	}
 }

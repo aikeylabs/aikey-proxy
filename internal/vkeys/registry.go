@@ -47,6 +47,14 @@ func (r *Registry) ReplaceAll(routes map[string]*ResolvedRoute) {
 }
 
 // Resolve looks up a virtual key token and returns the route, or nil.
+//
+// Contract: this is a hashmap exact-key lookup, NOT prefix / substring
+// matching. Callers must pass the full token string. The exact-match guarantee
+// is critical for the 2026-04-29 namespace-authority dispatch — token form
+// validation lives in dispatch.ClassifyToken; this function only resolves
+// the legitimate, fully-validated token. Future maintainers: do NOT change
+// to prefix lookup or fuzzy match — that would let `aikey_personal_<63-hex>`
+// or other malformed tokens silently match a valid key by accident.
 func (r *Registry) Resolve(token string) *ResolvedRoute {
 	r.mu.RLock()
 	defer r.mu.RUnlock()

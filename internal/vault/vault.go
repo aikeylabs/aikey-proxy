@@ -625,6 +625,18 @@ func hasColumn(db *sql.DB, table, column string) bool {
 // GetAllPersonalRouteTokens returns all personal key entries that have a
 // non-NULL route_token.  Returns ErrMissingRouteTokenColumn if the column
 // does not exist (old vault not yet migrated by CLI).
+//
+// Form filter (third-party review #4 [低], 2026-04-29): rows whose route_token
+// is NOT a strict `aikey_personal_<64-lowercase-hex>` are skipped with a
+// warn log. Why: post-migration the registry must only contain new-form
+// bearers; pre-migration vaults that haven't run the CLI's v1.0.5-alpha
+// upgrade yet may still hold `aikey_vk_*` or other legacy strings. Without
+// this filter those would land in the registry, where ClassifyToken would
+// later reject them at request time — but that means the user sees
+// inscrutable 401s instead of a clean startup warning. Filtering at load
+// surfaces the issue early and keeps the registry's invariant intact:
+// "after proxy startup the registry only sees aikey_team_* and
+// aikey_personal_<64-hex>" (主方案 §validation).
 func (r *Reader) GetAllPersonalRouteTokens() ([]PersonalRouteToken, error) {
 	if !hasColumn(r.db, "entries", "route_token") {
 		return nil, ErrMissingRouteTokenColumn
@@ -644,6 +656,13 @@ func (r *Reader) GetAllPersonalRouteTokens() ([]PersonalRouteToken, error) {
 		var code, url *string
 		if err := rows.Scan(&t.Alias, &t.RouteToken, &code, &url); err != nil {
 			slog.Warn("skip personal route token row", "error", err)
+			continue
+		}
+		if !isStrictPersonalBearerForm(t.RouteToken) {
+			slog.Warn("skip personal route token: non-strict form (likely legacy aikey_vk_* or pre-migration residue)",
+				"alias", t.Alias,
+				"route_token_prefix", routeTokenPrefixForLog(t.RouteToken),
+				"hint", "run `aikey db upgrade` to migrate vault.db to v1.0.5-alpha")
 			continue
 		}
 		if code != nil {
@@ -684,6 +703,15 @@ func (r *Reader) GetAllOAuthRouteTokens() ([]OAuthRouteToken, error) {
 		var identity *string
 		if err := rows.Scan(&t.AccountID, &t.RouteToken, &t.Provider, &identity); err != nil {
 			slog.Warn("skip oauth route token row", "error", err)
+			continue
+		}
+		if !isStrictPersonalBearerForm(t.RouteToken) {
+			// Same form filter as GetAllPersonalRouteTokens — see that
+			// function's docstring for rationale (third-party review #4 [低]).
+			slog.Warn("skip oauth route token: non-strict form (likely legacy aikey_vk_* or pre-migration residue)",
+				"account_id", t.AccountID,
+				"route_token_prefix", routeTokenPrefixForLog(t.RouteToken),
+				"hint", "run `aikey db upgrade` to migrate vault.db to v1.0.5-alpha")
 			continue
 		}
 		if identity != nil {

@@ -57,16 +57,30 @@ func isAikeyProbe(r *http.Request) bool {
 	return r != nil && r.Header.Get(headerAikeyProbe) == "1"
 }
 
-// extractVirtualKey extracts the virtual key token from the request.
-// It looks for tokens with the "aikey_vk_" prefix in:
-// 1. Authorization: Bearer <token>
-// 2. x-api-key: <token>
+// extractVirtualKey extracts a token from the request that belongs to the
+// `aikey_*` namespace. Returns "" if the header is missing or the token is
+// not in the aikey namespace (native tokens like sk-... handled separately).
+//
+// IMPORTANT (2026-04-29 prefix rename): this extractor is purely a
+// "is this an aikey-namespace token at all?" filter — it does NOT validate
+// whether the suffix matches a known prefix subform. All form/legitimacy
+// checks live in dispatch (proxy.go) per the namespace-authority principle:
+// any token starting with `aikey_` is authoritatively decided here, including
+// returning TOKEN_INVALID for unknown / malformed forms. If middleware
+// pre-filtered to a narrow whitelist (e.g. only aikey_team_ + aikey_personal_)
+// then unknown shapes like `aikey_route_*` would slip back to the
+// native-token / missing-token path and silently work — exactly the pitfall
+// the namespace-authority design forbids.
+//
+// Headers checked (in order):
+//   1. Authorization: Bearer <token>
+//   2. x-api-key: <token>
 func extractVirtualKey(req *http.Request) string {
 	// Check Authorization: Bearer <token> (OpenAI-style)
 	if auth := req.Header.Get("Authorization"); auth != "" {
 		if token, ok := strings.CutPrefix(auth, "Bearer "); ok {
 			token = strings.TrimSpace(token)
-			if strings.HasPrefix(token, "aikey_vk_") {
+			if strings.HasPrefix(token, "aikey_") {
 				return token
 			}
 		}
@@ -75,7 +89,7 @@ func extractVirtualKey(req *http.Request) string {
 	// Check x-api-key header (Anthropic-style)
 	if apiKey := req.Header.Get("x-api-key"); apiKey != "" {
 		apiKey = strings.TrimSpace(apiKey)
-		if strings.HasPrefix(apiKey, "aikey_vk_") {
+		if strings.HasPrefix(apiKey, "aikey_") {
 			return apiKey
 		}
 	}
@@ -86,9 +100,9 @@ func extractVirtualKey(req *http.Request) string {
 // extractRawAuthValue extracts the raw API key/token value from request headers,
 // regardless of prefix.  Returns "" if no auth header is present.
 // Used by path-prefix routing for two-phase auth handling:
-//   1. aikey_vk_ prefix → route token Registry resolve
+//   1. Any aikey_* prefix → namespace-authority dispatch (see ClassifyToken)
 //   2. Anything else (incl. native provider tokens from CLI tools) → fallback to default binding
-// Why non-aikey_vk_ is NOT rejected: CLI tools (claude, cursor, openai) send their own
+// Why non-aikey_-namespace tokens are NOT rejected: CLI tools (claude, cursor, openai) send their own
 // auth headers through the proxy; the binding logic replaces them with the real key.
 func extractRawAuthValue(req *http.Request) string {
 	// Check x-api-key first (Anthropic-style, most common for path-prefix)

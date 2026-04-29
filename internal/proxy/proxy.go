@@ -188,11 +188,47 @@ func (p *Proxy) Handle(w http.ResponseWriter, r *http.Request) {
 			"error.code", observability.ErrCodeTokenMissing,
 		)
 		writeJSONError(w, http.StatusUnauthorized, "authentication_error", "TOKEN_MISSING",
-			"Missing virtual key. Expected token with 'aikey_vk_' prefix in Authorization or x-api-key header.")
+			"Missing virtual key. Expected token with 'aikey_team_' or 'aikey_personal_' prefix in Authorization or x-api-key header.")
 		return
 	}
 
-	// 2. Resolve virtual key → route.
+	// 2. Namespace-authority gate (2026-04-29). Legacy /v1/... entry has no
+	// path prefix, so only Tier1 (registry-bound) tokens make sense here.
+	// Tier2 probe / Tier3 active sentinel both need a path-derived canonical
+	// provider — explicitly reject with a hint to use path-prefix routing.
+	// TokenInvalid (malformed / reserved aikey_route_* / unknown) hard-fails.
+	// Closes legacy-entry namespace bypass: see review #1, 2026-04-29.
+	switch ClassifyToken(token) {
+	case Tier1Team, Tier1Personal:
+		// fall through to registry resolve
+	case Tier2Probe:
+		p.errors.Add(1)
+		writeJSONError(w, http.StatusUnauthorized, "authentication_error", "TOKEN_INVALID",
+			"Probe sentinel requires path-prefix routing (use /<provider>/v1/... URL).")
+		return
+	case Tier3ActiveSentinel:
+		p.errors.Add(1)
+		writeJSONError(w, http.StatusUnauthorized, "authentication_error", "TOKEN_INVALID",
+			"Active sentinel requires path-prefix routing (use /<provider>/v1/... URL). "+
+				"This entry is for static team/personal tokens only.")
+		return
+	case TokenInvalid:
+		p.errors.Add(1)
+		logger.Warn("aikey_* token form invalid (namespace authority)",
+			"event.name", observability.EventProxyRequestAuthFailed,
+		)
+		writeJSONError(w, http.StatusUnauthorized, "authentication_error", "TOKEN_INVALID",
+			"Token is in the aikey_ namespace but doesn't match any recognized form. "+
+				"Run 'aikey route' to see valid tokens.")
+		return
+	default: // Tier3Native — extractVirtualKey only returns aikey_* tokens, so this is unreachable
+		p.errors.Add(1)
+		writeJSONError(w, http.StatusUnauthorized, "authentication_error", "TOKEN_INVALID",
+			"Unexpected token classification at legacy entry.")
+		return
+	}
+
+	// 3. Resolve virtual key → route.
 	route := p.registry.Resolve(token)
 	if route == nil {
 		p.errors.Add(1)
@@ -274,6 +310,22 @@ func (p *Proxy) Handle(w http.ResponseWriter, r *http.Request) {
 func (p *Proxy) handlePathPrefixRoute(w http.ResponseWriter, r *http.Request, providerCode, strippedPath string, startTime time.Time, logger *slog.Logger) {
 	logger = logger.With("provider", providerCode, "routing", "path-prefix")
 
+	// 2026-04-29 namespace-authority early hard-fail. Run BEFORE the
+	// activeReader nil check so malformed `aikey_*` tokens always fail
+	// loud with TOKEN_INVALID — independent of vault wiring state. This
+	// also keeps the proxy's behavior consistent across editions (Personal
+	// without active vault still rejects clearly-bad aikey tokens).
+	if rawAuth := extractRawAuthValue(r); rawAuth != "" && ClassifyToken(rawAuth) == TokenInvalid {
+		p.errors.Add(1)
+		logger.Warn("aikey_* token form invalid (namespace authority)",
+			"event.name", observability.EventProxyRequestAuthFailed,
+		)
+		writeJSONError(w, http.StatusUnauthorized, "authentication_error", "TOKEN_INVALID",
+			"Token is in the aikey_ namespace but doesn't match any recognized form. "+
+				"Run 'aikey route' to see valid tokens.")
+		return
+	}
+
 	if p.activeReader == nil {
 		p.errors.Add(1)
 		writeJSONError(w, http.StatusServiceUnavailable, "server_error", "ACTIVE_KEY_NOT_SUPPORTED",
@@ -299,17 +351,39 @@ func (p *Proxy) handlePathPrefixRoute(w http.ResponseWriter, r *http.Request, pr
 	// This is authoritative for both team and personal keys.
 	protocolType = providerToProtocol(canonicalCode)
 
-	// ── v1.0.4: Per-request route token resolution ─────────────────────────
-	// If the client sends an aikey_vk_ token, resolve it via Registry.
-	// Non-aikey_vk_ auth headers (e.g. native provider tokens from Claude CLI,
-	// Cursor, etc.) fall through to the default binding — the proxy replaces
-	// them with the real key from the vault binding.
+	// ── 2026-04-29 prefix rename: namespace-authority dispatch ─────────────
+	// `aikey_*` tokens are AiKey's routing namespace; proxy is the
+	// authoritative decision point. Only specific subforms (team, personal,
+	// probe, active) are valid; anything else in the namespace returns
+	// TOKEN_INVALID immediately. Non-`aikey_*` tokens (native provider
+	// tokens from Claude CLI / Cursor) fall through to the default binding.
+	// See dispatch.go ClassifyToken for the full namespace rules.
 	rawAuthValue := extractRawAuthValue(r)
-	if rawAuthValue != "" && strings.HasPrefix(rawAuthValue, "aikey_vk_") {
+	dispatchAction := ClassifyToken(rawAuthValue)
+
+	// Hard-fail any `aikey_*` token whose subform we don't recognize. This
+	// catches: aikey_route_* (reserved namespace, not implemented), unknown
+	// aikey_* prefixes (typos / future-extension residue), legacy aikey_vk_*
+	// (fully removed post-migration), malformed aikey_personal_<non-64-hex>.
+	// Falling through silently would mask config bugs — exactly what the
+	// namespace-authority principle forbids.
+	if dispatchAction == TokenInvalid {
+		p.errors.Add(1)
+		logger.Warn("aikey_* token form invalid (namespace authority)",
+			"event.name", observability.EventProxyRequestAuthFailed,
+		)
+		writeJSONError(w, http.StatusUnauthorized, "authentication_error", "TOKEN_INVALID",
+			"Token is in the aikey_ namespace but doesn't match any recognized form. "+
+				"Run 'aikey route' to see valid tokens.")
+		return
+	}
+
+	// Tier 1: aikey_team_<vk_id> or aikey_personal_<64-hex> — resolve via Registry.
+	if dispatchAction == Tier1Team || dispatchAction == Tier1Personal {
 		route := p.registry.Resolve(rawAuthValue)
 		if route == nil {
 			p.errors.Add(1)
-			logger.Warn("aikey_vk_ token not in registry",
+			logger.Warn("tier-1 bearer not in registry",
 				"event.name", observability.EventProxyRequestAuthFailed,
 			)
 			writeJSONError(w, http.StatusUnauthorized, "authentication_error", "TOKEN_INVALID",
@@ -425,9 +499,11 @@ func (p *Proxy) handlePathPrefixRoute(w http.ResponseWriter, r *http.Request, pr
 		return
 	}
 
-	// ── aikey_personal_alias_<alias> sentinel ─────────────────────────────
+	// ── aikey_probe_<alias> sentinel ────────────────────────────────────
 	//
 	// Introduced 2026-04-22 (Stage 3 of connectivity-probe-through-proxy).
+	// Renamed in the 2026-04-29 prefix rename refactor — was previously a
+	// dedicated `_alias_` suffix form, now `aikey_probe_<alias>`.
 	//
 	// Why: `aikey test <alias>` and the shell wrapper preflight (called
 	// before every `claude` / `codex`) must probe a specific personal API
@@ -447,12 +523,12 @@ func (p *Proxy) handlePathPrefixRoute(w http.ResponseWriter, r *http.Request, pr
 	// local-host equivalence — this is the same trust boundary that lets
 	// `claude` runtime hit `127.0.0.1:<port>/anthropic/v1/...` without
 	// presenting credentials. No new attack surface.
-	if rawAuthValue != "" && strings.HasPrefix(rawAuthValue, "aikey_personal_alias_") {
-		alias := strings.TrimPrefix(rawAuthValue, "aikey_personal_alias_")
+	if dispatchAction == Tier2Probe {
+		alias := strings.TrimPrefix(rawAuthValue, "aikey_probe_")
 		if alias == "" {
 			p.errors.Add(1)
 			writeJSONError(w, http.StatusUnauthorized, "authentication_error", "TOKEN_INVALID",
-				"aikey_personal_alias_ sentinel missing alias suffix")
+				"aikey_probe_ sentinel missing alias suffix")
 			return
 		}
 		plaintext, entryProviderCode, entryBaseURL, err := p.activeReader.GetPersonalKeyByAlias(alias)
@@ -489,7 +565,7 @@ func (p *Proxy) handlePathPrefixRoute(w http.ResponseWriter, r *http.Request, pr
 		}
 
 		// Strip provider prefix (e.g. /anthropic/v1/messages → /v1/messages)
-		// before forwarding, matching the aikey_vk_ branch's behaviour.
+		// before forwarding, matching the tier-1 (Registry) branch behaviour.
 		r.URL.Path = strippedPath
 		if r.URL.RawPath != "" {
 			r.URL.RawPath = strippedPath
@@ -734,7 +810,13 @@ func (p *Proxy) handlePathPrefixRoute(w http.ResponseWriter, r *http.Request, pr
 		route.RouteSource = "personal"
 	}
 
-	p.serveRoute(w, r, route, prov, realKey, "aikey_vk_"+virtualKeyID, startTime, logger)
+	// 2026-04-29 prefix rename: receipt token rebuilt from virtualKeyID for
+	// usage reporting only (not auth). At this code path virtualKeyID has
+	// already been resolved/normalized upstream (via the registry which
+	// itself goes through supervisor.NormalizeTeamToken at load time), so
+	// simple concat is safe — the registry guarantees no historical-prefix
+	// residue. Avoid importing supervisor here to prevent a package cycle.
+	p.serveRoute(w, r, route, prov, realKey, "aikey_team_"+virtualKeyID, startTime, logger)
 }
 
 // serveRoute executes the forwarding pipeline (streaming detection, transport

@@ -1,0 +1,148 @@
+package proxy
+
+// Token namespace dispatch — central authority for the `aikey_*` namespace.
+//
+// The 2026-04-29 prefix rename established the namespace-authority principle:
+// any token starting with `aikey_` belongs to AiKey's routing namespace, and
+// proxy is the AUTHORITATIVE decision point for what's legitimate. Native
+// provider tokens (e.g. `sk-...`) are handled by a separate fallthrough path.
+//
+// Dispatch outcomes:
+//   - Tier2Probe         → `aikey_probe_*` (test sentinel, tier 2 path)
+//   - Tier1Team          → `aikey_team_*` (team static bearer; Registry lookup)
+//   - Tier1Personal      → `aikey_personal_<64-hex>` (personal static bearer; Registry lookup)
+//   - Tier3ActiveSentinel→ `aikey_active_*` (follow-active sentinel; tier 3 fallthrough INTENTIONAL)
+//   - TokenInvalid       → any other `aikey_*` (unknown subform / malformed / reserved `aikey_route_*`)
+//   - Tier3Native        → token does not start with `aikey_` (native upstream credential)
+//
+// `aikey_active_*` is the SOLE exception within the aikey namespace allowed
+// to fall through — sentinel design depends on tier-3 picking up the active
+// binding via the URL path's canonical provider code. The suffix is purely
+// informational; proxy never validates it.
+//
+// Spec: roadmap20260320/技术实现/update/20260429-token前缀按角色重命名.md §3
+
+import "strings"
+
+// DispatchAction enumerates the routing decisions for a token after
+// namespace-authority filtering. Returned by ClassifyToken.
+type DispatchAction int
+
+const (
+	// Tier3Native — token is not in the aikey_ namespace; fall through to
+	// the path-binding lookup using its raw value (or replaced). Used by
+	// CLI tools that send their own native provider tokens.
+	Tier3Native DispatchAction = iota
+
+	// Tier3ActiveSentinel — token is `aikey_active_*`; intentionally falls
+	// through to GetProviderBinding(canonical). Suffix is informational.
+	Tier3ActiveSentinel
+
+	// Tier2Probe — token is `aikey_probe_*`; targets the exact alias in the
+	// suffix via the proxy's tier-2 probe path (server-side decryption).
+	Tier2Probe
+
+	// Tier1Team — token is `aikey_team_*`; resolve via Registry as a static
+	// bearer for the named team key. Registry miss → TokenInvalid downstream.
+	Tier1Team
+
+	// Tier1Personal — token is `aikey_personal_<64-hex>` (strict form);
+	// resolve via Registry as a static bearer for the named personal/OAuth
+	// route. Registry miss → TokenInvalid downstream.
+	Tier1Personal
+
+	// TokenInvalid — token is in the aikey_ namespace but does NOT match a
+	// known legitimate form. Caller MUST return HTTP 401 with body.error.code
+	// = "TOKEN_INVALID" and MUST NOT fall through. Includes:
+	//   - aikey_route_*    (reserved namespace, not implemented this round)
+	//   - aikey_unknown_*  (typo / unknown subform)
+	//   - aikey_personal_* with non-64-hex suffix (legacy sentinel, malformed bearer)
+	//   - aikey_team_      (empty vk_id)
+	TokenInvalid
+)
+
+// ClassifyToken applies the namespace-authority dispatch rules. Pure function,
+// no I/O — call sites pass the token string and dispatch on the returned
+// action.
+//
+// Order is significant: probe is checked BEFORE personal because both share
+// the `aikey_p` prefix; checking probe first guarantees `aikey_probe_*` is
+// never misclassified as a malformed personal bearer. Active is checked
+// last among aikey_* because its suffix is unconstrained, so any earlier
+// checks would shadow it inadvertently.
+func ClassifyToken(token string) DispatchAction {
+	if !strings.HasPrefix(token, "aikey_") {
+		return Tier3Native
+	}
+
+	switch {
+	case strings.HasPrefix(token, "aikey_probe_"):
+		// Tier 2 — probe sentinel. Suffix is the alias to test; non-empty
+		// is enforced at the probe handler (returning a clear error if so).
+		return Tier2Probe
+
+	case strings.HasPrefix(token, "aikey_team_"):
+		// Tier 1 — team static bearer. Empty vk_id (just `aikey_team_`)
+		// is invalid; the helper team_token_normalize on the writer side
+		// ensures this never happens, but defend at the dispatch boundary
+		// in case stale/legacy tokens leak through.
+		if token == "aikey_team_" {
+			return TokenInvalid
+		}
+		return Tier1Team
+
+	case strings.HasPrefix(token, "aikey_personal_"):
+		// Tier 1 — personal static bearer. Strict form: `aikey_personal_`
+		// + exactly 64 lowercase hex chars (length 79). isTier1Personal
+		// rejects everything else (legacy `aikey_personal_<alias>` form,
+		// uppercase hex, short/long suffix, non-hex chars).
+		if isTier1Personal(token) {
+			return Tier1Personal
+		}
+		return TokenInvalid
+
+	case strings.HasPrefix(token, "aikey_active_"):
+		// Tier 3 fallthrough — sentinel by design. Suffix is the canonical
+		// provider code; not validated here because the proxy resolves the
+		// route via the URL path's provider, not the sentinel suffix.
+		return Tier3ActiveSentinel
+
+	default:
+		// Any other aikey_* subform: aikey_route_* (reserved, not yet
+		// implemented), aikey_unknown_*, aikey_vk_* (legacy, fully removed
+		// post-migration), etc. → TOKEN_INVALID per namespace authority.
+		return TokenInvalid
+	}
+}
+
+// isTier1Personal returns true iff `token` is exactly `aikey_personal_`
+// followed by 64 lowercase hex chars. This is the strict, narrow form for
+// the personal static bearer (output of CLI's storage::generate_route_token).
+//
+// Why strict:
+//   - Legacy `aikey_personal_<alias>` (the pre-2026-04-29 sentinel form)
+//     would otherwise be silently routed via Registry lookup, only to
+//     produce a "not found" registry miss. The user sees no signal that
+//     their token shape itself is wrong.
+//   - Uppercase hex would 401 anyway because lookups are case-sensitive,
+//     but the error message would be opaque. Rejecting at form-check
+//     surface produces a precise error.
+//   - Length variations (63 hex / 65 hex / 128 hex) are obviously corrupt
+//     and should never reach Registry.
+func isTier1Personal(token string) bool {
+	suffix, ok := strings.CutPrefix(token, "aikey_personal_")
+	if !ok {
+		return false
+	}
+	if len(suffix) != 64 {
+		return false
+	}
+	for i := 0; i < len(suffix); i++ {
+		c := suffix[i]
+		isLowerHex := (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f')
+		if !isLowerHex {
+			return false
+		}
+	}
+	return true
+}

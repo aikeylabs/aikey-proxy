@@ -61,7 +61,7 @@ func setupTestProxyWithStore(t *testing.T, upstreamURL string, store events.Even
 	// the only source of routes.
 	registry := vkeys.NewRegistry()
 	registry.Merge(map[string]*vkeys.ResolvedRoute{
-		"aikey_vk_openai_test": {
+		"aikey_team_openai_test": {
 			VirtualKeyID: "vk_openai",
 			Provider:     "openai",
 			BaseURL:      upstreamURL,
@@ -69,7 +69,7 @@ func setupTestProxyWithStore(t *testing.T, upstreamURL string, store events.Even
 			ProtocolType: "openai",
 			RouteSource:  "personal_byok", // historical label kept for test parity
 		},
-		"aikey_vk_anthropic_test": {
+		"aikey_team_anthropic_test": {
 			VirtualKeyID:  "vk_anthropic",
 			Provider:      "anthropic",
 			BaseURL:       upstreamURL,
@@ -101,7 +101,7 @@ func TestProxy_OpenAI_KeyReplacement(t *testing.T) {
 
 	body := `{"model":"gpt-4o-mini","messages":[{"role":"user","content":"hi"}]}`
 	req := httptest.NewRequest("POST", "/v1/chat/completions", strings.NewReader(body))
-	req.Header.Set("Authorization", "Bearer aikey_vk_openai_test")
+	req.Header.Set("Authorization", "Bearer aikey_team_openai_test")
 	req.Header.Set("Content-Type", "application/json")
 
 	w := httptest.NewRecorder()
@@ -133,7 +133,7 @@ func TestProxy_Anthropic_KeyReplacement(t *testing.T) {
 
 	body := `{"model":"claude-sonnet-4-5-20250929","messages":[{"role":"user","content":"hi"}]}`
 	req := httptest.NewRequest("POST", "/v1/messages", strings.NewReader(body))
-	req.Header.Set("x-api-key", "aikey_vk_anthropic_test")
+	req.Header.Set("x-api-key", "aikey_team_anthropic_test")
 	req.Header.Set("Content-Type", "application/json")
 
 	w := httptest.NewRecorder()
@@ -178,7 +178,7 @@ func TestProxy_InvalidVirtualKey(t *testing.T) {
 	p := setupTestProxy(t, "http://unused")
 
 	req := httptest.NewRequest("POST", "/v1/chat/completions", strings.NewReader(`{}`))
-	req.Header.Set("Authorization", "Bearer aikey_vk_nonexistent")
+	req.Header.Set("Authorization", "Bearer aikey_team_nonexistent")
 
 	w := httptest.NewRecorder()
 	p.Handle(w, req)
@@ -198,7 +198,7 @@ func TestProxy_ForbiddenModel(t *testing.T) {
 
 	body := `{"model":"claude-opus-4-20250514","messages":[{"role":"user","content":"hi"}]}`
 	req := httptest.NewRequest("POST", "/v1/messages", strings.NewReader(body))
-	req.Header.Set("x-api-key", "aikey_vk_anthropic_test")
+	req.Header.Set("x-api-key", "aikey_team_anthropic_test")
 	req.Header.Set("Content-Type", "application/json")
 
 	w := httptest.NewRecorder()
@@ -230,7 +230,7 @@ func TestProxy_StreamingResponse(t *testing.T) {
 
 	body := `{"model":"gpt-4o-mini","messages":[{"role":"user","content":"hi"}],"stream":true}`
 	req := httptest.NewRequest("POST", "/v1/chat/completions", strings.NewReader(body))
-	req.Header.Set("Authorization", "Bearer aikey_vk_openai_test")
+	req.Header.Set("Authorization", "Bearer aikey_team_openai_test")
 	req.Header.Set("Content-Type", "application/json")
 
 	w := httptest.NewRecorder()
@@ -252,19 +252,19 @@ func TestProxy_StreamingResponse(t *testing.T) {
 
 func TestExtractVirtualKey_Bearer(t *testing.T) {
 	req := httptest.NewRequest("POST", "/", nil)
-	req.Header.Set("Authorization", "Bearer aikey_vk_abc123")
+	req.Header.Set("Authorization", "Bearer aikey_team_abc123")
 
-	if token := extractVirtualKey(req); token != "aikey_vk_abc123" {
-		t.Fatalf("expected aikey_vk_abc123, got %q", token)
+	if token := extractVirtualKey(req); token != "aikey_team_abc123" {
+		t.Fatalf("expected aikey_team_abc123, got %q", token)
 	}
 }
 
 func TestExtractVirtualKey_XAPIKey(t *testing.T) {
 	req := httptest.NewRequest("POST", "/", nil)
-	req.Header.Set("x-api-key", "aikey_vk_def456")
+	req.Header.Set("x-api-key", "aikey_team_def456")
 
-	if token := extractVirtualKey(req); token != "aikey_vk_def456" {
-		t.Fatalf("expected aikey_vk_def456, got %q", token)
+	if token := extractVirtualKey(req); token != "aikey_team_def456" {
+		t.Fatalf("expected aikey_team_def456, got %q", token)
 	}
 }
 
@@ -304,7 +304,7 @@ func TestProxy_NonStreaming_RecordsTokens_OpenAI(t *testing.T) {
 
 	body := `{"model":"gpt-4o-mini","messages":[{"role":"user","content":"hi"}]}`
 	req := httptest.NewRequest("POST", "/v1/chat/completions", strings.NewReader(body))
-	req.Header.Set("Authorization", "Bearer aikey_vk_openai_test")
+	req.Header.Set("Authorization", "Bearer aikey_team_openai_test")
 	req.Header.Set("Content-Type", "application/json")
 
 	p.Handle(httptest.NewRecorder(), req)
@@ -340,7 +340,7 @@ func TestProxy_NonStreaming_RecordsTokens_Anthropic(t *testing.T) {
 
 	body := `{"model":"claude-sonnet-4-5-20250929","messages":[{"role":"user","content":"hi"}]}`
 	req := httptest.NewRequest("POST", "/v1/messages", strings.NewReader(body))
-	req.Header.Set("x-api-key", "aikey_vk_anthropic_test")
+	req.Header.Set("x-api-key", "aikey_team_anthropic_test")
 	req.Header.Set("Content-Type", "application/json")
 
 	p.Handle(httptest.NewRecorder(), req)
@@ -379,7 +379,7 @@ func TestProxy_Streaming_RecordsTokens_Anthropic(t *testing.T) {
 
 	body := `{"model":"claude-sonnet-4-5-20250929","messages":[{"role":"user","content":"hi"}],"stream":true}`
 	req := httptest.NewRequest("POST", "/v1/messages", strings.NewReader(body))
-	req.Header.Set("x-api-key", "aikey_vk_anthropic_test")
+	req.Header.Set("x-api-key", "aikey_team_anthropic_test")
 	req.Header.Set("Content-Type", "application/json")
 
 	p.Handle(httptest.NewRecorder(), req)
@@ -411,7 +411,7 @@ func TestProxy_ErrorResponse_NoTokens(t *testing.T) {
 
 	body := `{"model":"gpt-4o-mini","messages":[{"role":"user","content":"hi"}]}`
 	req := httptest.NewRequest("POST", "/v1/chat/completions", strings.NewReader(body))
-	req.Header.Set("Authorization", "Bearer aikey_vk_openai_test")
+	req.Header.Set("Authorization", "Bearer aikey_team_openai_test")
 	req.Header.Set("Content-Type", "application/json")
 
 	p.Handle(httptest.NewRecorder(), req)
@@ -572,7 +572,7 @@ func TestHandlePathPrefix_TeamKey(t *testing.T) {
 	av := &mockActiveVault{
 		activeTeamKeys: map[string]*vault.ManagedKey{
 			"anthropic": {
-				VirtualKeyID:     "aikey_vk_test",
+				VirtualKeyID:     "test",
 				ProviderCode:     "anthropic",
 				ProtocolType:     "anthropic",
 				BaseURL:          upstream.URL,
@@ -631,7 +631,7 @@ func TestHandlePathPrefix_ProviderBaseURLUsed(t *testing.T) {
 	av := &mockActiveVault{
 		activeTeamKeys: map[string]*vault.ManagedKey{
 			"anthropic": {
-				VirtualKeyID:     "aikey_vk_multi",
+				VirtualKeyID:     "multi",
 				ProviderCode:     "anthropic",
 				ProtocolType:     "anthropic",
 				BaseURL:          "http://wrong-server.invalid",
@@ -699,7 +699,7 @@ func TestHandlePathPrefix_BindingPersonalKey(t *testing.T) {
 	}
 }
 
-// ── aikey_personal_alias_ sentinel tests (2026-04-22) ──────────────────────
+// ── aikey_probe_ sentinel tests (2026-04-22) ──────────────────────
 //
 // Why this whole cluster: Stage 3 of the connectivity-probe-through-proxy
 // fix introduced a sentinel bearer so `aikey test <alias>` and the shell
@@ -731,7 +731,7 @@ func TestHandlePathPrefix_PersonalAliasSentinel(t *testing.T) {
 	p := setupTestProxyWithActive(t, av)
 
 	req := httptest.NewRequest(http.MethodGet, "/anthropic/v1/models", nil)
-	req.Header.Set("Authorization", "Bearer aikey_personal_alias_my-claude")
+	req.Header.Set("Authorization", "Bearer aikey_probe_my-claude")
 	w := httptest.NewRecorder()
 	p.Handle(w, req)
 
@@ -776,7 +776,7 @@ func TestHandlePathPrefix_PersonalAliasSentinel_NotActive(t *testing.T) {
 	p := setupTestProxyWithActive(t, av)
 
 	req := httptest.NewRequest(http.MethodGet, "/anthropic/v1/models", nil)
-	req.Header.Set("Authorization", "Bearer aikey_personal_alias_inactive-key")
+	req.Header.Set("Authorization", "Bearer aikey_probe_inactive-key")
 	w := httptest.NewRecorder()
 	p.Handle(w, req)
 
@@ -799,7 +799,7 @@ func TestHandlePathPrefix_PersonalAliasSentinel_UnknownAlias(t *testing.T) {
 	p := setupTestProxyWithActive(t, av)
 
 	req := httptest.NewRequest(http.MethodGet, "/anthropic/v1/models", nil)
-	req.Header.Set("Authorization", "Bearer aikey_personal_alias_nonexistent")
+	req.Header.Set("Authorization", "Bearer aikey_probe_nonexistent")
 	w := httptest.NewRecorder()
 	p.Handle(w, req)
 
@@ -823,7 +823,7 @@ func TestHandlePathPrefix_PersonalAliasSentinel_EmptySuffix(t *testing.T) {
 
 	req := httptest.NewRequest(http.MethodGet, "/anthropic/v1/models", nil)
 	// Trailing-underscore-only sentinel: malformed caller.
-	req.Header.Set("Authorization", "Bearer aikey_personal_alias_")
+	req.Header.Set("Authorization", "Bearer aikey_probe_")
 	w := httptest.NewRecorder()
 	p.Handle(w, req)
 
