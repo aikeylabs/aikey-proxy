@@ -10,6 +10,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/AiKeyLabs/pkg/aikeycompat"
 	"github.com/AiKeyLabs/pkg/aikeytime"
 )
 
@@ -43,6 +44,9 @@ func NewWALWriter(dir string) (*WALWriter, error) {
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return nil, fmt.Errorf("create wal dir %s: %w", dir, err)
 	}
+	// Stage 2.5 windows-compat: WAL contains usage-event payloads which
+	// can include provider key fingerprints — harden NTFS ACL.
+	_ = aikeycompat.EnforceOwnerOnly(dir)
 	return &WALWriter{dir: dir}, nil
 }
 

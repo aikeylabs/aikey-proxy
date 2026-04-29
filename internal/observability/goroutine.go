@@ -10,6 +10,8 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+
+	"github.com/AiKeyLabs/pkg/aikeycompat"
 )
 
 // Severity selects what happens when a GoSafe-wrapped goroutine panics.
@@ -154,6 +156,9 @@ func writeCrashDump(name string, panicVal any, stack []byte, allStacks []byte) s
 	if err := os.MkdirAll(dir, 0o750); err != nil {
 		return ""
 	}
+	// Stage 2.5 windows-compat: harden NTFS ACL — crash dumps include
+	// stack traces with potentially-sensitive variable names. No-op on Unix.
+	_ = aikeycompat.EnforceOwnerOnly(dir)
 	ts := time.Now().UTC().Format("20060102T150405.000Z")
 	safe := sanitiseName(name)
 	path := filepath.Join(dir, fmt.Sprintf("crash-%s-%s.log", ts, safe))

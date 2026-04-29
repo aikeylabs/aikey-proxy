@@ -8,6 +8,8 @@ import (
 	"path/filepath"
 	"sync"
 	"time"
+
+	"github.com/AiKeyLabs/pkg/aikeycompat"
 )
 
 const (
@@ -53,6 +55,11 @@ func NewAsyncWriter(dir string) (*AsyncWriter, error) {
 	if err := os.MkdirAll(dir, 0o750); err != nil {
 		return nil, fmt.Errorf("create log dir %s: %w", dir, err)
 	}
+	// Stage 2.5 windows-compat: tighten NTFS ACL to owner-only so the
+	// inherited Authenticated Users grant can't surface observability
+	// logs (which include request paths, provider names) to other users.
+	// No-op on Unix — 0o750 above is the source of truth there.
+	_ = aikeycompat.EnforceOwnerOnly(dir)
 	w := &AsyncWriter{
 		ch:       make(chan []byte, channelBuffer),
 		done:     make(chan struct{}),

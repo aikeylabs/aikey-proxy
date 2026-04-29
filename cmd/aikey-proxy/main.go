@@ -10,7 +10,6 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
-	"syscall"
 	"time"
 
 	"golang.org/x/term"
@@ -24,6 +23,7 @@ import (
 	"github.com/AiKeyLabs/aikey-proxy/internal/vault"
 
 	broker "github.com/AiKeyLabs/aikey-auth-broker"
+	"github.com/AiKeyLabs/pkg/aikeycompat"
 	"github.com/AiKeyLabs/pkg/buildinfo"
 )
 
@@ -191,9 +191,10 @@ func main() {
 	// 7. Build and start the HTTP server.
 	srv := server.New(ln, dataHandler, adminHandler, oauthHandler)
 
-	// Handle graceful shutdown.
+	// Handle graceful shutdown — see pkg/aikeycompat for the per-OS
+	// signal set (Windows: SIGINT only; Unix: SIGINT + SIGTERM).
 	sigCh := make(chan os.Signal, 1)
-	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
+	signal.Notify(sigCh, aikeycompat.ShutdownSignals()...)
 
 	// Fatal: server.Serve is the process's reason for being. If it dies the
 	// proxy cannot serve requests, so exit(2) and let the OS supervisor
@@ -235,7 +236,11 @@ func getVaultPassword() (string, error) {
 	}
 
 	fmt.Fprint(os.Stderr, "Enter Master Password: ")
-	pw, err := term.ReadPassword(int(syscall.Stdin))
+	// Stage 1.7 windows-compat: `int(syscall.Stdin)` is fragile on
+	// Windows (Stdin is a HANDLE, not an fd) — `os.Stdin.Fd()` returns
+	// the right uintptr on every platform that golang.org/x/term knows
+	// about and avoids a panic on the Windows MSVC runtime.
+	pw, err := term.ReadPassword(int(os.Stdin.Fd()))
 	fmt.Fprintln(os.Stderr) // newline after password input
 	if err != nil {
 		return "", fmt.Errorf("read password: %w", err)

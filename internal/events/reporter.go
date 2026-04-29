@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/AiKeyLabs/aikey-proxy/internal/observability"
+	"github.com/AiKeyLabs/pkg/aikeycompat"
 	"github.com/AiKeyLabs/pkg/aikeytime"
 )
 
@@ -120,6 +121,9 @@ func NewReporter(cfg ReporterConfig) (*Reporter, error) {
 	}
 	if dlDir != "" {
 		os.MkdirAll(dlDir, 0o755)
+		// Stage 2.5 windows-compat: dead-letter contains failed event
+		// payloads — harden NTFS ACL.
+		_ = aikeycompat.EnforceOwnerOnly(dlDir)
 		dlw = newDeadLetterWriter(dlDir)
 	}
 

@@ -4,6 +4,7 @@ go 1.26.1
 
 require (
 	github.com/AiKeyLabs/aikey-auth-broker v0.0.0
+	github.com/AiKeyLabs/pkg/aikeycompat v0.0.0
 	github.com/AiKeyLabs/pkg/aikeytime v0.0.0
 	github.com/AiKeyLabs/pkg/buildinfo v0.0.0
 	golang.org/x/crypto v0.49.0
@@ -15,6 +16,8 @@ require (
 replace github.com/AiKeyLabs/pkg/buildinfo => ../pkg/buildinfo
 
 replace github.com/AiKeyLabs/pkg/aikeytime => ../pkg/aikeytime
+
+replace github.com/AiKeyLabs/pkg/aikeycompat => ../pkg/aikeycompat
 
 replace github.com/AiKeyLabs/aikey-auth-broker => ../aikey-auth-broker
 
