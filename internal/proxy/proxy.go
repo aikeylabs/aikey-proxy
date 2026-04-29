@@ -531,6 +531,100 @@ func (p *Proxy) handlePathPrefixRoute(w http.ResponseWriter, r *http.Request, pr
 				"aikey_probe_ sentinel missing alias suffix")
 			return
 		}
+
+		// ── OAuth probe path (2026-04-29 fix A — bugfix/2026-04-29-oauth-probe-tier2-503.md) ──
+		//
+		// CLI sends `aikey_probe_<account_id>` for OAuth credentials too
+		// (connectivity/mod.rs:243 oauth_target builds bearer this way).
+		// account_id looks like `session_*`. Without this branch the code
+		// below tries GetPersonalKeyByAlias("session_xxx"), fails, returns
+		// 503 — the user-facing "claude → ... 503" red row in `aikey doctor`.
+		//
+		// Try OAuth account lookup first (cheap status check via broker);
+		// only fall through to personal-key lookup if it's not a known
+		// OAuth account. This preserves Tier3 active-OAuth's documented
+		// flow (proxy refreshes token, attaches persona headers, forwards)
+		// for the probe path too — connectivity/mod.rs:84 explicitly
+		// promises this behavior.
+		if p.broker != nil {
+			if _, statusErr := p.broker.GetAccountStatus(r.Context(), alias); statusErr == nil {
+				// OAuth account recognized — refresh + forward
+				if err := p.broker.EnsureFresh(r.Context(), alias); err != nil {
+					p.errors.Add(1)
+					logger.Warn("oauth probe: EnsureFresh failed",
+						"account_id", alias, "error", err,
+						"event.name", observability.EventProxyRequestVaultFailed,
+					)
+					writeJSONError(w, http.StatusUnauthorized, "auth_error", "OAUTH_TOKEN_EXPIRED",
+						err.Error()+"\n  Run: aikey auth login "+providerCode)
+					return
+				}
+				cred, err := p.broker.ResolveCredential(r.Context(), alias)
+				if err != nil {
+					p.errors.Add(1)
+					logger.Error("oauth probe: ResolveCredential failed",
+						"account_id", alias, "error", err)
+					writeJSONError(w, http.StatusServiceUnavailable, "server_error",
+						"OAUTH_RESOLVE_FAILED", err.Error())
+					return
+				}
+
+				// BaseURL: same rule as Tier3 active-OAuth path (proxy.go:629).
+				// openai OAuth uses chatgpt.com/backend-api/codex (Codex API),
+				// not api.openai.com (API-key path).
+				var oauthBase string
+				if canonicalCode == "openai" {
+					oauthBase = "https://chatgpt.com/backend-api/codex"
+				} else {
+					oauthBase = providerDefaultBaseURL(canonicalCode)
+				}
+				oauthInject(r, cred, canonicalCode)
+
+				identityTag := cred.Identity
+				if identityTag == "" {
+					identityTag = alias
+				}
+				logger.Info("oauth probe: forwarding request",
+					"provider", canonicalCode,
+					"identity", identityTag,
+					"account_id", alias,
+					"routing", "tier2-probe",
+				)
+
+				// Strip provider prefix (e.g. /anthropic/v1/messages →
+				// /v1/messages) before forwarding — same as personal-probe
+				// fallback below.
+				r.URL.Path = strippedPath
+				if r.URL.RawPath != "" {
+					r.URL.RawPath = strippedPath
+				}
+
+				prov, err := p.providers.Get(protocolType)
+				if err != nil {
+					p.errors.Add(1)
+					writeJSONError(w, http.StatusBadGateway, "server_error", "PROVIDER_ERROR",
+						"Unknown provider protocol: "+protocolType)
+					return
+				}
+
+				oauthRoute := &vkeys.ResolvedRoute{
+					VirtualKeyID:  "oauth:" + alias,
+					Provider:      providerCode,
+					BaseURL:       oauthBase,
+					PlaintextKey:  "__oauth__", // sentinel — header injection done by oauthInject above
+					ProviderCode:  canonicalCode,
+					ProtocolType:  protocolType,
+					KeyAlias:      "", // OAuth uses Identity, not alias
+					RouteSource:   "oauth",
+					OAuthIdentity: identityTag,
+					AccountID:     alias, // OAuth account_id; correct field name (not OAuthAccountID)
+				}
+				p.serveRoute(w, r, oauthRoute, prov, "__oauth__", rawAuthValue, startTime, logger)
+				return
+			}
+			// not an OAuth account — fall through to personal-key lookup below
+		}
+
 		plaintext, entryProviderCode, entryBaseURL, err := p.activeReader.GetPersonalKeyByAlias(alias)
 		if err != nil {
 			p.errors.Add(1)
