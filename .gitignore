@@ -2,6 +2,11 @@
 bin/
 target/
 
+# v4.3 (2026-05-01): copied from aikey-cli/data/provider_fingerprint.yaml at
+# build time by `make sync-fingerprint` (transitive dep of `make build`).
+# Single source of truth lives in aikey-cli; do NOT edit this copy directly.
+internal/provider/data/provider_fingerprint.yaml
+
 # Runtime config (use aikey-proxy.yaml.example as template)
 # aikey-proxy.yaml is committed intentionally as the default config template
 

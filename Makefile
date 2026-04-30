@@ -21,9 +21,23 @@ INSTALL_DIR ?= $(HOME)/.aikey/bin
 GOWORK     ?= $(shell cd .. && pwd)/go.work
 export GOWORK
 
-.PHONY: build test run install uninstall restart clean lint cross-compile
+.PHONY: build test run install uninstall restart clean lint cross-compile sync-fingerprint
 
-build:
+# v4.3 (2026-05-01): aikey-cli/data/provider_fingerprint.yaml is the single
+# source of truth for provider routing. We copy it into aikey-proxy/data/
+# at build time so go:embed can pick it up. Why this approach (not symlink,
+# not runtime read): Go embed doesn't follow symlinks reliably, runtime
+# read introduces a deployment file dependency (drift, missing files), and
+# regenerated Go code would balloon the diff. A copy on every build keeps
+# both binaries' baseline aligned without runtime coupling.
+FINGERPRINT_SRC := ../aikey-cli/data/provider_fingerprint.yaml
+FINGERPRINT_DST := internal/provider/data/provider_fingerprint.yaml
+
+sync-fingerprint:
+	@mkdir -p internal/provider/data
+	@cp $(FINGERPRINT_SRC) $(FINGERPRINT_DST)
+
+build: sync-fingerprint
 	@go build $(LDFLAGS) -o bin/aikey-proxy ./cmd/aikey-proxy
 	@cp $(CONFIG) bin/$(CONFIG)
 
@@ -59,7 +73,7 @@ clean:
 lint:
 	golangci-lint run ./...
 
-cross-compile:
+cross-compile: sync-fingerprint
 	@mkdir -p bin
 	GOOS=darwin  GOARCH=arm64 go build $(LDFLAGS) -o bin/aikey-proxy-darwin-arm64  ./cmd/aikey-proxy
 	GOOS=darwin  GOARCH=amd64 go build $(LDFLAGS) -o bin/aikey-proxy-darwin-amd64  ./cmd/aikey-proxy
