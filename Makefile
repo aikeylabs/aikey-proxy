@@ -24,17 +24,18 @@ export GOWORK
 .PHONY: build test run install uninstall restart clean lint cross-compile sync-fingerprint
 
 # v4.3 (2026-05-01): aikey-cli/data/provider_fingerprint.yaml is the single
-# source of truth for provider routing. We copy it into aikey-proxy/data/
-# at build time so go:embed can pick it up. Why this approach (not symlink,
-# not runtime read): Go embed doesn't follow symlinks reliably, runtime
-# read introduces a deployment file dependency (drift, missing files), and
-# regenerated Go code would balloon the diff. A copy on every build keeps
-# both binaries' baseline aligned without runtime coupling.
+# source of truth for provider routing. The pkg/providerroutes Go package
+# embeds it via go:embed; we sync into pkg/providerroutes/data/ before any
+# go build so all consumers (this proxy + control service + future Go
+# consumers) compile against the same yaml content.
+#
+# The pkg/providerroutes/data/ copy is gitignored — canonical lives in
+# aikey-cli; editing the copy is a build-step concern, not a code change.
 FINGERPRINT_SRC := ../aikey-cli/data/provider_fingerprint.yaml
-FINGERPRINT_DST := internal/provider/data/provider_fingerprint.yaml
+FINGERPRINT_DST := ../pkg/providerroutes/data/provider_fingerprint.yaml
 
 sync-fingerprint:
-	@mkdir -p internal/provider/data
+	@mkdir -p ../pkg/providerroutes/data
 	@cp $(FINGERPRINT_SRC) $(FINGERPRINT_DST)
 
 build: sync-fingerprint

@@ -7,6 +7,7 @@ require (
 	github.com/AiKeyLabs/pkg/aikeycompat v0.0.0
 	github.com/AiKeyLabs/pkg/aikeytime v0.0.0
 	github.com/AiKeyLabs/pkg/buildinfo v0.0.0
+	github.com/AiKeyLabs/pkg/providerroutes v0.0.0
 	golang.org/x/crypto v0.49.0
 	golang.org/x/term v0.41.0
 	gopkg.in/yaml.v3 v3.0.1
@@ -18,6 +19,8 @@ replace github.com/AiKeyLabs/pkg/buildinfo => ../pkg/buildinfo
 replace github.com/AiKeyLabs/pkg/aikeytime => ../pkg/aikeytime
 
 replace github.com/AiKeyLabs/pkg/aikeycompat => ../pkg/aikeycompat
+
+replace github.com/AiKeyLabs/pkg/providerroutes => ../pkg/providerroutes
 
 replace github.com/AiKeyLabs/aikey-auth-broker => ../aikey-auth-broker
 

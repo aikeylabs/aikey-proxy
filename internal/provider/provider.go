@@ -3,90 +3,18 @@ package provider
 import (
 	"fmt"
 	"net/http"
-	"net/url"
-	"strings"
 )
 
-// applyBaseURL sets scheme/host on req and stitches the upstream URL.
+// applyBaseURL delegates to pkg/providerroutes.Table.Stitch — the
+// single source of truth for path stitching across the project (proxy,
+// control service, future consumers). All algorithm + lookup + table
+// loading logic lives in pkg/providerroutes; this thin wrapper exists
+// only because each provider's RewriteRequest predates the package and
+// callers expect this name.
 //
-// v4.3 (2026-05-01): config-table driven. The path stitch contract is:
-//
-//	final_url = baseURL + version + (req.URL.Path with leading version stripped)
-//
-// where (baseURL, version) come from the per-host provider_routes table
-// (loaded via fingerprint.LookupRouteByHost). Clients differ in whether
-// they put the API version in the request path (kimi-cli sends
-// /v1/chat/..., OpenAI SDK sends /chat/...); stripping the version from
-// the request once and re-appending it via the table guarantees a single
-// /version/ segment in the final URL no matter what the client sent.
-//
-// Falls back to literal-prepend (no version awareness) when:
-//   - baseURL host is not in provider_routes (third-party gateway absent
-//     from the table); the caller is expected to register the gateway as
-//     a new yaml row per the "all gateways in the table" rule. Until then
-//     proxy degrades to "use baseURL path verbatim, prepend it to req.path"
-//     so requests still flow, just without de-duplication.
-//
-// Why a single mathematical rule + table: every special-case version-path
-// dance is in declarative data, not branching code. New gateway = 1 yaml
-// row. New API version (e.g. /v2) = update the row's version field.
+// See pkg/providerroutes/doc.go and stitch.go for the contract.
 func applyBaseURL(req *http.Request, baseURL string) error {
-	target, err := url.Parse(baseURL)
-	if err != nil {
-		return fmt.Errorf("parse base_url: %w", err)
-	}
-
-	req.URL.Scheme = target.Scheme
-	req.URL.Host = target.Host
-	req.Host = target.Host
-
-	// Look up the canonical (base_url path, version) for this host. If
-	// found, prefer it over the parsed target.Path because target.Path
-	// may have come from a vault entry that included the version segment
-	// — the table separates them cleanly so we can re-attach version
-	// exactly once.
-	basePath, version := lookupRoutePath(target.Host, target.Path)
-
-	// Strip leading version from request path (client sent it, table will
-	// re-attach). Segment-aligned to avoid /v1 swallowing /v1abc.
-	reqPath := req.URL.Path
-	if version != "" {
-		if strings.HasPrefix(reqPath, version+"/") {
-			reqPath = strings.TrimPrefix(reqPath, version)
-		} else if reqPath == version {
-			reqPath = ""
-		}
-	}
-
-	stitched := basePath + version + reqPath
-	if stitched == "" {
-		stitched = "/"
-	}
-
-	req.URL.Path = stitched
-	if req.URL.RawPath != "" {
-		req.URL.RawPath = stitched
-	}
-	return nil
-}
-
-// lookupRoutePath resolves (base path, version) for an upstream host.
-// Returns (parsedPath, "") for hosts not in the routes table — degraded
-// behaviour that prepends the URL's path verbatim (no version dedup), so
-// unknown third-party gateways still flow but should be added to yaml
-// provider_routes for proper routing.
-func lookupRoutePath(host string, parsedPath string) (basePath, version string) {
-	host = strings.ToLower(host)
-	if route, ok := providerRouteByHost(host); ok {
-		// route.BaseURL is the canonical full root; extract just its path
-		// component so we don't smuggle scheme/host into the stitch.
-		if u, err := url.Parse(route.BaseURL); err == nil {
-			return strings.TrimRight(u.Path, "/"), route.Version
-		}
-	}
-	// Fallback: treat the full parsed path as base, version unknown (no
-	// re-attach). This is the legacy behaviour for hosts not yet in table.
-	return strings.TrimRight(parsedPath, "/"), ""
+	return Routes().Stitch(req, baseURL)
 }
 
 // TokenBreakdown is the richer counterpart of ExtractTokens's (in, out) pair.

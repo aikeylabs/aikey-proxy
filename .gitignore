@@ -2,10 +2,10 @@
 bin/
 target/
 
-# v4.3 (2026-05-01): copied from aikey-cli/data/provider_fingerprint.yaml at
-# build time by `make sync-fingerprint` (transitive dep of `make build`).
-# Single source of truth lives in aikey-cli; do NOT edit this copy directly.
-internal/provider/data/provider_fingerprint.yaml
+# v4.3 (2026-05-01): provider routing yaml synced into pkg/providerroutes/
+# at build time (see Makefile sync-fingerprint). Single source of truth
+# lives in aikey-cli/data/; the pkg/providerroutes/data/ copy is intentionally
+# gitignored at the workspace root, not here.
 
 # Runtime config (use aikey-proxy.yaml.example as template)
 # aikey-proxy.yaml is committed intentionally as the default config template

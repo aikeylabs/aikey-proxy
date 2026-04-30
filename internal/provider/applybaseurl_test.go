@@ -168,7 +168,7 @@ func TestProviderRoutesTable(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.host, func(t *testing.T) {
-			r, ok := providerRouteByHost(tc.host)
+			r, ok := Routes().ByHost(tc.host)
 			if !ok {
 				t.Fatalf("host %q missing from provider_routes table", tc.host)
 			}
