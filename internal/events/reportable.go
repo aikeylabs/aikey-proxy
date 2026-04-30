@@ -77,6 +77,19 @@ type ReportableEvent struct {
 	// authoritative total — these are diagnostic splits for UI rendering and
 	// (later) cost estimation. Adding as new fields keeps pre-v5 consumers
 	// parsing correctly via json:",omitempty".
+	//
+	// Wire-format note (2026-04-29): JSON tags follow Anthropic's nomenclature
+	// (`cache_read_input_tokens` / `cache_creation_input_tokens`). Two
+	// downstream consumers parse this struct:
+	//   1. CLI WAL reader (aikey-cli/src/usage_wal.rs) — Rust struct
+	//      uses the same field names → must stay Anthropic-faithful.
+	//   2. Collector ingest (aikey-data/collector-service/internal/ingest)
+	//      — its Go struct's JSON tags were re-aligned to
+	//      `cache_read_input_tokens` (matching this) on 2026-04-29 to
+	//      fix a long-standing field-name mismatch that silently dropped
+	//      cache_read values on the wire (DB column `cached_input_tokens`
+	//      is the legacy storage name; collector struct tag now bridges
+	//      the two). See bugfix 2026-04-29-cached-tokens-wire-mismatch.md.
 	CacheReadInputTokens     *int64 `json:"cache_read_input_tokens,omitempty"`
 	CacheCreationInputTokens *int64 `json:"cache_creation_input_tokens,omitempty"`
 

@@ -18,6 +18,7 @@ import (
 	"github.com/AiKeyLabs/aikey-proxy/internal/config"
 	"github.com/AiKeyLabs/aikey-proxy/internal/observability"
 	"github.com/AiKeyLabs/aikey-proxy/internal/proxy"
+	proxyruntime "github.com/AiKeyLabs/aikey-proxy/internal/runtime"
 	"github.com/AiKeyLabs/aikey-proxy/internal/server"
 	"github.com/AiKeyLabs/aikey-proxy/internal/supervisor"
 	"github.com/AiKeyLabs/aikey-proxy/internal/vault"
@@ -130,15 +131,49 @@ func main() {
 	}
 
 	// 4. Bind the TCP listener once — it is never closed during graceful reloads.
-	ln, err := supervisor.Listen(cfg)
+	// supervisor.Listen drifts to port+1..port+drift_max when the configured
+	// port is occupied (per 20260430-端口偏移能力修复.md).
+	ln, configuredAddr, actualAddr, driftOffset, err := supervisor.Listen(cfg)
 	if err != nil {
 		slog.Error("failed to bind listener", "error", err)
 		os.Exit(1)
 	}
+	if driftOffset > 0 {
+		slog.Warn("port drift: configured port occupied, fell back",
+			"configured", configuredAddr,
+			"actual", actualAddr,
+			"drift_offset", driftOffset,
+		)
+	}
 	slog.Info("listener bound",
 		"event.name", observability.EventProxyListenerBound,
-		"addr", ln.Addr(),
+		"addr", actualAddr,
 	)
+
+	// 4b. Write the runtime snapshot so CLI / web can discover the actual
+	// bound port. Per 20260428 ownership: the proxy process is the sole
+	// writer of its runtime state; install-state.json is desired/configured
+	// state and is owned by the installer. Snapshot is removed on graceful
+	// exit (deferred below) — crashed-process residue is overwritten by the
+	// next start.
+	snapshot := proxyruntime.Snapshot{
+		IncarnationID: proxyruntime.NewIncarnationID(),
+		PID:           os.Getpid(),
+		Listen: proxyruntime.Listen{
+			ConfiguredAddr: configuredAddr,
+			ActualAddr:     actualAddr,
+			DriftOffset:    driftOffset,
+		},
+		StartedAt: time.Now().UTC(),
+	}
+	if err := proxyruntime.Write(snapshot); err != nil {
+		slog.Warn("failed to write proxy-runtime.json (non-fatal)", "error", err)
+	}
+	defer func() {
+		if err := proxyruntime.Remove(); err != nil {
+			slog.Warn("failed to remove proxy-runtime.json on shutdown", "error", err)
+		}
+	}()
 
 	// 5. Create the Supervisor (starts the initial generation).
 	sup, err := supervisor.New(cfg, resolvedPath, password, buildinfo.Get().Version)

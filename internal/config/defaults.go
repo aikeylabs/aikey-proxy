@@ -14,4 +14,7 @@ const (
 	DefaultLogDir        = "~/.aikey/logs/aikey-proxy"
 	DefaultSlowRequestMs      = 2000
 	DefaultVerySlowRequestMs  = 10000
+	// DefaultPortDriftMax bounds runtime port drift when the configured
+	// listen port is occupied. See 20260430-端口偏移能力修复.md.
+	DefaultPortDriftMax = 10
 )

@@ -32,6 +32,13 @@ type Config struct {
 type ListenConfig struct {
 	Host string `yaml:"host"`
 	Port int    `yaml:"port"`
+	// PortDriftMax bounds runtime port drift when Port is occupied at start.
+	// Per 20260430-端口偏移能力修复.md: when an external process holds Port,
+	// the listener retries Port+1, Port+2, ... up to Port+PortDriftMax before
+	// failing. Default is DefaultPortDriftMax (10) when unset / 0. Set
+	// negative to disable drift (strict legacy behavior — fail on first
+	// EADDRINUSE; used by some E2E tests).
+	PortDriftMax int `yaml:"port_drift_max,omitempty"`
 }
 
 func (l ListenConfig) Addr() string {
@@ -141,6 +148,11 @@ func (c *Config) applyDefaults() {
 	}
 	if c.Listen.Port == 0 {
 		c.Listen.Port = DefaultPort
+	}
+	// 0 (unset / explicit 0) → default 10. Negative is honored as "strict no
+	// drift" per ListenConfig.PortDriftMax doc. Non-zero positive is honored.
+	if c.Listen.PortDriftMax == 0 {
+		c.Listen.PortDriftMax = DefaultPortDriftMax
 	}
 	if c.Vault.Path == "" {
 		c.Vault.Path = DefaultVaultPath

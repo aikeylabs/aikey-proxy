@@ -27,9 +27,11 @@ import (
 	"log/slog"
 	"net"
 	"net/http"
+	"os"
 	"strings"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"time"
 
 	"github.com/AiKeyLabs/aikey-proxy/internal/admin"
@@ -854,13 +856,64 @@ func (s *Supervisor) buildGeneration() (*generation, error) {
 	}, nil
 }
 
-// Listen creates and returns the TCP listener on the configured address.
-// The caller should hold this listener for the lifetime of the process and
-// pass it to http.Server.Serve so the port is never released during reloads.
-func Listen(cfg *config.Config) (net.Listener, error) {
-	ln, err := net.Listen("tcp", cfg.Listen.Addr())
-	if err != nil {
-		return nil, fmt.Errorf("listen on %s: %w", cfg.Listen.Addr(), err)
+// Listen creates and returns the TCP listener with automatic port-drift
+// fallback. Per 20260430-端口偏移能力修复.md, when the configured port is
+// occupied (EADDRINUSE) the listener retries port+1, port+2, ..., up to
+// port+cfg.Listen.PortDriftMax. The caller should hold the listener for the
+// lifetime of the process and pass it to http.Server.Serve so the port is
+// never released during reloads.
+//
+// Returned values:
+//   - ln: the bound listener
+//   - configuredAddr: cfg.Listen.Addr() (the originally requested address)
+//   - actualAddr: ln.Addr().String() (may differ from configuredAddr after drift)
+//   - driftOffset: actual port - configured port (0 when no drift occurred)
+//
+// driftMax < 0 disables drift entirely (strict legacy: fail on first
+// EADDRINUSE). driftMax == 0 is honoured by config.applyDefaults() — yaml
+// "port_drift_max: 0" gets coerced to DefaultPortDriftMax.
+func Listen(cfg *config.Config) (ln net.Listener, configuredAddr, actualAddr string, driftOffset int, err error) {
+	host := cfg.Listen.Host
+	port := cfg.Listen.Port
+	configuredAddr = cfg.Listen.Addr()
+
+	driftMax := cfg.Listen.PortDriftMax
+	if driftMax < 0 {
+		driftMax = 0
 	}
-	return ln, nil
+
+	var lastErr error
+	for offset := 0; offset <= driftMax; offset++ {
+		candidate := fmt.Sprintf("%s:%d", host, port+offset)
+		l, lerr := net.Listen("tcp", candidate)
+		if lerr == nil {
+			return l, configuredAddr, candidate, offset, nil
+		}
+		if !isAddrInUse(lerr) {
+			return nil, configuredAddr, "", 0, fmt.Errorf("listen on %s: %w", candidate, lerr)
+		}
+		lastErr = lerr
+	}
+	return nil, configuredAddr, "", 0, fmt.Errorf(
+		"port drift exhausted: %s:%d..%d all occupied (last error: %v)",
+		host, port, port+driftMax, lastErr,
+	)
+}
+
+// isAddrInUse returns true when err is "address already in use" — the
+// signal that drift should retry the next port.
+func isAddrInUse(err error) bool {
+	if err == nil {
+		return false
+	}
+	var sysErr *os.SyscallError
+	if errors.As(err, &sysErr) {
+		if errors.Is(sysErr.Err, syscall.EADDRINUSE) {
+			return true
+		}
+	}
+	// Cross-platform message-text fallback: macOS/Linux phrase + Windows phrase.
+	msg := err.Error()
+	return strings.Contains(msg, "address already in use") ||
+		strings.Contains(msg, "Only one usage of each socket address")
 }
