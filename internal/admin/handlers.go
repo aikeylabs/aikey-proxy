@@ -42,6 +42,15 @@ type Handler struct {
 	ReporterMetricsFn func() *events.ReporterMetrics
 	// CanaryResultFn returns the latest canary probe result (nil = canary disabled).
 	CanaryResultFn func() *events.CanaryResult
+
+	// DebugUpstreamHeadersStateFn / DebugUpstreamHeadersSetFn drive the
+	// /admin/debug/upstream-headers endpoints. State returns the resolved
+	// (enabled, source) tuple — source is "api" / "env" / "compile" /
+	// "default". Set takes a tri-state: 1 = force ON, 0 = clear API
+	// override (inherit env / compile), -1 = force OFF. Wired by main.go
+	// to proxy.UpstreamHeadersDebugState / SetUpstreamHeadersDebugAPIOverride.
+	DebugUpstreamHeadersStateFn func() (enabled bool, source string)
+	DebugUpstreamHeadersSetFn   func(state int)
 }
 
 // KeyCheckTarget holds decrypted credentials for one provider, used by GET /health/keys.
@@ -722,4 +731,75 @@ func writeJSON(w http.ResponseWriter, status int, v any) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(status)
 	json.NewEncoder(w).Encode(v)
+}
+
+// DebugUpstreamHeadersGet returns the current state of the upstream-headers
+// debug toggle plus the layer that produced it.
+//
+//	GET /admin/debug/upstream-headers
+//	→ 200 {"enabled": true|false, "source": "api"|"env"|"compile"|"default"}
+//	→ 503 {"error": "not wired"}        when the proxy didn't inject the hook
+func (h *Handler) DebugUpstreamHeadersGet(w http.ResponseWriter, r *http.Request) {
+	if h.DebugUpstreamHeadersStateFn == nil {
+		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "not wired"})
+		return
+	}
+	enabled, source := h.DebugUpstreamHeadersStateFn()
+	writeJSON(w, http.StatusOK, map[string]any{
+		"enabled": enabled,
+		"source":  source,
+	})
+}
+
+// DebugUpstreamHeadersSet flips the API runtime override.
+//
+//	POST /admin/debug/upstream-headers   body: {"enabled": true | false}
+//	→ 200 {"enabled": true|false, "source": "api"}
+//
+// Why JSON body (not query param): keeps the verb idempotent (re-POSTing
+// the same body is a no-op) and matches the established pattern of
+// /admin/probe/ping. Future fields (level / verbosity / TTL) extend
+// without breaking the URL.
+func (h *Handler) DebugUpstreamHeadersSet(w http.ResponseWriter, r *http.Request) {
+	if h.DebugUpstreamHeadersSetFn == nil || h.DebugUpstreamHeadersStateFn == nil {
+		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "not wired"})
+		return
+	}
+	var req struct {
+		Enabled *bool `json:"enabled"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.Enabled == nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{
+			"error": "body must be JSON object with bool field 'enabled'",
+		})
+		return
+	}
+	if *req.Enabled {
+		h.DebugUpstreamHeadersSetFn(1)
+	} else {
+		h.DebugUpstreamHeadersSetFn(-1)
+	}
+	enabled, source := h.DebugUpstreamHeadersStateFn()
+	writeJSON(w, http.StatusOK, map[string]any{
+		"enabled": enabled,
+		"source":  source,
+	})
+}
+
+// DebugUpstreamHeadersClear removes the API override so the toggle inherits
+// from env / compile / default.
+//
+//	DELETE /admin/debug/upstream-headers
+//	→ 200 {"enabled": <resolved-from-lower-layers>, "source": "env"|"compile"|"default"}
+func (h *Handler) DebugUpstreamHeadersClear(w http.ResponseWriter, r *http.Request) {
+	if h.DebugUpstreamHeadersSetFn == nil || h.DebugUpstreamHeadersStateFn == nil {
+		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "not wired"})
+		return
+	}
+	h.DebugUpstreamHeadersSetFn(0)
+	enabled, source := h.DebugUpstreamHeadersStateFn()
+	writeJSON(w, http.StatusOK, map[string]any{
+		"enabled": enabled,
+		"source":  source,
+	})
 }

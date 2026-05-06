@@ -64,6 +64,13 @@ func New(ln net.Listener, dataHandler http.Handler, adminHandler *admin.Handler,
 	// the China-network deployment where direct TCP to upstream is blocked.
 	mux.HandleFunc("POST /admin/probe/ping", adminHandler.ProbePing)
 
+	// Debug toggle for outbound upstream headers. 3-layer resolution
+	// (API > env AIKEY_PROXY_DEBUG_UPSTREAM_HEADERS > compile-time ldflags);
+	// see internal/proxy/debug_upstream.go for full semantics.
+	mux.HandleFunc("GET /admin/debug/upstream-headers", adminHandler.DebugUpstreamHeadersGet)
+	mux.HandleFunc("POST /admin/debug/upstream-headers", adminHandler.DebugUpstreamHeadersSet)
+	mux.HandleFunc("DELETE /admin/debug/upstream-headers", adminHandler.DebugUpstreamHeadersClear)
+
 	// Extra route registrars (e.g., OAuth broker handler)
 	for _, h := range extraHandlers {
 		h.RegisterRoutes(mux)

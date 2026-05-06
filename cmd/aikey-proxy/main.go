@@ -216,6 +216,8 @@ func main() {
 	adminHandler.KeyChecksFn = sup.GetKeyCheckTargets
 	adminHandler.ReporterMetricsFn = sup.ReporterMetrics
 	adminHandler.CanaryResultFn = sup.CanaryResult
+	adminHandler.DebugUpstreamHeadersStateFn = proxy.UpstreamHeadersDebugState
+	adminHandler.DebugUpstreamHeadersSetFn = proxy.SetUpstreamHeadersDebugAPIOverride
 
 	// Build the outbound transport for upstream providers (optional).
 	dataHandler := sup.Handler()

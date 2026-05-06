@@ -1,0 +1,45 @@
+aikey-proxy
+Copyright AiKey Labs
+
+This product is licensed under the Apache License, Version 2.0
+(see LICENSE for full text).
+
+================================================================================
+Third-party research acknowledgements
+================================================================================
+
+The Anthropic OAuth body-fingerprint mimicry implemented in
+internal/proxy/oauth_inject_waf_full.go was guided by reverse-engineering
+research originally documented and published by the open-source project
+sub2api (https://github.com/Wei-Shaw/sub2api), released under the
+GNU Lesser General Public License, version 3.0.
+
+The sub2api project documented the publicly-observable wire-format facts
+that real Claude Code CLI traffic carries on Anthropic's OAuth path,
+specifically:
+
+  - the cc_version trailing 3-hex fingerprint is derived from
+    SHA-256(constant-salt || sampled-bytes-of-first-user-text || cli-version);
+  - the cch field is an xxhash64 digest of the marshalled body keyed by
+    a constant 64-bit seed;
+  - the byte indices [4, 7, 20] are the canonical sample positions used
+    by the upstream client.
+
+These are observable protocol facts (not original creative expression of
+sub2api) and are used here purely to interoperate with Anthropic's WAF
+gating of premium models for non-Claude-CLI clients.
+
+The Go implementation in this repository is an independent re-expression
+written from the protocol specification: it uses different function
+decomposition, different parsing idioms (two-stage RawMessage parse,
+byte-level surgical placeholder rewrite without regex back-references,
+streaming SHA-256 input), and different naming and helper structure than
+sub2api's reference implementation. As a defensive measure, a copy of
+the LGPL-3.0 license text is shipped under
+THIRD-PARTY-LICENSES/sub2api-LGPL-3.0.txt.
+
+If you redistribute aikey-proxy together with any code derived from
+sub2api (rather than the independent re-expression here), the LGPL-3.0
+obligations from that project apply to the derived portions; the
+independent re-expression in oauth_inject_waf_full.go is contributed
+under the same Apache-2.0 license that covers the rest of this module.

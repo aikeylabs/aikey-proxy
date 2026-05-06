@@ -6,6 +6,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"regexp"
 	"strings"
 	"testing"
 )
@@ -543,18 +544,25 @@ func TestInjectClaudeOAuth_FullFlow_ClaudeCLI(t *testing.T) {
 }
 
 func TestInjectClaudeOAuth_PartialHeaders_PreservesClientSet(t *testing.T) {
-	// A client sets User-Agent and X-Stainless-OS but nothing else.
-	// Proxy should preserve those two and fill in all the rest.
+	// A non-Claude-Code client (Cursor) sets User-Agent + X-Stainless-OS,
+	// nothing else. Proxy must:
+	//   - OVERRIDE User-Agent to the verified Claude Code persona UA
+	//     (third-party UAs leak through to Anthropic OAuth WAF and trigger
+	//     429 business rejection — see oauth_inject.go injectClaudeOAuth
+	//     comments for the full reasoning)
+	//   - PRESERVE other persona headers the client did set (X-Stainless-OS)
+	//   - FILL IN the rest with verified defaults
 	req := httptest.NewRequest("POST", "/v1/messages", nil)
 	req.Header.Set("User-Agent", "Cursor/1.0")
 	req.Header.Set("X-Stainless-OS", "Darwin")
 
 	injectClaudeOAuth(req, claudeCred())
 
-	// Client-set values preserved
-	if got := req.Header.Get("User-Agent"); got != "Cursor/1.0" {
-		t.Errorf("User-Agent overwritten: got %q, want %q", got, "Cursor/1.0")
+	// User-Agent overridden because Cursor isn't claude-cli/*
+	if got := req.Header.Get("User-Agent"); got != "claude-cli/2.1.22 (external, cli)" {
+		t.Errorf("User-Agent should be forced to claude-cli persona, got %q", got)
 	}
+	// Other client-set persona header preserved
 	if got := req.Header.Get("X-Stainless-OS"); got != "Darwin" {
 		t.Errorf("X-Stainless-OS overwritten: got %q, want %q", got, "Darwin")
 	}
@@ -571,5 +579,357 @@ func TestInjectClaudeOAuth_PartialHeaders_PreservesClientSet(t *testing.T) {
 	}
 	if got := req.Header.Get("X-Stainless-Runtime"); got != "node" {
 		t.Errorf("X-Stainless-Runtime not filled: got %q, want %q", got, "node")
+	}
+}
+
+// TestInjectClaudeOAuth_RealClaudeCodeUA_Preserved guards forward-compatibility:
+// when Claude Code CLI itself is the client (UA starts with "claude-cli/"),
+// proxy must NOT downgrade its UA to the hardcoded 2.1.22. A future CLI version
+// may carry a newer fingerprint Anthropic expects (e.g. claude-cli/3.x with new
+// X-Stainless-Package-Version pairings); preserving the inbound UA keeps the
+// pairing intact.
+func TestInjectClaudeOAuth_RealClaudeCodeUA_Preserved(t *testing.T) {
+	req := httptest.NewRequest("POST", "/v1/messages", nil)
+	req.Header.Set("User-Agent", "claude-cli/3.5.0 (external, cli)")
+
+	injectClaudeOAuth(req, claudeCred())
+
+	if got := req.Header.Get("User-Agent"); got != "claude-cli/3.5.0 (external, cli)" {
+		t.Errorf("real claude-cli UA should be preserved, got %q", got)
+	}
+}
+
+// ─── WAF body fingerprint (full sub2api strategy + UA dispatch) ──────────────
+//
+// Pinned by research doc workflow/CI/research/oauth-token-response-identity/2026-04-15-oauth-token-response-identity.md
+// (sections "2026-05-06 增补 I" + "Round 5 / sub2api 对比"):
+//   - Anthropic OAuth-path WAF gates premium models on body.system[0]; without
+//     the magic intro / billing-header form, the WAF returns 429 with no
+//     rate-limit headers (business rejection masquerading as rate limit).
+//   - We apply the FULL sub2api 4-layer strategy ONLY for non-Claude-CLI
+//     clients (UA-detected at start of injectClaudeOAuth). Real CLI traffic
+//     already carries its own fingerprint and is skipped to avoid wasted I/O
+//     and accidental damage.
+//
+// Tests below exercise injectClaudeWAFFingerprintFull directly (UA dispatch
+// is tested separately via injectClaudeOAuth end-to-end).
+
+// regex matchers for the structural assertions
+var billingHeaderRe = regexp.MustCompile(`^x-anthropic-billing-header: cc_version=\d+\.\d+\.\d+\.[0-9a-f]{3}; cc_entrypoint=cli; cch=[0-9a-f]{5};$`)
+
+func TestInjectClaudeWAFFingerprintFull_NoSystem_BuildsBillingPlusIntro(t *testing.T) {
+	req := newJSONRequest("POST", "/v1/messages", map[string]any{
+		"model":    "claude-opus-4-7",
+		"messages": []any{map[string]any{"role": "user", "content": "Reply with: pong"}},
+	})
+
+	injectClaudeWAFFingerprintFull(req)
+
+	body := readBodyJSON(t, req)
+	sys, ok := body["system"].([]any)
+	if !ok || len(sys) != 2 {
+		t.Fatalf("system should be 2-block array, got %v (len=%d)", body["system"], len(sys))
+	}
+	billing := sys[0].(map[string]any)
+	if billing["type"] != "text" {
+		t.Errorf("system[0].type = %q; want text", billing["type"])
+	}
+	billingText, _ := billing["text"].(string)
+	if !billingHeaderRe.MatchString(billingText) {
+		t.Errorf("system[0] should be a fully-signed billing header, got %q", billingText)
+	}
+	intro := sys[1].(map[string]any)
+	if intro["text"] != claudeCodeSystemPrompt {
+		t.Errorf("system[1].text = %q; want claudeCodeSystemPrompt", intro["text"])
+	}
+	if cc, ok := intro["cache_control"].(map[string]any); !ok || cc["type"] != "ephemeral" {
+		t.Errorf("system[1].cache_control should be {type:ephemeral}, got %v", intro["cache_control"])
+	}
+}
+
+func TestInjectClaudeWAFFingerprintFull_StringSystem_MovedToMessages(t *testing.T) {
+	originalSystem := "You are a helpful coding assistant. Always answer in Chinese."
+	req := newJSONRequest("POST", "/v1/messages", map[string]any{
+		"model":    "claude-opus-4-7",
+		"system":   originalSystem,
+		"messages": []any{map[string]any{"role": "user", "content": "Hi"}},
+	})
+
+	injectClaudeWAFFingerprintFull(req)
+
+	body := readBodyJSON(t, req)
+	// system replaced with 2-block billing+intro
+	sys := body["system"].([]any)
+	if len(sys) != 2 {
+		t.Fatalf("system should be 2-block, got %d", len(sys))
+	}
+	if !billingHeaderRe.MatchString(sys[0].(map[string]any)["text"].(string)) {
+		t.Errorf("system[0] should be billing header, got %v", sys[0])
+	}
+	// original system should be moved into messages[0] (instr) + messages[1] (ack) pair
+	msgs := body["messages"].([]any)
+	if len(msgs) != 3 {
+		t.Fatalf("expected 3 messages (instr/ack/user), got %d", len(msgs))
+	}
+	m0content := msgs[0].(map[string]any)["content"].([]any)[0].(map[string]any)["text"].(string)
+	if !strings.Contains(m0content, originalSystem) {
+		t.Errorf("messages[0] should contain original system text, got %q", m0content)
+	}
+	if !strings.HasPrefix(m0content, "[System Instructions]") {
+		t.Errorf("messages[0] should start with [System Instructions], got %q", m0content)
+	}
+	if msgs[1].(map[string]any)["role"] != "assistant" {
+		t.Errorf("messages[1] should be assistant ack, got %v", msgs[1])
+	}
+}
+
+func TestInjectClaudeWAFFingerprintFull_ArraySystem_MovedToMessages(t *testing.T) {
+	clientBlock := map[string]any{"type": "text", "text": "be terse"}
+	req := newJSONRequest("POST", "/v1/messages", map[string]any{
+		"model":    "claude-sonnet-4-6",
+		"system":   []any{clientBlock},
+		"messages": []any{map[string]any{"role": "user", "content": "Hi"}},
+	})
+
+	injectClaudeWAFFingerprintFull(req)
+
+	body := readBodyJSON(t, req)
+	sys := body["system"].([]any)
+	if len(sys) != 2 || !billingHeaderRe.MatchString(sys[0].(map[string]any)["text"].(string)) {
+		t.Fatalf("system should be 2-block billing+intro, got %v", sys)
+	}
+	msgs := body["messages"].([]any)
+	if len(msgs) != 3 {
+		t.Fatalf("expected 3 messages, got %d", len(msgs))
+	}
+	m0text := msgs[0].(map[string]any)["content"].([]any)[0].(map[string]any)["text"].(string)
+	if !strings.Contains(m0text, "be terse") {
+		t.Errorf("messages[0] should contain client's text-block content, got %q", m0text)
+	}
+}
+
+func TestInjectClaudeWAFFingerprintFull_AlreadyMagicIntro_NoOp(t *testing.T) {
+	// Real Claude CLI traffic that somehow reaches the full path (e.g.
+	// dispatch bug, defensive). Idempotency check should leave it alone.
+	original := []any{
+		map[string]any{"type": "text", "text": claudeCodeSystemPrompt},
+		map[string]any{"type": "text", "text": "additional context block"},
+	}
+	originalMessages := []any{map[string]any{"role": "user", "content": "Hi"}}
+	req := newJSONRequest("POST", "/v1/messages", map[string]any{
+		"model":    "claude-opus-4-7",
+		"system":   original,
+		"messages": originalMessages,
+	})
+
+	injectClaudeWAFFingerprintFull(req)
+
+	body := readBodyJSON(t, req)
+	sys := body["system"].([]any)
+	if len(sys) != 2 {
+		t.Errorf("idempotent for magic-intro-already-present, got len=%d", len(sys))
+	}
+	if sys[0].(map[string]any)["text"] != claudeCodeSystemPrompt {
+		t.Errorf("system[0] should remain magic intro, got %v", sys[0])
+	}
+	msgs := body["messages"].([]any)
+	if len(msgs) != 1 {
+		t.Errorf("idempotent: messages should be unchanged (1 entry), got %d", len(msgs))
+	}
+}
+
+func TestInjectClaudeWAFFingerprintFull_AlreadyBillingHeader_NoOp(t *testing.T) {
+	// Real Claude CLI 2.1.92+ uses the billing-header form at system[0].
+	// Round 4b verified that any cc_entrypoint value satisfies WAF; this
+	// test pins the idempotent recognition of that form.
+	billingBlock := map[string]any{
+		"type": "text",
+		"text": "x-anthropic-billing-header: cc_version=2.1.128.f14; cc_entrypoint=cli; cch=00000;",
+	}
+	req := newJSONRequest("POST", "/v1/messages", map[string]any{
+		"model":    "claude-opus-4-7",
+		"system":   []any{billingBlock},
+		"messages": []any{map[string]any{"role": "user", "content": "Hi"}},
+	})
+
+	injectClaudeWAFFingerprintFull(req)
+
+	body := readBodyJSON(t, req)
+	sys := body["system"].([]any)
+	if len(sys) != 1 {
+		t.Errorf("idempotent for billing-already-present, got len=%d", len(sys))
+	}
+	first := sys[0].(map[string]any)["text"].(string)
+	if !strings.HasPrefix(first, "x-anthropic-billing-header:") {
+		t.Errorf("system[0] should remain billing header, got %q", first)
+	}
+}
+
+func TestInjectClaudeWAFFingerprintFull_HaikuModel_Skipped(t *testing.T) {
+	// Round 1 + sub2api confirmation: WAF doesn't apply to haiku models.
+	req := newJSONRequest("POST", "/v1/messages", map[string]any{
+		"model":    "claude-haiku-4-5-20251001",
+		"messages": []any{map[string]any{"role": "user", "content": "Hi"}},
+	})
+
+	injectClaudeWAFFingerprintFull(req)
+
+	body := readBodyJSON(t, req)
+	if _, ok := body["system"]; ok {
+		t.Errorf("haiku request should NOT have system injected, got %v", body["system"])
+	}
+}
+
+func TestInjectClaudeWAFFingerprintFull_NonJSONBody_LeavesUnchanged(t *testing.T) {
+	// Defensive: non-JSON body must be preserved unchanged.
+	originalBody := []byte("event: ping\ndata: {}\n\n")
+	req := httptest.NewRequest("POST", "/v1/messages", bytes.NewReader(originalBody))
+	req.Header.Set("Content-Type", "text/event-stream")
+	req.ContentLength = int64(len(originalBody))
+
+	injectClaudeWAFFingerprintFull(req)
+
+	got, _ := io.ReadAll(req.Body)
+	if string(got) != string(originalBody) {
+		t.Errorf("non-JSON body should be preserved.\n  before: %q\n  after:  %q",
+			originalBody, got)
+	}
+}
+
+// ─── UA-based dispatch in injectClaudeOAuth ──────────────────────────────────
+
+func TestClientIsClaudeCode(t *testing.T) {
+	cases := []struct {
+		ua   string
+		want bool
+	}{
+		{"claude-cli/2.1.128 (external, cli)", true},
+		{"claude-cli/3.0.0", true},
+		{"claude-cli/", true}, // technically valid prefix
+		{"opencode/0.5.2", false},
+		{"Cursor/0.42.0", false},
+		{"node", false},
+		{"", false},
+		{"Claude-CLI/2.1.0", false}, // case-sensitive
+		{"my-claude-cli/1.0", false}, // prefix must be exact
+	}
+	for _, tc := range cases {
+		req := httptest.NewRequest("POST", "/v1/messages", nil)
+		if tc.ua != "" {
+			req.Header.Set("User-Agent", tc.ua)
+		}
+		got := clientIsClaudeCode(req)
+		if got != tc.want {
+			t.Errorf("clientIsClaudeCode(%q) = %v; want %v", tc.ua, got, tc.want)
+		}
+	}
+}
+
+func TestInjectClaudeOAuth_RealClaudeCLI_SkipsWAFInjection(t *testing.T) {
+	// Real Claude CLI inbound — body.system stays untouched (no billing/intro
+	// blocks injected, no messages prepended).
+	req := newJSONRequest("POST", "/v1/messages", map[string]any{
+		"model":    "claude-opus-4-7",
+		"messages": []any{map[string]any{"role": "user", "content": "Hi"}},
+	})
+	req.Header.Set("User-Agent", "claude-cli/2.1.128 (external, cli)")
+
+	injectClaudeOAuth(req, claudeCred())
+
+	body := readBodyJSON(t, req)
+	if _, ok := body["system"]; ok {
+		t.Errorf("real claude-cli inbound: system should NOT be injected, got %v", body["system"])
+	}
+	msgs := body["messages"].([]any)
+	if len(msgs) != 1 {
+		t.Errorf("real claude-cli inbound: messages should NOT be rewritten, got len=%d", len(msgs))
+	}
+}
+
+func TestInjectClaudeOAuth_NonClaudeCLI_AppliesFullWAFInjection(t *testing.T) {
+	// Third-party client (opencode) — inbound UA does NOT start with claude-cli/,
+	// so injectClaudeOAuth applies the full sub2api strategy.
+	req := newJSONRequest("POST", "/v1/messages", map[string]any{
+		"model":    "claude-opus-4-7",
+		"messages": []any{map[string]any{"role": "user", "content": "Hi"}},
+	})
+	req.Header.Set("User-Agent", "opencode/0.5.2")
+
+	injectClaudeOAuth(req, claudeCred())
+
+	body := readBodyJSON(t, req)
+	sys, ok := body["system"].([]any)
+	if !ok || len(sys) != 2 {
+		t.Fatalf("opencode inbound: should have full 2-block system, got %v", body["system"])
+	}
+	if !billingHeaderRe.MatchString(sys[0].(map[string]any)["text"].(string)) {
+		t.Errorf("system[0] should be billing header, got %v", sys[0])
+	}
+	if sys[1].(map[string]any)["text"] != claudeCodeSystemPrompt {
+		t.Errorf("system[1] should be magic intro, got %v", sys[1])
+	}
+}
+
+// ─── algorithms (computeClaudeCodeVersionFingerprint, sealCCHPlaceholder) ────
+
+func TestComputeClaudeCodeVersionFingerprint_Deterministic(t *testing.T) {
+	body := []byte(`{"messages":[{"role":"user","content":"hello world this is a test"}]}`)
+	fp1 := computeClaudeCodeVersionFingerprint(body, "2.1.128")
+	fp2 := computeClaudeCodeVersionFingerprint(body, "2.1.128")
+	if fp1 != fp2 {
+		t.Errorf("fp not deterministic: %q != %q", fp1, fp2)
+	}
+	hexRe := regexp.MustCompile(`^[0-9a-f]{3}$`)
+	if !hexRe.MatchString(fp1) {
+		t.Errorf("fp must be exactly 3 hex chars, got %q", fp1)
+	}
+}
+
+func TestComputeClaudeCodeVersionFingerprint_VersionMatters(t *testing.T) {
+	body := []byte(`{"messages":[{"role":"user","content":"hello world"}]}`)
+	if computeClaudeCodeVersionFingerprint(body, "2.1.128") == computeClaudeCodeVersionFingerprint(body, "2.1.92") {
+		t.Errorf("expected fp to differ across versions")
+	}
+}
+
+func TestComputeClaudeCodeVersionFingerprint_ShortText(t *testing.T) {
+	// Algorithm pads with '0' when chars[7] / [20] are out of bounds.
+	body := []byte(`{"messages":[{"role":"user","content":"abc"}]}`)
+	fp := computeClaudeCodeVersionFingerprint(body, "2.1.128")
+	hexRe := regexp.MustCompile(`^[0-9a-f]{3}$`)
+	if !hexRe.MatchString(fp) {
+		t.Errorf("short-text fp must still be 3 hex, got %q", fp)
+	}
+}
+
+func TestSealCCHPlaceholder_ReplacesPlaceholder(t *testing.T) {
+	body := []byte(`{"system":[{"type":"text","text":"x-anthropic-billing-header: cc_version=2.1.128.abc; cc_entrypoint=cli; cch=00000;"}],"messages":[{"role":"user","content":"hello"}]}`)
+	out := sealCCHPlaceholder(body)
+	if strings.Contains(string(out), "cch=00000") {
+		t.Errorf("placeholder should be replaced, got %s", out)
+	}
+	if !regexp.MustCompile(`cch=[0-9a-f]{5};`).Match(out) {
+		t.Errorf("expected cch=<5hex>;, got %s", out)
+	}
+}
+
+func TestSealCCHPlaceholder_NoPlaceholderUnchanged(t *testing.T) {
+	body := []byte(`{"system":[{"type":"text","text":"x-anthropic-billing-header: cc_version=2.1.63; cc_entrypoint=cli; cch=abcde;"}],"messages":[]}`)
+	if string(sealCCHPlaceholder(body)) != string(body) {
+		t.Errorf("body without placeholder should be unchanged")
+	}
+}
+
+func TestSealCCHPlaceholder_BodyContentChangesHash(t *testing.T) {
+	a := []byte(`{"system":[{"type":"text","text":"x-anthropic-billing-header: cc_version=2.1.128.abc; cc_entrypoint=cli; cch=00000;"}],"messages":[{"role":"user","content":"hello"}]}`)
+	b := []byte(`{"system":[{"type":"text","text":"x-anthropic-billing-header: cc_version=2.1.128.abc; cc_entrypoint=cli; cch=00000;"}],"messages":[{"role":"user","content":"world"}]}`)
+	cchRe := regexp.MustCompile(`cch=([0-9a-f]{5})`)
+	mA := cchRe.FindStringSubmatch(string(sealCCHPlaceholder(a)))
+	mB := cchRe.FindStringSubmatch(string(sealCCHPlaceholder(b)))
+	if mA == nil || mB == nil {
+		t.Fatalf("cch regex didn't match: %v %v", mA, mB)
+	}
+	if mA[1] == mB[1] {
+		t.Errorf("expected different cch for different bodies, both got %q", mA[1])
 	}
 }

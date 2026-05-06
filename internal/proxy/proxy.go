@@ -10,6 +10,7 @@ import (
 	"net/http/httputil"
 	"net/url"
 	"os"
+	"strconv"
 	"strings"
 	"sync/atomic"
 	"time"
@@ -1019,6 +1020,22 @@ func (p *Proxy) serveRoute(w http.ResponseWriter, r *http.Request, route *vkeys.
 			}
 			// Remove hop-by-hop headers the proxy shouldn't forward.
 			req.Header.Del("X-Forwarded-For")
+
+			// Strip AiKey-internal annotations before forwarding. These are
+			// stashed onto the incoming request by extractModel() /
+			// stashExtractedFields() for downstream usage-event recording
+			// (see stashExtractedFields, proxy.go:1436). They must NOT
+			// reach the upstream provider — Anthropic's OAuth WAF, in
+			// particular, treats unrecognised headers as a persona signal
+			// that the request isn't a real Claude Code session, returning
+			// 429 with no X-RateLimit-Reset (business rejection signature).
+			// Strip the whole `x-aikey-*` namespace so future internal
+			// annotations don't repeat this leak.
+			for k := range req.Header {
+				if len(k) >= 8 && strings.EqualFold(k[:8], "X-Aikey-") {
+					req.Header.Del(k)
+				}
+			}
 			// Why: tell upstream we only accept identity (uncompressed) so the
 			// drainer and non-streaming token extractor can parse the body
 			// directly. Anthropic's OAuth endpoint in particular returns
@@ -1029,8 +1046,52 @@ func (p *Proxy) serveRoute(w http.ResponseWriter, r *http.Request, route *vkeys.
 			// and unambiguous token counting is more valuable than saving a
 			// few KB per request.
 			req.Header.Set("Accept-Encoding", "identity")
+
+			// Optional upstream-headers diagnostic capture. The toggle is
+			// resolved through three layers (API > env > compile); see
+			// debug_upstream.go for semantics. Logs the final method, URL,
+			// and headers — the snapshot AFTER all rewrites (path strip,
+			// OAuth Bearer + persona, Accept-Encoding override), so what
+			// you see is what goes on the wire. Authorization / x-api-key
+			// are masked.
+			if debugUpstreamHeadersEnabled() {
+				logger.Info("upstream request snapshot",
+					"event.name", "proxy.request.upstream_headers",
+					"method", req.Method,
+					"url", req.URL.String(),
+					"headers", maskAuthHeaders(req.Header),
+					"request_body", truncateBodyForLog(debugRequestBodyFromContext(r.Context())),
+				)
+			}
 		},
 		ModifyResponse: func(resp *http.Response) error {
+			// Upstream-headers debug toggle: log a "response snapshot" with
+			// status + body + selected response headers (rate-limit + retry
+			// hints) for ANY status code. Why every status, not just 4xx:
+			// the user-facing failure mode "opencode shows error" can be
+			// 200-with-empty-content, 200-with-error-body, 4xx, or 5xx; a
+			// snapshot scoped to 4xx misses the first two. Truncated to
+			// debug4xxBodyCap so log lines stay bounded.
+			if debugUpstreamHeadersEnabled() {
+				respBody, _ := io.ReadAll(resp.Body)
+				_ = resp.Body.Close()
+				resp.Body = io.NopCloser(bytes.NewReader(respBody))
+				resp.ContentLength = int64(len(respBody))
+				rateLimitHeaders := map[string]string{}
+				for k, v := range resp.Header {
+					kl := strings.ToLower(k)
+					if strings.Contains(kl, "ratelimit") || kl == "x-should-retry" || kl == "retry-after" || kl == "request-id" || kl == "anthropic-organization-id" {
+						rateLimitHeaders[k] = strings.Join(v, ", ")
+					}
+				}
+				logger.Info("upstream response snapshot",
+					"event.name", "proxy.response.upstream_snapshot",
+					"status_code", resp.StatusCode,
+					"upstream_request_id", extractUpstreamRequestID(resp),
+					"response_signal_headers", rateLimitHeaders,
+					"response_body", truncateBodyForLog(respBody),
+				)
+			}
 			if resp.StatusCode >= 400 {
 				// Optional debug capture: when AIKEY_PROXY_DEBUG_4XX_BODIES
 				// is set, drain the upstream body, log it together with the
@@ -1065,6 +1126,11 @@ func (p *Proxy) serveRoute(w http.ResponseWriter, r *http.Request, route *vkeys.
 				p.recordEvent(r, resp, startTime, route, bearerToken, streaming)
 				return nil
 			}
+			// Reverse tool-name rewrite — runs only when forward (in oauth_inject)
+			// stored a mapping on the request context. Real Claude CLI traffic
+			// has no mapping → no-op. See oauth_tool_rewrite.go.
+			toolNameRevMapping := toolNameMappingFrom(r.Context())
+
 			if !streaming {
 				// Non-streaming success: read body, extract tokens, re-buffer.
 				body, err := io.ReadAll(resp.Body)
@@ -1072,6 +1138,7 @@ func (p *Proxy) serveRoute(w http.ResponseWriter, r *http.Request, route *vkeys.
 				if err != nil {
 					return nil
 				}
+				body = rewriteToolNamesReverseJSON(body, toolNameRevMapping)
 				resp.Body = io.NopCloser(bytes.NewReader(body))
 				resp.ContentLength = int64(len(body))
 
@@ -1114,7 +1181,12 @@ func (p *Proxy) serveRoute(w http.ResponseWriter, r *http.Request, route *vkeys.
 				if probe {
 					collector = nil
 				}
-				resp.Body = newStreamDrainer(resp.Body, baseEvent, prov, collector, p.proxyCtx, r.Context(), cb)
+				// Wrap upstream BEFORE streamDrainer so SSE chunks are line-
+				// buffered + tool_use.name rewritten before the drainer reads
+				// them. newSSEToolNameRewriter is a no-op pass-through when
+				// the mapping is empty (real CLI traffic).
+				upstream := newSSEToolNameRewriter(resp.Body, toolNameRevMapping)
+				resp.Body = newStreamDrainer(upstream, baseEvent, prov, collector, p.proxyCtx, r.Context(), cb)
 			}
 			return nil
 		},
@@ -1210,18 +1282,50 @@ func debug4xxEnabled() bool {
 // usually <500 bytes; Claude Code request bodies that trigger them sit
 // around 1-3 KB). Larger payloads get a `...<truncated>` marker so the
 // reader knows there was more.
-const debug4xxBodyCap = 4 * 1024
+//
+// AIKEY_PROXY_DEBUG_BODY_CAP_BYTES env override: third-party clients
+// (opencode/Cline/Cursor) routinely send 30-80 KB request bodies (tool
+// definitions + message history); the default 4 KB cap is too small to
+// see metadata.user_id / tools / late messages when chasing identity-
+// gating bugs. Setting the env to e.g. 65536 lets a focused diagnostic
+// session capture full bodies. Hard-capped at 1 MB so a misconfigured
+// value can't OOM the log writer.
+const (
+	debug4xxBodyCap        = 4 * 1024
+	debugBodyCapHardCeil   = 1024 * 1024
+	debugBodyCapEnvOverride = "AIKEY_PROXY_DEBUG_BODY_CAP_BYTES"
+)
+
+// resolvedBodyLogCap returns the active body-log cap, env override winning
+// over the compile-time default. Invalid env values fall back silently.
+func resolvedBodyLogCap() int {
+	if v := os.Getenv(debugBodyCapEnvOverride); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			if n > debugBodyCapHardCeil {
+				return debugBodyCapHardCeil
+			}
+			return n
+		}
+	}
+	return debug4xxBodyCap
+}
 
 // stashRequestBodyForDebug reads r.Body fully, stores the bytes in request
 // context for ModifyResponse to retrieve later, and re-buffers r.Body for
-// the actual upstream call. No-op when the flag is off, the body is empty,
-// or the body exceeds extractBodyHardLimit.
+// the actual upstream call. No-op when no debug flag is active, the body
+// is empty, or the body exceeds extractBodyHardLimit.
+//
+// Why two flags drive this: AIKEY_PROXY_DEBUG_4XX_BODIES historically gated
+// 4xx-only body capture; debugUpstreamHeadersEnabled() also drives request-
+// body capture so the broader upstream-snapshot toggle can include body
+// alongside headers (otherwise body diagnostics needs a separate restart
+// with the legacy env).
 //
 // Why context (not a header): bodies can be megabytes of conversation; cramming
 // them into headers would break upstream forwarding (header size limits,
 // inadvertent leaks via mirrored response headers).
 func stashRequestBodyForDebug(r *http.Request) {
-	if !debug4xxEnabled() || r.Body == nil {
+	if (!debug4xxEnabled() && !debugUpstreamHeadersEnabled()) || r.Body == nil {
 		return
 	}
 	if r.ContentLength > extractBodyHardLimit {
@@ -1243,14 +1347,16 @@ func debugRequestBodyFromContext(ctx context.Context) []byte {
 	return b
 }
 
-// truncateBodyForLog renders body bytes as a string, capping at
-// debug4xxBodyCap and appending an explicit truncation marker so the reader
-// knows the captured snippet is incomplete.
+// truncateBodyForLog renders body bytes as a string, capping at the
+// resolved body-log cap (env override or compile default) and appending
+// an explicit truncation marker so the reader knows the captured snippet
+// is incomplete.
 func truncateBodyForLog(b []byte) string {
-	if len(b) <= debug4xxBodyCap {
+	cap := resolvedBodyLogCap()
+	if len(b) <= cap {
 		return string(b)
 	}
-	return string(b[:debug4xxBodyCap]) + "...<truncated>"
+	return string(b[:cap]) + "...<truncated>"
 }
 
 // extractUpstreamRequestID pulls the provider's own request id out of the

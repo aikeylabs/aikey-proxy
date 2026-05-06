@@ -40,14 +40,28 @@ func oauthInject(req *http.Request, cred *OAuthCredential, providerCode string) 
 
 // injectClaudeOAuth injects the full Claude Code persona.
 //
-// CRITICAL (2026-04-16 verified):
-//   Bearer token alone → 401 "OAuth authentication not supported"
-//   + ?beta=true + anthropic-version → accepted as OAuth
-//   + anthropic-beta + X-Stainless-* → 429 business rejection (no X-RateLimit-Reset)
-//   + metadata.user_id + X-Claude-Code-Session-Id → 200 success
+// Layered requirements:
+//   - 2026-04-16 verified (header layer):
+//       Bearer token alone → 401 "OAuth authentication not supported"
+//       + ?beta=true + anthropic-version → accepted as OAuth
+//       + anthropic-beta + X-Stainless-* → 429 business rejection (no rate-limit headers)
+//       + metadata.user_id + X-Claude-Code-Session-Id → 200 (header layer satisfied)
+//   - 2026-05-06 verified (body layer): for premium models (Sonnet/Opus),
+//       headers alone are NOT enough. WAF additionally checks system[0]:
+//       must equal claudeCodeSystemPrompt OR contain x-anthropic-billing-header
+//       with cc_entrypoint=. Otherwise: same 429-no-rate-limit-headers signature.
+//       Haiku is exempt from the body check.
 //
-// All layers are required. Missing any one triggers rejection.
+// See injectClaudeWAFFingerprint + research doc
+// workflow/CI/research/oauth-token-response-identity/2026-04-15-oauth-token-response-identity.md
+// (sections "2026-05-06 增补 I" + "Round 5 / sub2api 对比").
 func injectClaudeOAuth(req *http.Request, cred *OAuthCredential) {
+	// Capture inbound origin before any header rewrites. Step 4b below
+	// forces UA to "claude-cli/X.Y.Z (external, cli)" for non-CLI clients,
+	// which would mask third-party origin from later detection. We need
+	// the genuine inbound UA for the step-7 WAF dispatch (skip vs apply).
+	inboundClientIsClaudeCode := clientIsClaudeCode(req)
+
 	// 1. Bearer token
 	req.Header.Set("Authorization", "Bearer "+cred.AccessToken)
 
@@ -85,7 +99,25 @@ func injectClaudeOAuth(req *http.Request, cred *OAuthCredential) {
 	// Claude Code persona headers — each guarded independently.
 	// Why per-header: a client may set some but not all (e.g. User-Agent without
 	// X-Stainless-*). Blanket overwrite would destroy client-set values.
-	setIfAbsent(req, "User-Agent", "claude-cli/2.1.22 (external, cli)")
+	//
+	// User-Agent is the one exception that needs conditional overwrite. The
+	// rest of these are setIfAbsent so a future Claude Code CLI version's own
+	// values (UA, X-Stainless-Package-Version, etc.) aren't downgraded to the
+	// hardcoded defaults below. But for User-Agent, third-party clients
+	// (opencode/Vercel AI SDK, Cursor, Cline) always set their own UA, which
+	// leaks through setIfAbsent and reaches Anthropic's OAuth WAF — it then
+	// rejects the request as "not a Claude Code session" with 429 + no
+	// X-RateLimit-Reset (business rejection signature, ref
+	// workflow/CI/research/oauth-token-exchange-test/main.go:16-17).
+	//
+	// Detect-and-replace: trust the inbound UA only if it already starts with
+	// "claude-cli/" (real CLI, forward-compat with future versions); otherwise
+	// force the verified persona UA. Other persona headers stay setIfAbsent
+	// because third-party clients rarely set them, so the leak vector is
+	// User-Agent specific.
+	if !strings.HasPrefix(req.Header.Get("User-Agent"), "claude-cli/") {
+		req.Header.Set("User-Agent", "claude-cli/2.1.22 (external, cli)")
+	}
 	setIfAbsent(req, "X-App", "cli")
 	setIfAbsent(req, "Anthropic-Dangerous-Direct-Browser-Access", "true")
 	setIfAbsent(req, "X-Stainless-Lang", "js")
@@ -117,6 +149,99 @@ func injectClaudeOAuth(req *http.Request, cred *OAuthCredential) {
 		userID := fmt.Sprintf("user_%s_account_%s_session_%s", deviceID, accountUUID, sessionID)
 		injectMetadataUserIDIfAbsent(req, userID)
 	}
+
+	// 7. WAF body fingerprint dispatch (2026-05-06 research).
+	// Anthropic's OAuth WAF gates premium models (Sonnet/Opus) on a body-side
+	// Claude Code fingerprint check. Bisection verified the rule (research doc
+	// 2026-05-06 增补 I + Round 5 sub2api 对比); we apply it ONLY to non-claude-cli
+	// clients here. Real Claude CLI traffic already carries the fingerprint in
+	// body.system, so a body rewrite is at best wasted I/O and at worst risks
+	// damaging real-CLI traffic semantics.
+	//
+	// Detection signal: inbound User-Agent prefix `claude-cli/` — captured BEFORE
+	// step 4b (UA detect-and-replace), which would force every UA to claude-cli/2.1.22
+	// regardless of origin.
+	if !inboundClientIsClaudeCode {
+		injectClaudeWAFFingerprintFull(req)
+		// Tool-name TitleCase rewrite for Anthropic's third-party gate. See
+		// oauth_tool_rewrite.go for protocol details and bisection-doc refs.
+		// Reverse rewrite happens in proxy.go ModifyResponse via the mapping
+		// stored on req.Context().
+		rewriteToolNamesForward(req)
+	}
+}
+
+// claudeCodeSystemPrompt is the byte-exact 57-char marker that Anthropic's
+// OAuth-path WAF uses to gate premium model access (Sonnet/Opus). Bisection-
+// verified 2026-05-06: when system[0].text equals exactly this string, the
+// WAF lets the request through; otherwise (and absent the alternative
+// billing-header form) the WAF returns 429 "rate_limit_error" with NO
+// anthropic-ratelimit-* headers — i.e. business rejection disguised as
+// rate limit.
+//
+// Reference:
+//   workflow/CI/research/oauth-token-response-identity/2026-04-15-oauth-token-response-identity.md
+//   (sections "2026-05-06 增补 I" and "Round 5 / sub2api 对比")
+const claudeCodeSystemPrompt = "You are Claude Code, Anthropic's official CLI for Claude."
+
+// isHaikuRequest checks the body's "model" field for a haiku marker. WAF
+// skips body fingerprint check for haiku models (round 1 verified).
+func isHaikuRequest(body map[string]any) bool {
+	model, _ := body["model"].(string)
+	return strings.Contains(strings.ToLower(model), "haiku")
+}
+
+// normalizeSystemAndCheckFingerprint normalizes body.system to an array
+// representation and reports whether system[0] already satisfies the WAF
+// fingerprint.
+//
+// Returns:
+//   - normalized: array form of the system field (caller can prepend to it)
+//   - alreadyOK:  true if system[0] already matches; caller should no-op
+func normalizeSystemAndCheckFingerprint(system any) (normalized []any, alreadyOK bool) {
+	switch v := system.(type) {
+	case nil:
+		return []any{}, false
+	case string:
+		// String form: wrap as a single text block.
+		block := map[string]any{"type": "text", "text": v}
+		return []any{block}, hasFingerprint(block)
+	case []any:
+		if len(v) > 0 {
+			if first, ok := v[0].(map[string]any); ok && hasFingerprint(first) {
+				return v, true
+			}
+		}
+		return v, false
+	case map[string]any:
+		// Non-standard but possible: single block object instead of array.
+		// Wrap as array so caller can prepend cleanly.
+		return []any{v}, hasFingerprint(v)
+	default:
+		// Unknown shape — wrap and let WAF prepend handle it.
+		return []any{v}, false
+	}
+}
+
+// hasFingerprint reports whether the given block is a text block whose
+// content satisfies the WAF check (either the exact magic intro, or a
+// billing-header form). All other shapes return false.
+func hasFingerprint(block map[string]any) bool {
+	if t, _ := block["type"].(string); t != "text" {
+		return false
+	}
+	text, _ := block["text"].(string)
+	if text == claudeCodeSystemPrompt {
+		return true
+	}
+	// Billing-header form: "x-anthropic-billing-header: ... cc_entrypoint=..."
+	// Round 4b verified that any cc_entrypoint value passes; only the prefix
+	// + the cc_entrypoint key need to be present.
+	if strings.HasPrefix(text, "x-anthropic-billing-header:") &&
+		strings.Contains(text, "cc_entrypoint=") {
+		return true
+	}
+	return false
 }
 
 // injectCodexOAuth injects Codex (ChatGPT Plus/Pro) headers.
