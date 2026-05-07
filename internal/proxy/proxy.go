@@ -1142,7 +1142,22 @@ func (p *Proxy) serveRoute(w http.ResponseWriter, r *http.Request, route *vkeys.
 				resp.Body = io.NopCloser(bytes.NewReader(body))
 				resp.ContentLength = int64(len(body))
 
-				breakdown := prov.ExtractTokenBreakdown(body, false)
+				breakdown := prov.ExtractTokenBreakdown(body, false, logger)
+				// Caller-side double defense per principles/logging-conventions.md:
+				// extractor may have logged a WARN for a known shape mismatch, but if
+				// it returned (0, 0) on a non-empty 2xx body without WARN'ing (new
+				// wire format the extractor wasn't updated for), this catches it.
+				if resp.StatusCode >= 200 && resp.StatusCode < 300 &&
+					len(body) > 100 &&
+					breakdown.InputTokens == 0 && breakdown.OutputTokens == 0 {
+					logger.Warn("non-streaming: 2xx response with non-empty body but extractor produced zero tokens",
+						"event.name", observability.EventProxyExtractionEmpty,
+						"error.code", observability.ErrCodeUsageExtractionFailed,
+						"provider", route.ProviderCode,
+						"path", r.URL.Path,
+						"body_len", len(body),
+					)
+				}
 				ev := p.buildBaseEvent(r, resp, startTime, route, false)
 				ev.InputTokens = breakdown.InputTokens
 				ev.OutputTokens = breakdown.OutputTokens
@@ -1186,7 +1201,7 @@ func (p *Proxy) serveRoute(w http.ResponseWriter, r *http.Request, route *vkeys.
 				// them. newSSEToolNameRewriter is a no-op pass-through when
 				// the mapping is empty (real CLI traffic).
 				upstream := newSSEToolNameRewriter(resp.Body, toolNameRevMapping)
-				resp.Body = newStreamDrainer(upstream, baseEvent, prov, collector, p.proxyCtx, r.Context(), cb)
+				resp.Body = newStreamDrainer(upstream, baseEvent, prov, collector, p.proxyCtx, r.Context(), logger, cb)
 			}
 			return nil
 		},

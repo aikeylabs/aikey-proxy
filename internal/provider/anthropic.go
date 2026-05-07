@@ -3,7 +3,10 @@ package provider
 import (
 	"bytes"
 	"encoding/json"
+	"log/slog"
 	"net/http"
+
+	"github.com/AiKeyLabs/aikey-proxy/internal/observability"
 )
 
 // Anthropic implements the Anthropic-compatible provider protocol.
@@ -53,15 +56,34 @@ func (a *Anthropic) RewriteRequest(req *http.Request, realKey string, baseURL st
 // that has filled the cache. Summing into the returned input preserves the
 // "how much did I send" semantics; a later cost-accounting pass can re-split
 // the fields with their respective price multipliers (~1.25x write / ~0.1x read).
-func (a *Anthropic) ExtractTokens(data []byte, streaming bool) (int, int) {
+func (a *Anthropic) ExtractTokens(data []byte, streaming bool, logger *slog.Logger) (int, int) {
+	if logger == nil {
+		logger = slog.Default()
+	}
 	if !streaming {
 		var resp struct {
 			Usage anthropicUsage `json:"usage"`
 		}
-		if json.Unmarshal(data, &resp) == nil {
-			return resp.Usage.totalInput(), resp.Usage.OutputTokens
+		if err := json.Unmarshal(data, &resp); err != nil {
+			logger.Warn("anthropic extractor: unmarshal failed",
+				"event.name", observability.EventProxyExtractionMismatch,
+				"error.code", observability.ErrCodeUsageExtractionFailed,
+				"error", err.Error(),
+				"body_len", len(data),
+				"body_preview", previewBody(data, 200),
+			)
+			return 0, 0
 		}
-		return 0, 0
+		in, out := resp.Usage.totalInput(), resp.Usage.OutputTokens
+		if in == 0 && out == 0 {
+			logger.Warn("anthropic extractor: usage parsed but all token fields zero (likely unknown wire format)",
+				"event.name", observability.EventProxyExtractionMismatch,
+				"error.code", observability.ErrCodeUsageExtractionFailed,
+				"body_len", len(data),
+				"body_preview", previewBody(data, 200),
+			)
+		}
+		return in, out
 	}
 
 	// Streaming: scan SSE lines.
@@ -80,6 +102,8 @@ func (a *Anthropic) ExtractTokens(data []byte, streaming bool) (int, int) {
 			} `json:"message"`
 			Usage anthropicUsage `json:"usage"`
 		}
+		// Per-frame parse errors are common in streaming (heartbeats,
+		// partial chunks). WARN only at stream end if no usage observed.
 		if json.Unmarshal(line, &event) != nil {
 			continue
 		}
@@ -89,6 +113,14 @@ func (a *Anthropic) ExtractTokens(data []byte, streaming bool) (int, int) {
 		case "message_delta":
 			outputTokens = event.Usage.OutputTokens
 		}
+	}
+	if inputTokens == 0 && outputTokens == 0 {
+		logger.Warn("anthropic extractor: no usage observed across stream",
+			"event.name", observability.EventProxyExtractionMismatch,
+			"error.code", observability.ErrCodeUsageExtractionFailed,
+			"body_len", len(data),
+			"body_preview", previewBody(data, 200),
+		)
 	}
 	return inputTokens, outputTokens
 }
@@ -115,23 +147,33 @@ func (u anthropicUsage) totalInput() int {
 //
 // StopReason is populated from `stop_reason`: top-level for non-streaming
 // responses, or `message_delta.delta.stop_reason` for streaming.
-func (a *Anthropic) ExtractTokenBreakdown(data []byte, streaming bool) TokenBreakdown {
+func (a *Anthropic) ExtractTokenBreakdown(data []byte, streaming bool, logger *slog.Logger) TokenBreakdown {
+	if logger == nil {
+		logger = slog.Default()
+	}
 	if !streaming {
 		var resp struct {
 			Usage      anthropicUsage `json:"usage"`
 			StopReason string         `json:"stop_reason"`
 		}
-		if json.Unmarshal(data, &resp) == nil {
-			u := resp.Usage
-			return TokenBreakdown{
-				InputTokens:              u.totalInput(),
-				OutputTokens:             u.OutputTokens,
-				CacheReadInputTokens:     u.CacheReadInputTokens,
-				CacheCreationInputTokens: u.CacheCreationInputTokens,
-				StopReason:               resp.StopReason,
-			}
+		if err := json.Unmarshal(data, &resp); err != nil {
+			logger.Warn("anthropic breakdown: unmarshal failed",
+				"event.name", observability.EventProxyExtractionMismatch,
+				"error.code", observability.ErrCodeUsageExtractionFailed,
+				"error", err.Error(),
+				"body_len", len(data),
+				"body_preview", previewBody(data, 200),
+			)
+			return TokenBreakdown{}
 		}
-		return TokenBreakdown{}
+		u := resp.Usage
+		return TokenBreakdown{
+			InputTokens:              u.totalInput(),
+			OutputTokens:             u.OutputTokens,
+			CacheReadInputTokens:     u.CacheReadInputTokens,
+			CacheCreationInputTokens: u.CacheCreationInputTokens,
+			StopReason:               resp.StopReason,
+		}
 	}
 
 	var br TokenBreakdown

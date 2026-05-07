@@ -91,7 +91,7 @@ func TestExtractTokens_CompatMatrix(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			data := loadFixture(t, tt.fixture)
-			gotIn, gotOut := tt.provider.ExtractTokens(data, tt.streaming)
+			gotIn, gotOut := tt.provider.ExtractTokens(data, tt.streaming, nil)
 			if gotIn != tt.wantIn {
 				t.Errorf("input_tokens = %d, want %d", gotIn, tt.wantIn)
 			}
@@ -122,7 +122,7 @@ func TestExtractTokens_NonZero_Positive(t *testing.T) {
 	for _, tt := range positives {
 		t.Run(tt.name, func(t *testing.T) {
 			data := loadFixture(t, tt.fixture)
-			in, out := tt.provider.ExtractTokens(data, tt.streaming)
+			in, out := tt.provider.ExtractTokens(data, tt.streaming, nil)
 			if in == 0 && out == 0 {
 				t.Errorf("both input_tokens and output_tokens are 0; expected non-zero usage")
 			}

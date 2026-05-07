@@ -2,6 +2,7 @@ package provider
 
 import (
 	"fmt"
+	"log/slog"
 	"net/http"
 )
 
@@ -63,13 +64,20 @@ type Provider interface {
 	// For non-streaming requests, data is the full JSON response body.
 	// For streaming requests, data is the full accumulated SSE stream.
 	// Returns (inputTokens, outputTokens); returns (0, 0) if unavailable.
-	ExtractTokens(data []byte, streaming bool) (inputTokens, outputTokens int)
+	//
+	// logger is used to emit WARN entries on every silent-fail path
+	// (unmarshal error, missing usage field, no usage chunk in stream, etc.)
+	// per principles/logging-conventions.md. Pass a request-scoped logger so
+	// trace_id / request_id auto-attach to the WARN. nil is allowed but
+	// strongly discouraged in production paths — pass slog.Default() if
+	// truly no request context.
+	ExtractTokens(data []byte, streaming bool, logger *slog.Logger) (inputTokens, outputTokens int)
 
 	// ExtractTokenBreakdown is the richer sibling of ExtractTokens. It returns
 	// the same input/output totals plus provider-specific cache details. The
 	// default implementation for OpenAI-family providers simply delegates to
 	// ExtractTokens and leaves the cache fields at zero.
-	ExtractTokenBreakdown(data []byte, streaming bool) TokenBreakdown
+	ExtractTokenBreakdown(data []byte, streaming bool, logger *slog.Logger) TokenBreakdown
 }
 
 // Registry maps protocol names to provider implementations.

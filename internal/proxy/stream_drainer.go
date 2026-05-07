@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"io"
+	"log/slog"
 	"time"
 
 	"github.com/AiKeyLabs/aikey-proxy/internal/events"
@@ -69,8 +70,12 @@ func newStreamDrainer(
 	collector *events.Collector,
 	proxyCtx context.Context,
 	reqCtx context.Context,
+	logger *slog.Logger,
 	onComplete reporterCallback,
 ) *streamDrainer {
+	if logger == nil {
+		logger = slog.Default()
+	}
 	pr, pw := io.Pipe()
 
 	// Watcher: close upstream as soon as the client disconnects or the proxy
@@ -146,7 +151,21 @@ func newStreamDrainer(
 		pw.Close()
 
 		// Record token usage from however much of the stream was received.
-		breakdown := prov.ExtractTokenBreakdown(acc.Bytes(), true)
+		breakdown := prov.ExtractTokenBreakdown(acc.Bytes(), true, logger)
+		// Caller-side double defense per principles/logging-conventions.md.
+		// Only fires when the stream completed normally — partial / interrupted
+		// streams legitimately have zero tokens because we never reached the
+		// usage frame.
+		if completion == "complete" &&
+			acc.Len() > 100 &&
+			breakdown.InputTokens == 0 && breakdown.OutputTokens == 0 {
+			logger.Warn("streaming: complete stream with non-empty body but extractor produced zero tokens",
+				"event.name", observability.EventProxyExtractionEmpty,
+				"error.code", observability.ErrCodeUsageExtractionFailed,
+				"provider", prov.Name(),
+				"body_len", acc.Len(),
+			)
+		}
 		ev := baseEvent
 		ev.InputTokens = breakdown.InputTokens
 		ev.OutputTokens = breakdown.OutputTokens

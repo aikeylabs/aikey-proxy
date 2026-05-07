@@ -188,6 +188,19 @@ The env var takes precedence over `log.level` in the system yaml. Useful
 for one-off debugging without touching files or restarting the install
 flow.
 
+### Logging conventions
+
+This service follows the project-wide logging spec — every silent-fail
+path (parser fallthrough, missing field, shape mismatch) must emit a
+WARN, callers add a second-layer "2xx + non-empty body + zero result"
+defense, and `event.name` / `error.code` come from a central enum
+(`internal/observability/handler.go`). New extractors must ship
+fixture-based tests that assert WARN emission on every failure path.
+
+See [logging-conventions.md](../workflow/CI/IDE/claude/principles/logging-conventions.md)
+for the full spec and the 2026-05-07 incident that motivated it
+(codex/Responses-API silent-zero token loss).
+
 Full design (system / user split, migrate-config-split upgrade flow,
 removed-registry, deprecation rules):
 `roadmap20260320/技术实现/开源版本方案/config-split-system-user.md`.

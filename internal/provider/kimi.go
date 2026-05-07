@@ -1,19 +1,20 @@
 package provider
 
 import (
+	"log/slog"
 	"net/http"
 )
 
 // ExtractTokens delegates to the OpenAI-compatible implementation
 // since Kimi follows the same response format.
-func (k *Kimi) ExtractTokens(data []byte, streaming bool) (int, int) {
-	return (&OpenAI{}).ExtractTokens(data, streaming)
+func (k *Kimi) ExtractTokens(data []byte, streaming bool, logger *slog.Logger) (int, int) {
+	return (&OpenAI{}).ExtractTokens(data, streaming, logger)
 }
 
 // ExtractTokenBreakdown delegates to the OpenAI implementation; Kimi has no
 // provider-specific cache semantics beyond what OpenAI exposes.
-func (k *Kimi) ExtractTokenBreakdown(data []byte, streaming bool) TokenBreakdown {
-	return (&OpenAI{}).ExtractTokenBreakdown(data, streaming)
+func (k *Kimi) ExtractTokenBreakdown(data []byte, streaming bool, logger *slog.Logger) TokenBreakdown {
+	return (&OpenAI{}).ExtractTokenBreakdown(data, streaming, logger)
 }
 
 // Kimi implements the Moonshot AI (Kimi) provider protocol.

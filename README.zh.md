@@ -65,6 +65,12 @@ AIKEY_PROXY_LOG_LEVEL=debug ./bin/aikey-proxy --config aikey-proxy.yaml
 
 env 优先于 system yaml 中的 `log.level`，适合一次性调试，不需要改文件 + 重装流程。
 
+### 日志规范
+
+本服务遵守项目级日志规范——所有静默失败路径（parser 回落、字段缺失、shape 不匹配）必须打 WARN；调用方对"2xx + body 非空 + 解析结果全 0"做二层兜底；`event.name` / `error.code` 在中央枚举里定义（`internal/observability/handler.go`）。新增 extractor 必须配 fixture-based 测试，对每条失败路径断言 WARN 命中。
+
+详见 [logging-conventions.md](../workflow/CI/IDE/claude/principles/logging-conventions.md),含 2026-05-07 codex/Responses-API token 静默归零事故的根因和修法。
+
 完整方案（system/user 拆分、migrate-config-split 升级、removed-registry、deprecation 规则）：
 `roadmap20260320/技术实现/开源版本方案/config-split-system-user.md`
 

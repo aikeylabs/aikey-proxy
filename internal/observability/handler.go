@@ -44,15 +44,31 @@ const (
 	EventProxyRequestCompleted     = "proxy.request.completed"
 )
 
+// Usage extraction events.
+//
+// EventProxyExtractionMismatch fires when an extractor falls back to defaults
+// because the response body doesn't match expected wire format (json error,
+// missing usage field, unknown field names like Responses API's
+// input_tokens/output_tokens vs Chat Completions' prompt_tokens/completion_tokens).
+//
+// EventProxyExtractionEmpty is the caller-side double-defense: HTTP 200 with
+// non-empty body but extractor returned (0, 0). Catches the case where a new
+// wire format ships and the extractor wasn't updated to log Mismatch for it.
+const (
+	EventProxyExtractionMismatch = "proxy.extraction.shape_mismatch"
+	EventProxyExtractionEmpty    = "proxy.extraction.empty"
+)
+
 // ---- Error code constants ----
 
 const (
-	ErrCodeTokenMissing         = "TOKEN_MISSING"
-	ErrCodeTokenInvalid         = "TOKEN_INVALID"
-	ErrCodePolicyModelForbidden = "POLICY_MODEL_FORBIDDEN"
-	ErrCodeSecretNotConfigured  = "SECRET_NOT_CONFIGURED"
-	ErrCodeUpstreamError        = "UPSTREAM_ERROR"
-	ErrCodeProviderError        = "PROVIDER_ERROR"
+	ErrCodeTokenMissing          = "TOKEN_MISSING"
+	ErrCodeTokenInvalid          = "TOKEN_INVALID"
+	ErrCodePolicyModelForbidden  = "POLICY_MODEL_FORBIDDEN"
+	ErrCodeSecretNotConfigured   = "SECRET_NOT_CONFIGURED"
+	ErrCodeUpstreamError         = "UPSTREAM_ERROR"
+	ErrCodeProviderError         = "PROVIDER_ERROR"
+	ErrCodeUsageExtractionFailed = "USAGE_EXTRACTION_FAILED"
 )
 
 // ---- HealthSnapshot ----

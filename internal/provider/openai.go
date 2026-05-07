@@ -3,7 +3,10 @@ package provider
 import (
 	"bytes"
 	"encoding/json"
+	"log/slog"
 	"net/http"
+
+	"github.com/AiKeyLabs/aikey-proxy/internal/observability"
 )
 
 // OpenAI implements the OpenAI-compatible provider protocol.
@@ -22,33 +25,63 @@ func (o *OpenAI) RewriteRequest(req *http.Request, realKey string, baseURL strin
 
 // ExtractTokens parses OpenAI token usage.
 //
-// Non-streaming response body:
+// Two wire formats supported (auto-detected via field presence):
+//
+// 1. Chat Completions API (`/v1/chat/completions`):
 //
 //	{"usage": {"prompt_tokens": N, "completion_tokens": N}}
 //
-// Streaming: requires stream_options.include_usage=true; the last data chunk
-// before [DONE] carries the same usage object.
-func (o *OpenAI) ExtractTokens(data []byte, streaming bool) (int, int) {
-	// usageChunk uses a pointer for Usage so we can distinguish "field absent"
-	// (nil) from "field present with zero values" (e.g. prompt_tokens: 0).
-	type usageData struct {
-		PromptTokens     int `json:"prompt_tokens"`
-		CompletionTokens int `json:"completion_tokens"`
-	}
-	type usageChunk struct {
-		Usage *usageData `json:"usage"`
+// 2. Responses API (`/v1/responses`, used by codex with wire_api="responses"):
+//
+//	{"usage": {"input_tokens": N, "output_tokens": N}}
+//
+// Streaming: Chat Completions requires stream_options.include_usage=true; the
+// last data chunk before [DONE] carries the same usage object. Responses API
+// emits `response.completed` with embedded `response.usage`.
+//
+// Per principles/logging-conventions.md: every silent-zero path emits a WARN
+// with event.name=proxy.extraction.shape_mismatch + body_preview so an
+// operator can tell from one log line which wire format was unrecognized.
+func (o *OpenAI) ExtractTokens(data []byte, streaming bool, logger *slog.Logger) (int, int) {
+	if logger == nil {
+		logger = slog.Default()
 	}
 	if !streaming {
-		var resp usageChunk
-		if json.Unmarshal(data, &resp) == nil && resp.Usage != nil {
-			return resp.Usage.PromptTokens, resp.Usage.CompletionTokens
+		var resp openaiUsageEnvelope
+		if err := json.Unmarshal(data, &resp); err != nil {
+			logger.Warn("openai extractor: unmarshal failed",
+				"event.name", observability.EventProxyExtractionMismatch,
+				"error.code", observability.ErrCodeUsageExtractionFailed,
+				"error", err.Error(),
+				"body_len", len(data),
+				"body_preview", previewBody(data, 200),
+			)
+			return 0, 0
 		}
-		return 0, 0
+		if resp.Usage == nil {
+			logger.Warn("openai extractor: usage field missing on non-streaming response",
+				"event.name", observability.EventProxyExtractionMismatch,
+				"error.code", observability.ErrCodeUsageExtractionFailed,
+				"body_len", len(data),
+				"body_preview", previewBody(data, 200),
+			)
+			return 0, 0
+		}
+		in, out := resp.Usage.Resolve()
+		if in == 0 && out == 0 {
+			logger.Warn("openai extractor: usage object present but all token fields zero (likely unknown wire format)",
+				"event.name", observability.EventProxyExtractionMismatch,
+				"error.code", observability.ErrCodeUsageExtractionFailed,
+				"body_len", len(data),
+				"body_preview", previewBody(data, 200),
+			)
+		}
+		return in, out
 	}
 
 	// Streaming: scan SSE lines for a chunk that contains usage.
-	// The usage object appears in the final data chunk before [DONE]
-	// (requires stream_options.include_usage=true in the request).
+	// Both Chat Completions ([DONE] sentinel) and Responses API
+	// (response.completed event with embedded response.usage) are tried.
 	for _, line := range bytes.Split(data, []byte("\n")) {
 		line = bytes.TrimSpace(line)
 		// Strip SSE "data:" prefix. Some providers use "data: " (with space,
@@ -60,15 +93,83 @@ func (o *OpenAI) ExtractTokens(data []byte, streaming bool) (int, int) {
 		if len(line) == 0 || line[0] != '{' {
 			continue
 		}
-		var chunk usageChunk
-		// Why pointer check (Usage != nil) instead of PromptTokens > 0:
-		// some providers return prompt_tokens=0 for fully cached requests;
-		// the old > 0 check silently dropped those as "no usage".
-		if json.Unmarshal(line, &chunk) == nil && chunk.Usage != nil {
-			return chunk.Usage.PromptTokens, chunk.Usage.CompletionTokens
+		var chunk openaiUsageEnvelope
+		if err := json.Unmarshal(line, &chunk); err != nil {
+			// Per-frame parse errors during streaming are common (heartbeat
+			// frames, partial chunks). Don't WARN per-frame — only WARN at
+			// stream end if no usage was captured at all.
+			continue
+		}
+		// Why pointer check (Usage != nil) instead of value > 0:
+		// some providers return prompt_tokens=0 for fully cached requests.
+		if chunk.Usage != nil {
+			in, out := chunk.Usage.Resolve()
+			if in == 0 && out == 0 {
+				logger.Warn("openai extractor: streaming usage frame had all-zero tokens",
+					"event.name", observability.EventProxyExtractionMismatch,
+					"error.code", observability.ErrCodeUsageExtractionFailed,
+					"frame_preview", previewBody(line, 200),
+				)
+			}
+			return in, out
+		}
+		// Responses API: usage is nested under "response" on the
+		// response.completed event.
+		if chunk.Response != nil && chunk.Response.Usage != nil {
+			in, out := chunk.Response.Usage.Resolve()
+			if in == 0 && out == 0 {
+				logger.Warn("openai extractor: Responses API streaming usage had all-zero tokens",
+					"event.name", observability.EventProxyExtractionMismatch,
+					"error.code", observability.ErrCodeUsageExtractionFailed,
+					"frame_preview", previewBody(line, 200),
+				)
+			}
+			return in, out
 		}
 	}
+	logger.Warn("openai extractor: no usage chunk found in stream",
+		"event.name", observability.EventProxyExtractionMismatch,
+		"error.code", observability.ErrCodeUsageExtractionFailed,
+		"body_len", len(data),
+		"body_preview", previewBody(data, 200),
+	)
 	return 0, 0
+}
+
+// openaiUsageData mirrors fields from both Chat Completions and Responses APIs.
+// Resolve() picks whichever pair is non-zero so a single struct handles both.
+type openaiUsageData struct {
+	// Chat Completions API
+	PromptTokens     int `json:"prompt_tokens"`
+	CompletionTokens int `json:"completion_tokens"`
+	// Responses API (codex, GPT-5, etc.)
+	InputTokens  int `json:"input_tokens"`
+	OutputTokens int `json:"output_tokens"`
+}
+
+// Resolve returns (input, output) from whichever wire format populated them.
+// If both are populated (shouldn't happen but tolerated), Chat Completions wins.
+func (u *openaiUsageData) Resolve() (int, int) {
+	in := u.PromptTokens
+	if in == 0 {
+		in = u.InputTokens
+	}
+	out := u.CompletionTokens
+	if out == 0 {
+		out = u.OutputTokens
+	}
+	return in, out
+}
+
+// openaiUsageEnvelope wraps both top-level usage (Chat Completions, streaming
+// chunks) and response-nested usage (Responses API streaming).
+type openaiUsageEnvelope struct {
+	Usage *openaiUsageData `json:"usage"`
+	// Responses API streaming wraps usage in `response`:
+	//   {"type":"response.completed","response":{"usage":{...}}}
+	Response *struct {
+		Usage *openaiUsageData `json:"usage"`
+	} `json:"response,omitempty"`
 }
 
 // ExtractTokenBreakdown delegates to ExtractTokens for the token numbers
@@ -82,8 +183,8 @@ func (o *OpenAI) ExtractTokens(data []byte, streaming bool) (int, int) {
 // Streaming spec: `finish_reason` only appears on the final delta chunk
 // (before `[DONE]`). We scan SSE lines same as ExtractTokens and capture
 // the last non-empty finish_reason seen.
-func (o *OpenAI) ExtractTokenBreakdown(data []byte, streaming bool) TokenBreakdown {
-	in, out := o.ExtractTokens(data, streaming)
+func (o *OpenAI) ExtractTokenBreakdown(data []byte, streaming bool, logger *slog.Logger) TokenBreakdown {
+	in, out := o.ExtractTokens(data, streaming, logger)
 	br := TokenBreakdown{InputTokens: in, OutputTokens: out}
 	br.StopReason = extractOpenAIStopReason(data, streaming)
 	return br
@@ -127,4 +228,32 @@ func extractOpenAIStopReason(data []byte, streaming bool) string {
 		}
 	}
 	return lastReason
+}
+
+// previewBody returns a UTF-8 safe preview of the body (≤max bytes) for
+// inclusion in WARN logs. Trims any trailing newlines and replaces non-ASCII
+// control bytes with '?' so the log line stays grep-friendly. Long bodies
+// get a "..." suffix.
+func previewBody(data []byte, max int) string {
+	if len(data) == 0 {
+		return ""
+	}
+	end := len(data)
+	suffix := ""
+	if end > max {
+		end = max
+		suffix = "..."
+	}
+	// Make a sanitized copy: replace control bytes other than \t with '?'.
+	out := make([]byte, end)
+	for i, b := range data[:end] {
+		if b < 0x20 && b != '\t' {
+			out[i] = '?'
+		} else if b == 0x7f {
+			out[i] = '?'
+		} else {
+			out[i] = b
+		}
+	}
+	return string(out) + suffix
 }

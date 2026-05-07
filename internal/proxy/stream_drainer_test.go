@@ -107,7 +107,7 @@ func TestStreamDrainer_ForwardsFullStream(t *testing.T) {
 	collector, store := newTestCollector(t)
 	baseEvent := events.UsageEvent{Timestamp: time.Now(), VirtualKeyID: "vk_test", Provider: "anthropic"}
 
-	drainer := newStreamDrainer(upstream, baseEvent, &provider.Anthropic{}, collector, context.Background(), context.Background(), nil)
+	drainer := newStreamDrainer(upstream, baseEvent, &provider.Anthropic{}, collector, context.Background(), context.Background(), nil, nil)
 
 	got, err := io.ReadAll(drainer)
 	if err != nil {
@@ -143,7 +143,7 @@ func TestStreamDrainer_RecordsTokensOnStreamEnd(t *testing.T) {
 		StatusCode:   200,
 	}
 
-	drainer := newStreamDrainer(upstream, baseEvent, &provider.Anthropic{}, collector, context.Background(), context.Background(), nil)
+	drainer := newStreamDrainer(upstream, baseEvent, &provider.Anthropic{}, collector, context.Background(), context.Background(), nil, nil)
 	io.ReadAll(drainer)
 	drainer.Close()
 
@@ -180,7 +180,7 @@ func TestStreamDrainer_StopsOnClientDisconnect(t *testing.T) {
 	collector, store := newTestCollector(t)
 	baseEvent := events.UsageEvent{Timestamp: time.Now()}
 
-	drainer := newStreamDrainer(upstreamPR, baseEvent, &provider.Anthropic{}, collector, context.Background(), context.Background(), nil)
+	drainer := newStreamDrainer(upstreamPR, baseEvent, &provider.Anthropic{}, collector, context.Background(), context.Background(), nil, nil)
 
 	// Write first part (message_start) to upstream.
 	go func() { upstreamPW.Write([]byte(firstPart)) }()
@@ -225,7 +225,7 @@ func TestStreamDrainer_ProxyContextAbort(t *testing.T) {
 	collector, store := newTestCollector(t)
 	baseEvent := events.UsageEvent{Timestamp: time.Now()}
 
-	drainer := newStreamDrainer(pr, baseEvent, &provider.Anthropic{}, collector, proxyCtx, context.Background(), nil)
+	drainer := newStreamDrainer(pr, baseEvent, &provider.Anthropic{}, collector, proxyCtx, context.Background(), nil, nil)
 
 	// Cancel proxy context — goroutine should exit.
 	cancelProxy()
@@ -258,7 +258,7 @@ func TestStreamDrainer_EmptyStream(t *testing.T) {
 	collector, store := newTestCollector(t)
 	baseEvent := events.UsageEvent{Timestamp: time.Now()}
 
-	drainer := newStreamDrainer(upstream, baseEvent, &provider.Anthropic{}, collector, context.Background(), context.Background(), nil)
+	drainer := newStreamDrainer(upstream, baseEvent, &provider.Anthropic{}, collector, context.Background(), context.Background(), nil, nil)
 	io.ReadAll(drainer)
 	drainer.Close()
 
@@ -276,7 +276,7 @@ func TestStreamDrainer_DurationRecorded(t *testing.T) {
 	collector, store := newTestCollector(t)
 	baseEvent := events.UsageEvent{Timestamp: time.Now()}
 
-	drainer := newStreamDrainer(upstream, baseEvent, &provider.Anthropic{}, collector, context.Background(), context.Background(), nil)
+	drainer := newStreamDrainer(upstream, baseEvent, &provider.Anthropic{}, collector, context.Background(), context.Background(), nil, nil)
 	io.ReadAll(drainer)
 	drainer.Close()
 
@@ -321,6 +321,7 @@ func TestStreamDrainer_NilCollectorDoesNotPanic(t *testing.T) {
 		upstream, baseEvent, &provider.Anthropic{},
 		nil, // ← the nil that used to panic
 		context.Background(), context.Background(),
+		nil, // logger
 		cb,
 	)
 
