@@ -30,7 +30,10 @@ func oauthInject(req *http.Request, cred *OAuthCredential, providerCode string) 
 		injectClaudeOAuth(req, cred)
 	case "openai":
 		injectCodexOAuth(req, cred)
-	case "kimi", "moonshot":
+	// 2026-05-08 Kimi 双平台拆分: 'kimi' 是 deprecated alias,'kimi_code' 与
+	// 'moonshot' 都用 Kimi OAuth 协议 (kimi-cli upstream client_id);三者共用
+	// 同一注入路径。
+	case "kimi_code", "moonshot", "kimi":
 		injectKimiOAuth(req, cred)
 	default:
 		// Generic: just set Bearer token

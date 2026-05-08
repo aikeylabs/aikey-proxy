@@ -287,8 +287,19 @@ func (p *Proxy) Handle(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	// 5. Get provider adapter.
-	prov, err := p.providers.Get(route.Provider)
+	// 5. Get provider adapter — use protocol type (e.g. "openai_compatible"),
+	// not the provider_code (e.g. "kimi_code"). 2026-05-08 Kimi 双平台拆分:
+	// pre-split route.Provider 同时是 provider_code 又是 adapter registry key
+	// (因 "kimi"/"openai" 字面值刚好相同),post-split 新 provider_codes
+	// ("kimi_code" / "moonshot") **不是** adapter registry key —— adapter 是
+	// 按 protocol 注册 (openai_compatible / anthropic / kimi / generic)。
+	// 与 handlePathPrefixRoute 对齐用 protocol 查找,避免 502 PROVIDER_ERROR。
+	// route.ProtocolType 兜底退回 route.Provider 防 pre-2026-05-08 fixture。
+	adapterKey := route.ProtocolType
+	if adapterKey == "" {
+		adapterKey = route.Provider
+	}
+	prov, err := p.providers.Get(adapterKey)
 	if err != nil {
 		p.errors.Add(1)
 		logger.Error("unknown provider",
@@ -297,7 +308,7 @@ func (p *Proxy) Handle(w http.ResponseWriter, r *http.Request) {
 			"error.message", err.Error(),
 		)
 		writeJSONError(w, http.StatusBadGateway, "server_error", "PROVIDER_ERROR",
-			"Unknown provider: "+route.Provider)
+			"Unknown provider protocol: "+adapterKey)
 		return
 	}
 
@@ -1241,11 +1252,23 @@ func (p *Proxy) serveRoute(w http.ResponseWriter, r *http.Request, route *vkeys.
 
 // buildBaseEvent constructs a UsageEvent from the request/response metadata,
 // without token counts (filled in by callers that have the response body).
+//
+// 2026-05-08 Kimi 双平台拆分: Provider 字段优先用 canonical ProviderCode (e.g.
+// "kimi_code"),不用 URL-prefix 的 Provider (e.g. "kimi" deprecated alias) ——
+// 否则同一 vault entry 经 deprecated /kimi/v1 路径请求时 events.provider 写入
+// "kimi",而经 /kimi_code/v1 路径请求时写入 "kimi_code",计费 / 用量聚合时
+// 会被算成两个 provider,造成数据分裂。canonical ProviderCode 是 single source。
+// route.Provider 仍保留 URL-prefix 形式给其他 (调试 / RequestPath 关联) 用途。
 func (p *Proxy) buildBaseEvent(req *http.Request, resp *http.Response, startTime time.Time, route *vkeys.ResolvedRoute, streaming bool) events.UsageEvent {
+	provider := route.ProviderCode
+	if provider == "" {
+		// 极端兜底:ResolvedRoute 没填 ProviderCode 时退回 URL-form,避免空字符串
+		provider = route.Provider
+	}
 	ev := events.UsageEvent{
 		Timestamp:    startTime,
 		VirtualKeyID: route.VirtualKeyID,
-		Provider:     route.Provider,
+		Provider:     provider,
 		DurationMs:   time.Since(startTime).Milliseconds(),
 		StatusCode:   resp.StatusCode,
 		IsStreaming:  streaming,
@@ -1468,12 +1491,18 @@ func (p *Proxy) reportUsage(route *vkeys.ResolvedRoute, bearerToken, model strin
 //     must not conflate them.
 //
 // `providerCode` should be the route's canonical provider code (e.g.
-// "kimi", "anthropic"), not a URL-derived alias.
+// "kimi_code", "moonshot", "anthropic"), not a URL-derived alias.
+//
+// 2026-05-08 Kimi 双平台拆分: provider_code 'kimi' 拆为 'kimi_code' (Kimi Code)
+// + 'moonshot' (Moonshot)。两个平台都基于 Kimi 上游协议,都使用
+// `prompt_cache_key` 作为 session id 字段,所以都需要从 stash header 提取。
+// 'kimi' 保留为 deprecated alias 兜底 (老 vault 数据 / 手工构造场景)。
 func resolveSessionID(h http.Header, providerCode string) string {
 	if v := h.Get("X-Claude-Code-Session-Id"); v != "" {
 		return v
 	}
-	if providerCode == "kimi" {
+	switch providerCode {
+	case "kimi_code", "moonshot", "kimi":
 		return h.Get("x-aikey-kimi-session")
 	}
 	return ""

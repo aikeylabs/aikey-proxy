@@ -137,7 +137,9 @@ func isProviderCompatible(route *vkeys.ResolvedRoute, canonicalCode string) bool
 func extractProviderFromPath(path string) (providerCode, strippedPath string) {
 	// List covers both canonical codes and common brand-name aliases that may
 	// appear in base URLs written by older CLI versions or non-normalised keys.
-	known := []string{"anthropic", "claude", "openai", "google", "kimi", "deepseek", "moonshot"}
+	// 2026-05-08 Kimi 双平台拆分: 加 'kimi_code' 作为 path-prefix 候选。'kimi' 保留
+	// 作为 deprecated path-prefix(老 shell hook 已写到用户 env,不能断流)。
+	known := []string{"anthropic", "claude", "openai", "google", "kimi_code", "kimi", "deepseek", "moonshot"}
 	for _, code := range known {
 		prefix := "/" + code
 		if strings.HasPrefix(path, prefix+"/") || path == prefix {
@@ -182,12 +184,21 @@ func providerDefaultBaseURL(providerCode string) string {
 		return "https://api.openai.com/v1"
 	case "google", "gemini":
 		return "https://generativelanguage.googleapis.com"
-	case "kimi", "moonshot":
-		// Why no /v1: path-prefix routing strips "/kimi" leaving "/v1/chat/completions".
-		// applyBaseURL prepends the base path, so /coding + /v1/... = /coding/v1/...
-		// If we used /coding/v1 here, it would become /coding/v1/v1/... (double v1)
-		// because the duplicate-prefix check only matches identical prefixes.
+	case "kimi_code", "kimi":
+		// 2026-05-08 Kimi 双平台拆分:
+		//   - 'kimi_code' = canonical 新码 (Kimi Code 平台 https://api.kimi.com/coding)
+		//   - 'kimi'      = deprecated alias, mirrors kimi_code (vault 升级残留 / 手工
+		//                   构造数据兜底; provider_registry.yaml 同样把 'kimi' 留作 alias)
+		// Why no /v1: path-prefix routing strips "/kimi_code" / "/kimi" leaving
+		// "/v1/chat/completions". applyBaseURL prepends the base path, so /coding +
+		// /v1/... = /coding/v1/... If we used /coding/v1 here, it would become
+		// /coding/v1/v1/... (double v1).
 		return "https://api.kimi.com/coding"
+	case "moonshot":
+		// 2026-05-08 Kimi 双平台拆分: Moonshot 平台真实 upstream (api.moonshot.cn);
+		// pre-split 这里和 'kimi' 共用同一 case 错误地路由到 Kimi Code endpoint。
+		// Why no /v1: 同 kimi_code,path-prefix routing 已剥掉 /moonshot,留下 /v1/...
+		return "https://api.moonshot.cn"
 	case "deepseek":
 		// Why: same reason as openai — deepseek SDK expects /v1 in base_url.
 		return "https://api.deepseek.com/v1"
@@ -230,6 +241,12 @@ func providerCanonicalCode(providerCode string) string {
 		return "openai"
 	case "gemini":
 		return "google"
+	// 2026-05-08 Kimi 双平台拆分: 'kimi' 是 deprecated alias,canonical 形态是
+	// 'kimi_code'。这样 vault 查询 (GetProviderBinding) + isProviderCompatible
+	// 在新旧 path-prefix / vault 数据之间都能正确匹配。详见
+	// roadmap20260320/技术实现/update/20260508-Kimi双平台拆分-moonshot与kimi-code.md
+	case "kimi":
+		return "kimi_code"
 
 	// ── P0/P1 additions (2026-04-24) ──
 	case "grok", "xai_grok":

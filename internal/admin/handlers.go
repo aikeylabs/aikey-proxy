@@ -70,7 +70,10 @@ var knownProviders = []struct {
 	{"anthropic", "https://api.anthropic.com"},
 	{"openai", "https://api.openai.com/v1"},
 	{"deepseek", "https://api.deepseek.com/v1"},
-	{"kimi", "https://api.kimi.com/coding"},
+	// 2026-05-08 Kimi 双平台拆分: 'kimi' 拆为 'kimi_code' (api.kimi.com) +
+	// 'moonshot' (api.moonshot.cn);两条都进 admin probe 列表。
+	{"kimi_code", "https://api.kimi.com/coding"},
+	{"moonshot", "https://api.moonshot.cn"},
 	{"google", "https://generativelanguage.googleapis.com"},
 }
 
@@ -384,8 +387,15 @@ func probeKey(client *http.Client, t KeyCheckTarget) (int, error) {
 		return probeAnthropic(client, baseURL, t.APIKey)
 	case "google", "gemini":
 		return probeGoogle(client, baseURL, t.APIKey)
-	default: // openai, deepseek, kimi, moonshot, etc.
-		return probeOpenAICompat(client, baseURL, t.APIKey, probeModelForProtocol(t.Protocol))
+	default: // openai, deepseek, kimi_code, moonshot, etc.
+		// 2026-05-08 Kimi 双平台拆分 review feedback (medium):
+		// probeModelForProtocol 名字误导,实际接收 provider code 而非 protocol。
+		// supervisor.go::providerProtocol 把 kimi_code/moonshot 都归到 "openai"
+		// protocol,如果传 t.Protocol 则永远命中默认 gpt-4o-mini,api.kimi.com
+		// 会 reject。改传 t.Provider (provider_code: kimi_code / moonshot / ...) ,
+		// probeModelForProtocol 内的 kimi_code → kimi-k2.5、moonshot → moonshot-v1-8k
+		// case 才能真正生效。
+		return probeOpenAICompat(client, baseURL, t.APIKey, probeModelForProtocol(t.Provider))
 	}
 }
 
@@ -447,8 +457,11 @@ func probeModelForProtocol(protocol string) string {
 	switch strings.ToLower(protocol) {
 	case "deepseek":
 		return "deepseek-chat"
-	case "kimi", "moonshot":
-		return "moonshot-v1-8k"
+	// 2026-05-08 Kimi 双平台拆分: 两个平台用不同 model 名 (kimi-cli upstream 自带规范)
+	case "kimi_code", "kimi":
+		return "kimi-k2.5" // Kimi Code (api.kimi.com),'kimi' 是 deprecated alias
+	case "moonshot":
+		return "moonshot-v1-8k" // Moonshot (api.moonshot.cn)
 	default: // openai and any other OpenAI-compatible gateway
 		return "gpt-4o-mini"
 	}
@@ -463,8 +476,12 @@ func providerDefaultBaseURL(code string) string {
 		return "https://api.openai.com/v1"
 	case "google", "gemini":
 		return "https://generativelanguage.googleapis.com"
-	case "kimi", "moonshot":
+	// 2026-05-08 Kimi 双平台拆分: 拆 case,'kimi' 为 deprecated alias 与 kimi_code
+	// 同 endpoint;moonshot 是独立的 api.moonshot.cn upstream。
+	case "kimi_code", "kimi":
 		return "https://api.kimi.com/coding"
+	case "moonshot":
+		return "https://api.moonshot.cn"
 	case "deepseek":
 		return "https://api.deepseek.com/v1"
 	default:

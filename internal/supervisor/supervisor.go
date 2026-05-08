@@ -65,8 +65,12 @@ func providerDefaultBaseURL(providerCode string) string {
 		return "https://api.openai.com/v1"
 	case "google", "gemini":
 		return "https://generativelanguage.googleapis.com"
-	case "kimi", "moonshot":
+	// 2026-05-08 Kimi 双平台拆分: kimi/moonshot 拆 case (pre-split 共用 case
+	// 错误地把 moonshot 路由到 Kimi Code endpoint)。'kimi' 为 deprecated alias。
+	case "kimi_code", "kimi":
 		return "https://api.kimi.com/coding"
+	case "moonshot":
+		return "https://api.moonshot.cn"
 	case "deepseek":
 		return "https://api.deepseek.com/v1"
 	default:
@@ -556,8 +560,11 @@ func personalProviderBaseURL(code string) string {
 		return "https://api.openai.com/v1"
 	case "google", "gemini":
 		return "https://generativelanguage.googleapis.com"
-	case "kimi", "moonshot":
+	// 2026-05-08 Kimi 双平台拆分(同 supervisor.providerDefaultBaseURL)
+	case "kimi_code", "kimi":
 		return "https://api.kimi.com/coding"
+	case "moonshot":
+		return "https://api.moonshot.cn"
 	case "deepseek":
 		return "https://api.deepseek.com/v1"
 	default:

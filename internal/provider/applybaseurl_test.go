@@ -160,8 +160,11 @@ func TestProviderRoutesTable(t *testing.T) {
 		baseURL  string
 		version  string
 	}{
-		{"api.kimi.com", "kimi", "https://api.kimi.com/coding", "/v1"},
-		{"api.moonshot.cn", "kimi", "https://api.moonshot.cn", "/v1"},
+		// 2026-05-08 Kimi 双平台拆分: api.kimi.com → kimi_code (canonical),
+		// api.moonshot.cn → moonshot,两个独立 provider_code,与同步过来的
+		// pkg/providerroutes/data/provider_fingerprint.yaml 一致。
+		{"api.kimi.com", "kimi_code", "https://api.kimi.com/coding", "/v1"},
+		{"api.moonshot.cn", "moonshot", "https://api.moonshot.cn", "/v1"},
 		{"api.anthropic.com", "anthropic", "https://api.anthropic.com", "/v1"},
 		{"api.openai.com", "openai", "https://api.openai.com", "/v1"},
 		{"api.perplexity.ai", "perplexity", "https://api.perplexity.ai", ""},
