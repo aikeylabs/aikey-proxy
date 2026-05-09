@@ -182,9 +182,22 @@ type ManagedKey struct {
 	OwnerAccountID     string
 }
 
-// GetActiveManagedKeys reads all rows from managed_virtual_keys_cache where
-// local_state = 'active' and provider_key_ciphertext IS NOT NULL, then decrypts
-// each provider key using the vault AES key derived at Open time.
+// GetActiveManagedKeys reads all team keys from managed_virtual_keys_cache that
+// are usable for routing — i.e. server says active, ciphertext downloaded, and
+// not explicitly disabled or stale on the client side. Decrypts each provider
+// key using the vault AES key derived at Open time.
+//
+// Why no local_state='active' gate (2026-05-09): the CLI never promotes a
+// downloaded key to local_state='active' (set_virtual_key_local_state is only
+// ever called with "stale"). The historical filter `local_state='active'`
+// therefore matched zero rows in production, leaving the proxy's Tier1Team
+// registry empty and every `aikey_team_<vk_id>` bearer 401-ing — even though
+// claude/codex worked because they go through the Tier3-active-sentinel path
+// which reads `user_profile_provider_bindings` and calls `GetTeamKeyByID`
+// (which never had the local_state gate). This widens the registry to all
+// usable team keys so connectivity probes (`aikey test`) and any direct
+// `aikey_team_<vk_id>` bearer succeed consistently with claude's path. Bugfix:
+// workflow/CI/bugfix/20260509-team-key-tier1-registry-empty.md.
 //
 // Keys that fail to decrypt are skipped with a warning (e.g. written by a
 // different master password or corrupted data) so a single bad entry does not
@@ -196,9 +209,10 @@ func (r *Reader) GetActiveManagedKeys() ([]ManagedKey, error) {
 		       org_id, seat_id, credential_id, credential_revision,
 		       virtual_key_revision, owner_account_id
 		FROM managed_virtual_keys_cache
-		WHERE local_state = 'active'
-		  AND key_status  = 'active'
+		WHERE key_status = 'active'
 		  AND provider_key_ciphertext IS NOT NULL
+		  AND COALESCE(local_state, '') != 'stale'
+		  AND COALESCE(local_state, '') NOT LIKE 'disabled_by_%'
 	`)
 	if err != nil {
 		// Table may not exist on older vaults — treat as empty, not an error.
@@ -352,11 +366,22 @@ func (r *Reader) GetActiveKeyConfig() (*ActiveKeyConfig, error) {
 	}, nil
 }
 
-// GetActiveTeamKeyByProvider returns the decrypted team key for the given provider code.
+// GetActiveTeamKeyByProvider returns the first usable decrypted team key for the
+// given provider code. Used as a legacy fallback by the Tier3 active-sentinel
+// path when `user_profile_provider_bindings` has no entry (pre-v1.0.2 vaults).
 //
-// Matches on managed_virtual_keys_cache rows where local_state = 'active'
-// AND provider_code = providerCode (case-insensitive prefix match on the first active entry).
-// Returns nil if no active team key exists for that provider.
+// Why no local_state='active' gate (2026-05-09): same reason as
+// GetActiveManagedKeys — the CLI never promotes keys to that state, so the
+// historical filter selected zero rows in production. The post-v1.0.2 routing
+// path uses provider bindings + GetTeamKeyByID (which has no local_state gate),
+// and this fallback now matches that semantic. Bugfix:
+// workflow/CI/bugfix/20260509-team-key-tier1-registry-empty.md.
+//
+// LIMIT 1 picks an arbitrary row when multiple usable team keys exist for the
+// same provider — acceptable because real routing always goes through the
+// binding table; this fallback only fires for legacy vaults with one team key.
+//
+// Returns nil if no usable team key exists for that provider.
 func (r *Reader) GetActiveTeamKeyByProvider(providerCode string) (*ManagedKey, error) {
 	// Expand the provider code to all known aliases so that e.g. "anthropic"
 	// also matches rows stored as "Claude" or "claude" by the server.
@@ -372,9 +397,10 @@ func (r *Reader) GetActiveTeamKeyByProvider(providerCode string) (*ManagedKey, e
 		       provider_key_nonce, provider_key_ciphertext, provider_base_urls,
 		       org_id, seat_id, owner_account_id
 		FROM managed_virtual_keys_cache
-		WHERE local_state = 'active'
-		  AND key_status  = 'active'
+		WHERE key_status = 'active'
 		  AND provider_key_ciphertext IS NOT NULL
+		  AND COALESCE(local_state, '') != 'stale'
+		  AND COALESCE(local_state, '') NOT LIKE 'disabled_by_%%'
 		  AND LOWER(provider_code) IN (%s)
 		LIMIT 1
 	`, strings.Join(placeholders, ","))

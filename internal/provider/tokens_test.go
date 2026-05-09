@@ -275,3 +275,88 @@ func TestKimi_StopReason_DelegatesToOpenAI(t *testing.T) {
 		t.Fatalf("StopReason = %q, want length (kimi delegates to openai)", br.StopReason)
 	}
 }
+
+// ---------------------------------------------------------------------------
+// Model extraction (response-first, 2026-05-09)
+// ---------------------------------------------------------------------------
+//
+// These tests pin the contract that `ExtractTokenBreakdown` carries the
+// upstream-resolved model id in `breakdown.Model`. The proxy uses this to
+// override the request-body model captured by extractModel(), so the WAL /
+// receipt records the actual billed version (e.g. "claude-opus-4-7-20251015"
+// instead of the alias "claude-opus-4-7").
+//
+// Empty Model → graceful fallback to request.model (same as today's behavior).
+
+func TestAnthropic_Model_Streaming(t *testing.T) {
+	// Real Anthropic SSE shape — the message_start frame carries the
+	// upstream-resolved model on the `message.model` field.
+	sse := "" +
+		"data: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_x\",\"model\":\"claude-opus-4-7-20251015\",\"usage\":{\"input_tokens\":10}}}\n\n" +
+		"data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":5}}\n\n"
+	br := (&Anthropic{}).ExtractTokenBreakdown([]byte(sse), true, nil)
+	if br.Model != "claude-opus-4-7-20251015" {
+		t.Fatalf("Model = %q, want claude-opus-4-7-20251015", br.Model)
+	}
+}
+
+func TestAnthropic_Model_NonStreaming(t *testing.T) {
+	body := []byte(`{"id":"msg_x","model":"claude-sonnet-4-20250514","usage":{"input_tokens":15,"output_tokens":42},"stop_reason":"end_turn"}`)
+	br := (&Anthropic{}).ExtractTokenBreakdown(body, false, nil)
+	if br.Model != "claude-sonnet-4-20250514" {
+		t.Fatalf("Model = %q, want claude-sonnet-4-20250514", br.Model)
+	}
+}
+
+func TestAnthropic_Model_StreamCutEarly(t *testing.T) {
+	// Stream interrupted before message_start — Model stays empty so the
+	// proxy falls back to the request-body model. Don't synthesize a value.
+	sse := "data: {\"type\":\"content_block_delta\",\"delta\":{\"type\":\"text_delta\",\"text\":\"hi\"}}\n\n"
+	br := (&Anthropic{}).ExtractTokenBreakdown([]byte(sse), true, nil)
+	if br.Model != "" {
+		t.Fatalf("Model should be empty when message_start absent, got %q", br.Model)
+	}
+}
+
+func TestOpenAI_Model_Streaming_FirstChunkWins(t *testing.T) {
+	// Production OpenAI shape: every chunk carries `model`. The first
+	// non-empty hit wins; subsequent chunks (which would be redundantly
+	// identical anyway) don't override.
+	sse := "" +
+		"data: {\"id\":\"chatcmpl-1\",\"object\":\"chat.completion.chunk\",\"created\":1234,\"model\":\"gpt-4o-2024-08-06\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"content\":\"\"}}]}\n\n" +
+		"data: {\"id\":\"chatcmpl-1\",\"object\":\"chat.completion.chunk\",\"model\":\"gpt-4o-2024-08-06\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"hi\"}}]}\n\n" +
+		"data: [DONE]\n\n"
+	br := (&OpenAI{}).ExtractTokenBreakdown([]byte(sse), true, nil)
+	if br.Model != "gpt-4o-2024-08-06" {
+		t.Fatalf("Model = %q, want gpt-4o-2024-08-06", br.Model)
+	}
+}
+
+func TestOpenAI_Model_NonStreaming(t *testing.T) {
+	body := []byte(`{"id":"chatcmpl-1","object":"chat.completion","model":"gpt-4o-2024-08-06","choices":[{"index":0,"message":{"role":"assistant","content":"hi"},"finish_reason":"stop"}],"usage":{"prompt_tokens":10,"completion_tokens":5}}`)
+	br := (&OpenAI{}).ExtractTokenBreakdown(body, false, nil)
+	if br.Model != "gpt-4o-2024-08-06" {
+		t.Fatalf("Model = %q, want gpt-4o-2024-08-06", br.Model)
+	}
+}
+
+func TestOpenAI_Model_MissingFromAllChunks(t *testing.T) {
+	// Stripped fixture (or non-conformant compatible provider) — no chunk
+	// carries `model`. Extractor returns "" so proxy falls back to
+	// request.model. Don't synthesize.
+	sse := "data: {\"id\":\"chatcmpl-1\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"hi\"}}]}\n\n"
+	br := (&OpenAI{}).ExtractTokenBreakdown([]byte(sse), true, nil)
+	if br.Model != "" {
+		t.Fatalf("Model should be empty when chunks omit it, got %q", br.Model)
+	}
+}
+
+func TestKimi_Model_DelegatesToOpenAI(t *testing.T) {
+	// Kimi follows OpenAI-compatible shape — same chunk structure, same
+	// extractor. Pin via delegation that the model field round-trips.
+	body := []byte(`{"id":"cmpl-kimi","object":"chat.completion","model":"kimi-k2.5","choices":[{"index":0,"message":{"role":"assistant","content":"hi"},"finish_reason":"stop"}],"usage":{"prompt_tokens":3,"completion_tokens":2}}`)
+	br := (&Kimi{}).ExtractTokenBreakdown(body, false, nil)
+	if br.Model != "kimi-k2.5" {
+		t.Fatalf("Model = %q, want kimi-k2.5 (kimi delegates to openai)", br.Model)
+	}
+}

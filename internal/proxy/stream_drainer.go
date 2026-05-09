@@ -170,6 +170,15 @@ func newStreamDrainer(
 		ev.InputTokens = breakdown.InputTokens
 		ev.OutputTokens = breakdown.OutputTokens
 		ev.DurationMs = time.Since(baseEvent.Timestamp).Milliseconds()
+		// 2026-05-09 response-first model: prefer the upstream-resolved
+		// model id (e.g. claude-opus-4-7-20251015) carried in the
+		// stream's first frame over the request-body model
+		// (claude-opus-4-7) buildBaseEvent captured. Fall back to the
+		// request-side value when the stream cut early or the extractor
+		// didn't see a model frame (rare).
+		if breakdown.Model != "" {
+			ev.Model = breakdown.Model
+		}
 		// Collector is nil for probe traffic (see proxy.go::Handle stream branch):
 		// X-Aikey-Probe: 1 requests shouldn't produce usage events. Without
 		// this guard, nil deref here crashes the whole proxy process AFTER

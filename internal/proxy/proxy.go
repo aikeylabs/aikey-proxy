@@ -1172,6 +1172,16 @@ func (p *Proxy) serveRoute(w http.ResponseWriter, r *http.Request, route *vkeys.
 				ev := p.buildBaseEvent(r, resp, startTime, route, false)
 				ev.InputTokens = breakdown.InputTokens
 				ev.OutputTokens = breakdown.OutputTokens
+				// 2026-05-09 response-first model: prefer the
+				// upstream-resolved model id from the JSON response
+				// (often a dated pin like claude-opus-4-7-20251015)
+				// over the request-body model (alias the client sent)
+				// captured by extractModel(). Fall back to the
+				// request-side value when the body was malformed or
+				// the extractor returned an empty Model.
+				if breakdown.Model != "" {
+					ev.Model = breakdown.Model
+				}
 				// Probe traffic is forwarded normally so the CLI gets a truthful
 				// status code, but must not inflate usage counters or trigger
 				// reporter uploads (it'd be double-counting our own self-tests).

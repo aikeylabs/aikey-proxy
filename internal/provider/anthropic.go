@@ -153,6 +153,7 @@ func (a *Anthropic) ExtractTokenBreakdown(data []byte, streaming bool, logger *s
 	}
 	if !streaming {
 		var resp struct {
+			Model      string         `json:"model"`
 			Usage      anthropicUsage `json:"usage"`
 			StopReason string         `json:"stop_reason"`
 		}
@@ -173,6 +174,10 @@ func (a *Anthropic) ExtractTokenBreakdown(data []byte, streaming bool, logger *s
 			CacheReadInputTokens:     u.CacheReadInputTokens,
 			CacheCreationInputTokens: u.CacheCreationInputTokens,
 			StopReason:               resp.StopReason,
+			// Upstream-resolved model (often pinned to a dated alias —
+			// e.g. client sent `claude-opus-4-7`, response carries
+			// `claude-opus-4-7-20251015`). 2026-05-09: response-first.
+			Model: resp.Model,
 		}
 	}
 
@@ -187,6 +192,9 @@ func (a *Anthropic) ExtractTokenBreakdown(data []byte, streaming bool, logger *s
 		var event struct {
 			Type    string `json:"type"`
 			Message struct {
+				// Anthropic streaming: model is on the message envelope
+				// of the first `message_start` frame, alongside usage.
+				Model string         `json:"model"`
 				Usage anthropicUsage `json:"usage"`
 			} `json:"message"`
 			Delta struct {
@@ -203,6 +211,13 @@ func (a *Anthropic) ExtractTokenBreakdown(data []byte, streaming bool, logger *s
 			br.InputTokens = u.totalInput()
 			br.CacheReadInputTokens = u.CacheReadInputTokens
 			br.CacheCreationInputTokens = u.CacheCreationInputTokens
+			// Capture upstream model from the same frame. Only
+			// overwrite if non-empty — guards against late frames in
+			// the same stream that re-emit `message_start` without
+			// model (defensive; not observed in practice).
+			if event.Message.Model != "" {
+				br.Model = event.Message.Model
+			}
 		case "message_delta":
 			br.OutputTokens = event.Usage.OutputTokens
 			if event.Delta.StopReason != "" {

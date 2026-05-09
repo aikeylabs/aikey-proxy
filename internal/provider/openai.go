@@ -187,7 +187,43 @@ func (o *OpenAI) ExtractTokenBreakdown(data []byte, streaming bool, logger *slog
 	in, out := o.ExtractTokens(data, streaming, logger)
 	br := TokenBreakdown{InputTokens: in, OutputTokens: out}
 	br.StopReason = extractOpenAIStopReason(data, streaming)
+	br.Model = extractOpenAIModel(data, streaming)
 	return br
+}
+
+// extractOpenAIModel reads top-level `model` from a complete chat-completion
+// response (non-streaming) or any SSE chunk (streaming). OpenAI / Kimi /
+// Moonshot all repeat the model id on every chunk, so the first non-empty
+// hit wins.
+//
+// 2026-05-09: response-first model — captures upstream-resolved model
+// (often more specific than what the client sent, e.g. dated pin like
+// "gpt-4o-2024-08-06"). Empty string when unparseable / cut early; the
+// proxy falls back to the request-body model in that case.
+func extractOpenAIModel(data []byte, streaming bool) string {
+	type envelope struct {
+		Model string `json:"model"`
+	}
+	if !streaming {
+		var e envelope
+		if json.Unmarshal(data, &e) == nil {
+			return e.Model
+		}
+		return ""
+	}
+	for _, line := range bytes.Split(data, []byte("\n")) {
+		line = bytes.TrimSpace(line)
+		line = bytes.TrimPrefix(line, []byte("data: "))
+		line = bytes.TrimPrefix(line, []byte("data:"))
+		if len(line) == 0 || line[0] != '{' {
+			continue
+		}
+		var e envelope
+		if json.Unmarshal(line, &e) == nil && e.Model != "" {
+			return e.Model
+		}
+	}
+	return ""
 }
 
 // extractOpenAIStopReason reads `choices[0].finish_reason` from a complete

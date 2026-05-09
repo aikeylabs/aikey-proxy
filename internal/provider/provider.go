@@ -48,6 +48,25 @@ type TokenBreakdown struct {
 	// Empty string when the upstream response did not carry it (error, or
 	// stream cut before the usage/finish frame arrived).
 	StopReason string
+	// Model is the **upstream-resolved** model identifier carried in the
+	// response. Often more specific than what the client sent in the
+	// request body (e.g. client `claude-opus-4-7` → upstream
+	// `claude-opus-4-7-20251015` with date pin). When non-empty, the
+	// proxy prefers this over the request-body model so the WAL /
+	// receipt records the actual version that was billed.
+	//
+	// Empty string when the response didn't carry it (rare — major
+	// providers always echo it):
+	//   - Stream cut before the first frame (Anthropic message_start /
+	//     OpenAI first chunk).
+	//   - Non-200 / 4xx responses (no usage/model frame at all).
+	//   - body > extractBodyHardLimit (4 MB) — extractor skipped.
+	// In those cases the proxy falls back to the request-body model
+	// captured by extractModel().
+	//
+	// 2026-05-09: added so receipts surface the actual billed version
+	// instead of the client-side alias. See receipt design doc.
+	Model string
 }
 
 // Provider adapts requests for a specific AI provider protocol.
