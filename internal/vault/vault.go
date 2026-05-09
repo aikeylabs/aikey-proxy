@@ -164,6 +164,13 @@ func (r *Reader) ListAliases() ([]string, error) {
 // treated with the same care as a regular vault secret.
 type ManagedKey struct {
 	VirtualKeyID string
+	// LocalAlias is the user-facing name shown in `aikey list` for this team
+	// key (e.g. `key-335923591-0011-1`). Stored in the
+	// `managed_virtual_keys_cache.local_alias` column. May be empty for
+	// historical rows that pre-date the column add.
+	// 2026-05-09: surfaced into ManagedKey so routes carry it as KeyAlias and
+	// receipt / WAL `key_label` shows the alias instead of the vk_id tail.
+	LocalAlias   string
 	ProviderCode string
 	ProtocolType string
 	BaseURL      string
@@ -203,8 +210,19 @@ type ManagedKey struct {
 // different master password or corrupted data) so a single bad entry does not
 // block the proxy from starting.
 func (r *Reader) GetActiveManagedKeys() ([]ManagedKey, error) {
+	// 2026-05-09 alias surfacing: COALESCE(local_alias, alias) — the cache
+	// has two alias-like columns:
+	//   - `alias` (NOT NULL): server-side canonical alias (e.g.
+	//     "key-335923591-0011-1") set when the key was provisioned. Always
+	//     populated.
+	//   - `local_alias` (nullable, retrofit): per-client rename overlay
+	//     populated by `aikey key rename`. NULL until the user explicitly
+	//     renames.
+	// Use local_alias when set, fall back to alias. Either way the WAL /
+	// receipt now shows a meaningful name instead of the vk_id tail.
 	rows, err := r.db.Query(`
-		SELECT virtual_key_id, provider_code, protocol_type, base_url,
+		SELECT virtual_key_id, COALESCE(NULLIF(local_alias, ''), alias) AS effective_alias,
+		       provider_code, protocol_type, base_url,
 		       provider_key_nonce, provider_key_ciphertext, provider_base_urls,
 		       org_id, seat_id, credential_id, credential_revision,
 		       virtual_key_revision, owner_account_id
@@ -223,11 +241,12 @@ func (r *Reader) GetActiveManagedKeys() ([]ManagedKey, error) {
 	var keys []ManagedKey
 	for rows.Next() {
 		var vkID, provCode, protType, baseURL string
+		var localAlias *string // nullable column on historical rows
 		var nonce, ciphertext []byte
 		var providerBaseURLsJSON *string
 		var orgID, seatID, credID, credRev, vkRev string
 		var ownerAccountID *string
-		if err := rows.Scan(&vkID, &provCode, &protType, &baseURL, &nonce, &ciphertext, &providerBaseURLsJSON,
+		if err := rows.Scan(&vkID, &localAlias, &provCode, &protType, &baseURL, &nonce, &ciphertext, &providerBaseURLsJSON,
 			&orgID, &seatID, &credID, &credRev, &vkRev, &ownerAccountID); err != nil {
 			slog.Warn("managed key: scan error, skipping", "error", err)
 			continue
@@ -245,8 +264,13 @@ func (r *Reader) GetActiveManagedKeys() ([]ManagedKey, error) {
 		if ownerAccountID != nil {
 			accountID = *ownerAccountID
 		}
+		var aliasStr string
+		if localAlias != nil {
+			aliasStr = *localAlias
+		}
 		keys = append(keys, ManagedKey{
 			VirtualKeyID:       vkID,
+			LocalAlias:         aliasStr,
 			ProviderCode:       provCode,
 			ProtocolType:       protType,
 			BaseURL:            baseURL,
@@ -392,8 +416,12 @@ func (r *Reader) GetActiveTeamKeyByProvider(providerCode string) (*ManagedKey, e
 		placeholders[i] = "?"
 		args[i] = a
 	}
+	// 2026-05-09: include effective alias (COALESCE local_alias / alias) for
+	// receipt / WAL surfacing of team key alias.
 	query := fmt.Sprintf(`
-		SELECT virtual_key_id, provider_code, protocol_type, base_url,
+		SELECT virtual_key_id,
+		       COALESCE(NULLIF(local_alias, ''), alias) AS effective_alias,
+		       provider_code, protocol_type, base_url,
 		       provider_key_nonce, provider_key_ciphertext, provider_base_urls,
 		       org_id, seat_id, owner_account_id
 		FROM managed_virtual_keys_cache
@@ -414,12 +442,12 @@ func (r *Reader) GetActiveTeamKeyByProvider(providerCode string) (*ManagedKey, e
 		return nil, rows.Err()
 	}
 
-	var vkID, provCode, protType, baseURL string
+	var vkID, effectiveAlias, provCode, protType, baseURL string
 	var nonce, ciphertext []byte
 	var providerBaseURLsJSON *string
 	var orgID, seatID string
 	var ownerAccountID *string
-	if err := rows.Scan(&vkID, &provCode, &protType, &baseURL, &nonce, &ciphertext, &providerBaseURLsJSON,
+	if err := rows.Scan(&vkID, &effectiveAlias, &provCode, &protType, &baseURL, &nonce, &ciphertext, &providerBaseURLsJSON,
 		&orgID, &seatID, &ownerAccountID); err != nil {
 		return nil, fmt.Errorf("scan managed key: %w", err)
 	}
@@ -441,6 +469,7 @@ func (r *Reader) GetActiveTeamKeyByProvider(providerCode string) (*ManagedKey, e
 
 	return &ManagedKey{
 		VirtualKeyID:     vkID,
+		LocalAlias:       effectiveAlias,
 		ProviderCode:     provCode,
 		ProtocolType:     protType,
 		BaseURL:          baseURL,
@@ -457,14 +486,19 @@ func (r *Reader) GetActiveTeamKeyByProvider(providerCode string) (*ManagedKey, e
 // provider binding already tells us which key to use.
 // Returns nil if the key is not found or has no ciphertext.
 func (r *Reader) GetTeamKeyByID(virtualKeyID string) (*ManagedKey, error) {
-	var provCode, protType, baseURL string
+	var provCode, protType, baseURL, effectiveAlias string
 	var nonce, ciphertext []byte
 	var providerBaseURLsJSON *string
 	var orgID, seatID string
 	var ownerAccountID *string
 
+	// 2026-05-09: include effective alias (COALESCE local_alias / alias) so
+	// route's KeyAlias surfaces in WAL `key_label` and statusline receipt.
+	// Hot path (binding-driven team-key fetch) — without this column, the
+	// receipt falls back to the vk_id tail.
 	err := r.db.QueryRow(`
 		SELECT provider_code, protocol_type, base_url,
+		       COALESCE(NULLIF(local_alias, ''), alias) AS effective_alias,
 		       provider_key_nonce, provider_key_ciphertext, provider_base_urls,
 		       org_id, seat_id, owner_account_id
 		FROM managed_virtual_keys_cache
@@ -472,7 +506,7 @@ func (r *Reader) GetTeamKeyByID(virtualKeyID string) (*ManagedKey, error) {
 		  AND key_status = 'active'
 		  AND provider_key_ciphertext IS NOT NULL
 	`, virtualKeyID).Scan(
-		&provCode, &protType, &baseURL, &nonce, &ciphertext, &providerBaseURLsJSON,
+		&provCode, &protType, &baseURL, &effectiveAlias, &nonce, &ciphertext, &providerBaseURLsJSON,
 		&orgID, &seatID, &ownerAccountID,
 	)
 	if err == sql.ErrNoRows {
@@ -503,6 +537,7 @@ func (r *Reader) GetTeamKeyByID(virtualKeyID string) (*ManagedKey, error) {
 
 	return &ManagedKey{
 		VirtualKeyID:     virtualKeyID,
+		LocalAlias:       effectiveAlias,
 		ProviderCode:     provCode,
 		ProtocolType:     protType,
 		BaseURL:          baseURL,

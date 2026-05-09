@@ -36,9 +36,15 @@ func managedKeyToRoute(mk vault.ManagedKey) *vkeys.ResolvedRoute {
 	return &vkeys.ResolvedRoute{
 		// Provider points at the provider *adapter* (protocol), while
 		// ProviderCode retains the canonical provider identifier.
-		VirtualKeyID:       mk.VirtualKeyID,
-		Provider:           mk.ProtocolType,
-		BaseURL:            mk.BaseURL,
+		VirtualKeyID: mk.VirtualKeyID,
+		Provider:     mk.ProtocolType,
+		BaseURL:      mk.BaseURL,
+		// 2026-05-09: surface the user-facing alias (e.g. `key-335923591-0011-1`)
+		// onto the route so deriveKeyLabel uses it for receipt / WAL `key_label`
+		// instead of falling back to the vk_id tail. Empty for legacy rows that
+		// pre-date the `local_alias` column add — in that case deriveKeyLabel
+		// still falls back to the vk_id tail (no regression).
+		KeyAlias:           mk.LocalAlias,
 		PlaintextKey:       mk.PlaintextKey,
 		OrgID:              mk.OrgID,
 		AccountID:          mk.OwnerAccountID,

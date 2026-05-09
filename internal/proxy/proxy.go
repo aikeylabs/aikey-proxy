@@ -764,6 +764,12 @@ func (p *Proxy) handlePathPrefixRoute(w http.ResponseWriter, r *http.Request, pr
 			if mk != nil {
 				realKey = mk.PlaintextKey
 				virtualKeyID = mk.VirtualKeyID
+				// 2026-05-09: surface the team key's user-facing alias so the
+				// receipt / WAL `key_label` shows e.g. `key-335923591-0011-1`
+				// instead of the vk_id tail. mk.LocalAlias is COALESCEd with
+				// the canonical `alias` column in vault.GetTeamKeyByID, so it
+				// is non-empty for any normal team key.
+				keyAlias = mk.LocalAlias
 				if url, ok := mk.ProviderBaseURLs[canonicalCode]; ok && url != "" {
 					baseURL = url
 				} else if url, ok := mk.ProviderBaseURLs[providerCode]; ok && url != "" {
@@ -806,6 +812,10 @@ func (p *Proxy) handlePathPrefixRoute(w http.ResponseWriter, r *http.Request, pr
 		if mk != nil {
 			realKey = mk.PlaintextKey
 			virtualKeyID = mk.VirtualKeyID
+			// 2026-05-09: same alias surfacing as the binding-driven team
+			// branch above, for the legacy fallback (pre-v1.0.2 vaults
+			// without user_profile_provider_bindings).
+			keyAlias = mk.LocalAlias
 			if url, ok := mk.ProviderBaseURLs[canonicalCode]; ok && url != "" {
 				baseURL = url
 			} else if url, ok := mk.ProviderBaseURLs[providerCode]; ok && url != "" {
@@ -1209,7 +1219,20 @@ func (p *Proxy) serveRoute(w http.ResponseWriter, r *http.Request, route *vkeys.
 				var cb reporterCallback
 				if p.reporter != nil && !probe {
 					cb = func(br provider.TokenBreakdown, completion string) {
-						p.reportUsage(route, bearerToken, baseEvent.Model, startTime, resp.StatusCode, br, "", realKey, sessionID, completion, upstreamReqID)
+						// 2026-05-09 response-first: prefer the upstream-resolved
+						// model id from the SSE first frame (br.Model) over the
+						// request-body model captured into baseEvent. Same logic
+						// as in stream_drainer.go where ev.Model gets overridden
+						// for the SQLite collector path. Without this fix, the
+						// JSONL WAL written via reportUsage would carry the
+						// request-side undated alias even when extractor saw a
+						// dated upstream response — observed via DEBUG log
+						// "DEBUG response-first".
+						model := baseEvent.Model
+						if br.Model != "" {
+							model = br.Model
+						}
+						p.reportUsage(route, bearerToken, model, startTime, resp.StatusCode, br, "", realKey, sessionID, completion, upstreamReqID)
 					}
 				}
 				// For probe traffic skip the collector entirely by passing nil.
