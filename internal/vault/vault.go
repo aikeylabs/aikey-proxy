@@ -109,6 +109,44 @@ func (r *Reader) GetLoggedInAccountID() string {
 	return accountID
 }
 
+// GetPlatformRefreshToken returns the long-lived OAuth refresh_token
+// for the currently-logged-in user, or "" if not logged in / row missing.
+//
+// 2026-05-11 (B4 phase): proxy needs this to bootstrap RefreshableJWT
+// at startup so the team-route reporter can auto-renew the user JWT
+// without going through the CLI. The column is stored plaintext in the
+// vault SQLite file (matching aikey-cli's storage_platform.rs::
+// save_oauth_session) — the vault file's on-disk protection is OS-level
+// (~/.aikey/data perms), the same trust boundary CLI itself relies on.
+//
+// Why not encrypted with derivedKey: changing the storage shape would
+// require a coordinated CLI + vault migration; refresh_token's at-rest
+// protection currently rests on filesystem permissions, same as the
+// access_token sitting next to it (jwt_token column). B4 doesn't
+// expand that trust boundary — it just reads what's already there.
+//
+// Empty return means "no platform_account row yet" (pre-login) — caller
+// treats as "no team-route credential available; fall back to legacy
+// service_token if any, otherwise no auth header on uploads".
+func (r *Reader) GetPlatformRefreshToken() (string, error) {
+	var token sql.NullString
+	err := r.db.QueryRow(
+		"SELECT refresh_token FROM platform_account WHERE id = 1",
+	).Scan(&token)
+	if err == sql.ErrNoRows {
+		return "", nil
+	}
+	if err != nil {
+		return "", fmt.Errorf("query platform_account.refresh_token: %w", err)
+	}
+	if !token.Valid {
+		// Row exists but column is NULL (legacy rows from pre-refresh CLI
+		// versions). Same caller semantics as "not logged in".
+		return "", nil
+	}
+	return token.String, nil
+}
+
 // GetSecret retrieves and decrypts a secret by its alias.
 // Results are cached in memory for subsequent calls.
 func (r *Reader) GetSecret(alias string) (string, error) {
@@ -253,7 +291,21 @@ func (r *Reader) GetActiveManagedKeys() ([]ManagedKey, error) {
 		}
 		plaintext, err := Decrypt(r.derivedKey, nonce, ciphertext)
 		if err != nil {
-			slog.Warn("managed key: decryption failed, skipping", "vk_id", vkID, "error", err)
+			// 2026-05-11: was WARN, upgraded to ERROR. A decrypt failure on
+			// the proxy's hot path means this team key was written with a
+			// vault_key that no longer matches the current password_hash —
+			// downstream requests routed via aikey_team_<vk_id> will surface
+			// as 401 "Route token not found in registry" with no actionable
+			// signal. ERROR + an actionable hint forces the operator to see
+			// it (no silent registry shrink). See
+			// workflow/CI/bugfix/2026-05-11-team-key-decrypt-inconsistent.md.
+			slog.Error(
+				"managed key ciphertext was written with an inconsistent vault_key — proxy cannot decrypt. Recovery: aikey key sync --force-reencrypt",
+				"event.name", "vault.managed_key.decrypt_inconsistent",
+				"error.code", "VAULT_MANAGED_KEY_DECRYPT_INCONSISTENT",
+				"vk_id", vkID,
+				"error.message", err.Error(),
+			)
 			continue
 		}
 		providerBaseURLs := make(map[string]string)
@@ -522,6 +574,19 @@ func (r *Reader) GetTeamKeyByID(virtualKeyID string) (*ManagedKey, error) {
 
 	plaintext, decErr := Decrypt(r.derivedKey, nonce, ciphertext)
 	if decErr != nil {
+		// 2026-05-11: binding-driven team-key path (proxy.go:760). Surface
+		// an actionable ERROR so users hitting the path-prefix Tier-3
+		// fallthrough (e.g. `claude` runtime via the wrapper) see how to
+		// recover. The caller still receives an error so the higher-level
+		// route resolution short-circuits as before — this log is purely
+		// for visibility into a state that was previously silent.
+		slog.Error(
+			"managed key ciphertext was written with an inconsistent vault_key — proxy cannot decrypt. Recovery: aikey key sync --force-reencrypt",
+			"event.name", "vault.managed_key.decrypt_inconsistent",
+			"error.code", "VAULT_MANAGED_KEY_DECRYPT_INCONSISTENT",
+			"vk_id", virtualKeyID,
+			"error.message", decErr.Error(),
+		)
 		return nil, fmt.Errorf("decrypt team key %s: %w", virtualKeyID, decErr)
 	}
 

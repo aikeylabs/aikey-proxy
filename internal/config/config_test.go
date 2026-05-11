@@ -82,3 +82,138 @@ func TestExpandPaths_ExpandsTildeInWALDir(t *testing.T) {
 		t.Fatalf("expected suffix custom/wal, got %q", c.Events.WALDir)
 	}
 }
+
+// ── 2026-05-11 F1 fix: aikey-user.yaml proxy: section merge ───────────────
+//
+// Load() now reads aikey-user.yaml from the same directory and merges its
+// `proxy:` subtree on top of the system yaml. These tests pin the merge
+// behaviour we depend on so a future refactor that drops or weakens it
+// won't silently re-introduce the "make restart-personal wipes team
+// override" bug.
+
+const systemProxyYaml = `
+listen:
+  host: "127.0.0.1"
+  port: 27200
+vault:
+  path: "/tmp/test-vault.db"
+events:
+  db_path: "/tmp/events.db"
+  batch_size: 100
+  flush_interval: 5s
+  collector_url: "http://127.0.0.1:8090"
+  collector_token: "system-token"
+  collector_routes:
+    personal: "http://127.0.0.1:8090"
+    team:     "http://127.0.0.1:8090"
+    oauth:    "http://127.0.0.1:8090"
+  queue_capacity: 10000
+  upload_batch_size: 5
+  upload_interval: 5s
+  wal_dir: "/tmp/wal"
+  control_url: "http://127.0.0.1:8090"
+  service_token: "system-token"
+log:
+  level: info
+`
+
+// writeTestPair writes a system yaml + an optional user yaml in a temp
+// dir and returns the path to the system file (the Load() input).
+func writeTestPair(t *testing.T, system, user string) string {
+	t.Helper()
+	dir := t.TempDir()
+	sysPath := filepath.Join(dir, "aikey-proxy.yaml")
+	if err := os.WriteFile(sysPath, []byte(system), 0o644); err != nil {
+		t.Fatalf("write system yaml: %v", err)
+	}
+	if user != "" {
+		userPath := filepath.Join(dir, "aikey-user.yaml")
+		if err := os.WriteFile(userPath, []byte(user), 0o644); err != nil {
+			t.Fatalf("write user yaml: %v", err)
+		}
+	}
+	return sysPath
+}
+
+// Without aikey-user.yaml the system value passes through unchanged —
+// pre-login state for fresh Personal installs must keep working.
+func TestLoad_NoUserYamlPreservesSystemValues(t *testing.T) {
+	sysPath := writeTestPair(t, systemProxyYaml, "")
+	cfg, err := Load(sysPath)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if got := cfg.Events.CollectorRoutes["team"]; got != "http://127.0.0.1:8090" {
+		t.Fatalf("team route should equal system default when no user file: got %q", got)
+	}
+	if cfg.Events.CollectorToken != "system-token" {
+		t.Fatalf("collector_token mangled by no-user-file path: %q", cfg.Events.CollectorToken)
+	}
+}
+
+// The actual F1 contract: user-layer `proxy.events.collector_routes.team`
+// wins on field collision while leaving sibling routes (personal, oauth)
+// and other events fields untouched. This is what makes the team override
+// survive `make restart-personal`'s re-render of the system yaml.
+func TestLoad_UserYamlOverridesTeamRoute(t *testing.T) {
+	const userYaml = `
+proxy:
+  events:
+    collector_routes:
+      team: "http://192.168.0.113:3000"
+`
+	sysPath := writeTestPair(t, systemProxyYaml, userYaml)
+	cfg, err := Load(sysPath)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if got := cfg.Events.CollectorRoutes["team"]; got != "http://192.168.0.113:3000" {
+		t.Fatalf("user-layer team override lost: got %q", got)
+	}
+	if got := cfg.Events.CollectorRoutes["personal"]; got != "http://127.0.0.1:8090" {
+		t.Fatalf("personal route should keep system value: got %q", got)
+	}
+	if got := cfg.Events.CollectorRoutes["oauth"]; got != "http://127.0.0.1:8090" {
+		t.Fatalf("oauth route should keep system value: got %q", got)
+	}
+	if cfg.Events.CollectorToken != "system-token" {
+		t.Fatalf("unrelated event fields mangled by merge: token=%q", cfg.Events.CollectorToken)
+	}
+}
+
+// A user file that only declares non-proxy sections (e.g. `trial:` for
+// jwt_secret) must not affect proxy config — common state on shared
+// machines that run both Personal and Trial editions.
+func TestLoad_UserYamlWithoutProxySectionIsNoOp(t *testing.T) {
+	const userYaml = `
+trial:
+  jwt_secret: "irrelevant-to-proxy"
+  service_token: "also-irrelevant"
+`
+	sysPath := writeTestPair(t, systemProxyYaml, userYaml)
+	cfg, err := Load(sysPath)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if got := cfg.Events.CollectorRoutes["team"]; got != "http://127.0.0.1:8090" {
+		t.Fatalf("trial-only user file should not touch proxy routes: got team=%q", got)
+	}
+}
+
+// Empty user file is the "user file created but no fields yet" edge case.
+// Should be treated the same as a missing file (no error, system wins).
+func TestLoad_EmptyUserYamlIsNoOp(t *testing.T) {
+	sysPath := writeTestPair(t, systemProxyYaml, "")
+	// Re-write an explicit empty user file alongside the system file.
+	userPath := filepath.Join(filepath.Dir(sysPath), "aikey-user.yaml")
+	if err := os.WriteFile(userPath, []byte(""), 0o644); err != nil {
+		t.Fatalf("write empty user yaml: %v", err)
+	}
+	cfg, err := Load(sysPath)
+	if err != nil {
+		t.Fatalf("Load with empty user yaml: %v", err)
+	}
+	if got := cfg.Events.CollectorRoutes["team"]; got != "http://127.0.0.1:8090" {
+		t.Fatalf("empty user file shouldn't override anything: got team=%q", got)
+	}
+}

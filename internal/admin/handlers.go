@@ -40,6 +40,12 @@ type Handler struct {
 
 	// ReporterMetricsFn returns usage reporter counters (nil = reporter disabled).
 	ReporterMetricsFn func() *events.ReporterMetrics
+	// ReplayDeadLetterFn re-delivers entries from dead_letter.jsonl using
+	// the *current* reporter config (post-login JWT, fresh route URLs,
+	// etc). Nil = reporter / dead-letter writer disabled. Wired by main.go
+	// after the supervisor builds its first generation. See
+	// events.Reporter.ReplayDeadLetter for the contract.
+	ReplayDeadLetterFn func(ctx context.Context) (events.ReplayDeadLetterResult, error)
 	// CanaryResultFn returns the latest canary probe result (nil = canary disabled).
 	CanaryResultFn func() *events.CanaryResult
 
@@ -229,6 +235,73 @@ func (h *Handler) Reload(w http.ResponseWriter, r *http.Request) {
 
 	logger.Info("admin: reload completed successfully")
 	writeJSON(w, http.StatusOK, map[string]string{"status": "reloaded"})
+}
+
+// ReplayDeadLetter handles POST /admin/replay-dead-letter.
+//
+// Triggers reporter.ReplayDeadLetter() — see that method's docstring
+// for full semantics. Synchronous: the response carries the count
+// summary so operators see exactly how many entries were re-delivered.
+//
+// Returns:
+//   - 200 OK + ReplayDeadLetterResult JSON on success (including "0
+//     entries scanned" — that's still a successful no-op)
+//   - 503 Service Unavailable when ReplayDeadLetterFn isn't wired
+//     (reporter disabled at startup, e.g. no collector_url configured)
+//   - 500 Internal Server Error when replay itself errors (file
+//     read/write fail). Partial-success counts still come back in
+//     the result body so the operator can see what was already
+//     delivered before the error.
+//
+// Added 2026-05-11 per B-phase follow-up: dead_letter.jsonl used to be
+// permanent state — terminal failures (JWT expired briefly, collector
+// down for a few seconds) silently lost data forever. With replay an
+// operator runs `aikey proxy replay-dead-letter` after fixing the
+// upstream cause and recovers all dead-lettered events.
+func (h *Handler) ReplayDeadLetter(w http.ResponseWriter, r *http.Request) {
+	tc := observability.ExtractOrCreate(r)
+	logger := slog.With(
+		"trace_id", tc.TraceID,
+		"request_id", tc.RequestID,
+	)
+
+	if h.ReplayDeadLetterFn == nil {
+		logger.Warn("admin: replay-dead-letter not supported (reporter disabled)")
+		writeJSON(w, http.StatusServiceUnavailable, map[string]string{
+			"error": "reporter / dead-letter writer not configured",
+		})
+		return
+	}
+
+	// Give the replay up to 60 s. Each individual upload uses the
+	// reporter's HTTP client timeout (10 s), so a worst-case 6 entries
+	// of stuck upload still complete within budget.
+	ctx, cancel := context.WithTimeout(r.Context(), 60*time.Second)
+	defer cancel()
+
+	logger.Info("admin: replay-dead-letter requested")
+	result, err := h.ReplayDeadLetterFn(ctx)
+	if err != nil {
+		logger.Error("admin: replay-dead-letter failed",
+			"error.message", err.Error(),
+			"entries_scanned", result.EntriesScanned,
+			"entries_replayed_ok", result.EntriesReplayedOK,
+		)
+		// Still return the partial result so operators see what was
+		// recovered before the file I/O error hit.
+		writeJSON(w, http.StatusInternalServerError, map[string]any{
+			"error":  err.Error(),
+			"result": result,
+		})
+		return
+	}
+
+	logger.Info("admin: replay-dead-letter completed",
+		"entries_scanned", result.EntriesScanned,
+		"entries_replayed_ok", result.EntriesReplayedOK,
+		"entries_still_failing", result.EntriesStillFailing,
+	)
+	writeJSON(w, http.StatusOK, result)
 }
 
 // HealthProviderTargets returns the provider list for the currently active key without

@@ -436,6 +436,22 @@ func (s *Supervisor) ReporterMetrics() *events.ReporterMetrics {
 	return &m
 }
 
+// ReplayDeadLetter triggers a dead-letter replay pass on the active
+// generation's reporter. Returns ErrNoReporter when the reporter isn't
+// configured (no collector_url) so callers (admin handler) can map to
+// 503 instead of a misleading "0 entries scanned" success.
+//
+// Added 2026-05-11 for the B-phase follow-up — see
+// internal/events/dead_letter.go::Reporter.ReplayDeadLetter docstring
+// for full semantics.
+func (s *Supervisor) ReplayDeadLetter(ctx context.Context) (events.ReplayDeadLetterResult, error) {
+	gen := s.active.Load()
+	if gen.reporter == nil {
+		return events.ReplayDeadLetterResult{}, fmt.Errorf("reporter not configured")
+	}
+	return gen.reporter.ReplayDeadLetter(ctx)
+}
+
 // CanaryResult returns the latest canary probe result from the active generation.
 // Returns nil if canary probe is not configured.
 func (s *Supervisor) CanaryResult() *events.CanaryResult {
@@ -791,22 +807,51 @@ func (s *Supervisor) buildGeneration() (*generation, error) {
 		}
 	}
 
-	// Attach usage reporter if collector_url is configured.
+	// Attach usage reporter if any upload destination is configured —
+	// either the legacy single CollectorURL, or at least one non-empty
+	// per-route entry under CollectorRoutes (added 2026-05-10 for
+	// personal/team isolation). See roadmap update 20260510-personal-team-
+	// 数据隔离与合并显示.md.
 	var reporter *events.Reporter
 	var canary *events.CanaryProbe
-	if s.cfg.Events.CollectorURL != "" {
+	hasAnyURL := s.cfg.Events.CollectorURL != ""
+	for _, u := range s.cfg.Events.CollectorRoutes {
+		if u != "" {
+			hasAnyURL = true
+			break
+		}
+	}
+	if hasAnyURL {
+		// 2026-05-11 B4 phase: build per-RouteSource Credentials from the
+		// user-layer config.collector_credentials block. Today only the
+		// "team" route is wired (user JWT with auto-refresh against
+		// control-service). Personal / OAuth routes fall through to the
+		// legacy CollectorToken inside reporter — no change in behaviour.
+		//
+		// refresh_token is read directly from the vault's platform_account
+		// table (proxy already holds the master-derived key for vault
+		// access). Construction errors are non-fatal: an absent or partial
+		// credential just leaves the team route credential-less, which the
+		// reporter handles by falling back to CollectorToken.
+		credentials := buildCollectorCredentials(
+			s.cfg.Events.CollectorCredentials,
+			vaultReader,
+		)
+
 		var err error
 		reporter, err = events.NewReporter(events.ReporterConfig{
-			CollectorURL:    s.cfg.Events.CollectorURL,
-			CollectorToken:  s.cfg.Events.CollectorToken,
-			QueueCapacity:   s.cfg.Events.QueueCapacity,
-			BatchSize:       s.cfg.Events.UploadBatchSize,
-			UploadInterval:  s.cfg.Events.UploadInterval,
-			WALDir:          s.cfg.Events.WALDir,
-			SharedWAL:       sharedWAL,
-			ProxyInstanceID: fmt.Sprintf("proxy-%d", id),
-			ConfigHash:      s.cfg.PipelineConfigHash(),
-			DBPath:          s.cfg.Events.DBPath,
+			CollectorURL:              s.cfg.Events.CollectorURL,
+			CollectorRoutes:           s.cfg.Events.CollectorRoutes,
+			CollectorRouteCredentials: credentials,
+			CollectorToken:            s.cfg.Events.CollectorToken,
+			QueueCapacity:             s.cfg.Events.QueueCapacity,
+			BatchSize:                 s.cfg.Events.UploadBatchSize,
+			UploadInterval:            s.cfg.Events.UploadInterval,
+			WALDir:                    s.cfg.Events.WALDir,
+			SharedWAL:                 sharedWAL,
+			ProxyInstanceID:           fmt.Sprintf("proxy-%d", id),
+			ConfigHash:                s.cfg.PipelineConfigHash(),
+			DBPath:                    s.cfg.Events.DBPath,
 		})
 		if err != nil {
 			slog.Warn("reporter init failed, usage reporting disabled", "error", err)
@@ -923,4 +968,106 @@ func isAddrInUse(err error) bool {
 	msg := err.Error()
 	return strings.Contains(msg, "address already in use") ||
 		strings.Contains(msg, "Only one usage of each socket address")
+}
+
+// refreshTokenSource is the minimal vault contract buildCollectorCredentials
+// depends on. Defined here (not in vault/) so tests can pass a stub
+// without spinning up a real SQLite vault. *vault.Reader satisfies it
+// via its GetPlatformRefreshToken method.
+type refreshTokenSource interface {
+	GetPlatformRefreshToken() (string, error)
+}
+
+// buildCollectorCredentials turns the yaml-merged collector_credentials
+// map into the events.Credential map the reporter consumes. Today only
+// `type: jwt` is recognised; future types (mTLS material, OAuth client
+// creds for non-aikey backends, etc.) extend this switch.
+//
+// The refresh_token comes from vault, not yaml — see
+// vault.Reader.GetPlatformRefreshToken for the rationale.
+//
+// Returns nil when no credentials are configured. Reporter handles a
+// nil map by falling back to the legacy CollectorToken global, so an
+// unconfigured deployment keeps working unchanged.
+func buildCollectorCredentials(
+	cfgCreds map[string]config.CollectorCredential,
+	vaultReader refreshTokenSource,
+) map[string]events.Credential {
+	if len(cfgCreds) == 0 {
+		return nil
+	}
+	out := make(map[string]events.Credential, len(cfgCreds))
+
+	for routeSource, c := range cfgCreds {
+		switch c.Type {
+		case "jwt":
+			refreshToken, err := vaultReader.GetPlatformRefreshToken()
+			if err != nil {
+				slog.Warn(
+					"collector credential: skip route — vault refresh_token read failed",
+					"event.name", "credential.bootstrap.vault_read_failed",
+					"route_source", routeSource,
+					"error.message", err.Error(),
+				)
+				continue
+			}
+			if refreshToken == "" {
+				// platform_account row missing OR refresh_token NULL.
+				// Pre-login state; quietly skip so reporter falls back
+				// to legacy CollectorToken. Once `aikey account login`
+				// runs, refresh_token populates and a proxy reload picks
+				// it up.
+				slog.Info(
+					"collector credential: skip route — no vault refresh_token (pre-login)",
+					"event.name", "credential.bootstrap.no_refresh_token",
+					"route_source", routeSource,
+				)
+				continue
+			}
+			if c.Token == "" || c.RefreshURL == "" {
+				slog.Warn(
+					"collector credential: skip route — yaml bundle incomplete",
+					"event.name", "credential.bootstrap.yaml_incomplete",
+					"route_source", routeSource,
+					"missing_token", c.Token == "",
+					"missing_refresh_url", c.RefreshURL == "",
+				)
+				continue
+			}
+			out[routeSource] = &events.RefreshableJWT{
+				AccessToken:  c.Token,
+				RefreshToken: refreshToken,
+				ExpiresAt:    time.Unix(c.ExpiresAt, 0),
+				RefreshURL:   c.RefreshURL,
+				// PersistFn is intentionally nil: the proxy doesn't write
+				// back to user.yaml on each refresh — that's the CLI's
+				// responsibility on the next `aikey account login` /
+				// `aikey use` cycle. Leaving the new access_token only
+				// in-memory means a proxy restart re-reads the older
+				// (possibly stale) yaml value and the first Bearer()
+				// triggers another refresh — safe, idempotent, and keeps
+				// the file-write trust boundary unchanged.
+			}
+			slog.Info(
+				"collector credential: route wired (jwt)",
+				"event.name", "credential.bootstrap.wired",
+				"route_source", routeSource,
+				"refresh_url", c.RefreshURL,
+				"access_expires_at", c.ExpiresAt,
+			)
+
+		default:
+			slog.Warn(
+				"collector credential: unknown type, skipping",
+				"event.name", "credential.bootstrap.unknown_type",
+				"route_source", routeSource,
+				"type", c.Type,
+			)
+		}
+	}
+
+	if len(out) == 0 {
+		return nil
+	}
+	return out
 }

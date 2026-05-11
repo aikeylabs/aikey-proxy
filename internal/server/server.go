@@ -57,6 +57,13 @@ func New(ln net.Listener, dataHandler http.Handler, adminHandler *admin.Handler,
 	mux.HandleFunc("GET /status", adminHandler.Status)
 	mux.HandleFunc("GET /metrics", adminHandler.Metrics)
 	mux.HandleFunc("POST /admin/reload", adminHandler.Reload)
+	// Replay dead-letter usage events. Re-uses current reporter config
+	// (post-login JWT, current route URLs) so brief upstream errors
+	// (transient 401 / 5xx) don't permanently lose data. Operator
+	// triggers via `aikey proxy replay-dead-letter`. Idempotent: re-
+	// running is safe (entries that re-deliver are removed; entries
+	// still failing stay in the file for the next try).
+	mux.HandleFunc("POST /admin/replay-dead-letter", adminHandler.ReplayDeadLetter)
 	// Connectivity probe endpoint — used by `aikey test` / `aikey doctor` /
 	// `aikey add` to measure reachability + latency from the proxy's network
 	// context to upstream providers. Respects config.upstream_proxy.url and

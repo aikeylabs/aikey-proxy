@@ -215,6 +215,7 @@ func main() {
 	adminHandler.ReloadFn = sup.Reload
 	adminHandler.KeyChecksFn = sup.GetKeyCheckTargets
 	adminHandler.ReporterMetricsFn = sup.ReporterMetrics
+	adminHandler.ReplayDeadLetterFn = sup.ReplayDeadLetter
 	adminHandler.CanaryResultFn = sup.CanaryResult
 	adminHandler.DebugUpstreamHeadersStateFn = proxy.UpstreamHeadersDebugState
 	adminHandler.DebugUpstreamHeadersSetFn = proxy.SetUpstreamHeadersDebugAPIOverride

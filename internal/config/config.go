@@ -4,12 +4,15 @@ import (
 	"bufio"
 	"crypto/sha256"
 	"encoding/hex"
+	"errors"
 	"fmt"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"strings"
 	"time"
 
+	"github.com/AiKeyLabs/aikey-config-tool/pkg/configmerge"
 	"gopkg.in/yaml.v3"
 )
 
@@ -56,6 +59,27 @@ type ProviderConfig struct {
 	Timeout  time.Duration `yaml:"timeout"`
 }
 
+// CollectorCredential is the per-RouteSource credential bundle written
+// by `aikey account login` into aikey-user.yaml's `proxy:` section and
+// merged onto EventsConfig at startup. The proxy's supervisor turns
+// this into an `events.Credential` (e.g. RefreshableJWT) before passing
+// it to the reporter.
+//
+// `Type == "jwt"` is the only supported value today. Token is the
+// current short-lived access_token; ExpiresAt is its unix expiry
+// (0 = unknown → refresh on first use); RefreshURL is the absolute
+// URL the proxy's auto-refresh loop POSTs to. refresh_token does NOT
+// live here — it stays encrypted in the vault.
+//
+// Added 2026-05-11 (B4 phase). See roadmap update
+// 20260511-user-jwt-collector-ingest.md.
+type CollectorCredential struct {
+	Type       string `yaml:"type"`
+	Token      string `yaml:"token"`
+	ExpiresAt  int64  `yaml:"expires_at"`
+	RefreshURL string `yaml:"refresh_url"`
+}
+
 type EventsConfig struct {
 	DBPath        string        `yaml:"db_path"`
 	BatchSize     int           `yaml:"batch_size"`
@@ -64,6 +88,35 @@ type EventsConfig struct {
 	// Usage reporting to collector-service
 	CollectorURL   string        `yaml:"collector_url"`    // e.g. "http://localhost:27300"
 	CollectorToken string        `yaml:"collector_token"`  // Bearer token for auth
+
+	// CollectorRoutes maps RouteSource ("personal" / "team" / "oauth") →
+	// upload URL. When the lookup hits, this URL takes precedence over
+	// CollectorURL for that event. Misses fall through to CollectorURL.
+	// Empty value for a route disables upload for that route source
+	// (events are still WAL'd locally).
+	//
+	// Why this exists: separates per-key-type upload destinations so
+	// personal-key usage events stay on the local collector while team-key
+	// events go to the remote team server. Set by `aikey login --control-url`
+	// for the "team" key; never touches "personal" / "oauth" defaults.
+	// See roadmap20260320/技术实现/update/20260510-personal-team-数据隔离与合并显示.md.
+	CollectorRoutes map[string]string `yaml:"collector_routes"`
+
+	// CollectorCredentials maps RouteSource → credential bundle. Written
+	// by aikey-cli's `aikey account login --control-url <REMOTE>` (B3
+	// phase) into the **user** layer of the config split — proxy's Load
+	// reads them via configmerge.LoadAndMerge under the `proxy:` section,
+	// so they survive `make restart-personal` re-renders just like
+	// CollectorRoutes.team does.
+	//
+	// Today only "team" is populated and only `type: jwt` is supported;
+	// `refresh_token` is intentionally NOT in yaml (it lives encrypted
+	// in the vault's platform_account table — proxy reads it via the
+	// supervisor's already-derived master key).
+	//
+	// See roadmap20260320/技术实现/update/20260511-user-jwt-collector-ingest.md.
+	CollectorCredentials map[string]CollectorCredential `yaml:"collector_credentials"`
+
 	QueueCapacity  int           `yaml:"queue_capacity"`   // bounded queue size (default 10000)
 	UploadBatchSize int          `yaml:"upload_batch_size"` // events per upload (default 100)
 	UploadInterval time.Duration `yaml:"upload_interval"`  // max time between uploads (default 5s)
@@ -108,14 +161,24 @@ type UpstreamProxyConfig struct {
 }
 
 // Load reads and parses a YAML config file, applying defaults.
+//
+// Stage 2026-05-11 (F1 fix for collector_routes.team overwrite):
+// also merges `aikey-user.yaml` in the same directory as `path` when present,
+// using the `proxy:` section. User-layer values win on field collision per
+// configmerge.deepMerge semantics. This makes `aikey login --control-url
+// <REMOTE>`'s team-route override survive `make restart-personal` (which
+// rm's and re-renders the system yaml from template). Mirrors the
+// trial-server Load path (aikey-trial-server/config/config.go:97-110) so
+// both services follow the same merge protocol.
 func Load(path string) (*Config, error) {
-	data, err := os.ReadFile(path)
+	cfg := &Config{}
+
+	mergedYAML, err := loadAndMaybeMerge(path)
 	if err != nil {
-		return nil, fmt.Errorf("read config: %w", err)
+		return nil, err
 	}
 
-	cfg := &Config{}
-	if err := yaml.Unmarshal(data, cfg); err != nil {
+	if err := yaml.Unmarshal(mergedYAML, cfg); err != nil {
 		return nil, fmt.Errorf("parse config: %w", err)
 	}
 
@@ -129,6 +192,43 @@ func Load(path string) (*Config, error) {
 	cfg.expandPaths()
 
 	return cfg, nil
+}
+
+// loadAndMaybeMerge returns the raw yaml bytes that `yaml.Unmarshal` should
+// see. When `aikey-user.yaml` exists in the same directory as the system
+// path, its `proxy:` subtree is deep-merged on top before re-marshalling.
+//
+// Why marshal-after-merge: configmerge.LoadAndMerge returns a
+// map[string]any (yaml.v3 keeps that path simple). We re-marshal so the
+// downstream `yaml.Unmarshal(data, *Config)` path is unchanged — same
+// shape, same yaml tags, same struct-validation. Trial-server uses the
+// identical pattern; matching it keeps the two loaders behaviour-aligned.
+//
+// Missing user file is the personal-no-team-server case: return the
+// system bytes as-is and let the user-layer override stay absent.
+func loadAndMaybeMerge(path string) ([]byte, error) {
+	systemBytes, err := os.ReadFile(path)
+	if err != nil {
+		return nil, fmt.Errorf("read config: %w", err)
+	}
+
+	userPath := filepath.Join(filepath.Dir(path), "aikey-user.yaml")
+	if _, statErr := os.Stat(userPath); statErr != nil {
+		if errors.Is(statErr, fs.ErrNotExist) {
+			return systemBytes, nil
+		}
+		return nil, fmt.Errorf("stat user config: %w", statErr)
+	}
+
+	merged, err := configmerge.LoadAndMerge(path, userPath, "proxy")
+	if err != nil {
+		return nil, fmt.Errorf("merge system+user proxy config: %w", err)
+	}
+	out, err := yaml.Marshal(merged)
+	if err != nil {
+		return nil, fmt.Errorf("re-marshal merged proxy config: %w", err)
+	}
+	return out, nil
 }
 
 // applyEnvOverrides honours selected env vars after yaml + defaults

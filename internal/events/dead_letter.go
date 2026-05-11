@@ -1,6 +1,8 @@
 package events
 
 import (
+	"bytes"
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -112,6 +114,199 @@ func (w *deadLetterWriter) write(entry deadLetterEntry) {
 	if _, err := f.Write(data); err != nil {
 		slog.Error("dead_letter: write failed", "error", err)
 	}
+}
+
+// ReplayDeadLetterResult is the outcome of one ReplayDeadLetter() pass.
+// Surfaced to operators via the admin endpoint so they can tell at a
+// glance whether replay made progress.
+type ReplayDeadLetterResult struct {
+	// EntriesScanned is the total number of records read from
+	// dead_letter.jsonl (one per failed batch from the original
+	// upload run).
+	EntriesScanned int `json:"entries_scanned"`
+	// EntriesReplayedOK is the number of records that were successfully
+	// re-delivered to the collector this pass. These are removed from
+	// dead_letter.jsonl on disk.
+	EntriesReplayedOK int `json:"entries_replayed_ok"`
+	// EntriesStillFailing is the number of records still rejected
+	// (e.g. JWT still expired, collector still 401). These are kept in
+	// dead_letter.jsonl for a future replay attempt.
+	EntriesStillFailing int `json:"entries_still_failing"`
+	// EventsReplayedOK / EventsStillFailing sum the per-entry batch
+	// sizes — useful when batches are large (one entry, 100 events).
+	EventsReplayedOK    int `json:"events_replayed_ok"`
+	EventsStillFailing  int `json:"events_still_failing"`
+	// LastError is the most recent error message seen on a re-upload
+	// (empty if all succeeded). Useful for one-line diagnostics.
+	LastError string `json:"last_error,omitempty"`
+}
+
+// ReplayDeadLetter scans dead_letter.jsonl line by line and tries to
+// re-deliver each entry's batch to the collector using the *current*
+// reporter configuration (current CollectorRoutes / CollectorRouteCredentials
+// — which is the whole point: after a `aikey login` refresh or a
+// collector-side service_token rotation, the proxy's in-memory config
+// is up to date even though the file's stale `collector_url` field
+// is recorded at write time).
+//
+// On success the entry is removed from the file. On failure it stays.
+// The file is rewritten atomically (write to a sibling .tmp then
+// rename) so a mid-flight crash never leaves dead_letter.jsonl in a
+// half-truncated state.
+//
+// The function holds the deadLetterWriter mutex for the whole pass,
+// blocking any concurrent writes from the normal upload path during
+// replay. This is intentional — the proxy isn't expected to be
+// generating many new dead-letter entries while we're re-delivering
+// old ones, and the simpler exclusive-lock model avoids a more
+// complex two-phase commit between writes and re-deliveries.
+//
+// Added 2026-05-11 per the B-phase design doc's "reporter 401 fire-and-forget"
+// follow-up: previously, every terminal failure was permanently lost
+// the moment it hit dead_letter.jsonl, so a brief JWT expiry or
+// collector restart would silently lose hours of usage events. With
+// replay, an operator can run `aikey proxy replay-dead-letter` after
+// fixing the upstream cause and recover everything.
+func (r *Reporter) ReplayDeadLetter(ctx context.Context) (ReplayDeadLetterResult, error) {
+	if r.dlw == nil {
+		return ReplayDeadLetterResult{}, fmt.Errorf("reporter: dead-letter writer not configured")
+	}
+	r.dlw.mu.Lock()
+	defer r.dlw.mu.Unlock()
+
+	path := r.dlw.path
+	data, err := os.ReadFile(path)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return ReplayDeadLetterResult{}, nil // nothing to replay
+		}
+		return ReplayDeadLetterResult{}, fmt.Errorf("read dead_letter: %w", err)
+	}
+
+	var result ReplayDeadLetterResult
+	var keepLines [][]byte
+
+	for _, line := range bytes.Split(data, []byte("\n")) {
+		if len(bytes.TrimSpace(line)) == 0 {
+			continue
+		}
+		result.EntriesScanned++
+
+		var entry deadLetterEntry
+		if err := json.Unmarshal(line, &entry); err != nil {
+			// Malformed line — keep it so the operator can inspect manually;
+			// not our place to silently drop unparseable history.
+			slog.Warn("dead_letter replay: skip malformed line",
+				"event.name", "dead_letter.replay.malformed_line",
+				"error", err.Error(),
+			)
+			keepLines = append(keepLines, line)
+			continue
+		}
+
+		// Resolve URL + credential from current cfg, not entry.CollectorURL.
+		// Entry's URL was recorded at write time and may be stale (e.g.
+		// CLI re-logged in to a different control-url since then).
+		// We assume all events in one entry share the same RouteSource.
+		routeSource := ""
+		if len(entry.Events) > 0 {
+			routeSource = entry.Events[0].RouteSource
+		}
+		url := r.urlForRouteSource(routeSource)
+		cred := r.credentialForRouteSource(routeSource)
+		if url == "" {
+			// No upload destination configured for this RouteSource —
+			// keep entry in dead-letter and warn. Common case: team
+			// route configured but user logged out and `team` URL is
+			// now empty.
+			result.EntriesStillFailing++
+			result.EventsStillFailing += len(entry.Events)
+			result.LastError = fmt.Sprintf("no destination for route_source=%q", routeSource)
+			keepLines = append(keepLines, line)
+			continue
+		}
+
+		req := batchRequest{
+			Source:          "aikey-proxy",
+			SourceVersion:   "0.1.0",
+			ProxyInstanceID: r.cfg.ProxyInstanceID,
+			Events:          entry.Events,
+		}
+		body, err := json.Marshal(req)
+		if err != nil {
+			result.EntriesStillFailing++
+			result.EventsStillFailing += len(entry.Events)
+			result.LastError = "marshal: " + err.Error()
+			keepLines = append(keepLines, line)
+			continue
+		}
+
+		uploadURL := url + "/v1/usage-events:batch"
+		// Honor context cancellation between entries (long replay can be
+		// interrupted by SIGTERM during a graceful shutdown).
+		select {
+		case <-ctx.Done():
+			// Keep the rest of the file unread; rewrite preserves entries
+			// after this point as-is.
+			keepLines = append(keepLines, line)
+			// Note: we don't break here — we still want to flush
+			// keepLines before exit, so just count this as not-replayed
+			// and continue the loop. But ctx.Done means we should stop
+			// trying. Use a flag.
+			result.EntriesStillFailing++
+			result.EventsStillFailing += len(entry.Events)
+			result.LastError = "context cancelled"
+			// Continue draining to keep remaining lines.
+			continue
+		default:
+		}
+
+		if upErr := r.doUpload(uploadURL, body, cred); upErr != nil {
+			result.EntriesStillFailing++
+			result.EventsStillFailing += len(entry.Events)
+			result.LastError = fmt.Sprintf("HTTP %d: %s", upErr.StatusCode, upErr.Err)
+			keepLines = append(keepLines, line)
+			slog.Info("dead_letter replay: still failing, kept",
+				"event.name", "dead_letter.replay.still_failing",
+				"event_ids", entry.EventIDs,
+				"status", upErr.StatusCode,
+			)
+			continue
+		}
+
+		result.EntriesReplayedOK++
+		result.EventsReplayedOK += len(entry.Events)
+		r.uploadSuccess.Add(int64(len(entry.Events)))
+		slog.Info("dead_letter replay: re-delivered",
+			"event.name", "dead_letter.replay.delivered",
+			"event_ids", entry.EventIDs,
+			"route_source", routeSource,
+		)
+	}
+
+	// Rewrite the file atomically — write tmp + rename. If we replayed
+	// every entry, write an empty file rather than os.Remove() so the
+	// path keeps existing (operators may have file watchers on it).
+	tmpPath := path + ".tmp"
+	out := bytes.Join(keepLines, []byte("\n"))
+	if len(keepLines) > 0 {
+		out = append(out, '\n')
+	}
+	if err := os.WriteFile(tmpPath, out, 0o644); err != nil {
+		return result, fmt.Errorf("write dead_letter.tmp: %w", err)
+	}
+	if err := os.Rename(tmpPath, path); err != nil {
+		_ = os.Remove(tmpPath)
+		return result, fmt.Errorf("rename dead_letter.tmp: %w", err)
+	}
+
+	slog.Info("dead_letter replay: pass complete",
+		"event.name", "dead_letter.replay.pass_complete",
+		"scanned", result.EntriesScanned,
+		"replayed_ok", result.EntriesReplayedOK,
+		"still_failing", result.EntriesStillFailing,
+	)
+	return result, nil
 }
 
 // writeDeadLetter records a failed batch to dead_letter.jsonl with full diagnostic context.

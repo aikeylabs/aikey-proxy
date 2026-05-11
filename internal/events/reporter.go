@@ -21,6 +21,32 @@ import (
 type ReporterConfig struct {
 	CollectorURL    string        // e.g. "http://localhost:27300"
 	CollectorToken  string        // Bearer token
+
+	// CollectorRoutes maps RouteSource ("personal" / "team" / "oauth") →
+	// upload URL. When ev.RouteSource has a non-empty mapping, that URL
+	// is used for the event; misses fall through to CollectorURL.
+	// Empty value disables upload for that route (event still WAL'd).
+	//
+	// Why per-route: personal-key events stay on local collector;
+	// team-key events go to remote team collector after `aikey login`.
+	// Single channel + grouped per-URL upload — see uploadBatch.
+	CollectorRoutes map[string]string
+
+	// CollectorRouteCredentials maps RouteSource → Credential (added
+	// 2026-05-11 B-phase, see roadmap update
+	// 20260511-user-jwt-collector-ingest.md). When ev.RouteSource has a
+	// per-route credential the reporter uses its Bearer() for the upload
+	// header; misses fall back to the legacy CollectorToken (which is
+	// wrapped in a StaticTokenCredential at config-load time, see
+	// supervisor wiring).
+	//
+	// Why split from CollectorRoutes (URL): a route's URL is config-
+	// time fixed but its credential may be stateful (RefreshableJWT
+	// holds a mutex + refresh state). Keeping them parallel maps lets
+	// tests inject either independently and lets a future config field
+	// (e.g. per-route mTLS material) follow the same pattern.
+	CollectorRouteCredentials map[string]Credential
+
 	QueueCapacity   int           // bounded queue size (default 10000)
 	BatchSize       int           // events per upload batch (default 100)
 	UploadInterval  time.Duration // max time between uploads (default 5s)
@@ -136,7 +162,21 @@ func NewReporter(cfg ReporterConfig) (*Reporter, error) {
 		client: &http.Client{Timeout: 30 * time.Second},
 	}
 
-	if cfg.CollectorURL != "" {
+	// Start upload loop if any destination is configured (legacy single
+	// CollectorURL OR per-route CollectorRoutes with at least one
+	// non-empty entry). With both unset, events still get WAL'd but
+	// nothing uploads — same as the pre-CollectorRoutes behaviour when
+	// CollectorURL was empty.
+	hasAnyURL := cfg.CollectorURL != ""
+	if !hasAnyURL {
+		for _, u := range cfg.CollectorRoutes {
+			if u != "" {
+				hasAnyURL = true
+				break
+			}
+		}
+	}
+	if hasAnyURL {
 		r.wg.Add(1)
 		// Fatal: reporter upload loop silently dying means usage events pile
 		// up in the queue and get dropped — direct billing correctness risk.
@@ -144,6 +184,45 @@ func NewReporter(cfg ReporterConfig) (*Reporter, error) {
 	}
 
 	return r, nil
+}
+
+// urlForEvent picks the upload URL for an event, honouring per-route
+// overrides ahead of the legacy single-URL CollectorURL. Returns "" when
+// no destination is configured for the event's RouteSource — caller must
+// skip the upload (event is already WAL'd).
+func (r *Reporter) urlForEvent(ev ReportableEvent) string {
+	return r.urlForRouteSource(ev.RouteSource)
+}
+
+// urlForRouteSource is the route-source-keyed half of urlForEvent. Split
+// out 2026-05-11 so uploadBatch can group by RouteSource (and thus also
+// pick the right credential per group, not just per URL — two route
+// sources COULD collide on the same URL with different credentials).
+func (r *Reporter) urlForRouteSource(routeSource string) string {
+	if r.cfg.CollectorRoutes != nil {
+		if u, ok := r.cfg.CollectorRoutes[routeSource]; ok && u != "" {
+			return u
+		}
+	}
+	return r.cfg.CollectorURL
+}
+
+// credentialForRouteSource returns the bearer source for uploads tied
+// to this RouteSource. Per-route credentials win; falls back to the
+// legacy global CollectorToken wrapped in a StaticTokenCredential.
+// Returns nil only when neither path is configured — caller (doUpload)
+// then sends the upload with no Authorization header (matches pre-B
+// behaviour when CollectorToken was "").
+func (r *Reporter) credentialForRouteSource(routeSource string) Credential {
+	if r.cfg.CollectorRouteCredentials != nil {
+		if c, ok := r.cfg.CollectorRouteCredentials[routeSource]; ok && c != nil {
+			return c
+		}
+	}
+	if r.cfg.CollectorToken != "" {
+		return &StaticTokenCredential{Token: r.cfg.CollectorToken}
+	}
+	return nil
 }
 
 // Report enqueues a reportable event for WAL write and upload.
@@ -287,7 +366,58 @@ func (r *Reporter) uploadLoop() {
 	}
 }
 
+// uploadBatch groups the batch by RouteSource and delegates each group
+// to uploadGroupTo. Events without a destination URL are dropped at
+// this stage — they are already WAL'd locally for offline replay /
+// debugging.
+//
+// Why per-RouteSource grouping (changed 2026-05-11 from per-URL):
+// per-route credentials need RouteSource as the lookup key, not URL —
+// two route sources COULD legitimately point at the same URL with
+// different bearer credentials (e.g. a single collector accepting
+// both user-JWT-bound team events and S2S personal events). Grouping
+// by RouteSource keeps URL + credential paired correctly for the
+// entire batch.
+//
+// Why per-group grouping at all: the input batch can mix RouteSources
+// (a personal call and a team call may finish in the same 5s window).
+// Each group gets its own retry / dead-letter cycle so a slow /
+// failing destination can't penalise others.
 func (r *Reporter) uploadBatch(batch []ReportableEvent) {
+	if len(batch) == 0 {
+		return
+	}
+	groups := make(map[string][]ReportableEvent, 1)
+	skipped := 0
+	for _, ev := range batch {
+		if r.urlForEvent(ev) == "" {
+			skipped++
+			continue
+		}
+		groups[ev.RouteSource] = append(groups[ev.RouteSource], ev)
+	}
+	if skipped > 0 {
+		// Routine miss when a route_source has no destination configured
+		// (e.g. team route on a pure personal install). Counted as
+		// dropped so metrics show backlog vs. discard split.
+		r.dropped.Add(int64(skipped))
+	}
+	for routeSource, group := range groups {
+		url := r.urlForRouteSource(routeSource)
+		cred := r.credentialForRouteSource(routeSource)
+		r.uploadGroupTo(url, cred, group)
+	}
+}
+
+// uploadGroupTo handles one (url, credential, batch) triple including
+// retry + dead-letter. Extracted from the old monolithic uploadBatch
+// when per-route routing landed (2026-05-10); credential parameter
+// added 2026-05-11 to thread per-RouteSource bearer through the retry
+// loop. The retry/DLW logic itself is unchanged.
+//
+// cred may be nil — doUpload tolerates that by sending without an
+// Authorization header (matches pre-CollectorToken behaviour).
+func (r *Reporter) uploadGroupTo(collectorURL string, cred Credential, batch []ReportableEvent) {
 	req := batchRequest{
 		Source:          "aikey-proxy",
 		SourceVersion:   "0.1.0",
@@ -302,7 +432,7 @@ func (r *Reporter) uploadBatch(batch []ReportableEvent) {
 		return
 	}
 
-	url := r.cfg.CollectorURL + "/v1/usage-events:batch"
+	url := collectorURL + "/v1/usage-events:batch"
 
 	// Retry with exponential backoff: 5s, 15s, 60s, 5min
 	delays := []time.Duration{0, 5 * time.Second, 15 * time.Second, 60 * time.Second, 5 * time.Minute}
@@ -314,7 +444,7 @@ func (r *Reporter) uploadBatch(batch []ReportableEvent) {
 			time.Sleep(delay)
 		}
 
-		upErr := r.doUpload(url, body)
+		upErr := r.doUpload(url, body, cred)
 		if upErr == nil {
 			r.uploadSuccess.Add(int64(len(batch)))
 			r.onUploadSuccess(len(batch))
@@ -389,14 +519,35 @@ func (r *Reporter) onUploadFail(count int, upErr *uploadError, terminal bool) {
 // Why catch all non-2xx (not just 401/5xx): classifyUploadError needs to see 400
 // to mark it as terminal. If we only catch specific codes, 400 would fall through
 // to json.Decode and be misclassified as a success or decode error.
-func (r *Reporter) doUpload(url string, body []byte) *uploadError {
+//
+// cred (added 2026-05-11) is the per-RouteSource credential resolved by
+// uploadBatch. If nil, the request goes without an Authorization header —
+// matches pre-CollectorToken behaviour for credential-free deployments.
+// Bearer() failures are surfaced as a synthetic 401-class uploadError so
+// the retry/dead-letter loop treats stale credentials the same as a
+// server-side 401 (no infinite retry; lands in dead_letter.jsonl with
+// the credential error message as response body).
+func (r *Reporter) doUpload(url string, body []byte, cred Credential) *uploadError {
 	httpReq, err := http.NewRequest(http.MethodPost, url, bytes.NewReader(body))
 	if err != nil {
 		return &uploadError{Err: fmt.Errorf("build request: %w", err)}
 	}
 	httpReq.Header.Set("Content-Type", "application/json")
-	if r.cfg.CollectorToken != "" {
-		httpReq.Header.Set("Authorization", "Bearer "+r.cfg.CollectorToken)
+	if cred != nil {
+		// Bearer() may block briefly on refresh — bound by RefreshableJWT's
+		// internal HTTPClient timeout (10s default). Use the request context
+		// so a shutdown cancels the refresh attempt cleanly.
+		bearer, berr := cred.Bearer(httpReq.Context())
+		if berr != nil {
+			return &uploadError{
+				StatusCode:   http.StatusUnauthorized,
+				ResponseBody: berr.Error(),
+				Err:          fmt.Errorf("credential: %w", berr),
+			}
+		}
+		if bearer != "" {
+			httpReq.Header.Set("Authorization", "Bearer "+bearer)
+		}
 	}
 
 	resp, err := r.client.Do(httpReq)
