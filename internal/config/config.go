@@ -30,6 +30,21 @@ type Config struct {
 	Events        EventsConfig              `yaml:"events"`
 	Log           LogConfig                 `yaml:"log"`
 	UpstreamProxy UpstreamProxyConfig       `yaml:"upstream_proxy"`
+
+	// Observers is the Phase 4 M2 first-party observer config block.
+	// Keyed by observer.Name (e.g. "rhythm"); each value is a free-form
+	// map that the observer package's Build callback decodes into its
+	// own concrete settings struct (reporter URL, batch size, etc.).
+	//
+	// Absent block ⇒ no observers built (the default for non-degrade-
+	// detector deployments — Notify* hooks become zero-cost no-ops via
+	// the Active()==0 fast path).
+	//
+	// The proxy main code never inspects this block's contents — it
+	// just forwards `Observers[obsName]` to BuildObservers, which hands
+	// it to the per-observer Build callback. Adding a new observer
+	// doesn't require any change here.
+	Observers map[string]map[string]any `yaml:"observers,omitempty"`
 }
 
 type ListenConfig struct {

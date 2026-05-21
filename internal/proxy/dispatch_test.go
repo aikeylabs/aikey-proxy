@@ -45,6 +45,21 @@ func TestClassifyToken_Tier1Personal_StrictForm(t *testing.T) {
 	}
 }
 
+func TestClassifyToken_Tier1App_StrictForm(t *testing.T) {
+	hex := strings.Repeat("0", 64)
+	cases := []string{
+		"aikey_app_" + hex,
+		"aikey_app_" + strings.Repeat("f", 64),
+		"aikey_app_" + strings.Repeat("abcdef0123456789", 4),
+	}
+	for _, tok := range cases {
+		got := ClassifyToken(tok)
+		if got != Tier1App {
+			t.Errorf("ClassifyToken(%q) = %v, want Tier1App", tok, got)
+		}
+	}
+}
+
 func TestClassifyToken_Tier2Probe(t *testing.T) {
 	cases := []string{
 		"aikey_probe_my-claude",
@@ -138,6 +153,22 @@ func TestClassifyToken_TokenInvalid_LegacyAndMalformed(t *testing.T) {
 		{"legacy personal alias", "aikey_personal_my-claude"},
 		{"legacy personal UUID", "aikey_personal_54f8a3e1-b4d9-4e21-9fa0-0e3c5b7d8a91"},
 		{"legacy personal acc_id", "aikey_personal_acc_1234567890"},
+
+		// Malformed app bearer — wrong length.
+		{"app 63 hex", "aikey_app_" + strings.Repeat("0", 63)},
+		{"app 65 hex", "aikey_app_" + strings.Repeat("0", 65)},
+		{"app 128 hex (double)", "aikey_app_" + strings.Repeat("0", 128)},
+		{"app empty suffix", "aikey_app_"},
+
+		// Malformed app bearer — wrong charset.
+		{"app uppercase", "aikey_app_" + strings.Repeat("A", 64)},
+		{"app mixed case", "aikey_app_" + strings.Repeat("aA", 32)},
+		{"app non-hex letter g", "aikey_app_" + strings.Repeat("g", 64)},
+		{"app with hyphen", "aikey_app_" + strings.Repeat("0", 32) + "-" + strings.Repeat("0", 31)},
+
+		// Legacy app sentinel forms (none in production, but mirror personal — these MUST loud-fail).
+		{"app alias-like suffix", "aikey_app_my-agent"},
+		{"app UUID suffix", "aikey_app_54f8a3e1-b4d9-4e21-9fa0-0e3c5b7d8a91"},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
@@ -187,6 +218,37 @@ func TestIsTier1Personal_StrictForm(t *testing.T) {
 	for _, tok := range rejects {
 		if isTier1Personal(tok) {
 			t.Errorf("isTier1Personal(%q) = true, want false", tok)
+		}
+	}
+}
+
+// Strict form check for the app bearer predicate — mirrors
+// TestIsTier1Personal_StrictForm. Both predicates share the underlying
+// hasStrictHex64Suffix helper, so this also pins the shared invariant.
+func TestIsTier1App_StrictForm(t *testing.T) {
+	hex64 := strings.Repeat("0", 64)
+	if !isTier1App("aikey_app_" + hex64) {
+		t.Error("must accept aikey_app_<64 zeros>")
+	}
+	if !isTier1App("aikey_app_" + strings.Repeat("abcdef0123456789", 4)) {
+		t.Error("must accept aikey_app_<64 lowercase hex>")
+	}
+
+	rejects := []string{
+		"aikey_app_" + strings.Repeat("0", 63),       // 63
+		"aikey_app_" + strings.Repeat("0", 65),       // 65
+		"aikey_app_" + strings.Repeat("A", 64),       // uppercase
+		"aikey_app_" + strings.Repeat("g", 64),       // non-hex
+		"aikey_app_my-alias",                          // alias-like form
+		"aikey_app_",                                  // empty suffix
+		"aikey_personal_" + hex64,                     // wrong prefix (personal, not app)
+		"aikey_team_" + hex64,                         // wrong prefix (team)
+		"sk-" + hex64,                                 // not aikey
+		"",
+	}
+	for _, tok := range rejects {
+		if isTier1App(tok) {
+			t.Errorf("isTier1App(%q) = true, want false", tok)
 		}
 	}
 }

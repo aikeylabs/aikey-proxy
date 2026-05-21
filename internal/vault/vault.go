@@ -616,23 +616,50 @@ func (r *Reader) GetTeamKeyByID(virtualKeyID string) (*ManagedKey, error) {
 
 // ProviderBinding represents a row from user_profile_provider_bindings (v1.0.2).
 // It maps a provider to the key source that is currently Primary for the
-// implicit default profile.
+// addressed profile scope.
+//
+// Possible KeySourceType values (matches aikey-cli's CredentialType enum):
+//   - "personal"               — entries.alias (API key)
+//   - "team"                   — managed_virtual_keys_cache.virtual_key_id
+//   - "personal_oauth_account" — provider_accounts.provider_account_id (OAuth)
+//
+// The legacy short forms ("personal" / "team") are the canonical strings
+// written by the CLI; "personal_api_key" / "managed_virtual_key" are
+// accepted on read but never produced.
 type ProviderBinding struct {
 	ProviderCode  string
-	KeySourceType string // "personal" or "team"
-	KeySourceRef  string // alias (personal) or virtual_key_id (team)
+	KeySourceType string
+	KeySourceRef  string // alias (personal) / virtual_key_id (team) / provider_account_id (oauth)
 }
 
-// GetProviderBinding reads the current provider binding for the given provider
-// from user_profile_provider_bindings (profile_id = 'default').
-// Returns nil if no binding exists for that provider or the table does not exist.
+// GetProviderBinding reads the current provider binding for the given
+// provider in the implicit default profile (`profile_id = 'default'`).
+// Returns nil if no binding exists or the table does not exist.
+//
+// Kept as a thin wrapper over GetProviderBindingWithScope so the three
+// existing callers in the proxy package (proxy/proxy.go:702 and the
+// dispatch/middleware references) don't need to change signature.
 func (r *Reader) GetProviderBinding(providerCode string) (*ProviderBinding, error) {
+	return r.GetProviderBindingWithScope("default", providerCode)
+}
+
+// GetProviderBindingWithScope reads the provider binding for the given
+// (profileID, providerCode) tuple. Returns nil if no binding exists or
+// the table does not exist (pre-v1.0.2 vaults).
+//
+// profileID is `"default"` for the implicit user profile (legacy default
+// behavior) or `"app:<slug>"` for the third-party app pipeline (Phase 4).
+// The schema for `user_profile_provider_bindings.profile_id` is TEXT with
+// no enum constraint, so any string value is structurally valid — the
+// `app:` prefix is a writer-side convention enforced by `aikey app
+// authorize`, not by SQL.
+func (r *Reader) GetProviderBindingWithScope(profileID, providerCode string) (*ProviderBinding, error) {
 	var sourceType, sourceRef string
 	err := r.db.QueryRow(
 		`SELECT key_source_type, key_source_ref
 		   FROM user_profile_provider_bindings
-		  WHERE profile_id = 'default' AND provider_code = ?`,
-		providerCode,
+		  WHERE profile_id = ? AND provider_code = ?`,
+		profileID, providerCode,
 	).Scan(&sourceType, &sourceRef)
 	if err == sql.ErrNoRows {
 		return nil, nil
@@ -642,7 +669,7 @@ func (r *Reader) GetProviderBinding(providerCode string) (*ProviderBinding, erro
 		if strings.Contains(err.Error(), "no such table") {
 			return nil, nil
 		}
-		return nil, fmt.Errorf("read provider binding for %q: %w", providerCode, err)
+		return nil, fmt.Errorf("read provider binding for profile=%q provider=%q: %w", profileID, providerCode, err)
 	}
 	return &ProviderBinding{
 		ProviderCode:  providerCode,
@@ -846,6 +873,245 @@ func (r *Reader) GetAllOAuthRouteTokens() ([]OAuthRouteToken, error) {
 		result = append(result, t)
 	}
 	return result, rows.Err()
+}
+
+// ---------------------------------------------------------------------------
+// App pipeline (third-party Agent 接入, Phase 4) — read paths.
+// ---------------------------------------------------------------------------
+//
+// Two tables are added to the vault schema by aikey-cli's baseline migration
+// (src/migrations.rs v1_0_0_baseline.upgrade() tail block, 2026-05-20):
+//
+//   - app_records — application metadata (slug / name / vendor / declared
+//     protocol set / app_kind / follow_user_active). One row per installed
+//     app. Written by `aikey app register`.
+//
+//   - app_keys — issued credentials (route_token plaintext, key_id, status,
+//     timestamps). Multiple rows per slug allowed (rotation history). Written
+//     by `aikey app authorize` / `rotate`.
+//
+// Why route_token is stored plaintext (not hash) — same rationale as
+// entries.route_token and provider_accounts.route_token: aikey-proxy's
+// vkeys.Registry byToken map keys by the plaintext bearer that arrives
+// in the Authorization header, so any hash would prevent lookup. The
+// vault file itself is Argon2id + AES-256-GCM encrypted, so plaintext
+// inside the encrypted blob is the same protection envelope.
+//
+// Day 2 spike verified this against the existing Registry implementation:
+// roadmap20260320/技术实现/阶段4-增值版/2026-05-20-Phase0-spike-day2.md §3.
+
+// AppRecord represents a row from app_records — the metadata side of an
+// installed third-party Agent. No credentials live here; tokens are in
+// app_keys.
+type AppRecord struct {
+	Slug                  string
+	Name                  string
+	Vendor                string
+	Upstreams             []string // decoded from JSON column
+	AppKind               string   // "third-party" | "first-party"
+	FollowUserActive      bool
+	RequestedPermissions  []string // decoded from JSON column (nil if NULL)
+	CreatedAt             int64
+	UpdatedAt             int64
+}
+
+// GetSlug returns the app slug. Implemented as a method (not just a
+// field accessor) so *AppRecord directly satisfies the anonymous
+// `interface { GetSlug() string }` declared in the observer
+// framework's pkg/observer.VaultGetter — letting the proxy pass
+// *AppRecord through to the observer's enable-check predicate without
+// a wrapper struct.
+func (a *AppRecord) GetSlug() string { return a.Slug }
+
+// AppRouteToken is the joined view of app_keys × app_records used by the
+// supervisor to populate the registry. It carries both the credential
+// (RouteToken) and the metadata fields the App pipeline needs at request
+// time (AppKind / FollowUserActive / AllowedUpstreams) without forcing a
+// second DB hit per request.
+//
+// RouteToken is plaintext — see package doc for the rationale. Callers
+// MUST NOT log this struct via "%v" / "%+v" / fmt.Sprintf or pass it
+// directly to slog; use the LogValue method or extract non-secret fields
+// explicitly. The redaction is enforced by the LogValue receiver below.
+type AppRouteToken struct {
+	KeyID            string
+	AppSlug          string
+	RouteToken       string // ★ plaintext aikey_app_<64hex>
+	Status           string // "active" (loader only returns active)
+	AppKind          string
+	FollowUserActive bool
+	AllowedUpstreams []string
+}
+
+// LogValue implements slog.LogValuer to redact the plaintext RouteToken
+// from any log line that uses this value (or a slice of it) as an
+// attribute. Critical R6-mitigation per Day 3 spike report §6 — without
+// this, the routine vault loader trace logging would dump every app
+// token to disk.
+func (t AppRouteToken) LogValue() slog.Value {
+	return slog.GroupValue(
+		slog.String("key_id", t.KeyID),
+		slog.String("app_slug", t.AppSlug),
+		slog.String("route_token_prefix", routeTokenPrefixForLog(t.RouteToken)),
+		slog.String("status", t.Status),
+		slog.String("app_kind", t.AppKind),
+		slog.Bool("follow_user_active", t.FollowUserActive),
+		slog.Any("allowed_upstreams", t.AllowedUpstreams),
+	)
+}
+
+// GetAppRecord reads a single application's metadata by slug. Returns nil
+// if the row does not exist or the app_records table is absent
+// (pre-Phase-4 vault). Used by the App pipeline per request to enforce
+// upstream-set whitelist (inferred upstream must be in app.Upstreams).
+func (r *Reader) GetAppRecord(slug string) (*AppRecord, error) {
+	var (
+		rec                   AppRecord
+		protocolsJSON         string
+		requestedPermsJSON    *string
+		vendor                *string
+		followUserActiveInt   int
+	)
+	err := r.db.QueryRow(
+		`SELECT slug, name, vendor, upstreams, app_kind, follow_user_active,
+		        requested_permissions, created_at, updated_at
+		   FROM app_records
+		  WHERE slug = ?`,
+		slug,
+	).Scan(
+		&rec.Slug,
+		&rec.Name,
+		&vendor,
+		&protocolsJSON,
+		&rec.AppKind,
+		&followUserActiveInt,
+		&requestedPermsJSON,
+		&rec.CreatedAt,
+		&rec.UpdatedAt,
+	)
+	if err == sql.ErrNoRows {
+		return nil, nil
+	}
+	if err != nil {
+		if strings.Contains(err.Error(), "no such table") {
+			return nil, nil // pre-Phase-4 vault — no apps
+		}
+		return nil, fmt.Errorf("read app record for slug=%q: %w", slug, err)
+	}
+	if vendor != nil {
+		rec.Vendor = *vendor
+	}
+	rec.FollowUserActive = followUserActiveInt != 0
+	if err := json.Unmarshal([]byte(protocolsJSON), &rec.Upstreams); err != nil {
+		return nil, fmt.Errorf("decode app_records.upstreams for slug=%q: %w", slug, err)
+	}
+	if requestedPermsJSON != nil && *requestedPermsJSON != "" {
+		if err := json.Unmarshal([]byte(*requestedPermsJSON), &rec.RequestedPermissions); err != nil {
+			// Soft fail — requested_permissions is informational only, not
+			// runtime-enforced. Log + continue.
+			slog.Warn("app_records.requested_permissions decode failed; treating as empty",
+				"slug", slug, "error", err)
+		}
+	}
+	return &rec, nil
+}
+
+// GetAllAppRouteTokens returns all currently active app tokens joined with
+// their app_records metadata. Used by the supervisor at startup / restart
+// to populate vkeys.Registry's byToken map with app routes. Returns an
+// empty slice (not an error) if either table is absent (pre-Phase-4 vault).
+//
+// Form filter mirrors the personal / OAuth loaders: rows whose route_token
+// is not a strict `aikey_app_<64-hex>` are skipped with a WARN log rather
+// than aborting the load. Why: surfaces malformed writer-side bugs early
+// (clean startup warning instead of opaque 401s at request time) while
+// keeping the registry's invariant intact (registry only ever sees strict
+// Tier1 forms post-startup; see 主方案 §validation).
+func (r *Reader) GetAllAppRouteTokens() ([]AppRouteToken, error) {
+	// app_records may not exist on pre-Phase-4 vaults — treat as no apps.
+	if !hasColumn(r.db, "app_records", "slug") {
+		return nil, nil
+	}
+	if !hasColumn(r.db, "app_keys", "route_token") {
+		return nil, nil
+	}
+
+	rows, err := r.db.Query(
+		`SELECT k.key_id, k.app_slug, k.route_token, k.status,
+		        r.app_kind, r.follow_user_active, r.upstreams
+		   FROM app_keys k
+		   JOIN app_records r ON r.slug = k.app_slug
+		  WHERE k.status = 'active'
+		    AND (k.expires_at IS NULL OR k.expires_at > strftime('%s','now'))`,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("query app route tokens: %w", err)
+	}
+	defer rows.Close()
+
+	var result []AppRouteToken
+	for rows.Next() {
+		var (
+			t                   AppRouteToken
+			followUserActiveInt int
+			protocolsJSON       string
+		)
+		if err := rows.Scan(
+			&t.KeyID, &t.AppSlug, &t.RouteToken, &t.Status,
+			&t.AppKind, &followUserActiveInt, &protocolsJSON,
+		); err != nil {
+			slog.Warn("skip app route token row", "error", err)
+			continue
+		}
+		if !isStrictAppBearerForm(t.RouteToken) {
+			slog.Warn("skip app route token: non-strict form (writer-side bug or hand-crafted vault row)",
+				"app_slug", t.AppSlug,
+				"key_id", t.KeyID,
+				"route_token_prefix", routeTokenPrefixForLog(t.RouteToken),
+				"hint", "expected aikey_app_<64 lowercase hex>")
+			continue
+		}
+		t.FollowUserActive = followUserActiveInt != 0
+		if err := json.Unmarshal([]byte(protocolsJSON), &t.AllowedUpstreams); err != nil {
+			slog.Warn("skip app route token: upstreams JSON decode failed",
+				"app_slug", t.AppSlug, "key_id", t.KeyID, "error", err)
+			continue
+		}
+		result = append(result, t)
+	}
+	return result, rows.Err()
+}
+
+// GetActiveAppKeysForSlug returns the count of currently-active app_keys
+// rows for a given slug. "Active" = status='active' AND not expired.
+// Returns (0, nil) for a non-existent slug or a pre-Phase-4 vault (no
+// app_keys table) — both are valid steady states meaning "this app has
+// no live keys", not errors.
+//
+// Used by the Phase 4 observer framework's DefaultVaultEnableCheck to
+// decide at proxy startup whether to instantiate a first-party
+// observer. The semantics chosen here ("at least one active key")
+// match the user-visible meaning of `aikey app list`: an app shows up
+// only when it has at least one issued, non-expired bearer.
+func (r *Reader) GetActiveAppKeysForSlug(slug string) (int, error) {
+	// Pre-Phase-4 vault: app_keys table doesn't exist yet. Treat as no
+	// active keys rather than erroring — matches GetAppRecord's
+	// "soft return nil on missing table" convention.
+	if !hasColumn(r.db, "app_keys", "route_token") {
+		return 0, nil
+	}
+	var n int
+	err := r.db.QueryRow(
+		`SELECT COUNT(*) FROM app_keys
+		  WHERE app_slug = ?
+		    AND status = 'active'
+		    AND (expires_at IS NULL OR expires_at > strftime('%s','now'))`,
+		slug,
+	).Scan(&n)
+	if err != nil {
+		return 0, fmt.Errorf("count active app_keys for slug=%q: %w", slug, err)
+	}
+	return n, nil
 }
 
 // WriteConfigU64LE writes a uint64 as an 8-byte little-endian BLOB into the

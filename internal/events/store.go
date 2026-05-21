@@ -37,7 +37,11 @@ func OpenStore(dbPath string) (*Store, error) {
 }
 
 func migrate(db *sql.DB) error {
-	_, err := db.Exec(`
+	// Why per-statement Exec (not one big batch): we want partial-state
+	// safety — if the App-pipeline columns ALTERs (idempotent guards
+	// further down) fail individually we can investigate without rolling
+	// back the baseline.
+	if _, err := db.Exec(`
 		CREATE TABLE IF NOT EXISTS usage_events (
 			id INTEGER PRIMARY KEY AUTOINCREMENT,
 			timestamp INTEGER NOT NULL,
@@ -55,8 +59,41 @@ func migrate(db *sql.DB) error {
 		);
 		CREATE INDEX IF NOT EXISTS idx_events_timestamp ON usage_events(timestamp);
 		CREATE INDEX IF NOT EXISTS idx_events_vkey ON usage_events(virtual_key_id);
-	`)
-	return err
+	`); err != nil {
+		return err
+	}
+
+	// Phase 4 (AKL-207) — add App pipeline audit columns. SQLite has no
+	// `ADD COLUMN IF NOT EXISTS`, so we probe pragma_table_info and skip
+	// when the column already exists (idempotent for re-opening an
+	// existing DB).
+	appCols := []struct{ name, ddl string }{
+		{"app_slug", "ALTER TABLE usage_events ADD COLUMN app_slug TEXT DEFAULT ''"},
+		{"app_key_id", "ALTER TABLE usage_events ADD COLUMN app_key_id TEXT DEFAULT ''"},
+		{"app_mode", "ALTER TABLE usage_events ADD COLUMN app_mode TEXT DEFAULT ''"},
+		{"bound_via", "ALTER TABLE usage_events ADD COLUMN bound_via TEXT DEFAULT ''"},
+		{"requested_model", "ALTER TABLE usage_events ADD COLUMN requested_model TEXT DEFAULT ''"},
+		{"resolved_provider", "ALTER TABLE usage_events ADD COLUMN resolved_provider TEXT DEFAULT ''"},
+	}
+	for _, c := range appCols {
+		var count int
+		if err := db.QueryRow(
+			"SELECT COUNT(*) FROM pragma_table_info('usage_events') WHERE name=?", c.name,
+		).Scan(&count); err != nil {
+			return fmt.Errorf("probe %s: %w", c.name, err)
+		}
+		if count > 0 {
+			continue
+		}
+		if _, err := db.Exec(c.ddl); err != nil {
+			return fmt.Errorf("add %s: %w", c.name, err)
+		}
+	}
+	// Per-app index for the most common dashboard query ("usage by app").
+	if _, err := db.Exec(`CREATE INDEX IF NOT EXISTS idx_events_app_slug ON usage_events(app_slug) WHERE app_slug != ''`); err != nil {
+		return err
+	}
+	return nil
 }
 
 // Insert writes a batch of events to the database.
@@ -74,8 +111,9 @@ func (s *Store) Insert(events []UsageEvent) error {
 	stmt, err := tx.Prepare(`
 		INSERT INTO usage_events
 			(timestamp, virtual_key_id, provider, model, input_tokens, output_tokens,
-			 duration_ms, status_code, is_streaming, error_type, request_path)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+			 duration_ms, status_code, is_streaming, error_type, request_path,
+			 app_slug, app_key_id, app_mode, bound_via, requested_model, resolved_provider)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 	`)
 	if err != nil {
 		return fmt.Errorf("prepare insert: %w", err)
@@ -99,6 +137,12 @@ func (s *Store) Insert(events []UsageEvent) error {
 			streaming,
 			e.ErrorType,
 			e.RequestPath,
+			e.AppSlug,
+			e.AppKeyID,
+			e.AppMode,
+			e.BoundVia,
+			e.RequestedModel,
+			e.ResolvedProvider,
 		)
 		if err != nil {
 			return fmt.Errorf("insert event: %w", err)

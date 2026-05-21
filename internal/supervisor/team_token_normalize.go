@@ -85,7 +85,27 @@ func stripKnownPrefix(s string) (string, bool) {
 // would otherwise accept old `aikey_vk_<64-hex>` tokens — exactly the
 // pitfall the namespace-authority refactor closed.
 func isStrictPersonalRouteToken(token string) bool {
-	const prefix = "aikey_personal_"
+	return hasStrictHex64Suffix(token, "aikey_personal_")
+}
+
+// isStrictAppRouteToken returns true iff the given token is exactly the
+// Phase 4 app bearer form: `aikey_app_<64 lowercase hex>` (length 74).
+//
+// Mirrors isStrictPersonalRouteToken's role: filters out any vault rows
+// whose route_token shape doesn't match (writer-side bug or hand-crafted
+// vault residue) so the registry's invariant is preserved — "after
+// startup the registry only sees strict Tier1 forms" — and proxy's
+// dispatch.isTier1App can do exact-key Resolve without surprises.
+func isStrictAppRouteToken(token string) bool {
+	return hasStrictHex64Suffix(token, "aikey_app_")
+}
+
+// hasStrictHex64Suffix is the shared form predicate behind the strict
+// Tier1 bearer types (personal / app). DRY'd so future strict-form
+// additions get the same charset + length guarantees without copy-paste
+// drift (the same shape exists in dispatch.go and vault/route_token_form.go
+// — each package keeps its own copy to avoid import cycles).
+func hasStrictHex64Suffix(token, prefix string) bool {
 	suffix, ok := strings.CutPrefix(token, prefix)
 	if !ok {
 		return false

@@ -1,6 +1,7 @@
 package supervisor
 
 import (
+	"errors"
 	"testing"
 
 	"github.com/AiKeyLabs/aikey-proxy/internal/vault"
@@ -181,10 +182,12 @@ func TestBuildOAuthRoutesFiltered_KeepsStrictAndDropsLegacy(t *testing.T) {
 // It returns whatever the test caller seeds — including legacy /
 // malformed shapes — so we can verify the filter at the real call site.
 type fakeVaultRouteTokenReader struct {
-	personal       []vault.PersonalRouteToken
-	oauth          []vault.OAuthRouteToken
-	personalErr    error
-	oauthErr       error
+	personal    []vault.PersonalRouteToken
+	oauth       []vault.OAuthRouteToken
+	app         []vault.AppRouteToken
+	personalErr error
+	oauthErr    error
+	appErr      error
 }
 
 func (f *fakeVaultRouteTokenReader) GetAllPersonalRouteTokens() ([]vault.PersonalRouteToken, error) {
@@ -193,6 +196,10 @@ func (f *fakeVaultRouteTokenReader) GetAllPersonalRouteTokens() ([]vault.Persona
 
 func (f *fakeVaultRouteTokenReader) GetAllOAuthRouteTokens() ([]vault.OAuthRouteToken, error) {
 	return f.oauth, f.oauthErr
+}
+
+func (f *fakeVaultRouteTokenReader) GetAllAppRouteTokens() ([]vault.AppRouteToken, error) {
+	return f.app, f.appErr
 }
 
 // TestLoadVaultRoutesIntoRegistry_StartupPathFiltersLegacy is the smoke
@@ -300,15 +307,234 @@ func TestAllBuildersSetRouteSource(t *testing.T) {
 	managed := managedKeyToRoute(vault.ManagedKey{VirtualKeyID: "x", ProtocolType: "openai"})
 	personal := personalTokenToRoute(vault.PersonalRouteToken{Alias: "a", ProviderCode: "anthropic"})
 	oauth := oauthTokenToRoute(vault.OAuthRouteToken{AccountID: "x", Provider: "anthropic"})
+	app := appRouteTokenToRoute(vault.AppRouteToken{KeyID: "k", AppSlug: "x", AppKind: "third-party"})
 
 	for label, r := range map[string]struct{ Got, Want string }{
 		"managed":  {managed.RouteSource, "team"},
 		"personal": {personal.RouteSource, "personal"},
 		"oauth":    {oauth.RouteSource, "oauth"},
+		"app":      {app.RouteSource, "app"},
 	} {
 		if r.Got != r.Want {
 			t.Errorf("%s builder RouteSource = %q, want %q (if this fails, check route_builders.go)",
 				label, r.Got, r.Want)
+		}
+	}
+}
+
+// ── App pipeline route loading (AKL-202, 2026-05-20) ──────────────────────
+//
+// Phase 4 introduced a third route source: app tokens (aikey_app_<64hex>).
+// These tests pin the same invariants the personal/oauth tests pin:
+//   - The builder sets every app-specific field correctly.
+//   - The filter rejects malformed shapes (writer-side bug protection).
+//   - The startup loader feeds app tokens into the registry alongside
+//     personal/oauth without disturbing their loading.
+//   - Pre-Phase-4 vaults (no app_records table) return empty without error.
+
+// Strict app bearer fixtures (74 chars total: "aikey_app_" + 64-hex).
+const appHex64A = "aikey_app_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+const appHex64B = "aikey_app_bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+
+func TestAppRouteTokenToRoute_SetsAppFields(t *testing.T) {
+	at := vault.AppRouteToken{
+		KeyID:            "uuid-12345",
+		AppSlug:          "degrade-detector",
+		RouteToken:       appHex64A,
+		Status:           "active",
+		AppKind:          "first-party",
+		FollowUserActive: true,
+		AllowedUpstreams: []string{"openai", "anthropic"},
+	}
+	r := appRouteTokenToRoute(at)
+	if r == nil {
+		t.Fatal("expected non-nil route")
+	}
+	if r.RouteSource != "app" {
+		t.Errorf("RouteSource = %q, want \"app\"", r.RouteSource)
+	}
+	if r.AppSlug != "degrade-detector" {
+		t.Errorf("AppSlug passthrough wrong: %q", r.AppSlug)
+	}
+	if r.AppKind != "first-party" {
+		t.Errorf("AppKind passthrough wrong: %q", r.AppKind)
+	}
+	if r.AppKeyID != "uuid-12345" {
+		t.Errorf("AppKeyID passthrough wrong: %q", r.AppKeyID)
+	}
+	if !r.FollowUserActive {
+		t.Error("FollowUserActive passthrough wrong: false, want true")
+	}
+	if r.VirtualKeyID != "app:degrade-detector" {
+		t.Errorf("VirtualKeyID prefix wrong: %q (deriveKeyLabel reads this)", r.VirtualKeyID)
+	}
+	// Provider / BaseURL / KeyAlias intentionally empty — resolution
+	// happens per-request in the App pipeline. Pin the zero-value contract.
+	if r.Provider != "" {
+		t.Errorf("Provider should be empty (resolved per-request), got %q", r.Provider)
+	}
+	if r.BaseURL != "" {
+		t.Errorf("BaseURL should be empty (resolved per-request), got %q", r.BaseURL)
+	}
+	if r.KeyAlias != "" {
+		t.Errorf("KeyAlias should be empty (resolved per-request), got %q", r.KeyAlias)
+	}
+}
+
+func TestBuildAppRoutesFiltered_KeepsStrictAndDropsLegacy(t *testing.T) {
+	tokens := []vault.AppRouteToken{
+		{KeyID: "k1", AppSlug: "agent-a", RouteToken: appHex64A, AppKind: "third-party"},
+		{KeyID: "k2", AppSlug: "agent-b", RouteToken: appHex64B, AppKind: "third-party"},
+		// Malformed shapes that MUST be filtered out:
+		{KeyID: "k-bad1", AppSlug: "agent-c", RouteToken: "aikey_app_tooshort", AppKind: "third-party"},
+		{KeyID: "k-bad2", AppSlug: "agent-d", RouteToken: "aikey_personal_" + hex64Strict, AppKind: "third-party"}, // wrong prefix
+		{KeyID: "k-bad3", AppSlug: "agent-e", RouteToken: "aikey_app_" + "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA", AppKind: "third-party"}, // uppercase
+	}
+
+	got := buildAppRoutesFiltered(tokens)
+	if len(got) != 2 {
+		t.Errorf("expected 2 strict tokens to land, got %d; keys=%v", len(got), keysOf(got))
+	}
+	if got[appHex64A] == nil {
+		t.Errorf("strict %s must land", appHex64A)
+	}
+	if got[appHex64B] == nil {
+		t.Errorf("strict %s must land", appHex64B)
+	}
+	// Ensure the malformed bearer plaintexts are NOT registered under any key.
+	for _, bad := range []string{
+		"aikey_app_tooshort",
+		"aikey_personal_" + hex64Strict,
+	} {
+		if got[bad] != nil {
+			t.Errorf("malformed bearer %q must NOT land in map", bad)
+		}
+	}
+}
+
+func TestBuildAppRoutesFiltered_EmptyInputYieldsEmptyMap(t *testing.T) {
+	got := buildAppRoutesFiltered(nil)
+	if got == nil {
+		t.Fatal("nil input must yield empty (not nil) map")
+	}
+	if len(got) != 0 {
+		t.Errorf("nil input should yield empty map, got %d entries", len(got))
+	}
+}
+
+// TestLoadVaultRoutesIntoRegistry_LoadsAppTokensAlongsideOthers verifies
+// the startup path wires app tokens into the same registry as personal +
+// oauth, without disturbing their loading. The dispatch-side identity
+// (RouteSource == "app") is preserved so downstream consumers
+// (deriveKeyLabel, App pipeline auth) can branch on it.
+func TestLoadVaultRoutesIntoRegistry_LoadsAppTokensAlongsideOthers(t *testing.T) {
+	const personalStrict = "aikey_personal_" + hex64Strict
+
+	reader := &fakeVaultRouteTokenReader{
+		personal: []vault.PersonalRouteToken{
+			{Alias: "personal-A", RouteToken: personalStrict, ProviderCode: "anthropic"},
+		},
+		app: []vault.AppRouteToken{
+			{KeyID: "uuid-1", AppSlug: "agent-a", RouteToken: appHex64A, AppKind: "third-party"},
+			{KeyID: "uuid-2", AppSlug: "degrade-detector", RouteToken: appHex64B, AppKind: "first-party", FollowUserActive: true},
+		},
+	}
+
+	reg := vkeys.NewRegistry()
+	loadVaultRoutesIntoRegistry(reg, reader)
+
+	// Personal still landed.
+	if reg.Resolve(personalStrict) == nil {
+		t.Error("personal token must still land when app loading is added")
+	}
+
+	// App tokens landed and carry RouteSource="app" + app-identity fields.
+	a := reg.Resolve(appHex64A)
+	if a == nil {
+		t.Fatalf("app token %s must land", appHex64A)
+	}
+	if a.RouteSource != "app" {
+		t.Errorf("RouteSource = %q, want app", a.RouteSource)
+	}
+	if a.AppSlug != "agent-a" || a.AppKeyID != "uuid-1" {
+		t.Errorf("agent-a app fields wrong: %+v", a)
+	}
+	b := reg.Resolve(appHex64B)
+	if b == nil {
+		t.Fatalf("first-party app token %s must land", appHex64B)
+	}
+	if !b.FollowUserActive || b.AppKind != "first-party" {
+		t.Errorf("first-party + follow_user_active not propagated: %+v", b)
+	}
+}
+
+// TestLoadVaultRoutesIntoRegistry_AppErrorDoesNotAbortStartup pins
+// degradation: if GetAllAppRouteTokens returns an error (e.g. transient
+// SQLite I/O failure, schema mismatch), the loader must log + skip app
+// routes WITHOUT killing the personal/oauth load path. App tokens missing
+// is a Phase 4 feature regression; personal/oauth missing is a v1.0
+// regression — they can't share blast radius.
+func TestLoadVaultRoutesIntoRegistry_AppErrorDoesNotAbortStartup(t *testing.T) {
+	const personalStrict = "aikey_personal_" + hex64Strict
+	reader := &fakeVaultRouteTokenReader{
+		personal: []vault.PersonalRouteToken{
+			{Alias: "personal-A", RouteToken: personalStrict, ProviderCode: "anthropic"},
+		},
+		appErr: errors.New("transient sqlite IO failure"),
+	}
+
+	reg := vkeys.NewRegistry()
+	loadVaultRoutesIntoRegistry(reg, reader)
+
+	if reg.Resolve(personalStrict) == nil {
+		t.Error("personal token loading must survive app loader error (degradation contract)")
+	}
+}
+
+// TestLoadVaultRoutesIntoRegistry_NoAppsIsNotAnError pins the
+// pre-Phase-4 vault case: vault.GetAllAppRouteTokens returns nil + nil
+// when app_records doesn't exist. The loader must treat that as
+// "0 apps to register" without WARN spam.
+func TestLoadVaultRoutesIntoRegistry_NoAppsIsNotAnError(t *testing.T) {
+	reader := &fakeVaultRouteTokenReader{
+		// Everything empty / no error — pre-Phase-4 vault shape.
+	}
+
+	reg := vkeys.NewRegistry()
+	loadVaultRoutesIntoRegistry(reg, reader)
+
+	if reg.Count() != 0 {
+		t.Errorf("expected empty registry from pre-Phase-4 vault, got %d entries", reg.Count())
+	}
+}
+
+// TestIsStrictAppRouteToken pins the form predicate directly. Mirrors
+// TestIsStrictPersonalRouteToken in team_token_normalize_test.go.
+func TestIsStrictAppRouteToken(t *testing.T) {
+	cases := []struct {
+		token string
+		want  bool
+	}{
+		{appHex64A, true},
+		{appHex64B, true},
+		{"aikey_app_" + hex64Strict, true},
+		// Length variants.
+		{"aikey_app_" + hex64Strict[:63], false},
+		{"aikey_app_" + hex64Strict + "x", false},
+		{"aikey_app_", false},
+		// Case sensitivity.
+		{"aikey_app_AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA", false},
+		// Wrong prefix.
+		{"aikey_personal_" + hex64Strict, false},
+		{"aikey_team_" + hex64Strict, false},
+		{"aikey_vk_" + hex64Strict, false},
+		// Native non-aikey tokens.
+		{"sk-1234567890", false},
+		{"", false},
+	}
+	for _, c := range cases {
+		if got := isStrictAppRouteToken(c.token); got != c.want {
+			t.Errorf("isStrictAppRouteToken(%q) = %v, want %v", c.token, got, c.want)
 		}
 	}
 }

@@ -1,5 +1,28 @@
-# aikey-proxy configuration
-# Copy this file to aikey-proxy.yaml and modify as needed.
+# aikey-proxy dev fixture
+#
+# ── Purpose ───────────────────────────────────────────────────────────────
+# This file is a **human reference sample** of the proxy yaml schema. It is
+# consumed by:
+#
+#   - aikey-proxy/scripts/dev-setup.sh        (templates a fresh ~/.aikey/config/)
+#   - aikey-proxy/scripts/deploy-integration.sh (templates a remote /etc/aikey-proxy/)
+#   - workflow/CD/publish/release.sh           (mirrors `.example` into release tarball
+#                                               `bundle/config/default/aikey-proxy.yaml`)
+#   - aikey-proxy/README.md                    (schema reference)
+#
+# It is **NOT** loaded directly by `aikey proxy start` runtime — the cwd-first
+# resolution was removed 2026-05-21. See:
+#   - workflow/CI/bugfix/20260521-proxy-config-cwd-first-loads-stale-dev-fixture.md
+#   - roadmap20260320/技术实现/开源版本方案/config-split-system-user.md §v9
+#
+# Field set MUST be a SUBSET of the system layer logical shape rendered by
+# `aikey-config-tool render --profile personal`. PR-gate `make
+# test-config-split-dev-fixture` enforces this. Token-bearing fields use
+# `<dev-placeholder>` to flag "must be replaced by installer's render
+# step before this file is fit to load".
+#
+# Field reference: workflow/CD/templates/common/aikey-proxy.yaml.tmpl
+# ──────────────────────────────────────────────────────────────────────────
 
 listen:
   host: "127.0.0.1"
@@ -32,9 +55,25 @@ events:
   batch_size: 100
   flush_interval: 5s
 
-  # Usage reporting to collector-service
-  collector_url: "http://localhost:27300"
-  collector_token: "dev-token"
+  # Usage reporting to collector-service.
+  #
+  # In Personal / Trial deployments, collector_url + collector_routes both
+  # point at the local-server's ingest endpoint (127.0.0.1:8090). In
+  # Production deployments, collector_routes.team points at the remote
+  # team server (set by `aikey login`), while personal/oauth stay local.
+  collector_url: "http://127.0.0.1:8090"
+  collector_token: "<dev-placeholder>"
+  service_token: "<dev-placeholder>"
+
+  # collector_routes — per-RouteSource upload destinations. Populated by
+  # `aikey-config-tool render` based on profile + login state.
+  #   personal/oauth → local collector (8090 on personal/trial)
+  #   team           → remote control_url after `aikey login`, else local
+  collector_routes:
+    personal: "http://127.0.0.1:8090"
+    team:     "http://127.0.0.1:8090"
+    oauth:    "http://127.0.0.1:8090"
+
   queue_capacity: 10000
   upload_batch_size: 5
   upload_interval: 5s

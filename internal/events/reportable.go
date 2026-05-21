@@ -120,6 +120,29 @@ type ReportableEvent struct {
 	SessionID  string `json:"session_id,omitempty"`
 	KeyLabel   string `json:"key_label,omitempty"`
 	Completion string `json:"completion,omitempty"`
+
+	// Phase 4 App pipeline attribution fields (主方案 §5.3).
+	//
+	// Populated only when RouteSource == "app" (i.e. request flowed through
+	// /apps/<slug>/v1/...). Empty / omitted on JSON wire for legacy
+	// /v1/... and /<provider>/v1/... requests so existing collector / WAL
+	// consumers continue to parse the pre-Phase-4 shape.
+	//
+	// Mirrors the same 6 fields on UsageEvent (the local SQLite shape) so
+	// audit trail attribution is identical across the two pipelines:
+	//   UsageEvent → SQLite usage_events table (statusline / aikey app list)
+	//   ReportableEvent → WAL + collector (centralized billing / dashboard)
+	//
+	// AKL-207 §5.3 close-out (2026-05-21): the UsageEvent side was wired
+	// in 2026-05-20 but ReportableEvent shape was left unattributed —
+	// degrade-detector traffic would have shown up in the collector with
+	// app_slug = "" had M2 launched today. This block closes that gap.
+	AppSlug          string `json:"app_slug,omitempty"`
+	AppKeyID         string `json:"app_key_id,omitempty"`
+	AppMode          string `json:"app_mode,omitempty"`          // "isolated" | "follow-active"
+	BoundVia         string `json:"bound_via,omitempty"`         // "app:<slug>" (isolated) | "default" (follow-active)
+	RequestedModel   string `json:"requested_model,omitempty"`   // body.model captured at request entry
+	ResolvedProvider string `json:"resolved_provider,omitempty"` // post-binding provider_code (anthropic / openai / kimi_code / ...)
 }
 
 // ReportOpts collects all context needed to build a ReportableEvent.
@@ -277,6 +300,25 @@ func BuildReportableEvent(opts ReportOpts) ReportableEvent {
 		KeyLabel:   deriveKeyLabel(route),
 		Completion: completionOrDefault(opts.Completion),
 	}
+
+	// Phase 4 §5.3: App pipeline attribution. Mirror the buildBaseEvent
+	// logic in proxy.go so the two event shapes (local + wire) agree on
+	// what app made the call. Gated on RouteSource == "app" so legacy
+	// /v1/... requests omit these fields (omitempty drops them on wire).
+	if route.RouteSource == "app" {
+		ev.AppSlug = route.AppSlug
+		ev.AppKeyID = route.AppKeyID
+		if route.FollowUserActive {
+			ev.AppMode = "follow-active"
+			ev.BoundVia = "default" // follow-active reads the user's default profile binding
+		} else {
+			ev.AppMode = "isolated"
+			ev.BoundVia = "app:" + route.AppSlug
+		}
+		ev.RequestedModel = opts.Model
+		ev.ResolvedProvider = route.ProviderCode
+	}
+
 	return ev
 }
 

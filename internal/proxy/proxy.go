@@ -18,8 +18,11 @@ import (
 	"github.com/AiKeyLabs/aikey-proxy/internal/events"
 	"github.com/AiKeyLabs/aikey-proxy/internal/observability"
 	"github.com/AiKeyLabs/aikey-proxy/internal/provider"
+	"github.com/AiKeyLabs/aikey-proxy/internal/proxy/apppipe"
 	"github.com/AiKeyLabs/aikey-proxy/internal/vault"
 	"github.com/AiKeyLabs/aikey-proxy/internal/vkeys"
+	"github.com/AiKeyLabs/aikey-proxy/pkg/observer"
+	translator "github.com/AiKeyLabs/aikey-proxy/pkg/protocol-translator"
 )
 
 // VaultGetter retrieves decrypted secrets by alias.
@@ -68,8 +71,9 @@ type OAuthCredential struct {
 // and request forwarding.
 type Proxy struct {
 	vault        VaultGetter
-	activeReader ActiveKeyReader // non-nil when vault implements ActiveKeyReader
-	broker       OAuthBroker     // OAuth credential provider (nil = OAuth not available)
+	activeReader ActiveKeyReader   // non-nil when vault implements ActiveKeyReader
+	appVault     apppipe.VaultReader // non-nil when vault implements the App pipeline read surface (Phase 4)
+	broker       OAuthBroker       // OAuth credential provider (nil = OAuth not available)
 	registry     *vkeys.Registry
 	providers    *provider.Registry
 	collector    *events.Collector
@@ -84,6 +88,31 @@ type Proxy struct {
 	loggedInAccountID  string // current platform_account.account_id (for personal key events)
 	requests     atomic.Int64
 	errors       atomic.Int64
+
+	// translatorRegistry holds the protocol-translator pair registry the
+	// App pipeline consults when an inbound URL protocol differs from
+	// the binding's upstream protocol (Phase 2). Defaults to
+	// translator.DefaultRegistry() in New() — pair packages register
+	// themselves via blank-import side effect in cmd/aikey-proxy/main.go.
+	// Tests can swap via SetTranslatorRegistry to isolate from globals.
+	//
+	// Tier 1 / Tier 2 routes never read this field — it is referenced
+	// only inside handleAppPipeline, so the field's existence has no
+	// effect on the legacy proxy path.
+	translatorRegistry *translator.Registry
+
+	// observerRegistry holds the Phase 4 M2 plugin observer fan-out.
+	// Nil when no first-party observer is built (the common default for
+	// rc.5 ship traffic without degrade-detector installed). When set:
+	//   - handleAppPipeline calls NotifyStart on app pipeline entry,
+	//     NotifyEnd on exit (always, success or error).
+	//   - streamDrainer calls NotifySSEEvent per upstream SSE frame
+	//     BEFORE any ResponseTransform (the doc-anchor invariant from
+	//     plugin-架构设计.md §5.1 + observer/registry.go package doc).
+	// Tier 1 / Tier 2 routes never reach the Notify* hooks (they only
+	// fire inside the App pipeline branch), so the field being non-nil
+	// has zero cost on the legacy proxy path.
+	observerRegistry *observer.Registry
 
 	// Configurable slow-request thresholds (milliseconds).
 	SlowRequestMs     int64
@@ -109,17 +138,26 @@ func (p *Proxy) SetTransport(t http.RoundTripper) {
 // If v also implements ActiveKeyReader, path-prefix routing is enabled automatically.
 func New(v VaultGetter, reg *vkeys.Registry, prov *provider.Registry, coll *events.Collector, ctx context.Context) *Proxy {
 	p := &Proxy{
-		vault:             v,
-		registry:          reg,
-		providers:         prov,
-		collector:         coll,
-		proxyCtx:          ctx,
-		SlowRequestMs:     2000,
-		VerySlowRequestMs: 10000,
-		UpstreamTimeout:   defaultUpstreamTimeout,
+		vault:              v,
+		registry:           reg,
+		providers:          prov,
+		collector:          coll,
+		proxyCtx:           ctx,
+		translatorRegistry: translator.DefaultRegistry(),
+		SlowRequestMs:      2000,
+		VerySlowRequestMs:  10000,
+		UpstreamTimeout:    defaultUpstreamTimeout,
 	}
 	if ar, ok := v.(ActiveKeyReader); ok {
 		p.activeReader = ar
+	}
+	// AKL-205: if the vault also implements the App-pipeline read surface
+	// (GetProviderBindingWithScope + GetAppRecord, added by AKL-102), wire
+	// it so /apps/<slug>/v1/... requests can resolve. *vault.Reader
+	// satisfies both interfaces in production; tests that only need the
+	// App pipeline can inject via SetAppVault below.
+	if av, ok := v.(apppipe.VaultReader); ok {
+		p.appVault = av
 	}
 	return p
 }
@@ -128,6 +166,31 @@ func New(v VaultGetter, reg *vkeys.Registry, prov *provider.Registry, coll *even
 // Must be called before the proxy handles any OAuth-credential requests.
 func (p *Proxy) SetBroker(b OAuthBroker) {
 	p.broker = b
+}
+
+// SetAppVault injects a vault reader for App pipeline requests.
+// Mirrors SetBroker — provided for tests that build a Proxy with a
+// VaultGetter mock and need to expose the App-pipeline read surface
+// without satisfying the full ActiveKeyReader interface. In production
+// New(...) auto-wires this when the VaultGetter argument also implements
+// apppipe.VaultReader.
+func (p *Proxy) SetAppVault(av apppipe.VaultReader) {
+	p.appVault = av
+}
+
+// SetObserverRegistry attaches the Phase 4 M2 plugin observer registry.
+// Must be called BEFORE serving requests (typically in main.go right
+// after BuildObservers). nil disables the observer pipeline entirely
+// (Notify* hooks become zero-cost no-ops because the field's nil-check
+// short-circuits before reaching the registry's own len(observers)==0
+// check; saves one function call per request).
+//
+// Why a setter rather than a constructor arg: keeps `New(...)`'s
+// signature stable for the many test helpers + tooling that already
+// pass v/reg/prov/coll/ctx; first-party observers are opt-in feature
+// rather than a core dependency.
+func (p *Proxy) SetObserverRegistry(reg *observer.Registry) {
+	p.observerRegistry = reg
 }
 
 // SetReporter sets the usage reporter for collector-service upload.
@@ -172,6 +235,25 @@ func (p *Proxy) Handle(w http.ResponseWriter, r *http.Request) {
 		"request_id", tc.RequestID,
 	)
 
+	// 0a. App pipeline path: /apps/<slug>/v1/... (Phase 4).
+	//
+	// MUST be checked BEFORE extractProviderFromPath — otherwise
+	// /apps/X/openai/v1 would be misread by the legacy parser as
+	// provider="apps" with a meaningless stripped path, producing a
+	// confusing 404 instead of a precise App pipeline error. This
+	// ordering is the wiring invariant called out in apppipe/router.go's
+	// ExtractAppPath docstring; verified by TestHandle_AppPathTakesPrecedenceOverProviderPrefix.
+	//
+	// Today the App pipeline handler returns 501 with diagnostic detail
+	// (slug + protocol parsed correctly, vault → Registry plumbing
+	// confirmed working if the bearer is recognized) — the authn /
+	// resolve / egress / forward stages land in subsequent AKL-204..207
+	// sub-tasks.
+	if appCtx := apppipe.ExtractAppPath(r.URL.Path); appCtx != nil {
+		p.handleAppPipeline(w, r, appCtx, startTime, logger, tc.TraceID)
+		return
+	}
+
 	// 0. Path-prefix routing: /anthropic/v1/... or /openai/v1/...
 	// Takes precedence over token-based routing when the path starts with a
 	// known provider prefix. Uses the active key config from the vault.
@@ -202,6 +284,18 @@ func (p *Proxy) Handle(w http.ResponseWriter, r *http.Request) {
 	switch ClassifyToken(token) {
 	case Tier1Team, Tier1Personal:
 		// fall through to registry resolve
+	case Tier1App:
+		// App bearers route through /apps/<slug>/v1/... — they
+		// MUST NOT be presented at the legacy /v1/... entry because that
+		// would leak the app's binding scope into the user's default
+		// profile. Reject with a precise hint pointing at the env line
+		// `aikey app authorize` printed for this token.
+		p.errors.Add(1)
+		writeJSONError(w, http.StatusUnauthorized, "authentication_error", "APP_TOKEN_WRONG_PATH",
+			"App bearer tokens must be sent to /apps/<slug>/v1/... URLs, "+
+				"not the legacy /v1/... entry. Use the OPENAI_BASE_URL value printed "+
+				"by `aikey app authorize <slug>` for the correct URL.")
+		return
 	case Tier2Probe:
 		p.errors.Add(1)
 		writeJSONError(w, http.StatusUnauthorized, "authentication_error", "TOKEN_INVALID",
@@ -315,6 +409,439 @@ func (p *Proxy) Handle(w http.ResponseWriter, r *http.Request) {
 	p.serveRoute(w, r, route, prov, realKey, token, startTime, logger)
 }
 
+// ResolveBindingCredential resolves the upstream credential for the
+// given `binding`. Behavior depends on `binding.KeySourceType`:
+//
+//   - "personal_oauth_account" → broker.EnsureFresh + ResolveCredential,
+//     mutate `r` headers via oauthInject, apply Codex BaseURL override
+//     for canonicalCode=openai. On broker failure (broker nil, refresh
+//     failed, resolve failed) returns *BindingResolveError that the
+//     caller passes to writeJSONError.
+//
+//   - "team" → activeReader.GetTeamKeyByID; populates ManagedKey,
+//     KeyAlias (LocalAlias), BaseURL (ProviderBaseURLs lookup with
+//     canonicalCode → providerCode → mk.BaseURL fallback). Soft-fails
+//     (logger.Warn + empty RealKey) so caller falls back to legacy.
+//
+//   - default (personal) → activeReader.GetPersonalKeyByAlias;
+//     populates RealKey, KeyAlias (== binding.KeySourceRef), BaseURL
+//     (entry-specified or providerDefaultBaseURL). Soft-fails like team.
+//
+// Refactored from the inline code at handlePathPrefixRoute's binding
+// branch (AKL-207, 2026-05-20). Fence tests in oauth_binding_fence_test.go
+// pin the OAuth path's exact pre-refactor behavior.
+func (p *Proxy) ResolveBindingCredential(
+	r *http.Request,
+	binding *vault.ProviderBinding,
+	providerCode, canonicalCode string,
+	logger *slog.Logger,
+) (*apppipe.BindingCredential, *apppipe.BindingResolveError) {
+	out := &apppipe.BindingCredential{}
+
+	switch binding.KeySourceType {
+	case "personal_oauth_account":
+		// OAuth account — resolve via broker, not vault.
+		if p.broker == nil {
+			return nil, &apppipe.BindingResolveError{
+				StatusCode: http.StatusServiceUnavailable,
+				ErrorType:  "server_error",
+				ErrorCode:  "OAUTH_NOT_AVAILABLE",
+				Message:    "OAuth is not configured. Restart proxy or use API Key instead.",
+			}
+		}
+
+		// EnsureFresh: broker handles token refresh internally.
+		if err := p.broker.EnsureFresh(r.Context(), binding.KeySourceRef); err != nil {
+			logger.Warn("oauth: EnsureFresh failed", "account_id", binding.KeySourceRef, "error", err)
+			return nil, &apppipe.BindingResolveError{
+				StatusCode: http.StatusUnauthorized,
+				ErrorType:  "auth_error",
+				ErrorCode:  "OAUTH_TOKEN_EXPIRED",
+				Message:    err.Error() + "\n  Run: aikey auth login " + providerCode,
+			}
+		}
+
+		// Resolve decrypted credential.
+		cred, err := p.broker.ResolveCredential(r.Context(), binding.KeySourceRef)
+		if err != nil {
+			logger.Error("oauth: ResolveCredential failed", "account_id", binding.KeySourceRef, "error", err)
+			return nil, &apppipe.BindingResolveError{
+				StatusCode: http.StatusServiceUnavailable,
+				ErrorType:  "server_error",
+				ErrorCode:  "OAUTH_RESOLVE_FAILED",
+				Message:    err.Error(),
+			}
+		}
+
+		// Codex BaseURL override pinned by TestFence_OAuthBinding_OpenAICodexBaseURLOverride.
+		// Why: Codex OAuth uses chatgpt.com/backend-api/codex (Responses API),
+		// NOT api.openai.com/v1 (Chat Completions API). API key users hit
+		// api.openai.com; OAuth users hit chatgpt.com.
+		// Ref: workflow/CI/researchs/oauth-codex-test/main.go
+		if canonicalCode == "openai" {
+			out.BaseURL = "https://chatgpt.com/backend-api/codex"
+		} else {
+			out.BaseURL = providerDefaultBaseURL(canonicalCode)
+		}
+		oauthInject(r, cred, canonicalCode)
+
+		identityTag := cred.Identity
+		if identityTag == "" {
+			identityTag = binding.KeySourceRef
+		}
+		logger.Info("oauth: forwarding request",
+			"provider", canonicalCode,
+			"identity", identityTag,
+			"account_id", binding.KeySourceRef,
+		)
+
+		out.RealKey = "__oauth__" // sentinel — not used for header injection (injector did it)
+		out.VirtualKeyID = "oauth:" + binding.KeySourceRef
+		out.OAuthIdentity = identityTag
+		out.OAuthAccountID = binding.KeySourceRef
+		return out, nil
+
+	case "team":
+		mk, err := p.activeReader.GetTeamKeyByID(binding.KeySourceRef)
+		if err != nil {
+			logger.Warn("vault: team key lookup via binding failed", "vk_id", binding.KeySourceRef, "error", err)
+			return out, nil // soft fail — caller will try legacy fallback
+		}
+		if mk == nil {
+			return out, nil // not found, soft fail
+		}
+		out.ManagedKey = mk
+		out.RealKey = mk.PlaintextKey
+		out.VirtualKeyID = mk.VirtualKeyID
+		// 2026-05-09: surface the team key's user-facing alias so the
+		// receipt / WAL `key_label` shows e.g. `key-335923591-0011-1`
+		// instead of the vk_id tail.
+		out.KeyAlias = mk.LocalAlias
+		if url, ok := mk.ProviderBaseURLs[canonicalCode]; ok && url != "" {
+			out.BaseURL = url
+		} else if url, ok := mk.ProviderBaseURLs[providerCode]; ok && url != "" {
+			out.BaseURL = url
+		} else {
+			out.BaseURL = mk.BaseURL
+		}
+		return out, nil
+
+	default:
+		// Personal key path. binding.KeySourceType is typically "personal"
+		// (legacy) or "personal_api_key" (canonical post-CredentialType
+		// enum). Both are accepted via the default branch — strict-match
+		// would have been a regression if the writer side ever emits the
+		// other.
+		plaintext, _, entryBaseURL, err := p.activeReader.GetPersonalKeyByAlias(binding.KeySourceRef)
+		if err != nil {
+			logger.Warn("vault: personal key lookup via binding failed", "alias", binding.KeySourceRef, "error", err)
+			return out, nil // soft fail
+		}
+		out.RealKey = plaintext
+		out.VirtualKeyID = "personal:" + binding.KeySourceRef
+		out.KeyAlias = binding.KeySourceRef
+		if entryBaseURL != "" {
+			out.BaseURL = entryBaseURL
+		} else {
+			out.BaseURL = providerDefaultBaseURL(canonicalCode)
+		}
+		return out, nil
+	}
+}
+
+// handleAppPipeline is the entry into the Phase 4 App pipeline for requests
+// matching /apps/<slug>/v1/... (Tier 0a in proxy.Handle's
+// routing order). Today it's a structural stub returning 501 with the
+// parsed AppContext for diagnosability — Sprint 2 remaining tasks
+// (AKL-204 authn, AKL-205 resolve, AKL-206 egress sanitizer, AKL-207
+// pipeline editorial) replace this body with the full pipeline.
+//
+// Until those land, this handler proves the wiring works end-to-end:
+//   1. Tier 0a routing fires (URL parsing — AKL-203)
+//   2. The user sees confirmation that slug + protocol parsed correctly
+//   3. Counters + logger context include app_slug + app_protocol for
+//      operator visibility while the pipeline is being filled in
+//
+// The 501 is intentional vs 503: per RFC 9110, 501 says "the server does
+// not support the functionality required to fulfil the request" which
+// matches "this endpoint exists in routing but its handler is not yet
+// wired", whereas 503 implies temporary unavailability of a working
+// service. Clients (test scripts, integration probes) can distinguish
+// "deploy in progress" (501) from "transient downstream failure" (503).
+func (p *Proxy) handleAppPipeline(w http.ResponseWriter, r *http.Request, appCtx *apppipe.AppContext, startTime time.Time, logger *slog.Logger, traceID string) {
+	_ = startTime
+	logger = logger.With("app_slug", appCtx.Slug)
+
+	// Stage 1: authn — extract bearer, verify Registry membership, check
+	// the URL slug matches the token's vault-recorded AppSlug.
+	route, authErr := apppipe.Authenticate(r.Header, p.registry, appCtx)
+	if authErr != nil {
+		p.errors.Add(1)
+		logger.Warn("app pipeline authn failed",
+			"error.code", authErr.ErrorCode,
+			"event.name", observability.EventProxyRequestAuthFailed,
+		)
+		writeJSONError(w, authErr.StatusCode, "authentication_error", authErr.ErrorCode, authErr.Message)
+		return
+	}
+
+	// Stage 2: resolve metadata-only — pick profile scope + load app_records.
+	// Binding lookup is deferred to Stage 4 (after body sanitize + model
+	// inference); the inferred upstream is the lookup key.
+	resolved, resolveErr := apppipe.Resolve(p.appVault, route, appCtx)
+	if resolveErr != nil {
+		p.errors.Add(1)
+		logger.Warn("app pipeline resolve failed",
+			"error.code", resolveErr.ErrorCode,
+			"app_key_id", route.AppKeyID,
+			"app_kind", route.AppKind,
+		)
+		writeJSONError(w, resolveErr.StatusCode, "server_error", resolveErr.ErrorCode, resolveErr.Message)
+		return
+	}
+
+	// Stage 3: sanitize — strip aikey/metadata fields, reject n>1, silent-drop
+	// logprobs/seed with warnings. response_format is passed through to the
+	// protocol translator (Phase 2 Day 5).
+	bodyBytes, bodyErr := io.ReadAll(r.Body)
+	if bodyErr != nil {
+		p.errors.Add(1)
+		logger.Warn("app pipeline body read failed", "error", bodyErr)
+		writeJSONError(w, http.StatusBadRequest, "invalid_request_error", "BODY_READ_FAILED",
+			"Could not read request body: "+bodyErr.Error())
+		return
+	}
+	_ = r.Body.Close()
+
+	sanitized, sanitizeCtx, sanitizeErr := apppipe.SanitizeRequestBody(bodyBytes)
+	if sanitizeErr != nil {
+		p.errors.Add(1)
+		logger.Warn("app pipeline body sanitize failed",
+			"error.code", sanitizeErr.ErrorCode,
+			"app_key_id", route.AppKeyID,
+		)
+		writeJSONError(w, sanitizeErr.StatusCode, "invalid_request_error", sanitizeErr.ErrorCode, sanitizeErr.Message)
+		return
+	}
+	for _, w := range sanitizeCtx.Warnings {
+		logger.Warn("app pipeline field degraded", "degradation", w, "app_key_id", route.AppKeyID)
+	}
+
+	// Stage 4 (Phase 2 Day 7): infer upstream from body.model and look up
+	// the binding for (profile, upstream). This replaces the URL-protocol-
+	// based binding lookup of Phase 1. The Agent's body.model field is the
+	// single routing signal — LangChain-aligned per industry consensus.
+	inboundModel := extractModelLazy(sanitized)
+	inferredUpstream := provider.InferUpstreamFromModel(inboundModel)
+	binding, bindResolveErr := apppipe.ResolveUpstreamBinding(p.appVault, resolved, inferredUpstream)
+	if bindResolveErr != nil {
+		p.errors.Add(1)
+		logger.Warn("app pipeline upstream-binding resolve failed",
+			"error.code", bindResolveErr.ErrorCode,
+			"app_key_id", route.AppKeyID,
+			"model", inboundModel,
+			"inferred_upstream", inferredUpstream,
+		)
+		writeJSONError(w, bindResolveErr.StatusCode, "invalid_request_error",
+			bindResolveErr.ErrorCode, bindResolveErr.Message)
+		return
+	}
+
+	// Stage 5: resolve credential from binding (shared with legacy path).
+	// p.ResolveBindingCredential walks the same OAuth/team/personal branches
+	// used by handlePathPrefixRoute — pinned by oauth_binding_fence_test.go.
+	// Mutates r headers via oauthInject on the OAuth path.
+	cred, bindErr := p.ResolveBindingCredential(r, binding, inferredUpstream, inferredUpstream, logger)
+	if bindErr != nil {
+		p.errors.Add(1)
+		logger.Warn("app pipeline credential resolution failed",
+			"error.code", bindErr.ErrorCode,
+			"app_key_id", route.AppKeyID,
+		)
+		writeJSONError(w, bindErr.StatusCode, bindErr.ErrorType, bindErr.ErrorCode, bindErr.Message)
+		return
+	}
+	if cred.RealKey == "" {
+		p.errors.Add(1)
+		writeJSONError(w, http.StatusServiceUnavailable, "server_error", "BINDING_CREDENTIAL_UNRESOLVED",
+			"App's binding (profile=\""+resolved.ProfileID+"\", upstream=\""+inferredUpstream+
+				"\", source="+binding.KeySourceType+":"+binding.KeySourceRef+
+				") could not be resolved to a usable credential. The referenced "+
+				"alias or virtual-key may have been deleted. Re-run `aikey app route "+appCtx.Slug+
+				"` to repair.")
+		return
+	}
+
+	// Stage 6: build the ResolvedRoute for serveRoute. Provider /
+	// ProviderCode / ProtocolType reflect the BINDING's upstream provider
+	// (the inferred-from-model value, equal to binding.ProviderCode by
+	// construction in this branch). ProtocolFamily resolves the provider
+	// to its wire family via pkg/providerroutes yaml (single source of
+	// truth, see ResolvedRoute.ProtocolFamily doc-comment).
+	protocolFamily := ""
+	if pr, ok := provider.Routes().ByProvider(binding.ProviderCode); ok {
+		protocolFamily = pr.Protocol
+	}
+	appResolvedRoute := &vkeys.ResolvedRoute{
+		VirtualKeyID:     route.VirtualKeyID, // "app:<slug>"
+		Provider:         binding.ProviderCode,
+		BaseURL:          cred.BaseURL,
+		KeyAlias:         cred.KeyAlias,
+		PlaintextKey:     cred.RealKey,
+		OAuthIdentity:    cred.OAuthIdentity,
+		AccountID:        cred.OAuthAccountID,
+		ProviderCode:     binding.ProviderCode,
+		ProtocolType:     binding.ProviderCode,
+		ProtocolFamily:   protocolFamily,
+		RouteSource:      "app",
+		AppSlug:          route.AppSlug,
+		AppKind:          route.AppKind,
+		AppKeyID:         route.AppKeyID,
+		FollowUserActive: route.FollowUserActive,
+	}
+	if cred.ManagedKey != nil {
+		appResolvedRoute.OrgID = cred.ManagedKey.OrgID
+		appResolvedRoute.SeatID = cred.ManagedKey.SeatID
+		appResolvedRoute.CredentialID = cred.ManagedKey.CredentialID
+		appResolvedRoute.CredentialRevision = cred.ManagedKey.CredentialRevision
+		appResolvedRoute.VirtualKeyRevision = cred.ManagedKey.VirtualKeyRevision
+	}
+
+	// Stage 7: provider adapter selected by the BINDING's upstream protocol.
+	prov, err := p.providers.Get(binding.ProviderCode)
+	if err != nil {
+		p.errors.Add(1)
+		writeJSONError(w, http.StatusBadGateway, "server_error", "PROVIDER_ERROR",
+			"Unknown upstream provider protocol: "+binding.ProviderCode)
+		return
+	}
+
+	// Strip /apps/<slug>/v1 prefix → leave only the upstream path part
+	// (e.g., "/chat/completions"). serveRoute prepends BaseURL.
+	r.URL.Path = "/v1" + appCtx.StrippedPath
+	if r.URL.RawPath != "" {
+		r.URL.RawPath = r.URL.Path
+	}
+
+	// Stage 8 (Phase 2 protocol translation, optional): if inbound wire
+	// differs from upstream wire (binding.ProviderCode), translate the
+	// request body + arm a response-side closure on the ResolvedRoute.
+	// No-op when from == to. Phase 2 中方案 (2026-05-21): inbound wire
+	// is inferred from URL path — `/v1/messages` ≡ Anthropic, else
+	// OpenAI (see apppipe.InferInboundWire).
+	inboundFmt := apppipe.InferInboundWire(appCtx.StrippedPath)
+	translateOut, translateErr := apppipe.MaybeTranslateRequest(
+		r.Context(),
+		p.translatorRegistry,
+		appResolvedRoute,
+		binding,
+		inboundFmt,
+		r,
+		sanitized,
+		inboundModel,
+	)
+	if translateErr != nil {
+		p.errors.Add(1)
+		logger.Warn("app pipeline protocol translation failed",
+			"error.code", translateErr.ErrorCode,
+			"app_key_id", route.AppKeyID,
+			"upstream", binding.ProviderCode,
+		)
+		writeJSONError(w, translateErr.StatusCode, "invalid_request_error", translateErr.ErrorCode, translateErr.Message)
+		return
+	}
+	if translateOut.Engaged {
+		logger.Info("app pipeline translation engaged",
+			"upstream_format", string(translateOut.UpstreamFormat),
+			"app_key_id", route.AppKeyID,
+		)
+		// Rewrite the upstream path for the target format (e.g.
+		// /v1/chat/completions → /v1/messages for Anthropic).
+		if canonical := apppipe.CanonicalUpstreamPath(translateOut.UpstreamFormat); canonical != "" {
+			r.URL.Path = canonical
+			if r.URL.RawPath != "" {
+				r.URL.RawPath = canonical
+			}
+		}
+	}
+
+	// Replace request body with the post-translation bytes (or sanitized
+	// if no translation engaged — TranslateOutcome.Body is always the
+	// final bytes to forward).
+	r.Body = io.NopCloser(bytes.NewReader(translateOut.Body))
+	r.ContentLength = int64(len(translateOut.Body))
+
+	// Extract the inbound app bearer for serveRoute's bearerToken arg —
+	// used for audit / structured logging only (not for upstream injection;
+	// that's already handled by prov.RewriteRequest / oauthInject above).
+	inboundBearer := extractRawAuthValue(r)
+
+	logger.Info("app pipeline forwarding upstream",
+		"app_key_id", route.AppKeyID,
+		"app_kind", route.AppKind,
+		"profile_id", resolved.ProfileID,
+		"binding_source_type", binding.KeySourceType,
+		"upstream_base", cred.BaseURL,
+		"upstream", binding.ProviderCode,
+		"protocol_family", appResolvedRoute.ProtocolFamily,
+	)
+
+	// Phase 4 M2 plugin observer — NotifyStart at App pipeline entry +
+	// NotifyEnd at exit. The per-frame NotifySSEEvent dispatch lives
+	// inside streamDrainer (gated on the observer registry being
+	// attached + ProtocolFamily known) so it sees the byte-identical
+	// upstream SSE before ResponseTransform reshapes the chunks.
+	//
+	// Why we build the RequestContext here (not inside serveRoute):
+	// app-specific fields (AppSlug / AppKeyID / AppMode / ProviderID /
+	// ProtocolFamily) are only meaningful for the App pipeline branch.
+	// serveRoute is shared with the legacy /v1/... + /<provider>/v1/...
+	// paths which never need a RequestContext. Wiring here keeps the
+	// observer surface contained to the App pipeline by construction.
+	//
+	// nil observerRegistry ⇒ the Notify* helpers below short-circuit;
+	// see Proxy.observerRegistry doc-comment for zero-cost rationale.
+	var obsReqCtx *observer.RequestContext
+	if p.observerRegistry != nil && p.observerRegistry.Active() > 0 {
+		appMode := "isolated"
+		if route.FollowUserActive {
+			appMode = "follow-active"
+		}
+		obsReqCtx = &observer.RequestContext{
+			AppKeyID:       route.AppKeyID,
+			AppSlug:        route.AppSlug,
+			AppMode:        appMode,
+			// KeyAlias is the vault-side credential alias resolved at this
+			// step (e.g. user's "claude" for follow-user-active). trust-local
+			// uses it as the alias_name primary aggregation key — without it
+			// the report falls back to a synthetic "app:<slug>:<keyid>"
+			// alias and PerAliasTrust queries can't surface real-user trust
+			// per provider key.
+			KeyAlias:       appResolvedRoute.KeyAlias,
+			ProviderID:     binding.ProviderCode,
+			ProtocolFamily: appResolvedRoute.ProtocolFamily,
+			RequestedModel: inboundModel,
+			SessionID:      resolveSessionID(r.Header, binding.ProviderCode),
+			TraceID:        traceID,
+			StartedAt:      startTime,
+		}
+		// Stash on the route so streamDrainer can pull it out without
+		// needing a parallel parameter channel. Tier 1 / Tier 2 routes
+		// never set ObserverContext, so the drainer's nil-check
+		// short-circuits for legacy paths.
+		appResolvedRoute.ObserverContext = obsReqCtx
+		appResolvedRoute.ObserverRegistry = p.observerRegistry
+		p.observerRegistry.NotifyStart(r.Context(), obsReqCtx)
+	}
+
+	p.serveRoute(w, r, appResolvedRoute, prov, cred.RealKey, inboundBearer, startTime, logger)
+
+	if obsReqCtx != nil {
+		latency := int(time.Since(startTime).Milliseconds())
+		p.observerRegistry.NotifyEnd(r.Context(), obsReqCtx, latency)
+	}
+}
+
 // handlePathPrefixRoute resolves the active key for providerCode and forwards
 // the request with the provider prefix stripped from the path.
 // Called when the request path starts with a known provider prefix
@@ -327,15 +854,31 @@ func (p *Proxy) handlePathPrefixRoute(w http.ResponseWriter, r *http.Request, pr
 	// loud with TOKEN_INVALID — independent of vault wiring state. This
 	// also keeps the proxy's behavior consistent across editions (Personal
 	// without active vault still rejects clearly-bad aikey tokens).
-	if rawAuth := extractRawAuthValue(r); rawAuth != "" && ClassifyToken(rawAuth) == TokenInvalid {
-		p.errors.Add(1)
-		logger.Warn("aikey_* token form invalid (namespace authority)",
-			"event.name", observability.EventProxyRequestAuthFailed,
-		)
-		writeJSONError(w, http.StatusUnauthorized, "authentication_error", "TOKEN_INVALID",
-			"Token is in the aikey_ namespace but doesn't match any recognized form. "+
-				"Run 'aikey route' to see valid tokens.")
-		return
+	if rawAuth := extractRawAuthValue(r); rawAuth != "" {
+		switch ClassifyToken(rawAuth) {
+		case TokenInvalid:
+			p.errors.Add(1)
+			logger.Warn("aikey_* token form invalid (namespace authority)",
+				"event.name", observability.EventProxyRequestAuthFailed,
+			)
+			writeJSONError(w, http.StatusUnauthorized, "authentication_error", "TOKEN_INVALID",
+				"Token is in the aikey_ namespace but doesn't match any recognized form. "+
+					"Run 'aikey route' to see valid tokens.")
+			return
+		case Tier1App:
+			// 2026-05-20 AKL-208: App bearer at provider-prefix URL is the
+			// wrong path. Reject precisely BEFORE the activeReader nil check
+			// so the user-actionable hint surfaces consistently across
+			// editions (including Personal without active vault). The
+			// downstream Tier1App branch in this function would otherwise
+			// be unreachable in editions without activeReader.
+			p.errors.Add(1)
+			writeJSONError(w, http.StatusUnauthorized, "authentication_error", "APP_TOKEN_WRONG_PATH",
+				"App bearer tokens must be sent to /apps/<slug>/v1/... URLs, "+
+					"not /"+providerCode+"/v1/... Use the OPENAI_BASE_URL value printed "+
+					"by `aikey app authorize <slug>` for the correct URL.")
+			return
+		}
 	}
 
 	if p.activeReader == nil {
@@ -391,6 +934,7 @@ func (p *Proxy) handlePathPrefixRoute(w http.ResponseWriter, r *http.Request, pr
 	}
 
 	// Tier 1: aikey_team_<vk_id> or aikey_personal_<64-hex> — resolve via Registry.
+	// (Tier1App was handled early-fail above per AKL-208 for edition consistency.)
 	if dispatchAction == Tier1Team || dispatchAction == Tier1Personal {
 		route := p.registry.Resolve(rawAuthValue)
 		if route == nil {
@@ -698,101 +1242,33 @@ func (p *Proxy) handlePathPrefixRoute(w http.ResponseWriter, r *http.Request, pr
 
 	// ── v1.0.2: try provider binding first ─────────────────────────────────
 	// The new model stores per-provider primary key selection in
-	// user_profile_provider_bindings.  If a binding exists, resolve directly.
+	// user_profile_provider_bindings. If a binding exists, resolve directly
+	// via the shared resolveBindingCredential helper (AKL-207). The helper
+	// also serves the App pipeline so both paths produce identical
+	// credential records — see helper docstring for per-KeySourceType semantics.
 	binding, _ := p.activeReader.GetProviderBinding(canonicalCode)
 	if binding != nil {
-		if binding.KeySourceType == "personal_oauth_account" {
-			// OAuth account — resolve via broker, not vault
-			if p.broker == nil {
-				p.errors.Add(1)
-				writeJSONError(w, http.StatusServiceUnavailable, "server_error", "OAUTH_NOT_AVAILABLE",
-					"OAuth is not configured. Restart proxy or use API Key instead.")
-				return
-			}
-
-			// EnsureFresh: broker handles token refresh internally
-			if err := p.broker.EnsureFresh(r.Context(), binding.KeySourceRef); err != nil {
-				logger.Warn("oauth: EnsureFresh failed", "account_id", binding.KeySourceRef, "error", err)
-				p.errors.Add(1)
-				writeJSONError(w, http.StatusUnauthorized, "auth_error", "OAUTH_TOKEN_EXPIRED",
-					err.Error()+"\n  Run: aikey auth login "+providerCode)
-				return
-			}
-
-			// Resolve decrypted credential
-			cred, err := p.broker.ResolveCredential(r.Context(), binding.KeySourceRef)
-			if err != nil {
-				logger.Error("oauth: ResolveCredential failed", "account_id", binding.KeySourceRef, "error", err)
-				p.errors.Add(1)
-				writeJSONError(w, http.StatusServiceUnavailable, "server_error", "OAUTH_RESOLVE_FAILED", err.Error())
-				return
-			}
-
-			// Inject OAuth credential via provider-specific injector.
-			// Why override for openai: Codex OAuth uses chatgpt.com/backend-api/codex
-			// (Responses API), NOT api.openai.com/v1 (Chat Completions API).
-			// API key users hit api.openai.com; OAuth users hit chatgpt.com.
-			// Ref: workflow/CI/researchs/oauth-codex-test/main.go
-			if canonicalCode == "openai" {
-				baseURL = "https://chatgpt.com/backend-api/codex"
-			} else {
-				baseURL = providerDefaultBaseURL(canonicalCode)
-			}
-			oauthInject(r, cred, canonicalCode)
-
-			identityTag := cred.Identity
-			if identityTag == "" {
-				identityTag = binding.KeySourceRef
-			}
-			logger.Info("oauth: forwarding request",
-				"provider", canonicalCode,
-				"identity", identityTag,
-				"account_id", binding.KeySourceRef,
-			)
-
-			realKey = "__oauth__" // sentinel — not used for header injection (injector handles it)
-			virtualKeyID = "oauth:" + binding.KeySourceRef
-			oauthIdentity = identityTag
-			oauthAccountID = binding.KeySourceRef
-
-		} else if binding.KeySourceType == "team" {
-			var err error
-			mk, err = p.activeReader.GetTeamKeyByID(binding.KeySourceRef)
-			if err != nil {
-				logger.Warn("vault: team key lookup via binding failed", "vk_id", binding.KeySourceRef, "error", err)
-			}
-			if mk != nil {
-				realKey = mk.PlaintextKey
-				virtualKeyID = mk.VirtualKeyID
-				// 2026-05-09: surface the team key's user-facing alias so the
-				// receipt / WAL `key_label` shows e.g. `key-335923591-0011-1`
-				// instead of the vk_id tail. mk.LocalAlias is COALESCEd with
-				// the canonical `alias` column in vault.GetTeamKeyByID, so it
-				// is non-empty for any normal team key.
-				keyAlias = mk.LocalAlias
-				if url, ok := mk.ProviderBaseURLs[canonicalCode]; ok && url != "" {
-					baseURL = url
-				} else if url, ok := mk.ProviderBaseURLs[providerCode]; ok && url != "" {
-					baseURL = url
-				} else {
-					baseURL = mk.BaseURL
-				}
-			}
-		} else {
-			// personal key
-			plaintext, _, entryBaseURL, err := p.activeReader.GetPersonalKeyByAlias(binding.KeySourceRef)
-			if err != nil {
-				logger.Warn("vault: personal key lookup via binding failed", "alias", binding.KeySourceRef, "error", err)
-			} else {
-				realKey = plaintext
-				virtualKeyID = "personal:" + binding.KeySourceRef
-				keyAlias = binding.KeySourceRef
-				if entryBaseURL != "" {
-					baseURL = entryBaseURL
-				} else {
-					baseURL = providerDefaultBaseURL(canonicalCode)
-				}
-			}
+		cred, bindErr := p.ResolveBindingCredential(r, binding, providerCode, canonicalCode, logger)
+		if bindErr != nil {
+			// OAuth path: writeJSONError + return (helper does NOT increment
+			// p.errors because the caller's view of "what's an error" may
+			// differ — we increment here to keep the metric semantics
+			// identical to the pre-refactor inline code).
+			p.errors.Add(1)
+			writeJSONError(w, bindErr.StatusCode, bindErr.ErrorType, bindErr.ErrorCode, bindErr.Message)
+			return
+		}
+		// Soft-fail path (team / personal with empty cred): RealKey="" leaves
+		// the variables blank below and the legacy fallback block fires.
+		// OAuth-success path: cred fields populated, RealKey="__oauth__".
+		realKey = cred.RealKey
+		virtualKeyID = cred.VirtualKeyID
+		keyAlias = cred.KeyAlias
+		baseURL = cred.BaseURL
+		oauthIdentity = cred.OAuthIdentity
+		oauthAccountID = cred.OAuthAccountID
+		if cred.ManagedKey != nil {
+			mk = cred.ManagedKey
 		}
 	}
 
@@ -1160,14 +1636,71 @@ func (p *Proxy) serveRoute(w http.ResponseWriter, r *http.Request, route *vkeys.
 					return nil
 				}
 				body = rewriteToolNamesReverseJSON(body, toolNameRevMapping)
+
+				// Token extraction runs on the upstream-NATIVE body shape
+				// (e.g. Anthropic for an App pipeline binding pointed at
+				// Claude). The optional ResponseTransform below runs AFTER
+				// this so the translation step doesn't affect usage events.
+				breakdown := prov.ExtractTokenBreakdown(body, false, logger)
+
+				// Phase 2 (App pipeline only): if a ResponseTransform is
+				// armed on the ResolvedRoute, translate the upstream body
+				// to the inbound protocol shape (e.g. Anthropic → OpenAI).
+				// Tier 1 / Tier 2 routes leave this field nil → block is
+				// a single nil-check no-op. On failure: rewrite status to
+				// 502 + emit a synthetic OpenAI-style error envelope so
+				// the client gets a precise, structured error instead of
+				// the upstream's body or a generic httputil 502.
+				if route.ResponseTransform != nil {
+					translated, terr := route.ResponseTransform(r.Context(), body)
+					if terr != nil {
+						logger.Error("app pipeline response translation failed",
+							"event.name", "proxy.response.translation_failed",
+							"error", terr,
+							"provider", route.ProviderCode,
+							"app_slug", route.AppSlug,
+						)
+						resp.StatusCode = http.StatusBadGateway
+						resp.Status = "502 Bad Gateway"
+						// Drop transfer/content encoding headers that
+						// referred to the upstream body we're discarding.
+						resp.Header.Del("Content-Length")
+						resp.Header.Del("Content-Encoding")
+						resp.Header.Del("Transfer-Encoding")
+						resp.Header.Set("Content-Type", "application/json")
+						errBody := []byte(`{"error":{"type":"server_error","code":"RESPONSE_TRANSLATION_FAILED","message":"Upstream response could not be translated back to the inbound protocol shape: ` +
+							jsonEscapeForError(terr.Error()) + `"}}`)
+						resp.Body = io.NopCloser(bytes.NewReader(errBody))
+						resp.ContentLength = int64(len(errBody))
+						// Still record the event with the upstream-native
+						// breakdown so usage isn't lost on translation
+						// failures.
+						p.recordEvent(r, resp, startTime, route, bearerToken, streaming)
+						return nil
+					}
+					body = translated
+					// Translator changed the body size — drop the upstream's
+					// Content-Length header so Go's net/http server recomputes
+					// it from the new body length. Without this, the client
+					// sees `transfer closed with N bytes remaining` because
+					// the header still advertises the upstream-side size.
+					resp.Header.Del("Content-Length")
+					resp.Header.Del("Content-Encoding")
+					resp.Header.Del("Transfer-Encoding")
+				}
+
+				// Rebuffer with the FINAL body (post-translation if engaged,
+				// otherwise unchanged from upstream).
 				resp.Body = io.NopCloser(bytes.NewReader(body))
 				resp.ContentLength = int64(len(body))
 
-				breakdown := prov.ExtractTokenBreakdown(body, false, logger)
 				// Caller-side double defense per principles/logging-conventions.md:
 				// extractor may have logged a WARN for a known shape mismatch, but if
 				// it returned (0, 0) on a non-empty 2xx body without WARN'ing (new
 				// wire format the extractor wasn't updated for), this catches it.
+				// Note: `body` may be post-translation here, but breakdown was
+				// computed from the upstream-native body above so the WARN
+				// condition is unchanged in semantics.
 				if resp.StatusCode >= 200 && resp.StatusCode < 300 &&
 					len(body) > 100 &&
 					breakdown.InputTokens == 0 && breakdown.OutputTokens == 0 {
@@ -1245,7 +1778,21 @@ func (p *Proxy) serveRoute(w http.ResponseWriter, r *http.Request, route *vkeys.
 				// them. newSSEToolNameRewriter is a no-op pass-through when
 				// the mapping is empty (real CLI traffic).
 				upstream := newSSEToolNameRewriter(resp.Body, toolNameRevMapping)
-				resp.Body = newStreamDrainer(upstream, baseEvent, prov, collector, p.proxyCtx, r.Context(), logger, cb)
+				// Phase 4 M2 plugin observer dispatch: pluck the observer
+				// context + registry that handleAppPipeline stashed on the
+				// route (App pipeline branch only — legacy /v1/... routes
+				// leave both nil, the drainer short-circuits). Type-assert
+				// here because vkeys/types.go declares both fields as `any`
+				// to keep vkeys at the bottom of the dep graph.
+				var obsRegistry *observer.Registry
+				var obsReqCtx *observer.RequestContext
+				if route.ObserverRegistry != nil {
+					obsRegistry, _ = route.ObserverRegistry.(*observer.Registry)
+				}
+				if route.ObserverContext != nil {
+					obsReqCtx, _ = route.ObserverContext.(*observer.RequestContext)
+				}
+				resp.Body = newStreamDrainer(upstream, baseEvent, prov, collector, p.proxyCtx, r.Context(), logger, cb, obsRegistry, obsReqCtx)
 			}
 			return nil
 		},
@@ -1309,6 +1856,21 @@ func (p *Proxy) buildBaseEvent(req *http.Request, resp *http.Response, startTime
 	}
 	if model := req.Header.Get("x-aikey-model"); model != "" {
 		ev.Model = model
+		ev.RequestedModel = model // Phase 4 §5.3 — captured at request entry, may differ from upstream `Model` after translator remaps
+	}
+	// Phase 4 (AKL-207) — App pipeline audit fields. Empty for legacy paths
+	// (route.RouteSource != "app").
+	if route.RouteSource == "app" {
+		ev.AppSlug = route.AppSlug
+		ev.AppKeyID = route.AppKeyID
+		if route.FollowUserActive {
+			ev.AppMode = "follow-active"
+			ev.BoundVia = "default" // follow-active path uses the user's default profile binding
+		} else {
+			ev.AppMode = "isolated"
+			ev.BoundVia = "app:" + route.AppSlug
+		}
+		ev.ResolvedProvider = provider
 	}
 	return ev
 }
@@ -1571,6 +2133,64 @@ func resolveSessionID(h http.Header, providerCode string) string {
 // The fence alone preserves the OOM protection that review finding #1
 // asked for, without the field-order fragility.
 const extractBodyHardLimit = 4 * 1024 * 1024 // 4 MB
+
+// jsonEscapeForError escapes a string for safe embedding in a JSON
+// error-body literal. Only escapes the JSON-syntax-critical characters
+// (`\`, `"`, control bytes); higher-byte sequences pass through, which
+// is fine for UTF-8 since none of them collide with structural JSON.
+// Used by the App-pipeline ResponseTransform failure path to embed
+// an upstream error message into a synthetic error envelope without
+// pulling json.Marshal on a known-tiny string.
+func jsonEscapeForError(s string) string {
+	var b strings.Builder
+	b.Grow(len(s) + 4)
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		switch c {
+		case '\\':
+			b.WriteString(`\\`)
+		case '"':
+			b.WriteString(`\"`)
+		case '\n':
+			b.WriteString(`\n`)
+		case '\r':
+			b.WriteString(`\r`)
+		case '\t':
+			b.WriteString(`\t`)
+		default:
+			if c < 0x20 {
+				// Other control chars get the \u00XX form. Rare in error
+				// messages; covered for safety.
+				const hex = "0123456789abcdef"
+				b.WriteString(`\u00`)
+				b.WriteByte(hex[(c>>4)&0xf])
+				b.WriteByte(hex[c&0xf])
+			} else {
+				b.WriteByte(c)
+			}
+		}
+	}
+	return b.String()
+}
+
+// extractModelLazy parses the `model` field out of an already-buffered
+// JSON body without touching the http.Request — used by App pipeline's
+// translation step, which has the sanitized bytes in-hand and doesn't
+// want to consume/re-buffer r.Body. Returns empty string on parse
+// failure or absent field (caller treats empty as "let translator
+// decide / pass through").
+func extractModelLazy(body []byte) string {
+	if len(body) == 0 || len(body) > extractBodyHardLimit {
+		return ""
+	}
+	var partial struct {
+		Model string `json:"model"`
+	}
+	if err := json.Unmarshal(body, &partial); err != nil {
+		return ""
+	}
+	return partial.Model
+}
 
 func extractModel(r *http.Request) string {
 	if r.Body == nil {

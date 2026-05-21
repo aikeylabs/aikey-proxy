@@ -8,6 +8,7 @@ require (
 	github.com/AiKeyLabs/pkg/aikeytime v0.0.0
 	github.com/AiKeyLabs/pkg/buildinfo v0.0.0
 	github.com/AiKeyLabs/pkg/providerroutes v0.0.0
+	github.com/aikeylabs/degrade-detector/proxy-plugin/rhythm v0.0.0
 	golang.org/x/crypto v0.49.0
 	golang.org/x/term v0.41.0
 	gopkg.in/yaml.v3 v3.0.1
@@ -24,6 +25,12 @@ replace github.com/AiKeyLabs/pkg/providerroutes => ../pkg/providerroutes
 
 replace github.com/AiKeyLabs/aikey-auth-broker => ../aikey-auth-broker
 
+// Phase 4 M2 first-party observer: the degrade-detector rhythm plugin
+// is a separate Go module living side-by-side in the aikeylabs/ workspace.
+// CI / release pipelines pin to a tagged version + drop this replace; local
+// development uses the path replace so changes propagate without publish.
+replace github.com/aikeylabs/degrade-detector/proxy-plugin/rhythm => ../degrade-detector/proxy-plugin/rhythm
+
 require (
 	github.com/andybalholm/brotli v1.2.0 // indirect
 	github.com/cespare/xxhash/v2 v2.3.0 // indirect
@@ -39,6 +46,10 @@ require (
 	github.com/quic-go/quic-go v0.57.1 // indirect
 	github.com/refraction-networking/utls v1.8.1 // indirect
 	github.com/remyoudompheng/bigfft v0.0.0-20230129092748-24d4a6f8daec // indirect
+	github.com/tidwall/gjson v1.19.0 // indirect
+	github.com/tidwall/match v1.1.1 // indirect
+	github.com/tidwall/pretty v1.2.0 // indirect
+	github.com/tidwall/sjson v1.2.5 // indirect
 	golang.org/x/net v0.51.0 // indirect
 	golang.org/x/sys v0.42.0 // indirect
 	golang.org/x/text v0.35.0 // indirect

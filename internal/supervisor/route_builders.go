@@ -91,6 +91,31 @@ func oauthTokenToRoute(ot vault.OAuthRouteToken) *vkeys.ResolvedRoute {
 	}
 }
 
+// appRouteTokenToRoute builds an App pipeline route from a vault app
+// route-token record (Phase 4 third-party Agent接入).
+//
+// Why Provider / BaseURL / KeyAlias are intentionally empty: app routes
+// resolve their upstream credential per-request via the App pipeline (see
+// vault.GetProviderBindingWithScope("app:<slug>", protocol)), not at load
+// time. Pinning a static Provider here would lock the app to one upstream
+// and defeat the point of the binding indirection (which lets the user
+// switch which underlying account the app uses without rotating the
+// app's token).
+//
+// VirtualKeyID prefix is "app:" mirroring "personal:" / "oauth:" so the
+// existing deriveKeyLabel observability codepath produces a sensible
+// label without special-casing.
+func appRouteTokenToRoute(at vault.AppRouteToken) *vkeys.ResolvedRoute {
+	return &vkeys.ResolvedRoute{
+		VirtualKeyID:     "app:" + at.AppSlug,
+		RouteSource:      "app",
+		AppSlug:          at.AppSlug,
+		AppKind:          at.AppKind,
+		AppKeyID:         at.KeyID,
+		FollowUserActive: at.FollowUserActive,
+	}
+}
+
 // ── Filtered route-set builders (single source of truth for both startup
 //    `buildGeneration` and reload `syncManagedKeys` paths) ─────────────────
 //
@@ -141,6 +166,34 @@ func buildOAuthRoutesFiltered(tokens []vault.OAuthRouteToken) map[string]*vkeys.
 	return out
 }
 
+// buildAppRoutesFiltered converts app-pipeline route-token records into a
+// `route → ResolvedRoute` map, skipping (with WARN) any record whose
+// `RouteToken` is not a strict `aikey_app_<64-lowercase-hex>`. Mirrors the
+// personal / OAuth filters; same eligibility rule, different form prefix.
+//
+// Vault-side filter already enforces this (vault/route_token_form.go +
+// vault.GetAllAppRouteTokens), so this layer is belt-and-suspenders for
+// the same reason the personal/OAuth filters duplicate the check —
+// supervisor MUST NOT trust vault-side filtering alone, since a future
+// vault implementation (or a test fixture / hand-crafted vault row) could
+// bypass it. Registry's invariant "byToken only ever holds strict Tier1
+// forms" stays true regardless.
+func buildAppRoutesFiltered(tokens []vault.AppRouteToken) map[string]*vkeys.ResolvedRoute {
+	out := make(map[string]*vkeys.ResolvedRoute, len(tokens))
+	for _, at := range tokens {
+		if !isStrictAppRouteToken(at.RouteToken) {
+			slog.Warn("registry load: skipping legacy/malformed app route token",
+				"app_slug", at.AppSlug,
+				"key_id", at.KeyID,
+				"token_prefix", tokenPrefixForLog(at.RouteToken),
+				"hint", "expected aikey_app_<64 lowercase hex>")
+			continue
+		}
+		out[at.RouteToken] = appRouteTokenToRoute(at)
+	}
+	return out
+}
+
 // vaultRouteTokenReader is the minimal vault-reader surface that
 // loadVaultRoutesIntoRegistry depends on. Defined as an interface so
 // tests can inject a fake without spinning up a real vault file —
@@ -148,6 +201,7 @@ func buildOAuthRoutesFiltered(tokens []vault.OAuthRouteToken) map[string]*vkeys.
 type vaultRouteTokenReader interface {
 	GetAllPersonalRouteTokens() ([]vault.PersonalRouteToken, error)
 	GetAllOAuthRouteTokens() ([]vault.OAuthRouteToken, error)
+	GetAllAppRouteTokens() ([]vault.AppRouteToken, error)
 }
 
 // loadVaultRoutesIntoRegistry merges all strict-form personal + OAuth
@@ -193,6 +247,22 @@ func loadVaultRoutesIntoRegistry(reg *vkeys.Registry, vaultReader vaultRouteToke
 		slog.Warn("could not load oauth route tokens", "error", oerr)
 	case len(oauthTokens) > 0:
 		if routes := buildOAuthRoutesFiltered(oauthTokens); len(routes) > 0 {
+			reg.Merge(routes)
+		}
+	}
+
+	// App pipeline bearers (app_keys.route_token, Phase 4). vault.GetAllAppRouteTokens
+	// returns nil (no error) on pre-Phase-4 vaults that don't have the
+	// app_records / app_keys tables — so a non-error empty result is
+	// treated identically to "no apps registered". Any unexpected error
+	// is logged but does NOT abort the startup load (preserves
+	// personal/team/oauth routing even if app loading regressed).
+	appTokens, aerr := vaultReader.GetAllAppRouteTokens()
+	switch {
+	case aerr != nil:
+		slog.Warn("could not load app route tokens", "error", aerr)
+	case len(appTokens) > 0:
+		if routes := buildAppRoutesFiltered(appTokens); len(routes) > 0 {
 			reg.Merge(routes)
 		}
 	}

@@ -127,6 +127,25 @@ export AIKEY_MASTER_PASSWORD="your-password"
 curl http://127.0.0.1:27200/health
 ```
 
+> ⚠️ **Dev-loop note (2026-05-21)**: invoking the binary directly with a
+> relative `--config aikey-proxy.yaml` reads **this repo's dev fixture**,
+> which is a schema sample, NOT the runtime config that installs use.
+> For day-to-day dev iteration prefer:
+>
+> ```bash
+> # System layer is rendered by aikey-config-tool to ~/.aikey/config/
+> aikey-config-tool render --profile personal
+> ./bin/aikey-proxy --config ~/.aikey/config/aikey-proxy.yaml
+> ```
+>
+> Or use the higher-level CLI which auto-resolves the canonical path:
+>
+> ```bash
+> aikey proxy start   # reads ~/.aikey/config/aikey-proxy.yaml unless --config given
+> ```
+>
+> Background: [bugfix 20260521-proxy-config-cwd-first](../workflow/CI/bugfix/20260521-proxy-config-cwd-first-loads-stale-dev-fixture.md).
+
 ## Get a virtual-key bearer token
 
 Virtual keys are issued by `aikey-cli` and stored in the vault. The proxy

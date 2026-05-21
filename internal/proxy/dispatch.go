@@ -11,6 +11,7 @@ package proxy
 //   - Tier2Probe         → `aikey_probe_*` (test sentinel, tier 2 path)
 //   - Tier1Team          → `aikey_team_*` (team static bearer; Registry lookup)
 //   - Tier1Personal      → `aikey_personal_<64-hex>` (personal static bearer; Registry lookup)
+//   - Tier1App           → `aikey_app_<64-hex>` (third-party app static bearer; App pipeline)
 //   - Tier3ActiveSentinel→ `aikey_active_*` (follow-active sentinel; tier 3 fallthrough INTENTIONAL)
 //   - TokenInvalid       → any other `aikey_*` (unknown subform / malformed / reserved `aikey_route_*`)
 //   - Tier3Native        → token does not start with `aikey_` (native upstream credential)
@@ -51,12 +52,19 @@ const (
 	// route. Registry miss → TokenInvalid downstream.
 	Tier1Personal
 
+	// Tier1App — token is `aikey_app_<64-hex>` (strict form); third-party
+	// app static bearer routed via App pipeline (internal/proxy/apppipe).
+	// Registry lookup uses the plaintext token as key (byToken map),
+	// matching the personal/OAuth pattern. Registry miss → TokenInvalid.
+	Tier1App
+
 	// TokenInvalid — token is in the aikey_ namespace but does NOT match a
 	// known legitimate form. Caller MUST return HTTP 401 with body.error.code
 	// = "TOKEN_INVALID" and MUST NOT fall through. Includes:
 	//   - aikey_route_*    (reserved namespace, not implemented this round)
 	//   - aikey_unknown_*  (typo / unknown subform)
 	//   - aikey_personal_* with non-64-hex suffix (legacy sentinel, malformed bearer)
+	//   - aikey_app_*      with non-64-hex suffix
 	//   - aikey_team_      (empty vk_id)
 	TokenInvalid
 )
@@ -101,6 +109,20 @@ func ClassifyToken(token string) DispatchAction {
 		}
 		return TokenInvalid
 
+	case strings.HasPrefix(token, "aikey_app_"):
+		// Tier 1 — third-party app static bearer. Strict form: `aikey_app_`
+		// + exactly 64 lowercase hex chars (length 74). Mirrors the
+		// personal bearer form-check for the same reasons (precise rejection
+		// of malformed shapes before they reach Registry lookup).
+		//
+		// MUST be checked BEFORE `aikey_active_` — `aikey_app_` is not a
+		// prefix of `aikey_active_` so no shadowing today, but keep this
+		// ordering strict to defend against future namespace additions.
+		if isTier1App(token) {
+			return Tier1App
+		}
+		return TokenInvalid
+
 	case strings.HasPrefix(token, "aikey_active_"):
 		// Tier 3 fallthrough — sentinel by design. Suffix is the canonical
 		// provider code; not validated here because the proxy resolves the
@@ -130,7 +152,23 @@ func ClassifyToken(token string) DispatchAction {
 //   - Length variations (63 hex / 65 hex / 128 hex) are obviously corrupt
 //     and should never reach Registry.
 func isTier1Personal(token string) bool {
-	suffix, ok := strings.CutPrefix(token, "aikey_personal_")
+	return hasStrictHex64Suffix(token, "aikey_personal_")
+}
+
+// isTier1App returns true iff `token` is exactly `aikey_app_` followed by
+// 64 lowercase hex chars. Mirrors isTier1Personal for the third-party app
+// bearer namespace; same strict-form rationale (precise rejection of
+// malformed shapes before Registry lookup).
+func isTier1App(token string) bool {
+	return hasStrictHex64Suffix(token, "aikey_app_")
+}
+
+// hasStrictHex64Suffix returns true iff `token` is exactly `prefix` followed
+// by 64 lowercase hex chars. Shared form-check for Tier1 strict bearers
+// (personal / app) — DRY the predicate so future strict-form additions get
+// the same charset + length guarantees without copy-paste drift.
+func hasStrictHex64Suffix(token, prefix string) bool {
+	suffix, ok := strings.CutPrefix(token, prefix)
 	if !ok {
 		return false
 	}

@@ -26,6 +26,25 @@ import (
 	broker "github.com/AiKeyLabs/aikey-auth-broker"
 	"github.com/AiKeyLabs/pkg/aikeycompat"
 	"github.com/AiKeyLabs/pkg/buildinfo"
+
+	// Protocol-translator pair registrations (Phase 2). Each blank-import
+	// fires the pair package's init() which registers (from, to) transforms
+	// with translator.DefaultRegistry(). The App pipeline reads from the
+	// same default registry. New pairs (Codex / Kimi /阶段 1+) land here.
+	_ "github.com/AiKeyLabs/aikey-proxy/pkg/protocol-translator/pairs/openai_anthropic"
+
+	// Phase 4 M2 first-party observer registrations. Each blank-import
+	// fires the plugin package's init() which calls
+	// observer.RegisterObserver to add its descriptor to the process-
+	// global registration sink. The supervisor's buildObserverRegistry
+	// reads from that sink at proxy-generation construction time.
+	//
+	// Adding a new first-party observer requires exactly TWO lines in this
+	// file: one import line here + (separately) one entry in
+	// observer.FirstPartyAllowlist (in pkg/observer/registry.go). No
+	// changes to internal/proxy/* or internal/supervisor/* are required —
+	// the framework picks up the new descriptor automatically.
+	_ "github.com/aikeylabs/degrade-detector/proxy-plugin/rhythm"
 )
 
 const defaultConfigName = "aikey-proxy.yaml"

@@ -159,3 +159,101 @@ func TestDeriveKeyLabel_PathPrefix_TokenRoute_CarriesAlias(t *testing.T) {
 		t.Fatalf("path-prefix token route: want alias, got %q", got)
 	}
 }
+
+// TestBuildReportableEvent_AppPipelineFieldsIsolated pins AKL-207 §5.3
+// close-out: the ReportableEvent shape (collector wire + WAL) must carry
+// the 6 app-attribution fields when the request came through the App
+// pipeline in isolated mode. Without these fields the central collector
+// receives degrade-detector traffic with empty app_slug and the billing /
+// usage dashboard cannot attribute it.
+func TestBuildReportableEvent_AppPipelineFieldsIsolated(t *testing.T) {
+	route := &vkeys.ResolvedRoute{
+		VirtualKeyID:     "app:degrade-detector",
+		RouteSource:      "app",
+		ProviderCode:     "anthropic",
+		AppSlug:          "degrade-detector",
+		AppKind:          "first-party",
+		AppKeyID:         "key-uuid-abc",
+		FollowUserActive: false, // isolated mode
+	}
+	ev := BuildReportableEvent(ReportOpts{
+		EventID:    "evt-1",
+		Route:      route,
+		Model:      "claude-3-5-sonnet-20241022",
+		StatusCode: 200,
+	})
+	if ev.AppSlug != "degrade-detector" {
+		t.Errorf("AppSlug = %q, want degrade-detector", ev.AppSlug)
+	}
+	if ev.AppKeyID != "key-uuid-abc" {
+		t.Errorf("AppKeyID = %q, want key-uuid-abc", ev.AppKeyID)
+	}
+	if ev.AppMode != "isolated" {
+		t.Errorf("AppMode = %q, want isolated (FollowUserActive=false)", ev.AppMode)
+	}
+	if ev.BoundVia != "app:degrade-detector" {
+		t.Errorf("BoundVia = %q, want app:degrade-detector", ev.BoundVia)
+	}
+	if ev.RequestedModel != "claude-3-5-sonnet-20241022" {
+		t.Errorf("RequestedModel = %q, want claude-3-5-sonnet-20241022", ev.RequestedModel)
+	}
+	if ev.ResolvedProvider != "anthropic" {
+		t.Errorf("ResolvedProvider = %q, want anthropic", ev.ResolvedProvider)
+	}
+}
+
+// TestBuildReportableEvent_AppPipelineFieldsFollowActive pins the
+// follow-active variant — degrade-detector's expected steady-state mode
+// (first-party, follow_user_active=true). AppMode + BoundVia must
+// reflect "follow-active" + "default" so the central collector can
+// distinguish "this app traffic used the user's currently-selected key"
+// from "this app traffic used its own isolated key".
+func TestBuildReportableEvent_AppPipelineFieldsFollowActive(t *testing.T) {
+	route := &vkeys.ResolvedRoute{
+		VirtualKeyID:     "app:degrade-detector",
+		RouteSource:      "app",
+		ProviderCode:     "anthropic",
+		AppSlug:          "degrade-detector",
+		AppKind:          "first-party",
+		AppKeyID:         "key-uuid-xyz",
+		FollowUserActive: true, // dynamic follow mode
+	}
+	ev := BuildReportableEvent(ReportOpts{
+		EventID:    "evt-2",
+		Route:      route,
+		Model:      "claude-3-5-sonnet-20241022",
+		StatusCode: 200,
+	})
+	if ev.AppMode != "follow-active" {
+		t.Errorf("AppMode = %q, want follow-active (FollowUserActive=true)", ev.AppMode)
+	}
+	if ev.BoundVia != "default" {
+		t.Errorf("BoundVia = %q, want default (follow-active reads default profile)", ev.BoundVia)
+	}
+}
+
+// TestBuildReportableEvent_LegacyRoutesOmitAppFields pins the regression
+// gate — pre-Phase-4 callers (personal/team/oauth routes) must NOT have
+// any of the 6 app fields populated, so omitempty drops them on JSON
+// wire and pre-v5 collector consumers continue to parse correctly. If
+// this test ever fails, the "if route.RouteSource == app" gate broke.
+func TestBuildReportableEvent_LegacyRoutesOmitAppFields(t *testing.T) {
+	route := &vkeys.ResolvedRoute{
+		VirtualKeyID: "vk-personal-1",
+		RouteSource:  "personal",
+		ProviderCode: "openai",
+		// Even if a buggy caller set AppSlug, the gate must drop it.
+		AppSlug:  "ghost-app",
+		AppKeyID: "ghost-key",
+	}
+	ev := BuildReportableEvent(ReportOpts{
+		EventID:    "evt-3",
+		Route:      route,
+		Model:      "gpt-4o",
+		StatusCode: 200,
+	})
+	if ev.AppSlug != "" || ev.AppKeyID != "" || ev.AppMode != "" || ev.BoundVia != "" || ev.RequestedModel != "" || ev.ResolvedProvider != "" {
+		t.Errorf("legacy route leaked App fields: AppSlug=%q AppKeyID=%q AppMode=%q BoundVia=%q RequestedModel=%q ResolvedProvider=%q",
+			ev.AppSlug, ev.AppKeyID, ev.AppMode, ev.BoundVia, ev.RequestedModel, ev.ResolvedProvider)
+	}
+}

@@ -1,5 +1,28 @@
-# aikey-proxy configuration
-# Copy this file to aikey-proxy.yaml and modify as needed.
+# aikey-proxy schema sample (example)
+#
+# ── Purpose ───────────────────────────────────────────────────────────────
+# This file is the **canonical schema reference** for the proxy yaml. It is
+# consumed by:
+#
+#   - aikey-proxy/scripts/dev-setup.sh        (templates a fresh ~/.aikey/config/)
+#   - aikey-proxy/scripts/deploy-integration.sh
+#   - workflow/CD/publish/release.sh           (cps into release tarball
+#                                               `bundle/config/default/aikey-proxy.yaml`
+#                                               as the first-install default)
+#
+# It is **NOT** loaded directly by `aikey proxy start` runtime — the cwd-first
+# resolution was removed 2026-05-21. See:
+#   - workflow/CI/bugfix/20260521-proxy-config-cwd-first-loads-stale-dev-fixture.md
+#   - roadmap20260320/技术实现/开源版本方案/config-split-system-user.md §v9
+#
+# Field set MUST be a SUBSET of the system layer logical shape rendered by
+# `aikey-config-tool render --profile personal`. PR-gate
+# `make test-config-split-dev-fixture` enforces this. Token-bearing fields
+# use `<dev-placeholder>` so it's obvious they need real values from the
+# installer's render step (or operator-provided secrets).
+#
+# Field reference: workflow/CD/templates/common/aikey-proxy.yaml.tmpl
+# ──────────────────────────────────────────────────────────────────────────
 
 listen:
   host: "127.0.0.1"
@@ -32,28 +55,36 @@ events:
   batch_size: 100
   flush_interval: 5s
 
-  # Usage reporting to collector-service (optional).
-  # When collector_url is set, team-managed key usage events are uploaded
-  # to the data service for org-level analytics.
+  # Usage reporting to collector-service.
   #
-  # Leave collector_url empty or commented out for standalone-local mode
-  # (personal BYOK only, no server). Enable it when a Control Service is
-  # available and you want org-level usage tracking.
+  # `collector_url` is the legacy single-destination field — events for
+  # any RouteSource not matched by `collector_routes` below fall through
+  # to this URL. Personal / Trial use 127.0.0.1:8090 (local-server);
+  # Production deployments may point at a remote collector container.
   #
-  # Environment-specific defaults:
-  #   Local dev / local server:   http://127.0.0.1:27300
-  #   Private deployment:         http://<server-ip>:27300
-  #   SaaS (future):              https://collector.aikey.dev
-  #
-  # collector_url: ""
-  # collector_token: ""
-  # queue_capacity: 10000
-  # upload_batch_size: 100
-  # upload_interval: 5s
+  # `collector_token` (legacy) and `service_token` are the bearer secrets
+  # the collector-service validates. They are placeholders here — the
+  # installer's `aikey-config-tool render` step substitutes real values
+  # into the system-layer copy at `~/.aikey/config/aikey-proxy.yaml`.
+  collector_url: "http://127.0.0.1:8090"
+  collector_token: "<dev-placeholder>"
+  service_token: "<dev-placeholder>"
+
+  # collector_routes — per-RouteSource upload destinations. Populated by
+  # `aikey-config-tool render` based on profile + login state.
+  #   personal/oauth → local collector  (8090 on personal/trial)
+  #   team           → remote control_url after `aikey login`, else local
+  collector_routes:
+    personal: "http://127.0.0.1:8090"
+    team:     "http://127.0.0.1:8090"
+    oauth:    "http://127.0.0.1:8090"
+
+  queue_capacity: 10000
+  upload_batch_size: 5
+  upload_interval: 5s
 
   # WAL directory for usage event durability and dead letter storage.
   # Always set this — dead_letter.jsonl is written here for terminal upload failures.
-  # If omitted, falls back to the events db_path directory (~/.aikey/data/).
   wal_dir: "~/.aikey/data/usage-wal"
 
 log:

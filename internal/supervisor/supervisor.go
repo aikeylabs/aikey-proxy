@@ -780,6 +780,13 @@ func (s *Supervisor) buildGeneration() (*generation, error) {
 		p.SetBroker(s.broker)
 	}
 
+	// Phase 4 M2: build the per-generation observer registry. Skipped when
+	// no observer descriptors are registered (e.g. proxy build without the
+	// rhythm plugin blank-imported in main.go); in that path SetObserver
+	// is never called and Notify* hooks are zero-cost no-ops at request
+	// time. See pkg/observer/registry.go for the registration contract.
+	p.SetObserverRegistry(buildObserverRegistry(vaultReader, s.cfg.Observers, slog.Default()))
+
 	// Create the local WAL writer unconditionally whenever WALDir is set.
 	// This is the canonical event log used by `aikey statusline` / `aikey watch`,
 	// and it must exist even in standalone (no collector_url) deployments —

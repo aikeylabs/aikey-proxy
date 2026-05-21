@@ -472,7 +472,12 @@ type mockActiveVault struct {
 	personalText     string
 	personalProv     string
 	personalBaseURL  string
-	providerBindings map[string]*vault.ProviderBinding // keyed by lowercase provider code
+	providerBindings map[string]*vault.ProviderBinding // keyed by lowercase provider code (default profile)
+	// App-pipeline-specific fields (AKL-207). nil values are fine; the App
+	// pipeline methods return nil/nil for the no-op case which equals
+	// "no app registered" / "no scope binding" — graceful.
+	appRecord    *vault.AppRecord
+	appBindings  map[string]*vault.ProviderBinding // keyed by `<profileID>|<providerCode>`
 }
 
 func (m *mockActiveVault) GetSecret(alias string) (string, error) {
@@ -526,6 +531,40 @@ func (m *mockActiveVault) GetProviderBinding(providerCode string) (*vault.Provid
 		return nil, nil
 	}
 	return b, nil
+}
+
+// GetProviderBindingWithScope satisfies apppipe.VaultReader. Tests setting
+// `appBindings["app:<slug>|<provider>"] = ...` exercise the App pipeline's
+// isolated-mode resolution; setting `appBindings["default|<provider>"] = ...`
+// covers follow-active mode. Falls back to the legacy `providerBindings` map
+// when scope == "default" so existing fixtures don't need to migrate.
+func (m *mockActiveVault) GetProviderBindingWithScope(profileID, providerCode string) (*vault.ProviderBinding, error) {
+	if m.appBindings != nil {
+		if b, ok := m.appBindings[profileID+"|"+strings.ToLower(providerCode)]; ok {
+			return b, nil
+		}
+	}
+	// Backstop: default profile reuses the existing field so legacy
+	// fixtures don't have to populate appBindings.
+	if profileID == "default" && m.providerBindings != nil {
+		if b, ok := m.providerBindings[strings.ToLower(providerCode)]; ok {
+			return b, nil
+		}
+	}
+	return nil, nil
+}
+
+// GetAppRecord satisfies apppipe.VaultReader. Tests set m.appRecord to the
+// metadata they want apppipe.Resolve to read; multi-app tests can build
+// distinct mocks per slug.
+func (m *mockActiveVault) GetAppRecord(slug string) (*vault.AppRecord, error) {
+	if m.appRecord == nil {
+		return nil, nil
+	}
+	if m.appRecord.Slug != slug {
+		return nil, nil
+	}
+	return m.appRecord, nil
 }
 
 func setupTestProxyWithActive(t *testing.T, av *mockActiveVault) *Proxy {

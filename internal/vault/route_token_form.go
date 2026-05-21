@@ -21,7 +21,24 @@ import "strings"
 // OAuth bearer form. Used by registry loaders to skip pre-migration
 // rows whose route_token is still `aikey_vk_*` or another legacy shape.
 func isStrictPersonalBearerForm(token string) bool {
-	const prefix = "aikey_personal_"
+	return hasStrictHex64Suffix(token, "aikey_personal_")
+}
+
+// isStrictAppBearerForm reports whether token matches exactly
+// `aikey_app_<64 lowercase hex>` — the third-party Agent app bearer
+// form (Phase 4 app pipeline). Mirrors isStrictPersonalBearerForm so
+// app route_token loading filters out any malformed rows the writer
+// might have produced (e.g. legacy alias-style strings hand-crafted
+// into vault before the Rust CLI's `aikey app authorize` was wired up).
+func isStrictAppBearerForm(token string) bool {
+	return hasStrictHex64Suffix(token, "aikey_app_")
+}
+
+// hasStrictHex64Suffix is the shared predicate behind the strict Tier1
+// bearer forms (personal/app). Centralized so future strict-form additions
+// (`aikey_route_*` etc.) get the same charset + length guarantees without
+// copy-paste drift.
+func hasStrictHex64Suffix(token, prefix string) bool {
 	suffix, ok := strings.CutPrefix(token, prefix)
 	if !ok {
 		return false

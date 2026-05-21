@@ -10,6 +10,7 @@ import (
 	"github.com/AiKeyLabs/aikey-proxy/internal/events"
 	"github.com/AiKeyLabs/aikey-proxy/internal/observability"
 	"github.com/AiKeyLabs/aikey-proxy/internal/provider"
+	"github.com/AiKeyLabs/aikey-proxy/pkg/observer"
 )
 
 // streamDrainer wraps an upstream SSE response body. A background goroutine
@@ -72,11 +73,28 @@ func newStreamDrainer(
 	reqCtx context.Context,
 	logger *slog.Logger,
 	onComplete reporterCallback,
+	// Phase 4 M2 plugin observer hooks (optional). Both must be non-nil
+	// for per-frame NotifySSEEvent dispatch to fire — the drainer
+	// checks this once per read and short-circuits otherwise, so legacy
+	// (no-observer) callers pay one nil-check per chunk and zero
+	// allocations. The two arguments are kept separate (rather than
+	// bundled into a single struct) so the existing legacy callers can
+	// pass `nil, nil` without constructing wrapper values.
+	obsRegistry *observer.Registry,
+	obsReqCtx *observer.RequestContext,
 ) *streamDrainer {
 	if logger == nil {
 		logger = slog.Default()
 	}
 	pr, pw := io.Pipe()
+
+	// SSEParser is allocated only when observer dispatch is wired —
+	// avoids the 8 KiB buf cost on legacy streams that don't use it.
+	// Nil parser inside the read loop is the "skip observer" signal.
+	var sseParser *observer.SSEParser
+	if obsRegistry != nil && obsReqCtx != nil {
+		sseParser = observer.NewSSEParser()
+	}
 
 	// Watcher: close upstream as soon as the client disconnects or the proxy
 	// shuts down. Complements the Close() path for cases where the ReverseProxy
@@ -136,6 +154,28 @@ func newStreamDrainer(
 				}
 				// Only accumulate bytes that were successfully forwarded.
 				acc.Write(buf[:n])
+
+				// Phase 4 M2 observer dispatch: feed the just-read bytes
+				// to the SSE parser and emit any complete frames before
+				// the next upstream.Read. ORDERING INVARIANT (per
+				// plugin-架构设计.md §5.1 + proxy.go's doc-anchor):
+				// observers see byte-identical upstream frames BEFORE
+				// any ResponseTransform reshapes them. This loop is
+				// the only place that satisfies that — pw.Write above
+				// only forwards bytes to the client pipe; the
+				// translator's response-side hook (if armed) runs
+				// downstream of THIS loop in serveRoute's
+				// ModifyResponse path.
+				//
+				// NotifySSEEvent is non-blocking (per its docstring's
+				// P0-2 invariant). A slow / panicking observer can
+				// drop frames or auto-disable itself but cannot stall
+				// this drainer.
+				if sseParser != nil {
+					for _, frame := range sseParser.Parse(buf[:n]) {
+						obsRegistry.NotifySSEEvent(reqCtx, obsReqCtx, frame.EventType, frame.Data)
+					}
+				}
 			}
 			if readErr != nil {
 				// io.EOF is the happy path and leaves completion as "complete".
