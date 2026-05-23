@@ -155,12 +155,44 @@ func isTier1Personal(token string) bool {
 	return hasStrictHex64Suffix(token, "aikey_personal_")
 }
 
-// isTier1App returns true iff `token` is exactly `aikey_app_` followed by
-// 64 lowercase hex chars. Mirrors isTier1Personal for the third-party app
-// bearer namespace; same strict-form rationale (precise rejection of
-// malformed shapes before Registry lookup).
+// isTier1App returns true iff `token` is one of:
+//   - exact strict form `aikey_app_<64 lowercase hex>` (third-party app
+//     bearer issued by `aikey app register` / aikey-cli authorize_atomic);
+//   - a well-known first-party app Bearer from
+//     :data:`firstPartyAppBearerWhitelist` (zero-config, see SPEC §1.3).
+//
+// The whitelist exception was added 2026-05-22 so trust-local (the
+// degrade-detector first-party app) can ship a human-readable, install-
+// invariant Bearer instead of paying the env-injection ceremony to
+// persist a random 64-hex one across launchd restarts.
 func isTier1App(token string) bool {
-	return hasStrictHex64Suffix(token, "aikey_app_")
+	return hasStrictHex64Suffix(token, "aikey_app_") || isFirstPartyAppBearer(token)
+}
+
+// firstPartyAppBearerWhitelist is the well-known set of first-party app
+// Bearers exempted from the strict `aikey_app_<64 hex>` form. Same value
+// on every install (zero-config trust-local). Not secrets — see SPEC
+// `workflow/CI/requirements/2026-05-22-l3-rhythm-signal-design-rules.md`
+// §1.3.
+//
+// **Drift 防退化**: this map must equal the matching constants in:
+//   - degrade-detector/server_local/services/check_orchestrator.py
+//     ::FIRST_PARTY_APP_KEY
+//   - aikey-cli/src/migrations.rs::DEGRADE_DETECTOR_FIRST_PARTY_BEARER
+//
+// Duplicated in 3 packages here (proxy/dispatch.go, vault/route_token_form.go,
+// supervisor/team_token_normalize.go) due to import-cycle constraints —
+// same lockstep convention as :func:`hasStrictHex64Suffix`.
+var firstPartyAppBearerWhitelist = map[string]struct{}{
+	"aikey_app_internal_degrade_detector_v1": {},
+}
+
+// isFirstPartyAppBearer reports whether token is a baked-in first-party
+// Bearer that should be accepted alongside strict-form tokens. See
+// :data:`firstPartyAppBearerWhitelist` doc for the security model.
+func isFirstPartyAppBearer(token string) bool {
+	_, ok := firstPartyAppBearerWhitelist[token]
+	return ok
 }
 
 // hasStrictHex64Suffix returns true iff `token` is exactly `prefix` followed

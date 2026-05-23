@@ -31,10 +31,12 @@ import (
 // the corresponding read with an error (covers the unhappy path); a nil
 // return value covers "no row found".
 type fakeVault struct {
-	bindings  map[string]*vault.ProviderBinding // key = profileID + "|" + providerCode
-	bindErr   error
-	appRecord *vault.AppRecord
-	appRecErr error
+	bindings   map[string]*vault.ProviderBinding // key = profileID + "|" + providerCode
+	bindErr    error
+	appRecord  *vault.AppRecord
+	appRecErr  error
+	aliasCreds map[string]*vault.AliasCredential // key = alias name; nil entry → "not found"
+	aliasErr   error                              // when set, GetAliasCredential always errors
 }
 
 func (f *fakeVault) GetProviderBindingWithScope(profileID, providerCode string) (*vault.ProviderBinding, error) {
@@ -55,6 +57,16 @@ func (f *fakeVault) GetAppRecord(slug string) (*vault.AppRecord, error) {
 		return nil, nil
 	}
 	return f.appRecord, nil
+}
+
+func (f *fakeVault) GetAliasCredential(name string) (*vault.AliasCredential, error) {
+	if f.aliasErr != nil {
+		return nil, f.aliasErr
+	}
+	if f.aliasCreds == nil {
+		return nil, nil
+	}
+	return f.aliasCreds[name], nil
 }
 
 func basicAppRoute(slug, kind string, followActive bool) *vkeys.ResolvedRoute {
@@ -301,6 +313,128 @@ func TestResolveUpstreamBinding_ReadErrorBubblesUp(t *testing.T) {
 	}
 	if err.ErrorCode != "BINDING_READ_FAILED" {
 		t.Errorf("ErrorCode = %q, want BINDING_READ_FAILED", err.ErrorCode)
+	}
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// B mode (init_from_user_active) tests — credential-mode-architecture
+// SPEC §1.1.B / §3.3 / §6.1. ResolveUpstreamBinding must short-circuit the
+// provider-binding lookup when AppRecord.BoundAlias is non-empty and use
+// vault.GetAliasCredential instead, mapping its status / errors to App
+// pipeline error codes.
+// ─────────────────────────────────────────────────────────────────────────
+
+// boundFixture builds a ResolvedAppContext for an app in B mode.
+func boundFixture(slug, kind, boundAlias string, upstreams []string) *ResolvedAppContext {
+	return &ResolvedAppContext{
+		// ProfileID is irrelevant in B mode — the alias lookup bypasses
+		// the profile-scoped binding table. Set to "app:<slug>" anyway
+		// so any logging that surfaces it is consistent with mode A.
+		ProfileID: "app:" + slug,
+		AppRecord: &vault.AppRecord{
+			Slug:       slug,
+			Upstreams:  upstreams,
+			AppKind:    kind,
+			BoundAlias: boundAlias,
+			BoundAt:    1_700_000_000,
+		},
+		AppRoute: basicAppRoute(slug, kind, false),
+	}
+}
+
+func TestResolveUpstreamBinding_BMode_HappyPath(t *testing.T) {
+	// B mode lookup MUST consult GetAliasCredential, NOT
+	// GetProviderBindingWithScope. Seed bindings empty + alias hit.
+	want := &vault.ProviderBinding{
+		ProviderCode:  "anthropic",
+		KeySourceType: "personal_oauth_account",
+		KeySourceRef:  "acct-abc",
+	}
+	fv := &fakeVault{
+		aliasCreds: map[string]*vault.AliasCredential{
+			"user@host.com": {Binding: want, Status: "active", AliasKind: "oauth"},
+		},
+	}
+	r := boundFixture("first-party-x", "first-party", "user@host.com", []string{"anthropic"})
+	got, rerr := ResolveUpstreamBinding(fv, r, "anthropic")
+	if rerr != nil {
+		t.Fatalf("expected success, got %+v", rerr)
+	}
+	if got != want {
+		t.Errorf("expected synthetic binding from alias lookup; got different pointer (mode A path may have been taken)")
+	}
+}
+
+func TestResolveUpstreamBinding_BMode_AliasMissing_Returns404(t *testing.T) {
+	fv := &fakeVault{aliasCreds: map[string]*vault.AliasCredential{}}
+	r := boundFixture("first-party-x", "first-party", "gone@host.com", []string{"anthropic"})
+	_, rerr := ResolveUpstreamBinding(fv, r, "anthropic")
+	if rerr == nil {
+		t.Fatalf("expected BOUND_ALIAS_NOT_FOUND, got success")
+	}
+	if rerr.StatusCode != http.StatusNotFound {
+		t.Errorf("StatusCode = %d, want 404", rerr.StatusCode)
+	}
+	if rerr.ErrorCode != "BOUND_ALIAS_NOT_FOUND" {
+		t.Errorf("ErrorCode = %q, want BOUND_ALIAS_NOT_FOUND", rerr.ErrorCode)
+	}
+}
+
+func TestResolveUpstreamBinding_BMode_AliasRevoked_Returns403(t *testing.T) {
+	fv := &fakeVault{
+		aliasCreds: map[string]*vault.AliasCredential{
+			"u@h.com": {
+				Binding:   &vault.ProviderBinding{ProviderCode: "anthropic", KeySourceType: "personal_oauth_account", KeySourceRef: "acct-x"},
+				Status:    "revoked",
+				AliasKind: "oauth",
+			},
+		},
+	}
+	r := boundFixture("first-party-x", "first-party", "u@h.com", []string{"anthropic"})
+	_, rerr := ResolveUpstreamBinding(fv, r, "anthropic")
+	if rerr == nil {
+		t.Fatalf("expected BOUND_ALIAS_REVOKED, got success")
+	}
+	if rerr.StatusCode != http.StatusForbidden {
+		t.Errorf("StatusCode = %d, want 403", rerr.StatusCode)
+	}
+	if rerr.ErrorCode != "BOUND_ALIAS_REVOKED" {
+		t.Errorf("ErrorCode = %q, want BOUND_ALIAS_REVOKED", rerr.ErrorCode)
+	}
+}
+
+func TestResolveUpstreamBinding_BMode_VaultError_Returns500(t *testing.T) {
+	fv := &fakeVault{aliasErr: errors.New("alias DB read simulated")}
+	r := boundFixture("first-party-x", "first-party", "anything", []string{"anthropic"})
+	_, rerr := ResolveUpstreamBinding(fv, r, "anthropic")
+	if rerr == nil {
+		t.Fatalf("expected BOUND_ALIAS_READ_FAILED, got success")
+	}
+	if rerr.ErrorCode != "BOUND_ALIAS_READ_FAILED" {
+		t.Errorf("ErrorCode = %q, want BOUND_ALIAS_READ_FAILED", rerr.ErrorCode)
+	}
+}
+
+func TestResolveUpstreamBinding_BMode_UpstreamWhitelistStillApplies(t *testing.T) {
+	// Even in B mode, the app's declared upstreams[] list governs scope.
+	// A first-party app bound to oauth(anthropic) cannot suddenly send
+	// openai traffic without re-registering — the UPSTREAM_NOT_DECLARED
+	// check fires BEFORE the bound_alias short-circuit.
+	fv := &fakeVault{
+		aliasCreds: map[string]*vault.AliasCredential{
+			"u@h.com": {
+				Binding: &vault.ProviderBinding{ProviderCode: "anthropic", KeySourceType: "personal_oauth_account", KeySourceRef: "acct-x"},
+				Status:  "active",
+			},
+		},
+	}
+	r := boundFixture("first-party-x", "first-party", "u@h.com", []string{"anthropic"})
+	_, rerr := ResolveUpstreamBinding(fv, r, "openai") // not in Upstreams
+	if rerr == nil {
+		t.Fatalf("expected UPSTREAM_NOT_DECLARED, got success")
+	}
+	if rerr.ErrorCode != "UPSTREAM_NOT_DECLARED" {
+		t.Errorf("ErrorCode = %q, want UPSTREAM_NOT_DECLARED — B mode does not bypass upstream-whitelist gate", rerr.ErrorCode)
 	}
 }
 

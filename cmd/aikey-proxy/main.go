@@ -45,6 +45,16 @@ import (
 	// changes to internal/proxy/* or internal/supervisor/* are required —
 	// the framework picks up the new descriptor automatically.
 	_ "github.com/aikeylabs/degrade-detector/proxy-plugin/rhythm"
+
+	// P3 step 2c (2026-05-23, credential-mode-architecture SPEC §1.4):
+	// proxy-bundled ndjson-fanout observer. Reads vault `observe_streams`
+	// at Build time and writes per-subscriber NDJSON files for any
+	// app that subscribes. Owner slug "aikey-proxy-core" is the
+	// proxy-infrastructure synthetic (FirstPartyAllowlist) — special-cased
+	// always-on by supervisor.buildObserverRegistry. Vault is injected by
+	// supervisor at generation-build time (which is where vault.Open
+	// happens); main.go just blank-imports for init() side effect.
+	_ "github.com/AiKeyLabs/aikey-proxy/internal/observer/ndjson_fanout"
 )
 
 const defaultConfigName = "aikey-proxy.yaml"

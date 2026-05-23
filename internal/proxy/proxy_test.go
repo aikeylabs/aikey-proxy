@@ -478,6 +478,10 @@ type mockActiveVault struct {
 	// "no app registered" / "no scope binding" — graceful.
 	appRecord    *vault.AppRecord
 	appBindings  map[string]*vault.ProviderBinding // keyed by `<profileID>|<providerCode>`
+	// Mode B / Mode C alias lookup (2026-05-23, credential-mode-architecture
+	// SPEC §1.1.B + §1.1.C). nil keeps GetAliasCredential returning
+	// "not found" so legacy tests (mode A flows) need no changes.
+	aliasCreds   map[string]*vault.AliasCredential // keyed by alias name
 }
 
 func (m *mockActiveVault) GetSecret(alias string) (string, error) {
@@ -565,6 +569,18 @@ func (m *mockActiveVault) GetAppRecord(slug string) (*vault.AppRecord, error) {
 		return nil, nil
 	}
 	return m.appRecord, nil
+}
+
+// GetAliasCredential satisfies apppipe.VaultReader + probepipe.VaultReader.
+// Added 2026-05-23 for mode B / mode C. Tests that exercise either pipeline
+// populate m.aliasCreds keyed by alias name; the default zero-value map
+// returns nil → "alias not found" so unrelated tests (mode A flows) keep
+// passing without further setup.
+func (m *mockActiveVault) GetAliasCredential(name string) (*vault.AliasCredential, error) {
+	if m.aliasCreds == nil {
+		return nil, nil
+	}
+	return m.aliasCreds[name], nil
 }
 
 func setupTestProxyWithActive(t *testing.T, av *mockActiveVault) *Proxy {

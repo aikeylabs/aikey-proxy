@@ -44,6 +44,7 @@ package observer
 
 import (
 	"context"
+	"encoding/json"
 	"log/slog"
 	"runtime/debug"
 	"sync"
@@ -131,6 +132,136 @@ type RequestContext struct {
 	SessionID      string
 	TraceID        string // per-request UUID; observers use as state-map key
 	StartedAt      time.Time
+
+	// Stream is the SPEC §1.4.1 stream name this request emits under
+	// (StreamUserChat / StreamAppPipeline / StreamProbe). Set by the
+	// Registry on the way into NotifyStart so observers can read it
+	// without re-deriving from path; the caller's stream argument to
+	// NotifyStart is authoritative — this field exists solely to
+	// surface the same value through the existing OnRequestStart /
+	// OnSSEEvent / OnRequestEnd contract (which never grew its own
+	// stream parameter to keep the StreamingObserver interface stable).
+	Stream string
+
+	// metadataJSON* implement the MetadataJSON() lazy cache. Private —
+	// observers must use the method, not the raw fields. sync.Once gives
+	// us thread-safe "marshal at most once, even under concurrent observer
+	// goroutine load" with a single atomic load on the fast path.
+	//
+	// Why private: keeps the wire format change point at MetadataJSON
+	// only; nothing outside this file can poke the cache (and accidentally
+	// produce inconsistent bytes per observer).
+	metadataJSONOnce sync.Once
+	metadataJSON     []byte
+	metadataJSONErr  error
+}
+
+// metadataPayload is the lazy-cached JSON shape MetadataJSON() emits.
+// Locked at v=1 — bumping the version means an existing NDJSON consumer
+// reading from disk has to opt in. omitempty everywhere except v so the
+// wire format stays compact for the common-case fields that aren't set
+// in every pipeline (App-side fields are blank for user_chat etc.).
+//
+// Field tags mirror the wire format documented inline in MetadataJSON's
+// doc comment; tests pin this so a future refactor sees the breakage
+// rather than silently shifting field names.
+type metadataPayload struct {
+	V               int    `json:"v"`
+	TraceID         string `json:"trace_id,omitempty"`
+	Stream          string `json:"stream,omitempty"`
+	Provider        string `json:"provider,omitempty"`
+	Alias           string `json:"alias,omitempty"`
+	AppSlug         string `json:"app_slug,omitempty"`
+	AppKeyID        string `json:"app_key_id,omitempty"`
+	AppMode         string `json:"app_mode,omitempty"`
+	RequestedModel  string `json:"requested_model,omitempty"`
+	ResolvedModel   string `json:"resolved_model,omitempty"`
+	SessionID       string `json:"session_id,omitempty"`
+	ProtocolFamily  string `json:"protocol_family,omitempty"`
+	StartedAtUnixMs int64  `json:"started_at_unix_ms,omitempty"`
+}
+
+// MetadataJSON returns a stable JSON serialisation of the per-request
+// metadata fields observers commonly need. Lazily computed on first call
+// and cached across subsequent calls — including concurrent observer
+// goroutine calls; sync.Once gives us atomic fast path + at-most-once
+// marshal under contention.
+//
+// Multiple observers sharing the same RequestContext (the framework hands
+// the same *RequestContext to every observer's consumer goroutine) all
+// pay one json.Marshal in aggregate, regardless of how many observers
+// call this. Critical optimisation for the 5+ observer / 1000+ req/sec
+// case: with N observers each marshaling independently the proxy spends
+// O(N) CPU per request on duplicate serialisation; this helper collapses
+// that to O(1).
+//
+// Wire format is v=1 (see metadataPayload). Locked — any change is a
+// breaking event for downstream NDJSON consumers; bump v and document
+// the migration before altering tags.
+//
+// The returned slice is SHARED with all callers — observers MUST NOT
+// mutate it. Copy via `append([]byte(nil), b...)` before any modification.
+//
+// Returns the marshal error from the first attempt; cached too, so
+// subsequent calls see the same error without re-trying (consistent
+// per-request behaviour — a corrupt RequestContext should produce the
+// same failure for every observer).
+func (r *RequestContext) MetadataJSON() ([]byte, error) {
+	r.metadataJSONOnce.Do(func() {
+		payload := metadataPayload{
+			V:               1,
+			TraceID:         r.TraceID,
+			Stream:          r.Stream,
+			Provider:        r.ProviderID,
+			Alias:           r.KeyAlias,
+			AppSlug:         r.AppSlug,
+			AppKeyID:        r.AppKeyID,
+			AppMode:         r.AppMode,
+			RequestedModel:  r.RequestedModel,
+			ResolvedModel:   r.ResolvedModel,
+			SessionID:       r.SessionID,
+			ProtocolFamily:  r.ProtocolFamily,
+			StartedAtUnixMs: r.StartedAt.UnixMilli(),
+		}
+		r.metadataJSON, r.metadataJSONErr = json.Marshal(&payload)
+	})
+	return r.metadataJSON, r.metadataJSONErr
+}
+
+// Stream name constants for Observer.Streams declarations and Notify*
+// call sites. Mirror the vocabulary defined in SPEC
+// `workflow/CI/requirements/2026-05-23-credential-mode-architecture.md` §1.4.1.
+//
+// Adding a new stream is a coordinated change:
+//
+//  1. Add a new entry here + to the SPEC's §1.4.1 table
+//  2. Add `NotifyStart/End/SSEEvent` call sites in the proxy that emit it
+//  3. Update relevant Observer descriptors' Streams to declare interest
+//
+// We use string typed constants (rather than an enum / iota) so
+// observers from external repositories (degrade-detector/proxy-plugin/*)
+// can hardcode the literal value when this package's version skews.
+const (
+	// StreamUserChat — traffic on legacy `/v1/...` and `/<provider>/v1/...`
+	// (the user's primary chat surface).
+	StreamUserChat = "user_chat"
+
+	// StreamAppPipeline — traffic on `/apps/<slug>/v1/...` (App pipeline,
+	// SPEC §1.2 modes A/B).
+	StreamAppPipeline = "app_pipeline"
+
+	// StreamProbe — traffic on `/probe/<alias>/v1/...` (Probe pipeline,
+	// SPEC §1.3 mode C).
+	StreamProbe = "probe"
+)
+
+// AllStreams returns the full set of valid stream names. Used by
+// RegisterObserver to validate Observer.Streams entries and by
+// observers that want to subscribe to everything (e.g., ndjson-fanout).
+//
+// Order is stable: user_chat, app_pipeline, probe.
+func AllStreams() []string {
+	return []string{StreamUserChat, StreamAppPipeline, StreamProbe}
 }
 
 // Observer is the descriptor an observer package registers at init()
@@ -146,6 +277,21 @@ type Observer struct {
 	// belongs to. Must be present in FirstPartyAllowlist below.
 	OwnerAppSlug string
 
+	// Streams is the explicit list of stream names this observer cares
+	// about (see Stream* constants and SPEC §1.4.1). The Registry skips
+	// Notify dispatch for any stream not in this list. MUST be non-empty —
+	// an empty Streams is a registration bug (the observer would silently
+	// receive no events, hard to diagnose), so RegisterObserver panics.
+	//
+	// Pick the minimum:
+	//   - rhythm (App-pipeline-only)        → []string{StreamAppPipeline}
+	//   - generic file fanout (everything)  → AllStreams()
+	//   - compliance detector (user only)   → []string{StreamUserChat}
+	//
+	// Entries are validated against AllStreams() at registration time;
+	// any unknown stream name panics.
+	Streams []string
+
 	// Build constructs the observer implementation from the proxy
 	// config block (e.g. yaml `observers.<name>` map). Build is
 	// called once at proxy startup; if it returns an error the
@@ -153,6 +299,19 @@ type Observer struct {
 	// continues to start. This is intentional: a misconfigured
 	// observer must NEVER block proxy main flow.
 	Build func(cfg map[string]any) (StreamingObserver, error)
+}
+
+// HandlesStream reports whether the observer's Streams declaration
+// includes the named stream. Used by Registry dispatch to skip irrelevant
+// observers. Empty Streams returns false for every name (registration
+// rejects empty Streams at startup, but the predicate stays defensive).
+func (o *Observer) HandlesStream(name string) bool {
+	for _, s := range o.Streams {
+		if s == name {
+			return true
+		}
+	}
+	return false
 }
 
 // FirstPartyAllowlist is the slug whitelist for observer registration.
@@ -171,6 +330,20 @@ type Observer struct {
 //   - the observer package must vendor-link, not dynamically load
 var FirstPartyAllowlist = map[string]bool{
 	"degrade-detector": true,
+
+	// aikey-proxy-core is the synthetic owner slug for proxy-bundled
+	// infrastructure observers (currently: ndjson-fanout, P3 step 2c).
+	// These observers don't belong to any user-installed first-party
+	// app — they're part of aikey-proxy itself, providing generic
+	// services (file fanout for vault-declared subscribers) that any
+	// future Agent can subscribe to via `aikey app create --observe`.
+	//
+	// supervisor.buildObserverRegistry special-cases this slug to bypass
+	// DefaultVaultEnableCheck (which would look up app_records and
+	// reject — no such app row exists for "aikey-proxy-core"). The
+	// observer's own Build() is still responsible for noop'ing when
+	// no actual subscribers are configured in vault.
+	"aikey-proxy-core": true,
 }
 
 // ---------------------------------------------------------------------------
@@ -219,12 +392,46 @@ func RegisterObserver(o Observer) {
 	if o.Name == "" || o.OwnerAppSlug == "" || o.Build == nil {
 		panic("observer: incomplete descriptor — Name, OwnerAppSlug, Build all required")
 	}
+	// Streams is a required field: an observer with no declared streams
+	// would silently never receive events — "failure is invisible" is the
+	// anti-pattern the SPEC §1.4 stream routing model explicitly fixes.
+	// Better to panic at startup than to ship a dead observer.
+	if len(o.Streams) == 0 {
+		panic("observer: '" + o.Name + "' must declare Streams (e.g. " +
+			"[]string{StreamAppPipeline} for rhythm-style, or AllStreams() " +
+			"for generic fanout); empty Streams is silent failure")
+	}
+	validStreams := map[string]struct{}{}
+	for _, s := range AllStreams() {
+		validStreams[s] = struct{}{}
+	}
+	for _, s := range o.Streams {
+		if _, ok := validStreams[s]; !ok {
+			panic("observer: '" + o.Name + "' declares unknown stream '" + s +
+				"'; valid streams are " + joinStrings(AllStreams(), ", ") +
+				" (see pkg/observer.Stream* constants)")
+		}
+	}
 	for _, prev := range registrations {
 		if prev.Name == o.Name {
 			panic("observer: duplicate registration for name '" + o.Name + "'")
 		}
 	}
 	registrations = append(registrations, o)
+}
+
+// joinStrings is a tiny strings.Join alternative kept local to avoid
+// pulling the strings import for one call site. Matches apppipe's flat-
+// import style.
+func joinStrings(parts []string, sep string) string {
+	if len(parts) == 0 {
+		return ""
+	}
+	out := parts[0]
+	for _, p := range parts[1:] {
+		out += sep + p
+	}
+	return out
 }
 
 // RegisteredObservers returns a snapshot of the current registration
@@ -545,14 +752,27 @@ type requestState struct {
 // NotifyStart begins fan-out for a request. Safe to call with zero
 // active observers (returns immediately, no allocation).
 //
+// `stream` declares which SPEC §1.4.1 stream this request belongs to
+// (StreamUserChat / StreamAppPipeline / StreamProbe). Observers whose
+// `Streams` declaration does NOT include this value are skipped at this
+// stage — no channel is allocated, no consumer goroutine spawned, and
+// subsequent NotifySSEEvent / NotifyEnd calls for the same TraceID will
+// naturally skip them too (no entry in rs.channels). This is the SPEC
+// §1.4-aligned "route to interested observers only" behavior.
+//
 // MUST be called exactly once before any NotifySSEEvent for the same
 // TraceID; calling NotifyStart twice for the same TraceID overwrites
 // the previous state silently — that is a bug in the caller, but the
 // registry will not crash.
-func (r *Registry) NotifyStart(ctx context.Context, req *RequestContext) {
+func (r *Registry) NotifyStart(ctx context.Context, stream string, req *RequestContext) {
 	if len(r.observers) == 0 || req == nil {
 		return
 	}
+	// Thread the stream onto the request so observers can read it later
+	// via req.Stream (the StreamingObserver hooks don't grow their own
+	// stream parameter). Safe to mutate here: no consumer goroutine has
+	// touched req yet — they start a few lines below in startConsumer.
+	req.Stream = stream
 	// Per P1-1: observer-side context is detached from the request ctx,
 	// so client disconnects don't kill in-flight observer work. It also
 	// has its own bounded lifetime (maxRequestAge) to guard against
@@ -567,6 +787,13 @@ func (r *Registry) NotifyStart(ctx context.Context, req *RequestContext) {
 	}
 	for _, ao := range r.observers {
 		if ao.disabled.Load() {
+			continue
+		}
+		// Per-stream routing: only spawn a consumer for observers that
+		// declared interest in this stream. SPEC §1.4.1 vocabulary;
+		// declaration enforced at RegisterObserver (must be non-empty,
+		// must be valid names).
+		if !ao.descriptor.HandlesStream(stream) {
 			continue
 		}
 		ch := make(chan observerEvent, notifyChannelBufferSize)

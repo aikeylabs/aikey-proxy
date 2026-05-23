@@ -73,6 +73,10 @@ func newTestReaderWithAppTables(t *testing.T) *Reader {
 			upstreams TEXT NOT NULL,
 			app_kind TEXT NOT NULL DEFAULT 'third-party',
 			follow_user_active INTEGER NOT NULL DEFAULT 0,
+			-- B-mode columns (2026-05-23, credential-mode-architecture SPEC §3.1).
+			-- Must stay in lockstep with aikey-cli/src/migrations.rs baseline DDL.
+			bound_alias TEXT,
+			bound_at INTEGER,
 			requested_permissions TEXT,
 			created_at INTEGER NOT NULL DEFAULT (strftime('%s', 'now')),
 			updated_at INTEGER NOT NULL DEFAULT (strftime('%s', 'now'))
@@ -312,6 +316,105 @@ func TestGetAppRecord_PreFeatureVaultGracefulNil(t *testing.T) {
 	}
 	if got != nil {
 		t.Errorf("expected nil on missing table, got %+v", got)
+	}
+}
+
+// TestGetAppRecord_ReadsBoundAlias pins the B-mode field plumbing
+// (2026-05-23, credential-mode-architecture SPEC §3.1 / §6.1). A row with
+// non-NULL bound_alias must surface AppRecord.BoundAlias + BoundAt to the
+// App pipeline so resolve.go's B-mode short-circuit fires.
+func TestGetAppRecord_ReadsBoundAlias(t *testing.T) {
+	r := newTestReaderWithAppTables(t)
+
+	_, err := r.db.Exec(
+		`INSERT INTO app_records
+		   (slug, name, upstreams, app_kind, follow_user_active,
+		    bound_alias, bound_at)
+		 VALUES (?, ?, ?, ?, ?, ?, ?)`,
+		"degrade-detector",
+		"Degrade Detector",
+		`["anthropic"]`,
+		"first-party",
+		0, // B mode: follow_user_active=0
+		"user@host.com",
+		1716200000,
+	)
+	if err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+
+	rec, err := r.GetAppRecord("degrade-detector")
+	if err != nil {
+		t.Fatalf("GetAppRecord: %v", err)
+	}
+	if rec == nil {
+		t.Fatal("expected record, got nil")
+	}
+	if rec.FollowUserActive {
+		t.Error("FollowUserActive = true, want false (B mode)")
+	}
+	if rec.BoundAlias != "user@host.com" {
+		t.Errorf("BoundAlias = %q, want user@host.com", rec.BoundAlias)
+	}
+	if rec.BoundAt != 1716200000 {
+		t.Errorf("BoundAt = %d, want 1716200000", rec.BoundAt)
+	}
+}
+
+// TestGetAppRecord_PreP2VaultLegacyShape exercises the backward-compat path:
+// a vault file from before the 2026-05-23 P2 migration lacks bound_alias /
+// bound_at columns; the extended SELECT errors with "no such column" and
+// GetAppRecord must fall back to the 9-column shape gracefully, leaving
+// BoundAlias = "" so the App pipeline keeps using A mode for legacy rows.
+func TestGetAppRecord_PreP2VaultLegacyShape(t *testing.T) {
+	db, err := sql.Open("sqlite", ":memory:")
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	t.Cleanup(func() { db.Close() })
+
+	// Pre-P2 schema: no bound_alias / bound_at columns.
+	_, err = db.Exec(`CREATE TABLE app_records (
+		slug TEXT PRIMARY KEY,
+		name TEXT NOT NULL,
+		vendor TEXT,
+		upstreams TEXT NOT NULL,
+		app_kind TEXT NOT NULL DEFAULT 'third-party',
+		follow_user_active INTEGER NOT NULL DEFAULT 0,
+		requested_permissions TEXT,
+		created_at INTEGER NOT NULL DEFAULT (strftime('%s', 'now')),
+		updated_at INTEGER NOT NULL DEFAULT (strftime('%s', 'now'))
+	)`)
+	if err != nil {
+		t.Fatalf("schema: %v", err)
+	}
+	_, err = db.Exec(
+		`INSERT INTO app_records (slug, name, upstreams, app_kind, follow_user_active) VALUES
+		 ('legacy-agent', 'Legacy Agent', '["openai"]', 'third-party', 1)`,
+	)
+	if err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+
+	r := &Reader{db: db}
+	rec, err := r.GetAppRecord("legacy-agent")
+	if err != nil {
+		t.Fatalf("GetAppRecord must gracefully fall back on pre-P2 vault: %v", err)
+	}
+	if rec == nil {
+		t.Fatal("expected record from legacy-shape SELECT, got nil")
+	}
+	if rec.Slug != "legacy-agent" || rec.AppKind != "third-party" {
+		t.Errorf("legacy fields not decoded: %+v", rec)
+	}
+	if !rec.FollowUserActive {
+		t.Error("FollowUserActive should still decode to true on legacy shape")
+	}
+	if rec.BoundAlias != "" {
+		t.Errorf("BoundAlias = %q, want empty (legacy vault has no column)", rec.BoundAlias)
+	}
+	if rec.BoundAt != 0 {
+		t.Errorf("BoundAt = %d, want 0 (legacy vault has no column)", rec.BoundAt)
 	}
 }
 

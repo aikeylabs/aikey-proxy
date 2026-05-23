@@ -181,12 +181,12 @@ func buildOAuthRoutesFiltered(tokens []vault.OAuthRouteToken) map[string]*vkeys.
 func buildAppRoutesFiltered(tokens []vault.AppRouteToken) map[string]*vkeys.ResolvedRoute {
 	out := make(map[string]*vkeys.ResolvedRoute, len(tokens))
 	for _, at := range tokens {
-		if !isStrictAppRouteToken(at.RouteToken) {
+		if !isStrictAppRouteToken(at.RouteToken) && !isFirstPartyAppBearer(at.RouteToken) {
 			slog.Warn("registry load: skipping legacy/malformed app route token",
 				"app_slug", at.AppSlug,
 				"key_id", at.KeyID,
 				"token_prefix", tokenPrefixForLog(at.RouteToken),
-				"hint", "expected aikey_app_<64 lowercase hex>")
+				"hint", "expected aikey_app_<64 lowercase hex> or first-party whitelist entry")
 			continue
 		}
 		out[at.RouteToken] = appRouteTokenToRoute(at)

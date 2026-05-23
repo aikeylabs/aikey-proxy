@@ -100,6 +100,22 @@ func isStrictAppRouteToken(token string) bool {
 	return hasStrictHex64Suffix(token, "aikey_app_")
 }
 
+// firstPartyAppBearerWhitelist is the well-known set of first-party app
+// Bearers exempted from the strict form. Lockstep duplicate — see
+// internal/proxy/dispatch.go::firstPartyAppBearerWhitelist for the
+// security model rationale + cross-repo drift防退化 list.
+var firstPartyAppBearerWhitelist = map[string]struct{}{
+	"aikey_app_internal_degrade_detector_v1": {},
+}
+
+// isFirstPartyAppBearer reports whether token is a baked-in first-party
+// Bearer exempted from the strict form. supervisor's route builder
+// accepts these so they make it into the in-memory route map.
+func isFirstPartyAppBearer(token string) bool {
+	_, ok := firstPartyAppBearerWhitelist[token]
+	return ok
+}
+
 // hasStrictHex64Suffix is the shared form predicate behind the strict
 // Tier1 bearer types (personal / app). DRY'd so future strict-form
 // additions get the same charset + length guarantees without copy-paste

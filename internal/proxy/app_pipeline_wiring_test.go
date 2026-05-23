@@ -601,6 +601,11 @@ func buildTestObserverRegistry(t *testing.T, recorder *rhythmHooksRecorder) *obs
 	observer.RegisterObserver(observer.Observer{
 		Name:         "rhythm-test-" + t.Name(),
 		OwnerAppSlug: "degrade-detector", // matches FirstPartyAllowlist
+		// Production rhythm observer subscribes only to App pipeline; mirror
+		// here so the test fixture exercises the same stream-routing path
+		// the prod observer takes (App pipeline NotifyStart calls hit it,
+		// user_chat / probe calls — which we'll wire in P3 step 4 — don't).
+		Streams: []string{observer.StreamAppPipeline},
 		Build: func(_ map[string]any) (observer.StreamingObserver, error) {
 			return recorder, nil
 		},
@@ -800,6 +805,7 @@ func TestHandle_AppPath_SSEFramesDispatched(t *testing.T) {
 	observer.RegisterObserver(observer.Observer{
 		Name:         "rhythm-frames-" + t.Name(),
 		OwnerAppSlug: "degrade-detector",
+		Streams:      []string{observer.StreamAppPipeline}, // see sibling fixture comment
 		Build: func(_ map[string]any) (observer.StreamingObserver, error) {
 			return recorder, nil
 		},

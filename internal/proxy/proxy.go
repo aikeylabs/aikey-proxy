@@ -19,6 +19,7 @@ import (
 	"github.com/AiKeyLabs/aikey-proxy/internal/observability"
 	"github.com/AiKeyLabs/aikey-proxy/internal/provider"
 	"github.com/AiKeyLabs/aikey-proxy/internal/proxy/apppipe"
+	"github.com/AiKeyLabs/aikey-proxy/internal/proxy/probepipe"
 	"github.com/AiKeyLabs/aikey-proxy/internal/vault"
 	"github.com/AiKeyLabs/aikey-proxy/internal/vkeys"
 	"github.com/AiKeyLabs/aikey-proxy/pkg/observer"
@@ -73,6 +74,7 @@ type Proxy struct {
 	vault        VaultGetter
 	activeReader ActiveKeyReader   // non-nil when vault implements ActiveKeyReader
 	appVault     apppipe.VaultReader // non-nil when vault implements the App pipeline read surface (Phase 4)
+	probeVault   probepipe.VaultReader // non-nil when vault implements the Probe pipeline read surface (mode C, SPEC 2026-05-23)
 	broker       OAuthBroker       // OAuth credential provider (nil = OAuth not available)
 	registry     *vkeys.Registry
 	providers    *provider.Registry
@@ -113,6 +115,15 @@ type Proxy struct {
 	// fire inside the App pipeline branch), so the field being non-nil
 	// has zero cost on the legacy proxy path.
 	observerRegistry *observer.Registry
+
+	// filterStub501Active is set at proxy generation build time when the
+	// vault contains any app_records row with filter_stages != NULL. While
+	// active, ALL data-plane traffic returns 501 FILTER_NOT_IMPLEMENTED —
+	// SPEC §1.5.7 / §6.6 anti-example F mandate that an unimplemented
+	// filter chain must NOT silently let traffic through (would be
+	// "pseudo-security": looks configured, actually inert). Set during
+	// supervisor.buildGeneration; not flipped at runtime.
+	filterStub501Active bool
 
 	// Configurable slow-request thresholds (milliseconds).
 	SlowRequestMs     int64
@@ -159,6 +170,12 @@ func New(v VaultGetter, reg *vkeys.Registry, prov *provider.Registry, coll *even
 	if av, ok := v.(apppipe.VaultReader); ok {
 		p.appVault = av
 	}
+	// Probe pipeline (mode C) needs GetAliasCredential — auto-wire when
+	// the vault implements it. *vault.Reader satisfies probepipe.VaultReader
+	// in production; tests can swap via SetProbeVault.
+	if pv, ok := v.(probepipe.VaultReader); ok {
+		p.probeVault = pv
+	}
 	return p
 }
 
@@ -176,6 +193,23 @@ func (p *Proxy) SetBroker(b OAuthBroker) {
 // apppipe.VaultReader.
 func (p *Proxy) SetAppVault(av apppipe.VaultReader) {
 	p.appVault = av
+}
+
+// SetProbeVault injects a vault reader for Probe pipeline requests (mode C).
+// Mirrors SetAppVault — auto-wired by New(...) when the VaultGetter argument
+// also implements probepipe.VaultReader.
+func (p *Proxy) SetProbeVault(pv probepipe.VaultReader) {
+	p.probeVault = pv
+}
+
+// SetFilterStub501Active is the supervisor wiring entry for the SPEC
+// §1.5.7 P3 stub: when the vault has any app declaring filter_stages
+// but the real filter dispatcher is not yet shipped, the proxy must
+// fail-loud rather than silent-allow. Called once at generation build;
+// must not be flipped at runtime (the filterpipe implementation will
+// land in P4 alongside its own runtime wiring).
+func (p *Proxy) SetFilterStub501Active(active bool) {
+	p.filterStub501Active = active
 }
 
 // SetObserverRegistry attaches the Phase 4 M2 plugin observer registry.
@@ -235,6 +269,50 @@ func (p *Proxy) Handle(w http.ResponseWriter, r *http.Request) {
 		"request_id", tc.RequestID,
 	)
 
+	// 0-pre. SPEC §1.5.7 / §6.6 E-mode fail-loud stub.
+	//
+	// If vault has any app_records row declaring filter_stages but the
+	// filterpipe dispatcher is not implemented (always true in P3 — real
+	// impl lands in P4), reject ALL data-plane requests with 501. This
+	// is the explicit fix for anti-example F: an unimplemented filter
+	// MUST NOT silently let traffic through, otherwise an operator who
+	// configured filter_stages believes they have compliance enforcement
+	// while actually the chain is inert.
+	//
+	// Lives BEFORE all routing branches so probe / app / user_chat all
+	// return uniformly. supervisor.buildGeneration warns the operator at
+	// startup so they see this state in logs, not just in client 501s.
+	if p.filterStub501Active {
+		p.errors.Add(1)
+		writeJSONError(w, http.StatusNotImplemented, "server_error",
+			"FILTER_NOT_IMPLEMENTED",
+			"This proxy build has vault rows declaring filter_stages but the "+
+				"filterpipe dispatcher is not implemented yet (SPEC §1.5.7 P3 stub). "+
+				"All traffic is being rejected to avoid silent-allow. Either clear "+
+				"the filter declaration in vault or wait for the proxy build that "+
+				"includes the filter dispatcher.")
+		return
+	}
+
+	// 0a-prime. Probe pipeline path: /probe/<alias>/v1/... (mode C, SPEC
+	// 2026-05-23-credential-mode-architecture §1.3).
+	//
+	// MUST be checked BEFORE both /apps/ and the legacy provider-prefix
+	// parser — same prefix-collision reason as the App routing below: a
+	// URL like /probe/X/v1 must not be misread as a provider-prefix route
+	// or app slug. The ordering invariant is enforced by a regression
+	// test in proxy_test.go.
+	//
+	// Probe pipeline differs from App pipeline in three ways: URL alias
+	// (instead of vault-registered slug) is the credential source, the
+	// constant first-party Bearer (instead of issued app key) is the
+	// auth, and follow_user_active is ALWAYS ignored. See SPEC §1.3 for
+	// the full contract.
+	if probeCtx := probepipe.ExtractProbePath(r.URL.Path); probeCtx != nil {
+		p.handleProbePipeline(w, r, probeCtx, startTime, logger, tc.TraceID)
+		return
+	}
+
 	// 0a. App pipeline path: /apps/<slug>/v1/... (Phase 4).
 	//
 	// MUST be checked BEFORE extractProviderFromPath — otherwise
@@ -258,7 +336,7 @@ func (p *Proxy) Handle(w http.ResponseWriter, r *http.Request) {
 	// Takes precedence over token-based routing when the path starts with a
 	// known provider prefix. Uses the active key config from the vault.
 	if providerCode, strippedPath := extractProviderFromPath(r.URL.Path); providerCode != "" {
-		p.handlePathPrefixRoute(w, r, providerCode, strippedPath, startTime, logger)
+		p.handlePathPrefixRoute(w, r, providerCode, strippedPath, startTime, logger, tc.TraceID)
 		return
 	}
 
@@ -406,7 +484,74 @@ func (p *Proxy) Handle(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	p.serveRoute(w, r, route, prov, realKey, token, startTime, logger)
+	// SPEC §1.4.1: legacy /v1/... entry serves user-chat traffic; wire
+	// observer through helper so ndjson-fanout subscribers see this stream.
+	p.serveRouteWithObserver(w, r, route, prov, realKey, token, startTime, logger,
+		observer.StreamUserChat, tc.TraceID)
+}
+
+// serveRouteWithObserver wraps p.serveRoute with NotifyStart/End for the
+// given SPEC §1.4.1 stream. Used by user_chat callers (Handle's legacy
+// /v1/ branch + handlePathPrefixRoute's 4 sub-branches) so the
+// observer wiring lives in one place rather than 5 copy-pastes.
+//
+// Why not also use this from handleAppPipeline / handleProbePipeline:
+// those handlers build a richer RequestContext (AppKeyID / AppSlug /
+// AppMode for the App pipeline, alias_kind logging for Probe) inline
+// at call site. Funneling them through here would either lose those
+// fields or balloon the helper's signature. Two-handler-specific +
+// one-shared-helper is the right granularity — DRY where the pipelines
+// agree, explicit where they diverge.
+//
+// requestedModel intentionally empty for user_chat — extracting body.model
+// here would require parsing + restoring r.Body, with risk of breaking
+// the byte-identical forward semantics path-prefix routing relies on.
+// Event.Model has json:omitempty so the downstream NDJSON consumer
+// survives the absence.
+func (p *Proxy) serveRouteWithObserver(
+	w http.ResponseWriter, r *http.Request,
+	route *vkeys.ResolvedRoute, prov provider.Provider,
+	realKey, inboundBearer string,
+	startTime time.Time, logger *slog.Logger,
+	stream string, traceID string,
+) {
+	var obsReqCtx *observer.RequestContext
+	if p.observerRegistry != nil && p.observerRegistry.Active() > 0 {
+		// User_chat-side ProtocolFamily fallback (2026-05-23): the legacy
+		// /v1/... route resolution doesn't fill `route.ProtocolFamily`
+		// (it's only populated in handleAppPipeline — see
+		// ResolvedRoute.ProtocolFamily doc-comment). Without this, the
+		// rhythm observer's protocol gate trips on every user_chat event
+		// (`unknown_protocol` WARN) and D-rule scoring never runs. We
+		// re-derive from the same provider_fingerprint yaml the app
+		// pipeline uses so user_chat observers see the same shape app
+		// observers do. No change for paths that already filled the
+		// field (route.ProtocolFamily != "" wins).
+		pf := route.ProtocolFamily
+		if pf == "" && route.ProviderCode != "" {
+			if pr, ok := provider.Routes().ByProvider(route.ProviderCode); ok {
+				pf = pr.Protocol
+			}
+		}
+		obsReqCtx = &observer.RequestContext{
+			KeyAlias:       route.KeyAlias,
+			ProviderID:     route.ProviderCode,
+			ProtocolFamily: pf,
+			SessionID:      resolveSessionID(r.Header, route.ProviderCode),
+			TraceID:        traceID,
+			StartedAt:      startTime,
+		}
+		route.ObserverContext = obsReqCtx
+		route.ObserverRegistry = p.observerRegistry
+		p.observerRegistry.NotifyStart(r.Context(), stream, obsReqCtx)
+	}
+
+	p.serveRoute(w, r, route, prov, realKey, inboundBearer, startTime, logger)
+
+	if obsReqCtx != nil {
+		latency := int(time.Since(startTime).Milliseconds())
+		p.observerRegistry.NotifyEnd(r.Context(), obsReqCtx, latency)
+	}
 }
 
 // ResolveBindingCredential resolves the upstream credential for the
@@ -603,6 +748,15 @@ func (p *Proxy) handleAppPipeline(w http.ResponseWriter, r *http.Request, appCtx
 	// Stage 3: sanitize — strip aikey/metadata fields, reject n>1, silent-drop
 	// logprobs/seed with warnings. response_format is passed through to the
 	// protocol translator (Phase 2 Day 5).
+	//
+	// Capture the genuine inbound User-Agent BEFORE Stage 5 (which calls
+	// oauthInject → forces UA to "claude-cli/2.1.22 (external, cli)" for
+	// non-CLI clients). The post-translation WAF re-rewrite below needs
+	// to know if the original client was real Claude CLI (skip rewrite)
+	// vs a third-party SDK (apply rewrite). Without this snapshot the
+	// post-translation check always sees the masked UA.
+	inboundUAWasClaudeCode := clientIsClaudeCode(r)
+
 	bodyBytes, bodyErr := io.ReadAll(r.Body)
 	if bodyErr != nil {
 		p.errors.Add(1)
@@ -645,6 +799,32 @@ func (p *Proxy) handleAppPipeline(w http.ResponseWriter, r *http.Request, appCtx
 		writeJSONError(w, bindResolveErr.StatusCode, "invalid_request_error",
 			bindResolveErr.ErrorCode, bindResolveErr.Message)
 		return
+	}
+
+	// B mode normalization (2026-05-23, credential-mode-architecture SPEC §1.1.B):
+	// When the binding came from a bound_alias dereference, its ProviderCode
+	// may be a brand alias from the vault row (e.g., OAuth provider="claude")
+	// rather than the canonical code body.model resolves to ("anthropic").
+	// Normalize both sides via providerCanonicalCode — same lockstep
+	// canonicalization handleProbePipeline applies for mode C — so downstream
+	// stages (provider adapter, WAF inject) see a single canonical value.
+	// Mismatch is a caller-side bug (e.g., bound_alias=oauth(anthropic) but
+	// body.model=gpt-4); fail loud rather than letting the upstream reject
+	// the wrong-provider credential.
+	if resolved.AppRecord != nil && resolved.AppRecord.BoundAlias != "" {
+		canonicalBound := providerCanonicalCode(binding.ProviderCode)
+		canonicalUpstream := providerCanonicalCode(inferredUpstream)
+		if canonicalBound != "" && canonicalBound != canonicalUpstream {
+			p.errors.Add(1)
+			writeJSONError(w, http.StatusBadRequest, "invalid_request_error",
+				"BOUND_ALIAS_PROVIDER_MISMATCH",
+				"App \""+appCtx.Slug+"\" is bound to alias \""+resolved.AppRecord.BoundAlias+
+					"\" (provider=\""+binding.ProviderCode+"\") but body.model resolves to upstream \""+
+					inferredUpstream+"\". Use a body.model matching the bound alias's provider, "+
+					"or `aikey app update "+appCtx.Slug+" --bound-alias <name>` to re-bind.")
+			return
+		}
+		binding.ProviderCode = canonicalUpstream
 	}
 
 	// Stage 5: resolve credential from binding (shared with legacy path).
@@ -771,14 +951,50 @@ func (p *Proxy) handleAppPipeline(w http.ResponseWriter, r *http.Request, appCtx
 	r.Body = io.NopCloser(bytes.NewReader(translateOut.Body))
 	r.ContentLength = int64(len(translateOut.Body))
 
+	// Phase 4 fix (2026-05-22, Stage 7 smoke): when OAuth → Anthropic, the
+	// WAF body fingerprint must be present in body.system[0]. The body
+	// rewriter ran inside ResolveBindingCredential's oauthInject() call
+	// above, but at that point r.Body had already been consumed by Stage 3
+	// (line 606 io.ReadAll); the rewriter saw an empty body, no-oped, and
+	// returned without injecting. Now that r.Body carries the post-
+	// translation bytes, re-run the WAF rewriter so the body that actually
+	// goes upstream gets the magic-intro + billing-header fingerprint.
+	// Without this, Anthropic returns 429 "rate_limit_error" with no
+	// anthropic-ratelimit-* headers (business rejection signature, ref
+	// workflow/CI/research/oauth-token-response-identity/2026-04-15-oauth-token-response-identity.md).
+	if binding.KeySourceType == "personal_oauth_account" &&
+		binding.ProviderCode == "anthropic" &&
+		!inboundUAWasClaudeCode {
+		injectClaudeWAFFingerprintFull(r)
+		// injectClaudeWAFFingerprintFull may have rewritten r.Body; sync
+		// ContentLength so the reverse proxy reports the correct length
+		// to the upstream.
+		if r.Body != nil {
+			if newBytes, err := io.ReadAll(r.Body); err == nil {
+				r.Body = io.NopCloser(bytes.NewReader(newBytes))
+				r.ContentLength = int64(len(newBytes))
+			}
+		}
+	}
+
 	// Extract the inbound app bearer for serveRoute's bearerToken arg —
 	// used for audit / structured logging only (not for upstream injection;
 	// that's already handled by prov.RewriteRequest / oauthInject above).
 	inboundBearer := extractRawAuthValue(r)
 
+	// app_mode tags the credential-resolution path so log readers can tell
+	// A vs B mode without re-deriving from follow_user_active + bound_alias
+	// fields. SPEC §1.1 / §6.1 anti-example "label deception" was rooted in
+	// log fields that didn't distinguish modes; this is the explicit fix.
+	appMode := "a"
+	if resolved.AppRecord != nil && resolved.AppRecord.BoundAlias != "" {
+		appMode = "b"
+	}
 	logger.Info("app pipeline forwarding upstream",
 		"app_key_id", route.AppKeyID,
 		"app_kind", route.AppKind,
+		"app_mode", appMode,
+		"bound_alias", resolved.AppRecord.BoundAlias, // empty in A mode
 		"profile_id", resolved.ProfileID,
 		"binding_source_type", binding.KeySourceType,
 		"upstream_base", cred.BaseURL,
@@ -831,10 +1047,281 @@ func (p *Proxy) handleAppPipeline(w http.ResponseWriter, r *http.Request, appCtx
 		// short-circuits for legacy paths.
 		appResolvedRoute.ObserverContext = obsReqCtx
 		appResolvedRoute.ObserverRegistry = p.observerRegistry
-		p.observerRegistry.NotifyStart(r.Context(), obsReqCtx)
+		// SPEC §1.4.1: this handler serves the /apps/<slug>/v1/... pipeline
+		// so emit under the StreamAppPipeline name. Observers that didn't
+		// declare interest in this stream are filtered at Registry level.
+		p.observerRegistry.NotifyStart(r.Context(), observer.StreamAppPipeline, obsReqCtx)
 	}
 
 	p.serveRoute(w, r, appResolvedRoute, prov, cred.RealKey, inboundBearer, startTime, logger)
+
+	if obsReqCtx != nil {
+		latency := int(time.Since(startTime).Milliseconds())
+		p.observerRegistry.NotifyEnd(r.Context(), obsReqCtx, latency)
+	}
+}
+
+// handleProbePipeline is the entry into the Probe pipeline (mode C) for
+// requests matching /probe/<alias>/v1/... See SPEC
+// `workflow/CI/requirements/2026-05-23-credential-mode-architecture.md` §1.3.
+//
+// Pipeline stages (parallel to handleAppPipeline but simpler — no
+// app_records / follow_user_active / provider-binding indirection):
+//
+//	1. authn          — first-party constant Bearer check (probepipe.Authenticate)
+//	2. resolve alias  — vault.GetAliasCredential → synthetic ProviderBinding
+//	3. sanitize body  — strip aikey/* fields, reject n>1 (reuses apppipe)
+//	4. infer upstream — body.model → provider; sanity-check matches alias's provider
+//	5. resolve cred   — reuses ResolveBindingCredential (shared with App pipeline)
+//	6. build route    — synthesize ResolvedRoute with RouteSource="probe"
+//	7. translate      — reuses apppipe.MaybeTranslateRequest (no-op when wire matches)
+//	8. forward        — same serveRoute as App / legacy pipelines
+//
+// Why we reuse so much from apppipe: sanitize / translate / ResolveBindingCredential
+// don't depend on app concepts (slug / follow_user_active); they operate on
+// (ProviderBinding, request) inputs. Sharing them avoids divergence on the
+// shared upstream-injection paths (OAuth WAF fingerprint, model translation,
+// SSE drain). Probe-specific differences live entirely in stages 1-2 + 6.
+func (p *Proxy) handleProbePipeline(w http.ResponseWriter, r *http.Request, probeCtx *probepipe.ProbeContext, startTime time.Time, logger *slog.Logger, traceID string) {
+	_ = traceID
+	logger = logger.With("probe_alias", probeCtx.AliasName, "routing", "probe")
+
+	// Stage 1: authn — first-party constant Bearer.
+	if authErr := probepipe.Authenticate(r.Header); authErr != nil {
+		p.errors.Add(1)
+		logger.Warn("probe pipeline authn failed",
+			"error.code", authErr.ErrorCode,
+			"event.name", observability.EventProxyRequestAuthFailed,
+		)
+		writeJSONError(w, authErr.StatusCode, "authentication_error", authErr.ErrorCode, authErr.Message)
+		return
+	}
+
+	// Stage 2: resolve alias → synthetic ProviderBinding.
+	aliasCred, resolveErr := probepipe.Resolve(p.probeVault, probeCtx)
+	if resolveErr != nil {
+		p.errors.Add(1)
+		logger.Warn("probe pipeline alias resolve failed",
+			"error.code", resolveErr.ErrorCode,
+		)
+		writeJSONError(w, resolveErr.StatusCode, "server_error", resolveErr.ErrorCode, resolveErr.Message)
+		return
+	}
+	binding := aliasCred.Binding
+
+	// Capture the genuine inbound User-Agent BEFORE the credential resolve
+	// step (which may call oauthInject and mask the UA). Mirrors the
+	// handleAppPipeline pattern; needed for the post-translation WAF rewrite
+	// decision below.
+	inboundUAWasClaudeCode := clientIsClaudeCode(r)
+
+	// Stage 3: sanitize body (reuses apppipe — same egress rules apply).
+	bodyBytes, bodyErr := io.ReadAll(r.Body)
+	if bodyErr != nil {
+		p.errors.Add(1)
+		logger.Warn("probe pipeline body read failed", "error", bodyErr)
+		writeJSONError(w, http.StatusBadRequest, "invalid_request_error", "BODY_READ_FAILED",
+			"Could not read request body: "+bodyErr.Error())
+		return
+	}
+	_ = r.Body.Close()
+
+	sanitized, sanitizeCtx, sanitizeErr := apppipe.SanitizeRequestBody(bodyBytes)
+	if sanitizeErr != nil {
+		p.errors.Add(1)
+		logger.Warn("probe pipeline body sanitize failed",
+			"error.code", sanitizeErr.ErrorCode,
+		)
+		writeJSONError(w, sanitizeErr.StatusCode, "invalid_request_error", sanitizeErr.ErrorCode, sanitizeErr.Message)
+		return
+	}
+	for _, warning := range sanitizeCtx.Warnings {
+		logger.Warn("probe pipeline field degraded", "degradation", warning)
+	}
+
+	// Stage 4: infer upstream from body.model and sanity-check it matches the
+	// alias's recorded provider. Probing FreySilvaqzs@... (Anthropic OAuth)
+	// with a body that says "gpt-4o" is a caller-side bug — fail loud.
+	//
+	// Compare via canonical codes so brand aliases agree:
+	// vault may store "claude" (OAuth) while InferUpstreamFromModel returns
+	// "anthropic"; both must reconcile. providerCanonicalCode is the same
+	// helper apppipe + path-prefix routing use, so the probe pipeline
+	// inherits identical alias semantics with no drift.
+	inboundModel := extractModelLazy(sanitized)
+	inferredUpstream := provider.InferUpstreamFromModel(inboundModel)
+	if inferredUpstream == "" {
+		p.errors.Add(1)
+		writeJSONError(w, http.StatusBadRequest, "invalid_request_error", "UPSTREAM_UNINFERRABLE",
+			"Could not infer upstream provider from body.model. Expected a "+
+				"recognized model id (claude-*, gpt-*, kimi-*, ...) so AiKey "+
+				"can confirm the alias's provider matches the request.")
+		return
+	}
+	canonicalUpstream := providerCanonicalCode(inferredUpstream)
+	canonicalBound := providerCanonicalCode(binding.ProviderCode)
+	if canonicalBound != "" && canonicalBound != canonicalUpstream {
+		p.errors.Add(1)
+		writeJSONError(w, http.StatusBadRequest, "invalid_request_error", "PROBE_PROVIDER_MISMATCH",
+			"Alias \""+probeCtx.AliasName+"\" is bound to provider \""+binding.ProviderCode+
+				"\" but body.model resolves to upstream \""+inferredUpstream+
+				"\". Use a body.model that matches the alias's provider.")
+		return
+	}
+	// Normalize binding's ProviderCode to canonical form so downstream
+	// stages (provider adapter lookup, ResolveBindingCredential, translate)
+	// see the same code regardless of vault storage convention.
+	binding.ProviderCode = canonicalUpstream
+
+	// Stage 5: resolve credential via the shared App/legacy machinery.
+	upstream := binding.ProviderCode
+	cred, bindErr := p.ResolveBindingCredential(r, binding, upstream, upstream, logger)
+	if bindErr != nil {
+		p.errors.Add(1)
+		logger.Warn("probe pipeline credential resolution failed",
+			"error.code", bindErr.ErrorCode,
+			"binding_source_type", binding.KeySourceType,
+		)
+		writeJSONError(w, bindErr.StatusCode, bindErr.ErrorType, bindErr.ErrorCode, bindErr.Message)
+		return
+	}
+	if cred.RealKey == "" {
+		p.errors.Add(1)
+		writeJSONError(w, http.StatusServiceUnavailable, "server_error", "BINDING_CREDENTIAL_UNRESOLVED",
+			"Alias \""+probeCtx.AliasName+"\" (source="+binding.KeySourceType+":"+
+				binding.KeySourceRef+") could not be resolved to a usable credential. "+
+				"The referenced personal entry or OAuth account may have been deleted.")
+		return
+	}
+
+	// Stage 6: build the ResolvedRoute for serveRoute. RouteSource="probe"
+	// distinguishes probe traffic from app/legacy in usage_event records;
+	// trust-local reads this to attribute probe events to the right pipeline.
+	protocolFamily := ""
+	if pr, ok := provider.Routes().ByProvider(binding.ProviderCode); ok {
+		protocolFamily = pr.Protocol
+	}
+	probeResolvedRoute := &vkeys.ResolvedRoute{
+		VirtualKeyID:     "probe:" + probeCtx.AliasName,
+		Provider:         binding.ProviderCode,
+		BaseURL:          cred.BaseURL,
+		KeyAlias:         cred.KeyAlias,
+		PlaintextKey:     cred.RealKey,
+		OAuthIdentity:    cred.OAuthIdentity,
+		AccountID:        cred.OAuthAccountID,
+		ProviderCode:     binding.ProviderCode,
+		ProtocolType:     binding.ProviderCode,
+		ProtocolFamily:   protocolFamily,
+		RouteSource:      "probe",
+		FollowUserActive: false, // Probe NEVER follows active — that's the whole point of mode C.
+	}
+	if cred.ManagedKey != nil {
+		probeResolvedRoute.OrgID = cred.ManagedKey.OrgID
+		probeResolvedRoute.SeatID = cred.ManagedKey.SeatID
+		probeResolvedRoute.CredentialID = cred.ManagedKey.CredentialID
+		probeResolvedRoute.CredentialRevision = cred.ManagedKey.CredentialRevision
+		probeResolvedRoute.VirtualKeyRevision = cred.ManagedKey.VirtualKeyRevision
+	}
+
+	// Stage 7: provider adapter.
+	prov, err := p.providers.Get(binding.ProviderCode)
+	if err != nil {
+		p.errors.Add(1)
+		writeJSONError(w, http.StatusBadGateway, "server_error", "PROVIDER_ERROR",
+			"Unknown upstream provider: "+binding.ProviderCode)
+		return
+	}
+
+	// Strip /probe/<alias>/v1 prefix → leave only upstream path.
+	r.URL.Path = "/v1" + probeCtx.StrippedPath
+	if r.URL.RawPath != "" {
+		r.URL.RawPath = r.URL.Path
+	}
+
+	// Stage 8: protocol translation (reuses apppipe — no-op when inbound and
+	// upstream wire formats already match, which is the common case for
+	// first-party degrade-detector calling Anthropic /messages).
+	inboundFmt := apppipe.InferInboundWire(probeCtx.StrippedPath)
+	translateOut, translateErr := apppipe.MaybeTranslateRequest(
+		r.Context(),
+		p.translatorRegistry,
+		probeResolvedRoute,
+		binding,
+		inboundFmt,
+		r,
+		sanitized,
+		inboundModel,
+	)
+	if translateErr != nil {
+		p.errors.Add(1)
+		logger.Warn("probe pipeline protocol translation failed",
+			"error.code", translateErr.ErrorCode,
+			"upstream", binding.ProviderCode,
+		)
+		writeJSONError(w, translateErr.StatusCode, "invalid_request_error", translateErr.ErrorCode, translateErr.Message)
+		return
+	}
+	if translateOut.Engaged {
+		logger.Info("probe pipeline translation engaged",
+			"upstream_format", string(translateOut.UpstreamFormat),
+		)
+		if canonical := apppipe.CanonicalUpstreamPath(translateOut.UpstreamFormat); canonical != "" {
+			r.URL.Path = canonical
+			if r.URL.RawPath != "" {
+				r.URL.RawPath = canonical
+			}
+		}
+	}
+	r.Body = io.NopCloser(bytes.NewReader(translateOut.Body))
+	r.ContentLength = int64(len(translateOut.Body))
+
+	// OAuth → Anthropic WAF fingerprint rewrite (same rationale as App pipeline
+	// — body had been consumed at sanitize stage, oauthInject saw empty body
+	// and no-oped; re-run on the final post-translation body).
+	if binding.KeySourceType == "personal_oauth_account" &&
+		binding.ProviderCode == "anthropic" &&
+		!inboundUAWasClaudeCode {
+		injectClaudeWAFFingerprintFull(r)
+		if r.Body != nil {
+			if newBytes, err := io.ReadAll(r.Body); err == nil {
+				r.Body = io.NopCloser(bytes.NewReader(newBytes))
+				r.ContentLength = int64(len(newBytes))
+			}
+		}
+	}
+
+	inboundBearer := extractRawAuthValue(r)
+
+	logger.Info("probe pipeline forwarding upstream",
+		"binding_source_type", binding.KeySourceType,
+		"upstream_base", cred.BaseURL,
+		"upstream", binding.ProviderCode,
+		"protocol_family", probeResolvedRoute.ProtocolFamily,
+		"alias_kind", aliasCred.AliasKind,
+	)
+
+	// Observer wiring (SPEC §1.4 stream = probe). Same pattern as
+	// handleAppPipeline — Registry filters per-observer by Streams
+	// declaration, so observers that didn't subscribe to probe (e.g.
+	// rhythm with Streams=[app_pipeline]) get nothing; ndjson-fanout
+	// (Streams=AllStreams()) writes the event to subscribers' files.
+	var obsReqCtx *observer.RequestContext
+	if p.observerRegistry != nil && p.observerRegistry.Active() > 0 {
+		obsReqCtx = &observer.RequestContext{
+			KeyAlias:       probeResolvedRoute.KeyAlias,
+			ProviderID:     binding.ProviderCode,
+			ProtocolFamily: probeResolvedRoute.ProtocolFamily,
+			RequestedModel: inboundModel,
+			SessionID:      resolveSessionID(r.Header, binding.ProviderCode),
+			TraceID:        traceID,
+			StartedAt:      startTime,
+		}
+		probeResolvedRoute.ObserverContext = obsReqCtx
+		probeResolvedRoute.ObserverRegistry = p.observerRegistry
+		p.observerRegistry.NotifyStart(r.Context(), observer.StreamProbe, obsReqCtx)
+	}
+
+	p.serveRoute(w, r, probeResolvedRoute, prov, cred.RealKey, inboundBearer, startTime, logger)
 
 	if obsReqCtx != nil {
 		latency := int(time.Since(startTime).Milliseconds())
@@ -846,7 +1333,7 @@ func (p *Proxy) handleAppPipeline(w http.ResponseWriter, r *http.Request, appCtx
 // the request with the provider prefix stripped from the path.
 // Called when the request path starts with a known provider prefix
 // (e.g., /anthropic/v1/messages → strip /anthropic → forward to Anthropic API).
-func (p *Proxy) handlePathPrefixRoute(w http.ResponseWriter, r *http.Request, providerCode, strippedPath string, startTime time.Time, logger *slog.Logger) {
+func (p *Proxy) handlePathPrefixRoute(w http.ResponseWriter, r *http.Request, providerCode, strippedPath string, startTime time.Time, logger *slog.Logger, traceID string) {
 	logger = logger.With("provider", providerCode, "routing", "path-prefix")
 
 	// 2026-04-29 namespace-authority early hard-fail. Run BEFORE the
@@ -1051,7 +1538,9 @@ func (p *Proxy) handlePathPrefixRoute(w http.ResponseWriter, r *http.Request, pr
 			oauthInject(r, cred, canonicalCode)
 		}
 
-		p.serveRoute(w, r, tokenRoute, prov, tokenRealKey, rawAuthValue, startTime, logger)
+		// SPEC §1.4.1 user_chat — see serveRouteWithObserver docstring.
+		p.serveRouteWithObserver(w, r, tokenRoute, prov, tokenRealKey, rawAuthValue, startTime, logger,
+			observer.StreamUserChat, traceID)
 		return
 	}
 
@@ -1175,7 +1664,9 @@ func (p *Proxy) handlePathPrefixRoute(w http.ResponseWriter, r *http.Request, pr
 					OAuthIdentity: identityTag,
 					AccountID:     alias, // OAuth account_id; correct field name (not OAuthAccountID)
 				}
-				p.serveRoute(w, r, oauthRoute, prov, "__oauth__", rawAuthValue, startTime, logger)
+				// SPEC §1.4.1 user_chat — see serveRouteWithObserver docstring.
+				p.serveRouteWithObserver(w, r, oauthRoute, prov, "__oauth__", rawAuthValue, startTime, logger,
+					observer.StreamUserChat, traceID)
 				return
 			}
 			// not an OAuth account — fall through to personal-key lookup below
@@ -1234,7 +1725,9 @@ func (p *Proxy) handlePathPrefixRoute(w http.ResponseWriter, r *http.Request, pr
 			// regardless of which path produced the route.
 			RouteSource: "personal",
 		}
-		p.serveRoute(w, r, aliasRoute, prov, plaintext, rawAuthValue, startTime, logger)
+		// SPEC §1.4.1 user_chat — see serveRouteWithObserver docstring.
+		p.serveRouteWithObserver(w, r, aliasRoute, prov, plaintext, rawAuthValue, startTime, logger,
+			observer.StreamUserChat, traceID)
 		return
 	}
 
@@ -1408,7 +1901,9 @@ func (p *Proxy) handlePathPrefixRoute(w http.ResponseWriter, r *http.Request, pr
 	// itself goes through supervisor.NormalizeTeamToken at load time), so
 	// simple concat is safe — the registry guarantees no historical-prefix
 	// residue. Avoid importing supervisor here to prevent a package cycle.
-	p.serveRoute(w, r, route, prov, realKey, "aikey_team_"+virtualKeyID, startTime, logger)
+	// SPEC §1.4.1 user_chat — see serveRouteWithObserver docstring.
+	p.serveRouteWithObserver(w, r, route, prov, realKey, "aikey_team_"+virtualKeyID, startTime, logger,
+		observer.StreamUserChat, traceID)
 }
 
 // serveRoute executes the forwarding pipeline (streaming detection, transport

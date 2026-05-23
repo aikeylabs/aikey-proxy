@@ -3,6 +3,7 @@ package supervisor
 import (
 	"log/slog"
 
+	"github.com/AiKeyLabs/aikey-proxy/internal/observer/ndjson_fanout"
 	"github.com/AiKeyLabs/aikey-proxy/internal/vault"
 	"github.com/AiKeyLabs/aikey-proxy/pkg/observer"
 )
@@ -42,9 +43,30 @@ func buildObserverRegistry(
 			"event.name", "proxy.observer.no_registrations")
 		return nil
 	}
+	// Inject the vault into the ndjson-fanout observer BEFORE BuildObservers
+	// runs. The framework's Build callback receives only `cfg map[string]any`
+	// (no vault) so observers needing vault access read it from a package-
+	// local setter; supervisor is the natural wiring point because it owns
+	// the *vault.Reader lifecycle (see buildGeneration in supervisor.go).
+	ndjson_fanout.SetVaultReader(ndjson_fanout.NewVaultBridge(v))
+
 	reg := observer.NewRegistry(logger)
 	adapter := newSupervisorVaultObserverAdapter(v)
+	// Slugs whose observers are always enabled regardless of vault state
+	// (proxy-bundled infrastructure, not user-installed apps). Currently:
+	//   aikey-proxy-core  — owns the ndjson-fanout observer (SPEC §1.4)
+	//
+	// DefaultVaultEnableCheck would reject these (no app_records row to
+	// confirm "live") so we short-circuit before reaching it. Adding new
+	// always-on slugs here is intentional friction: every entry implies
+	// extra proxy memory + IO; PR review should confirm.
+	alwaysOn := map[string]bool{
+		"aikey-proxy-core": true,
+	}
 	enableCheck := func(slug string) bool {
+		if alwaysOn[slug] {
+			return true
+		}
 		return observer.DefaultVaultEnableCheck(slug, adapter, logger)
 	}
 	reg.BuildObservers(enableCheck, cfg)

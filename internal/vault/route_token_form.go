@@ -34,6 +34,23 @@ func isStrictAppBearerForm(token string) bool {
 	return hasStrictHex64Suffix(token, "aikey_app_")
 }
 
+// firstPartyAppBearerWhitelist is the well-known set of first-party app
+// Bearers exempted from the strict `aikey_app_<64 hex>` form. Lockstep
+// duplicate of the same set in internal/proxy/dispatch.go (see that file
+// for the security-model rationale and the cross-repo drift防退化 list).
+var firstPartyAppBearerWhitelist = map[string]struct{}{
+	"aikey_app_internal_degrade_detector_v1": {},
+}
+
+// isFirstPartyAppBearer reports whether token is a well-known first-party
+// Bearer exempted from the strict form check. Vault Registry loader
+// accepts these so the row gets into the Registry; dispatch then also
+// accepts them so request authn succeeds.
+func isFirstPartyAppBearer(token string) bool {
+	_, ok := firstPartyAppBearerWhitelist[token]
+	return ok
+}
+
 // hasStrictHex64Suffix is the shared predicate behind the strict Tier1
 // bearer forms (personal/app). Centralized so future strict-form additions
 // (`aikey_route_*` etc.) get the same charset + length guarantees without

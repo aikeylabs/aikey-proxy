@@ -383,6 +383,25 @@ func (s *Supervisor) syncManagedKeys() {
 		slog.Warn("managed key sync: GetAllOAuthRouteTokens failed", "error", otErr)
 	}
 
+	// 5. App pipeline bearers (Phase 4 `aikey_app_*` tokens). Without this
+	// block, `aikey app rotate / revoke / pause / resume / register / route`
+	// would silently require `aikey proxy restart` because the only other
+	// place GetAllAppRouteTokens is called is buildGeneration (startup +
+	// /admin/reload). The `proxy_vault_state()` indicator would still report
+	// Current after the seq write below, which makes the silent staleness
+	// strictly worse than printing a restart hint — see
+	// memory: no-proxy-restart-for-vault-mutations.
+	//
+	// ReplaceAll handles revoke/pause/resume atomically (a deleted/paused
+	// token simply doesn't appear in allRoutes → vanishes on swap).
+	if appTokens, atErr := gen.vault.GetAllAppRouteTokens(); atErr == nil {
+		for tok, route := range buildAppRoutesFiltered(appTokens) {
+			allRoutes[tok] = route
+		}
+	} else {
+		slog.Warn("managed key sync: GetAllAppRouteTokens failed", "error", atErr)
+	}
+
 	// Atomic replace — deleted/revoked tokens disappear immediately.
 	gen.registry.ReplaceAll(allRoutes)
 
@@ -786,6 +805,26 @@ func (s *Supervisor) buildGeneration() (*generation, error) {
 	// is never called and Notify* hooks are zero-cost no-ops at request
 	// time. See pkg/observer/registry.go for the registration contract.
 	p.SetObserverRegistry(buildObserverRegistry(vaultReader, s.cfg.Observers, slog.Default()))
+
+	// SPEC §1.5.7 P3 stub: if vault has any app declaring filter_stages but
+	// no filterpipe dispatcher is shipped, flip the proxy to fail-loud 501
+	// mode so traffic is NOT silently let through. See anti-example F.
+	// The check is per-generation (cheap), so a future vault edit that
+	// removes the filter declaration will re-enable normal serving on
+	// next Reload.
+	if hasFilter, err := vaultReader.HasFilterAppsRegistered(); err != nil {
+		slog.Warn("supervisor: filter_stages check failed; treating as inactive",
+			"event.name", "proxy.filter_stub_check_failed",
+			"error", err)
+	} else if hasFilter {
+		slog.Warn("supervisor: vault has filter_stages declared but filterpipe "+
+			"dispatcher is not implemented (P3 stub). ALL data-plane traffic "+
+			"will return 501 FILTER_NOT_IMPLEMENTED until either the filter "+
+			"declaration is removed or the proxy is upgraded to the P4 "+
+			"filter dispatcher build. SPEC §1.5.7 / §6.6.",
+			"event.name", "proxy.filter_stub_active")
+		p.SetFilterStub501Active(true)
+	}
 
 	// Create the local WAL writer unconditionally whenever WALDir is set.
 	// This is the canonical event log used by `aikey statusline` / `aikey watch`,

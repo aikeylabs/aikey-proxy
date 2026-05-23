@@ -39,9 +39,15 @@ import (
 // Decoupled from proxy.ActiveKeyReader so tests can supply a focused
 // stub without satisfying ActiveKeyReader's full method set.
 // *vault.Reader satisfies this via AKL-102.
+//
+// GetAliasCredential was added 2026-05-23 for B mode (credential-mode
+// architecture SPEC §1.1.B / §3.3): when an app row carries a non-empty
+// bound_alias, ResolveUpstreamBinding short-circuits the provider-binding
+// lookup and resolves the credential via this method instead.
 type VaultReader interface {
 	GetProviderBindingWithScope(profileID, providerCode string) (*vault.ProviderBinding, error)
 	GetAppRecord(slug string) (*vault.AppRecord, error)
+	GetAliasCredential(name string) (*vault.AliasCredential, error)
 }
 
 // ResolveError represents a request that passed authn but cannot proceed
@@ -175,6 +181,23 @@ func ResolveUpstreamBinding(
 		}
 	}
 
+	// ── B mode short-circuit (2026-05-23, SPEC §1.1.B + §3.3) ──────────
+	//
+	// If the row carries a non-empty bound_alias, resolve the credential
+	// from that alias snapshot instead of looking up a user-profile
+	// provider binding. The synthesised binding is shape-compatible with
+	// what GetProviderBindingWithScope would return, so all downstream
+	// stages (ResolveBindingCredential, provider adapter, OAuth inject)
+	// see one uniform binding contract.
+	//
+	// Canonical-alias mismatch (binding.ProviderCode brand alias vs
+	// inferredUpstream canonical, e.g. "claude" vs "anthropic") is
+	// handled at the proxy.handleAppPipeline call-site where
+	// providerCanonicalCode lives — same split as handleProbePipeline.
+	if resolved.AppRecord.BoundAlias != "" {
+		return resolveBoundAliasBinding(reader, resolved)
+	}
+
 	// Binding lookup. Key is (profile_id, upstream_provider).
 	binding, err := reader.GetProviderBindingWithScope(resolved.ProfileID, inferredUpstream)
 	if err != nil {
@@ -201,6 +224,65 @@ func ResolveUpstreamBinding(
 		}
 	}
 	return binding, nil
+}
+
+// resolveBoundAliasBinding is the B-mode credential lookup: dereference
+// AppRecord.BoundAlias via the same GetAliasCredential helper the Probe
+// pipeline uses, and return its synthesised binding.
+//
+// Errors map to App-pipeline-shape codes so callers don't need a separate
+// branch for B-mode failure handling:
+//   - alias lookup vault failure  → 500 BOUND_ALIAS_READ_FAILED
+//   - alias row missing            → 404 BOUND_ALIAS_NOT_FOUND
+//   - alias status != "active"     → 403 BOUND_ALIAS_REVOKED (revoked)
+//                                  / BOUND_ALIAS_PAUSED (paused)
+//                                  / BOUND_ALIAS_INACTIVE (other)
+func resolveBoundAliasBinding(reader VaultReader, resolved *ResolvedAppContext) (*vault.ProviderBinding, *ResolveError) {
+	alias := resolved.AppRecord.BoundAlias
+	cred, err := reader.GetAliasCredential(alias)
+	if err != nil {
+		return nil, &ResolveError{
+			StatusCode: http.StatusInternalServerError,
+			ErrorCode:  "BOUND_ALIAS_READ_FAILED",
+			Message: "Failed to look up bound_alias \"" + alias + "\" for app \"" +
+				resolved.AppRoute.AppSlug + "\": " + err.Error(),
+		}
+	}
+	if cred == nil {
+		return nil, &ResolveError{
+			StatusCode: http.StatusNotFound,
+			ErrorCode:  "BOUND_ALIAS_NOT_FOUND",
+			Message: "App \"" + resolved.AppRoute.AppSlug + "\" is configured in B mode " +
+				"with bound_alias=\"" + alias + "\", but that alias is missing from the vault. " +
+				"Re-bind via `aikey app update " + resolved.AppRoute.AppSlug + " --bound-alias <name>` " +
+				"after running `aikey list` to see available aliases.",
+		}
+	}
+	switch cred.Status {
+	case "active":
+		return cred.Binding, nil
+	case "revoked":
+		return nil, &ResolveError{
+			StatusCode: http.StatusForbidden,
+			ErrorCode:  "BOUND_ALIAS_REVOKED",
+			Message: "App \"" + resolved.AppRoute.AppSlug + "\" bound_alias \"" + alias +
+				"\" is revoked. Re-authorize the credential or re-bind to a different alias.",
+		}
+	case "paused":
+		return nil, &ResolveError{
+			StatusCode: http.StatusForbidden,
+			ErrorCode:  "BOUND_ALIAS_PAUSED",
+			Message: "App \"" + resolved.AppRoute.AppSlug + "\" bound_alias \"" + alias +
+				"\" is paused. Re-enable it before this app can forward.",
+		}
+	default:
+		return nil, &ResolveError{
+			StatusCode: http.StatusForbidden,
+			ErrorCode:  "BOUND_ALIAS_INACTIVE",
+			Message: "App \"" + resolved.AppRoute.AppSlug + "\" bound_alias \"" + alias +
+				"\" has status \"" + cred.Status + "\" which is not usable.",
+		}
+	}
 }
 
 // containsString and joinStrings — tiny helpers kept here instead of

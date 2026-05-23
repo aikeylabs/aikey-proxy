@@ -2,6 +2,8 @@ package supervisor
 
 import (
 	"errors"
+	"os"
+	"strings"
 	"testing"
 
 	"github.com/AiKeyLabs/aikey-proxy/internal/vault"
@@ -536,5 +538,42 @@ func TestIsStrictAppRouteToken(t *testing.T) {
 		if got := isStrictAppRouteToken(c.token); got != c.want {
 			t.Errorf("isStrictAppRouteToken(%q) = %v, want %v", c.token, got, c.want)
 		}
+	}
+}
+
+
+// TestSyncManagedKeys_IncludesAppTokenLoadingBlock is a source-level fence
+// against accidental deletion of the app-route-token loading inside
+// syncManagedKeys. Without this block, `aikey app rotate / revoke / pause /
+// resume / register / route` silently requires `aikey proxy restart` to
+// take effect — which violates the "no proxy restart for vault mutations"
+// invariant (memory: no-proxy-restart-for-vault-mutations).
+//
+// Low-fidelity guard: pins source references, not runtime behavior. A
+// behavioural test would boot a real Supervisor with a temp vault, bump
+// change_seq, wait one 5s tick, and assert registry membership — tracked
+// as P1 because it needs vault fixture scaffolding this package doesn't
+// yet have.
+func TestSyncManagedKeys_IncludesAppTokenLoadingBlock(t *testing.T) {
+	src, err := os.ReadFile("supervisor.go")
+	if err != nil {
+		t.Fatalf("could not read supervisor.go: %v", err)
+	}
+	body := string(src)
+
+	syncStart := strings.Index(body, "func (s *Supervisor) syncManagedKeys()")
+	if syncStart < 0 {
+		t.Fatal("syncManagedKeys not found in supervisor.go — function renamed? update this fence test")
+	}
+	syncBody := body[syncStart:]
+
+	if !strings.Contains(syncBody, "GetAllAppRouteTokens()") {
+		t.Fatal("regression: syncManagedKeys no longer calls GetAllAppRouteTokens — " +
+			"`aikey app rotate/revoke/pause/resume/register/route` will silently require " +
+			"`aikey proxy restart`. See memory: no-proxy-restart-for-vault-mutations.")
+	}
+	if !strings.Contains(syncBody, "buildAppRoutesFiltered(") {
+		t.Fatal("regression: syncManagedKeys no longer calls buildAppRoutesFiltered — " +
+			"app tokens won't be filtered/merged at sync time.")
 	}
 }

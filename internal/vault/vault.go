@@ -384,6 +384,138 @@ func (r *Reader) GetPersonalKeyByAlias(alias string) (plaintext, providerCode, b
 	return string(plain), providerCode, baseURL, nil
 }
 
+// AliasCredential is the result of a Probe-pipeline alias lookup. It carries
+// a synthetic ProviderBinding that downstream credential resolution
+// (proxy.ResolveBindingCredential) can consume identically to a real binding
+// returned by GetProviderBindingWithScope.
+//
+// AliasKind is a logging/audit field — callers must NOT use it for control
+// flow (the synthesized Binding.KeySourceType is authoritative).
+//
+// Status mirrors provider_accounts.status for OAuth rows; personal entries
+// have no status column, so the loader sets "active" when the row exists.
+// Callers map non-"active" status to HTTP errors (typically 403 with
+// ALIAS_REVOKED / ALIAS_PAUSED reason codes).
+type AliasCredential struct {
+	Binding   *ProviderBinding
+	Status    string // "active" | "revoked" | "paused" | ...
+	AliasKind string // "personal" | "oauth" — audit/log only, not control flow
+}
+
+// GetAliasCredential resolves a probe URL alias (`/probe/<alias>/...`) to a
+// synthetic ProviderBinding. See SPEC
+// `workflow/CI/requirements/2026-05-23-credential-mode-architecture.md` §1.3
+// for the Probe pipeline contract.
+//
+// Lookup order, first match wins:
+//  1. entries.alias                       → personal API key
+//  2. provider_accounts.local_alias       → OAuth account (user-renamed)
+//  3. provider_accounts.display_identity  → OAuth account (original identity)
+//
+// Returns (nil, nil) when no row matches — caller maps to 404 ALIAS_NOT_FOUND.
+// Returns ac with Status != "active" when a row exists but is unusable.
+// Returns error only for infrastructure failures (DB unreachable, etc.).
+//
+// Why a synthetic ProviderBinding instead of a probe-only credential struct:
+// downstream resolution (proxy.ResolveBindingCredential) is keyed on
+// (KeySourceType, KeySourceRef) pairs mirroring the provider_bindings
+// schema. Reusing that machinery means OAuth WAF fingerprint / personal-key
+// decrypt / managed-key fetch logic is shared — Probe and App pipelines
+// diverge only in how the binding was sourced, not in how it resolves to a
+// usable plaintext credential.
+func (r *Reader) GetAliasCredential(name string) (*AliasCredential, error) {
+	if name == "" {
+		return nil, nil
+	}
+
+	// 1. Personal entries lookup.
+	var providerCode sql.NullString
+	err := r.db.QueryRow(
+		"SELECT provider_code FROM entries WHERE alias = ?", name,
+	).Scan(&providerCode)
+	switch {
+	case err == nil:
+		code := ""
+		if providerCode.Valid {
+			code = providerCode.String
+		}
+		return &AliasCredential{
+			Binding: &ProviderBinding{
+				ProviderCode:  code,
+				KeySourceType: "personal",
+				KeySourceRef:  name,
+			},
+			Status:    "active",
+			AliasKind: "personal",
+		}, nil
+	case err == sql.ErrNoRows:
+		// fall through to OAuth lookup
+	default:
+		return nil, fmt.Errorf("personal alias lookup %q: %w", name, err)
+	}
+
+	// 2 + 3. OAuth lookup. provider_accounts may not exist on pre-v1.0.3
+	// vaults — treat as "no match".
+	if !hasColumn(r.db, "provider_accounts", "provider_account_id") {
+		return nil, nil
+	}
+
+	var (
+		acctID, provider, status string
+		hasLocalAlias            = hasColumn(r.db, "provider_accounts", "local_alias")
+	)
+
+	if hasLocalAlias {
+		err = r.db.QueryRow(
+			`SELECT provider_account_id, provider, status
+			   FROM provider_accounts
+			  WHERE local_alias = ? AND local_alias IS NOT NULL AND local_alias != ''
+			  LIMIT 1`,
+			name,
+		).Scan(&acctID, &provider, &status)
+		switch {
+		case err == nil:
+			return &AliasCredential{
+				Binding: &ProviderBinding{
+					ProviderCode:  provider,
+					KeySourceType: "personal_oauth_account",
+					KeySourceRef:  acctID,
+				},
+				Status:    status,
+				AliasKind: "oauth",
+			}, nil
+		case err == sql.ErrNoRows:
+			// fall through to display_identity
+		default:
+			return nil, fmt.Errorf("oauth local_alias lookup %q: %w", name, err)
+		}
+	}
+
+	err = r.db.QueryRow(
+		`SELECT provider_account_id, provider, status
+		   FROM provider_accounts
+		  WHERE display_identity = ?
+		  LIMIT 1`,
+		name,
+	).Scan(&acctID, &provider, &status)
+	switch {
+	case err == nil:
+		return &AliasCredential{
+			Binding: &ProviderBinding{
+				ProviderCode:  provider,
+				KeySourceType: "personal_oauth_account",
+				KeySourceRef:  acctID,
+			},
+			Status:    status,
+			AliasKind: "oauth",
+		}, nil
+	case err == sql.ErrNoRows:
+		return nil, nil
+	default:
+		return nil, fmt.Errorf("oauth display_identity lookup %q: %w", name, err)
+	}
+}
+
 // ActiveKeyConfig represents the globally-active key selection written by `aikey use`.
 // It mirrors the three config table rows: active_key_type, active_key_ref, active_key_providers.
 type ActiveKeyConfig struct {
@@ -903,6 +1035,15 @@ func (r *Reader) GetAllOAuthRouteTokens() ([]OAuthRouteToken, error) {
 // AppRecord represents a row from app_records — the metadata side of an
 // installed third-party Agent. No credentials live here; tokens are in
 // app_keys.
+//
+// B-mode fields (2026-05-23, credential-mode-architecture SPEC §3.1):
+// BoundAlias + BoundAt carry the snapshotted credential identity for
+// "init_from_user_active" mode. When BoundAlias is non-empty, the App
+// pipeline resolves credentials via GetAliasCredential(BoundAlias)
+// instead of looking up the user's current active binding — making the
+// app's identity sticky across later `aikey use` changes. See SPEC §1.1
+// for the A vs B mode contract; mutex with FollowUserActive is
+// enforced at the writer side (aikey-cli migrations + `aikey app create`).
 type AppRecord struct {
 	Slug                  string
 	Name                  string
@@ -910,6 +1051,8 @@ type AppRecord struct {
 	Upstreams             []string // decoded from JSON column
 	AppKind               string   // "third-party" | "first-party"
 	FollowUserActive      bool
+	BoundAlias            string // "" = not in B mode (use FollowUserActive)
+	BoundAt               int64  // 0 when BoundAlias is unset
 	RequestedPermissions  []string // decoded from JSON column (nil if NULL)
 	CreatedAt             int64
 	UpdatedAt             int64
@@ -960,17 +1103,229 @@ func (t AppRouteToken) LogValue() slog.Value {
 	)
 }
 
+// HasFilterAppsRegistered reports whether any row in `app_records` has a
+// non-NULL `filter_stages` column — i.e. one or more apps declared the
+// E-mode (sync_filter) contract. Used by the proxy at startup to decide
+// whether to fail-loud (P3 step 5) since the actual filter dispatcher
+// is not implemented until P4 (SPEC §1.5.7).
+//
+// Returns (false, nil) on pre-P3 vaults (column missing) — that's a
+// "no filter apps" state, the proxy serves traffic normally.
+func (r *Reader) HasFilterAppsRegistered() (bool, error) {
+	if !hasColumn(r.db, "app_records", "filter_stages") {
+		return false, nil
+	}
+	var n int
+	err := r.db.QueryRow(
+		`SELECT COUNT(*) FROM app_records WHERE filter_stages IS NOT NULL`,
+	).Scan(&n)
+	if err != nil {
+		return false, fmt.Errorf("count filter_stages rows: %w", err)
+	}
+	return n > 0, nil
+}
+
+// ObserveSubscription is one parsed entry from `app_records.observe_streams`.
+// SPEC §1.4.3 allows both simple-string and object-form JSON elements;
+// this flat view normalises both:
+//
+//	["user_chat"]
+//	  → ObserveSubscription{Slug:"...", Stream:"user_chat", PayloadLevel:"metadata"}
+//
+//	[{"stream":"user_chat","payload_level":"full"}]
+//	  → ObserveSubscription{Slug:"...", Stream:"user_chat", PayloadLevel:"full"}
+//
+// PayloadLevel defaults to "metadata" when the input is a bare string
+// (per SPEC §1.4.2: full is opt-in via object form + consent fields).
+type ObserveSubscription struct {
+	Slug         string
+	Stream       string
+	PayloadLevel string // "metadata" | "full"
+}
+
+// ListObserveSubscriptions scans `app_records` for non-NULL observe_streams
+// and returns the flattened (slug, stream, level) view. Used by the
+// ndjson-fanout observer at Build time to construct its per-subscriber
+// routing table.
+//
+// Returns nil + nil on pre-P3 vaults (column missing) so the observer can
+// noop gracefully. Per-row JSON decode failures are logged WARN and
+// skipped — one malformed row must not silence the rest of the table.
+func (r *Reader) ListObserveSubscriptions() ([]ObserveSubscription, error) {
+	// Pre-P3 vault has no observe_streams column; treat as "no subscribers".
+	if !hasColumn(r.db, "app_records", "observe_streams") {
+		return nil, nil
+	}
+
+	rows, err := r.db.Query(
+		`SELECT slug, observe_streams FROM app_records WHERE observe_streams IS NOT NULL`,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("list observe subscriptions: %w", err)
+	}
+	defer rows.Close()
+
+	var out []ObserveSubscription
+	for rows.Next() {
+		var slug, raw string
+		if err := rows.Scan(&slug, &raw); err != nil {
+			slog.Warn("vault: skip observe_streams row (scan failed)",
+				"error", err)
+			continue
+		}
+		subs, err := parseObserveStreamsJSON(slug, raw)
+		if err != nil {
+			slog.Warn("vault: observe_streams JSON decode failed; row skipped",
+				"slug", slug,
+				"raw", raw,
+				"error", err)
+			continue
+		}
+		out = append(out, subs...)
+	}
+	return out, rows.Err()
+}
+
+// parseObserveStreamsJSON decodes one row's observe_streams column into
+// flat ObserveSubscription entries. Handles both SPEC §1.4.3 shapes
+// AND a mixed array (e.g. `["user_chat", {"stream":"probe","payload_level":"full"}]`)
+// — we parse as []json.RawMessage and try string-then-object per element,
+// so authoring tools that emit either form interop cleanly.
+func parseObserveStreamsJSON(slug, raw string) ([]ObserveSubscription, error) {
+	if raw == "" {
+		return nil, nil
+	}
+	var elements []json.RawMessage
+	if err := json.Unmarshal([]byte(raw), &elements); err != nil {
+		return nil, fmt.Errorf("not a JSON array: %w", err)
+	}
+	out := make([]ObserveSubscription, 0, len(elements))
+	for _, el := range elements {
+		// Try the simple-string form first (most common, set by
+		// `aikey app create --observe <stream>` and by
+		// ensure_first_party_app_keys for degrade-detector).
+		var s string
+		if err := json.Unmarshal(el, &s); err == nil {
+			out = append(out, ObserveSubscription{
+				Slug:         slug,
+				Stream:       s,
+				PayloadLevel: "metadata",
+			})
+			continue
+		}
+		// Fall back to object form (opt-in payload_level=full path).
+		var obj struct {
+			Stream       string `json:"stream"`
+			PayloadLevel string `json:"payload_level"`
+		}
+		if err := json.Unmarshal(el, &obj); err != nil {
+			return nil, fmt.Errorf("element neither string nor object: %s", string(el))
+		}
+		if obj.Stream == "" {
+			return nil, fmt.Errorf("object element missing 'stream' field: %s", string(el))
+		}
+		level := obj.PayloadLevel
+		if level == "" {
+			level = "metadata"
+		}
+		out = append(out, ObserveSubscription{
+			Slug:         slug,
+			Stream:       obj.Stream,
+			PayloadLevel: level,
+		})
+	}
+	return out, nil
+}
+
 // GetAppRecord reads a single application's metadata by slug. Returns nil
 // if the row does not exist or the app_records table is absent
 // (pre-Phase-4 vault). Used by the App pipeline per request to enforce
 // upstream-set whitelist (inferred upstream must be in app.Upstreams).
+//
+// Backward compat (2026-05-23): bound_alias / bound_at were added by the
+// P2 migration; older vault files lack the columns. We attempt the
+// extended SELECT first and fall back to the legacy 9-column SELECT
+// when SQLite reports "no such column" — same pattern used by
+// GetPersonalKeyByAlias for entries.base_url retrofit.
 func (r *Reader) GetAppRecord(slug string) (*AppRecord, error) {
 	var (
-		rec                   AppRecord
-		protocolsJSON         string
-		requestedPermsJSON    *string
-		vendor                *string
-		followUserActiveInt   int
+		rec                 AppRecord
+		protocolsJSON       string
+		requestedPermsJSON  *string
+		vendor              *string
+		followUserActiveInt int
+		boundAlias          *string
+		boundAt             *int64
+	)
+	err := r.db.QueryRow(
+		`SELECT slug, name, vendor, upstreams, app_kind, follow_user_active,
+		        bound_alias, bound_at,
+		        requested_permissions, created_at, updated_at
+		   FROM app_records
+		  WHERE slug = ?`,
+		slug,
+	).Scan(
+		&rec.Slug,
+		&rec.Name,
+		&vendor,
+		&protocolsJSON,
+		&rec.AppKind,
+		&followUserActiveInt,
+		&boundAlias,
+		&boundAt,
+		&requestedPermsJSON,
+		&rec.CreatedAt,
+		&rec.UpdatedAt,
+	)
+	if err == sql.ErrNoRows {
+		return nil, nil
+	}
+	if err != nil {
+		if strings.Contains(err.Error(), "no such table") {
+			return nil, nil // pre-Phase-4 vault — no apps
+		}
+		if strings.Contains(err.Error(), "no such column") {
+			// Pre-2026-05-23 vault without bound_alias / bound_at. Fall back
+			// to the legacy SELECT — BoundAlias stays "" so the App pipeline
+			// keeps using A mode (follow_user_active) for these legacy rows.
+			return r.getAppRecordLegacyShape(slug)
+		}
+		return nil, fmt.Errorf("read app record for slug=%q: %w", slug, err)
+	}
+	if vendor != nil {
+		rec.Vendor = *vendor
+	}
+	rec.FollowUserActive = followUserActiveInt != 0
+	if boundAlias != nil {
+		rec.BoundAlias = *boundAlias
+	}
+	if boundAt != nil {
+		rec.BoundAt = *boundAt
+	}
+	if err := json.Unmarshal([]byte(protocolsJSON), &rec.Upstreams); err != nil {
+		return nil, fmt.Errorf("decode app_records.upstreams for slug=%q: %w", slug, err)
+	}
+	if requestedPermsJSON != nil && *requestedPermsJSON != "" {
+		if err := json.Unmarshal([]byte(*requestedPermsJSON), &rec.RequestedPermissions); err != nil {
+			// Soft fail — requested_permissions is informational only, not
+			// runtime-enforced. Log + continue.
+			slog.Warn("app_records.requested_permissions decode failed; treating as empty",
+				"slug", slug, "error", err)
+		}
+	}
+	return &rec, nil
+}
+
+// getAppRecordLegacyShape is the pre-2026-05-23 fallback when the vault
+// hasn't been migrated to add bound_alias / bound_at columns yet. Mirrors
+// the main reader, but selects the 9-column shape.
+func (r *Reader) getAppRecordLegacyShape(slug string) (*AppRecord, error) {
+	var (
+		rec                 AppRecord
+		protocolsJSON       string
+		requestedPermsJSON  *string
+		vendor              *string
+		followUserActiveInt int
 	)
 	err := r.db.QueryRow(
 		`SELECT slug, name, vendor, upstreams, app_kind, follow_user_active,
@@ -993,10 +1348,7 @@ func (r *Reader) GetAppRecord(slug string) (*AppRecord, error) {
 		return nil, nil
 	}
 	if err != nil {
-		if strings.Contains(err.Error(), "no such table") {
-			return nil, nil // pre-Phase-4 vault — no apps
-		}
-		return nil, fmt.Errorf("read app record for slug=%q: %w", slug, err)
+		return nil, fmt.Errorf("read app record (legacy shape) for slug=%q: %w", slug, err)
 	}
 	if vendor != nil {
 		rec.Vendor = *vendor
@@ -1007,8 +1359,6 @@ func (r *Reader) GetAppRecord(slug string) (*AppRecord, error) {
 	}
 	if requestedPermsJSON != nil && *requestedPermsJSON != "" {
 		if err := json.Unmarshal([]byte(*requestedPermsJSON), &rec.RequestedPermissions); err != nil {
-			// Soft fail — requested_permissions is informational only, not
-			// runtime-enforced. Log + continue.
 			slog.Warn("app_records.requested_permissions decode failed; treating as empty",
 				"slug", slug, "error", err)
 		}
@@ -1063,12 +1413,12 @@ func (r *Reader) GetAllAppRouteTokens() ([]AppRouteToken, error) {
 			slog.Warn("skip app route token row", "error", err)
 			continue
 		}
-		if !isStrictAppBearerForm(t.RouteToken) {
+		if !isStrictAppBearerForm(t.RouteToken) && !isFirstPartyAppBearer(t.RouteToken) {
 			slog.Warn("skip app route token: non-strict form (writer-side bug or hand-crafted vault row)",
 				"app_slug", t.AppSlug,
 				"key_id", t.KeyID,
 				"route_token_prefix", routeTokenPrefixForLog(t.RouteToken),
-				"hint", "expected aikey_app_<64 lowercase hex>")
+				"hint", "expected aikey_app_<64 lowercase hex> or first-party whitelist entry")
 			continue
 		}
 		t.FollowUserActive = followUserActiveInt != 0
