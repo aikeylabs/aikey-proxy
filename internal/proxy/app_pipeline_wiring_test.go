@@ -35,6 +35,20 @@ import (
 	"github.com/AiKeyLabs/aikey-proxy/internal/vault"
 	"github.com/AiKeyLabs/aikey-proxy/internal/vkeys"
 	"github.com/AiKeyLabs/aikey-proxy/pkg/observer"
+
+	// Blank-import the OpenAI ↔ Anthropic translator pair so its init()
+	// registers with translator.DefaultRegistry() at test-binary boot.
+	// In production this happens in cmd/aikey-proxy/main.go; the
+	// internal/proxy package itself does not import any pairs package,
+	// so test binaries need the explicit blank-import. Without this
+	// every cross-protocol test fails with TRANSLATION_PAIR_NOT_REGISTERED
+	// despite the production binary working correctly — see
+	// TestHandle_AppPath_OpenAIWireToAnthropicUpstream_TranslatesEndToEnd
+	// for the regression it fences. (The comment in
+	// translation_isolation_test.go:38-39 claiming "tests import the
+	// pair via transitive imports" is aspirational, not true — this
+	// blank-import makes it true for the whole package.)
+	_ "github.com/AiKeyLabs/aikey-proxy/pkg/protocol-translator/pairs/openai_anthropic"
 )
 
 // strict app bearer fixture (74 chars: aikey_app_ + 64-hex)
@@ -129,6 +143,160 @@ func TestHandle_AppPath_HappyPathForwardsToUpstream(t *testing.T) {
 	// sanitizer didn't accidentally trash the request.
 	if !strings.Contains(string(capturedBody), `"messages"`) {
 		t.Errorf("upstream body lost messages field: %s", string(capturedBody))
+	}
+}
+
+// TestHandle_AppPath_OpenAIWireToAnthropicUpstream_TranslatesEndToEnd is
+// the A2 (Google "medium" — real localhost TCP for the upstream side;
+// inbound stays synthetic via httptest.NewRequest as elsewhere in this
+// file) regression for the protocol-translator integration on the App
+// pipeline. Added 2026-05-25 because the Agent-Quickstart "Supported
+// matrix" specifically claims this case works ("Cursor OpenAI-compat
+// endpoint + Claude model → /apps/X/v1/chat/completions → ✅ Fully
+// supported (OpenAI→Anthropic translation)"), but until now there was
+// NO end-to-end test that exercised:
+//
+//   inbound OpenAI wire (URL path /v1/chat/completions)
+//        ↓
+//   translator pairs/openai_anthropic.ConvertRequest
+//        ↓
+//   outbound Anthropic wire (URL path /v1/messages, top-level
+//        `messages` + `max_tokens`, no OpenAI `choices`)
+//        ↓
+//   translator pairs/openai_anthropic.ConvertNonStream
+//        ↓
+//   inbound-shaped OpenAI response (`choices[0].message.content`)
+//
+// Direct passthrough is covered by HappyPathForwardsToUpstream above
+// (OpenAI → OpenAI) and the rhythm-test-app tests further down
+// (Anthropic → Anthropic). Both assume same-wire-format passthrough,
+// so neither catches a regression that breaks translator wiring —
+// translator unit tests pass + same-wire passthrough passes, but the
+// "Cursor + Claude" path silently 500s. This test fences that gap.
+//
+// What the test does NOT cover: streaming SSE chunks. Per the
+// translator package doc that's still 阶段 1 work; the matrix
+// explicitly carves out streaming as a known limit. Non-stream is the
+// claim we can validate today.
+func TestHandle_AppPath_OpenAIWireToAnthropicUpstream_TranslatesEndToEnd(t *testing.T) {
+	var (
+		upstreamPath    string
+		upstreamBody    []byte
+		upstreamAuth    string
+		upstreamAPIKey  string
+	)
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		upstreamPath = r.URL.Path
+		// Anthropic API uses x-api-key, not Authorization. OpenAI uses
+		// Authorization: Bearer. Capture both so the assertion below
+		// works for either header convention.
+		upstreamAuth = r.Header.Get("Authorization")
+		upstreamAPIKey = r.Header.Get("X-Api-Key")
+		upstreamBody, _ = io.ReadAll(r.Body)
+		// Anthropic non-stream response shape. The proxy's translator
+		// MUST convert this to OpenAI shape before returning it to the
+		// client — that's the assertion below on w.Body.
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		w.Write([]byte(`{
+			"id": "msg_test",
+			"type": "message",
+			"role": "assistant",
+			"model": "claude-3-5-sonnet-20241022",
+			"content": [{"type":"text","text":"hi from anthropic"}],
+			"stop_reason": "end_turn",
+			"usage": {"input_tokens": 3, "output_tokens": 5}
+		}`))
+	}))
+	defer upstream.Close()
+
+	av := newAppPipelineTestVault("cross-proto-test", []string{"anthropic"}, "sk-ant-real", upstream.URL)
+	p := setupTestProxyWithActive(t, av)
+	seedAppRouteInProxy(p, "cross-proto-test")
+
+	// Inbound: OpenAI wire (URL = /v1/chat/completions) but body.model is
+	// claude-*. The resolver infers upstream=anthropic from the model
+	// name; the translator must then flip the wire format.
+	body := `{
+		"model": "claude-3-5-sonnet-20241022",
+		"messages": [{"role":"user","content":"hi"}]
+	}`
+	req := httptest.NewRequest("POST", "/apps/cross-proto-test/v1/chat/completions", strings.NewReader(body))
+	req.Header.Set("Authorization", "Bearer "+testAppBearer)
+	req.Header.Set("Content-Type", "application/json")
+
+	w := httptest.NewRecorder()
+	p.Handle(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200 from cross-proto forward, got %d: %s", w.Code, w.Body.String())
+	}
+
+	// 1) Upstream URL flip — translator must have moved the URL path
+	//    from /v1/chat/completions (OpenAI) to /v1/messages (Anthropic).
+	//    A regression here is the most common symptom of broken
+	//    translator wiring (proxy just passes /chat/completions through
+	//    to api.anthropic.com which 404s).
+	if upstreamPath != "/v1/messages" {
+		t.Errorf("upstream path = %q, want /v1/messages (proves translator URL flip)", upstreamPath)
+	}
+
+	// 2) Outbound credential — must be the vault-decrypted personal key,
+	//    NOT the inbound aikey_app_ bearer. Anthropic uses x-api-key
+	//    not Authorization, so check both header conventions: at least
+	//    one must carry the secret AND neither must carry the app
+	//    bearer (that would mean the credential resolver failed to swap
+	//    in the upstream key).
+	hasKey := upstreamAPIKey == "sk-ant-real" || upstreamAuth == "Bearer sk-ant-real"
+	if !hasKey {
+		t.Errorf("upstream got NO vault-decrypted key (x-api-key=%q, Authorization=%q); credential resolver failed",
+			upstreamAPIKey, upstreamAuth)
+	}
+	if upstreamAuth == "Bearer "+testAppBearer || upstreamAPIKey == testAppBearer {
+		t.Errorf("upstream got the inbound app bearer (x-api-key=%q, Authorization=%q); credential resolver did NOT swap in the upstream key",
+			upstreamAPIKey, upstreamAuth)
+	}
+
+	// 3) Outbound body shape — must look like Anthropic, not like OpenAI.
+	//    `choices` is OpenAI's response-side field; if it leaks into the
+	//    request body the translator's request half didn't fire.
+	//    `max_tokens` is required by Anthropic Messages API, so its
+	//    presence proves the translator added it (OpenAI request bodies
+	//    don't require it).
+	bodyStr := string(upstreamBody)
+	if strings.Contains(bodyStr, `"choices"`) {
+		t.Errorf("upstream body leaked OpenAI 'choices' field — translator request half didn't fire: %s", bodyStr)
+	}
+	if !strings.Contains(bodyStr, `"messages"`) {
+		t.Errorf("upstream body missing 'messages' field: %s", bodyStr)
+	}
+	if !strings.Contains(bodyStr, `"max_tokens"`) {
+		t.Errorf("upstream body missing 'max_tokens' (required by Anthropic, added by translator): %s", bodyStr)
+	}
+
+	// 4) Inbound response shape — translator response half must have
+	//    converted Anthropic's `content: [{type:"text",text:"..."}]`
+	//    into OpenAI's `choices[0].message.content`. If the upstream
+	//    response leaked through unchanged, the client (Cursor /
+	//    openai-python) would fail to parse — that's the user-visible
+	//    breakage we're fencing against.
+	var openAIResp struct {
+		ID      string `json:"id"`
+		Choices []struct {
+			Message struct {
+				Role    string `json:"role"`
+				Content string `json:"content"`
+			} `json:"message"`
+		} `json:"choices"`
+	}
+	if err := json.Unmarshal(w.Body.Bytes(), &openAIResp); err != nil {
+		t.Fatalf("response not JSON: %v, body=%s", err, w.Body.String())
+	}
+	if len(openAIResp.Choices) == 0 {
+		t.Fatalf("response missing OpenAI choices array (translator response half didn't fire): %s", w.Body.String())
+	}
+	if !strings.Contains(openAIResp.Choices[0].Message.Content, "hi from anthropic") {
+		t.Errorf("response content = %q, want substring 'hi from anthropic'", openAIResp.Choices[0].Message.Content)
 	}
 }
 
