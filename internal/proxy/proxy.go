@@ -2127,6 +2127,27 @@ func (p *Proxy) serveRoute(w http.ResponseWriter, r *http.Request, route *vkeys.
 				)
 			}
 			if resp.StatusCode >= 400 {
+				// 2026-05-25 — default-on app-pipeline 4xx/5xx forensic
+				// WARN log. Symptom that motivated this: a third-party
+				// APP's OAuth call returned 8 × 404 from Anthropic, and
+				// neither the WAL nor the proxy log captured the
+				// outbound URL or upstream error envelope — we couldn't
+				// distinguish "wrong URL" / "wrong model" / "WAF body
+				// rejection" without that data. The opt-in
+				// AIKEY_PROXY_DEBUG_4XX_BODIES capture below is verbose
+				// (full request/response body), but that's gated
+				// because bodies contain user prompts (PII). This new
+				// log stays default-on by limiting to non-PII fields:
+				// status + outbound URL + response envelope error
+				// metadata + route shape. No body contents.
+				//
+				// Scoped to RouteSource == "app" because the legacy
+				// /v1/... and provider-prefix paths already have their
+				// own observability surfaces; this fills the third-
+				// party app gap specifically.
+				if route.RouteSource == "app" {
+					p.logAppUpstreamErrorForensic(logger, r, resp, route, realKey)
+				}
 				// Optional debug capture: when AIKEY_PROXY_DEBUG_4XX_BODIES
 				// is set, drain the upstream body, log it together with the
 				// stashed request body, and re-buffer so the client still
@@ -2515,6 +2536,138 @@ func stashRequestBodyForDebug(r *http.Request) {
 func debugRequestBodyFromContext(ctx context.Context) []byte {
 	b, _ := ctx.Value(ctxKeyDebugReqBody).([]byte)
 	return b
+}
+
+// logAppUpstreamErrorForensic emits a default-on WARN log whenever an
+// app-pipeline request returns 4xx/5xx from the upstream. The goal is
+// to make third-party APP integration failures debuggable WITHOUT
+// requiring the operator to flip AIKEY_PROXY_DEBUG_4XX_BODIES first —
+// that flag dumps full bodies (PII) and is rightly opt-in, but the
+// resulting "off by default" leaves users staring at a generic 404 in
+// the dashboard with no way to ask "what URL? what error message?
+// what model? OAuth or API key?".
+//
+// PII safety contract:
+//   - Logs: status, outbound URL (host + path + query), upstream
+//     request_id, route shape (slug / kind / route_source), credential
+//     family (oauth vs personal-or-team — never the actual secret),
+//     upstream error envelope's `type` + `message` (truncated to
+//     errorMessageLogCap chars).
+//   - Does NOT log: Authorization header, x-api-key, OAuth bearer,
+//     full request body (may contain user prompts), full response body
+//     (may contain provider's PII echo).
+//
+// Body handling: drains the response body so the envelope parser can
+// run, then re-buffers so the client still gets the original payload
+// — same pattern as the existing debug4xx capture below. The drain is
+// hard-capped at errorBodyParseCap to keep memory pressure bounded
+// even when the upstream returns a giant 4xx response.
+//
+// When the body parses as a known provider error envelope (Anthropic /
+// OpenAI shape) the parsed `type` + `message` are surfaced as
+// dedicated fields so log consumers (jq filters, alert rules) can
+// pivot without string-matching the whole envelope.
+func (p *Proxy) logAppUpstreamErrorForensic(
+	logger *slog.Logger,
+	r *http.Request,
+	resp *http.Response,
+	route *vkeys.ResolvedRoute,
+	realKey string,
+) {
+	// Drain the response body — capped — so we can parse the error
+	// envelope. Re-buffer immediately so the downstream client still
+	// gets the original payload byte-for-byte.
+	const errorBodyParseCap = 8 * 1024
+	var bodyBytes []byte
+	if resp.Body != nil {
+		buf, err := io.ReadAll(io.LimitReader(resp.Body, errorBodyParseCap+1))
+		if err == nil {
+			bodyBytes = buf
+		}
+		_ = resp.Body.Close()
+		// Re-buffer for the client. If reading hit the cap, we lose
+		// the tail — accept that trade-off (the alternative is two
+		// passes / a TeeReader, both add complexity without proving
+		// useful in practice; provider errors fit well under 8 KB).
+		resp.Body = io.NopCloser(bytes.NewReader(bodyBytes))
+		resp.ContentLength = int64(len(bodyBytes))
+	}
+
+	// Outbound URL — reconstruct host from route.BaseURL since
+	// ReverseProxy.Director set req.URL.Scheme/Host on a different
+	// request object (the one passed to Director, not `r`). r.URL.Path
+	// + r.URL.RawQuery at this point ARE the outbound versions (the
+	// path mutation in handleAppPipeline + the ?beta=true added by
+	// oauthInject all happened before the Director ran).
+	outboundURL := route.BaseURL + r.URL.Path
+	if r.URL.RawQuery != "" {
+		outboundURL += "?" + r.URL.RawQuery
+	}
+
+	// Credential family — never the secret. realKey is one of:
+	//   "__oauth__" sentinel (oauth path; actual token in header set by oauthInject)
+	//   personal key plaintext / team virtual key plaintext (set by ResolveBindingCredential)
+	// Logging the family alone is enough for diagnosis without leaking
+	// the secret. realKey could in theory contain a real key, so the
+	// switch is a positive-match-or-redact pattern.
+	credFamily := "personal-or-team"
+	if realKey == "__oauth__" {
+		credFamily = "oauth"
+	}
+
+	// Parse the response envelope for provider-side error metadata.
+	// Both Anthropic and OpenAI wrap errors in:
+	//   {"type":"error","error":{"type":"...","message":"..."}}     (Anthropic)
+	//   {"error":{"type":"...","message":"...","code":"..."}}        (OpenAI)
+	// A single struct with optional fields covers both shapes.
+	errType, errMessage := parseUpstreamErrorEnvelope(bodyBytes)
+
+	const errorMessageLogCap = 500
+	if len(errMessage) > errorMessageLogCap {
+		errMessage = errMessage[:errorMessageLogCap] + "...<truncated>"
+	}
+
+	logger.Warn("app pipeline upstream error",
+		"event.name", "proxy.app.upstream_error",
+		"status_code", resp.StatusCode,
+		"upstream_request_id", extractUpstreamRequestID(resp),
+		"outbound_url", outboundURL,
+		"outbound_method", r.Method,
+		"route_source", route.RouteSource,
+		"app_slug", route.AppSlug,
+		"app_kind", route.AppKind,
+		"provider", route.ProviderCode,
+		"credential_family", credFamily,
+		"upstream_error_type", errType,
+		"upstream_error_message", errMessage,
+		// Hint for verbose follow-up — only one place to point operators
+		// at when this log isn't sufficient for diagnosis.
+		"hint", "set AIKEY_PROXY_DEBUG_4XX_BODIES=1 for full request/response body capture (PII risk: contains user prompts)",
+	)
+}
+
+// parseUpstreamErrorEnvelope extracts (type, message) from a provider
+// error response body. Returns ("", "") when the body isn't parseable
+// JSON or doesn't match a known envelope shape — both cases are
+// signal-free, not a bug.
+//
+// Anthropic shape:  {"type":"error","error":{"type":"not_found_error","message":"..."}}
+// OpenAI shape:     {"error":{"type":"invalid_request","message":"...","code":"..."}}
+// Both share the `error.{type,message}` nested path, so one parse covers them.
+func parseUpstreamErrorEnvelope(body []byte) (errType, errMessage string) {
+	if len(body) == 0 {
+		return "", ""
+	}
+	var env struct {
+		Error struct {
+			Type    string `json:"type"`
+			Message string `json:"message"`
+		} `json:"error"`
+	}
+	if err := json.Unmarshal(body, &env); err != nil {
+		return "", ""
+	}
+	return env.Error.Type, env.Error.Message
 }
 
 // truncateBodyForLog renders body bytes as a string, capping at the

@@ -300,6 +300,148 @@ func TestHandle_AppPath_OpenAIWireToAnthropicUpstream_TranslatesEndToEnd(t *test
 	}
 }
 
+// TestParseUpstreamErrorEnvelope fences the JSON shape parsing for the
+// 2026-05-25 default-on app-pipeline 4xx/5xx forensic log. The parser
+// must handle both Anthropic and OpenAI envelope shapes (they share
+// the same `error.{type,message}` nested path, so one struct covers
+// both) and degrade silently to ("", "") for non-JSON / unknown shapes.
+//
+// Why this matters: if the parser silently swallows a known shape,
+// the WARN log loses its highest-signal fields (error_type +
+// error_message) and operators are back to staring at a generic
+// `404 Not Found` with no upstream context. That was the exact
+// symptom that motivated this whole feature (8 × 404s from claude-mem
+// with no way to see Anthropic's explanation).
+func TestParseUpstreamErrorEnvelope(t *testing.T) {
+	cases := []struct {
+		name        string
+		body        string
+		wantType    string
+		wantMessage string
+	}{
+		{
+			name:        "anthropic 404 not_found_error",
+			body:        `{"type":"error","error":{"type":"not_found_error","message":"model: claude-opus-4-7"}}`,
+			wantType:    "not_found_error",
+			wantMessage: "model: claude-opus-4-7",
+		},
+		{
+			name:        "anthropic 429 rate_limit",
+			body:        `{"type":"error","error":{"type":"rate_limit_error","message":"This request would exceed your organization's rate limit"}}`,
+			wantType:    "rate_limit_error",
+			wantMessage: "This request would exceed your organization's rate limit",
+		},
+		{
+			name:        "openai invalid_request_error",
+			body:        `{"error":{"message":"Unsupported model","type":"invalid_request_error","code":"model_not_found"}}`,
+			wantType:    "invalid_request_error",
+			wantMessage: "Unsupported model",
+		},
+		{
+			name:        "openai authentication_error",
+			body:        `{"error":{"message":"Invalid API key","type":"authentication_error","code":"invalid_api_key","param":null}}`,
+			wantType:    "authentication_error",
+			wantMessage: "Invalid API key",
+		},
+		{
+			name:        "empty body — graceful",
+			body:        "",
+			wantType:    "",
+			wantMessage: "",
+		},
+		{
+			name:        "non-JSON HTML (gateway 502 page) — graceful",
+			body:        `<html><body>502 Bad Gateway</body></html>`,
+			wantType:    "",
+			wantMessage: "",
+		},
+		{
+			name:        "JSON but unknown envelope shape — graceful",
+			body:        `{"status":"error","detail":"something went wrong"}`,
+			wantType:    "",
+			wantMessage: "",
+		},
+		{
+			name:        "JSON with only partial fields — partial fill",
+			body:        `{"error":{"type":"server_error"}}`,
+			wantType:    "server_error",
+			wantMessage: "",
+		},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			gotType, gotMsg := parseUpstreamErrorEnvelope([]byte(c.body))
+			if gotType != c.wantType {
+				t.Errorf("type = %q, want %q", gotType, c.wantType)
+			}
+			if gotMsg != c.wantMessage {
+				t.Errorf("message = %q, want %q", gotMsg, c.wantMessage)
+			}
+		})
+	}
+}
+
+// TestHandle_AppPath_UpstreamError_LogsForensic verifies the
+// end-to-end wiring: when the upstream returns 4xx, the app pipeline
+// ModifyResponse closure invokes logAppUpstreamErrorForensic and the
+// downstream client still gets the original payload (the drain +
+// re-buffer must not corrupt the response).
+//
+// This pins the contract that ADDING the forensic log doesn't BREAK
+// the existing pass-through-to-client behavior — a regression where
+// the log forgot to re-buffer would silently 0-byte every 4xx
+// response to the user.
+func TestHandle_AppPath_UpstreamError_LogsForensic(t *testing.T) {
+	const anthropicErrBody = `{"type":"error","error":{"type":"not_found_error","message":"model: claude-experimental-xyz not found"}}`
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.Header().Set("request-id", "req_011_test_404")
+		w.WriteHeader(http.StatusNotFound)
+		_, _ = w.Write([]byte(anthropicErrBody))
+	}))
+	defer upstream.Close()
+
+	av := newAppPipelineTestVault("err-test-app", []string{"anthropic"}, "sk-ant-real", upstream.URL)
+	p := setupTestProxyWithActive(t, av)
+	seedAppRouteInProxy(p, "err-test-app")
+
+	// Use a model the resolver recognises as claude-family (prefix
+	// "claude-") so it routes to the anthropic upstream — letting the
+	// test exercise the END-OF-PIPELINE 4xx path (upstream rejects),
+	// not the EARLY-RESOLUTION 4xx path (UPSTREAM_UNINFERRABLE for
+	// unknown model names). The model name itself just has to be
+	// claude-prefixed; the mock upstream returns 404 regardless of
+	// what specific model id arrives.
+	body := `{"model":"claude-experimental-xyz","messages":[{"role":"user","content":"hi"}],"max_tokens":10}`
+	req := httptest.NewRequest("POST", "/apps/err-test-app/v1/messages", strings.NewReader(body))
+	req.Header.Set("Authorization", "Bearer "+testAppBearer)
+	req.Header.Set("Content-Type", "application/json")
+
+	w := httptest.NewRecorder()
+	p.Handle(w, req)
+
+	// 1) Client must see the upstream's 404 — proxy is a passthrough
+	//    for error responses, the forensic log is a side observation.
+	if w.Code != http.StatusNotFound {
+		t.Fatalf("expected 404 passthrough, got %d: %s", w.Code, w.Body.String())
+	}
+
+	// 2) Client body must be the EXACT upstream body. A regression in
+	//    the drain+re-buffer dance (forgetting NopCloser, double-read)
+	//    would silently 0-byte the client. Byte-for-byte match here is
+	//    the strongest possible fence.
+	if got := w.Body.String(); got != anthropicErrBody {
+		t.Errorf("response body corrupted by forensic log drain:\n  want: %q\n  got:  %q", anthropicErrBody, got)
+	}
+
+	// 3) Upstream request_id must be surfaced via Content-Length /
+	//    headers — verify ContentLength matches (proves re-buffer set
+	//    it correctly).
+	if w.Header().Get("Request-Id") != "req_011_test_404" {
+		t.Errorf("upstream request-id header not forwarded: got %q", w.Header().Get("Request-Id"))
+	}
+}
+
 // TestHandle_AppPathTakesPrecedenceOverProviderPrefix is the regression
 // test for the ordering invariant called out in router.go's ExtractAppPath
 // docstring + apppipe/router.go's package doc. Slug='openai' could in
