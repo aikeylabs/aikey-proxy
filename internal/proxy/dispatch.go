@@ -179,10 +179,13 @@ func isTier1App(token string) bool {
 //   - degrade-detector/server_local/services/check_orchestrator.py
 //     ::FIRST_PARTY_APP_KEY
 //   - aikey-cli/src/migrations.rs::DEGRADE_DETECTOR_FIRST_PARTY_BEARER
+//   - aikey-proxy/internal/events/reportable.go::firstPartyBearerToSlug
+//     (KEY set must match; that map ALSO carries slug values for probe-pipeline
+//     attribution — see BR-rc.5-54 / 2026-05-25)
 //
-// Duplicated in 3 packages here (proxy/dispatch.go, vault/route_token_form.go,
-// supervisor/team_token_normalize.go) due to import-cycle constraints —
-// same lockstep convention as :func:`hasStrictHex64Suffix`.
+// Duplicated in 4 packages now (proxy/dispatch.go, vault/route_token_form.go,
+// supervisor/team_token_normalize.go, events/reportable.go) due to import-cycle
+// constraints — same lockstep convention as :func:`hasStrictHex64Suffix`.
 var firstPartyAppBearerWhitelist = map[string]struct{}{
 	"aikey_app_internal_degrade_detector_v1": {},
 }

@@ -257,3 +257,67 @@ func TestBuildReportableEvent_LegacyRoutesOmitAppFields(t *testing.T) {
 			ev.AppSlug, ev.AppKeyID, ev.AppMode, ev.BoundVia, ev.RequestedModel, ev.ResolvedProvider)
 	}
 }
+
+// TestBuildReportableEvent_ProbeBearerFirstPartyAttribution pins
+// BR-rc.5-54 (2026-05-25): probe pipeline events fired with a known
+// first-party constant bearer MUST be attributed to that app via
+// AppSlug, even though the probe URL itself carries no slug. Without
+// this, the /user/apps/<slug> dashboard's `WHERE app_slug=...` filter
+// drops every successful manual Trust Check probe and the user sees a
+// misleading "no token consumption" picture.
+//
+// The other 5 App-pipeline fields (AppKeyID / AppMode / BoundVia /
+// RequestedModel / ResolvedProvider) MUST stay empty for probe events
+// — they're App-pipeline-specific (probe has no app_keys row, no
+// profile binding, the alias is explicit in the URL). The dashboard
+// reads AppSlug only, so this minimal attribution is enough; the
+// other fields would inject false semantics for downstream consumers.
+func TestBuildReportableEvent_ProbeBearerFirstPartyAttribution(t *testing.T) {
+	route := &vkeys.ResolvedRoute{
+		VirtualKeyID: "probe:FreySilvaqzs@qualityservice.com",
+		RouteSource:  "probe",
+		ProviderCode: "anthropic",
+	}
+	ev := BuildReportableEvent(ReportOpts{
+		EventID:     "evt-probe-1",
+		Route:       route,
+		BearerToken: "aikey_app_internal_degrade_detector_v1",
+		Model:       "claude-opus-4-7",
+		StatusCode:  200,
+	})
+	if ev.AppSlug != "degrade-detector" {
+		t.Errorf("expected AppSlug=\"degrade-detector\" for first-party probe bearer; got %q", ev.AppSlug)
+	}
+	// Probe events MUST NOT carry App-pipeline-specific fields — they
+	// don't have an app_keys row, no profile binding, no Mode A/B
+	// dispatch. Only the slug attribution is meaningful for dashboard
+	// filtering; anything else would invent semantics.
+	if ev.AppKeyID != "" || ev.AppMode != "" || ev.BoundVia != "" || ev.RequestedModel != "" || ev.ResolvedProvider != "" {
+		t.Errorf("probe attribution leaked App-pipeline-specific fields: AppKeyID=%q AppMode=%q BoundVia=%q RequestedModel=%q ResolvedProvider=%q",
+			ev.AppKeyID, ev.AppMode, ev.BoundVia, ev.RequestedModel, ev.ResolvedProvider)
+	}
+}
+
+// TestBuildReportableEvent_ProbeUnknownBearerNoAttribution pins the
+// negative path: when a probe is fired with a bearer NOT in the
+// first-party constant set (e.g. an `aikey_app_<64hex>` third-party
+// bearer somehow reached probe, or a future caller misuses), we MUST
+// NOT fabricate an AppSlug — empty result tells the dashboard to leave
+// it in the "ungrouped probe traffic" bucket.
+func TestBuildReportableEvent_ProbeUnknownBearerNoAttribution(t *testing.T) {
+	route := &vkeys.ResolvedRoute{
+		VirtualKeyID: "probe:my-alias",
+		RouteSource:  "probe",
+		ProviderCode: "anthropic",
+	}
+	ev := BuildReportableEvent(ReportOpts{
+		EventID:     "evt-probe-2",
+		Route:       route,
+		BearerToken: "aikey_app_unknown_third_party_xyz_64hex_xyz_64hex_xyz_64hex_xyz_64hex",
+		Model:       "claude-opus-4-7",
+		StatusCode:  200,
+	})
+	if ev.AppSlug != "" {
+		t.Errorf("expected empty AppSlug for unknown bearer; got %q (don't fabricate attribution)", ev.AppSlug)
+	}
+}

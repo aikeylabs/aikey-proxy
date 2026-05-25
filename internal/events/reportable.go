@@ -317,9 +317,55 @@ func BuildReportableEvent(opts ReportOpts) ReportableEvent {
 		}
 		ev.RequestedModel = opts.Model
 		ev.ResolvedProvider = route.ProviderCode
+	} else if route.RouteSource == "probe" {
+		// Probe pipeline attribution (BR-rc.5-54, 2026-05-25): when
+		// trust-local (or any future first-party plugin) fires a
+		// `/probe/<alias>/v1/messages` request with its compile-time
+		// constant bearer, the probe URL itself carries NO app slug —
+		// the proxy only learns who's calling by reverse-mapping the
+		// bearer. Without this attribution, every successful manual
+		// `Trust Check` probe lands in ODS with `app_slug=NULL`, so
+		// the `/user/apps/<slug>` dashboard's `WHERE app_slug=...`
+		// filter shows ONLY the orphan `/apps/<slug>/...` rows (often
+		// failures) and HIDES the real successful probe traffic →
+		// user sees "3 requests, 0 tokens" while the feature is
+		// actually working — UX-broken honesty hole.
+		//
+		// We deliberately do NOT set AppKeyID / AppMode / BoundVia
+		// here: those are App-pipeline-specific (probe has no app_keys
+		// row, no profile binding, the alias is explicit in the URL).
+		// Only AppSlug is filled — enough to make the dashboard whole
+		// without polluting downstream consumers that key off
+		// AppMode/BoundVia semantics.
+		if slug := firstPartyAppSlugForBearer(opts.BearerToken); slug != "" {
+			ev.AppSlug = slug
+		}
 	}
 
 	return ev
+}
+
+// firstPartyBearerToSlug maps a first-party app's compile-time constant
+// bearer back to its slug, so probe-pipeline events can be attributed
+// to the right app in dashboards (see BuildReportableEvent above).
+//
+// **Drift 防退化**: this map's KEY set MUST equal the bearer set in
+//   - aikey-proxy/internal/proxy/dispatch.go::firstPartyAppBearerWhitelist
+//   - aikey-proxy/internal/vault/route_token_form.go::firstPartyAppBearerWhitelist
+//   - aikey-proxy/internal/supervisor/team_token_normalize.go::firstPartyAppBearerWhitelist
+//   - aikey-cli/src/migrations.rs::DEGRADE_DETECTOR_FIRST_PARTY_BEARER
+//   - degrade-detector/server_local/services/check_orchestrator.py::FIRST_PARTY_APP_KEY
+// Adding a new first-party app means touching ALL of these — same
+// lockstep convention as the existing 3 whitelist copies.
+var firstPartyBearerToSlug = map[string]string{
+	"aikey_app_internal_degrade_detector_v1": "degrade-detector",
+}
+
+// firstPartyAppSlugForBearer returns the slug owning `bearer`, or empty
+// string if the bearer isn't a known first-party constant. Empty result
+// MUST cause the caller to skip AppSlug attribution (don't fabricate).
+func firstPartyAppSlugForBearer(bearer string) string {
+	return firstPartyBearerToSlug[bearer]
 }
 
 // deriveKeyLabel returns a user-facing identifier for the credential based on
