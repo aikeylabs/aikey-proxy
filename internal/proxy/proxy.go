@@ -827,6 +827,17 @@ func (p *Proxy) handleAppPipeline(w http.ResponseWriter, r *http.Request, appCtx
 		binding.ProviderCode = canonicalUpstream
 	}
 
+	// Capture inbound bearer BEFORE Stage 5 — ResolveBindingCredential calls
+	// oauthInject which overwrites r.Header.Authorization with the upstream
+	// OAuth access token. If we read it AFTER, `extractRawAuthValue(r)` returns
+	// the upstream secret instead of the client-presented token, breaking the
+	// audit anchor (virtual_key_hash) AND the first-party probe attribution
+	// branch in BuildReportableEvent (BR-rc.5-60 fix relies on the client
+	// bearer to reverse-lookup the app slug). Bug surfaced via BR-rc.5-60
+	// follow-up 2026-05-25 when manual Trust Check probes kept landing in ODS
+	// with app_slug=NULL despite the attribution code being in place.
+	inboundBearer := extractRawAuthValue(r)
+
 	// Stage 5: resolve credential from binding (shared with legacy path).
 	// p.ResolveBindingCredential walks the same OAuth/team/personal branches
 	// used by handlePathPrefixRoute — pinned by oauth_binding_fence_test.go.
@@ -977,10 +988,9 @@ func (p *Proxy) handleAppPipeline(w http.ResponseWriter, r *http.Request, appCtx
 		}
 	}
 
-	// Extract the inbound app bearer for serveRoute's bearerToken arg —
-	// used for audit / structured logging only (not for upstream injection;
-	// that's already handled by prov.RewriteRequest / oauthInject above).
-	inboundBearer := extractRawAuthValue(r)
+	// inboundBearer is captured pre-Stage-5 above (moved 2026-05-25 to
+	// survive oauthInject's Authorization rewrite — see comment near
+	// Stage 5).
 
 	// app_mode tags the credential-resolution path so log readers can tell
 	// A vs B mode without re-deriving from follow_user_active + bound_alias
@@ -1173,6 +1183,14 @@ func (p *Proxy) handleProbePipeline(w http.ResponseWriter, r *http.Request, prob
 	// see the same code regardless of vault storage convention.
 	binding.ProviderCode = canonicalUpstream
 
+	// Capture inbound bearer BEFORE Stage 5 — same reason as handleAppPipeline:
+	// ResolveBindingCredential → oauthInject overwrites r.Header.Authorization
+	// with the upstream OAuth access token. Reading AFTER returns the upstream
+	// secret instead of the client's constant first-party bearer, breaking
+	// BR-rc.5-60's probe → app_slug attribution (firstPartyAppSlugForBearer
+	// lookup fails because the bearer is no longer the whitelisted constant).
+	inboundBearer := extractRawAuthValue(r)
+
 	// Stage 5: resolve credential via the shared App/legacy machinery.
 	upstream := binding.ProviderCode
 	cred, bindErr := p.ResolveBindingCredential(r, binding, upstream, upstream, logger)
@@ -1290,7 +1308,7 @@ func (p *Proxy) handleProbePipeline(w http.ResponseWriter, r *http.Request, prob
 		}
 	}
 
-	inboundBearer := extractRawAuthValue(r)
+	// inboundBearer captured pre-Stage-5 above (must precede oauthInject).
 
 	logger.Info("probe pipeline forwarding upstream",
 		"binding_source_type", binding.KeySourceType,
