@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"fmt"
 	"io"
 	"log/slog"
 	"net/http"
@@ -725,6 +726,53 @@ func (p *Proxy) ResolveBindingCredential(
 func (p *Proxy) handleAppPipeline(w http.ResponseWriter, r *http.Request, appCtx *apppipe.AppContext, startTime time.Time, logger *slog.Logger, traceID string) {
 	_ = startTime
 	logger = logger.With("app_slug", appCtx.Slug)
+
+	// 2026-05-25 防呆 (double-v1 base_url misconfiguration):
+	//
+	// Real-world bug seen with Anthropic Python SDK + claude-mem-style
+	// plugin: the SDK appends "/v1/messages" to the configured base_url
+	// unconditionally. If the user set base_url to
+	// "http://127.0.0.1:27200/apps/<slug>/v1" (the form that works for
+	// openai-python, which appends "/chat/completions" without "/v1"),
+	// the Anthropic SDK produces
+	// "http://127.0.0.1:27200/apps/<slug>/v1/v1/messages" — double v1.
+	//
+	// ExtractAppPath happily parses this as
+	// {Slug:<slug>, StrippedPath:"/v1/messages"}, then the handler
+	// prepends "/v1" again on line 921 → outbound URL becomes
+	// "https://api.anthropic.com/v1/v1/messages" which Anthropic 404s
+	// with "Not Found". The user sees an opaque 404 with no clue that
+	// it's a base_url config error on their side.
+	//
+	// Detection: strippedPath starting with "/v1/" means the inbound URL
+	// was /apps/<slug>/v1/v1/... (only the second v1 ends up in
+	// strippedPath after the first one was stripped). No legitimate
+	// upstream path starts with /v1 (Anthropic uses /messages,
+	// /complete; OpenAI uses /chat/completions, /embeddings; none start
+	// with another "v1" segment). Safe to reject.
+	//
+	// Emit a precise, actionable error so the user fixes it in their
+	// SDK config rather than blaming AiKey for "404 from upstream".
+	if strings.HasPrefix(appCtx.StrippedPath, "/v1/") || appCtx.StrippedPath == "/v1" {
+		p.errors.Add(1)
+		logger.Warn("app pipeline base_url misconfigured (double /v1)",
+			"event.name", "proxy.app.base_url_misconfigured",
+			"inbound_path", r.URL.Path,
+			"stripped_path", appCtx.StrippedPath,
+			"hint", "client base_url likely ends with /v1 AND SDK appends another /v1/<endpoint>",
+		)
+		writeJSONError(w, http.StatusBadRequest, "invalid_request_error", "BASE_URL_MISCONFIGURED",
+			fmt.Sprintf(
+				"Your client's base_url has a double /v1/ — received URL %q after stripping "+
+					"the app prefix becomes %q, which means the original URL was "+
+					"/apps/%s/v1/v1/... — that 'second v1' was added by your SDK on top of the /v1 "+
+					"already in your base_url. Fix: drop /v1 from base_url. "+
+					"For Anthropic SDK: base_url=\"http://127.0.0.1:27200/apps/%s\" (no trailing /v1). "+
+					"For OpenAI SDK: base_url=\"http://127.0.0.1:27200/apps/%s/v1\" (keep /v1 — OpenAI SDK appends /chat/completions without /v1).",
+				r.URL.Path, appCtx.StrippedPath, appCtx.Slug, appCtx.Slug, appCtx.Slug,
+			))
+		return
+	}
 
 	// Stage 1: authn — extract bearer, verify Registry membership, check
 	// the URL slug matches the token's vault-recorded AppSlug.

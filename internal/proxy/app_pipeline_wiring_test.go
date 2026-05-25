@@ -442,6 +442,100 @@ func TestHandle_AppPath_UpstreamError_LogsForensic(t *testing.T) {
 	}
 }
 
+// TestHandle_AppPath_DoubleV1_RejectsWithBaseURLMisconfigured is the
+// fence for the 2026-05-25 防呆 guard. Real-world bug: Anthropic
+// Python SDK appends "/v1/messages" to base_url unconditionally; if
+// the user set base_url to ".../apps/<slug>/v1" (the form openai-python
+// expects), the SDK produces ".../apps/<slug>/v1/v1/messages". Pre-guard,
+// the proxy parsed this as Slug=<slug>, StrippedPath="/v1/messages",
+// prepended "/v1" again, and forwarded "/v1/v1/messages" to the
+// upstream — Anthropic returned 404 with no explanation. The guard
+// catches this at handler entry and returns a precise error code +
+// actionable hint so users fix base_url instead of debugging
+// non-existent upstream routing.
+//
+// Both Anthropic-SDK shape (.../v1/v1/messages) and OpenAI-SDK shape
+// (.../v1/v1/chat/completions) trip the same guard — the rule is
+// "strippedPath starts with /v1/".
+func TestHandle_AppPath_DoubleV1_RejectsWithBaseURLMisconfigured(t *testing.T) {
+	// No upstream needed — the guard fires before any forwarding.
+	av := newAppPipelineTestVault("dv1-test", []string{"anthropic"}, "sk-ant-real", "http://unused")
+	p := setupTestProxyWithActive(t, av)
+	seedAppRouteInProxy(p, "dv1-test")
+
+	cases := []struct {
+		name string
+		path string
+	}{
+		{"anthropic SDK shape (double v1 + messages)", "/apps/dv1-test/v1/v1/messages"},
+		{"openai SDK shape (double v1 + chat/completions)", "/apps/dv1-test/v1/v1/chat/completions"},
+		{"bare double v1", "/apps/dv1-test/v1/v1"},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			req := httptest.NewRequest("POST", c.path, strings.NewReader(`{"model":"claude-3-5-sonnet","messages":[{"role":"user","content":"hi"}]}`))
+			req.Header.Set("Authorization", "Bearer "+testAppBearer)
+			req.Header.Set("Content-Type", "application/json")
+			w := httptest.NewRecorder()
+			p.Handle(w, req)
+
+			if w.Code != http.StatusBadRequest {
+				t.Fatalf("path %q: expected 400, got %d: %s", c.path, w.Code, w.Body.String())
+			}
+
+			var env struct {
+				Error struct {
+					Type    string `json:"type"`
+					Code    string `json:"code"`
+					Message string `json:"message"`
+				} `json:"error"`
+			}
+			if err := json.Unmarshal(w.Body.Bytes(), &env); err != nil {
+				t.Fatalf("response not JSON: %v, body=%s", err, w.Body.String())
+			}
+			if env.Error.Code != "BASE_URL_MISCONFIGURED" {
+				t.Errorf("error.code = %q, want BASE_URL_MISCONFIGURED", env.Error.Code)
+			}
+			// Message must mention the exact fix in actionable form —
+			// the user should see what base_url to use for each SDK.
+			if !strings.Contains(env.Error.Message, "drop /v1") {
+				t.Errorf("error.message should contain actionable 'drop /v1' hint, got: %s", env.Error.Message)
+			}
+			if !strings.Contains(env.Error.Message, "Anthropic SDK") {
+				t.Errorf("error.message should call out Anthropic SDK explicitly, got: %s", env.Error.Message)
+			}
+			if !strings.Contains(env.Error.Message, "OpenAI SDK") {
+				t.Errorf("error.message should call out OpenAI SDK explicitly, got: %s", env.Error.Message)
+			}
+		})
+	}
+}
+
+// TestHandle_AppPath_SingleV1_PassesGuard verifies the guard does NOT
+// false-positive on legitimate single-v1 paths. Pre-guard the regression
+// risk was "guard too eager rejects valid URLs"; this pin catches that.
+func TestHandle_AppPath_SingleV1_PassesGuard(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{"id":"x","type":"message","content":[{"type":"text","text":"ok"}],"role":"assistant","stop_reason":"end_turn","usage":{"input_tokens":1,"output_tokens":1}}`))
+	}))
+	defer upstream.Close()
+	av := newAppPipelineTestVault("single-v1-test", []string{"anthropic"}, "sk-ant-real", upstream.URL)
+	p := setupTestProxyWithActive(t, av)
+	seedAppRouteInProxy(p, "single-v1-test")
+
+	// Legitimate /apps/<slug>/v1/messages — no double v1.
+	req := httptest.NewRequest("POST", "/apps/single-v1-test/v1/messages", strings.NewReader(`{"model":"claude-3-5-sonnet","messages":[{"role":"user","content":"hi"}]}`))
+	req.Header.Set("Authorization", "Bearer "+testAppBearer)
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+	p.Handle(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("single-v1 path should pass guard, got %d: %s", w.Code, w.Body.String())
+	}
+}
+
 // TestHandle_AppPathTakesPrecedenceOverProviderPrefix is the regression
 // test for the ordering invariant called out in router.go's ExtractAppPath
 // docstring + apppipe/router.go's package doc. Slug='openai' could in
