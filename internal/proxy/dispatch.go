@@ -8,7 +8,8 @@ package proxy
 // provider tokens (e.g. `sk-...`) are handled by a separate fallthrough path.
 //
 // Dispatch outcomes:
-//   - Tier2Probe         → `aikey_probe_*` (test sentinel, tier 2 path)
+//   - Tier2Probe         → `aikey_probe_<alias>` (test sentinel; vault-decrypted)
+//   - Tier2ProbeRaw      → `aikey_probe_raw_<canonical>` (pre-save probe; bearer in X-Aikey-Probe-Bearer header, no vault lookup)
 //   - Tier1Team          → `aikey_team_*` (team static bearer; Registry lookup)
 //   - Tier1Personal      → `aikey_personal_<64-hex>` (personal static bearer; Registry lookup)
 //   - Tier1App           → `aikey_app_<64-hex>` (third-party app static bearer; App pipeline)
@@ -42,6 +43,20 @@ const (
 	// Tier2Probe — token is `aikey_probe_*`; targets the exact alias in the
 	// suffix via the proxy's tier-2 probe path (server-side decryption).
 	Tier2Probe
+
+	// Tier2ProbeRaw — token is `aikey_probe_raw_<canonical_provider_code>`;
+	// pre-save connectivity probe. Bearer comes from the X-Aikey-Probe-Bearer
+	// HTTP header (not vault lookup, not active binding). Used by:
+	//   - Web Add Key modal Test connectivity button (pre-save, plaintext key in form)
+	//   - CLI `aikey add` connectivity test (pre-save)
+	//
+	// Spec: roadmap20260320/技术实现/update/20260526-pre-save-proxy-probe-raw.md
+	// Suffix MUST be a known canonical provider code (no aliases — caller must
+	// pre-normalize). Caller MUST also send `X-Aikey-Probe: 1` to skip
+	// reporter / WAL (enforced at handler boundary). Outbound X-Aikey-Probe-*
+	// headers MUST be stripped before forwarding to upstream (allowlist model,
+	// see handleProbeRaw).
+	Tier2ProbeRaw
 
 	// Tier1Team — token is `aikey_team_*`; resolve via Registry as a static
 	// bearer for the named team key. Registry miss → TokenInvalid downstream.
@@ -84,6 +99,21 @@ func ClassifyToken(token string) DispatchAction {
 	}
 
 	switch {
+	case strings.HasPrefix(token, "aikey_probe_raw_"):
+		// Tier 2 ProbeRaw — pre-save probe (2026-05-26). MUST be checked
+		// BEFORE aikey_probe_ because they share the aikey_probe_ prefix;
+		// reverse order would misclassify aikey_probe_raw_<canonical> as
+		// Tier2Probe with alias="raw_<canonical>" (silent failure: alias
+		// lookup miss → confusing 503 instead of a clear TOKEN_INVALID).
+		suffix := strings.TrimPrefix(token, "aikey_probe_raw_")
+		if !isCanonicalProviderCode(suffix) {
+			// Empty suffix, non-canonical (alias like "claude" / "gpt"),
+			// or unknown provider → TOKEN_INVALID. Caller must pre-normalize
+			// to canonical codes; this avoids ambiguity at the proxy boundary.
+			return TokenInvalid
+		}
+		return Tier2ProbeRaw
+
 	case strings.HasPrefix(token, "aikey_probe_"):
 		// Tier 2 — probe sentinel. Suffix is the alias to test; non-empty
 		// is enforced at the probe handler (returning a clear error if so).
@@ -135,6 +165,60 @@ func ClassifyToken(token string) DispatchAction {
 		// post-migration), etc. → TOKEN_INVALID per namespace authority.
 		return TokenInvalid
 	}
+}
+
+// canonicalProviderCodes is the strict allowlist of canonical provider codes
+// accepted as the suffix of `aikey_probe_raw_*` (Tier2ProbeRaw, 2026-05-26).
+//
+// ⚠️  CROSS-LANGUAGE DRIFT RISK — MUST STAY IN SYNC WITH:
+//   - aikey-cli/data/provider_registry.yaml (canonical source-of-truth)
+//   - aikey-proxy/internal/proxy/middleware.go::providerDefaultBaseURL switch
+//   - aikey-proxy/internal/proxy/middleware.go::providerCanonicalCode mapper
+//
+// Aliases ("claude" / "gpt" / "gemini") are INTENTIONALLY EXCLUDED — caller
+// (CLI/Web) MUST pre-normalize to canonical form before constructing the
+// aikey_probe_raw_ token. This forces explicit caller awareness of provider
+// identity (the URL path's canonical code IS the routing decision) and avoids
+// ambiguity at the proxy boundary.
+//
+// Why a separate map (not reuse providerDefaultBaseURL switch): drift across
+// the two would silently produce wrong behavior (a provider added to the
+// default-base-URL switch but missing here would reject valid probe_raw
+// tokens). Single source of truth via grep gate in CI:
+//   `grep -A2 "case \"" middleware.go::providerDefaultBaseURL | grep "case"`
+//   must produce same set as keys of canonicalProviderCodes.
+var canonicalProviderCodes = map[string]struct{}{
+	"anthropic":   {},
+	"openai":      {},
+	"google":      {},
+	"deepseek":    {},
+	"kimi_code":   {},
+	"moonshot":    {},
+	"groq":        {},
+	"xai":         {},
+	"openrouter":  {},
+	"perplexity":  {},
+	"zhipu":       {},
+	"qwen":        {},
+	"doubao":      {},
+	"siliconflow": {},
+}
+
+// isCanonicalProviderCode returns true iff `code` is a known canonical
+// provider code (NOT an alias). Used by ClassifyToken to validate
+// `aikey_probe_raw_<canonical>` suffix at the namespace authority boundary.
+//
+// Rejects:
+//   - "" (empty suffix)
+//   - aliases ("claude", "gpt", "chatgpt", "codex", "gemini", "kimi", "grok",
+//     "pplx", "glm", "zhipuai", "dashscope", "tongyi", "ark", "volcengine",
+//     "xai_grok")
+//   - any case variation (must be lowercase; the namespace-authority principle
+//     forbids implicit normalization)
+//   - unknown providers (typos / future-extension residue)
+func isCanonicalProviderCode(code string) bool {
+	_, ok := canonicalProviderCodes[code]
+	return ok
 }
 
 // isTier1Personal returns true iff `token` is exactly `aikey_personal_`

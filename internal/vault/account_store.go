@@ -2,12 +2,34 @@ package vault
 
 import (
 	"context"
+	"crypto/rand"
 	"database/sql"
+	"encoding/hex"
 	"fmt"
 	"time"
 
 	broker "github.com/AiKeyLabs/aikey-auth-broker"
 )
+
+// generateRouteToken mirrors aikey-cli's `storage::generate_route_token()`
+// (aikey-cli/src/storage.rs:1423): "aikey_personal_" + 64 lowercase hex
+// chars (256 bits via crypto/rand). The lowercase requirement comes from
+// the proxy's `isTier1Personal` form check, which rejects uppercase —
+// this is a hard contract documented in
+// roadmap20260320/技术实现/update/20260429-token前缀按角色重命名.md §4.
+//
+// Defined here (not in a shared helper) because this file is the only Go
+// site that needs to generate the token — broker.ProviderAccount struct
+// has no RouteToken field (token is a vault-owned identifier, not a
+// broker concept). See bugfix
+// 20260525-vault-oauth-route-token-not-generated-by-web-broker.md.
+func generateRouteToken() (string, error) {
+	var b [32]byte
+	if _, err := rand.Read(b[:]); err != nil {
+		return "", fmt.Errorf("crypto/rand: %w", err)
+	}
+	return "aikey_personal_" + hex.EncodeToString(b[:]), nil
+}
 
 // VaultAccountStore implements broker.AccountStore using SQLite.
 // Account metadata is stored in plaintext (not encrypted) — only tokens are encrypted.
@@ -22,12 +44,66 @@ func NewAccountStore(db *sql.DB) *VaultAccountStore {
 }
 
 func (s *VaultAccountStore) Save(_ context.Context, acct *broker.ProviderAccount) error {
-	_, err := s.db.Exec(
+	// BR-rc.5 fix (2026-05-25): preserve / generate `route_token`.
+	//
+	// Pre-fix: this INSERT covered 12 columns NOT including route_token.
+	// `INSERT OR REPLACE` semantics replace the entire row, so any
+	// existing route_token (e.g. seeded later by `aikey route` or by an
+	// earlier CLI `aikey auth login` against the same account) would be
+	// nuked on every broker save. New OAuth accounts created via the
+	// web OAuthBrokerCard ended up with route_token=NULL, which the
+	// vault drawer UI rendered as "Unlock vault to reveal this token"
+	// even when the vault was unlocked (UI assumes NULL=locked).
+	//
+	// CLI-side `aikey auth login` symmetric path called
+	// `storage::ensure_provider_account_route_token(account_id)` right
+	// after broker save (commands_auth/mod.rs:393), so CLI-added OAuth
+	// happened to have route_token. Web path bypasses that — the broker
+	// is the only writer for web-added accounts, so the broker's save
+	// MUST itself manage route_token.
+	//
+	// Strategy:
+	//   1. Read existing route_token for this account_id (could exist
+	//      from a prior save or from CLI-side ensure).
+	//   2. If empty / NULL, generate a fresh one matching CLI format
+	//      ("aikey_personal_" + 64 lowercase hex).
+	//   3. INSERT OR REPLACE with the resolved token in the value list.
+	//
+	// Wrapped in a transaction so the read + insert is atomic against
+	// concurrent saves of the same account_id (rare but possible if the
+	// user clicks "Connect" twice in the OAuthBrokerCard UI).
+	//
+	// See bugfix 20260525-vault-oauth-route-token-not-generated-by-web-
+	// broker.md.
+
+	tx, err := s.db.Begin()
+	if err != nil {
+		return fmt.Errorf("save provider account: begin tx: %w", err)
+	}
+	defer func() { _ = tx.Rollback() }() // no-op after Commit
+
+	var existing sql.NullString
+	if err := tx.QueryRow(
+		"SELECT route_token FROM provider_accounts WHERE provider_account_id = ?",
+		acct.ProviderAccountID,
+	).Scan(&existing); err != nil && err != sql.ErrNoRows {
+		return fmt.Errorf("save provider account: read existing route_token: %w", err)
+	}
+
+	routeToken := existing.String
+	if !existing.Valid || routeToken == "" {
+		routeToken, err = generateRouteToken()
+		if err != nil {
+			return fmt.Errorf("save provider account: generate route_token: %w", err)
+		}
+	}
+
+	if _, err := tx.Exec(
 		`INSERT OR REPLACE INTO provider_accounts
 			(provider_account_id, provider, auth_type, credential_type, status,
 			 external_id, display_identity, org_uuid, account_tier,
-			 created_at, last_used_at, owner_type)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+			 created_at, last_used_at, owner_type, route_token)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		acct.ProviderAccountID,
 		acct.Provider,
 		acct.AuthType,
@@ -40,9 +116,13 @@ func (s *VaultAccountStore) Save(_ context.Context, acct *broker.ProviderAccount
 		acct.CreatedAt.Unix(),
 		nullTime(acct.LastUsedAt),
 		"local_user",
-	)
-	if err != nil {
+		routeToken,
+	); err != nil {
 		return fmt.Errorf("save provider account: %w", err)
+	}
+
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("save provider account: commit: %w", err)
 	}
 	return nil
 }

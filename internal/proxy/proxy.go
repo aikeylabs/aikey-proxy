@@ -379,6 +379,15 @@ func (p *Proxy) Handle(w http.ResponseWriter, r *http.Request) {
 		writeJSONError(w, http.StatusUnauthorized, "authentication_error", "TOKEN_INVALID",
 			"Probe sentinel requires path-prefix routing (use /<provider>/v1/... URL).")
 		return
+	case Tier2ProbeRaw:
+		// Same gating reason as Tier2Probe — probe_raw needs path-derived
+		// canonical provider to construct upstream URL; legacy /v1/... entry
+		// has no path prefix. Reject precisely so caller (CLI/web) gets a
+		// clear hint rather than a silent upstream-URL-empty failure.
+		p.errors.Add(1)
+		writeJSONError(w, http.StatusUnauthorized, "authentication_error", "TOKEN_INVALID",
+			"Pre-save probe (aikey_probe_raw_*) requires path-prefix routing (use /<provider>/v1/... URL).")
+		return
 	case Tier3ActiveSentinel:
 		p.errors.Add(1)
 		writeJSONError(w, http.StatusUnauthorized, "authentication_error", "TOKEN_INVALID",
@@ -1435,6 +1444,21 @@ func (p *Proxy) handlePathPrefixRoute(w http.ResponseWriter, r *http.Request, pr
 		writeJSONError(w, http.StatusUnauthorized, "authentication_error", "TOKEN_INVALID",
 			"Token is in the aikey_ namespace but doesn't match any recognized form. "+
 				"Run 'aikey route' to see valid tokens.")
+		return
+	}
+
+	// Tier2ProbeRaw — pre-save proxy probe (2026-05-26, see probe_raw.go +
+	// roadmap20260320/技术实现/update/20260526-pre-save-proxy-probe-raw.md).
+	// MUST be dispatched BEFORE Tier1 / Tier3 paths because handleProbeRaw
+	// short-circuits all vault binding lookups — caller's plaintext bearer
+	// in X-Aikey-Probe-Bearer is the auth source. Self-contained pipeline:
+	// no reporter / WAL / GetProviderBinding involvement (audit-able as one
+	// file in probe_raw.go).
+	if dispatchAction == Tier2ProbeRaw {
+		// Strip provider prefix so handleProbeRaw forwards using the path
+		// the caller actually requested (e.g. /anthropic/v1/messages →
+		// /v1/messages joined onto upstream base URL).
+		p.handleProbeRaw(w, r, canonicalCode, strippedPath, logger)
 		return
 	}
 

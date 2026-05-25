@@ -191,6 +191,123 @@ func TestClassifyToken_ProbeChecksBeforePersonal(t *testing.T) {
 	}
 }
 
+// 2026-05-26 — Tier2ProbeRaw (pre-save probe). Pins the contract from
+// roadmap20260320/技术实现/update/20260526-pre-save-proxy-probe-raw.md §2.1.
+//
+// Three invariants under test:
+//   A. Canonical-only acceptance — suffix must be in the canonicalProviderCodes
+//      allowlist; aliases (claude/gpt/etc) are rejected with TokenInvalid.
+//   B. Order independence vs Tier2Probe — `aikey_probe_raw_<canonical>` shares
+//      the `aikey_probe_` prefix with Tier2Probe; reverse order would silently
+//      misclassify as Tier2Probe with alias="raw_<canonical>". Pin the order.
+//   C. Strict form — empty suffix / non-canonical / case-variations all fail.
+func TestClassifyToken_Tier2ProbeRaw_Canonical(t *testing.T) {
+	// Every canonical provider must accept.
+	canonicals := []string{
+		"anthropic", "openai", "google", "deepseek",
+		"kimi_code", "moonshot", "groq", "xai",
+		"openrouter", "perplexity", "zhipu", "qwen",
+		"doubao", "siliconflow",
+	}
+	for _, c := range canonicals {
+		tok := "aikey_probe_raw_" + c
+		got := ClassifyToken(tok)
+		if got != Tier2ProbeRaw {
+			t.Errorf("ClassifyToken(%q) = %v, want Tier2ProbeRaw", tok, got)
+		}
+	}
+}
+
+// Invariant B: probe_raw must shadow probe (checked first in classifier).
+// If reversed, aikey_probe_raw_anthropic → Tier2Probe with alias="raw_anthropic"
+// → silent failure at handler (alias miss → confusing 503 instead of clean
+// TOKEN_INVALID surface to caller).
+func TestClassifyToken_ProbeRawChecksBeforeProbe(t *testing.T) {
+	tok := "aikey_probe_raw_anthropic"
+	got := ClassifyToken(tok)
+	if got != Tier2ProbeRaw {
+		t.Errorf("ClassifyToken(%q) = %v, want Tier2ProbeRaw (probe_raw must shadow probe)", tok, got)
+	}
+}
+
+// Invariant A & C: aliases + empty + unknown + case variations → TokenInvalid.
+// Callers (CLI/Web) MUST pre-normalize to canonical before constructing the
+// probe_raw token; reject anything else loud at the dispatch boundary per the
+// namespace-authority principle (no implicit normalization).
+func TestClassifyToken_Tier2ProbeRaw_RejectsNonCanonical(t *testing.T) {
+	rejects := []struct {
+		name string
+		tok  string
+	}{
+		// Empty suffix.
+		{"empty suffix", "aikey_probe_raw_"},
+
+		// Aliases — caller must normalize to canonical first.
+		{"alias claude", "aikey_probe_raw_claude"},
+		{"alias gpt", "aikey_probe_raw_gpt"},
+		{"alias chatgpt", "aikey_probe_raw_chatgpt"},
+		{"alias codex", "aikey_probe_raw_codex"},
+		{"alias gemini", "aikey_probe_raw_gemini"},
+		{"alias kimi", "aikey_probe_raw_kimi"},
+		{"alias grok", "aikey_probe_raw_grok"},
+		{"alias glm", "aikey_probe_raw_glm"},
+		{"alias dashscope", "aikey_probe_raw_dashscope"},
+		{"alias ark", "aikey_probe_raw_ark"},
+		{"alias volcengine", "aikey_probe_raw_volcengine"},
+
+		// Case variations — namespace-authority forbids implicit normalization.
+		{"uppercase canonical", "aikey_probe_raw_ANTHROPIC"},
+		{"mixed case canonical", "aikey_probe_raw_OpenAI"},
+
+		// Unknown provider (typo / future-extension residue / made-up).
+		{"unknown made-up", "aikey_probe_raw_blahblah"},
+		{"typo of canonical", "aikey_probe_raw_anthopic"},
+
+		// Whitespace and special chars.
+		{"trailing space", "aikey_probe_raw_anthropic "},
+		{"leading space", "aikey_probe_raw_ anthropic"},
+		{"double underscore", "aikey_probe_raw__anthropic"},
+	}
+	for _, c := range rejects {
+		t.Run(c.name, func(t *testing.T) {
+			got := ClassifyToken(c.tok)
+			if got != TokenInvalid {
+				t.Errorf("ClassifyToken(%q) = %v, want TokenInvalid", c.tok, got)
+			}
+		})
+	}
+}
+
+// isCanonicalProviderCode focused suite — pins the allowlist itself.
+// Drift between this list and the providerDefaultBaseURL switch is the
+// security-critical risk (a probe_raw token for a provider missing here
+// silently fails; a provider added here but missing from base URL silently
+// succeeds with empty upstream URL). Both directions need a fence test.
+func TestIsCanonicalProviderCode_StrictAllowlist(t *testing.T) {
+	accepts := []string{
+		"anthropic", "openai", "google", "deepseek",
+		"kimi_code", "moonshot", "groq", "xai",
+		"openrouter", "perplexity", "zhipu", "qwen",
+		"doubao", "siliconflow",
+	}
+	for _, c := range accepts {
+		if !isCanonicalProviderCode(c) {
+			t.Errorf("isCanonicalProviderCode(%q) = false, want true", c)
+		}
+	}
+
+	rejects := []string{
+		"", "claude", "gpt", "chatgpt", "codex", "gemini",
+		"kimi", "grok", "glm", "dashscope", "ark",
+		"ANTHROPIC", "OpenAI", "blahblah", " anthropic", "anthropic ",
+	}
+	for _, c := range rejects {
+		if isCanonicalProviderCode(c) {
+			t.Errorf("isCanonicalProviderCode(%q) = true, want false", c)
+		}
+	}
+}
+
 // Strict form check: isTier1Personal as a standalone unit (also covered
 // indirectly by ClassifyToken tests, but worth a focused suite for the
 // most security-critical predicate).
