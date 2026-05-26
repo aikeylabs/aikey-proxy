@@ -88,7 +88,7 @@ func (p *Proxy) serveRouteWithObserver(
 			KeyAlias:       route.KeyAlias,
 			ProviderID:     route.ProviderCode,
 			ProtocolFamily: pf,
-			SessionID:      resolveSessionID(r.Header, route.ProviderCode),
+			SessionID:      resolveSessionID(r, route.ProtocolType, route.ProviderCode),
 			TraceID:        traceID,
 			StartedAt:      startTime,
 		}
@@ -587,7 +587,7 @@ func (p *Proxy) serveRoute(w http.ResponseWriter, r *http.Request, route *vkeys.
 					p.collector.Record(ev)
 					// Non-streaming always terminates atomically — the response is
 					// either the full JSON or it's an error we surface elsewhere.
-					sessionID := resolveSessionID(r.Header, route.ProviderCode)
+					sessionID := resolveSessionID(r, route.ProtocolType, route.ProviderCode)
 					upstreamReqID := extractUpstreamRequestID(resp)
 					p.reportUsage(route, bearerToken, ev.Model, startTime, resp.StatusCode, breakdown, "", realKey, sessionID, "complete", upstreamReqID)
 				}
@@ -599,7 +599,7 @@ func (p *Proxy) serveRoute(w http.ResponseWriter, r *http.Request, route *vkeys.
 				// Capture probe flag + session_id from the request now; by
 				// callback time the request's header map may have been recycled.
 				probe := isAikeyProbe(r)
-				sessionID := resolveSessionID(r.Header, route.ProviderCode)
+				sessionID := resolveSessionID(r, route.ProtocolType, route.ProviderCode)
 				// Capture upstreamReqID NOW (response headers are stable from
 				// here onward; the streaming body keeps draining in a goroutine
 				// but headers are already finalised by upstream).

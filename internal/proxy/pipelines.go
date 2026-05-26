@@ -517,7 +517,7 @@ func (p *Proxy) handleAppPipeline(w http.ResponseWriter, r *http.Request, appCtx
 			ProviderID:     binding.ProviderCode,
 			ProtocolFamily: appResolvedRoute.ProtocolFamily,
 			RequestedModel: inboundModel,
-			SessionID:      resolveSessionID(r.Header, binding.ProviderCode),
+			SessionID:      resolveSessionID(r, appResolvedRoute.ProtocolType, binding.ProviderCode),
 			TraceID:        traceID,
 			StartedAt:      startTime,
 		}
@@ -800,7 +800,7 @@ func (p *Proxy) handleProbePipeline(w http.ResponseWriter, r *http.Request, prob
 			ProviderID:     binding.ProviderCode,
 			ProtocolFamily: probeResolvedRoute.ProtocolFamily,
 			RequestedModel: inboundModel,
-			SessionID:      resolveSessionID(r.Header, binding.ProviderCode),
+			SessionID:      resolveSessionID(r, probeResolvedRoute.ProtocolType, binding.ProviderCode),
 			TraceID:        traceID,
 			StartedAt:      startTime,
 		}

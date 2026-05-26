@@ -74,6 +74,11 @@ func migrate(db *sql.DB) error {
 		{"bound_via", "ALTER TABLE usage_events ADD COLUMN bound_via TEXT DEFAULT ''"},
 		{"requested_model", "ALTER TABLE usage_events ADD COLUMN requested_model TEXT DEFAULT ''"},
 		{"resolved_provider", "ALTER TABLE usage_events ADD COLUMN resolved_provider TEXT DEFAULT ''"},
+		// v1.0.0-rc.6: session_id for Performance Top N sessions chart.
+		// Same idempotent-ADD-with-pragma-probe pattern as the rest;
+		// new column lives at end of the table to keep INSERT ordering
+		// of pre-existing columns stable.
+		{"session_id", "ALTER TABLE usage_events ADD COLUMN session_id TEXT DEFAULT ''"},
 	}
 	for _, c := range appCols {
 		var count int
@@ -112,8 +117,9 @@ func (s *Store) Insert(events []UsageEvent) error {
 		INSERT INTO usage_events
 			(timestamp, virtual_key_id, provider, model, input_tokens, output_tokens,
 			 duration_ms, status_code, is_streaming, error_type, request_path,
-			 app_slug, app_key_id, app_mode, bound_via, requested_model, resolved_provider)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+			 app_slug, app_key_id, app_mode, bound_via, requested_model, resolved_provider,
+			 session_id)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 	`)
 	if err != nil {
 		return fmt.Errorf("prepare insert: %w", err)
@@ -143,6 +149,7 @@ func (s *Store) Insert(events []UsageEvent) error {
 			e.BoundVia,
 			e.RequestedModel,
 			e.ResolvedProvider,
+			e.SessionID,
 		)
 		if err != nil {
 			return fmt.Errorf("insert event: %w", err)

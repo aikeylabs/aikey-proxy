@@ -1030,47 +1030,90 @@ func TestExtractModel_StreamingRequest_StillExtractsKimiSession(t *testing.T) {
 	}
 }
 
+// resolveSessionID was rewritten 2026-05-26 to delegate to the
+// sessionid package's config-driven extractor (session-fingerprint.yaml). The
+// tests below are smoke tests at the wrapper layer — they verify the
+// proxy correctly hands req/protocol/provider to the extractor and
+// the resulting session_id matches what the WAL would record. Pure
+// rule-correctness tests live in sessionid/matcher_test.go.
+//
+// Signature change: was (http.Header, providerCode); is (*http.Request,
+// protocolType, providerCode). Callers in pipelines.go / forward_and_resolve.go
+// updated in lockstep. See design + plan docs:
+//   roadmap20260320/技术实现/阶段5-丰富生态/20260526-Performance页会话维度与下钻设计.md
+
+func makeReqWithHeaders(h http.Header) *http.Request {
+	req := httptest.NewRequest("POST", "https://example.com/v1/messages", strings.NewReader(""))
+	for k, vs := range h {
+		for _, v := range vs {
+			req.Header.Add(k, v)
+		}
+	}
+	return req
+}
+
 func TestResolveSessionID_ClaudeHeaderWins(t *testing.T) {
-	// Claude header wins across ALL providers — it's Claude-specific and
-	// can't be forged by other SDKs. Pass providerCode="kimi" here to
-	// prove the gate doesn't accidentally short-circuit the Claude path.
+	// Claude header is the authoritative source on anthropic protocol.
+	// Even with an X-Aikey-Kimi-Session stash present (a body-parsed
+	// hint that's only meaningful for kimi routes), Claude wins on
+	// anthropic because the yaml's anthropic rule does NOT include
+	// the Kimi stash header — protocol scoping prevents cross-pollution.
 	h := http.Header{}
 	h.Set("X-Claude-Code-Session-Id", "claude-sess-1")
 	h.Set("x-aikey-kimi-session", "kimi-sess-should-lose")
-	if got := resolveSessionID(h, "kimi"); got != "claude-sess-1" {
-		t.Errorf("want Claude header to win, got %q", got)
+	req := makeReqWithHeaders(h)
+	if got := resolveSessionID(req, "anthropic", "anthropic"); got != "claude-sess-1" {
+		t.Errorf("want Claude header to win on anthropic protocol, got %q", got)
 	}
 }
 
 func TestResolveSessionID_KimiFallback(t *testing.T) {
+	// Kimi protocol: the X-Aikey-Kimi-Session header (stashed by
+	// extractModel from body's prompt_cache_key) is the canonical
+	// session source per yaml's openai_compatible/kimi_code rule.
 	h := http.Header{}
 	h.Set("x-aikey-kimi-session", "kimi-sess-only")
-	if got := resolveSessionID(h, "kimi"); got != "kimi-sess-only" {
-		t.Errorf("want kimi fallback, got %q", got)
+	req := makeReqWithHeaders(h)
+	if got := resolveSessionID(req, "openai_compatible", "kimi_code"); got != "kimi-sess-only" {
+		t.Errorf("want kimi stash header to provide session, got %q", got)
 	}
 }
 
 func TestResolveSessionID_BothMissing(t *testing.T) {
-	if got := resolveSessionID(http.Header{}, "kimi"); got != "" {
+	req := makeReqWithHeaders(http.Header{})
+	if got := resolveSessionID(req, "openai_compatible", "kimi_code"); got != "" {
 		t.Errorf("want empty for no headers, got %q", got)
 	}
 }
 
-// Regression guard for review finding #3 (2026-04-20): if a non-Kimi
-// provider's body happens to carry `prompt_cache_key` (and extractModel
-// stamps x-aikey-kimi-session regardless of provider, which it does),
-// resolveSessionID MUST NOT surface that value to the WAL event — it's
-// Kimi-specific semantics, applying it to Anthropic / OpenAI / Generic
-// events would be silent data pollution.
+// Regression guard for review finding #3 (2026-04-20), preserved across
+// the 2026-05-26 sessionid refactor: if a non-Kimi provider's body
+// happens to carry `prompt_cache_key` (and extractModel still stamps
+// x-aikey-kimi-session regardless of provider), the WAL event MUST NOT
+// surface that value — `prompt_cache_key` is Kimi-specific semantics.
+//
+// The yaml achieves this via protocol scoping: only the kimi_code /
+// moonshot / kimi rules list X-Aikey-Kimi-Session as a source.
+// Anthropic / OpenAI rules don't, so the stash is invisible there.
 func TestResolveSessionID_NonKimiProviderIgnoresKimiHeader(t *testing.T) {
 	h := http.Header{}
 	h.Set("x-aikey-kimi-session", "looks-like-session-but-not-kimi")
 
-	for _, provider := range []string{"anthropic", "openai", "generic", ""} {
-		if got := resolveSessionID(h, provider); got != "" {
-			t.Errorf("provider=%q: x-aikey-kimi-session must NOT leak (got %q) — "+
-				"gate should restrict this header to kimi routes only",
-				provider, got)
+	cases := []struct {
+		protocol string
+		provider string
+	}{
+		{"anthropic", "anthropic"},
+		{"openai", "openai"},
+		{"some_future_protocol", "generic"},
+		{"", ""},
+	}
+	for _, c := range cases {
+		req := makeReqWithHeaders(h)
+		if got := resolveSessionID(req, c.protocol, c.provider); got != "" {
+			t.Errorf("protocol=%q provider=%q: x-aikey-kimi-session must NOT leak (got %q) — "+
+				"yaml scoping should restrict this header to kimi routes only",
+				c.protocol, c.provider, got)
 		}
 	}
 }

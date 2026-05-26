@@ -38,6 +38,7 @@ import (
 	"github.com/AiKeyLabs/aikey-proxy/internal/events"
 	"github.com/AiKeyLabs/aikey-proxy/internal/observability"
 	"github.com/AiKeyLabs/aikey-proxy/internal/provider"
+	"github.com/AiKeyLabs/aikey-proxy/internal/proxy/sessionid"
 	"github.com/AiKeyLabs/aikey-proxy/internal/vkeys"
 )
 
@@ -69,6 +70,12 @@ func (p *Proxy) buildBaseEvent(req *http.Request, resp *http.Response, startTime
 		ev.Model = model
 		ev.RequestedModel = model // Phase 4 §5.3 — captured at request entry, may differ from upstream `Model` after translator remaps
 	}
+	// SessionID (v1.0.0-rc.6): populate the local UsageEvent so the
+	// offline-retry upload path (events.db → collector ingest) preserves
+	// the session dimension even when the live reporter is down. Uses
+	// the same yaml-driven extractor as reportUsage's sessionID arg, so
+	// local and wire formats stay in lockstep.
+	ev.SessionID = resolveSessionID(req, route.ProtocolType, route.ProviderCode)
 	// Phase 4 (AKL-207) — App pipeline audit fields. Empty for legacy paths
 	// (route.RouteSource != "app").
 	if route.RouteSource == "app" {
@@ -111,7 +118,7 @@ func (p *Proxy) recordEvent(req *http.Request, resp *http.Response, startTime ti
 	p.collector.Record(ev)
 	// Error responses are treated as interrupted — the client never got a
 	// usable result even though the request finished "fast" from our POV.
-	sessionID := resolveSessionID(req.Header, route.ProviderCode)
+	sessionID := resolveSessionID(req, route.ProtocolType, route.ProviderCode)
 	upstreamReqID := extractUpstreamRequestID(resp)
 	p.reportUsage(route, bearerToken, ev.Model, startTime, resp.StatusCode, provider.TokenBreakdown{}, ev.ErrorType, "", sessionID, "interrupted", upstreamReqID)
 }
@@ -437,46 +444,35 @@ func (p *Proxy) reportUsage(route *vkeys.ResolvedRoute, bearerToken, model strin
 	p.wal.Append(ev)
 }
 
-// resolveSessionID picks the request's session identifier from whichever
-// source the upstream client populated:
-//   - `X-Claude-Code-Session-Id` header (Claude Code native)
-//   - `x-aikey-kimi-session` header (we stash it from body `prompt_cache_key`
-//     in extractModel; only Kimi's kimi-cli populates that field)
-//
-// Header order is "Claude first" so Claude's current behaviour is unchanged
-// when both happen to be set (which shouldn't occur in practice since one
-// vk corresponds to one provider).
 // resolveSessionID returns the session id to stamp into the WAL event.
 //
-// Priority:
-//  1. `X-Claude-Code-Session-Id` request header (authoritative — set by
-//     Claude Code client for every turn). Wins unconditionally, across
-//     any provider — the header is Claude-specific and can't be forged
-//     by other upstream SDKs.
-//  2. `x-aikey-kimi-session` (stashed by extractModel from body
-//     `prompt_cache_key`). Only consulted when `providerCode == "kimi"`,
-//     so a non-Kimi client that happens to put a `prompt_cache_key` in
-//     its body CANNOT inject a session_id into our WAL (review finding
-//     2026-04-20 #3). `prompt_cache_key` is a first-class Kimi concept;
-//     other SDKs may repurpose that field for unrelated things and we
-//     must not conflate them.
+// Delegates to the sessionid package's config-driven extractor
+// (fingerprint.yaml). The dispatch table there encodes which header
+// or body field carries the session ID for each (protocol, provider)
+// combination — Claude Code's X-Claude-Code-Session-Id, Kimi's
+// prompt_cache_key, OpenAI's conversation_id, the cross-protocol
+// X-Aikey-Session-Id convention for third-party Agents, plus a
+// common fallback. New protocols are added by editing yaml, not Go
+// code. See design doc:
 //
-// `providerCode` should be the route's canonical provider code (e.g.
-// "kimi_code", "moonshot", "anthropic"), not a URL-derived alias.
+//	roadmap20260320/技术实现/阶段5-丰富生态/
+//	  20260526-Performance页会话维度与下钻设计.md
 //
-// 2026-05-08 Kimi 双平台拆分: provider_code 'kimi' 拆为 'kimi_code' (Kimi Code)
-// + 'moonshot' (Moonshot)。两个平台都基于 Kimi 上游协议,都使用
-// `prompt_cache_key` 作为 session id 字段,所以都需要从 stash header 提取。
-// 'kimi' 保留为 deprecated alias 兜底 (老 vault 数据 / 手工构造场景)。
-func resolveSessionID(h http.Header, providerCode string) string {
-	if v := h.Get("X-Claude-Code-Session-Id"); v != "" {
-		return v
-	}
-	switch providerCode {
-	case "kimi_code", "moonshot", "kimi":
-		return h.Get("x-aikey-kimi-session")
-	}
-	return ""
+// Pre-rc.6 behavior was a hard-coded ladder: X-Claude-Code-Session-Id
+// header, then (only for Kimi) x-aikey-kimi-session header that
+// extractModel pre-stashes from the body's prompt_cache_key. The new
+// extractor preserves both paths (Kimi yaml rule tries the stashed
+// header first as a perf shortcut, then falls back to body parsing
+// if the stash isn't populated), so the existing extractModel stash
+// mechanism continues to work without changes.
+//
+// Both args come from the resolved route; protocol is the wire-level
+// protocol family (e.g. "anthropic", "openai", "openai_compatible"),
+// provider is the canonical code (e.g. "anthropic", "kimi_code",
+// "moonshot", "openai"). Empty values are tolerated — the extractor
+// falls through to common_fallback.
+func resolveSessionID(req *http.Request, protocolType, providerCode string) string {
+	return sessionid.Default().Extract(req, protocolType, providerCode)
 }
 
 // extractModel reads the request body to find the top-level `model` field

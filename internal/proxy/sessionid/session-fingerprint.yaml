@@ -1,0 +1,131 @@
+# Session ID extraction fingerprint table.
+#
+# Why this file exists. ODS / DWD carry a single `session_id` column
+# meant to aggregate per-conversation token usage across every supported
+# protocol. The header / body field that carries the session ID differs
+# per client and per protocol, so the extractor is config-driven instead
+# of code-driven — adding a new protocol means editing this yaml, not
+# adding an `if` branch in Go. See:
+#   roadmap20260320/技术实现/阶段5-丰富生态/20260526-Performance页会话维度与下钻设计.md
+#   roadmap20260320/技术实现/阶段5-丰富生态/20260526-Performance页会话维度-分阶段实施计划.md
+#
+# Trust model. session_id is client-controlled and spoofable. It feeds
+# display-only dashboard dimensions, never authorization or billing.
+# Same trust posture as uaattribution's app_slug.
+#
+# Matching order. Rules are evaluated in declared order. The first
+# rule whose match block satisfies (protocol [+ optional provider])
+# the inbound request gets to try its sources. Within that rule,
+# sources are tried in declared order; the first non-empty extraction
+# wins (short-circuit). If no rule matches (or the matching rule
+# returns empty) we fall through to `common_fallback`. If that also
+# returns empty the matcher returns "" and the caller writes NULL to
+# the DB (intentionally: NULL = "no session dimension on this event").
+#
+# Source types.
+#   - header:           HTTP header by name (case-insensitive per Go http.Header.Get)
+#   - body_json_field:  JSON field path on the request body (dot-separated, supports
+#                       one level of nesting e.g. "metadata.user_id"). Body parsing
+#                       is opt-in per rule — adding a body_json_field source means
+#                       paying a 64KB read + json.Unmarshal cost on every request
+#                       of that protocol. Don't add it casually. Bodies larger than
+#                       64KB skip JSON parsing (graceful degradation, returns "").
+
+rules:
+  # ── Anthropic protocol ──────────────────────────────────────────
+  # Source order: explicit convention (X-Aikey-Session-Id) > implicit
+  # IDE header (X-Claude-Code-Session-Id).
+  #
+  # Why explicit first: aikey-proxy's oauthInject middleware stamps a
+  # fake X-Claude-Code-Session-Id UUID on every OAuth request as part
+  # of its WAF-defeat headers (so non-Claude-Code clients can also
+  # reach Anthropic's OAuth-only endpoints). Without ordering it
+  # first, a third-party Agent that bothers to set X-Aikey-Session-Id
+  # would have its identifier silently overridden by the stamped UUID
+  # at extraction time — breaking the very contract the convention
+  # header is meant to provide.
+  #
+  # When ONLY Claude Code itself is the caller, X-Aikey-Session-Id is
+  # absent (Claude Code doesn't know about it), so the matcher falls
+  # through to X-Claude-Code-Session-Id and gets the real UUID Claude
+  # Code stamped — behavior unchanged for the existing common case.
+  - match: { protocol: "anthropic" }
+    sources:
+      - { type: "header", name: "X-Aikey-Session-Id" }
+      - { type: "header", name: "X-Claude-Code-Session-Id" }
+
+  # ── Kimi family (openai_compatible protocol, provider scoped) ───
+  # Kimi documents `prompt_cache_key` in the body as the per-session
+  # discriminator that powers their cache hit calculation. Reusing it
+  # as session_id lines AiKey's dashboard up with what Kimi itself
+  # already aggregates on.
+  - match: { protocol: "openai_compatible", provider: "kimi_code" }
+    sources:
+      - { type: "header", name: "X-Aikey-Kimi-Session" }
+      - { type: "body_json_field", path: "prompt_cache_key" }
+      - { type: "header", name: "X-Aikey-Session-Id" }
+  - match: { protocol: "openai_compatible", provider: "moonshot" }
+    sources:
+      - { type: "header", name: "X-Aikey-Kimi-Session" }
+      - { type: "body_json_field", path: "prompt_cache_key" }
+      - { type: "header", name: "X-Aikey-Session-Id" }
+
+  # Deprecated alias compatibility: pre-2026-05-08 vaults store
+  # provider_code = "kimi" before the kimi_code / moonshot split.
+  # Keep this rule so events from old vaults still get session
+  # attribution; remove once those vaults are confirmed migrated.
+  - match: { protocol: "openai_compatible", provider: "kimi" }
+    sources:
+      - { type: "header", name: "X-Aikey-Kimi-Session" }
+      - { type: "body_json_field", path: "prompt_cache_key" }
+      - { type: "header", name: "X-Aikey-Session-Id" }
+
+  # ── OpenAI protocol (Cursor, Codex CLI, ChatGPT API direct) ─────
+  # OpenAI doesn't have a standard session header; `conversation_id`
+  # in body is the closest (used by ChatGPT API). Cursor / Cline use
+  # the X-Aikey convention header.
+  - match: { protocol: "openai" }
+    sources:
+      - { type: "header", name: "X-Aikey-Session-Id" }
+      - { type: "body_json_field", path: "conversation_id" }
+
+  # ── GLM / Zhipu (openai_compatible) ─────────────────────────────
+  # GLM uses request_id as the per-request correlation; not strictly
+  # a session but the closest practical handle. Third-party agents
+  # against GLM should set X-Aikey-Session-Id for proper grouping.
+  - match: { protocol: "openai_compatible", provider: "zhipu" }
+    sources:
+      - { type: "header", name: "X-Aikey-Session-Id" }
+      - { type: "body_json_field", path: "request_id" }
+
+# Fallback tried when no rule matched OR matched rule's sources all
+# returned empty. Pure-header so it's always cheap.
+#
+# X-Claude-Code-Session-Id is here (not just under the anthropic rule)
+# because Claude Code routinely wraps non-Anthropic upstreams — users
+# can route Claude Code's API calls through any provider via /v1/...
+# path-prefix or by reconfiguring the CLI's base URL. The header is
+# Claude-specific in origin but represents "the IDE conversation",
+# which is a valid session identifier regardless of upstream protocol.
+# Pre-2026-05-26 behavior was "Claude header wins across ALL providers"
+# (see TestResolveSessionID_ClaudeHeaderWins for the original
+# invariant) — putting it in common_fallback preserves that.
+#
+# X-Aikey-Session-Id is the cross-protocol convention header for
+# third-party Agents — added FIRST so explicit convention wins over
+# the implicit Claude-IDE header when both are set. Same rationale
+# as the anthropic rule's source ordering above — oauthInject stamps
+# X-Claude-Code-Session-Id defensively, so explicit user intent
+# (X-Aikey-Session-Id) must win to preserve the contract.
+common_fallback:
+  - { type: "header", name: "X-Aikey-Session-Id" }
+  - { type: "header", name: "X-Claude-Code-Session-Id" }
+
+# Hard safety bound on body parsing. Requests whose body exceeds this
+# byte count skip the JSON parse step entirely (extractor returns ""
+# from the body source). Keeps Claude Code's multi-MB cached-prompt
+# requests from being held in memory — header-only Anthropic rules
+# never trigger body reads anyway, but the limit is enforced
+# defensively in case someone adds a body source to anthropic rules
+# in the future.
+body_max_bytes: 65536

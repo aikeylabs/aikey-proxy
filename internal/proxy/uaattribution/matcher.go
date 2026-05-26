@@ -32,10 +32,10 @@ import (
 	"gopkg.in/yaml.v3"
 )
 
-//go:embed fingerprint.yaml
+//go:embed ua-fingerprint.yaml
 var embeddedFingerprintYAML []byte
 
-// rule is one prefix → slug mapping entry from fingerprint.yaml.
+// rule is one prefix → slug mapping entry from ua-fingerprint.yaml.
 type rule struct {
 	Prefix string `yaml:"prefix"`
 	Slug   string `yaml:"slug"`
@@ -61,7 +61,7 @@ type Matcher struct {
 //
 // Matching is case-sensitive prefix; the first rule that matches wins.
 // An empty input or no matching rule returns the configured fallback
-// (never the empty string — see fingerprint.yaml rationale).
+// (never the empty string — see ua-fingerprint.yaml rationale).
 func (m *Matcher) Match(userAgent string) string {
 	ua := strings.TrimSpace(userAgent)
 	if ua == "" {
@@ -78,7 +78,7 @@ func (m *Matcher) Match(userAgent string) string {
 // Load parses raw YAML bytes into a Matcher.
 //
 // Used directly only by tests; production code calls Default which
-// caches the matcher built from the embedded fingerprint.yaml.
+// caches the matcher built from the embedded ua-fingerprint.yaml.
 func Load(raw []byte) (*Matcher, error) {
 	var f fingerprintFile
 	if err := yaml.Unmarshal(raw, &f); err != nil {
@@ -104,14 +104,14 @@ var (
 )
 
 // Default returns the process-wide Matcher built from the embedded
-// fingerprint.yaml. The first call parses; subsequent calls return the
+// ua-fingerprint.yaml. The first call parses; subsequent calls return the
 // cached instance. Panics if the embedded YAML is malformed (boot-time
 // build break — see package docstring "Failure mode").
 func Default() *Matcher {
 	defaultOnce.Do(func() {
 		m, err := Load(embeddedFingerprintYAML)
 		if err != nil {
-			panic(fmt.Sprintf("uaattribution: embedded fingerprint.yaml is invalid: %v", err))
+			panic(fmt.Sprintf("uaattribution: embedded ua-fingerprint.yaml is invalid: %v", err))
 		}
 		defaultM = m
 	})

@@ -36,4 +36,13 @@ type UsageEvent struct {
 	BoundVia         string `json:"bound_via,omitempty"`         // profile_id used at resolve time, e.g., "app:degrade-detector" or "default"
 	RequestedModel   string `json:"requested_model,omitempty"`   // body's `model` field (may differ from resolved if translator remaps)
 	ResolvedProvider string `json:"resolved_provider,omitempty"` // post-binding provider_code (Anthropic / openai / kimi_code)
+
+	// SessionID — per-conversation session ID extracted from the
+	// inbound request via sessionid/session-fingerprint.yaml (Claude Code
+	// header / Kimi prompt_cache_key / OpenAI conversation_id /
+	// X-Aikey-Session-Id convention). Persisted to local events.db
+	// so the offline-retry upload path preserves the dimension if
+	// the proxy reports drained from cache. Wire serialization on
+	// ReportableEvent uses the same json:"session_id" tag for parity.
+	SessionID string `json:"session_id,omitempty"`
 }

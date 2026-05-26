@@ -6,7 +6,7 @@ import (
 )
 
 func TestDefaultLoads(t *testing.T) {
-	// Boot-time invariant: embedded fingerprint.yaml must always parse
+	// Boot-time invariant: embedded ua-fingerprint.yaml must always parse
 	// cleanly. If a future edit corrupts the YAML this test catches it
 	// in CI rather than at proxy startup.
 	m := Default()
