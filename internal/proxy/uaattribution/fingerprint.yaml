@@ -1,0 +1,58 @@
+# User-Agent → app_slug fingerprint table.
+#
+# Why this file exists: OAuth direct-call path (/v1/...) doesn't carry an
+# app context, so without UA inspection the usage-by-key report renders
+# every session under the same email with no way to tell which client
+# generated the traffic. See:
+#   - workflow/CI/requirements/2026-05-26-usage-by-key-app-attribution.md
+#   - workflow/CI/bugfix/20260526-usage-by-key-duplicate-rows-by-app-attribution.md
+#
+# Trust model: UA is client-controlled and can be spoofed. This signal is
+# advisory only — it never affects routing, auth, or billing. Used purely
+# for the per-app attribution dimension in the usage-by-key dashboard.
+#
+# Matching rule: case-sensitive prefix match against the raw User-Agent
+# header value, evaluated in declared order. First match wins. If no
+# rule matches (or UA is empty) the matcher returns `fallback_slug`.
+#
+# Adding a new client: add a new entry in `rules` with the shortest
+# stable prefix that uniquely identifies that client. Keep slugs in
+# kebab-case (matches the conventions already used by registered app
+# slugs like `degrade-detector` and `claude-mem-spike`).
+
+rules:
+  - prefix: "claude-cli/"
+    slug: "claude-code"
+    # Official Anthropic Claude Code CLI. Format: claude-cli/<semver> (<edition>).
+
+  - prefix: "cursor/"
+    slug: "cursor"
+    # Cursor IDE's built-in AI client.
+
+  - prefix: "Cursor/"
+    slug: "cursor"
+    # Capitalized variant observed in some Cursor versions.
+
+  - prefix: "cline/"
+    slug: "cline"
+    # Cline (formerly Claude Dev) VSCode extension.
+
+  - prefix: "Cline/"
+    slug: "cline"
+
+  - prefix: "Continue/"
+    slug: "continue"
+    # Continue.dev IDE extension.
+
+  - prefix: "codex/"
+    slug: "codex"
+    # OpenAI Codex CLI.
+
+  - prefix: "openai-cli/"
+    slug: "codex"
+
+# Fallback when no rule matches. Surfaced in the UI as "Unknown App".
+# Never write an empty string downstream — empty would collide with the
+# semantics of "no app context at all" which is no longer reachable on
+# the OAuth direct path once this matcher is wired in.
+fallback_slug: "unknown-app"

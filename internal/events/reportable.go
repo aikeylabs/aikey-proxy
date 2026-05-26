@@ -340,6 +340,22 @@ func BuildReportableEvent(opts ReportOpts) ReportableEvent {
 		if slug := firstPartyAppSlugForBearer(opts.BearerToken); slug != "" {
 			ev.AppSlug = slug
 		}
+	} else if route.RouteSource == "oauth" && route.AppSlug != "" {
+		// OAuth-direct attribution (2026-05-26, usage-by-key dashboard fix):
+		// the OAuth path now carries a UA-derived AppSlug (see
+		// pipelines.go's handlePathPrefixRoute and the requirements doc
+		// at workflow/CI/requirements/2026-05-26-usage-by-key-app-attribution.md).
+		// Forward it to the event payload so the dashboard can collapse
+		// multi-session noise per (identity, app_slug). Unlike the App
+		// pipeline branch above we deliberately DO NOT set
+		// AppKeyID / AppMode / BoundVia — those are App-pipeline
+		// authorization fields and have no meaning for a UA-derived
+		// label. Same scoping as the probe branch.
+		//
+		// Trust note: route.AppSlug here originates from a client-
+		// controlled User-Agent header and can be spoofed. This signal
+		// is display-only — never use it for authorization or billing.
+		ev.AppSlug = route.AppSlug
 	}
 
 	return ev

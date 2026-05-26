@@ -78,10 +78,29 @@ type ResolvedRoute struct {
 	// them after Registry.Resolve to recover the app context required for
 	// authorization + protocol-set enforcement + audit events.
 
-	// AppSlug is the app_records.slug this token was issued for. URL
-	// `/apps/<AppSlug>/<protocol>/v1/...` must match this exactly or the
-	// request is rejected with APP_MISMATCH (defense against token reuse
-	// across apps).
+	// AppSlug carries two distinct semantics depending on RouteSource:
+	//
+	//   1. RouteSource == "app" — REGISTERED. The app_records.slug this
+	//      token was issued for. URL `/apps/<AppSlug>/<protocol>/v1/...`
+	//      must match this exactly or the request is rejected with
+	//      APP_MISMATCH (defense against token reuse across apps).
+	//      Authoritative, server-derived, used for authorization.
+	//
+	//   2. RouteSource == "oauth" — UA-DETECTED. The slug returned by
+	//      uaattribution.Default().Match(r.Header["User-Agent"]) at
+	//      handler entry. Display-only, used by the usage-by-key
+	//      dashboard to attribute traffic to a client app (Claude Code /
+	//      Cursor / Cline / "unknown-app" fallback). Trivially
+	//      spoofable — never use for authorization or billing.
+	//
+	// Other RouteSource values ("personal", "team", "probe") leave this
+	// field empty.
+	//
+	// Why one field for both: avoids new schema columns (慎重新建数据结构)
+	// and the only consumer that distinguishes — apppipe's APP_MISMATCH
+	// validator — runs strictly inside the App pipeline where RouteSource
+	// is guaranteed "app". See:
+	//   workflow/CI/requirements/2026-05-26-usage-by-key-app-attribution.md
 	AppSlug string
 
 	// AppKind is "first-party" or "third-party" (mirrors app_records.app_kind).

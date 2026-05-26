@@ -40,6 +40,7 @@ import (
 	"github.com/AiKeyLabs/aikey-proxy/internal/observability"
 	"github.com/AiKeyLabs/aikey-proxy/internal/provider"
 	"github.com/AiKeyLabs/aikey-proxy/internal/proxy"
+	"github.com/AiKeyLabs/aikey-proxy/internal/proxy/apppipe"
 	"github.com/AiKeyLabs/aikey-proxy/internal/vault"
 	"github.com/AiKeyLabs/aikey-proxy/internal/vkeys"
 )
@@ -442,6 +443,19 @@ func (s *Supervisor) TotalRequests() int64 {
 // TotalErrors returns the proxy's cumulative error counter.
 func (s *Supervisor) TotalErrors() int64 {
 	return s.active.Load().proxy.TotalErrors()
+}
+
+// AppHealthSnapshot returns the active proxy generation's in-memory "most
+// recent app-pipeline call per slug" snapshot. Drives the Web "Connected
+// Apps" list Health column via the /admin/apps/health endpoint.
+//
+// Each Reload swaps in a fresh *Proxy with an empty cache — that matches
+// the "config changed; previously-observed health may be stale" intuition
+// (the new generation will repopulate as traffic flows). Persisting
+// across reloads would require either a sidecar store or copying the map
+// — neither warranted for "list-page health badge".
+func (s *Supervisor) AppHealthSnapshot() []apppipe.AppHealth {
+	return s.active.Load().proxy.AppHealthSnapshot()
 }
 
 // ReporterMetrics returns usage reporter counters from the active generation.

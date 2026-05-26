@@ -14,6 +14,7 @@ import (
 	"github.com/AiKeyLabs/aikey-proxy/internal/config"
 	"github.com/AiKeyLabs/aikey-proxy/internal/events"
 	"github.com/AiKeyLabs/aikey-proxy/internal/observability"
+	"github.com/AiKeyLabs/aikey-proxy/internal/proxy/apppipe"
 	"github.com/AiKeyLabs/aikey-proxy/internal/vkeys"
 )
 
@@ -57,6 +58,18 @@ type Handler struct {
 	// to proxy.UpstreamHeadersDebugState / SetUpstreamHeadersDebugAPIOverride.
 	DebugUpstreamHeadersStateFn func() (enabled bool, source string)
 	DebugUpstreamHeadersSetFn   func(state int)
+
+	// AppHealthFn returns the in-memory record of "the most recent app
+	// pipeline call, per app_slug" for the GET /admin/apps/health endpoint.
+	// Wired by main.go to *proxy.Proxy.AppHealthSnapshot — see
+	// internal/proxy/apppipe/health.go for the cache rationale (volatile
+	// observability surface, NOT a CQRS read projection).
+	//
+	// nil means the proxy did not wire the cache (older build, or test
+	// harness that didn't construct one) — the handler responds 503 in
+	// that case so consumers can distinguish "no data yet" (empty array)
+	// from "feature disabled" (503).
+	AppHealthFn func() []apppipe.AppHealth
 }
 
 // KeyCheckTarget holds decrypted credentials for one provider, used by GET /health/keys.
@@ -380,6 +393,42 @@ func (h *Handler) HealthProviders(w http.ResponseWriter, r *http.Request) {
 		})
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"providers": results})
+}
+
+// AppHealthResponse is the JSON envelope GET /admin/apps/health emits.
+// `apps` is sorted by app_slug for deterministic snapshots.
+type AppHealthResponse struct {
+	Apps []apppipe.AppHealth `json:"apps"`
+}
+
+// AppHealth returns the in-process record of "most recent app pipeline call
+// per slug". Drives the Web "Connected Apps" list's Health column.
+//
+// GET /admin/apps/health
+//
+// Why a separate endpoint vs piggy-backing on /metrics: /metrics is a
+// system-wide counter dashboard (request totals, error totals, reporter
+// stats). Per-app health is a different consumer surface — the Web list
+// page reads it once per page load, not periodic scrape — so a focused
+// endpoint with a stable schema is easier to evolve than burying app data
+// inside metricsResponse.
+//
+// Cache lifetime: process-memory only; proxy restart returns an empty
+// list and the UI shows "No recent calls" until traffic resumes. The
+// query-service / DWD path remains the durable source of truth for
+// historic auditing (this endpoint is intentionally NOT that).
+func (h *Handler) AppHealth(w http.ResponseWriter, r *http.Request) {
+	if h.AppHealthFn == nil {
+		writeJSON(w, http.StatusServiceUnavailable, map[string]string{
+			"error": "app health cache not wired",
+		})
+		return
+	}
+	apps := h.AppHealthFn()
+	if apps == nil {
+		apps = []apppipe.AppHealth{}
+	}
+	writeJSON(w, http.StatusOK, AppHealthResponse{Apps: apps})
 }
 
 // HealthKeys tests whether the active key can authenticate to its provider(s)

@@ -78,6 +78,11 @@ func New(ln net.Listener, dataHandler http.Handler, adminHandler *admin.Handler,
 	mux.HandleFunc("POST /admin/debug/upstream-headers", adminHandler.DebugUpstreamHeadersSet)
 	mux.HandleFunc("DELETE /admin/debug/upstream-headers", adminHandler.DebugUpstreamHeadersClear)
 
+	// In-memory "most recent call per app_slug" snapshot — drives the Web
+	// "Connected Apps" list Health column. Volatile (process memory only);
+	// see internal/proxy/apppipe/health.go for the rationale.
+	mux.HandleFunc("GET /admin/apps/health", adminHandler.AppHealth)
+
 	// Extra route registrars (e.g., OAuth broker handler)
 	for _, h := range extraHandlers {
 		h.RegisterRoutes(mux)

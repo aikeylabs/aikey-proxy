@@ -1,0 +1,1449 @@
+// pipelines.go — the three pipeline-entry handlers + their shared
+// response-writer wrapper.
+//
+//   - handleAppPipeline      — /apps/<slug>/v1/...   (Phase 4 App pipeline)
+//   - handleProbePipeline    — /probe/<alias>/v1/... (Probe / mode C)
+//   - handlePathPrefixRoute  — /v1/... and /<provider>/v1/... (legacy)
+//
+// Each handler stages: parse → authn → resolve binding → translate
+// (App only) → forward → record. Forwarding itself is delegated to
+// serveRoute / serveRouteWithObserver in forward_and_resolve.go.
+//
+// Also holds appPipelineStatusWriter — a thin http.ResponseWriter
+// wrapper that captures the final status code on every exit path so
+// the in-memory AppHealthCache (see apppipe/health.go) can record
+// each app's last-call health for the Web "Connected Apps" Health
+// column.
+//
+// Split out of proxy.go on 2026-05-26 — see
+// workflow/CI/refactor/2026-05-26-proxy-go-split.md for the file map.
+package proxy
+
+import (
+	"bytes"
+	"fmt"
+	"io"
+	"log/slog"
+	"net/http"
+	"strings"
+	"time"
+
+	"github.com/AiKeyLabs/aikey-proxy/internal/observability"
+	"github.com/AiKeyLabs/aikey-proxy/internal/provider"
+	"github.com/AiKeyLabs/aikey-proxy/internal/proxy/apppipe"
+	"github.com/AiKeyLabs/aikey-proxy/internal/proxy/probepipe"
+	"github.com/AiKeyLabs/aikey-proxy/internal/proxy/uaattribution"
+	"github.com/AiKeyLabs/aikey-proxy/internal/vault"
+	"github.com/AiKeyLabs/aikey-proxy/internal/vkeys"
+	"github.com/AiKeyLabs/aikey-proxy/pkg/observer"
+)
+
+// appPipelineStatusWriter wraps an http.ResponseWriter so handleAppPipeline
+// can observe the final HTTP status (and optional proxy-side error
+// category) on every exit path — early proxy-synthesized 4xx as well as
+// the ReverseProxy success path that copies the upstream status through.
+//
+// Why not net/http/httptest.ResponseRecorder: that one buffers the entire
+// body in memory. We need a transparent passthrough so streaming SSE
+// responses (the common app-pipeline success shape) aren't buffered.
+//
+// Why a custom field for errorType: we want the per-slug HealthCache to
+// optionally carry a proxy-side category string (e.g. "base_url_misconfigured")
+// that callers set explicitly when they synthesize a 4xx. The HTTP wire
+// has no header for this, so we thread it via a method on the wrapper.
+//
+// Concurrency: a single handler goroutine owns the wrapper for the duration
+// of the request — no mutex needed.
+type appPipelineStatusWriter struct {
+	http.ResponseWriter
+	statusCode int
+	errorType  string
+	written    bool
+}
+
+func (s *appPipelineStatusWriter) WriteHeader(code int) {
+	if !s.written {
+		s.statusCode = code
+		s.written = true
+	}
+	s.ResponseWriter.WriteHeader(code)
+}
+
+// Write captures the implicit "200 OK because the handler wrote a body
+// without calling WriteHeader" case (net/http's own contract). statusCode
+// was pre-seeded to 200 in the wrapper constructor so we don't need to
+// overwrite here — but we do need to flip the written flag so a later
+// WriteHeader call (which net/http would log as "superfluous") doesn't
+// overwrite the observed-as-200 code.
+func (s *appPipelineStatusWriter) Write(b []byte) (int, error) {
+	if !s.written {
+		s.written = true
+	}
+	return s.ResponseWriter.Write(b)
+}
+
+// Flush forwards to the underlying writer's Flush if it implements
+// http.Flusher — required so SSE streams (which the App pipeline often
+// produces) aren't buffered behind the wrapper. Without this method the
+// wrapper would silently break streaming responses.
+func (s *appPipelineStatusWriter) Flush() {
+	if f, ok := s.ResponseWriter.(http.Flusher); ok {
+		f.Flush()
+	}
+}
+
+// handleAppPipeline is the entry into the Phase 4 App pipeline for requests
+// matching /apps/<slug>/v1/... (Tier 0a in proxy.Handle's
+// routing order). Today it's a structural stub returning 501 with the
+// parsed AppContext for diagnosability — Sprint 2 remaining tasks
+// (AKL-204 authn, AKL-205 resolve, AKL-206 egress sanitizer, AKL-207
+// pipeline editorial) replace this body with the full pipeline.
+//
+// Until those land, this handler proves the wiring works end-to-end:
+//  1. Tier 0a routing fires (URL parsing — AKL-203)
+//  2. The user sees confirmation that slug + protocol parsed correctly
+//  3. Counters + logger context include app_slug + app_protocol for
+//     operator visibility while the pipeline is being filled in
+//
+// The 501 is intentional vs 503: per RFC 9110, 501 says "the server does
+// not support the functionality required to fulfil the request" which
+// matches "this endpoint exists in routing but its handler is not yet
+// wired", whereas 503 implies temporary unavailability of a working
+// service. Clients (test scripts, integration probes) can distinguish
+// "deploy in progress" (501) from "transient downstream failure" (503).
+func (p *Proxy) handleAppPipeline(w http.ResponseWriter, r *http.Request, appCtx *apppipe.AppContext, startTime time.Time, logger *slog.Logger, traceID string) {
+	_ = startTime
+	logger = logger.With("app_slug", appCtx.Slug)
+
+	// Wrap the response writer so we observe the final status code on
+	// EVERY exit path — proxy-side early errors (BASE_URL_MISCONFIGURED,
+	// authn fail, resolve fail) AND the ReverseProxy success path
+	// (upstream status passed through). The captured value drives the
+	// per-slug HealthCache update below, which the Web "Connected Apps"
+	// list reads to populate the Health column.
+	//
+	// Default 200 mirrors net/http's own behaviour: if a handler writes a
+	// body without calling WriteHeader, Go implicitly uses 200. Capturing
+	// "actually called WriteHeader yet?" via the bool gives us a cheap
+	// way to distinguish "explicit 200" from "implicit 200 because the
+	// handler wrote no header and no body" — useful when the early-exit
+	// path forgets WriteHeader (we'd see 200, which is the bug, but at
+	// least we record the actual on-wire status).
+	sw := &appPipelineStatusWriter{ResponseWriter: w, statusCode: http.StatusOK}
+	w = sw
+	defer func() {
+		// `errorType` left empty for now — the UI's 4-bucket classification
+		// (OK / Warn / Error / Never) only needs status_code. Future work
+		// can thread a proxy-side error code (e.g. "base_url_misconfigured")
+		// through via sw.errorType for richer tooltip detail without
+		// changing the cache shape.
+		p.recordAppHealth(appCtx.Slug, sw.statusCode, sw.errorType)
+	}()
+
+	// 2026-05-25 防呆 (double-v1 base_url misconfiguration):
+	//
+	// Real-world bug seen with Anthropic Python SDK + claude-mem-style
+	// plugin: the SDK appends "/v1/messages" to the configured base_url
+	// unconditionally. If the user set base_url to
+	// "http://127.0.0.1:27200/apps/<slug>/v1" (the form that works for
+	// openai-python, which appends "/chat/completions" without "/v1"),
+	// the Anthropic SDK produces
+	// "http://127.0.0.1:27200/apps/<slug>/v1/v1/messages" — double v1.
+	//
+	// ExtractAppPath happily parses this as
+	// {Slug:<slug>, StrippedPath:"/v1/messages"}, then the handler
+	// prepends "/v1" again on line 921 → outbound URL becomes
+	// "https://api.anthropic.com/v1/v1/messages" which Anthropic 404s
+	// with "Not Found". The user sees an opaque 404 with no clue that
+	// it's a base_url config error on their side.
+	//
+	// Detection: strippedPath starting with "/v1/" means the inbound URL
+	// was /apps/<slug>/v1/v1/... (only the second v1 ends up in
+	// strippedPath after the first one was stripped). No legitimate
+	// upstream path starts with /v1 (Anthropic uses /messages,
+	// /complete; OpenAI uses /chat/completions, /embeddings; none start
+	// with another "v1" segment). Safe to reject.
+	//
+	// Emit a precise, actionable error so the user fixes it in their
+	// SDK config rather than blaming AiKey for "404 from upstream".
+	if strings.HasPrefix(appCtx.StrippedPath, "/v1/") || appCtx.StrippedPath == "/v1" {
+		p.errors.Add(1)
+		logger.Warn("app pipeline base_url misconfigured (double /v1)",
+			"event.name", "proxy.app.base_url_misconfigured",
+			"inbound_path", r.URL.Path,
+			"stripped_path", appCtx.StrippedPath,
+			"hint", "client base_url likely ends with /v1 AND SDK appends another /v1/<endpoint>",
+		)
+		writeJSONError(w, http.StatusBadRequest, "invalid_request_error", "BASE_URL_MISCONFIGURED",
+			fmt.Sprintf(
+				"Your client's base_url has a double /v1/ — received URL %q after stripping "+
+					"the app prefix becomes %q, which means the original URL was "+
+					"/apps/%s/v1/v1/... — that 'second v1' was added by your SDK on top of the /v1 "+
+					"already in your base_url. Fix: drop /v1 from base_url. "+
+					"For Anthropic SDK: base_url=\"http://127.0.0.1:27200/apps/%s\" (no trailing /v1). "+
+					"For OpenAI SDK: base_url=\"http://127.0.0.1:27200/apps/%s/v1\" (keep /v1 — OpenAI SDK appends /chat/completions without /v1).",
+				r.URL.Path, appCtx.StrippedPath, appCtx.Slug, appCtx.Slug, appCtx.Slug,
+			))
+		return
+	}
+
+	// Stage 1: authn — extract bearer, verify Registry membership, check
+	// the URL slug matches the token's vault-recorded AppSlug.
+	route, authErr := apppipe.Authenticate(r.Header, p.registry, appCtx)
+	if authErr != nil {
+		p.errors.Add(1)
+		logger.Warn("app pipeline authn failed",
+			"error.code", authErr.ErrorCode,
+			"event.name", observability.EventProxyRequestAuthFailed,
+		)
+		writeJSONError(w, authErr.StatusCode, "authentication_error", authErr.ErrorCode, authErr.Message)
+		return
+	}
+
+	// Stage 2: resolve metadata-only — pick profile scope + load app_records.
+	// Binding lookup is deferred to Stage 4 (after body sanitize + model
+	// inference); the inferred upstream is the lookup key.
+	resolved, resolveErr := apppipe.Resolve(p.appVault, route, appCtx)
+	if resolveErr != nil {
+		p.errors.Add(1)
+		logger.Warn("app pipeline resolve failed",
+			"error.code", resolveErr.ErrorCode,
+			"app_key_id", route.AppKeyID,
+			"app_kind", route.AppKind,
+		)
+		writeJSONError(w, resolveErr.StatusCode, "server_error", resolveErr.ErrorCode, resolveErr.Message)
+		return
+	}
+
+	// Stage 3: sanitize — strip aikey/metadata fields, reject n>1, silent-drop
+	// logprobs/seed with warnings. response_format is passed through to the
+	// protocol translator (Phase 2 Day 5).
+	//
+	// Capture the genuine inbound User-Agent BEFORE Stage 5 (which calls
+	// oauthInject → forces UA to "claude-cli/2.1.22 (external, cli)" for
+	// non-CLI clients). The post-translation WAF re-rewrite below needs
+	// to know if the original client was real Claude CLI (skip rewrite)
+	// vs a third-party SDK (apply rewrite). Without this snapshot the
+	// post-translation check always sees the masked UA.
+	inboundUAWasClaudeCode := clientIsClaudeCode(r)
+
+	bodyBytes, bodyErr := io.ReadAll(r.Body)
+	if bodyErr != nil {
+		p.errors.Add(1)
+		logger.Warn("app pipeline body read failed", "error", bodyErr)
+		writeJSONError(w, http.StatusBadRequest, "invalid_request_error", "BODY_READ_FAILED",
+			"Could not read request body: "+bodyErr.Error())
+		return
+	}
+	_ = r.Body.Close()
+
+	sanitized, sanitizeCtx, sanitizeErr := apppipe.SanitizeRequestBody(bodyBytes)
+	if sanitizeErr != nil {
+		p.errors.Add(1)
+		logger.Warn("app pipeline body sanitize failed",
+			"error.code", sanitizeErr.ErrorCode,
+			"app_key_id", route.AppKeyID,
+		)
+		writeJSONError(w, sanitizeErr.StatusCode, "invalid_request_error", sanitizeErr.ErrorCode, sanitizeErr.Message)
+		return
+	}
+	for _, w := range sanitizeCtx.Warnings {
+		logger.Warn("app pipeline field degraded", "degradation", w, "app_key_id", route.AppKeyID)
+	}
+
+	// Stage 4 (Phase 2 Day 7): infer upstream from body.model and look up
+	// the binding for (profile, upstream). This replaces the URL-protocol-
+	// based binding lookup of Phase 1. The Agent's body.model field is the
+	// single routing signal — LangChain-aligned per industry consensus.
+	inboundModel := extractModelLazy(sanitized)
+	inferredUpstream := provider.InferUpstreamFromModel(inboundModel)
+	binding, bindResolveErr := apppipe.ResolveUpstreamBinding(p.appVault, resolved, inferredUpstream)
+	if bindResolveErr != nil {
+		p.errors.Add(1)
+		logger.Warn("app pipeline upstream-binding resolve failed",
+			"error.code", bindResolveErr.ErrorCode,
+			"app_key_id", route.AppKeyID,
+			"model", inboundModel,
+			"inferred_upstream", inferredUpstream,
+		)
+		writeJSONError(w, bindResolveErr.StatusCode, "invalid_request_error",
+			bindResolveErr.ErrorCode, bindResolveErr.Message)
+		return
+	}
+
+	// B mode normalization (2026-05-23, credential-mode-architecture SPEC §1.1.B):
+	// When the binding came from a bound_alias dereference, its ProviderCode
+	// may be a brand alias from the vault row (e.g., OAuth provider="claude")
+	// rather than the canonical code body.model resolves to ("anthropic").
+	// Normalize both sides via providerCanonicalCode — same lockstep
+	// canonicalization handleProbePipeline applies for mode C — so downstream
+	// stages (provider adapter, WAF inject) see a single canonical value.
+	// Mismatch is a caller-side bug (e.g., bound_alias=oauth(anthropic) but
+	// body.model=gpt-4); fail loud rather than letting the upstream reject
+	// the wrong-provider credential.
+	if resolved.AppRecord != nil && resolved.AppRecord.BoundAlias != "" {
+		canonicalBound := providerCanonicalCode(binding.ProviderCode)
+		canonicalUpstream := providerCanonicalCode(inferredUpstream)
+		if canonicalBound != "" && canonicalBound != canonicalUpstream {
+			p.errors.Add(1)
+			writeJSONError(w, http.StatusBadRequest, "invalid_request_error",
+				"BOUND_ALIAS_PROVIDER_MISMATCH",
+				"App \""+appCtx.Slug+"\" is bound to alias \""+resolved.AppRecord.BoundAlias+
+					"\" (provider=\""+binding.ProviderCode+"\") but body.model resolves to upstream \""+
+					inferredUpstream+"\". Use a body.model matching the bound alias's provider, "+
+					"or `aikey app update "+appCtx.Slug+" --bound-alias <name>` to re-bind.")
+			return
+		}
+		binding.ProviderCode = canonicalUpstream
+	}
+
+	// Capture inbound bearer BEFORE Stage 5 — ResolveBindingCredential calls
+	// oauthInject which overwrites r.Header.Authorization with the upstream
+	// OAuth access token. If we read it AFTER, `extractRawAuthValue(r)` returns
+	// the upstream secret instead of the client-presented token, breaking the
+	// audit anchor (virtual_key_hash) AND the first-party probe attribution
+	// branch in BuildReportableEvent (BR-rc.5-60 fix relies on the client
+	// bearer to reverse-lookup the app slug). Bug surfaced via BR-rc.5-60
+	// follow-up 2026-05-25 when manual Trust Check probes kept landing in ODS
+	// with app_slug=NULL despite the attribution code being in place.
+	inboundBearer := extractRawAuthValue(r)
+
+	// Stage 5: resolve credential from binding (shared with legacy path).
+	// p.ResolveBindingCredential walks the same OAuth/team/personal branches
+	// used by handlePathPrefixRoute — pinned by oauth_binding_fence_test.go.
+	// Mutates r headers via oauthInject on the OAuth path.
+	cred, bindErr := p.ResolveBindingCredential(r, binding, inferredUpstream, inferredUpstream, logger)
+	if bindErr != nil {
+		p.errors.Add(1)
+		logger.Warn("app pipeline credential resolution failed",
+			"error.code", bindErr.ErrorCode,
+			"app_key_id", route.AppKeyID,
+		)
+		writeJSONError(w, bindErr.StatusCode, bindErr.ErrorType, bindErr.ErrorCode, bindErr.Message)
+		return
+	}
+	if cred.RealKey == "" {
+		p.errors.Add(1)
+		writeJSONError(w, http.StatusServiceUnavailable, "server_error", "BINDING_CREDENTIAL_UNRESOLVED",
+			"App's binding (profile=\""+resolved.ProfileID+"\", upstream=\""+inferredUpstream+
+				"\", source="+binding.KeySourceType+":"+binding.KeySourceRef+
+				") could not be resolved to a usable credential. The referenced "+
+				"alias or virtual-key may have been deleted. Re-run `aikey app route "+appCtx.Slug+
+				"` to repair.")
+		return
+	}
+
+	// Stage 6: build the ResolvedRoute for serveRoute. Provider /
+	// ProviderCode / ProtocolType reflect the BINDING's upstream provider
+	// (the inferred-from-model value, equal to binding.ProviderCode by
+	// construction in this branch). ProtocolFamily resolves the provider
+	// to its wire family via pkg/providerroutes yaml (single source of
+	// truth, see ResolvedRoute.ProtocolFamily doc-comment).
+	protocolFamily := ""
+	if pr, ok := provider.Routes().ByProvider(binding.ProviderCode); ok {
+		protocolFamily = pr.Protocol
+	}
+	appResolvedRoute := &vkeys.ResolvedRoute{
+		VirtualKeyID:     route.VirtualKeyID, // "app:<slug>"
+		Provider:         binding.ProviderCode,
+		BaseURL:          cred.BaseURL,
+		KeyAlias:         cred.KeyAlias,
+		PlaintextKey:     cred.RealKey,
+		OAuthIdentity:    cred.OAuthIdentity,
+		AccountID:        cred.OAuthAccountID,
+		ProviderCode:     binding.ProviderCode,
+		ProtocolType:     binding.ProviderCode,
+		ProtocolFamily:   protocolFamily,
+		RouteSource:      "app",
+		AppSlug:          route.AppSlug,
+		AppKind:          route.AppKind,
+		AppKeyID:         route.AppKeyID,
+		FollowUserActive: route.FollowUserActive,
+	}
+	if cred.ManagedKey != nil {
+		appResolvedRoute.OrgID = cred.ManagedKey.OrgID
+		appResolvedRoute.SeatID = cred.ManagedKey.SeatID
+		appResolvedRoute.CredentialID = cred.ManagedKey.CredentialID
+		appResolvedRoute.CredentialRevision = cred.ManagedKey.CredentialRevision
+		appResolvedRoute.VirtualKeyRevision = cred.ManagedKey.VirtualKeyRevision
+	}
+
+	// Stage 7: provider adapter selected by the BINDING's upstream protocol.
+	prov, err := p.providers.Get(binding.ProviderCode)
+	if err != nil {
+		p.errors.Add(1)
+		writeJSONError(w, http.StatusBadGateway, "server_error", "PROVIDER_ERROR",
+			"Unknown upstream provider protocol: "+binding.ProviderCode)
+		return
+	}
+
+	// Strip /apps/<slug>/v1 prefix → leave only the upstream path part
+	// (e.g., "/chat/completions"). serveRoute prepends BaseURL.
+	r.URL.Path = "/v1" + appCtx.StrippedPath
+	if r.URL.RawPath != "" {
+		r.URL.RawPath = r.URL.Path
+	}
+
+	// Stage 8 (Phase 2 protocol translation, optional): if inbound wire
+	// differs from upstream wire (binding.ProviderCode), translate the
+	// request body + arm a response-side closure on the ResolvedRoute.
+	// No-op when from == to. Phase 2 中方案 (2026-05-21): inbound wire
+	// is inferred from URL path — `/v1/messages` ≡ Anthropic, else
+	// OpenAI (see apppipe.InferInboundWire).
+	inboundFmt := apppipe.InferInboundWire(appCtx.StrippedPath)
+	translateOut, translateErr := apppipe.MaybeTranslateRequest(
+		r.Context(),
+		p.translatorRegistry,
+		appResolvedRoute,
+		binding,
+		inboundFmt,
+		r,
+		sanitized,
+		inboundModel,
+	)
+	if translateErr != nil {
+		p.errors.Add(1)
+		logger.Warn("app pipeline protocol translation failed",
+			"error.code", translateErr.ErrorCode,
+			"app_key_id", route.AppKeyID,
+			"upstream", binding.ProviderCode,
+		)
+		writeJSONError(w, translateErr.StatusCode, "invalid_request_error", translateErr.ErrorCode, translateErr.Message)
+		return
+	}
+	if translateOut.Engaged {
+		logger.Info("app pipeline translation engaged",
+			"upstream_format", string(translateOut.UpstreamFormat),
+			"app_key_id", route.AppKeyID,
+		)
+		// Rewrite the upstream path for the target format (e.g.
+		// /v1/chat/completions → /v1/messages for Anthropic).
+		if canonical := apppipe.CanonicalUpstreamPath(translateOut.UpstreamFormat); canonical != "" {
+			r.URL.Path = canonical
+			if r.URL.RawPath != "" {
+				r.URL.RawPath = canonical
+			}
+		}
+	}
+
+	// Replace request body with the post-translation bytes (or sanitized
+	// if no translation engaged — TranslateOutcome.Body is always the
+	// final bytes to forward).
+	r.Body = io.NopCloser(bytes.NewReader(translateOut.Body))
+	r.ContentLength = int64(len(translateOut.Body))
+
+	// Phase 4 fix (2026-05-22, Stage 7 smoke): when OAuth → Anthropic, the
+	// WAF body fingerprint must be present in body.system[0]. The body
+	// rewriter ran inside ResolveBindingCredential's oauthInject() call
+	// above, but at that point r.Body had already been consumed by Stage 3
+	// (line 606 io.ReadAll); the rewriter saw an empty body, no-oped, and
+	// returned without injecting. Now that r.Body carries the post-
+	// translation bytes, re-run the WAF rewriter so the body that actually
+	// goes upstream gets the magic-intro + billing-header fingerprint.
+	// Without this, Anthropic returns 429 "rate_limit_error" with no
+	// anthropic-ratelimit-* headers (business rejection signature, ref
+	// workflow/CI/research/oauth-token-response-identity/2026-04-15-oauth-token-response-identity.md).
+	if binding.KeySourceType == "personal_oauth_account" &&
+		binding.ProviderCode == "anthropic" &&
+		!inboundUAWasClaudeCode {
+		injectClaudeWAFFingerprintFull(r)
+		// injectClaudeWAFFingerprintFull may have rewritten r.Body; sync
+		// ContentLength so the reverse proxy reports the correct length
+		// to the upstream.
+		if r.Body != nil {
+			if newBytes, err := io.ReadAll(r.Body); err == nil {
+				r.Body = io.NopCloser(bytes.NewReader(newBytes))
+				r.ContentLength = int64(len(newBytes))
+			}
+		}
+	}
+
+	// inboundBearer is captured pre-Stage-5 above (moved 2026-05-25 to
+	// survive oauthInject's Authorization rewrite — see comment near
+	// Stage 5).
+
+	// app_mode tags the credential-resolution path so log readers can tell
+	// A vs B mode without re-deriving from follow_user_active + bound_alias
+	// fields. SPEC §1.1 / §6.1 anti-example "label deception" was rooted in
+	// log fields that didn't distinguish modes; this is the explicit fix.
+	appMode := "a"
+	if resolved.AppRecord != nil && resolved.AppRecord.BoundAlias != "" {
+		appMode = "b"
+	}
+	logger.Info("app pipeline forwarding upstream",
+		"app_key_id", route.AppKeyID,
+		"app_kind", route.AppKind,
+		"app_mode", appMode,
+		"bound_alias", resolved.AppRecord.BoundAlias, // empty in A mode
+		"profile_id", resolved.ProfileID,
+		"binding_source_type", binding.KeySourceType,
+		"upstream_base", cred.BaseURL,
+		"upstream", binding.ProviderCode,
+		"protocol_family", appResolvedRoute.ProtocolFamily,
+	)
+
+	// Phase 4 M2 plugin observer — NotifyStart at App pipeline entry +
+	// NotifyEnd at exit. The per-frame NotifySSEEvent dispatch lives
+	// inside streamDrainer (gated on the observer registry being
+	// attached + ProtocolFamily known) so it sees the byte-identical
+	// upstream SSE before ResponseTransform reshapes the chunks.
+	//
+	// Why we build the RequestContext here (not inside serveRoute):
+	// app-specific fields (AppSlug / AppKeyID / AppMode / ProviderID /
+	// ProtocolFamily) are only meaningful for the App pipeline branch.
+	// serveRoute is shared with the legacy /v1/... + /<provider>/v1/...
+	// paths which never need a RequestContext. Wiring here keeps the
+	// observer surface contained to the App pipeline by construction.
+	//
+	// nil observerRegistry ⇒ the Notify* helpers below short-circuit;
+	// see Proxy.observerRegistry doc-comment for zero-cost rationale.
+	var obsReqCtx *observer.RequestContext
+	if p.observerRegistry != nil && p.observerRegistry.Active() > 0 {
+		appMode := "isolated"
+		if route.FollowUserActive {
+			appMode = "follow-active"
+		}
+		obsReqCtx = &observer.RequestContext{
+			AppKeyID: route.AppKeyID,
+			AppSlug:  route.AppSlug,
+			AppMode:  appMode,
+			// KeyAlias is the vault-side credential alias resolved at this
+			// step (e.g. user's "claude" for follow-user-active). trust-local
+			// uses it as the alias_name primary aggregation key — without it
+			// the report falls back to a synthetic "app:<slug>:<keyid>"
+			// alias and PerAliasTrust queries can't surface real-user trust
+			// per provider key.
+			KeyAlias:       appResolvedRoute.KeyAlias,
+			ProviderID:     binding.ProviderCode,
+			ProtocolFamily: appResolvedRoute.ProtocolFamily,
+			RequestedModel: inboundModel,
+			SessionID:      resolveSessionID(r.Header, binding.ProviderCode),
+			TraceID:        traceID,
+			StartedAt:      startTime,
+		}
+		// Stash on the route so streamDrainer can pull it out without
+		// needing a parallel parameter channel. Tier 1 / Tier 2 routes
+		// never set ObserverContext, so the drainer's nil-check
+		// short-circuits for legacy paths.
+		appResolvedRoute.ObserverContext = obsReqCtx
+		appResolvedRoute.ObserverRegistry = p.observerRegistry
+		// SPEC §1.4.1: this handler serves the /apps/<slug>/v1/... pipeline
+		// so emit under the StreamAppPipeline name. Observers that didn't
+		// declare interest in this stream are filtered at Registry level.
+		p.observerRegistry.NotifyStart(r.Context(), observer.StreamAppPipeline, obsReqCtx)
+	}
+
+	p.serveRoute(w, r, appResolvedRoute, prov, cred.RealKey, inboundBearer, startTime, logger)
+
+	if obsReqCtx != nil {
+		latency := int(time.Since(startTime).Milliseconds())
+		p.observerRegistry.NotifyEnd(r.Context(), obsReqCtx, latency)
+	}
+}
+
+// handleProbePipeline is the entry into the Probe pipeline (mode C) for
+// requests matching /probe/<alias>/v1/... See SPEC
+// `workflow/CI/requirements/2026-05-23-credential-mode-architecture.md` §1.3.
+//
+// Pipeline stages (parallel to handleAppPipeline but simpler — no
+// app_records / follow_user_active / provider-binding indirection):
+//
+//  1. authn          — first-party constant Bearer check (probepipe.Authenticate)
+//  2. resolve alias  — vault.GetAliasCredential → synthetic ProviderBinding
+//  3. sanitize body  — strip aikey/* fields, reject n>1 (reuses apppipe)
+//  4. infer upstream — body.model → provider; sanity-check matches alias's provider
+//  5. resolve cred   — reuses ResolveBindingCredential (shared with App pipeline)
+//  6. build route    — synthesize ResolvedRoute with RouteSource="probe"
+//  7. translate      — reuses apppipe.MaybeTranslateRequest (no-op when wire matches)
+//  8. forward        — same serveRoute as App / legacy pipelines
+//
+// Why we reuse so much from apppipe: sanitize / translate / ResolveBindingCredential
+// don't depend on app concepts (slug / follow_user_active); they operate on
+// (ProviderBinding, request) inputs. Sharing them avoids divergence on the
+// shared upstream-injection paths (OAuth WAF fingerprint, model translation,
+// SSE drain). Probe-specific differences live entirely in stages 1-2 + 6.
+func (p *Proxy) handleProbePipeline(w http.ResponseWriter, r *http.Request, probeCtx *probepipe.ProbeContext, startTime time.Time, logger *slog.Logger, traceID string) {
+	_ = traceID
+	logger = logger.With("probe_alias", probeCtx.AliasName, "routing", "probe")
+
+	// Stage 1: authn — first-party constant Bearer.
+	if authErr := probepipe.Authenticate(r.Header); authErr != nil {
+		p.errors.Add(1)
+		logger.Warn("probe pipeline authn failed",
+			"error.code", authErr.ErrorCode,
+			"event.name", observability.EventProxyRequestAuthFailed,
+		)
+		writeJSONError(w, authErr.StatusCode, "authentication_error", authErr.ErrorCode, authErr.Message)
+		return
+	}
+
+	// Stage 2: resolve alias → synthetic ProviderBinding.
+	aliasCred, resolveErr := probepipe.Resolve(p.probeVault, probeCtx)
+	if resolveErr != nil {
+		p.errors.Add(1)
+		logger.Warn("probe pipeline alias resolve failed",
+			"error.code", resolveErr.ErrorCode,
+		)
+		writeJSONError(w, resolveErr.StatusCode, "server_error", resolveErr.ErrorCode, resolveErr.Message)
+		return
+	}
+	binding := aliasCred.Binding
+
+	// Capture the genuine inbound User-Agent BEFORE the credential resolve
+	// step (which may call oauthInject and mask the UA). Mirrors the
+	// handleAppPipeline pattern; needed for the post-translation WAF rewrite
+	// decision below.
+	inboundUAWasClaudeCode := clientIsClaudeCode(r)
+
+	// Stage 3: sanitize body (reuses apppipe — same egress rules apply).
+	bodyBytes, bodyErr := io.ReadAll(r.Body)
+	if bodyErr != nil {
+		p.errors.Add(1)
+		logger.Warn("probe pipeline body read failed", "error", bodyErr)
+		writeJSONError(w, http.StatusBadRequest, "invalid_request_error", "BODY_READ_FAILED",
+			"Could not read request body: "+bodyErr.Error())
+		return
+	}
+	_ = r.Body.Close()
+
+	sanitized, sanitizeCtx, sanitizeErr := apppipe.SanitizeRequestBody(bodyBytes)
+	if sanitizeErr != nil {
+		p.errors.Add(1)
+		logger.Warn("probe pipeline body sanitize failed",
+			"error.code", sanitizeErr.ErrorCode,
+		)
+		writeJSONError(w, sanitizeErr.StatusCode, "invalid_request_error", sanitizeErr.ErrorCode, sanitizeErr.Message)
+		return
+	}
+	for _, warning := range sanitizeCtx.Warnings {
+		logger.Warn("probe pipeline field degraded", "degradation", warning)
+	}
+
+	// Stage 4: infer upstream from body.model and sanity-check it matches the
+	// alias's recorded provider. Probing FreySilvaqzs@... (Anthropic OAuth)
+	// with a body that says "gpt-4o" is a caller-side bug — fail loud.
+	//
+	// Compare via canonical codes so brand aliases agree:
+	// vault may store "claude" (OAuth) while InferUpstreamFromModel returns
+	// "anthropic"; both must reconcile. providerCanonicalCode is the same
+	// helper apppipe + path-prefix routing use, so the probe pipeline
+	// inherits identical alias semantics with no drift.
+	inboundModel := extractModelLazy(sanitized)
+	inferredUpstream := provider.InferUpstreamFromModel(inboundModel)
+	if inferredUpstream == "" {
+		p.errors.Add(1)
+		writeJSONError(w, http.StatusBadRequest, "invalid_request_error", "UPSTREAM_UNINFERRABLE",
+			"Could not infer upstream provider from body.model. Expected a "+
+				"recognized model id (claude-*, gpt-*, kimi-*, ...) so AiKey "+
+				"can confirm the alias's provider matches the request.")
+		return
+	}
+	canonicalUpstream := providerCanonicalCode(inferredUpstream)
+	canonicalBound := providerCanonicalCode(binding.ProviderCode)
+	if canonicalBound != "" && canonicalBound != canonicalUpstream {
+		p.errors.Add(1)
+		writeJSONError(w, http.StatusBadRequest, "invalid_request_error", "PROBE_PROVIDER_MISMATCH",
+			"Alias \""+probeCtx.AliasName+"\" is bound to provider \""+binding.ProviderCode+
+				"\" but body.model resolves to upstream \""+inferredUpstream+
+				"\". Use a body.model that matches the alias's provider.")
+		return
+	}
+	// Normalize binding's ProviderCode to canonical form so downstream
+	// stages (provider adapter lookup, ResolveBindingCredential, translate)
+	// see the same code regardless of vault storage convention.
+	binding.ProviderCode = canonicalUpstream
+
+	// Capture inbound bearer BEFORE Stage 5 — same reason as handleAppPipeline:
+	// ResolveBindingCredential → oauthInject overwrites r.Header.Authorization
+	// with the upstream OAuth access token. Reading AFTER returns the upstream
+	// secret instead of the client's constant first-party bearer, breaking
+	// BR-rc.5-60's probe → app_slug attribution (firstPartyAppSlugForBearer
+	// lookup fails because the bearer is no longer the whitelisted constant).
+	inboundBearer := extractRawAuthValue(r)
+
+	// Stage 5: resolve credential via the shared App/legacy machinery.
+	upstream := binding.ProviderCode
+	cred, bindErr := p.ResolveBindingCredential(r, binding, upstream, upstream, logger)
+	if bindErr != nil {
+		p.errors.Add(1)
+		logger.Warn("probe pipeline credential resolution failed",
+			"error.code", bindErr.ErrorCode,
+			"binding_source_type", binding.KeySourceType,
+		)
+		writeJSONError(w, bindErr.StatusCode, bindErr.ErrorType, bindErr.ErrorCode, bindErr.Message)
+		return
+	}
+	if cred.RealKey == "" {
+		p.errors.Add(1)
+		writeJSONError(w, http.StatusServiceUnavailable, "server_error", "BINDING_CREDENTIAL_UNRESOLVED",
+			"Alias \""+probeCtx.AliasName+"\" (source="+binding.KeySourceType+":"+
+				binding.KeySourceRef+") could not be resolved to a usable credential. "+
+				"The referenced personal entry or OAuth account may have been deleted.")
+		return
+	}
+
+	// Stage 6: build the ResolvedRoute for serveRoute. RouteSource="probe"
+	// distinguishes probe traffic from app/legacy in usage_event records;
+	// trust-local reads this to attribute probe events to the right pipeline.
+	protocolFamily := ""
+	if pr, ok := provider.Routes().ByProvider(binding.ProviderCode); ok {
+		protocolFamily = pr.Protocol
+	}
+	probeResolvedRoute := &vkeys.ResolvedRoute{
+		VirtualKeyID:     "probe:" + probeCtx.AliasName,
+		Provider:         binding.ProviderCode,
+		BaseURL:          cred.BaseURL,
+		KeyAlias:         cred.KeyAlias,
+		PlaintextKey:     cred.RealKey,
+		OAuthIdentity:    cred.OAuthIdentity,
+		AccountID:        cred.OAuthAccountID,
+		ProviderCode:     binding.ProviderCode,
+		ProtocolType:     binding.ProviderCode,
+		ProtocolFamily:   protocolFamily,
+		RouteSource:      "probe",
+		FollowUserActive: false, // Probe NEVER follows active — that's the whole point of mode C.
+	}
+	if cred.ManagedKey != nil {
+		probeResolvedRoute.OrgID = cred.ManagedKey.OrgID
+		probeResolvedRoute.SeatID = cred.ManagedKey.SeatID
+		probeResolvedRoute.CredentialID = cred.ManagedKey.CredentialID
+		probeResolvedRoute.CredentialRevision = cred.ManagedKey.CredentialRevision
+		probeResolvedRoute.VirtualKeyRevision = cred.ManagedKey.VirtualKeyRevision
+	}
+
+	// Stage 7: provider adapter.
+	prov, err := p.providers.Get(binding.ProviderCode)
+	if err != nil {
+		p.errors.Add(1)
+		writeJSONError(w, http.StatusBadGateway, "server_error", "PROVIDER_ERROR",
+			"Unknown upstream provider: "+binding.ProviderCode)
+		return
+	}
+
+	// Strip /probe/<alias>/v1 prefix → leave only upstream path.
+	r.URL.Path = "/v1" + probeCtx.StrippedPath
+	if r.URL.RawPath != "" {
+		r.URL.RawPath = r.URL.Path
+	}
+
+	// Stage 8: protocol translation (reuses apppipe — no-op when inbound and
+	// upstream wire formats already match, which is the common case for
+	// first-party degrade-detector calling Anthropic /messages).
+	inboundFmt := apppipe.InferInboundWire(probeCtx.StrippedPath)
+	translateOut, translateErr := apppipe.MaybeTranslateRequest(
+		r.Context(),
+		p.translatorRegistry,
+		probeResolvedRoute,
+		binding,
+		inboundFmt,
+		r,
+		sanitized,
+		inboundModel,
+	)
+	if translateErr != nil {
+		p.errors.Add(1)
+		logger.Warn("probe pipeline protocol translation failed",
+			"error.code", translateErr.ErrorCode,
+			"upstream", binding.ProviderCode,
+		)
+		writeJSONError(w, translateErr.StatusCode, "invalid_request_error", translateErr.ErrorCode, translateErr.Message)
+		return
+	}
+	if translateOut.Engaged {
+		logger.Info("probe pipeline translation engaged",
+			"upstream_format", string(translateOut.UpstreamFormat),
+		)
+		if canonical := apppipe.CanonicalUpstreamPath(translateOut.UpstreamFormat); canonical != "" {
+			r.URL.Path = canonical
+			if r.URL.RawPath != "" {
+				r.URL.RawPath = canonical
+			}
+		}
+	}
+	r.Body = io.NopCloser(bytes.NewReader(translateOut.Body))
+	r.ContentLength = int64(len(translateOut.Body))
+
+	// OAuth → Anthropic WAF fingerprint rewrite (same rationale as App pipeline
+	// — body had been consumed at sanitize stage, oauthInject saw empty body
+	// and no-oped; re-run on the final post-translation body).
+	if binding.KeySourceType == "personal_oauth_account" &&
+		binding.ProviderCode == "anthropic" &&
+		!inboundUAWasClaudeCode {
+		injectClaudeWAFFingerprintFull(r)
+		if r.Body != nil {
+			if newBytes, err := io.ReadAll(r.Body); err == nil {
+				r.Body = io.NopCloser(bytes.NewReader(newBytes))
+				r.ContentLength = int64(len(newBytes))
+			}
+		}
+	}
+
+	// inboundBearer captured pre-Stage-5 above (must precede oauthInject).
+
+	logger.Info("probe pipeline forwarding upstream",
+		"binding_source_type", binding.KeySourceType,
+		"upstream_base", cred.BaseURL,
+		"upstream", binding.ProviderCode,
+		"protocol_family", probeResolvedRoute.ProtocolFamily,
+		"alias_kind", aliasCred.AliasKind,
+	)
+
+	// Observer wiring (SPEC §1.4 stream = probe). Same pattern as
+	// handleAppPipeline — Registry filters per-observer by Streams
+	// declaration, so observers that didn't subscribe to probe (e.g.
+	// rhythm with Streams=[app_pipeline]) get nothing; ndjson-fanout
+	// (Streams=AllStreams()) writes the event to subscribers' files.
+	var obsReqCtx *observer.RequestContext
+	if p.observerRegistry != nil && p.observerRegistry.Active() > 0 {
+		obsReqCtx = &observer.RequestContext{
+			KeyAlias:       probeResolvedRoute.KeyAlias,
+			ProviderID:     binding.ProviderCode,
+			ProtocolFamily: probeResolvedRoute.ProtocolFamily,
+			RequestedModel: inboundModel,
+			SessionID:      resolveSessionID(r.Header, binding.ProviderCode),
+			TraceID:        traceID,
+			StartedAt:      startTime,
+		}
+		probeResolvedRoute.ObserverContext = obsReqCtx
+		probeResolvedRoute.ObserverRegistry = p.observerRegistry
+		p.observerRegistry.NotifyStart(r.Context(), observer.StreamProbe, obsReqCtx)
+	}
+
+	p.serveRoute(w, r, probeResolvedRoute, prov, cred.RealKey, inboundBearer, startTime, logger)
+
+	if obsReqCtx != nil {
+		latency := int(time.Since(startTime).Milliseconds())
+		p.observerRegistry.NotifyEnd(r.Context(), obsReqCtx, latency)
+	}
+}
+
+// handlePathPrefixRoute resolves the active key for providerCode and forwards
+// the request with the provider prefix stripped from the path.
+// Called when the request path starts with a known provider prefix
+// (e.g., /anthropic/v1/messages → strip /anthropic → forward to Anthropic API).
+func (p *Proxy) handlePathPrefixRoute(w http.ResponseWriter, r *http.Request, providerCode, strippedPath string, startTime time.Time, logger *slog.Logger, traceID string) {
+	logger = logger.With("provider", providerCode, "routing", "path-prefix")
+
+	// Snapshot the inbound User-Agent BEFORE any downstream stage can
+	// mutate it. oauthInject (called inside both the OAuth-probe branch
+	// below and ResolveBindingCredential's OAuth branch) overwrites UA to
+	// "claude-cli/2.1.22 (external, cli)" to defeat upstream WAF rules
+	// that key off the original client UA. We need the original here to
+	// derive app_slug for OAuth events — see
+	// workflow/CI/requirements/2026-05-26-usage-by-key-app-attribution.md
+	// and the route construction sites below for how this is consumed.
+	// Personal / team / path-prefix-non-OAuth callers don't read this
+	// snapshot; leaving it set is harmless (no event field is populated).
+	inboundClientUA := r.Header.Get("User-Agent")
+
+	// 2026-04-29 namespace-authority early hard-fail. Run BEFORE the
+	// activeReader nil check so malformed `aikey_*` tokens always fail
+	// loud with TOKEN_INVALID — independent of vault wiring state. This
+	// also keeps the proxy's behavior consistent across editions (Personal
+	// without active vault still rejects clearly-bad aikey tokens).
+	if rawAuth := extractRawAuthValue(r); rawAuth != "" {
+		switch ClassifyToken(rawAuth) {
+		case TokenInvalid:
+			p.errors.Add(1)
+			logger.Warn("aikey_* token form invalid (namespace authority)",
+				"event.name", observability.EventProxyRequestAuthFailed,
+			)
+			writeJSONError(w, http.StatusUnauthorized, "authentication_error", "TOKEN_INVALID",
+				"Token is in the aikey_ namespace but doesn't match any recognized form. "+
+					"Run 'aikey route' to see valid tokens.")
+			return
+		case Tier1App:
+			// 2026-05-20 AKL-208: App bearer at provider-prefix URL is the
+			// wrong path. Reject precisely BEFORE the activeReader nil check
+			// so the user-actionable hint surfaces consistently across
+			// editions (including Personal without active vault). The
+			// downstream Tier1App branch in this function would otherwise
+			// be unreachable in editions without activeReader.
+			p.errors.Add(1)
+			writeJSONError(w, http.StatusUnauthorized, "authentication_error", "APP_TOKEN_WRONG_PATH",
+				"App bearer tokens must be sent to /apps/<slug>/v1/... URLs, "+
+					"not /"+providerCode+"/v1/... Use the OPENAI_BASE_URL value printed "+
+					"by `aikey app authorize <slug>` for the correct URL.")
+			return
+		}
+	}
+
+	if p.activeReader == nil {
+		p.errors.Add(1)
+		writeJSONError(w, http.StatusServiceUnavailable, "server_error", "ACTIVE_KEY_NOT_SUPPORTED",
+			"Path-prefix routing is not available (vault does not support active key config).")
+		return
+	}
+
+	var realKey, baseURL, protocolType, virtualKeyID string
+	var mk *vault.ManagedKey                 // populated when resolved via team key (for org metadata)
+	var oauthIdentity, oauthAccountID string // populated when resolved via OAuth account
+	// keyAlias carries the vault-entry alias for personal / BYOK routes so the
+	// reporter's deriveKeyLabel shows "my-kimi-key" instead of a truncated
+	// virtual_key_id like "personal:my-…". Team keys have no per-binary alias
+	// (ManagedKey stores VK id, not label); OAuth uses OAuthIdentity instead.
+	var keyAlias string
+
+	// Normalise brand aliases ("claude" → "anthropic") before vault lookup so
+	// the query matches the provider_code stored by the server.
+	canonicalCode := providerCanonicalCode(providerCode)
+
+	// Protocol type is determined by the URL path provider code — the user's
+	// intent is explicit (e.g. /anthropic/v1/messages → Anthropic protocol).
+	// This is authoritative for both team and personal keys.
+	protocolType = providerToProtocol(canonicalCode)
+
+	// ── 2026-04-29 prefix rename: namespace-authority dispatch ─────────────
+	// `aikey_*` tokens are AiKey's routing namespace; proxy is the
+	// authoritative decision point. Only specific subforms (team, personal,
+	// probe, active) are valid; anything else in the namespace returns
+	// TOKEN_INVALID immediately. Non-`aikey_*` tokens (native provider
+	// tokens from Claude CLI / Cursor) fall through to the default binding.
+	// See dispatch.go ClassifyToken for the full namespace rules.
+	rawAuthValue := extractRawAuthValue(r)
+	dispatchAction := ClassifyToken(rawAuthValue)
+
+	// Hard-fail any `aikey_*` token whose subform we don't recognize. This
+	// catches: aikey_route_* (reserved namespace, not implemented), unknown
+	// aikey_* prefixes (typos / future-extension residue), legacy aikey_vk_*
+	// (fully removed post-migration), malformed aikey_personal_<non-64-hex>.
+	// Falling through silently would mask config bugs — exactly what the
+	// namespace-authority principle forbids.
+	if dispatchAction == TokenInvalid {
+		p.errors.Add(1)
+		logger.Warn("aikey_* token form invalid (namespace authority)",
+			"event.name", observability.EventProxyRequestAuthFailed,
+		)
+		writeJSONError(w, http.StatusUnauthorized, "authentication_error", "TOKEN_INVALID",
+			"Token is in the aikey_ namespace but doesn't match any recognized form. "+
+				"Run 'aikey route' to see valid tokens.")
+		return
+	}
+
+	// Tier2ProbeRaw — pre-save proxy probe (2026-05-26, see probe_raw.go +
+	// roadmap20260320/技术实现/update/20260526-pre-save-proxy-probe-raw.md).
+	// MUST be dispatched BEFORE Tier1 / Tier3 paths because handleProbeRaw
+	// short-circuits all vault binding lookups — caller's plaintext bearer
+	// in X-Aikey-Probe-Bearer is the auth source. Self-contained pipeline:
+	// no reporter / WAL / GetProviderBinding involvement (audit-able as one
+	// file in probe_raw.go).
+	if dispatchAction == Tier2ProbeRaw {
+		// Strip provider prefix so handleProbeRaw forwards using the path
+		// the caller actually requested (e.g. /anthropic/v1/messages →
+		// /v1/messages joined onto upstream base URL).
+		p.handleProbeRaw(w, r, canonicalCode, strippedPath, logger)
+		return
+	}
+
+	// Tier 1: aikey_team_<vk_id> or aikey_personal_<64-hex> — resolve via Registry.
+	// (Tier1App was handled early-fail above per AKL-208 for edition consistency.)
+	if dispatchAction == Tier1Team || dispatchAction == Tier1Personal {
+		route := p.registry.Resolve(rawAuthValue)
+		if route == nil {
+			p.errors.Add(1)
+			logger.Warn("tier-1 bearer not in registry",
+				"event.name", observability.EventProxyRequestAuthFailed,
+			)
+			writeJSONError(w, http.StatusUnauthorized, "authentication_error", "TOKEN_INVALID",
+				"Route token not found in registry. Run 'aikey route' to see available tokens.")
+			return
+		}
+
+		// Provider compatibility check: token's provider must match path's provider.
+		if !isProviderCompatible(route, canonicalCode) {
+			p.errors.Add(1)
+			writeJSONError(w, http.StatusForbidden, "permission_error", "PROVIDER_MISMATCH",
+				"Route token is bound to provider '"+route.ProviderCode+
+					"', but request path indicates '"+canonicalCode+
+					"'. Use the correct path prefix or a different token.")
+			return
+		}
+
+		// Strip provider prefix from path.
+		r.URL.Path = strippedPath
+		if r.URL.RawPath != "" {
+			r.URL.RawPath = strippedPath
+		}
+
+		// Resolve real key.
+		var tokenRealKey string
+		if route.PlaintextKey != "" {
+			tokenRealKey = route.PlaintextKey
+		} else if route.KeyAlias == "__oauth__" {
+			// OAuth route token — broker handles credential injection in serveRoute.
+			tokenRealKey = "__oauth__"
+			oauthIdentity = route.OAuthIdentity
+			oauthAccountID = route.AccountID
+		} else {
+			var err error
+			tokenRealKey, err = p.vault.GetSecret(route.KeyAlias)
+			if err != nil {
+				p.errors.Add(1)
+				writeJSONError(w, http.StatusServiceUnavailable, "server_error", "SECRET_NOT_CONFIGURED",
+					"Provider API Key '"+route.KeyAlias+"' is not in the vault. Run: aikey add "+route.KeyAlias)
+				return
+			}
+		}
+
+		// Override baseURL from path's provider default if route doesn't specify one.
+		tokenBaseURL := route.BaseURL
+		if tokenBaseURL == "" {
+			tokenBaseURL = providerDefaultBaseURL(canonicalCode)
+		}
+
+		prov, err := p.providers.Get(protocolType)
+		if err != nil {
+			p.errors.Add(1)
+			writeJSONError(w, http.StatusBadGateway, "server_error", "PROVIDER_ERROR",
+				"Unknown provider protocol: "+protocolType)
+			return
+		}
+
+		tokenRoute := &vkeys.ResolvedRoute{
+			VirtualKeyID:  route.VirtualKeyID,
+			Provider:      providerCode,
+			BaseURL:       tokenBaseURL,
+			PlaintextKey:  tokenRealKey,
+			ProviderCode:  canonicalCode,
+			ProtocolType:  protocolType,
+			OrgID:         route.OrgID,
+			AccountID:     route.AccountID,
+			SeatID:        route.SeatID,
+			OAuthIdentity: oauthIdentity,
+			AllowedModels: route.AllowedModels, // Why: serveRoute checks this field for model allowlist enforcement
+			// Why: KeyAlias is the user-facing label for team/personal/BYOK
+			// routes (see deriveKeyLabel in reportable.go). Without copying
+			// it through, path-prefix receipts degrade to a truncated
+			// virtual_key_id like `vk_abc…` instead of the key's alias.
+			// OAuth uses OAuthIdentity instead so we skip KeyAlias for the
+			// sentinel __oauth__ value.
+			KeyAlias: func() string {
+				if route.KeyAlias == "__oauth__" {
+					return ""
+				}
+				return route.KeyAlias
+			}(),
+			// Why: route_source drives deriveKeyLabel's classification — OAuth
+			// routes pick OAuthIdentity (user's email), personal/team pick
+			// KeyAlias. Without this copy, reportable.go's OrgID-based fallback
+			// mis-classifies OAuth as "personal" and the UI shows a truncated
+			// VK id like `oauth:sessio` instead of the user's email.
+			RouteSource: route.RouteSource,
+		}
+		// UA-derived app attribution for the Tier-1 OAuth path (aikey_personal_*
+		// wrapper tokens whose registry-resolved route has RouteSource="oauth").
+		// This is the MOST COMMON OAuth invocation route — `aikey use <oauth-alias>`
+		// hands the user an `aikey_personal_<64hex>` token, the registry maps it
+		// to a vault.OAuthRouteToken at startup, and every request lands here.
+		// tokenRoute is a per-request copy so mutating it is safe (no race with
+		// concurrent requests hitting the same OAuth account); the cached
+		// registry route is left untouched. inboundClientUA was snapshotted at
+		// handler entry before oauthInject below scrubbed the header. See spec
+		// at workflow/CI/requirements/2026-05-26-usage-by-key-app-attribution.md.
+		if tokenRoute.RouteSource == "oauth" {
+			tokenRoute.AppSlug = uaattribution.Default().Match(inboundClientUA)
+		}
+
+		// Handle OAuth credential injection if this is an OAuth route token.
+		if tokenRealKey == "__oauth__" && oauthAccountID != "" && p.broker != nil {
+			if err := p.broker.EnsureFresh(r.Context(), oauthAccountID); err != nil {
+				p.errors.Add(1)
+				writeJSONError(w, http.StatusUnauthorized, "auth_error", "OAUTH_TOKEN_EXPIRED",
+					err.Error()+"\n  Run: aikey auth login "+providerCode)
+				return
+			}
+			cred, err := p.broker.ResolveCredential(r.Context(), oauthAccountID)
+			if err != nil {
+				p.errors.Add(1)
+				writeJSONError(w, http.StatusServiceUnavailable, "server_error", "OAUTH_RESOLVE_FAILED", err.Error())
+				return
+			}
+			// Why override for openai: Codex OAuth uses chatgpt.com/backend-api/codex
+			// (Responses API), NOT api.openai.com/v1 (Chat Completions API).
+			if canonicalCode == "openai" {
+				tokenRoute.BaseURL = "https://chatgpt.com/backend-api/codex"
+			}
+			oauthInject(r, cred, canonicalCode)
+		}
+
+		// SPEC §1.4.1 user_chat — see serveRouteWithObserver docstring.
+		p.serveRouteWithObserver(w, r, tokenRoute, prov, tokenRealKey, rawAuthValue, startTime, logger,
+			observer.StreamUserChat, traceID)
+		return
+	}
+
+	// ── aikey_probe_<alias> sentinel ────────────────────────────────────
+	//
+	// Introduced 2026-04-22 (Stage 3 of connectivity-probe-through-proxy).
+	// Renamed in the 2026-04-29 prefix rename refactor — was previously a
+	// dedicated `_alias_` suffix form, now `aikey_probe_<alias>`.
+	//
+	// Why: `aikey test <alias>` and the shell wrapper preflight (called
+	// before every `claude` / `codex`) must probe a specific personal API
+	// key without the CLI touching the vault. The CLI cannot ask for the
+	// master password on every invocation — that's terrible UX for a
+	// wrapper that runs on every command. Proxy already holds the vault
+	// derived key in memory from its own startup password prompt, so it
+	// can decrypt any personal alias on demand.
+	//
+	// Unlike the no-bearer fallback below — which resolves whichever
+	// personal/team/OAuth binding is ACTIVE for canonicalCode — this
+	// sentinel tests EXACTLY the alias the caller named. That fixes the
+	// 2026-04-22 caveat where probing an inactive personal key silently
+	// exercised the active one.
+	//
+	// Security: proxy is bound to 127.0.0.1, so any caller already has
+	// local-host equivalence — this is the same trust boundary that lets
+	// `claude` runtime hit `127.0.0.1:<port>/anthropic/v1/...` without
+	// presenting credentials. No new attack surface.
+	if dispatchAction == Tier2Probe {
+		alias := strings.TrimPrefix(rawAuthValue, "aikey_probe_")
+		if alias == "" {
+			p.errors.Add(1)
+			writeJSONError(w, http.StatusUnauthorized, "authentication_error", "TOKEN_INVALID",
+				"aikey_probe_ sentinel missing alias suffix")
+			return
+		}
+
+		// ── OAuth probe path (2026-04-29 fix A — bugfix/2026-04-29-oauth-probe-tier2-503.md) ──
+		//
+		// CLI sends `aikey_probe_<account_id>` for OAuth credentials too
+		// (connectivity/mod.rs:243 oauth_target builds bearer this way).
+		// account_id looks like `session_*`. Without this branch the code
+		// below tries GetPersonalKeyByAlias("session_xxx"), fails, returns
+		// 503 — the user-facing "claude → ... 503" red row in `aikey doctor`.
+		//
+		// Try OAuth account lookup first (cheap status check via broker);
+		// only fall through to personal-key lookup if it's not a known
+		// OAuth account. This preserves Tier3 active-OAuth's documented
+		// flow (proxy refreshes token, attaches persona headers, forwards)
+		// for the probe path too — connectivity/mod.rs:84 explicitly
+		// promises this behavior.
+		if p.broker != nil {
+			if _, statusErr := p.broker.GetAccountStatus(r.Context(), alias); statusErr == nil {
+				// OAuth account recognized — refresh + forward
+				if err := p.broker.EnsureFresh(r.Context(), alias); err != nil {
+					p.errors.Add(1)
+					logger.Warn("oauth probe: EnsureFresh failed",
+						"account_id", alias, "error", err,
+						"event.name", observability.EventProxyRequestVaultFailed,
+					)
+					writeJSONError(w, http.StatusUnauthorized, "auth_error", "OAUTH_TOKEN_EXPIRED",
+						err.Error()+"\n  Run: aikey auth login "+providerCode)
+					return
+				}
+				cred, err := p.broker.ResolveCredential(r.Context(), alias)
+				if err != nil {
+					p.errors.Add(1)
+					logger.Error("oauth probe: ResolveCredential failed",
+						"account_id", alias, "error", err)
+					writeJSONError(w, http.StatusServiceUnavailable, "server_error",
+						"OAUTH_RESOLVE_FAILED", err.Error())
+					return
+				}
+
+				// BaseURL: same rule as Tier3 active-OAuth path (proxy.go:629).
+				// openai OAuth uses chatgpt.com/backend-api/codex (Codex API),
+				// not api.openai.com (API-key path).
+				var oauthBase string
+				if canonicalCode == "openai" {
+					oauthBase = "https://chatgpt.com/backend-api/codex"
+				} else {
+					oauthBase = providerDefaultBaseURL(canonicalCode)
+				}
+				oauthInject(r, cred, canonicalCode)
+
+				identityTag := cred.Identity
+				if identityTag == "" {
+					identityTag = alias
+				}
+				logger.Info("oauth probe: forwarding request",
+					"provider", canonicalCode,
+					"identity", identityTag,
+					"account_id", alias,
+					"routing", "tier2-probe",
+				)
+
+				// Strip provider prefix (e.g. /anthropic/v1/messages →
+				// /v1/messages) before forwarding — same as personal-probe
+				// fallback below.
+				r.URL.Path = strippedPath
+				if r.URL.RawPath != "" {
+					r.URL.RawPath = strippedPath
+				}
+
+				prov, err := p.providers.Get(protocolType)
+				if err != nil {
+					p.errors.Add(1)
+					writeJSONError(w, http.StatusBadGateway, "server_error", "PROVIDER_ERROR",
+						"Unknown provider protocol: "+protocolType)
+					return
+				}
+
+				oauthRoute := &vkeys.ResolvedRoute{
+					VirtualKeyID:  "oauth:" + alias,
+					Provider:      providerCode,
+					BaseURL:       oauthBase,
+					PlaintextKey:  "__oauth__", // sentinel — header injection done by oauthInject above
+					ProviderCode:  canonicalCode,
+					ProtocolType:  protocolType,
+					KeyAlias:      "", // OAuth uses Identity, not alias
+					RouteSource:   "oauth",
+					OAuthIdentity: identityTag,
+					AccountID:     alias, // OAuth account_id; correct field name (not OAuthAccountID)
+					// UA-derived app attribution. inboundClientUA was captured
+					// at handler entry, before oauthInject scrubbed the header.
+					// Matcher always returns a non-empty slug (falls back to
+					// "unknown-app") so OAuth events never render as empty
+					// app_slug in the usage-by-key dashboard.
+					AppSlug: uaattribution.Default().Match(inboundClientUA),
+				}
+				// SPEC §1.4.1 user_chat — see serveRouteWithObserver docstring.
+				p.serveRouteWithObserver(w, r, oauthRoute, prov, "__oauth__", rawAuthValue, startTime, logger,
+					observer.StreamUserChat, traceID)
+				return
+			}
+			// not an OAuth account — fall through to personal-key lookup below
+		}
+
+		plaintext, entryProviderCode, entryBaseURL, err := p.activeReader.GetPersonalKeyByAlias(alias)
+		if err != nil {
+			p.errors.Add(1)
+			logger.Warn("personal-alias sentinel: vault lookup failed",
+				"alias", alias, "error", err,
+				"event.name", observability.EventProxyRequestVaultFailed,
+			)
+			writeJSONError(w, http.StatusServiceUnavailable, "server_error", "SECRET_NOT_CONFIGURED",
+				"Personal key '"+alias+"' not found or could not be decrypted. Run: aikey list")
+			return
+		}
+
+		// Derive baseURL: entry's custom URL > entry's stored provider default >
+		// path-prefix canonical default. The last rung matters for personal
+		// keys that are bound to multiple providers (one alias, several
+		// provider_code rows via the bindings table) — path prefix
+		// disambiguates at probe time.
+		resolvedBase := entryBaseURL
+		if resolvedBase == "" && entryProviderCode != "" {
+			resolvedBase = providerDefaultBaseURL(entryProviderCode)
+		}
+		if resolvedBase == "" {
+			resolvedBase = providerDefaultBaseURL(canonicalCode)
+		}
+
+		prov, err := p.providers.Get(protocolType)
+		if err != nil {
+			p.errors.Add(1)
+			writeJSONError(w, http.StatusBadGateway, "server_error", "PROVIDER_ERROR",
+				"Unknown provider protocol: "+protocolType)
+			return
+		}
+
+		// Strip provider prefix (e.g. /anthropic/v1/messages → /v1/messages)
+		// before forwarding, matching the tier-1 (Registry) branch behaviour.
+		r.URL.Path = strippedPath
+		if r.URL.RawPath != "" {
+			r.URL.RawPath = strippedPath
+		}
+
+		aliasRoute := &vkeys.ResolvedRoute{
+			VirtualKeyID: "personal:" + alias,
+			Provider:     providerCode,
+			BaseURL:      resolvedBase,
+			PlaintextKey: plaintext,
+			ProviderCode: canonicalCode,
+			ProtocolType: protocolType,
+			KeyAlias:     alias,
+			// RouteSource = "personal" matches what personalTokenToRoute uses
+			// so reportable.go's label classification stays consistent
+			// regardless of which path produced the route.
+			RouteSource: "personal",
+		}
+		// SPEC §1.4.1 user_chat — see serveRouteWithObserver docstring.
+		p.serveRouteWithObserver(w, r, aliasRoute, prov, plaintext, rawAuthValue, startTime, logger,
+			observer.StreamUserChat, traceID)
+		return
+	}
+
+	// ── No auth header: fall through to default binding ────────────────────
+
+	// ── v1.0.2: try provider binding first ─────────────────────────────────
+	// The new model stores per-provider primary key selection in
+	// user_profile_provider_bindings. If a binding exists, resolve directly
+	// via the shared resolveBindingCredential helper (AKL-207). The helper
+	// also serves the App pipeline so both paths produce identical
+	// credential records — see helper docstring for per-KeySourceType semantics.
+	binding, _ := p.activeReader.GetProviderBinding(canonicalCode)
+	if binding != nil {
+		cred, bindErr := p.ResolveBindingCredential(r, binding, providerCode, canonicalCode, logger)
+		if bindErr != nil {
+			// OAuth path: writeJSONError + return (helper does NOT increment
+			// p.errors because the caller's view of "what's an error" may
+			// differ — we increment here to keep the metric semantics
+			// identical to the pre-refactor inline code).
+			p.errors.Add(1)
+			writeJSONError(w, bindErr.StatusCode, bindErr.ErrorType, bindErr.ErrorCode, bindErr.Message)
+			return
+		}
+		// Soft-fail path (team / personal with empty cred): RealKey="" leaves
+		// the variables blank below and the legacy fallback block fires.
+		// OAuth-success path: cred fields populated, RealKey="__oauth__".
+		realKey = cred.RealKey
+		virtualKeyID = cred.VirtualKeyID
+		keyAlias = cred.KeyAlias
+		baseURL = cred.BaseURL
+		oauthIdentity = cred.OAuthIdentity
+		oauthAccountID = cred.OAuthAccountID
+		if cred.ManagedKey != nil {
+			mk = cred.ManagedKey
+		}
+	}
+
+	// ── Legacy fallback: active team key → active personal key ─────────────
+	// For backward compatibility with pre-v1.0.2 vaults that don't have the
+	// user_profile_provider_bindings table.
+	if realKey == "" {
+		var err error
+		mk, err = p.activeReader.GetActiveTeamKeyByProvider(canonicalCode)
+		if err != nil {
+			p.errors.Add(1)
+			logger.Error("vault: active team key lookup failed", "error", err)
+			writeJSONError(w, http.StatusServiceUnavailable, "server_error", "VAULT_ERROR", err.Error())
+			return
+		}
+
+		if mk != nil {
+			realKey = mk.PlaintextKey
+			virtualKeyID = mk.VirtualKeyID
+			// 2026-05-09: same alias surfacing as the binding-driven team
+			// branch above, for the legacy fallback (pre-v1.0.2 vaults
+			// without user_profile_provider_bindings).
+			keyAlias = mk.LocalAlias
+			if url, ok := mk.ProviderBaseURLs[canonicalCode]; ok && url != "" {
+				baseURL = url
+			} else if url, ok := mk.ProviderBaseURLs[providerCode]; ok && url != "" {
+				baseURL = url
+			} else {
+				baseURL = mk.BaseURL
+			}
+		} else {
+			cfg, err := p.activeReader.GetActiveKeyConfig()
+			if err != nil {
+				p.errors.Add(1)
+				logger.Error("vault: active key config read failed", "error", err)
+				writeJSONError(w, http.StatusServiceUnavailable, "server_error", "VAULT_ERROR", err.Error())
+				return
+			}
+			if cfg != nil && cfg.KeyType == "personal" {
+				supported := len(cfg.Providers) == 0
+				for _, code := range cfg.Providers {
+					if strings.EqualFold(providerCanonicalCode(code), canonicalCode) {
+						supported = true
+						break
+					}
+				}
+				if supported {
+					plaintext, pcode, entryBaseURL, err := p.activeReader.GetPersonalKeyByAlias(cfg.KeyRef)
+					if err != nil {
+						p.errors.Add(1)
+						logger.Error("vault: personal key read failed", "alias", cfg.KeyRef, "error", err)
+						writeJSONError(w, http.StatusServiceUnavailable, "server_error", "VAULT_ERROR", err.Error())
+						return
+					}
+					realKey = plaintext
+					virtualKeyID = "personal:" + cfg.KeyRef
+					keyAlias = cfg.KeyRef
+					if entryBaseURL != "" {
+						baseURL = entryBaseURL
+					} else if pcode != "" {
+						baseURL = providerDefaultBaseURL(pcode)
+					} else {
+						baseURL = providerDefaultBaseURL(canonicalCode)
+					}
+				}
+			}
+		}
+	}
+
+	if realKey == "" {
+		p.errors.Add(1)
+		logger.Warn("no active key for provider")
+		writeJSONError(w, http.StatusServiceUnavailable, "server_error", "NO_ACTIVE_KEY",
+			"No active key for '"+providerCode+"'. Run 'aikey use <key>'.")
+		return
+	}
+
+	// Resolve provider adapter by protocol type (derived from URL path).
+	prov, err := p.providers.Get(protocolType)
+	if err != nil {
+		p.errors.Add(1)
+		writeJSONError(w, http.StatusBadGateway, "server_error", "PROVIDER_ERROR",
+			"Unknown provider protocol: "+protocolType+" (from path: "+providerCode+")")
+		return
+	}
+
+	// Strip provider prefix from path before forwarding.
+	r.URL.Path = strippedPath
+	if r.URL.RawPath != "" {
+		r.URL.RawPath = strippedPath
+	}
+
+	route := &vkeys.ResolvedRoute{
+		VirtualKeyID: virtualKeyID,
+		Provider:     providerCode,
+		BaseURL:      baseURL,
+		PlaintextKey: realKey,
+		ProviderCode: canonicalCode,
+		ProtocolType: protocolType,
+		// Why: for personal/BYOK path-prefix routes, keyAlias was captured
+		// above at vault-lookup time. Without this field, reportable.go's
+		// deriveKeyLabel falls back to truncating VirtualKeyID (e.g.
+		// "personal:my-kimi-…" instead of "my-kimi-key"). Team & OAuth
+		// paths leave this empty because they label via different fields
+		// (ManagedKey has no alias; OAuth uses OAuthIdentity).
+		KeyAlias: keyAlias,
+	}
+	// Populate org/account/seat from managed key so usage events carry the correct org_id.
+	if mk != nil {
+		route.OrgID = mk.OrgID
+		route.AccountID = mk.OwnerAccountID
+		route.SeatID = mk.SeatID
+	}
+	// OAuth: carry identity + account_id so usage events can identify the account.
+	if oauthAccountID != "" {
+		route.AccountID = oauthAccountID
+		route.OAuthIdentity = oauthIdentity
+	}
+	// Why: classify so reportable.go's deriveKeyLabel picks the right label
+	// field (OAuthIdentity for oauth, KeyAlias for team/personal). Without
+	// this, the OrgID fallback in reportable.go mis-classifies OAuth personal
+	// requests as "personal" and produces truncated labels like `oauth:sessio`
+	// instead of the user's email. Order matters: OAuth wins even when a team
+	// managed-key lookup happens to side-populate mk for the same account.
+	switch {
+	case oauthAccountID != "":
+		route.RouteSource = "oauth"
+		// UA-derived app attribution for the direct OAuth path
+		// (/v1/...). inboundClientUA was snapshotted at handler entry
+		// before ResolveBindingCredential's oauthInject scrubbed it.
+		// Matcher returns a non-empty slug ("unknown-app" fallback) so
+		// the usage-by-key dashboard always has a row label. Personal /
+		// team branches deliberately leave AppSlug empty per spec R5
+		// (workflow/CI/requirements/2026-05-26-usage-by-key-app-attribution.md).
+		route.AppSlug = uaattribution.Default().Match(inboundClientUA)
+	case mk != nil:
+		route.RouteSource = "team"
+	default:
+		route.RouteSource = "personal"
+	}
+
+	// 2026-04-29 prefix rename: receipt token rebuilt from virtualKeyID for
+	// usage reporting only (not auth). At this code path virtualKeyID has
+	// already been resolved/normalized upstream (via the registry which
+	// itself goes through supervisor.NormalizeTeamToken at load time), so
+	// simple concat is safe — the registry guarantees no historical-prefix
+	// residue. Avoid importing supervisor here to prevent a package cycle.
+	// SPEC §1.4.1 user_chat — see serveRouteWithObserver docstring.
+	p.serveRouteWithObserver(w, r, route, prov, realKey, "aikey_team_"+virtualKeyID, startTime, logger,
+		observer.StreamUserChat, traceID)
+}

@@ -248,6 +248,7 @@ func main() {
 	adminHandler.CanaryResultFn = sup.CanaryResult
 	adminHandler.DebugUpstreamHeadersStateFn = proxy.UpstreamHeadersDebugState
 	adminHandler.DebugUpstreamHeadersSetFn = proxy.SetUpstreamHeadersDebugAPIOverride
+	adminHandler.AppHealthFn = sup.AppHealthSnapshot
 
 	// Build the outbound transport for upstream providers (optional).
 	dataHandler := sup.Handler()
