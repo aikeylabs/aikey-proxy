@@ -275,6 +275,16 @@ func (p *Proxy) serveRoute(w http.ResponseWriter, r *http.Request, route *vkeys.
 		injectStreamUsageOption(r)
 	}
 
+	// 6c. P4 filter dispatch: inbound compliance/DLP check on the request body
+	// BEFORE forwarding to the LLM. No-op when no filter hook is installed
+	// (zero hot-path cost behind the nil check inside applyInboundFilter).
+	// On Block, applyInboundFilter writes the 403 and we return without
+	// forwarding. On Mask, r.Body is rewritten to the redacted version so the
+	// upstream LLM never sees the raw sensitive prompt. Fail-open on degraded.
+	if !p.applyInboundFilter(w, r, extractModel(r), logger) {
+		return
+	}
+
 	// 7. Store metadata in context for post-processing.
 	// For streaming requests, bridge the HTTP/1.1 close-notifier to a context
 	// so the streamDrainer can abort the upstream call when the client

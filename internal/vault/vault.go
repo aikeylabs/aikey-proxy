@@ -873,6 +873,30 @@ func ReadConfigU64LE(dbPath string, key string) (uint64, error) {
 	return v, nil
 }
 
+// ReadConfigString reads a string value (stored as a UTF-8 BLOB) from the vault
+// config table. Returns "" if the key is absent or the vault does not yet
+// exist. Opens a fresh connection so the Supervisor can call it before
+// vault.Open (same contract as ReadConfigU64LE). Used to read
+// runtime.source_identity for delivery-integrity event stamping — written by
+// the CLI side (storage.rs SOURCE_IDENTITY_KEY).
+func ReadConfigString(dbPath string, key string) (string, error) {
+	db, err := sql.Open("sqlite", dbPath)
+	if err != nil {
+		return "", fmt.Errorf("open vault db for config read: %w", err)
+	}
+	defer db.Close()
+
+	var value string
+	err = db.QueryRow("SELECT CAST(value AS TEXT) FROM config WHERE key = ?", key).Scan(&value)
+	if err == sql.ErrNoRows {
+		return "", nil
+	}
+	if err != nil {
+		return "", fmt.Errorf("read config key %q: %w", key, err)
+	}
+	return value, nil
+}
+
 // ---------------------------------------------------------------------------
 // Route token reading (personal keys and OAuth accounts)
 // ---------------------------------------------------------------------------
@@ -1123,6 +1147,35 @@ func (r *Reader) HasFilterAppsRegistered() (bool, error) {
 		return false, fmt.Errorf("count filter_stages rows: %w", err)
 	}
 	return n > 0, nil
+}
+
+// GetFilterAppSlugs returns the slugs of apps that declared a non-NULL
+// `filter_stages` (i.e. registered as a filter/DLP app via `aikey app install`).
+// The supervisor resolves each slug's installed binary by convention
+// (<apps_dir>/<slug>/bin/<slug>) and spawns it. Empty when none / the column is
+// absent. Multiple rows per slug (rotation history) are de-duplicated.
+func (r *Reader) GetFilterAppSlugs() ([]string, error) {
+	if !hasColumn(r.db, "app_records", "filter_stages") {
+		return nil, nil
+	}
+	rows, err := r.db.Query(
+		`SELECT DISTINCT slug FROM app_records WHERE filter_stages IS NOT NULL`,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("query filter_stages slugs: %w", err)
+	}
+	defer rows.Close()
+	var slugs []string
+	for rows.Next() {
+		var s string
+		if err := rows.Scan(&s); err != nil {
+			return nil, fmt.Errorf("scan filter slug: %w", err)
+		}
+		if s != "" {
+			slugs = append(slugs, s)
+		}
+	}
+	return slugs, rows.Err()
 }
 
 // ObserveSubscription is one parsed entry from `app_records.observe_streams`.

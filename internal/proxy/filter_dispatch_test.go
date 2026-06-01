@@ -1,0 +1,262 @@
+package proxy
+
+import (
+	"bytes"
+	"context"
+	"encoding/json"
+	"io"
+	"log/slog"
+	"net/http"
+	"net/http/httptest"
+	"strings"
+	"testing"
+
+	"github.com/AiKeyLabs/aikey-proxy/internal/apphook"
+)
+
+// stubHook is a configurable apphook.Hook for testing applyInboundFilter's
+// verdict handling without spawning a real child.
+type stubHook struct {
+	resp         *apphook.Response
+	gotPayload   []byte
+	gotDirection apphook.Direction
+	called       int
+}
+
+func (h *stubHook) Name() string { return "stub" }
+func (h *stubHook) Detect(ctx context.Context, req *apphook.Request) *apphook.Response {
+	h.called++
+	h.gotPayload = append([]byte(nil), req.Payload...)
+	h.gotDirection = req.Direction
+	return h.resp
+}
+func (h *stubHook) Status() *apphook.Status { return &apphook.Status{Healthy: true} }
+
+func newReq(body string) *http.Request {
+	r := httptest.NewRequest("POST", "/v1/messages", bytes.NewBufferString(body))
+	r.Header.Set("Content-Type", "application/json")
+	return r
+}
+
+func readReqBody(t *testing.T, r *http.Request) string {
+	t.Helper()
+	b, _ := io.ReadAll(r.Body)
+	return string(b)
+}
+
+func discardLogger() *slog.Logger {
+	return slog.New(slog.NewTextHandler(io.Discard, nil))
+}
+
+// No hook installed → proceed=true, body untouched, zero cost.
+func TestApplyInboundFilter_NoHook_PassThrough(t *testing.T) {
+	p := &Proxy{} // filterHook nil
+	r := newReq(`{"model":"claude","messages":[{"role":"user","content":"hi"}]}`)
+	w := httptest.NewRecorder()
+
+	proceed := p.applyInboundFilter(w, r, "claude", discardLogger())
+	if !proceed {
+		t.Fatal("expected proceed=true with no hook")
+	}
+	if got := readReqBody(t, r); got != `{"model":"claude","messages":[{"role":"user","content":"hi"}]}` {
+		t.Errorf("body mutated despite no hook: %s", got)
+	}
+}
+
+// Allow verdict → proceed, body unchanged.
+func TestApplyInboundFilter_Allow(t *testing.T) {
+	hook := &stubHook{resp: &apphook.Response{Action: apphook.ActionAllow}}
+	p := &Proxy{filterHook: hook}
+	body := `{"messages":[{"content":"hello"}]}`
+	r := newReq(body)
+	w := httptest.NewRecorder()
+
+	proceed := p.applyInboundFilter(w, r, "m", discardLogger())
+	if !proceed {
+		t.Fatal("Allow should proceed")
+	}
+	if hook.called != 1 {
+		t.Errorf("hook.Detect called %d times, want 1", hook.called)
+	}
+	if hook.gotDirection != apphook.DirectionInbound {
+		t.Errorf("direction: got %v want inbound", hook.gotDirection)
+	}
+	// L1: the hook sees the extracted CONTENT ("hello"), never the JSON envelope.
+	if string(hook.gotPayload) != "hello" {
+		t.Errorf("hook got payload %q, want \"hello\" (content, not envelope)", hook.gotPayload)
+	}
+	if got := readReqBody(t, r); got != body {
+		t.Errorf("Allow should not mutate body: %s", got)
+	}
+}
+
+// Mask verdict → the masked CONTENT is written back into the envelope, which is
+// otherwise preserved (L1: only content string values change, structure intact).
+func TestApplyInboundFilter_Mask(t *testing.T) {
+	hook := &stubHook{resp: &apphook.Response{
+		Action:         apphook.ActionMask,
+		MutatedPayload: []byte("my id is [masked]"), // content-level mask
+	}}
+	p := &Proxy{filterHook: hook}
+	r := newReq(`{"messages":[{"content":"my id is 110101199001011234"}]}`)
+	w := httptest.NewRecorder()
+
+	proceed := p.applyInboundFilter(w, r, "m", discardLogger())
+	if !proceed {
+		t.Fatal("Mask should proceed (forward masked)")
+	}
+	// Hook saw the content, not the envelope.
+	if string(hook.gotPayload) != "my id is 110101199001011234" {
+		t.Errorf("hook got payload %q, want the content string", hook.gotPayload)
+	}
+	got := readReqBody(t, r)
+	// Masked content reinserted, raw id gone, envelope structure preserved + valid JSON.
+	if !strings.Contains(got, `"my id is [masked]"`) {
+		t.Errorf("masked content not reinserted:\n%s", got)
+	}
+	if strings.Contains(got, "110101199001011234") {
+		t.Errorf("raw id survived in body:\n%s", got)
+	}
+	if !json.Valid([]byte(got)) || !strings.Contains(got, `"messages"`) {
+		t.Errorf("envelope structure not preserved:\n%s", got)
+	}
+	if r.ContentLength != int64(len(got)) {
+		t.Errorf("ContentLength: got %d want %d", r.ContentLength, len(got))
+	}
+	if r.Header.Get("Content-Length") != itoaInt64(int64(len(got))) {
+		t.Errorf("Content-Length header not updated: %s", r.Header.Get("Content-Length"))
+	}
+}
+
+// Mask verdict but empty payload → that piece is left unchanged (defensive); the
+// body is not mutated.
+func TestApplyInboundFilter_MaskEmptyPayload_LeavesUnchanged(t *testing.T) {
+	hook := &stubHook{resp: &apphook.Response{Action: apphook.ActionMask}} // no MutatedPayload
+	p := &Proxy{filterHook: hook}
+	orig := `{"messages":[{"content":"x"}]}`
+	r := newReq(orig)
+	w := httptest.NewRecorder()
+
+	proceed := p.applyInboundFilter(w, r, "m", discardLogger())
+	if !proceed {
+		t.Fatal("should proceed")
+	}
+	if got := readReqBody(t, r); got != orig {
+		t.Errorf("empty-mask should leave body unchanged: %s", got)
+	}
+}
+
+// Block verdict → proceed=false, 403 written with structured error.
+func TestApplyInboundFilter_Block(t *testing.T) {
+	hook := &stubHook{resp: &apphook.Response{
+		Action: apphook.ActionBlock,
+		Reason: "private key leak detected",
+	}}
+	p := &Proxy{filterHook: hook}
+	r := newReq(`{"messages":[{"content":"key=sk-ant-secret"}]}`)
+	w := httptest.NewRecorder()
+
+	proceed := p.applyInboundFilter(w, r, "m", discardLogger())
+	if proceed {
+		t.Fatal("Block should NOT proceed")
+	}
+	if w.Code != http.StatusForbidden {
+		t.Errorf("status: got %d want 403", w.Code)
+	}
+	var body map[string]any
+	_ = json.Unmarshal(w.Body.Bytes(), &body)
+	// writeJSONError shape: {"error": {"type":..., "code":..., "message":...}}
+	errObj, _ := body["error"].(map[string]any)
+	if errObj == nil {
+		t.Fatalf("no error object in body: %s", w.Body.String())
+	}
+	if errObj["code"] != "COMPLIANCE_BLOCKED" {
+		t.Errorf("code: got %v want COMPLIANCE_BLOCKED", errObj["code"])
+	}
+	if errObj["message"] != "private key leak detected" {
+		t.Errorf("message: got %v", errObj["message"])
+	}
+}
+
+// Block with empty reason → default message.
+func TestApplyInboundFilter_BlockDefaultMessage(t *testing.T) {
+	hook := &stubHook{resp: &apphook.Response{Action: apphook.ActionBlock}}
+	p := &Proxy{filterHook: hook}
+	r := newReq(`{"messages":[{"content":"x"}]}`) // needs a content piece to inspect
+	w := httptest.NewRecorder()
+
+	p.applyInboundFilter(w, r, "m", discardLogger())
+	var body map[string]any
+	_ = json.Unmarshal(w.Body.Bytes(), &body)
+	errObj := body["error"].(map[string]any)
+	if errObj["message"] != "request blocked by compliance policy" {
+		t.Errorf("default message: got %v", errObj["message"])
+	}
+}
+
+// Warn verdict → proceed, body unchanged (passed through with warning).
+func TestApplyInboundFilter_Warn(t *testing.T) {
+	hook := &stubHook{resp: &apphook.Response{Action: apphook.ActionWarn, Reason: "soft signal"}}
+	p := &Proxy{filterHook: hook}
+	body := `{"messages":[{"content":"borderline"}]}`
+	r := newReq(body)
+	w := httptest.NewRecorder()
+
+	proceed := p.applyInboundFilter(w, r, "m", discardLogger())
+	if !proceed {
+		t.Fatal("Warn should proceed")
+	}
+	if got := readReqBody(t, r); got != body {
+		t.Errorf("Warn should not mutate body: %s", got)
+	}
+}
+
+// Degraded (Action=Allow + Degraded=true) → fail-open, proceed, body unchanged.
+func TestApplyInboundFilter_DegradedFailsOpen(t *testing.T) {
+	hook := &stubHook{resp: &apphook.Response{
+		Action:   apphook.ActionAllow,
+		Degraded: true,
+		Reason:   "child unreachable",
+	}}
+	p := &Proxy{filterHook: hook}
+	body := `{"messages":[{"content":"anything"}]}`
+	r := newReq(body)
+	w := httptest.NewRecorder()
+
+	proceed := p.applyInboundFilter(w, r, "m", discardLogger())
+	if !proceed {
+		t.Fatal("degraded must fail-open (proceed), NOT fail the request (§6 #11)")
+	}
+	if w.Code != 200 {
+		t.Errorf("degraded should not write an error status, got %d", w.Code)
+	}
+	if got := readReqBody(t, r); got != body {
+		t.Errorf("degraded should not mutate body: %s", got)
+	}
+}
+
+// nil body → proceed (nothing to inspect).
+func TestApplyInboundFilter_NilBody(t *testing.T) {
+	hook := &stubHook{resp: &apphook.Response{Action: apphook.ActionBlock}} // would block if called
+	p := &Proxy{filterHook: hook}
+	r := httptest.NewRequest("GET", "/v1/models", nil)
+	r.Body = nil
+	w := httptest.NewRecorder()
+
+	proceed := p.applyInboundFilter(w, r, "m", discardLogger())
+	if !proceed {
+		t.Fatal("nil body should proceed without calling hook")
+	}
+	if hook.called != 0 {
+		t.Errorf("hook should not be called on nil body, called=%d", hook.called)
+	}
+}
+
+func TestItoaInt64(t *testing.T) {
+	cases := map[int64]string{0: "0", 5: "5", 42: "42", 1024: "1024", -7: "-7"}
+	for in, want := range cases {
+		if got := itoaInt64(in); got != want {
+			t.Errorf("itoaInt64(%d): got %q want %q", in, got, want)
+		}
+	}
+}

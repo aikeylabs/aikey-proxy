@@ -35,6 +35,7 @@ import (
 	"time"
 
 	"github.com/AiKeyLabs/aikey-proxy/internal/admin"
+	"github.com/AiKeyLabs/aikey-proxy/internal/apphook"
 	"github.com/AiKeyLabs/aikey-proxy/internal/config"
 	"github.com/AiKeyLabs/aikey-proxy/internal/events"
 	"github.com/AiKeyLabs/aikey-proxy/internal/observability"
@@ -111,6 +112,7 @@ type generation struct {
 	eventStore *events.Store
 	reporter   *events.Reporter      // usage reporter (nil when collector_url is not configured)
 	canary     *events.CanaryProbe  // synthetic canary probe (nil when reporter or control_url is not configured)
+	filterHook *apphook.ChildHook    // P4 compliance/DLP filter child (nil when no filter app is active)
 
 	// standaloneWAL is only populated when this generation created the
 	// local WAL writer AND no reporter consumed it — i.e. collector_url is
@@ -143,6 +145,14 @@ func (g *generation) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 // close releases all resources held by this generation.
 func (g *generation) close() {
+	// Stop the filter child first so it stops consuming stdin/stdout and exits
+	// before the rest of the generation tears down. Bounded shutdown — a stuck
+	// child must not block the reload drain (the new generation already serves).
+	if g.filterHook != nil {
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		_ = g.filterHook.Shutdown(ctx)
+		cancel()
+	}
 	// Close canary probe first (it uses the reporter).
 	if g.canary != nil {
 		g.canary.Close()
@@ -820,25 +830,15 @@ func (s *Supervisor) buildGeneration() (*generation, error) {
 	// time. See pkg/observer/registry.go for the registration contract.
 	p.SetObserverRegistry(buildObserverRegistry(vaultReader, s.cfg.Observers, slog.Default()))
 
-	// SPEC §1.5.7 P3 stub: if vault has any app declaring filter_stages but
-	// no filterpipe dispatcher is shipped, flip the proxy to fail-loud 501
-	// mode so traffic is NOT silently let through. See anti-example F.
-	// The check is per-generation (cheap), so a future vault edit that
-	// removes the filter declaration will re-enable normal serving on
-	// next Reload.
-	if hasFilter, err := vaultReader.HasFilterAppsRegistered(); err != nil {
-		slog.Warn("supervisor: filter_stages check failed; treating as inactive",
-			"event.name", "proxy.filter_stub_check_failed",
-			"error", err)
-	} else if hasFilter {
-		slog.Warn("supervisor: vault has filter_stages declared but filterpipe "+
-			"dispatcher is not implemented (P3 stub). ALL data-plane traffic "+
-			"will return 501 FILTER_NOT_IMPLEMENTED until either the filter "+
-			"declaration is removed or the proxy is upgraded to the P4 "+
-			"filter dispatcher build. SPEC §1.5.7 / §6.6.",
-			"event.name", "proxy.filter_stub_active")
-		p.SetFilterStub501Active(true)
-	}
+	// P4 filter dispatcher (was the P3 fail-loud 501 stub). Decides whether
+	// this generation runs a compliance/DLP filter child and spawns it, wiring
+	// it into p via SetFilterHook. On spawn failure or a vault declaration we
+	// can't honor, it flips the proxy to fail-loud 501 instead (anti-example F:
+	// never silently pass traffic through an unrunnable filter). The returned
+	// child is stored in the generation so it's Shutdown on reload-drain. The
+	// check is per-generation (cheap), so a vault/env change re-evaluates on
+	// next Reload. See filter_hook.go + SPEC §1.5.7 / §6.6.
+	filterHook := s.installFilterHook(p, vaultReader)
 
 	// Create the local WAL writer unconditionally whenever WALDir is set.
 	// This is the canonical event log used by `aikey statusline` / `aikey watch`,
@@ -963,6 +963,7 @@ func (s *Supervisor) buildGeneration() (*generation, error) {
 		eventStore:    eventStore,
 		reporter:      reporter,
 		canary:        canary,
+		filterHook:    filterHook,
 		standaloneWAL: ownedWAL,
 		drained:       make(chan struct{}),
 	}, nil

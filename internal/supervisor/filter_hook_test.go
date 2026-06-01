@@ -1,0 +1,110 @@
+package supervisor
+
+import (
+	"context"
+	"os"
+	"path/filepath"
+	"testing"
+	"time"
+
+	"github.com/AiKeyLabs/aikey-proxy/internal/config"
+	"github.com/AiKeyLabs/aikey-proxy/internal/proxy"
+)
+
+// resolveAppBinary picks the first installed <appsDir>/<slug>/bin/<slug> — the
+// convention `aikey app install` lays the detector down at, and what the
+// supervisor spawns when the vault declares a filter app (P1).
+func TestResolveAppBinary(t *testing.T) {
+	dir := t.TempDir()
+	binDir := filepath.Join(dir, "myfilter", "bin")
+	if err := os.MkdirAll(binDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	bin := filepath.Join(binDir, "myfilter")
+	if err := os.WriteFile(bin, []byte("#!/bin/sh\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	if got := resolveAppBinary(dir, []string{"myfilter"}); got != bin {
+		t.Errorf("resolve = %q, want %q", got, bin)
+	}
+	if got := resolveAppBinary(dir, []string{"absent"}); got != "" {
+		t.Errorf("absent slug should be empty, got %q", got)
+	}
+	if got := resolveAppBinary(dir, []string{"absent", "myfilter"}); got != bin {
+		t.Errorf("should find the second slug, got %q", got)
+	}
+	// a directory at the binary path must NOT count as a binary.
+	_ = os.MkdirAll(filepath.Join(dir, "dirapp", "bin", "dirapp"), 0o755)
+	if got := resolveAppBinary(dir, []string{"dirapp"}); got != "" {
+		t.Errorf("a dir is not a binary, got %q", got)
+	}
+}
+
+// appsDir derives <home>/.aikey/apps from the vault path <home>/.aikey/data/vault.db.
+func TestSupervisorAppsDir(t *testing.T) {
+	s := &Supervisor{cfg: &config.Config{Vault: config.VaultConfig{
+		Path: filepath.FromSlash("/home/u/.aikey/data/vault.db"),
+	}}}
+	want := filepath.FromSlash("/home/u/.aikey/apps")
+	if got := s.appsDir(); got != want {
+		t.Errorf("appsDir = %q, want %q", got, want)
+	}
+}
+
+// filterTimeout resolves env override → default. Covers default, valid, and
+// invalid/zero (must fall back, never use a bad value that would silently
+// disable masking via fail-open).
+func TestFilterTimeout(t *testing.T) {
+	cases := []struct {
+		name string
+		env  string
+		set  bool
+		want time.Duration
+	}{
+		{"unset_uses_default", "", false, filterDefaultTimeout},
+		{"empty_uses_default", "", true, filterDefaultTimeout},
+		{"valid_override", "150", true, 150 * time.Millisecond},
+		{"invalid_uses_default", "abc", true, filterDefaultTimeout},
+		{"zero_uses_default", "0", true, filterDefaultTimeout},
+		{"negative_uses_default", "-5", true, filterDefaultTimeout},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if tc.set {
+				t.Setenv(filterTimeoutMsEnv, tc.env)
+			} else {
+				t.Setenv(filterTimeoutMsEnv, "") // isolate from ambient env
+			}
+			if got := filterTimeout(); got != tc.want {
+				t.Errorf("filterTimeout()=%v want %v", got, tc.want)
+			}
+		})
+	}
+}
+
+// installFilterHook with an explicit-but-missing binary must fail loud: NO hook
+// wired into the proxy (FilterHook stays nil), and the helper returns nil (no
+// live child to tear down). The proxy's fail-loud 501 path is engaged via
+// SetFilterStub501Active — we assert the hook is NOT installed, which is the
+// observable half of "don't silently pass traffic through a dead filter".
+func TestInstallFilterHook_SpawnFailure_FailsLoud(t *testing.T) {
+	t.Setenv(filterBinaryEnv, "/nonexistent/aikey-compliance-detector-xyz")
+	t.Setenv(filterArgsEnv, "")
+	t.Setenv(filterTimeoutMsEnv, "")
+
+	s := &Supervisor{ctx: context.Background()}
+	p := &proxy.Proxy{}
+
+	hook := s.installFilterHook(p, nil) // vault not consulted on the env path
+	if hook != nil {
+		t.Errorf("expected nil hook on spawn failure, got %v", hook)
+	}
+	if p.FilterHook() != nil {
+		t.Error("filter hook must NOT be installed when the binary can't spawn")
+	}
+}
+
+// (The vault-declared-but-no-binary outcome consults a *vault.Reader and is
+// covered by the integration-level buildGeneration tests, not here — building
+// a real vault Reader for a unit test would only re-exercise vault code.)

@@ -7,6 +7,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/AiKeyLabs/aikey-proxy/internal/apphook"
 	"github.com/AiKeyLabs/aikey-proxy/internal/events"
 	"github.com/AiKeyLabs/aikey-proxy/internal/provider"
 	"github.com/AiKeyLabs/aikey-proxy/internal/proxy/apppipe"
@@ -108,13 +109,30 @@ type Proxy struct {
 	observerRegistry *observer.Registry
 
 	// filterStub501Active is set at proxy generation build time when the
-	// vault contains any app_records row with filter_stages != NULL. While
-	// active, ALL data-plane traffic returns 501 FILTER_NOT_IMPLEMENTED —
-	// SPEC §1.5.7 / §6.6 anti-example F mandate that an unimplemented
-	// filter chain must NOT silently let traffic through (would be
-	// "pseudo-security": looks configured, actually inert). Set during
-	// supervisor.buildGeneration; not flipped at runtime.
+	// vault contains any app_records row with filter_stages != NULL BUT no
+	// working filter dispatcher could be constructed (e.g. detector binary
+	// missing). While active, ALL data-plane traffic returns 501
+	// FILTER_NOT_IMPLEMENTED — SPEC §1.5.7 / §6.6 anti-example F mandate that
+	// an unimplemented/broken filter chain must NOT silently let traffic
+	// through (would be "pseudo-security": looks configured, actually inert).
+	// Set during supervisor.buildGeneration; not flipped at runtime.
+	//
+	// Mutually exclusive with filterHook: supervisor sets EITHER a working
+	// filterHook (dispatcher present) OR filterStub501Active (declared but
+	// no working dispatcher), never both.
 	filterStub501Active bool
+
+	// filterHook is the P4 filter dispatcher — a generic apphook.Hook
+	// (ai-compliance-detector / DLP / etc.) that inspects the inbound
+	// request body before forwarding. Nil = no filter (the common default
+	// for traffic without a filter app installed); when nil, serveRoute's
+	// filter injection is a no-op (zero hot-path cost).
+	//
+	// CRITICAL: proxy MUST NOT know what business the hook does (方案 §6
+	// 不变量 #16). It calls Detect, gets a generic Action verdict, applies it.
+	// Set during supervisor.buildGeneration when a filter app is registered
+	// AND its child binary spawned successfully.
+	filterHook apphook.Hook
 
 	// Configurable slow-request thresholds (milliseconds).
 	SlowRequestMs     int64
@@ -246,6 +264,23 @@ func (p *Proxy) recordAppHealth(slug string, statusCode int, errorType string) {
 // land in P4 alongside its own runtime wiring).
 func (p *Proxy) SetFilterStub501Active(active bool) {
 	p.filterStub501Active = active
+}
+
+// SetFilterHook installs the P4 filter dispatcher hook. Called once at
+// generation build time by the supervisor when a filter app is registered
+// AND its child binary spawned OK. Passing a working hook is the signal that
+// the dispatcher IS present, so the supervisor leaves filterStub501Active
+// false (the two are mutually exclusive).
+//
+// nil hook = no filter (serveRoute's injection is a no-op).
+func (p *Proxy) SetFilterHook(h apphook.Hook) {
+	p.filterHook = h
+}
+
+// FilterHook returns the installed filter dispatcher hook (nil if none).
+// Used by status reporting + tests.
+func (p *Proxy) FilterHook() apphook.Hook {
+	return p.filterHook
 }
 
 // SetObserverRegistry attaches the Phase 4 M2 plugin observer registry.
