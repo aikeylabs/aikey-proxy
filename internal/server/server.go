@@ -83,6 +83,11 @@ func New(ln net.Listener, dataHandler http.Handler, adminHandler *admin.Handler,
 	// see internal/proxy/apppipe/health.go for the rationale.
 	mux.HandleFunc("GET /admin/apps/health", adminHandler.AppHealth)
 
+	// Delivery-integrity audit (D2.5 / D3): local client state + client-confirmed
+	// reconciliation (re-send WAL-present gaps, confirm WAL-absent gaps lost).
+	mux.HandleFunc("GET /admin/audit/status", adminHandler.AuditStatus)
+	mux.HandleFunc("POST /admin/audit/reconcile", adminHandler.AuditReconcile)
+
 	// Extra route registrars (e.g., OAuth broker handler)
 	for _, h := range extraHandlers {
 		h.RegisterRoutes(mux)

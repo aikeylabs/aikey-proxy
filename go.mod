@@ -8,6 +8,7 @@ require (
 	github.com/AiKeyLabs/pkg/aikeytime v0.0.0
 	github.com/AiKeyLabs/pkg/buildinfo v0.0.0
 	github.com/AiKeyLabs/pkg/providerroutes v0.0.0
+	github.com/AiKeyLabs/pkg/usagehash v0.0.0
 	github.com/aikeylabs/degrade-detector/proxy-plugin/rhythm v0.0.0
 	golang.org/x/crypto v0.49.0
 	golang.org/x/term v0.41.0
@@ -22,6 +23,8 @@ replace github.com/AiKeyLabs/pkg/aikeytime => ../pkg/aikeytime
 replace github.com/AiKeyLabs/pkg/aikeycompat => ../pkg/aikeycompat
 
 replace github.com/AiKeyLabs/pkg/providerroutes => ../pkg/providerroutes
+
+replace github.com/AiKeyLabs/pkg/usagehash => ../pkg/usagehash
 
 replace github.com/AiKeyLabs/aikey-auth-broker => ../aikey-auth-broker
 

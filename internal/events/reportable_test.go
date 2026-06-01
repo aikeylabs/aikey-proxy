@@ -4,6 +4,7 @@ import (
 	"testing"
 
 	"github.com/AiKeyLabs/aikey-proxy/internal/vkeys"
+	"github.com/AiKeyLabs/pkg/usagehash"
 )
 
 // deriveKeyLabel's contract is the single place where RouteSource mis-population
@@ -319,5 +320,52 @@ func TestBuildReportableEvent_ProbeUnknownBearerNoAttribution(t *testing.T) {
 	})
 	if ev.AppSlug != "" {
 		t.Errorf("expected empty AppSlug for unknown bearer; got %q (don't fabricate attribution)", ev.AppSlug)
+	}
+}
+
+// TestBuildReportableEvent_StampsContentHash verifies stage C: the proxy stamps
+// a content hash over the metering tuple that the collector can recompute. The
+// hash must equal an independent usagehash.Compute over the same values, prove
+// scheme-known, and CHANGE when any metering field is corrupted (the silent-zero
+// guard). Building the event via the real BuildReportableEvent (not a hand-rolled
+// struct) is what makes this a true fence against client/server hash drift.
+func TestBuildReportableEvent_StampsContentHash(t *testing.T) {
+	route := &vkeys.ResolvedRoute{
+		OrgID:        "personal",
+		ProviderCode: "anthropic",
+		RouteSource:  "personal",
+	}
+	opts := ReportOpts{
+		EventID:                  "e-hash-1",
+		Route:                    route,
+		Model:                    "claude-opus-4-7",
+		StatusCode:               200,
+		InputTokens:              100,
+		OutputTokens:             50,
+		CacheReadInputTokens:     10,
+		CacheCreationInputTokens: 20,
+	}
+	ev := BuildReportableEvent(opts)
+
+	if ev.ContentHash == "" {
+		t.Fatal("ContentHash not stamped")
+	}
+	if !usagehash.SchemeKnown(ev.ContentHash) {
+		t.Fatalf("ContentHash %q not a known scheme", ev.ContentHash)
+	}
+	// Independently recompute the same tuple — must match byte-for-byte.
+	want := usagehash.Compute(usagehash.Input{
+		InputTokens: 100, OutputTokens: 50, TotalTokens: 150,
+		CacheReadInputTokens: 10, CacheCreationInputTokens: 20,
+		Model: "claude-opus-4-7", ProviderCode: "anthropic",
+	})
+	if ev.ContentHash != want {
+		t.Fatalf("ContentHash = %s, want %s (client stamp must match server recompute)", ev.ContentHash, want)
+	}
+
+	// Corrupting a token value must change the stamp (the whole point of C).
+	opts.OutputTokens = 0
+	if BuildReportableEvent(opts).ContentHash == ev.ContentHash {
+		t.Fatal("output_tokens 50→0 did not change ContentHash — corruption would slip through")
 	}
 }

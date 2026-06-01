@@ -36,6 +36,7 @@ func TestReporter_ReportAndUpload(t *testing.T) {
 	reporter, err := NewReporter(ReporterConfig{
 		CollectorURL:   srv.URL,
 		QueueCapacity:  100,
+		WALDir:         t.TempDir(), // WAL is the upload outbox in the new model
 		BatchSize:      5,
 		UploadInterval: 50 * time.Millisecond,
 	})
@@ -108,6 +109,7 @@ func TestReporter_PerRouteRouting(t *testing.T) {
 			"team":     teamSrv.URL,
 		},
 		QueueCapacity:  100,
+		WALDir:         t.TempDir(), // WAL is the upload outbox in the new model
 		BatchSize:      5,
 		UploadInterval: 50 * time.Millisecond,
 	})
@@ -166,6 +168,7 @@ func TestReporter_PerRouteIsolation(t *testing.T) {
 			"team":     "", // explicitly empty: pre-login state
 		},
 		QueueCapacity:  100,
+		WALDir:         t.TempDir(), // WAL is the upload outbox in the new model
 		BatchSize:      5,
 		UploadInterval: 50 * time.Millisecond,
 	})
@@ -198,10 +201,17 @@ func TestReporter_PerRouteIsolation(t *testing.T) {
 	}
 }
 
-func TestReporter_DropWhenQueueFull(t *testing.T) {
-	// No collector URL → upload loop not started, queue will fill up
+// TestReporter_NoDropAllWALd replaces the old TestReporter_DropWhenQueueFull.
+// The WAL-as-outbox model has no in-memory queue, so there is no "queue full"
+// drop: every reported event is appended to the WAL (the durable buffer) and
+// nothing is discarded regardless of upload backpressure. This test pins that
+// new contract — Generated == Reported, Dropped == 0, and all events are
+// durably on disk for a (possibly offline) later upload.
+func TestReporter_NoDropAllWALd(t *testing.T) {
+	dir := t.TempDir()
+	// No collector URL → upload loop not started; events must still all WAL.
 	reporter, err := NewReporter(ReporterConfig{
-		QueueCapacity: 2,
+		WALDir: dir,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -223,8 +233,16 @@ func TestReporter_DropWhenQueueFull(t *testing.T) {
 	if m.Generated != 5 {
 		t.Errorf("generated=%d, want 5", m.Generated)
 	}
-	if m.Dropped < 3 {
-		t.Errorf("dropped=%d, want at least 3", m.Dropped)
+	if m.Dropped != 0 {
+		t.Errorf("dropped=%d, want 0 (WAL buffers, never drops)", m.Dropped)
+	}
+	// All 5 events must be durably in the WAL.
+	entries, err := ReadAllWAL(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != 5 {
+		t.Errorf("WAL has %d entries, want 5 (every event WAL'd)", len(entries))
 	}
 }
 
@@ -316,6 +334,7 @@ func TestReporter_PerRouteCredential_DispatchesCorrectBearer(t *testing.T) {
 			"team": &StaticTokenCredential{Token: "user-jwt-for-team"},
 		},
 		QueueCapacity:  100,
+		WALDir:         t.TempDir(), // WAL is the upload outbox in the new model
 		BatchSize:      5,
 		UploadInterval: 50 * time.Millisecond,
 	})
@@ -363,6 +382,7 @@ func TestReporter_NoPerRouteCredential_FallsBackToLegacyToken(t *testing.T) {
 		CollectorToken: "legacy-only",
 		// No CollectorRouteCredentials at all.
 		QueueCapacity:  100,
+		WALDir:         t.TempDir(), // WAL is the upload outbox in the new model
 		BatchSize:      5,
 		UploadInterval: 50 * time.Millisecond,
 	})
@@ -478,6 +498,7 @@ func TestReporter_MixedBatch_EachGroupGetsOwnBearer(t *testing.T) {
 			"team":     &StaticTokenCredential{Token: "team-cred"},
 		},
 		QueueCapacity: 100,
+		WALDir:        t.TempDir(), // WAL is the upload outbox in the new model
 		// Batch size large enough that a single flush picks up both events
 		BatchSize:      10,
 		UploadInterval: 50 * time.Millisecond,

@@ -70,6 +70,12 @@ type Handler struct {
 	// that case so consumers can distinguish "no data yet" (empty array)
 	// from "feature disabled" (503).
 	AppHealthFn func() []apppipe.AppHealth
+
+	// AuditStatusFn / ReconcileGapsFn drive `aikey audit` (D2.5 / D3): the local
+	// client delivery state, and the client-confirmed reconciliation pass
+	// (re-send WAL-present gaps, confirm WAL-absent gaps lost now). nil → 503.
+	AuditStatusFn   func() *events.AuditStatus
+	ReconcileGapsFn func(ctx context.Context) (events.ReconcileResult, error)
 }
 
 // KeyCheckTarget holds decrypted credentials for one provider, used by GET /health/keys.
@@ -207,6 +213,38 @@ func (h *Handler) Metrics(w http.ResponseWriter, r *http.Request) {
 		Reporter:           reporterMetrics,
 		Canary:             canaryResult,
 	})
+}
+
+// AuditStatus serves GET /admin/audit/status (D2.5): the local client-side
+// delivery state (allocator high-water, WAL backlog, dead-letter pile, upload
+// health) that the collector's completeness endpoint cannot see.
+func (h *Handler) AuditStatus(w http.ResponseWriter, r *http.Request) {
+	if h.AuditStatusFn == nil {
+		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "usage reporter not configured"})
+		return
+	}
+	st := h.AuditStatusFn()
+	if st == nil {
+		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "usage reporter not configured"})
+		return
+	}
+	writeJSON(w, http.StatusOK, st)
+}
+
+// AuditReconcile serves POST /admin/audit/reconcile (D3): force a client-confirmed
+// reconciliation — re-send gaps still in the WAL, confirm WAL-absent gaps as lost
+// now. Returns how many were re-sent vs confirmed-lost.
+func (h *Handler) AuditReconcile(w http.ResponseWriter, r *http.Request) {
+	if h.ReconcileGapsFn == nil {
+		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "usage reporter not configured"})
+		return
+	}
+	res, err := h.ReconcileGapsFn(r.Context())
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+		return
+	}
+	writeJSON(w, http.StatusOK, res)
 }
 
 // Reload triggers a graceful runtime reload without closing the TCP listener.

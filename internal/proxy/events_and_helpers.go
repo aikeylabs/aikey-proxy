@@ -408,9 +408,31 @@ func (p *Proxy) reportUsage(route *vkeys.ResolvedRoute, bearerToken, model strin
 	if p.reporter == nil && p.wal == nil {
 		return
 	}
+
+	// Delivery integrity: allocate a per-source, never-reused sequence for this
+	// event (design §5.2). Canary events are deliberately excluded — they are
+	// synthetic liveness probes, not business usage, and must not create gaps in
+	// the real sequence stream. A SeqAllocator error (e.g. reserve fsync failed)
+	// degrades to a v1-shaped event (no seq) rather than blocking the report —
+	// the reserve-ahead invariant guarantees the failed seq is never reused.
+	var sourceID string
+	var sourceSeq *int64
+	if p.seqAlloc != nil && p.sourceID != "" && route != nil && route.OrgID != "__canary__" {
+		if seq, err := p.seqAlloc.Next(); err != nil {
+			slog.Warn("reportUsage: seq alloc failed, emitting v1 event",
+				"event.name", "usage.seqalloc.next_failed", "error", err)
+		} else {
+			sourceID = p.sourceID
+			s := seq
+			sourceSeq = &s
+		}
+	}
+
 	ev := events.BuildReportableEvent(events.ReportOpts{
 		EventID:                  observability.NewID(),
 		ProxyInstanceID:          p.proxyInstanceID,
+		SourceID:                 sourceID,
+		SourceSeq:                sourceSeq,
 		Route:                    route,
 		BearerToken:              bearerToken,
 		Model:                    model,

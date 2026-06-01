@@ -7,6 +7,7 @@ import (
 
 	"github.com/AiKeyLabs/aikey-proxy/internal/vkeys"
 	"github.com/AiKeyLabs/pkg/aikeytime"
+	"github.com/AiKeyLabs/pkg/usagehash"
 )
 
 // ReportableEvent contains all anchor fields required by collector-service.
@@ -24,6 +25,27 @@ type ReportableEvent struct {
 	// ODS with the provider's audit log without us having to log full bodies.
 	// Always populated for both success + error paths when upstream sets it.
 	UpstreamRequestID string `json:"upstream_request_id,omitempty"`
+
+	// Delivery integrity (2026-05-30). SourceID is this vault's stable source
+	// identity (runtime.source_identity — a vault-scoped install id, NOT a
+	// hardware fingerprint). SourceSeq is its per-source, never-reused sequence
+	// from SeqAllocator; the collector uses (SourceID, SourceSeq) to detect gaps
+	// and prove completeness. Dedicated fields (not overloaded onto DeviceID) so
+	// the wire contract is explicit and matches the server's
+	// usage_event_ods.source_id/source_seq columns. Empty/nil on legacy events —
+	// those store fine but skip gap detection. SourceSeq is a pointer so
+	// "absent" (v1) is distinguishable from a real 0.
+	SourceID  string `json:"source_id,omitempty"`
+	SourceSeq *int64 `json:"source_seq,omitempty"`
+
+	// ContentHash is the financial-grade tamper/corruption fingerprint over the
+	// metering tuple (pkg/usagehash, stage C). The collector RECOMPUTES it and
+	// compares; a mismatch quarantines the event instead of billing a silently
+	// corrupted value (e.g. a token count that became 0 in transit). Empty on
+	// events built before stage C / by older proxies — the collector then skips
+	// validation (conserve, never false-quarantine). Carried on the wire so the
+	// collector receives the client-stamped value alongside the fields it hashes.
+	ContentHash string `json:"content_hash,omitempty"`
 
 	// schema + source metadata
 	SchemaVersion      int    `json:"schema_version"`
@@ -184,6 +206,13 @@ type ReportOpts struct {
 	// `openai-request-id`). Carried through so support can pivot from a local
 	// ODS row to provider-side logs.
 	UpstreamRequestID string
+
+	// Delivery integrity (2026-05-30). SourceID is the vault's stable source
+	// identity; SourceSeq is the per-source never-reused sequence allocated by
+	// the proxy's SeqAllocator just before building this event. Leave SourceSeq
+	// nil for events that must not participate in gap detection (e.g. canary).
+	SourceID  string
+	SourceSeq *int64
 }
 
 // BuildReportableEvent creates a ReportableEvent from the proxy request context.
@@ -237,6 +266,8 @@ func BuildReportableEvent(opts ReportOpts) ReportableEvent {
 		EventID:           opts.EventID,
 		UpstreamRequestID: opts.UpstreamRequestID,
 		ProxyInstanceID:   opts.ProxyInstanceID,
+		SourceID:          opts.SourceID,
+		SourceSeq:         opts.SourceSeq,
 		SchemaVersion:     1,
 		SourceVersion:      opts.SourceVersion,
 		ClientVersion:      opts.ClientVersion,
@@ -357,6 +388,21 @@ func BuildReportableEvent(opts ReportOpts) ReportableEvent {
 		// is display-only — never use it for authorization or billing.
 		ev.AppSlug = route.AppSlug
 	}
+
+	// Stamp the content hash over the metering tuple AS STORED in ev. Use the
+	// raw int64 values (cache fields deref-or-zero exactly as the collector
+	// will: a nil/omitted cache field on the wire is hashed as 0 on both sides),
+	// so client-stamped and server-recomputed bytes are identical. See
+	// pkg/usagehash for why these specific fields and why no omitempty.
+	ev.ContentHash = usagehash.Compute(usagehash.Input{
+		InputTokens:              inTok,
+		OutputTokens:             outTok,
+		TotalTokens:              totalTok,
+		CacheReadInputTokens:     int64(opts.CacheReadInputTokens),
+		CacheCreationInputTokens: int64(opts.CacheCreationInputTokens),
+		Model:                    opts.Model,
+		ProviderCode:             route.ProviderCode,
+	})
 
 	return ev
 }

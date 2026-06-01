@@ -93,6 +93,25 @@ func newDeadLetterWriter(walDir string) *deadLetterWriter {
 	}
 }
 
+// Count returns the number of dead-letter entries currently on disk (one JSON
+// object per line). Best-effort for `aikey audit status` (D2.5) — a read error
+// or absent file reports 0. Each line is one failed upload batch.
+func (w *deadLetterWriter) Count() int {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	data, err := os.ReadFile(w.path)
+	if err != nil {
+		return 0
+	}
+	n := 0
+	for _, line := range bytes.Split(data, []byte("\n")) {
+		if len(bytes.TrimSpace(line)) > 0 {
+			n++
+		}
+	}
+	return n
+}
+
 func (w *deadLetterWriter) write(entry deadLetterEntry) {
 	data, err := json.Marshal(entry)
 	if err != nil {
@@ -261,7 +280,7 @@ func (r *Reporter) ReplayDeadLetter(ctx context.Context) (ReplayDeadLetterResult
 		default:
 		}
 
-		if upErr := r.doUpload(uploadURL, body, cred); upErr != nil {
+		if _, upErr := r.doUpload(uploadURL, body, cred); upErr != nil {
 			result.EntriesStillFailing++
 			result.EventsStillFailing += len(entry.Events)
 			result.LastError = fmt.Sprintf("HTTP %d: %s", upErr.StatusCode, upErr.Err)

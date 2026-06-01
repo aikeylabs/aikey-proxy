@@ -28,6 +28,7 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -87,6 +88,13 @@ const (
 
 	// VaultChangeSeqKey is written by the CLI on every vault write.
 	VaultChangeSeqKey = "runtime.vault.change_seq"
+	// SourceIdentityKey is the vault config key holding this install's stable
+	// delivery-integrity source id (a UUID written by the CLI at vault init).
+	// Must match aikey-cli/src/storage.rs SOURCE_IDENTITY_KEY.
+	SourceIdentityKey = "runtime.source_identity"
+	// seqStateFile is the reserve-ahead high-water-mark file, kept alongside the
+	// WAL in the WAL directory so its lifecycle matches the WAL it sequences.
+	seqStateFile = "seq.state"
 
 	// drainTimeout is how long the old generation waits for in-flight
 	// requests before being forcibly closed.
@@ -121,6 +129,12 @@ type generation struct {
 	// split is what keeps `generation.close()` from leaking file handles
 	// on every reload in offline/standalone deployments.
 	standaloneWAL *events.WALWriter
+
+	// seqAlloc is the delivery-integrity sequence allocator for this generation.
+	// Closed in close() so a graceful shutdown shrinks the persisted high-water
+	// mark to the actual last-used seq (zero seq burn on the common restart
+	// path; only a hard crash leaves a bounded auditable gap). nil when no WAL.
+	seqAlloc *events.SeqAllocator
 
 	// Drain tracking: incremented when a request enters Handle, decremented on exit.
 	inflight atomic.Int64
@@ -169,6 +183,12 @@ func (g *generation) close() {
 	// on offline-mode deployments. Only non-nil when reporter is nil.
 	if g.standaloneWAL != nil {
 		_ = g.standaloneWAL.Close()
+	}
+	// Close the seq allocator AFTER the WAL is flushed: it shrinks the persisted
+	// high-water mark to the actual last-used seq, so a graceful restart resumes
+	// exactly there with zero burned (known-loss) seqs.
+	if g.seqAlloc != nil {
+		_ = g.seqAlloc.Close()
 	}
 	if g.collector != nil {
 		_ = g.collector.Close()
@@ -493,6 +513,27 @@ func (s *Supervisor) ReplayDeadLetter(ctx context.Context) (events.ReplayDeadLet
 		return events.ReplayDeadLetterResult{}, fmt.Errorf("reporter not configured")
 	}
 	return gen.reporter.ReplayDeadLetter(ctx)
+}
+
+// AuditStatus returns the active generation's local delivery state for `aikey
+// audit status` (D2.5). Returns nil if the reporter isn't configured.
+func (s *Supervisor) AuditStatus() *events.AuditStatus {
+	gen := s.active.Load()
+	if gen == nil || gen.reporter == nil {
+		return nil
+	}
+	st := gen.reporter.AuditStatus()
+	return &st
+}
+
+// ReconcileGaps triggers a client-confirmed reconciliation pass (D3) on the
+// active generation's reporter. Errors when the reporter isn't configured.
+func (s *Supervisor) ReconcileGaps(ctx context.Context) (events.ReconcileResult, error) {
+	gen := s.active.Load()
+	if gen == nil || gen.reporter == nil {
+		return events.ReconcileResult{}, fmt.Errorf("reporter not configured")
+	}
+	return gen.reporter.ReconcileGaps(ctx)
 }
 
 // CanaryResult returns the latest canary probe result from the active generation.
@@ -847,6 +888,8 @@ func (s *Supervisor) buildGeneration() (*generation, error) {
 	// also created below we hand it this shared instance so there is only a
 	// single writer touching the directory.
 	var sharedWAL *events.WALWriter
+	var seqAlloc *events.SeqAllocator
+	var sourceID string // vault source identity; reused for SetDeliveryIntegrity + ReporterConfig.SourceID
 	if s.cfg.Events.WALDir != "" {
 		if w, werr := events.NewWALWriter(s.cfg.Events.WALDir); werr != nil {
 			slog.Warn("local wal init failed, offline usage log disabled", "error", werr)
@@ -856,6 +899,26 @@ func (s *Supervisor) buildGeneration() (*generation, error) {
 			// sink; when reporter is non-nil the proxy skips direct append
 			// (reporter.Report handles it via the shared instance).
 			p.SetWAL(sharedWAL)
+
+			// Delivery integrity: build the reserve-ahead sequence allocator
+			// (state file next to the WAL) and read the vault's stable source
+			// identity, then wire both into the proxy so reportUsage can stamp
+			// source_id / source_seq. Failures degrade to v1-shaped events
+			// (no seq) rather than blocking the proxy — usage still flows, it
+			// just doesn't participate in server gap detection until fixed.
+			seqStatePath := filepath.Join(s.cfg.Events.WALDir, seqStateFile)
+			if sa, serr := events.NewSeqAllocator(seqStatePath, events.DefaultSeqBlockSize); serr != nil {
+				slog.Warn("seq allocator init failed, events emitted without source_seq",
+					"event.name", "usage.seqalloc.init_failed", "error", serr)
+			} else {
+				seqAlloc = sa
+				sourceID, _ = vault.ReadConfigString(s.cfg.Vault.Path, SourceIdentityKey)
+				if sourceID == "" {
+					slog.Warn("source_identity missing from vault; events emitted without source_id",
+						"event.name", "usage.source_identity.missing")
+				}
+				p.SetDeliveryIntegrity(sourceID, seqAlloc)
+			}
 			// Thread proxy identity fields that reportUsage needs even in
 			// the offline path.  SetReporter below would overwrite these
 			// with the same values when a reporter is present.
@@ -909,6 +972,8 @@ func (s *Supervisor) buildGeneration() (*generation, error) {
 			UploadInterval:            s.cfg.Events.UploadInterval,
 			WALDir:                    s.cfg.Events.WALDir,
 			SharedWAL:                 sharedWAL,
+			SeqAlloc:                  seqAlloc, // may be nil; reporter only READS Allocated() for tail-gap detection
+			SourceID:                  sourceID, // for D2.5/D3 audit: filter completeness to "my" source
 			ProxyInstanceID:           fmt.Sprintf("proxy-%d", id),
 			ConfigHash:                s.cfg.PipelineConfigHash(),
 			DBPath:                    s.cfg.Events.DBPath,
@@ -965,6 +1030,7 @@ func (s *Supervisor) buildGeneration() (*generation, error) {
 		canary:        canary,
 		filterHook:    filterHook,
 		standaloneWAL: ownedWAL,
+		seqAlloc:      seqAlloc,
 		drained:       make(chan struct{}),
 	}, nil
 }

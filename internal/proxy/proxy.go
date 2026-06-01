@@ -76,6 +76,12 @@ type Proxy struct {
 	transport          http.RoundTripper // nil → http.DefaultTransport (reads env vars)
 	proxyCtx           context.Context   // cancelled when the proxy shuts down
 	proxyInstanceID    string
+	// Delivery integrity (2026-05-30). sourceID is the vault's stable source
+	// identity stamped on every reported event; seqAlloc hands out the
+	// per-source never-reused sequence. Both nil/empty until SetDeliveryIntegrity
+	// wires them (offline-only or pre-seqalloc builds report v1-shaped events).
+	sourceID           string
+	seqAlloc           *events.SeqAllocator
 	clientVersion      string // build version for audit metadata in usage events
 	proxyConfigVersion string // generation ID or config revision
 	loadedControlSeq   int64  // vault change_seq loaded at generation build time
@@ -319,6 +325,16 @@ func (p *Proxy) SetReporter(r *events.Reporter, instanceID, clientVersion, confi
 // a collector_url.
 func (p *Proxy) SetWAL(w *events.WALWriter) {
 	p.wal = w
+}
+
+// SetDeliveryIntegrity wires the per-source identity + sequence allocator used
+// to stamp source_id / source_seq on reported usage events. Called once per
+// generation by the supervisor. When seqAlloc is nil (e.g. WAL init failed),
+// reportUsage falls back to emitting v1-shaped events (no source_seq), which
+// are still stored locally but excluded from server-side gap detection.
+func (p *Proxy) SetDeliveryIntegrity(sourceID string, seqAlloc *events.SeqAllocator) {
+	p.sourceID = sourceID
+	p.seqAlloc = seqAlloc
 }
 
 // TotalRequests returns the total number of proxied requests.
