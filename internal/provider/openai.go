@@ -145,6 +145,25 @@ type openaiUsageData struct {
 	// Responses API (codex, GPT-5, etc.)
 	InputTokens  int `json:"input_tokens"`
 	OutputTokens int `json:"output_tokens"`
+	// Reasoning tokens (o-series): Chat Completions nests under
+	// completion_tokens_details; Responses API under output_tokens_details.
+	CompletionTokensDetails *openaiTokenDetails `json:"completion_tokens_details,omitempty"`
+	OutputTokensDetails     *openaiTokenDetails `json:"output_tokens_details,omitempty"`
+}
+
+type openaiTokenDetails struct {
+	ReasoningTokens int `json:"reasoning_tokens"`
+}
+
+// ReasoningTokens returns the reasoning bucket from whichever API shape carried it.
+func (u *openaiUsageData) ReasoningTokens() int {
+	if u.CompletionTokensDetails != nil {
+		return u.CompletionTokensDetails.ReasoningTokens
+	}
+	if u.OutputTokensDetails != nil {
+		return u.OutputTokensDetails.ReasoningTokens
+	}
+	return 0
 }
 
 // Resolve returns (input, output) from whichever wire format populated them.
@@ -186,9 +205,47 @@ type openaiUsageEnvelope struct {
 func (o *OpenAI) ExtractTokenBreakdown(data []byte, streaming bool, logger *slog.Logger) TokenBreakdown {
 	in, out := o.ExtractTokens(data, streaming, logger)
 	br := TokenBreakdown{InputTokens: in, OutputTokens: out}
+	br.ReasoningTokens = extractOpenAIReasoning(data, streaming)
 	br.StopReason = extractOpenAIStopReason(data, streaming)
 	br.Model = extractOpenAIModel(data, streaming)
 	return br
+}
+
+// extractOpenAIReasoning reads the o-series reasoning bucket from
+// usage.completion_tokens_details.reasoning_tokens (Chat Completions) or
+// output_tokens_details.reasoning_tokens (Responses API). Streaming: the usage
+// frame only lands on the final chunk, so we keep the last non-zero value seen.
+// Zero for non-reasoning models (field absent → omitempty → 0).
+func extractOpenAIReasoning(data []byte, streaming bool) int {
+	parse := func(b []byte) int {
+		var env openaiUsageEnvelope
+		if json.Unmarshal(b, &env) != nil {
+			return 0
+		}
+		if env.Usage != nil {
+			return env.Usage.ReasoningTokens()
+		}
+		if env.Response != nil && env.Response.Usage != nil {
+			return env.Response.Usage.ReasoningTokens()
+		}
+		return 0
+	}
+	if !streaming {
+		return parse(data)
+	}
+	last := 0
+	for _, line := range bytes.Split(data, []byte("\n")) {
+		line = bytes.TrimSpace(line)
+		line = bytes.TrimPrefix(line, []byte("data:"))
+		line = bytes.TrimSpace(line)
+		if len(line) == 0 || bytes.Equal(line, []byte("[DONE]")) {
+			continue
+		}
+		if r := parse(line); r > 0 {
+			last = r
+		}
+	}
+	return last
 }
 
 // extractOpenAIModel reads top-level `model` from a complete chat-completion

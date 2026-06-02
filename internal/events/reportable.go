@@ -114,6 +114,11 @@ type ReportableEvent struct {
 	//      the two). See bugfix 2026-04-29-cached-tokens-wire-mismatch.md.
 	CacheReadInputTokens     *int64 `json:"cache_read_input_tokens,omitempty"`
 	CacheCreationInputTokens *int64 `json:"cache_creation_input_tokens,omitempty"`
+	// Cost-pricing audit (v1.0.0-rc.8): reasoning tokens (o-series) + upstream
+	// region/endpoint. omitempty keeps them off the wire for events lacking them.
+	ReasoningTokens *int64  `json:"reasoning_tokens,omitempty"`
+	Region          *string `json:"region,omitempty"`
+	EndpointURL     *string `json:"endpoint_url,omitempty"`
 
 	// StopReason is the raw provider-specific termination reason (Anthropic
 	// `stop_reason` or OpenAI/Kimi `choices[0].finish_reason`), passed
@@ -183,6 +188,10 @@ type ReportOpts struct {
 	// BuildReportableEvent will omit these fields from the JSON event.
 	CacheReadInputTokens     int
 	CacheCreationInputTokens int
+	// Cost-pricing audit (v1.0.0-rc.8): reasoning tokens + upstream region/endpoint.
+	ReasoningTokens int
+	Region          string
+	EndpointURL     string
 	// StopReason is the raw termination string from the provider; pass
 	// through un-normalized. BuildReportableEvent omits the JSON field
 	// when empty.
@@ -320,6 +329,9 @@ func BuildReportableEvent(opts ReportOpts) ReportableEvent {
 		// consumers still parse today.
 		CacheReadInputTokens:     int64PtrIfNonZero(opts.CacheReadInputTokens),
 		CacheCreationInputTokens: int64PtrIfNonZero(opts.CacheCreationInputTokens),
+		ReasoningTokens:          int64PtrIfNonZero(opts.ReasoningTokens),
+		Region:                   strPtrIfNonEmpty(opts.Region),
+		EndpointURL:              strPtrIfNonEmpty(opts.EndpointURL),
 
 		StopReason: opts.StopReason,
 
@@ -481,6 +493,16 @@ func int64PtrIfNonZero(n int) *int64 {
 	}
 	v := int64(n)
 	return &v
+}
+
+// strPtrIfNonEmpty returns a pointer to s, or nil when empty — so omitempty
+// drops the field from the wire event (region/endpoint_url are absent for
+// direct providers / events without routing info).
+func strPtrIfNonEmpty(s string) *string {
+	if s == "" {
+		return nil
+	}
+	return &s
 }
 
 // hashIfNotEmpty returns a SHA-256 hex digest, or empty string.

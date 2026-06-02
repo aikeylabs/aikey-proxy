@@ -443,7 +443,13 @@ func (p *Proxy) reportUsage(route *vkeys.ResolvedRoute, bearerToken, model strin
 		OutputTokens:             breakdown.OutputTokens,
 		CacheReadInputTokens:     breakdown.CacheReadInputTokens,
 		CacheCreationInputTokens: breakdown.CacheCreationInputTokens,
-		StopReason:               breakdown.StopReason,
+		// Cost-pricing audit (v1.0.0-rc.8): reasoning from the breakdown, region
+		// + endpoint derived from the resolved route's upstream URL. Both
+		// flowing through this single reportUsage covers streaming + non-streaming.
+		ReasoningTokens: breakdown.ReasoningTokens,
+		Region:          regionFromBaseURL(routeBaseURL(route)),
+		EndpointURL:     routeBaseURL(route),
+		StopReason:      breakdown.StopReason,
 		ErrorType:                errorType,
 		RealKey:                  realKey,
 		ClientVersion:            p.clientVersion,
@@ -464,6 +470,40 @@ func (p *Proxy) reportUsage(route *vkeys.ResolvedRoute, bearerToken, model strin
 	// Offline path: no collector_url, but WAL is still desired so local
 	// statusline / watch can consume it.
 	p.wal.Append(ev)
+}
+
+// routeBaseURL returns the resolved upstream base URL, nil-safe.
+func routeBaseURL(route *vkeys.ResolvedRoute) string {
+	if route == nil {
+		return ""
+	}
+	return route.BaseURL
+}
+
+// regionFromBaseURL extracts the cloud region from a Bedrock or Vertex upstream
+// URL for region-aware pricing. Returns "" for direct providers
+// (api.anthropic.com, api.openai.com, ...) which are not region-scoped.
+//
+//	Bedrock: bedrock-runtime.<region>.amazonaws.com
+//	Vertex:  <region>-aiplatform.googleapis.com
+func regionFromBaseURL(baseURL string) string {
+	if baseURL == "" {
+		return ""
+	}
+	host := baseURL
+	if i := strings.Index(host, "://"); i >= 0 {
+		host = host[i+3:]
+	}
+	if i := strings.IndexByte(host, '/'); i >= 0 {
+		host = host[:i]
+	}
+	if strings.HasPrefix(host, "bedrock-runtime.") && strings.HasSuffix(host, ".amazonaws.com") {
+		return strings.TrimSuffix(strings.TrimPrefix(host, "bedrock-runtime."), ".amazonaws.com")
+	}
+	if strings.HasSuffix(host, "-aiplatform.googleapis.com") {
+		return strings.TrimSuffix(host, "-aiplatform.googleapis.com")
+	}
+	return ""
 }
 
 // resolveSessionID returns the session id to stamp into the WAL event.

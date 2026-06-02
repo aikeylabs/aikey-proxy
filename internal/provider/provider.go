@@ -39,6 +39,11 @@ type TokenBreakdown struct {
 	// CacheCreationInputTokens is the portion of InputTokens that was
 	// written to the cache this turn. Zero under the same conditions.
 	CacheCreationInputTokens int
+	// ReasoningTokens is the model's internal reasoning/thinking tokens
+	// (OpenAI o-series usage.completion_tokens_details.reasoning_tokens;
+	// Gemini thoughtsTokenCount). Billed at the output rate. Zero for models
+	// without a separate reasoning bucket (Anthropic folds thinking into output).
+	ReasoningTokens int
 	// StopReason is the raw termination reason emitted by the provider in
 	// the final response chunk. Values are provider-specific and passed
 	// through un-normalized so consumers can pattern-match against the
