@@ -57,6 +57,8 @@ func New(ln net.Listener, dataHandler http.Handler, adminHandler *admin.Handler,
 	mux.HandleFunc("GET /status", adminHandler.Status)
 	mux.HandleFunc("GET /metrics", adminHandler.Metrics)
 	mux.HandleFunc("POST /admin/reload", adminHandler.Reload)
+	// Effective compliance packs (built-in + pulled) of the live filter child.
+	mux.HandleFunc("GET /admin/compliance/packs", adminHandler.CompliancePacks)
 	// Replay dead-letter usage events. Re-uses current reporter config
 	// (post-login JWT, current route URLs) so brief upstream errors
 	// (transient 401 / 5xx) don't permanently lose data. Operator

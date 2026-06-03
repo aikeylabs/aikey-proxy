@@ -249,6 +249,7 @@ func main() {
 	adminHandler.DebugUpstreamHeadersStateFn = proxy.UpstreamHeadersDebugState
 	adminHandler.DebugUpstreamHeadersSetFn = proxy.SetUpstreamHeadersDebugAPIOverride
 	adminHandler.AppHealthFn = sup.AppHealthSnapshot
+	adminHandler.EffectivePacksFn = sup.EffectivePacks
 	adminHandler.AuditStatusFn = sup.AuditStatus
 	adminHandler.ReconcileGapsFn = sup.ReconcileGaps
 

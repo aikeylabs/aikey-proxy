@@ -277,6 +277,53 @@ func (h *ChildHook) Detect(ctx context.Context, req *Request) *Response {
 	return res
 }
 
+// ErrPacksUnavailable means the child could not report its effective packs
+// (degraded, or an older child that doesn't implement op=4). Admin maps it to a
+// "packs unavailable" response — never an error that affects the data plane.
+var ErrPacksUnavailable = errors.New("apphook: effective packs unavailable")
+
+// ListPacks queries the child for its currently-effective compliance packs
+// (op=4: built-in baseline + pulled packs). Returns the raw JSON report payload.
+//
+// Design (Option A): shares the Detect pipe under detectMu, held ONLY for the
+// brief write+read of this bounded query. The child's handler is lock-free +
+// non-blocking (atomic snapshot + static manifest), so it can't stall a real
+// Detect. A crashed/wedged child surfaces as a write/read error → degraded,
+// same failure mode Detect already has (no new risk). Backward compatible: an
+// old child returns Allow + empty payload for the unknown op → we return
+// ErrPacksUnavailable, which the admin layer maps to "packs unavailable".
+func (h *ChildHook) ListPacks(ctx context.Context) ([]byte, error) {
+	if h.degraded.Load() {
+		return nil, ErrPacksUnavailable
+	}
+	ctx, cancel := context.WithTimeout(ctx, h.cfg.Timeout)
+	defer cancel()
+	_ = ctx // timeout intent; pipe I/O failure (crash) surfaces as read/write error
+
+	h.detectMu.Lock()
+	defer h.detectMu.Unlock()
+	if h.degraded.Load() {
+		return nil, ErrPacksUnavailable
+	}
+
+	if err := h.writeFrame([]byte{4}); err != nil { // op=4 = ListPacks
+		h.markDegraded("listpacks_write_failed: " + err.Error())
+		return nil, err
+	}
+	respPayload, err := h.readFrame()
+	if err != nil {
+		h.markDegraded("listpacks_read_failed: " + err.Error())
+		return nil, err
+	}
+	// Response: [action 1B][JSON report...]. Ignore the action byte; the report
+	// is everything after. An old child (unknown op → Allow + nothing) yields a
+	// 1-byte payload → unavailable.
+	if len(respPayload) <= 1 {
+		return nil, ErrPacksUnavailable
+	}
+	return respPayload[1:], nil
+}
+
 // Status implements Hook.
 func (h *ChildHook) Status() *Status {
 	return h.status.Load()

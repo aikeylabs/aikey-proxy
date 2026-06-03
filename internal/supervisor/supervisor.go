@@ -537,6 +537,20 @@ func (s *Supervisor) TotalErrors() int64 {
 	return s.active.Load().proxy.TotalErrors()
 }
 
+// EffectivePacks queries the ACTIVE generation's compliance filter child for the
+// packs currently effective in it (built-in baseline + pulled). Returns the raw
+// JSON report. Always reads s.active (never a cached hook), so after a Reload
+// re-spawns the child it hits the new live process — same source as Detect.
+// Returns apphook.ErrPacksUnavailable when no filter child is active; admin maps
+// that to "packs unavailable", never an error that touches the data plane.
+func (s *Supervisor) EffectivePacks(ctx context.Context) ([]byte, error) {
+	g := s.active.Load()
+	if g == nil || g.filterHook == nil {
+		return nil, apphook.ErrPacksUnavailable
+	}
+	return g.filterHook.ListPacks(ctx)
+}
+
 // AppHealthSnapshot returns the active proxy generation's in-memory "most
 // recent app-pipeline call per slug" snapshot. Drives the Web "Connected
 // Apps" list Health column via the /admin/apps/health endpoint.

@@ -71,6 +71,13 @@ type Handler struct {
 	// from "feature disabled" (503).
 	AppHealthFn func() []apppipe.AppHealth
 
+	// EffectivePacksFn returns the raw JSON report of compliance packs currently
+	// effective in the live filter child (built-in + pulled). Returns an error
+	// (apphook.ErrPacksUnavailable) when no filter child is active / can't report;
+	// the handler maps that to `{available:false}`, never a 5xx. Drives the Web
+	// "effective packs" drawer on the self-view compliance page.
+	EffectivePacksFn func(ctx context.Context) ([]byte, error)
+
 	// AuditStatusFn / ReconcileGapsFn drive `aikey audit` (D2.5 / D3): the local
 	// client delivery state, and the client-confirmed reconciliation pass
 	// (re-send WAL-present gaps, confirm WAL-absent gaps lost now). nil → 503.
@@ -467,6 +474,36 @@ func (h *Handler) AppHealth(w http.ResponseWriter, r *http.Request) {
 		apps = []apppipe.AppHealth{}
 	}
 	writeJSON(w, http.StatusOK, AppHealthResponse{Apps: apps})
+}
+
+// CompliancePacksEnvelope wraps the detector's raw effective-packs report so the
+// Web can distinguish "no compliance filter active" (available:false) from a
+// real report. report is the detector's {built_in,pulled,cursor} JSON verbatim.
+type CompliancePacksEnvelope struct {
+	Available bool            `json:"available"`
+	Report    json.RawMessage `json:"report,omitempty"`
+}
+
+// CompliancePacks returns the compliance packs currently effective in the LIVE
+// filter detector child (built-in baseline + pulled from master), queried over
+// the IPC (op=ListPacks). Same process that serves Detect → same source.
+//
+// GET /admin/compliance/packs
+//
+// A missing/idle filter child (compliance off, offline, or an older detector) is
+// a NORMAL state, not an error — returns {available:false} with 200 so the data
+// plane and the Web both treat it gracefully.
+func (h *Handler) CompliancePacks(w http.ResponseWriter, r *http.Request) {
+	if h.EffectivePacksFn == nil {
+		writeJSON(w, http.StatusOK, CompliancePacksEnvelope{Available: false})
+		return
+	}
+	report, err := h.EffectivePacksFn(r.Context())
+	if err != nil || len(report) == 0 {
+		writeJSON(w, http.StatusOK, CompliancePacksEnvelope{Available: false})
+		return
+	}
+	writeJSON(w, http.StatusOK, CompliancePacksEnvelope{Available: true, Report: report})
 }
 
 // HealthKeys tests whether the active key can authenticate to its provider(s)
