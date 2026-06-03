@@ -101,12 +101,23 @@ func (s *Supervisor) installFilterHook(p *proxy.Proxy, vaultReader *vault.Reader
 		recordAllowEnv = "AIKEY_COMPLIANCE_RECORD_ALLOW=1"
 	}
 
+	// Explicitly enable the detector's Personal/Trial local-intake path. Why an
+	// explicit flag instead of letting the detector self-decide: the detector
+	// self-discovers the local-server URL from the CLI yaml, which exists on any
+	// dev machine — so a test/bench that spawns the detector binary directly
+	// (e.g. TestChildHookFullStackLatency, N=1000 fixture iterations) would
+	// otherwise upload its fixtures into the live audit DB. Only the real
+	// supervisor sets this, so tests stay isolated. Harmless on Production: the
+	// detector checks AIKEY_CONTROL_MASTER_URL first and takes the master path
+	// before ever reaching the local-intake gate.
+	const localIntakeEnv = "AIKEY_COMPLIANCE_LOCAL_INTAKE=1"
+
 	cfg := apphook.ChildHookConfig{
 		Name:       "ai-compliance-detector",
 		BinaryPath: binPath,
 		BinaryArgs: binArgs,
 		Timeout:    filterTimeout(),
-		ExtraEnv:   []string{recordAllowEnv},
+		ExtraEnv:   []string{recordAllowEnv, localIntakeEnv},
 	}
 	hook := apphook.NewChildHook(cfg)
 	if err := hook.Start(s.ctx); err != nil {
