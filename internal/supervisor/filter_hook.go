@@ -20,6 +20,7 @@ package supervisor
 
 import (
 	"context"
+	"encoding/json"
 	"log/slog"
 	"os"
 	"path/filepath"
@@ -112,12 +113,26 @@ func (s *Supervisor) installFilterHook(p *proxy.Proxy, vaultReader *vault.Reader
 	// before ever reaching the local-intake gate.
 	const localIntakeEnv = "AIKEY_COMPLIANCE_LOCAL_INTAKE=1"
 
+	// Pass the team control-panel URL so the detector's pack puller pulls
+	// compliance packs from that backend (public /v1/packs/changed, no token).
+	// Injected as AIKEY_PACK_MASTER_URL — NOT AIKEY_CONTROL_MASTER_URL — so it
+	// drives ONLY pack pulling, never the detector's event-intake routing (which
+	// must stay LOCAL self-view on Personal; setting the control-master URL there
+	// would switch intake to the master path and, with no app token, disable it).
+	// The URL's single source is config.json controlPanelUrl (set by
+	// `aikey login --control-url`); the proxy is the conduit, the detector keeps
+	// NO copy. Empty (no team configured) → puller stays offline.
+	extraEnv := []string{recordAllowEnv, localIntakeEnv}
+	if masterURL := readControlPanelURL(); masterURL != "" {
+		extraEnv = append(extraEnv, "AIKEY_PACK_MASTER_URL="+masterURL)
+	}
+
 	cfg := apphook.ChildHookConfig{
 		Name:       "ai-compliance-detector",
 		BinaryPath: binPath,
 		BinaryArgs: binArgs,
 		Timeout:    filterTimeout(),
-		ExtraEnv:   []string{recordAllowEnv, localIntakeEnv},
+		ExtraEnv:   extraEnv,
 	}
 	hook := apphook.NewChildHook(cfg)
 	if err := hook.Start(s.ctx); err != nil {
@@ -204,4 +219,29 @@ func filterTimeout() time.Duration {
 		return filterDefaultTimeout
 	}
 	return time.Duration(ms) * time.Millisecond
+}
+
+// readControlPanelURL reads the team control-panel URL from the CLI's single
+// source: ~/.aikey/config/config.json `controlPanelUrl` (written by
+// `aikey login --control-url`). The proxy passes it to the detector as
+// AIKEY_CONTROL_MASTER_URL so the pack puller pulls compliance packs from the
+// team backend. The detector keeps NO copy of this URL — the proxy is the sole
+// conduit (single source). Returns "" on any read/parse miss (no team / fresh
+// install) → puller stays offline, no error.
+func readControlPanelURL() string {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return ""
+	}
+	b, err := os.ReadFile(filepath.Join(home, ".aikey", "config", "config.json"))
+	if err != nil {
+		return ""
+	}
+	var cfg struct {
+		ControlPanelURL string `json:"controlPanelUrl"`
+	}
+	if err := json.Unmarshal(b, &cfg); err != nil {
+		return ""
+	}
+	return strings.TrimRight(cfg.ControlPanelURL, "/")
 }
