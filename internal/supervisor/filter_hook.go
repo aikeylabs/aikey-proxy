@@ -124,7 +124,14 @@ func (s *Supervisor) installFilterHook(p *proxy.Proxy, vaultReader *vault.Reader
 	// NO copy. Empty (no team configured) → puller stays offline.
 	extraEnv := []string{recordAllowEnv, localIntakeEnv}
 	if masterURL := readControlPanelURL(); masterURL != "" {
-		extraEnv = append(extraEnv, "AIKEY_PACK_MASTER_URL="+masterURL)
+		// Bound to a team → pull packs from it, and poll every 60s so a newly
+		// published pack appears within ~1 minute (the detector's default is 1h,
+		// too slow for "add pack → see it"). Incremental cursor-based pulls are
+		// cheap. Offline (no team) → neither var is set, puller stays off.
+		extraEnv = append(extraEnv,
+			"AIKEY_PACK_MASTER_URL="+masterURL,
+			"AIKEY_PACK_POLL_INTERVAL=60s",
+		)
 	}
 
 	cfg := apphook.ChildHookConfig{
