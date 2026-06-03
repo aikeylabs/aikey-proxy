@@ -600,6 +600,8 @@ func (p *Proxy) serveRoute(w http.ResponseWriter, r *http.Request, route *vkeys.
 					sessionID := resolveSessionID(r, route.ProtocolType, route.ProviderCode)
 					upstreamReqID := extractUpstreamRequestID(resp)
 					p.reportUsage(route, bearerToken, ev.Model, startTime, resp.StatusCode, breakdown, "", realKey, sessionID, "complete", upstreamReqID)
+					// Phase 2 Stage 3: accrue token quota for this completed request.
+					p.accrueQuotaTokens(route, breakdown)
 				}
 			} else {
 				// Streaming success: wrap body — background goroutine drains the
@@ -615,7 +617,11 @@ func (p *Proxy) serveRoute(w http.ResponseWriter, r *http.Request, route *vkeys.
 				// but headers are already finalised by upstream).
 				upstreamReqID := extractUpstreamRequestID(resp)
 				var cb reporterCallback
-				if p.reporter != nil && !probe {
+				// Fire the completion callback for all non-probe streams (not just
+				// when a reporter is configured): Phase 2 Stage 3 quota accrual must
+				// count on stream completion even in offline/no-reporter mode. The
+				// usage upload stays reporter-gated inside.
+				if !probe {
 					cb = func(br provider.TokenBreakdown, completion string) {
 						// 2026-05-09 response-first: prefer the upstream-resolved
 						// model id from the SSE first frame (br.Model) over the
@@ -630,7 +636,12 @@ func (p *Proxy) serveRoute(w http.ResponseWriter, r *http.Request, route *vkeys.
 						if br.Model != "" {
 							model = br.Model
 						}
-						p.reportUsage(route, bearerToken, model, startTime, resp.StatusCode, br, "", realKey, sessionID, completion, upstreamReqID)
+						if p.reporter != nil {
+							p.reportUsage(route, bearerToken, model, startTime, resp.StatusCode, br, "", realKey, sessionID, completion, upstreamReqID)
+						}
+						// Phase 2 Stage 3: accrue token quota on stream completion,
+						// independent of the reporter.
+						p.accrueQuotaTokens(route, br)
 					}
 				}
 				// For probe traffic skip the collector entirely by passing nil.

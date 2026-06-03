@@ -12,6 +12,7 @@ import (
 	"github.com/AiKeyLabs/aikey-proxy/internal/provider"
 	"github.com/AiKeyLabs/aikey-proxy/internal/proxy/apppipe"
 	"github.com/AiKeyLabs/aikey-proxy/internal/proxy/probepipe"
+	"github.com/AiKeyLabs/aikey-proxy/internal/quota"
 	"github.com/AiKeyLabs/aikey-proxy/internal/vault"
 	"github.com/AiKeyLabs/aikey-proxy/internal/vkeys"
 	"github.com/AiKeyLabs/aikey-proxy/pkg/observer"
@@ -86,8 +87,15 @@ type Proxy struct {
 	proxyConfigVersion string // generation ID or config revision
 	loadedControlSeq   int64  // vault change_seq loaded at generation build time
 	loggedInAccountID  string // current platform_account.account_id (for personal key events)
-	requests           atomic.Int64
-	errors             atomic.Int64
+
+	// quota is the Phase 2 enterprise token-quota gate (Stage 3). nil-safe +
+	// flag-gated: when nil or disabled it is a pure no-op, so the request path is
+	// never blocked by quota machinery — only by an actual confirmed over-limit.
+	// Wired via SetQuotaEnforcer from the supervisor's snapshot+counter.
+	quota *quota.Enforcer
+
+	requests atomic.Int64
+	errors   atomic.Int64
 
 	// translatorRegistry holds the protocol-translator pair registry the
 	// App pipeline consults when an inbound URL protocol differs from
@@ -225,6 +233,14 @@ func (p *Proxy) SetAppVault(av apppipe.VaultReader) {
 // also implements probepipe.VaultReader.
 func (p *Proxy) SetProbeVault(pv probepipe.VaultReader) {
 	p.probeVault = pv
+}
+
+// SetQuotaEnforcer injects the Phase 2 token-quota gate (Stage 3). Wired by the
+// supervisor from the per-process snapshot+counter. Safe to leave unset — a nil
+// enforcer is a no-op (no enforcement), which is the correct behavior for
+// editions/tests that don't run quota.
+func (p *Proxy) SetQuotaEnforcer(e *quota.Enforcer) {
+	p.quota = e
 }
 
 // AppHealthSnapshot returns the in-process record of the most recent

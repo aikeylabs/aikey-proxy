@@ -211,6 +211,13 @@ func (p *Proxy) Handle(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
+	// 3b. Enterprise token-quota gate (Phase 2 Stage 3). Pre-route, in-memory;
+	// blocks an over-limit seat with 429 before any vault/upstream work. No-op
+	// when quota is disabled or the seat has no quota.
+	if p.enforceQuotaTokens(w, route, logger) {
+		return
+	}
+
 	// 4. Get real key — either from the pre-decrypted managed cache or from vault.
 	var realKey string
 	if route.PlaintextKey != "" {

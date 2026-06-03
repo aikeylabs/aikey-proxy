@@ -42,6 +42,7 @@ const (
 	EventProxyRequestUpstreamError = "proxy.request.upstream_error"
 	EventProxyRequestSlow          = "proxy.request.slow"
 	EventProxyRequestCompleted     = "proxy.request.completed"
+	EventProxyRequestQuotaExceeded = "proxy.request.quota_exceeded"
 )
 
 // Usage extraction events.
@@ -69,6 +70,11 @@ const (
 	ErrCodeUpstreamError         = "UPSTREAM_ERROR"
 	ErrCodeProviderError         = "PROVIDER_ERROR"
 	ErrCodeUsageExtractionFailed = "USAGE_EXTRACTION_FAILED"
+	// Enterprise quota (Phase 2, design §5.5). Stage 3 wires the token code;
+	// USD + degraded-block are reserved for later stages ($ enforcement / §8).
+	ErrCodeQuotaExceededToken = "QUOTA_EXCEEDED_TOKEN"
+	ErrCodeQuotaExceededUSD   = "QUOTA_EXCEEDED_USD"
+	ErrCodeQuotaDegradedBlock = "QUOTA_DEGRADED_BLOCK"
 )
 
 // ---- HealthSnapshot ----

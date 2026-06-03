@@ -43,6 +43,7 @@ import (
 	"github.com/AiKeyLabs/aikey-proxy/internal/provider"
 	"github.com/AiKeyLabs/aikey-proxy/internal/proxy"
 	"github.com/AiKeyLabs/aikey-proxy/internal/proxy/apppipe"
+	"github.com/AiKeyLabs/aikey-proxy/internal/quota"
 	"github.com/AiKeyLabs/aikey-proxy/internal/vault"
 	"github.com/AiKeyLabs/aikey-proxy/internal/vkeys"
 )
@@ -254,6 +255,16 @@ type Supervisor struct {
 	genID     atomic.Int64
 	startedAt time.Time
 
+	// Enterprise quota (Phase 2 Stage 2 — design §0.5/§5.2). Snapshot + counter
+	// live on the supervisor (not per-generation) so the counter accumulates
+	// continuously across 5s syncs and /admin/reload; the snapshot is gen-swapped
+	// on each vault-seq advance. quotaEnabled gates LOADING only (off = the
+	// rule-distribution rail is fully bypassed, proxy == pre-quota behavior).
+	// Stage 2 only loads + counts; request interception is Stage 3.
+	quotaEnabled  bool
+	quotaSnapshot *quota.Snapshot
+	quotaCounter  *quota.Counter
+
 	// ctx / cancel bound the lifetime of all detached upstream calls.
 	// Cancelled in Shutdown() to stop any in-flight upstream requests.
 	ctx    context.Context
@@ -278,13 +289,16 @@ func (s *Supervisor) VaultReader() *vault.Reader {
 func New(cfg *config.Config, configPath, password, version string) (*Supervisor, error) {
 	ctx, cancel := context.WithCancel(context.Background())
 	s := &Supervisor{
-		cfg:        cfg,
-		configPath: configPath,
-		password:   password,
-		version:    version,
-		startedAt:  time.Now(),
-		ctx:        ctx,
-		cancel:     cancel,
+		cfg:           cfg,
+		configPath:    configPath,
+		password:      password,
+		version:       version,
+		startedAt:     time.Now(),
+		ctx:           ctx,
+		cancel:        cancel,
+		quotaEnabled:  quotaEnabledFromEnv(),
+		quotaSnapshot: quota.NewSnapshot(),
+		quotaCounter:  quota.NewCounter(),
 	}
 	gen, err := s.buildGeneration()
 	if err != nil {
@@ -436,6 +450,12 @@ func (s *Supervisor) syncManagedKeys() {
 	// Atomic replace — deleted/revoked tokens disappear immediately.
 	gen.registry.ReplaceAll(allRoutes)
 
+	// Quota rules ride the same vault-seq advance (design §0.5/§5.2). This is
+	// strictly after the managed-key path above and fully fault-isolated (gated
+	// by the flag, swallows errors, keeps last-known-good) so a quota problem
+	// can never disturb managed-key delivery — the proxy's main path.
+	s.reloadQuotaSnapshot(gen)
+
 	// Record that we've caught up to this seq.
 	if werr := vault.WriteConfigU64LE(s.cfg.Vault.Path, ProxyLoadedSeqKey, vaultSeq); werr != nil {
 		slog.Warn("managed key sync: failed to write loaded_vault_change_seq", "error", werr)
@@ -446,6 +466,48 @@ func (s *Supervisor) syncManagedKeys() {
 		)
 	}
 }
+
+// quotaEnabledFromEnv reads the PROXY_QUOTA_ENABLED feature flag. Default OFF:
+// Stage 2 only builds the rule-distribution rail (load + count, no enforcement),
+// so until Stage 3 lands the quota path stays bypassed in normal deployments and
+// the proxy behaves exactly as before. Accepts "1"/"true"/"yes" (case-insensitive).
+func quotaEnabledFromEnv() bool {
+	switch strings.ToLower(strings.TrimSpace(os.Getenv("PROXY_QUOTA_ENABLED"))) {
+	case "1", "true", "yes", "on":
+		return true
+	default:
+		return false
+	}
+}
+
+// reloadQuotaSnapshot loads the quota rules cached in the vault and atomically
+// swaps them into the in-memory snapshot. Fully fault-isolated: gated by the
+// feature flag, and on any error it logs a WARN and KEEPS the last-known-good
+// snapshot (design §8) — it never returns an error and never touches the
+// managed-key path. Called at startup / reload (buildGeneration) and on each
+// vault-seq advance (syncManagedKeys).
+func (s *Supervisor) reloadQuotaSnapshot(gen *generation) {
+	if !s.quotaEnabled || gen == nil || gen.vault == nil {
+		return
+	}
+	subjects, err := quota.LoadSubjects(gen.vault.DB())
+	if err != nil {
+		slog.Warn("quota.snapshot.load_failed", "error", err.Error())
+		return
+	}
+	s.quotaSnapshot.ReplaceAll(subjects)
+	// Stage 4 回填: seed each subject's counter from the control-reported
+	// current-period baseline so a restart/another machine doesn't resume from
+	// zero. Idempotent on unchanged baselines (won't wipe local increments).
+	quota.SeedBaselines(s.quotaCounter, subjects, time.Now())
+	slog.Info("quota.snapshot.loaded", "subjects", len(subjects))
+}
+
+// QuotaSnapshot exposes the live rule snapshot (Stage 3 enforcement + tests).
+func (s *Supervisor) QuotaSnapshot() *quota.Snapshot { return s.quotaSnapshot }
+
+// QuotaCounter exposes the in-memory counter (Stage 3 enforcement + tests).
+func (s *Supervisor) QuotaCounter() *quota.Counter { return s.quotaCounter }
 
 // Handler returns an http.Handler that always delegates to the active generation.
 // This is the function passed to the http.Server — it never changes across reloads.
@@ -863,6 +925,11 @@ func (s *Supervisor) buildGeneration() (*generation, error) {
 	if s.broker != nil {
 		p.SetBroker(s.broker)
 	}
+	// Phase 2 Stage 3: wire the token-quota gate from the per-process snapshot +
+	// counter (both supervisor-scoped so the counter survives 5s syncs/reloads).
+	// nil-safe + flag-gated inside the enforcer — a no-op when PROXY_QUOTA_ENABLED
+	// is off, so the request path is unchanged unless quota is explicitly on.
+	p.SetQuotaEnforcer(quota.NewEnforcer(s.quotaSnapshot, s.quotaCounter, s.quotaEnabled))
 
 	// Phase 4 M2: build the per-generation observer registry. Skipped when
 	// no observer descriptors are registered (e.g. proxy build without the
@@ -1017,7 +1084,7 @@ func (s *Supervisor) buildGeneration() (*generation, error) {
 		ownedWAL = sharedWAL
 	}
 
-	return &generation{
+	gen := &generation{
 		id:            id,
 		vaultPath:     s.cfg.Vault.Path,
 		vault:         vaultReader,
@@ -1032,7 +1099,13 @@ func (s *Supervisor) buildGeneration() (*generation, error) {
 		standaloneWAL: ownedWAL,
 		seqAlloc:      seqAlloc,
 		drained:       make(chan struct{}),
-	}, nil
+	}
+
+	// Load quota rules for this generation's vault at startup / reload (the 5s
+	// sync only fires on a later seq advance). Fault-isolated — see helper.
+	s.reloadQuotaSnapshot(gen)
+
+	return gen, nil
 }
 
 // Listen creates and returns the TCP listener with automatic port-drift
