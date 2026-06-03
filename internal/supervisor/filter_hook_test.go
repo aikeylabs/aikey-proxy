@@ -25,18 +25,18 @@ func TestResolveAppBinary(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if got := resolveAppBinary(dir, []string{"myfilter"}); got != bin {
-		t.Errorf("resolve = %q, want %q", got, bin)
+	if got, slug := resolveAppBinary(dir, []string{"myfilter"}); got != bin || slug != "myfilter" {
+		t.Errorf("resolve = (%q,%q), want (%q,myfilter)", got, slug, bin)
 	}
-	if got := resolveAppBinary(dir, []string{"absent"}); got != "" {
-		t.Errorf("absent slug should be empty, got %q", got)
+	if got, slug := resolveAppBinary(dir, []string{"absent"}); got != "" || slug != "" {
+		t.Errorf("absent slug should be empty, got (%q,%q)", got, slug)
 	}
-	if got := resolveAppBinary(dir, []string{"absent", "myfilter"}); got != bin {
-		t.Errorf("should find the second slug, got %q", got)
+	if got, slug := resolveAppBinary(dir, []string{"absent", "myfilter"}); got != bin || slug != "myfilter" {
+		t.Errorf("should find the second slug, got (%q,%q)", got, slug)
 	}
 	// a directory at the binary path must NOT count as a binary.
 	_ = os.MkdirAll(filepath.Join(dir, "dirapp", "bin", "dirapp"), 0o755)
-	if got := resolveAppBinary(dir, []string{"dirapp"}); got != "" {
+	if got, _ := resolveAppBinary(dir, []string{"dirapp"}); got != "" {
 		t.Errorf("a dir is not a binary, got %q", got)
 	}
 }

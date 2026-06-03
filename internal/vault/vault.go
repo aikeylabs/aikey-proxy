@@ -1178,6 +1178,28 @@ func (r *Reader) GetFilterAppSlugs() ([]string, error) {
 	return slugs, rows.Err()
 }
 
+// GetFilterRecordAllow reports whether the given filter app has
+// filter_record_allow=1 — the settings-page "record allow events" toggle. The
+// supervisor passes this to the detector child as AIKEY_COMPLIANCE_RECORD_ALLOW
+// so it can drop clean "allow" scans at source. Returns false (the default) when
+// the column is absent (pre-flag vaults) or the row is 0/NULL/missing.
+func (r *Reader) GetFilterRecordAllow(slug string) (bool, error) {
+	if !hasColumn(r.db, "app_records", "filter_record_allow") {
+		return false, nil
+	}
+	var v sql.NullInt64
+	err := r.db.QueryRow(
+		`SELECT filter_record_allow FROM app_records WHERE slug = ? LIMIT 1`, slug,
+	).Scan(&v)
+	if err == sql.ErrNoRows {
+		return false, nil
+	}
+	if err != nil {
+		return false, fmt.Errorf("read filter_record_allow for %q: %w", slug, err)
+	}
+	return v.Valid && v.Int64 != 0, nil
+}
+
 // ObserveSubscription is one parsed entry from `app_records.observe_streams`.
 // SPEC §1.4.3 allows both simple-string and object-form JSON elements;
 // this flat view normalises both:

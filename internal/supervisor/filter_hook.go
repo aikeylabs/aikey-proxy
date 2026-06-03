@@ -66,7 +66,7 @@ const filterDefaultTimeout = 80 * time.Millisecond
 // child to tear down" — either nothing was declared, or spawn failed and the
 // proxy is in fail-loud 501 mode instead.
 func (s *Supervisor) installFilterHook(p *proxy.Proxy, vaultReader *vault.Reader) *apphook.ChildHook {
-	binPath, binArgs, declaredButMissing := s.resolveFilterBinary(vaultReader)
+	binPath, binArgs, slug, declaredButMissing := s.resolveFilterBinary(vaultReader)
 	if binPath == "" {
 		if declaredButMissing {
 			// Vault declares a filter app but its installed binary can't be
@@ -82,11 +82,31 @@ func (s *Supervisor) installFilterHook(p *proxy.Proxy, vaultReader *vault.Reader
 		return nil // nothing declared (normal serving), or declared-but-missing (501 set)
 	}
 
+	// Pass the per-app record-allow flag to the detector as env so it can drop
+	// clean "allow" scans at source. Default off; on a flag change the vault
+	// change_seq bump triggers a proxy reload → this hook re-installs → the
+	// child re-spawns with the new value. The dev-override path has no slug
+	// (slug==""), so it just gets the default-off env.
+	recordAllow := false
+	if slug != "" {
+		if ra, err := vaultReader.GetFilterRecordAllow(slug); err != nil {
+			slog.Warn("supervisor: read filter_record_allow failed; defaulting off",
+				"event.name", "proxy.filter_record_allow_read_failed", "slug", slug, "error", err)
+		} else {
+			recordAllow = ra
+		}
+	}
+	recordAllowEnv := "AIKEY_COMPLIANCE_RECORD_ALLOW=0"
+	if recordAllow {
+		recordAllowEnv = "AIKEY_COMPLIANCE_RECORD_ALLOW=1"
+	}
+
 	cfg := apphook.ChildHookConfig{
 		Name:       "ai-compliance-detector",
 		BinaryPath: binPath,
 		BinaryArgs: binArgs,
 		Timeout:    filterTimeout(),
+		ExtraEnv:   []string{recordAllowEnv},
 	}
 	hook := apphook.NewChildHook(cfg)
 	if err := hook.Start(s.ctx); err != nil {
@@ -118,23 +138,25 @@ func (s *Supervisor) installFilterHook(p *proxy.Proxy, vaultReader *vault.Reader
 // Returns ("", nil, false) when nothing is declared (normal serving), and
 // ("", nil, true) when a filter app IS declared but no binary was found
 // (caller fails loud rather than serving unfiltered).
-func (s *Supervisor) resolveFilterBinary(vaultReader *vault.Reader) (binPath string, args []string, declaredButMissing bool) {
+func (s *Supervisor) resolveFilterBinary(vaultReader *vault.Reader) (binPath string, args []string, slug string, declaredButMissing bool) {
 	if env := strings.TrimSpace(os.Getenv(filterBinaryEnv)); env != "" {
-		return env, strings.Fields(os.Getenv(filterArgsEnv)), false
+		// Dev override: no slug → caller can't read per-app vault config (gets
+		// the record-allow default-off env).
+		return env, strings.Fields(os.Getenv(filterArgsEnv)), "", false
 	}
 	slugs, err := vaultReader.GetFilterAppSlugs()
 	if err != nil {
 		slog.Warn("supervisor: filter_stages check failed; treating as inactive",
 			"event.name", "proxy.filter_stub_check_failed", "error", err)
-		return "", nil, false
+		return "", nil, "", false
 	}
 	if len(slugs) == 0 {
-		return "", nil, false
+		return "", nil, "", false
 	}
-	if bin := resolveAppBinary(s.appsDir(), slugs); bin != "" {
-		return bin, nil, false
+	if bin, sl := resolveAppBinary(s.appsDir(), slugs); bin != "" {
+		return bin, nil, sl, false
 	}
-	return "", nil, true
+	return "", nil, "", true
 }
 
 // appsDir is where `aikey app install` lays out app trees, derived from the
@@ -143,16 +165,18 @@ func (s *Supervisor) appsDir() string {
 	return filepath.Join(filepath.Dir(filepath.Dir(s.cfg.Vault.Path)), "apps")
 }
 
-// resolveAppBinary returns the first existing <appsDir>/<slug>/bin/<slug> file,
-// or "" if none. Pure (filesystem only) — unit-testable with a temp dir.
-func resolveAppBinary(appsDir string, slugs []string) string {
-	for _, slug := range slugs {
-		bin := filepath.Join(appsDir, slug, "bin", slug)
-		if fi, err := os.Stat(bin); err == nil && !fi.IsDir() {
-			return bin
+// resolveAppBinary returns the first existing <appsDir>/<slug>/bin/<slug> file
+// and its slug, or ("","") if none. Pure (filesystem only) — unit-testable with
+// a temp dir. The slug lets the caller read per-app vault config (e.g.
+// filter_record_allow) for the binary it actually resolved.
+func resolveAppBinary(appsDir string, slugs []string) (bin string, slug string) {
+	for _, s := range slugs {
+		b := filepath.Join(appsDir, s, "bin", s)
+		if fi, err := os.Stat(b); err == nil && !fi.IsDir() {
+			return b, s
 		}
 	}
-	return ""
+	return "", ""
 }
 
 // filterTimeout resolves the per-Detect deadline: env override (ms) if a valid

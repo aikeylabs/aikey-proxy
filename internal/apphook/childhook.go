@@ -44,6 +44,12 @@ type ChildHookConfig struct {
 	RestartMaxAttempts int           // 0 = unlimited (default 3)
 	RestartBaseDelay   time.Duration // initial backoff (default 100ms)
 	RestartMaxDelay    time.Duration // backoff cap (default 30s)
+	// ExtraEnv are "KEY=VALUE" entries appended to the child's environment (on
+	// top of the proxy's inherited env). Used to pass per-app runtime config
+	// the proxy derives from vault — e.g. AIKEY_COMPLIANCE_RECORD_ALLOW from the
+	// app_records.filter_record_allow flag. The child re-reads these at spawn,
+	// so a flag change → vault change_seq → proxy reload → re-spawn picks it up.
+	ExtraEnv []string
 }
 
 func (c *ChildHookConfig) applyDefaults() {
@@ -121,6 +127,11 @@ func (h *ChildHook) spawnLocked(ctx context.Context) error {
 	}
 
 	cmd := exec.Command(h.cfg.BinaryPath, h.cfg.BinaryArgs...)
+	// Inherit the proxy's env (the child relies on it for AIKEY_* config) and
+	// append any per-app ExtraEnv the supervisor derived from vault.
+	if len(h.cfg.ExtraEnv) > 0 {
+		cmd.Env = append(os.Environ(), h.cfg.ExtraEnv...)
+	}
 	stdin, err := cmd.StdinPipe()
 	if err != nil {
 		h.markDegraded("pipe_setup_failed")
