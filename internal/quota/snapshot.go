@@ -26,8 +26,9 @@ const (
 	KindGroup = "group"
 )
 
-// Metrics (mirror control, design §3.4). Stage 3 enforces tokens only; usd
-// enforcement needs proxy-side pricing and is a later stage.
+// Metrics (mirror control, design §3.4). Both are enforced: tokens from a local
+// count, usd from a server-computed baseline read via UsdUsedSource (the proxy
+// never computes cost — design D-U1).
 const (
 	MetricTokens = "tokens"
 	MetricUSD    = "usd"
@@ -51,9 +52,10 @@ type Rule struct {
 }
 
 // Baseline is the control-reported current-period used for one (metric, period)
-// of a subject (Stage 4 回填 — design §5.4). Delivered via the snapshot so a
-// restart/another machine doesn't start the counter from zero. Stage 4 carries
-// the tokens metric; usd arrives with $ enforcement.
+// of a subject (回填 — design §5.4). Delivered via the snapshot so a
+// restart/another machine doesn't start the counter from zero. Carries BOTH
+// metrics: tokens (top-up for the local increment) and usd (the enforcement
+// value itself — the proxy reads it instead of computing cost).
 type Baseline struct {
 	Metric string  `json:"metric"`
 	Period string  `json:"period"`

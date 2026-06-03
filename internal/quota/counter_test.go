@@ -62,11 +62,14 @@ func TestCounterBaselinePlusIncrement(t *testing.T) {
 	}
 }
 
-func TestSeedBaselinesTokensOnly(t *testing.T) {
+// P3: SeedBaselines seeds BOTH metrics. tokens baseline tops up the local
+// increment; usd baseline IS the enforcement value (counterUsdSource reads it,
+// the proxy never accrues usd increments).
+func TestSeedBaselinesBothMetrics(t *testing.T) {
 	subjects := []Subject{
 		{SubjectID: "seat-a", SubjectKind: KindSeat, Baselines: []Baseline{
 			{Metric: MetricTokens, Period: PeriodMonthly, Used: 42},
-			{Metric: MetricUSD, Period: PeriodMonthly, Used: 9.99}, // ignored this stage
+			{Metric: MetricUSD, Period: PeriodMonthly, Used: 9.99},
 		}},
 		{SubjectID: "seat-b", SubjectKind: KindSeat}, // no baselines
 	}
@@ -77,8 +80,8 @@ func TestSeedBaselinesTokensOnly(t *testing.T) {
 	if got := c.Get("seat-a", MetricTokens, pk); got != 42 {
 		t.Errorf("token baseline: want 42 got %v", got)
 	}
-	if got := c.Get("seat-a", MetricUSD, pk); got != 0 {
-		t.Errorf("usd baseline must be ignored this stage, got %v", got)
+	if got := c.Get("seat-a", MetricUSD, pk); got != 9.99 {
+		t.Errorf("usd baseline must be seeded (P3): want 9.99 got %v", got)
 	}
 	if got := c.Get("seat-b", MetricTokens, pk); got != 0 {
 		t.Errorf("no-baseline seat: want 0 got %v", got)

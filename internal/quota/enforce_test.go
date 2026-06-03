@@ -104,12 +104,53 @@ func TestEnforcerCrossPeriodResets(t *testing.T) {
 	}
 }
 
-func TestEnforcerUsdRulesIgnoredThisStage(t *testing.T) {
-	// usd-only subject → Stage 3 must not produce buckets (tokens only).
-	e := newTestEnforcer(true, []Subject{{SubjectID: "seat-a", SubjectKind: KindSeat,
+// P3: usd is enforced against the seeded master baseline (the proxy never
+// computes cost — counterUsdSource reads counter[usd]). The crossing is decided
+// by the baseline; the proxy adds no usd increment.
+func TestEnforcerUsdBlocksFromBaseline(t *testing.T) {
+	snap := NewSnapshot()
+	snap.ReplaceAll([]Subject{{SubjectID: "seat-a", SubjectKind: KindSeat,
 		Rules: []Rule{{Metric: MetricUSD, Period: PeriodMonthly, LimitAmount: 50}}}})
-	buckets, v := e.Check("seat-a", fixedNow)
-	if len(buckets) != 0 || v != nil {
-		t.Errorf("usd rule must be ignored in token enforcement, got buckets=%v v=%v", buckets, v)
+	c := NewCounter()
+	e := NewEnforcer(snap, c, true)
+	pk := PeriodKey(PeriodMonthly, fixedNow)
+
+	// usd baseline under limit → allow; usd-only subject yields no token buckets.
+	c.SetBaseline("seat-a", MetricUSD, pk, 30)
+	if buckets, v := e.Check("seat-a", fixedNow); v != nil || len(buckets) != 0 {
+		t.Fatalf("usd 30/50: want allow + no token buckets, got buckets=%v v=%+v", buckets, v)
+	}
+
+	// usd baseline at limit → block with a usd-metric violation.
+	c.SetBaseline("seat-a", MetricUSD, pk, 50)
+	_, v := e.Check("seat-a", fixedNow)
+	if v == nil || v.Metric != MetricUSD || v.Limit != 50 || v.Used != 50 || v.SubjectID != "seat-a" {
+		t.Fatalf("usd 50/50: want usd block, got %+v", v)
+	}
+
+	// the proxy must NOT accrue usd locally — token accrual leaves usd untouched.
+	e.AddForSeat("seat-a", 999, fixedNow)
+	if got := c.Get("seat-a", MetricUSD, pk); got != 50 {
+		t.Errorf("usd must stay = baseline (no local accrual), got %v", got)
 	}
 }
+
+// P3: SetUsdSource lets P4 swap the usd used-source (max(local, master)) without
+// touching enforcement. Here a stub source forces a block independent of the
+// counter, proving Check routes usd through the source.
+func TestEnforcerUsdSourceOverride(t *testing.T) {
+	snap := NewSnapshot()
+	snap.ReplaceAll([]Subject{{SubjectID: "seat-a", SubjectKind: KindSeat,
+		Rules: []Rule{{Metric: MetricUSD, Period: PeriodMonthly, LimitAmount: 50}}}})
+	e := NewEnforcer(snap, NewCounter(), true)
+	e.SetUsdSource(stubUsdSource(80)) // counter says 0, source says 80 → block
+
+	_, v := e.Check("seat-a", fixedNow)
+	if v == nil || v.Metric != MetricUSD || v.Used != 80 {
+		t.Fatalf("usd source override: want block at 80, got %+v", v)
+	}
+}
+
+type stubUsdSource float64
+
+func (s stubUsdSource) UsdUsed(_, _ string) float64 { return float64(s) }

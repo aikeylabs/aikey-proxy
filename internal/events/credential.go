@@ -27,7 +27,7 @@ import (
 //   - StaticTokenCredential — wraps a fixed string (legacy service_token
 //     path; trivial Bearer() that just returns the value).
 //   - RefreshableJWT — wraps a user JWT with auto-refresh against a
-//     control-service /auth/refresh endpoint. The contract is "ask me
+//     control-service POST /v1/auth/cli/token/refresh endpoint. The contract is "ask me
 //     right before you send and I will give you a fresh enough token,
 //     blocking only as long as a network round-trip in the window
 //     before access expires."
@@ -64,7 +64,7 @@ func (s *StaticTokenCredential) Bearer(_ context.Context) (string, error) {
 const refreshSkewBeforeExpiry = 5 * time.Minute
 
 // RefreshableJWT is a user-scoped JWT with automatic refresh against a
-// control-service /auth/refresh endpoint. The lifecycle:
+// control-service POST /v1/auth/cli/token/refresh endpoint. The lifecycle:
 //
 //  1. proxy startup: loaded from aikey-user.yaml + vault (refresh_token
 //     is encrypted in vault; access_token + expires_at are plaintext
@@ -105,7 +105,7 @@ type RefreshableJWT struct {
 
 	// RefreshURL is the absolute URL the refresh POST hits. Resolved at
 	// config-load time from the collector_routes.team URL (e.g.
-	// https://control.example.com/auth/refresh).
+	// https://control.example.com/v1/auth/cli/token/refresh).
 	RefreshURL string
 
 	// HTTPClient lets tests inject a stubbed client. Nil means use the
@@ -163,11 +163,20 @@ func (j *RefreshableJWT) Bearer(ctx context.Context) (string, error) {
 }
 
 // refreshResponse is the wire shape returned by control-service's
-// /auth/refresh endpoint. expires_at is unix seconds (matches the
-// control-service JWT lifecycle's "iat / exp" convention).
+// POST /v1/auth/cli/token/refresh endpoint. expires_in is the new access
+// token's remaining lifetime in *relative seconds* (OAuth convention),
+// identical to the contract the CLI session-refresh already consumes
+// (aikey-cli platform_client.rs `RefreshResponse`).
+//
+// Why relative, not an absolute expires_at: an earlier draft of this
+// struct assumed an absolute `expires_at` against a `/auth/refresh`
+// endpoint that was never implemented on the server — once the access
+// token expired, every refresh failed with "missing expires_at" and
+// team usage events were silently dead-lettered. See
+// workflow/CI/bugfix/2026-06-03-team-usage-refresh-contract-mismatch.md.
 type refreshResponse struct {
 	AccessToken string `json:"access_token"`
-	ExpiresAt   int64  `json:"expires_at"`
+	ExpiresIn   int64  `json:"expires_in"`
 	// Server MAY rotate the refresh token. When present we accept it
 	// in-memory but do NOT persist (see RefreshToken docstring).
 	RefreshToken string `json:"refresh_token,omitempty"`
@@ -217,14 +226,16 @@ func (j *RefreshableJWT) refresh(ctx context.Context) (string, time.Time, error)
 	if out.AccessToken == "" {
 		return "", time.Time{}, fmt.Errorf("refresh response missing access_token")
 	}
-	if out.ExpiresAt == 0 {
-		return "", time.Time{}, fmt.Errorf("refresh response missing expires_at")
+	if out.ExpiresIn == 0 {
+		return "", time.Time{}, fmt.Errorf("refresh response missing expires_in")
 	}
 	// Defense-in-depth: in-memory accept refresh_token rotation.
 	if out.RefreshToken != "" {
 		j.RefreshToken = out.RefreshToken
 	}
-	return out.AccessToken, time.Unix(out.ExpiresAt, 0), nil
+	// expires_in is relative seconds; convert to an absolute deadline so
+	// Bearer()'s `time.Until(ExpiresAt)` window check works.
+	return out.AccessToken, time.Now().Add(time.Duration(out.ExpiresIn) * time.Second), nil
 }
 
 // defaultRefreshClient is the http.Client used when RefreshableJWT

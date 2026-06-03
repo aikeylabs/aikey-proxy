@@ -19,10 +19,11 @@ import (
 // enforcer makes both functions pure no-ops, so a quota problem can never block
 // or slow a request — only a confirmed over-limit blocks (design §8 / 不变量 6).
 
-// enforceQuotaTokens runs the pre-route token-quota check. Returns true when the
-// request was blocked (a 429 has been written; the caller MUST return). false =
-// allow (quota off, no seat quota, or under limit). Pure in-memory — no I/O.
-func (p *Proxy) enforceQuotaTokens(w http.ResponseWriter, route *vkeys.ResolvedRoute, logger *slog.Logger) bool {
+// enforceQuota runs the pre-route quota check (token AND usd). Returns true when
+// the request was blocked (a 429 has been written; the caller MUST return).
+// false = allow (quota off, no seat quota, or under limit). Pure in-memory — no
+// I/O (usd "used" is read from the in-memory usd source, never computed here).
+func (p *Proxy) enforceQuota(w http.ResponseWriter, route *vkeys.ResolvedRoute, logger *slog.Logger) bool {
 	if !p.quota.Enabled() || route == nil {
 		return false
 	}
@@ -37,6 +38,12 @@ func (p *Proxy) enforceQuotaTokens(w http.ResponseWriter, route *vkeys.ResolvedR
 	limitStr := strconv.FormatFloat(v.Limit, 'f', -1, 64)
 	usedStr := strconv.FormatFloat(v.Used, 'f', -1, 64)
 
+	// Metric-specific error code + label (token vs cost). Default to token.
+	code, label := observability.ErrCodeQuotaExceededToken, "Token"
+	if v.Metric == quota.MetricUSD {
+		code, label = observability.ErrCodeQuotaExceededUSD, "Cost ($)"
+	}
+
 	w.Header().Set("X-Aikey-Quota-Limit", limitStr)
 	w.Header().Set("X-Aikey-Quota-Used", usedStr)
 	w.Header().Set("X-Aikey-Quota-Remaining", "0")
@@ -49,16 +56,17 @@ func (p *Proxy) enforceQuotaTokens(w http.ResponseWriter, route *vkeys.ResolvedR
 		resetMsg = reset.UTC().Format(time.RFC3339)
 	}
 
-	logger.Warn("quota exceeded: token limit",
+	logger.Warn("quota exceeded",
 		"event.name", observability.EventProxyRequestQuotaExceeded,
-		"error.code", observability.ErrCodeQuotaExceededToken,
+		"error.code", code,
+		"metric", v.Metric,
 		"subject_id", v.SubjectID,
 		"period_key", v.PeriodKey,
 		"used", v.Used,
 		"limit", v.Limit,
 	)
-	writeJSONError(w, http.StatusTooManyRequests, "quota_error", observability.ErrCodeQuotaExceededToken,
-		"Token quota exceeded for this seat (used "+usedStr+" / limit "+limitStr+"). Resets at "+resetMsg+".")
+	writeJSONError(w, http.StatusTooManyRequests, "quota_error", code,
+		label+" quota exceeded for this seat (used "+usedStr+" / limit "+limitStr+"). Resets at "+resetMsg+".")
 	return true
 }
 

@@ -60,7 +60,7 @@ func TestRefreshableJWT_Bearer_ReturnsAccessWhenFresh(t *testing.T) {
 // ── RefreshableJWT: refresh trigger ────────────────────────────────────
 
 // refreshServer returns an httptest server that pretends to be
-// control-service's /auth/refresh. callCount lets tests assert
+// control-service's POST /v1/auth/cli/token/refresh. callCount lets tests assert
 // "refresh was actually hit" / "refresh ran exactly once".
 type refreshServerSpy struct {
 	calls    atomic.Int32
@@ -94,7 +94,7 @@ func TestRefreshableJWT_Bearer_RefreshesWhenWithinSkewWindow(t *testing.T) {
 	srv, spy := newRefreshServer(t, func(_ refreshRequest) (refreshResponse, int) {
 		return refreshResponse{
 			AccessToken: "rotated-access",
-			ExpiresAt:   time.Now().Add(7 * 24 * time.Hour).Unix(),
+			ExpiresIn:   int64((7 * 24 * time.Hour).Seconds()),
 		}, http.StatusOK
 	})
 
@@ -168,7 +168,7 @@ func TestRefreshableJWT_Bearer_RefreshHTTPErrorPropagates(t *testing.T) {
 func TestRefreshableJWT_Bearer_RefreshMissingAccessTokenInResponse(t *testing.T) {
 	srv, _ := newRefreshServer(t, func(_ refreshRequest) (refreshResponse, int) {
 		// 200 but no access_token — a malformed control-service response.
-		return refreshResponse{ExpiresAt: time.Now().Add(7 * 24 * time.Hour).Unix()}, http.StatusOK
+		return refreshResponse{ExpiresIn: int64((7 * 24 * time.Hour).Seconds())}, http.StatusOK
 	})
 
 	j := &RefreshableJWT{
@@ -200,7 +200,7 @@ func TestRefreshableJWT_Bearer_AcceptsRotatedRefreshTokenInMemory(t *testing.T) 
 		return refreshResponse{
 			AccessToken:  "fresh",
 			RefreshToken: "rotated-from-" + req.RefreshToken,
-			ExpiresAt:    time.Now().Add(7 * 24 * time.Hour).Unix(),
+			ExpiresIn:    int64((7 * 24 * time.Hour).Seconds()),
 		}, http.StatusOK
 	})
 
@@ -285,7 +285,7 @@ func TestRefreshableJWT_Bearer_ConcurrentCallsRefreshOnce(t *testing.T) {
 		time.Sleep(100 * time.Millisecond)
 		return refreshResponse{
 			AccessToken: "fresh",
-			ExpiresAt:   time.Now().Add(7 * 24 * time.Hour).Unix(),
+			ExpiresIn:   int64((7 * 24 * time.Hour).Seconds()),
 		}, http.StatusOK
 	})
 
@@ -324,7 +324,7 @@ func TestRefreshableJWT_Bearer_PersistFailureDoesNotBlock(t *testing.T) {
 	srv, _ := newRefreshServer(t, func(_ refreshRequest) (refreshResponse, int) {
 		return refreshResponse{
 			AccessToken: "fresh",
-			ExpiresAt:   time.Now().Add(7 * 24 * time.Hour).Unix(),
+			ExpiresIn:   int64((7 * 24 * time.Hour).Seconds()),
 		}, http.StatusOK
 	})
 
@@ -349,6 +349,85 @@ func TestRefreshableJWT_Bearer_PersistFailureDoesNotBlock(t *testing.T) {
 	// from this same proxy instance will hit the cache, not re-refresh.
 	if j.AccessToken != "fresh" {
 		t.Fatalf("in-memory AccessToken not updated: %q", j.AccessToken)
+	}
+}
+
+// ── RefreshableJWT: real server wire-contract (regression) ─────────────
+//
+// These two tests pin the EXACT wire shape control-service emits from
+// POST /v1/auth/cli/token/refresh (see aikey-control-master
+// handler_identity.go `oauthTokenBody`). They feed raw JSON bytes rather
+// than encoding a refreshResponse struct, so a JSON-tag drift can't hide
+// behind a struct round-trip — that round-trip blindness is exactly what
+// let the original bug (parsing absolute `expires_at` against a server
+// that emits relative `expires_in`) ship green. See
+// workflow/CI/bugfix/2026-06-03-team-usage-refresh-contract-mismatch.md.
+
+func rawJSONRefreshServer(t *testing.T, status int, body string) *httptest.Server {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(status)
+		_, _ = w.Write([]byte(body))
+	}))
+	t.Cleanup(srv.Close)
+	return srv
+}
+
+func TestRefreshableJWT_Bearer_ParsesRealServerWireShape(t *testing.T) {
+	// Byte-for-byte the body oauthTokenBody() produces (expires_in is
+	// RELATIVE seconds; token_type + account are extra fields we ignore).
+	srv := rawJSONRefreshServer(t, http.StatusOK, `{
+		"access_token":  "new-access",
+		"refresh_token": "new-refresh",
+		"token_type":    "Bearer",
+		"expires_in":    3600,
+		"account": {"account_id": "acc-1", "email": "x@y.z"}
+	}`)
+
+	j := &RefreshableJWT{
+		AccessToken:  "stale",
+		RefreshToken: "rt",
+		ExpiresAt:    time.Now().Add(1 * time.Minute), // inside skew → refresh
+		RefreshURL:   srv.URL,
+	}
+
+	got, err := j.Bearer(context.Background())
+	if err != nil {
+		t.Fatalf("Bearer against real wire shape: %v", err)
+	}
+	if got != "new-access" {
+		t.Fatalf("got %q, want new-access", got)
+	}
+	// expires_in=3600 must become an absolute deadline ~1h out — NOT the
+	// 1970 epoch that the old `expires_at`-parsing produced (which made
+	// every subsequent Bearer() re-refresh, then dead-letter on failure).
+	remaining := time.Until(j.ExpiresAt)
+	if remaining < 50*time.Minute || remaining > 70*time.Minute {
+		t.Fatalf("expires_in=3600 should yield ~1h remaining, got %v", remaining)
+	}
+}
+
+func TestRefreshableJWT_Bearer_RejectsLegacyExpiresAtOnlyShape(t *testing.T) {
+	// The pre-fix wrong assumption: a server that emits only absolute
+	// `expires_at`. The proxy must now reject it (missing expires_in)
+	// rather than silently treating the token as already-expired. If
+	// someone reverts the field back to expires_at, this test fails.
+	srv := rawJSONRefreshServer(t, http.StatusOK,
+		`{"access_token":"x","expires_at":4102444800}`)
+
+	j := &RefreshableJWT{
+		AccessToken:  "stale",
+		RefreshToken: "rt",
+		ExpiresAt:    time.Now().Add(1 * time.Minute),
+		RefreshURL:   srv.URL,
+	}
+
+	_, err := j.Bearer(context.Background())
+	if err == nil {
+		t.Fatal("a response without expires_in must error, not silently succeed")
+	}
+	if !contains(err.Error(), "expires_in") {
+		t.Fatalf("error should name the missing field, got: %v", err)
 	}
 }
 

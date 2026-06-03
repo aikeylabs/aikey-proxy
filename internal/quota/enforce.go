@@ -2,9 +2,11 @@ package quota
 
 import "time"
 
-// Stage 3 enforcement — TOKEN quota only. $ (usd) enforcement needs proxy-side
-// pricing to compute billable per request and is a later stage; this file
-// deliberately handles the tokens metric exclusively.
+// Phase 2 enforcement. TOKEN quota is enforced from a local count (baseline +
+// proxy-accrued increment). USD quota is enforced WITHOUT proxy-side pricing
+// (design D-U1): the proxy reads a server-computed usd "used" via UsdUsedSource
+// (P3: master baseline; P4: max(local collector, master)) and compares it to the
+// limit — it never computes cost itself. The Add accrual path stays token-only.
 
 // TokenBucket is a deduped applicable token-quota limit for a seat: which
 // subject's counter, which window, and the limit. Computed once at check time
@@ -20,6 +22,7 @@ type TokenBucket struct {
 // Violation describes the bucket that caused a block (取最严格 — the first
 // at-or-over-limit bucket found across the seat's own + group subjects).
 type Violation struct {
+	Metric    string // MetricTokens | MetricUSD — drives the 429 error code/message
 	SubjectID string
 	Period    string
 	PeriodKey string
@@ -27,31 +30,70 @@ type Violation struct {
 	Used      float64
 }
 
-// Enforcer is the proxy-side token-quota gate. Holds the live snapshot + counter
-// + the feature flag. nil-safe and flag-gated so it is a pure no-op (pass
-// through) when quota is disabled or unwired — the request main path is never
-// blocked by quota machinery, only by an actual confirmed over-limit
-// (design §8 / 不变量 6: "无规则=放行").
+// UsdUsedSource resolves a subject's current usd usage for enforcement. The proxy
+// never computes cost itself (D-U1) — it reads a server-computed number. P3 wires
+// counterUsdSource (= the master usd baseline seeded into the counter); P4 will
+// wire max(local collector, master baseline).
+type UsdUsedSource interface {
+	UsdUsed(subjectID, periodKey string) float64
+}
+
+// counterUsdSource reads usd usage straight from the counter — i.e. the master
+// usd baseline seeded by the snapshot (the counter never accrues usd increments,
+// since the proxy doesn't compute cost). This is the P3 master-only source.
+type counterUsdSource struct{ counter *Counter }
+
+func (c counterUsdSource) UsdUsed(subjectID, periodKey string) float64 {
+	return c.counter.Get(subjectID, MetricUSD, periodKey)
+}
+
+// Enforcer is the proxy-side token+usd quota gate. Holds the live snapshot +
+// counter + usd source + the feature flag. nil-safe and flag-gated so it is a
+// pure no-op (pass through) when quota is disabled or unwired — the request main
+// path is never blocked by quota machinery, only by an actual confirmed
+// over-limit (design §8 / 不变量 6: "无规则=放行").
 type Enforcer struct {
-	snapshot *Snapshot
-	counter  *Counter
-	enabled  bool
+	snapshot  *Snapshot
+	counter   *Counter
+	usdSource UsdUsedSource
+	enabled   bool
 }
 
 // NewEnforcer wires the gate. A nil snapshot/counter or enabled=false yields a
-// no-op enforcer.
+// no-op enforcer. usd defaults to the master-baseline source (counterUsdSource);
+// P4 overrides it via SetUsdSource.
 func NewEnforcer(snapshot *Snapshot, counter *Counter, enabled bool) *Enforcer {
-	return &Enforcer{snapshot: snapshot, counter: counter, enabled: enabled}
+	var src UsdUsedSource
+	if counter != nil {
+		src = counterUsdSource{counter}
+	}
+	return &Enforcer{snapshot: snapshot, counter: counter, usdSource: src, enabled: enabled}
+}
+
+// SetUsdSource overrides the usd used-source (P4: max(local collector, master
+// baseline)). No-op on nil so the P3 default (master baseline) stays.
+func (e *Enforcer) SetUsdSource(src UsdUsedSource) {
+	if e != nil && src != nil {
+		e.usdSource = src
+	}
+}
+
+func (e *Enforcer) usdUsed(subjectID, periodKey string) float64 {
+	if e == nil || e.usdSource == nil {
+		return 0
+	}
+	return e.usdSource.UsdUsed(subjectID, periodKey)
 }
 
 // Enabled reports whether enforcement is active (cheap guard for the hot path).
 func (e *Enforcer) Enabled() bool { return e != nil && e.enabled }
 
-// tokenBucketsForSeat returns the deduped token buckets applicable to a seat at
-// time now (the seat's own subject + its groups; token-metric rules only).
-// Dedup by (subject, period_key) keeping the strictest (lowest) limit, so a
-// duplicate/overlapping rule can only tighten, never double-count.
-func (s *Snapshot) tokenBucketsForSeat(seatID string, now time.Time) []TokenBucket {
+// bucketsForSeat returns the deduped quota buckets of one metric applicable to a
+// seat at time now (the seat's own subject + its groups). Dedup by (subject,
+// period_key) keeping the strictest (lowest) limit, so a duplicate/overlapping
+// rule can only tighten, never double-count. The struct is named TokenBucket for
+// history; it is metric-agnostic (also used for usd).
+func (s *Snapshot) bucketsForSeat(seatID string, now time.Time, metric string) []TokenBucket {
 	subs := s.SubjectsForSeat(seatID)
 	if len(subs) == 0 {
 		return nil
@@ -61,7 +103,7 @@ func (s *Snapshot) tokenBucketsForSeat(seatID string, now time.Time) []TokenBuck
 	var out []TokenBucket
 	for _, sub := range subs {
 		for _, rule := range sub.Rules {
-			if rule.Metric != MetricTokens || rule.LimitAmount <= 0 {
+			if rule.Metric != metric || rule.LimitAmount <= 0 {
 				continue
 			}
 			pk := PeriodKey(rule.Period, now)
@@ -84,11 +126,21 @@ func (s *Snapshot) tokenBucketsForSeat(seatID string, now time.Time) []TokenBuck
 	return out
 }
 
-// Check evaluates a seat's token quota at time now. Returns the applicable
-// buckets (to reuse at increment) and a non-nil Violation if any bucket is at or
-// over its limit (取最严格). Returns (nil, nil) = allow when quota is disabled /
-// unwired / the seat has no token quota. Pure in-memory (no I/O) — it adds no
-// failure mode to the request path.
+// tokenBucketsForSeat / usdBucketsForSeat: per-metric views. tokens feeds both
+// Check and the Add accrual path; usd feeds Check only (no proxy usd increment).
+func (s *Snapshot) tokenBucketsForSeat(seatID string, now time.Time) []TokenBucket {
+	return s.bucketsForSeat(seatID, now, MetricTokens)
+}
+
+func (s *Snapshot) usdBucketsForSeat(seatID string, now time.Time) []TokenBucket {
+	return s.bucketsForSeat(seatID, now, MetricUSD)
+}
+
+// Check evaluates a seat's token + usd quota at time now. Returns the applicable
+// TOKEN buckets (to reuse at increment) and a non-nil Violation if any token OR
+// usd bucket is at/over its limit (取最严格 — token checked first). Returns
+// (nil/[], nil) = allow when quota is disabled / unwired / the seat has no quota.
+// Pure in-memory (no I/O) — it adds no failure mode to the request path.
 //
 // The crossing request itself is allowed (check runs before the response-time
 // increment); the limit is a soft ceiling that blocks the NEXT request once
@@ -97,20 +149,30 @@ func (e *Enforcer) Check(seatID string, now time.Time) ([]TokenBucket, *Violatio
 	if e == nil || !e.enabled || e.snapshot == nil || e.counter == nil || seatID == "" {
 		return nil, nil
 	}
-	buckets := e.snapshot.tokenBucketsForSeat(seatID, now)
-	for _, b := range buckets {
+	// tokens: used = baseline + local increment (the proxy counts tokens itself).
+	tokenBuckets := e.snapshot.tokenBucketsForSeat(seatID, now)
+	for _, b := range tokenBuckets {
 		used := e.counter.Get(b.SubjectID, MetricTokens, b.PeriodKey)
 		if used >= b.Limit {
-			return buckets, &Violation{
-				SubjectID: b.SubjectID,
-				Period:    b.Period,
-				PeriodKey: b.PeriodKey,
-				Limit:     b.Limit,
-				Used:      used,
+			return tokenBuckets, &Violation{
+				Metric: MetricTokens, SubjectID: b.SubjectID, Period: b.Period,
+				PeriodKey: b.PeriodKey, Limit: b.Limit, Used: used,
 			}
 		}
 	}
-	return buckets, nil
+	// usd: used comes from the usd source (the proxy never computes cost) — P3
+	// master baseline, P4 max(local, master). usd buckets are NOT returned: the
+	// Add accrual path is token-only (no usd increment to add).
+	for _, b := range e.snapshot.usdBucketsForSeat(seatID, now) {
+		used := e.usdUsed(b.SubjectID, b.PeriodKey)
+		if used >= b.Limit {
+			return tokenBuckets, &Violation{
+				Metric: MetricUSD, SubjectID: b.SubjectID, Period: b.Period,
+				PeriodKey: b.PeriodKey, Limit: b.Limit, Used: used,
+			}
+		}
+	}
+	return tokenBuckets, nil
 }
 
 // Add accrues a request's raw token delta onto each applicable bucket, called
@@ -127,9 +189,11 @@ func (e *Enforcer) Add(buckets []TokenBucket, delta float64) {
 }
 
 // SeedBaselines applies each subject's control-reported baselines to the counter
-// at the current period's bucket (Stage 4 回填 — design §5.4). Called after a
-// snapshot reload so a restart/another machine continues from the reported used
-// rather than zero. Only the tokens metric is seeded this stage. SetBaseline is
+// at the current period's bucket (回填 — design §5.4). Called after a snapshot
+// reload so a restart/another machine continues from the reported used rather
+// than zero. Seeds BOTH metrics (P3): the tokens baseline tops up the
+// local-increment counter; the usd baseline IS the enforcement value (the proxy
+// never accrues usd increments — counterUsdSource reads this). SetBaseline is
 // idempotent on an unchanged value, so calling this on every snapshot reload
 // (which fires on any vault_change_seq advance) does not wipe local increments.
 func SeedBaselines(counter *Counter, subjects []Subject, now time.Time) {
@@ -138,9 +202,6 @@ func SeedBaselines(counter *Counter, subjects []Subject, now time.Time) {
 	}
 	for i := range subjects {
 		for _, b := range subjects[i].Baselines {
-			if b.Metric != MetricTokens {
-				continue
-			}
 			counter.SetBaseline(subjects[i].SubjectID, b.Metric, PeriodKey(b.Period, now), b.Used)
 		}
 	}

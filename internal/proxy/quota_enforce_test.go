@@ -29,7 +29,7 @@ func TestEnforceQuotaTokens_BlocksOverLimitWith429(t *testing.T) {
 
 	route := &vkeys.ResolvedRoute{SeatID: "seat-a"}
 	w := httptest.NewRecorder()
-	blocked := p.enforceQuotaTokens(w, route, discardLogger())
+	blocked := p.enforceQuota(w, route, discardLogger())
 
 	if !blocked {
 		t.Fatal("over-limit request must be blocked")
@@ -55,7 +55,7 @@ func TestEnforceQuotaTokens_AllowsUnderLimitAndWhenDisabled(t *testing.T) {
 	// under limit → not blocked, nothing written
 	p, _ := quotaTestProxy(true, subs)
 	w := httptest.NewRecorder()
-	if p.enforceQuotaTokens(w, &vkeys.ResolvedRoute{SeatID: "seat-a"}, discardLogger()) {
+	if p.enforceQuota(w, &vkeys.ResolvedRoute{SeatID: "seat-a"}, discardLogger()) {
 		t.Error("under-limit must be allowed")
 	}
 	if w.Code != 200 { // ResponseRecorder defaults to 200 when nothing written
@@ -66,7 +66,7 @@ func TestEnforceQuotaTokens_AllowsUnderLimitAndWhenDisabled(t *testing.T) {
 	pOff, counterOff := quotaTestProxy(false, subs)
 	pk := quota.PeriodKey(quota.PeriodMonthly, time.Now())
 	counterOff.Add("seat-a", quota.MetricTokens, pk, 9999) // way over, but disabled
-	if pOff.enforceQuotaTokens(httptest.NewRecorder(), &vkeys.ResolvedRoute{SeatID: "seat-a"}, discardLogger()) {
+	if pOff.enforceQuota(httptest.NewRecorder(), &vkeys.ResolvedRoute{SeatID: "seat-a"}, discardLogger()) {
 		t.Error("disabled enforcer must never block")
 	}
 }
