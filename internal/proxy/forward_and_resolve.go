@@ -281,7 +281,7 @@ func (p *Proxy) serveRoute(w http.ResponseWriter, r *http.Request, route *vkeys.
 	// On Block, applyInboundFilter writes the 403 and we return without
 	// forwarding. On Mask, r.Body is rewritten to the redacted version so the
 	// upstream LLM never sees the raw sensitive prompt. Fail-open on degraded.
-	if !p.applyInboundFilter(w, r, extractModel(r), logger) {
+	if !p.applyInboundFilter(w, r, extractModel(r), route.RouteSource, route.OrgID, logger) {
 		return
 	}
 

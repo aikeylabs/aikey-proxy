@@ -54,7 +54,7 @@ func TestApplyInboundFilter_NoHook_PassThrough(t *testing.T) {
 	r := newReq(`{"model":"claude","messages":[{"role":"user","content":"hi"}]}`)
 	w := httptest.NewRecorder()
 
-	proceed := p.applyInboundFilter(w, r, "claude", discardLogger())
+	proceed := p.applyInboundFilter(w, r, "claude", "personal", "", discardLogger())
 	if !proceed {
 		t.Fatal("expected proceed=true with no hook")
 	}
@@ -71,7 +71,7 @@ func TestApplyInboundFilter_Allow(t *testing.T) {
 	r := newReq(body)
 	w := httptest.NewRecorder()
 
-	proceed := p.applyInboundFilter(w, r, "m", discardLogger())
+	proceed := p.applyInboundFilter(w, r, "m", "personal", "", discardLogger())
 	if !proceed {
 		t.Fatal("Allow should proceed")
 	}
@@ -101,7 +101,7 @@ func TestApplyInboundFilter_Mask(t *testing.T) {
 	r := newReq(`{"messages":[{"content":"my id is 110101199001011234"}]}`)
 	w := httptest.NewRecorder()
 
-	proceed := p.applyInboundFilter(w, r, "m", discardLogger())
+	proceed := p.applyInboundFilter(w, r, "m", "personal", "", discardLogger())
 	if !proceed {
 		t.Fatal("Mask should proceed (forward masked)")
 	}
@@ -137,7 +137,7 @@ func TestApplyInboundFilter_MaskEmptyPayload_LeavesUnchanged(t *testing.T) {
 	r := newReq(orig)
 	w := httptest.NewRecorder()
 
-	proceed := p.applyInboundFilter(w, r, "m", discardLogger())
+	proceed := p.applyInboundFilter(w, r, "m", "personal", "", discardLogger())
 	if !proceed {
 		t.Fatal("should proceed")
 	}
@@ -156,7 +156,7 @@ func TestApplyInboundFilter_Block(t *testing.T) {
 	r := newReq(`{"messages":[{"content":"key=sk-ant-secret"}]}`)
 	w := httptest.NewRecorder()
 
-	proceed := p.applyInboundFilter(w, r, "m", discardLogger())
+	proceed := p.applyInboundFilter(w, r, "m", "personal", "", discardLogger())
 	if proceed {
 		t.Fatal("Block should NOT proceed")
 	}
@@ -185,7 +185,7 @@ func TestApplyInboundFilter_BlockDefaultMessage(t *testing.T) {
 	r := newReq(`{"messages":[{"content":"x"}]}`) // needs a content piece to inspect
 	w := httptest.NewRecorder()
 
-	p.applyInboundFilter(w, r, "m", discardLogger())
+	p.applyInboundFilter(w, r, "m", "personal", "", discardLogger())
 	var body map[string]any
 	_ = json.Unmarshal(w.Body.Bytes(), &body)
 	errObj := body["error"].(map[string]any)
@@ -202,7 +202,7 @@ func TestApplyInboundFilter_Warn(t *testing.T) {
 	r := newReq(body)
 	w := httptest.NewRecorder()
 
-	proceed := p.applyInboundFilter(w, r, "m", discardLogger())
+	proceed := p.applyInboundFilter(w, r, "m", "personal", "", discardLogger())
 	if !proceed {
 		t.Fatal("Warn should proceed")
 	}
@@ -223,7 +223,7 @@ func TestApplyInboundFilter_DegradedFailsOpen(t *testing.T) {
 	r := newReq(body)
 	w := httptest.NewRecorder()
 
-	proceed := p.applyInboundFilter(w, r, "m", discardLogger())
+	proceed := p.applyInboundFilter(w, r, "m", "personal", "", discardLogger())
 	if !proceed {
 		t.Fatal("degraded must fail-open (proceed), NOT fail the request (§6 #11)")
 	}
@@ -243,7 +243,7 @@ func TestApplyInboundFilter_NilBody(t *testing.T) {
 	r.Body = nil
 	w := httptest.NewRecorder()
 
-	proceed := p.applyInboundFilter(w, r, "m", discardLogger())
+	proceed := p.applyInboundFilter(w, r, "m", "personal", "", discardLogger())
 	if !proceed {
 		t.Fatal("nil body should proceed without calling hook")
 	}

@@ -67,6 +67,13 @@ const (
 	DirectionOutbound Direction = 1 // LLM → user
 )
 
+// RouteClass values for Request.RouteClass (v2). Mirrors the detector's
+// pipe.RouteClass* — kept as plain uint8 here to avoid a cross-module import.
+const (
+	RouteClassPersonal uint8 = 0 // child uploads locally (self-view)
+	RouteClassTeam     uint8 = 1 // child returns the event; proxy forwards to master
+)
+
 // Request is what proxy sends to the child app.
 // Fields are deliberately generic — payload is a byte slice (could be prompt
 // text, JSON, even binary). Apps that want structured access decode it
@@ -78,6 +85,12 @@ type Request struct {
 	UserRole    string // e.g. "customer-service" (used by compliance to pick pack)
 	TargetModel string // e.g. "claude-sonnet-4-6"
 	RequestID   string // for tracing
+	// RouteClass tells the child where this request's event should be reported:
+	// 0 = personal (child uploads locally, current behavior), 1 = team (child
+	// returns the event in Response.Event for the proxy to forward to master).
+	// Only the class travels the pipe — never the credential/URL. (v2 protocol,
+	// update doc 20260603 §2.3.)
+	RouteClass uint8
 }
 
 // Response is what the child app returns to proxy.
@@ -87,6 +100,11 @@ type Response struct {
 	Reason          string        // human-readable (for error messages, logs)
 	LatencyObserved time.Duration // measured by proxy, set by Hook.Detect not by child
 	Degraded        bool          // true if child unreachable / timed out — proxy already fell back to Allow
+	// Event is the compliance event JSON the child hands back for the proxy to
+	// forward to master, populated ONLY for team-routed requests (RouteClass=1).
+	// Empty for personal-routed (child uploaded locally) and non-Detect ops.
+	// (v2 protocol, update doc 20260603 §2.2/§3.2.)
+	Event []byte
 }
 
 // Hook is the contract between aikey-proxy main loop and a first-party app.

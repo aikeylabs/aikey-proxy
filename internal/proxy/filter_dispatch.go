@@ -25,10 +25,12 @@ package proxy
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"io"
 	"log/slog"
 	"net/http"
+	"time"
 
 	"github.com/AiKeyLabs/aikey-proxy/internal/apphook"
 )
@@ -53,6 +55,8 @@ func (p *Proxy) applyInboundFilter(
 	w http.ResponseWriter,
 	r *http.Request,
 	model string,
+	routeSource string,
+	orgID string,
 	logger *slog.Logger,
 ) (proceed bool) {
 	hook := p.filterHook
@@ -62,6 +66,41 @@ func (p *Proxy) applyInboundFilter(
 	if r.Body == nil {
 		return true
 	}
+
+	// Route class decides where the compliance event goes: team keys → master
+	// (the detector returns the event and the proxy forwards it with the team
+	// credential), everything else → the detector's local self-view. Only the
+	// class crosses the pipe — never the credential/URL. (update doc 20260603 §3)
+	routeClass := apphook.RouteClassPersonal
+	if routeSource == "team" {
+		routeClass = apphook.RouteClassTeam
+	}
+	// Team-routed events the detector hands back, uploaded to master on exit
+	// (covers both the normal return and the early Block return). Async +
+	// fail-loud: a dropped upload is an audit gap and must be visible.
+	var teamEvents [][]byte
+	defer func() {
+		if routeClass != apphook.RouteClassTeam || len(teamEvents) == 0 {
+			return
+		}
+		if p.reporter == nil {
+			// Fail-loud: a team compliance event with nowhere to go is an audit
+			// gap, not a silent no-op (the reporter is the only upload path).
+			logger.Warn("filter: team compliance events dropped — no reporter configured",
+				"event.name", "proxy.filter.compliance_upload_dropped", "count", len(teamEvents))
+			return
+		}
+		evs := teamEvents
+		go func() {
+			ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+			defer cancel()
+			if err := p.reporter.UploadComplianceEvents(ctx, routeSource, evs); err != nil {
+				logger.Warn("filter: team compliance upload failed",
+					"event.name", "proxy.filter.compliance_upload_failed",
+					"error", err, "count", len(evs))
+			}
+		}()
+	}()
 
 	// Read + re-buffer the body. We must restore r.Body regardless of verdict
 	// so the ReverseProxy downstream can read it.
@@ -92,6 +131,7 @@ func (p *Proxy) applyInboundFilter(
 			Direction:   apphook.DirectionInbound,
 			Payload:     []byte(pieces[i].text),
 			TargetModel: model,
+			RouteClass:  routeClass,
 			// RequestID best-effort from the inbound trace header; child uses it
 			// only for log correlation. Empty is fine.
 			RequestID: r.Header.Get("x-request-id"),
@@ -101,6 +141,17 @@ func (p *Proxy) applyInboundFilter(
 		if resp == nil { // defensive: a nil response is treated as degraded allow
 			degraded = true
 			continue
+		}
+		// Team-routed only: collect the event the detector handed back for the
+		// proxy to forward to master (the deferred upload sends them). Guard on
+		// routeClass so the proxy stays self-consistent even if a child ever
+		// returned an Event on a personal route — those must never be uploaded.
+		// The proxy stamps the authoritative tenant_id = the VK's resolved org
+		// (NOT user input): the detector runs on a client with no org context,
+		// and the master must not trust a client-self-reported tenant.
+		// (update doc 20260603 §2.1)
+		if routeClass == apphook.RouteClassTeam && len(resp.Event) > 0 {
+			teamEvents = append(teamEvents, injectTenant(resp.Event, orgID))
 		}
 
 		switch resp.Action {
@@ -176,6 +227,33 @@ func (p *Proxy) applyInboundFilter(
 		"orig_bytes", len(bodyBytes),
 		"masked_bytes", len(newBody))
 	return true
+}
+
+// injectTenant overwrites the team event JSON's tenant_id with the authoritative
+// org id the proxy resolved from the authenticated VK. The detector builds the
+// event on a client that has no org context (tenant_id empty), and the master
+// must not trust a client-self-reported tenant — so the trusted proxy stamps it
+// from the VK's actual org. Fail-open: on parse error return the bytes unchanged
+// (the master will reject a malformed event, which is more visible than dropping
+// it here).
+func injectTenant(eventJSON []byte, orgID string) []byte {
+	if orgID == "" {
+		return eventJSON
+	}
+	var m map[string]json.RawMessage
+	if err := json.Unmarshal(eventJSON, &m); err != nil {
+		return eventJSON
+	}
+	q, err := json.Marshal(orgID)
+	if err != nil {
+		return eventJSON
+	}
+	m["tenant_id"] = q
+	out, err := json.Marshal(m)
+	if err != nil {
+		return eventJSON
+	}
+	return out
 }
 
 // itoaInt64 formats an int64 without pulling strconv into a hot file (mirrors

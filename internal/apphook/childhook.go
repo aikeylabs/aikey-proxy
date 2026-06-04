@@ -57,7 +57,7 @@ func (c *ChildHookConfig) applyDefaults() {
 		c.Timeout = 1 * time.Millisecond
 	}
 	if c.ProtocolVersion == 0 {
-		c.ProtocolVersion = 1
+		c.ProtocolVersion = 2 // v2: RouteClass in request + length-prefixed findings + Event in response
 	}
 	if c.ReadyTimeout == 0 {
 		c.ReadyTimeout = 5 * time.Second
@@ -236,31 +236,42 @@ func (h *ChildHook) Detect(ctx context.Context, req *Request) *Response {
 
 	start := time.Now()
 
-	// Write request frame: [version][len LE 4B][op=1][payload]
-	payload := append([]byte{1}, req.Payload...) // op=1 = Detect
+	// Write request frame (v2): [version][len LE 4B] | [op=1][route_class][payload]
+	payload := append([]byte{1, req.RouteClass}, req.Payload...) // op=1 = Detect
 	if err := h.writeFrame(payload); err != nil {
 		h.markDegraded("write_failed: " + err.Error())
 		return &Response{Action: ActionAllow, Degraded: true, Reason: "child write failed"}
 	}
 
-	// Read response frame: [version][len LE 4B][action 1B][findings...]
+	// Read response frame (v2): [version][len LE 4B] | [action 1B][findings_len 4B][findings][event]
 	respPayload, err := h.readFrame()
 	if err != nil {
 		h.markDegraded("read_failed: " + err.Error())
 		return &Response{Action: ActionAllow, Degraded: true, Reason: "child read failed"}
 	}
 
-	if len(respPayload) < 1 {
+	if len(respPayload) < 5 {
 		h.markDegraded("short_response")
 		return &Response{Action: ActionAllow, Degraded: true, Reason: "short response"}
 	}
+
+	flen := int(binary.LittleEndian.Uint32(respPayload[1:5]))
+	if 5+flen > len(respPayload) {
+		h.markDegraded("malformed_response")
+		return &Response{Action: ActionAllow, Degraded: true, Reason: "malformed response framing"}
+	}
+	findings := respPayload[5 : 5+flen] // ActionMask → masked payload; else per-op
+	event := respPayload[5+flen:]       // team-routed compliance event for the proxy to forward
 
 	res := &Response{
 		Action:          Action(respPayload[0]),
 		LatencyObserved: time.Since(start),
 	}
-	if res.Action == ActionMask && len(respPayload) > 1 {
-		res.MutatedPayload = respPayload[1:]
+	if res.Action == ActionMask && len(findings) > 0 {
+		res.MutatedPayload = findings
+	}
+	if len(event) > 0 {
+		res.Event = event
 	}
 
 	// Update status (cheap atomic swap).
@@ -315,13 +326,18 @@ func (h *ChildHook) ListPacks(ctx context.Context) ([]byte, error) {
 		h.markDegraded("listpacks_read_failed: " + err.Error())
 		return nil, err
 	}
-	// Response: [action 1B][JSON report...]. Ignore the action byte; the report
-	// is everything after. An old child (unknown op → Allow + nothing) yields a
-	// 1-byte payload → unavailable.
-	if len(respPayload) <= 1 {
+	// Response (v2): [action 1B][findings_len 4B][JSON report][event]. The report
+	// is the length-prefixed findings slice; ignore the action byte and trailing
+	// event (empty for ListPacks). A child that doesn't implement op=4 returns an
+	// empty report → unavailable. (A v1 child fails earlier on version mismatch.)
+	if len(respPayload) < 5 {
 		return nil, ErrPacksUnavailable
 	}
-	return respPayload[1:], nil
+	flen := int(binary.LittleEndian.Uint32(respPayload[1:5]))
+	if flen == 0 || 5+flen > len(respPayload) {
+		return nil, ErrPacksUnavailable
+	}
+	return respPayload[5 : 5+flen], nil
 }
 
 // Status implements Hook.
