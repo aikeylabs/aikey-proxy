@@ -43,6 +43,11 @@ func (p *Proxy) enforceQuota(w http.ResponseWriter, route *vkeys.ResolvedRoute, 
 	if v.Metric == quota.MetricUSD {
 		code, label = observability.ErrCodeQuotaExceededUSD, "Cost ($)"
 	}
+	// D-U7/P9 budget-mode fail-closed: not an at/over-limit hit but "can't verify"
+	// (stale baseline / server unreachable) under a strict deployment.
+	if v.FailClosedStale {
+		code = observability.ErrCodeQuotaDegradedBlock
+	}
 
 	w.Header().Set("X-Aikey-Quota-Limit", limitStr)
 	w.Header().Set("X-Aikey-Quota-Used", usedStr)
@@ -65,20 +70,50 @@ func (p *Proxy) enforceQuota(w http.ResponseWriter, route *vkeys.ResolvedRoute, 
 		"used", v.Used,
 		"limit", v.Limit,
 	)
-	writeJSONError(w, http.StatusTooManyRequests, "quota_error", code,
-		label+" quota exceeded for this seat (used "+usedStr+" / limit "+limitStr+"). Resets at "+resetMsg+".")
+	msg := label + " quota exceeded for this seat (used " + usedStr + " / limit " + limitStr + "). Resets at " + resetMsg + "."
+	if v.FailClosedStale {
+		msg = "Cost ($) quota cannot be verified right now (control server unreachable); blocked by strict budget policy (used " + usedStr + " / limit " + limitStr + "). Retry when connectivity is restored."
+	}
+	writeJSONError(w, http.StatusTooManyRequests, "quota_error", code, msg)
 	return true
 }
 
-// accrueQuotaTokens adds a completed request's raw token usage to the seat's
-// token counters (design §3.4 raw sum). No-op when quota is off / route nil /
-// no usage. Called once per request after the upstream usage is known (both the
-// non-streaming and streaming completion paths).
-func (p *Proxy) accrueQuotaTokens(route *vkeys.ResolvedRoute, b provider.TokenBreakdown) {
+// accrueQuotaUsage adds a completed request's usage to the seat's quota counters:
+// raw tokens (design §3.4) AND locally-priced usd (D-U8/P7, priced from the edge
+// summary). No-op when quota is off / route nil / no usage. Called once per
+// request after the upstream usage is known (non-streaming + streaming paths).
+func (p *Proxy) accrueQuotaUsage(route *vkeys.ResolvedRoute, b provider.TokenBreakdown, logger *slog.Logger) {
 	if !p.quota.Enabled() || route == nil {
 		return
 	}
+	now := time.Now()
+	// tokens: this sum MUST match the server's DWD token metric so the proxy's local
+	// increment lines up with the baseline it tops up. The server metric is
+	// `input_tokens + output + cached_input + cache_creation + reasoning`
+	// (collector dwdMetricSumExpr), and DWD.input_tokens is the TOTAL input — cache
+	// is a SUBSET of it (verified on real data: total_tokens == input + output, and
+	// cache_read+cache_creation <= input_tokens). So the metric counts the cache
+	// buckets twice (inside input AND added again); the proxy mirrors that EXACTLY
+	// here so enforcement stays consistent with the baseline.
+	// NOTE(2026-06-04): the metric (and billable) double-counting cache vs the true
+	// token/cost is a real but SEPARATE billing-semantics question in the collector
+	// (changes customer bills — large blast radius); do NOT "fix" it here in
+	// isolation or the proxy would drift below the server baseline. See
+	// bugfix/2026-06-04-quota-token-metric-cache-semantics.md.
 	delta := float64(b.InputTokens + b.OutputTokens + b.CacheReadInputTokens +
 		b.CacheCreationInputTokens + b.ReasoningTokens)
-	p.quota.AddForSeat(route.SeatID, delta, time.Now())
+	p.quota.AddForSeat(route.SeatID, delta, now)
+	// usd (D-U8/P7): price this request locally from the edge summary (correct
+	// token-type split is inside Cost). Unknown model with a summary present →
+	// WARN (usd not counted; token floor + server baseline backstop). No summary
+	// yet (rollout / Personal) → silent.
+	if _, priced, hadSummary := p.quota.AccrueUsdForSeat(route.SeatID, b.Model,
+		b.InputTokens, b.OutputTokens, b.CacheReadInputTokens,
+		b.CacheCreationInputTokens, b.ReasoningTokens, now); hadSummary && !priced && logger != nil {
+		logger.Warn("quota usd: request model not in edge price summary; usd not counted (token floor applies)",
+			"event.name", observability.EventProxyQuotaModelUnpriced,
+			"model", b.Model,
+			"seat_id", route.SeatID,
+		)
+	}
 }

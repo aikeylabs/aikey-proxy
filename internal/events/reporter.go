@@ -326,6 +326,21 @@ func (r *Reporter) Close() error {
 }
 
 // Metrics returns current reporter counters and delivery state.
+// LastOKUploadAt returns the time of the last SUCCESSFUL usage upload, or the zero
+// time if none has succeeded yet (or the most recent attempt failed). The proxy
+// uses it as a CONTINUOUS server-reachability freshness signal for quota budget
+// mode (D-U7/P9): every request batch that uploads OK advances it; sustained
+// upload failure (server unreachable) leaves it stale → budget mode fail-closes.
+// Reliable because it's tied to real traffic, unlike the per-command CLI sync.
+func (r *Reporter) LastOKUploadAt() time.Time {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	if r.lastUploadStatus != "ok" {
+		return time.Time{}
+	}
+	return r.lastUploadAt
+}
+
 func (r *Reporter) Metrics() ReporterMetrics {
 	r.mu.RLock()
 	m := ReporterMetrics{

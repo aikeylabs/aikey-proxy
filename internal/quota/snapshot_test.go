@@ -49,6 +49,55 @@ func TestSnapshotReverseIndexAndSubjectsForSeat(t *testing.T) {
 	}
 }
 
+func TestLoadPriceSummary(t *testing.T) {
+	db, err := sql.Open("sqlite", ":memory:")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+
+	// Tolerance: no config table (pre-Phase-2 vault) → (nil, nil), not an error.
+	if ps, err := LoadPriceSummary(db); err != nil || ps != nil {
+		t.Fatalf("missing config table: want (nil,nil) got (%v,%v)", ps, err)
+	}
+
+	// config kv table mirrors aikey-cli vault (key TEXT PK, value BLOB).
+	if _, err := db.Exec(`CREATE TABLE config (key TEXT PRIMARY KEY, value BLOB NOT NULL)`); err != nil {
+		t.Fatal(err)
+	}
+	// Absent key → still (nil, nil) (fall back to floor, don't error).
+	if ps, err := LoadPriceSummary(db); err != nil || ps != nil {
+		t.Fatalf("absent key: want (nil,nil) got (%v,%v)", ps, err)
+	}
+
+	// Insert the summary exactly as the CLI persists it (key quota.price_summary).
+	const summary = `{"version":"v1","models":{"claude-opus-4-8":{"input":5e-6,"output":2.5e-5,"cache_creation":6.25e-6,"cache_read":5e-7,"reasoning":2.5e-5}}}`
+	if _, err := db.Exec(`INSERT INTO config (key, value) VALUES (?, ?)`, quotaPriceSummaryKey, []byte(summary)); err != nil {
+		t.Fatal(err)
+	}
+	ps, err := LoadPriceSummary(db)
+	if err != nil {
+		t.Fatalf("load: %v", err)
+	}
+	if ps == nil || ps.Version != "v1" {
+		t.Fatalf("want version v1, got %+v", ps)
+	}
+	op, ok := ps.Models["claude-opus-4-8"]
+	if !ok || op.Input != 5e-6 || op.Output != 2.5e-5 || op.CacheRead != 5e-7 {
+		t.Fatalf("opus-4-8 rates wrong: %+v (ok=%v)", op, ok)
+	}
+
+	// Holder: atomic set/get round-trips.
+	snap := NewSnapshot()
+	if snap.PriceSummary() != nil {
+		t.Error("fresh snapshot must have nil price summary")
+	}
+	snap.SetPriceSummary(ps)
+	if got := snap.PriceSummary(); got == nil || got.Version != "v1" {
+		t.Errorf("holder round-trip failed: %+v", got)
+	}
+}
+
 func TestLoadSubjects(t *testing.T) {
 	db, err := sql.Open("sqlite", ":memory:")
 	if err != nil {

@@ -17,6 +17,7 @@ import (
 	"fmt"
 	"strings"
 	"sync"
+	"time"
 )
 
 // Subject kinds (mirror control). Only these two — org/tenant deliberately
@@ -71,6 +72,30 @@ type Subject struct {
 	Baselines   []Baseline // current-period used per (metric,period); may be empty
 }
 
+// ModelUnitPrices is one model's per-token USD rates. Mirrors control's
+// quota.ModelUnitPrices and the per-event unit_prices_snapshot JSON — the
+// cross-repo contract. Keep in lockstep with aikey-control-master
+// .../quota/pricesummary.go and aikey-data .../internal/pricing/summary.go.
+type ModelUnitPrices struct {
+	Input         float64 `json:"input"`
+	Output        float64 `json:"output"`
+	CacheCreation float64 `json:"cache_creation"`
+	CacheRead     float64 `json:"cache_read"`
+	Reasoning     float64 `json:"reasoning"`
+}
+
+// PriceSummary is the deployment-global edge price table (design D-U8) the proxy
+// uses for LOCAL usd pricing. Delivered inline in the control snapshot, cached by
+// the CLI in the vault `config` table (quotaPriceSummaryKey), loaded here. P6 only
+// LOADS + holds it; P7 consumes it for enforcement.
+type PriceSummary struct {
+	Version string                     `json:"version"`
+	Models  map[string]ModelUnitPrices `json:"models"`
+}
+
+// quotaPriceSummaryKey mirrors aikey-cli storage_platform.rs QUOTA_PRICE_SUMMARY_KEY.
+const quotaPriceSummaryKey = "quota.price_summary"
+
 // Snapshot is the atomically-swappable rule set + seat→group reverse index.
 // Read under RLock; replaced wholesale under Lock (gen-swap — mirrors
 // vkeys.Registry.ReplaceAll so a 5s sync never tears a concurrent read).
@@ -78,6 +103,8 @@ type Snapshot struct {
 	mu           sync.RWMutex
 	subjects     map[string]*Subject // subject_id → subject
 	seatToGroups map[string][]string // seat_id → [group subject_id...]
+	priceSummary *PriceSummary       // D-U8/P6: edge prices for local usd pricing (P7)
+	lastSyncAt   time.Time           // D-U7/P9: proxy's last successful server contact (reporter upload) — freshness for budget-mode staleness; zero = signal unavailable
 }
 
 // NewSnapshot returns an empty snapshot (safe to read before the first load).
@@ -107,6 +134,49 @@ func (s *Snapshot) ReplaceAll(subjects []Subject) {
 	s.subjects = subjMap
 	s.seatToGroups = rev
 	s.mu.Unlock()
+}
+
+// SetPriceSummary atomically swaps the edge price summary (D-U8/P6). nil-safe.
+func (s *Snapshot) SetPriceSummary(ps *PriceSummary) {
+	s.mu.Lock()
+	s.priceSummary = ps
+	s.mu.Unlock()
+}
+
+// PriceSummary returns the current edge price summary (nil if none delivered yet —
+// P7 then falls back to the input-equivalent token floor).
+func (s *Snapshot) PriceSummary() *PriceSummary {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.priceSummary
+}
+
+// SetLastSyncAt records when the CLI last successfully synced (D-U7/P9 freshness
+// signal). Zero time = unavailable. nil-safe via the mutex.
+func (s *Snapshot) SetLastSyncAt(t time.Time) {
+	s.mu.Lock()
+	s.lastSyncAt = t
+	s.mu.Unlock()
+}
+
+// LastSyncAt returns the last successful CLI sync time (zero if unknown).
+func (s *Snapshot) LastSyncAt() time.Time {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.lastSyncAt
+}
+
+// budgetStale reports whether the cached baseline is too old to trust under budget
+// mode (D-U7/P9): now − lastSyncAt > maxStaleness. A ZERO lastSyncAt (freshness
+// signal not available — a CLI that doesn't yet write it, or no sync ever) returns
+// false: do NOT fail-closed on a missing signal (rollout-safe, never over-blocks).
+func (s *Snapshot) budgetStale(now time.Time, maxStaleness time.Duration) bool {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	if s.lastSyncAt.IsZero() {
+		return false
+	}
+	return now.Sub(s.lastSyncAt) > maxStaleness
 }
 
 // SubjectsForSeat returns the seat's own subject (if any) plus every group
@@ -183,6 +253,33 @@ func LoadSubjects(db *sql.DB) ([]Subject, error) {
 		out = append(out, sub)
 	}
 	return out, rows.Err()
+}
+
+// LoadPriceSummary reads the deployment-global edge price summary from the vault
+// `config` table (key quota.price_summary, written by the CLI from the delivery
+// snapshot — D-U8/P6). Tolerant: a missing config table / absent key / empty
+// value yields (nil, nil), so the proxy falls back to the input-equivalent floor
+// (P7) without disturbing the vault-sync loop.
+func LoadPriceSummary(db *sql.DB) (*PriceSummary, error) {
+	var raw string
+	err := db.QueryRow(`SELECT CAST(value AS TEXT) FROM config WHERE key = ?`, quotaPriceSummaryKey).Scan(&raw)
+	if err == sql.ErrNoRows {
+		return nil, nil
+	}
+	if err != nil {
+		if isMissingTableOrColumn(err) {
+			return nil, nil
+		}
+		return nil, err
+	}
+	if raw == "" {
+		return nil, nil
+	}
+	var ps PriceSummary
+	if err := json.Unmarshal([]byte(raw), &ps); err != nil {
+		return nil, fmt.Errorf("quota: parse price summary: %w", err)
+	}
+	return &ps, nil
 }
 
 // isMissingTableOrColumn detects SQLite "no such table"/"no such column" (the

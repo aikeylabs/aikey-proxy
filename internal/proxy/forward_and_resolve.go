@@ -248,6 +248,20 @@ func (p *Proxy) ResolveBindingCredential(
 // serveRoute executes the forwarding pipeline (streaming detection, transport
 // selection, reverse proxy) shared by token-based and path-prefix routing.
 func (p *Proxy) serveRoute(w http.ResponseWriter, r *http.Request, route *vkeys.ResolvedRoute, prov provider.Provider, realKey string, bearerToken string, startTime time.Time, logger *slog.Logger) {
+	// Phase 2 quota gate — UNIVERSAL chokepoint (Stage 3 + D-U8/P7). serveRoute is
+	// the single funnel EVERY real route passes through (Tier1 token, OAuth,
+	// active-sentinel, app pipeline, default binding; serveRouteWithObserver
+	// delegates here). Enforcing here — rather than per-branch in the dispatchers —
+	// guarantees no real-traffic path can accrue usage (accrueQuotaUsage runs in
+	// this same forward flow) without ALSO being blocked when over-limit. This
+	// closes the gap where path-prefix traffic (aikey use → /<provider>/v1/...)
+	// counted usd/tokens but never enforced. Probes are exempt: they must pass for
+	// health checks and are likewise excluded from accrual (isAikeyProbe). The gate
+	// is in-memory + flag-gated — a no-op when quota is off or the seat has no quota.
+	if !isAikeyProbe(r) && p.enforceQuota(w, route, logger) {
+		return
+	}
+
 	// Why: extractModel also stashes the parsed model into the `x-aikey-model`
 	// request header, which buildBaseEvent later reads to populate ev.Model.
 	// Historically this was only called inside the allowlist check (`len(route.AllowedModels) > 0`),
@@ -600,8 +614,8 @@ func (p *Proxy) serveRoute(w http.ResponseWriter, r *http.Request, route *vkeys.
 					sessionID := resolveSessionID(r, route.ProtocolType, route.ProviderCode)
 					upstreamReqID := extractUpstreamRequestID(resp)
 					p.reportUsage(route, bearerToken, ev.Model, startTime, resp.StatusCode, breakdown, "", realKey, sessionID, "complete", upstreamReqID)
-					// Phase 2 Stage 3: accrue token quota for this completed request.
-					p.accrueQuotaTokens(route, breakdown)
+					// Phase 2: accrue token + local usd quota for this completed request.
+					p.accrueQuotaUsage(route, breakdown, logger)
 				}
 			} else {
 				// Streaming success: wrap body — background goroutine drains the
@@ -639,9 +653,9 @@ func (p *Proxy) serveRoute(w http.ResponseWriter, r *http.Request, route *vkeys.
 						if p.reporter != nil {
 							p.reportUsage(route, bearerToken, model, startTime, resp.StatusCode, br, "", realKey, sessionID, completion, upstreamReqID)
 						}
-						// Phase 2 Stage 3: accrue token quota on stream completion,
+						// Phase 2: accrue token + local usd quota on stream completion,
 						// independent of the reporter.
-						p.accrueQuotaTokens(route, br)
+						p.accrueQuotaUsage(route, br, logger)
 					}
 				}
 				// For probe traffic skip the collector entirely by passing nil.

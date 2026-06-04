@@ -87,3 +87,45 @@ func TestSeedBaselinesBothMetrics(t *testing.T) {
 		t.Errorf("no-baseline seat: want 0 got %v", got)
 	}
 }
+
+// TestSetBaseline_MaxReconciliation_Monotonic guards D-U8/P8 reconnect
+// reconciliation: on a baseline change `used` stays = max(old used, new baseline)
+// — never dips (no transient under-count), never double-counts. Models the real
+// flow: local accrual leads, server baseline catches up, increment is absorbed.
+func TestSetBaseline_MaxReconciliation_Monotonic(t *testing.T) {
+	c := NewCounter()
+	const sid, pk = "seat-a", "monthly:2026-06"
+	used := func() float64 { return c.Get(sid, MetricUSD, pk) }
+
+	// seed baseline 100, then accrue 50 locally → used 150.
+	c.SetBaseline(sid, MetricUSD, pk, 100)
+	c.Add(sid, MetricUSD, pk, 50)
+	if used() != 150 {
+		t.Fatalf("after seed+accrue: want 150 got %v", used())
+	}
+
+	// server partially catches up (120 < 150): used must NOT drop (no under-count).
+	c.SetBaseline(sid, MetricUSD, pk, 120)
+	if used() != 150 {
+		t.Errorf("partial catch-up: used must stay 150 (monotonic), got %v", used())
+	}
+
+	// server fully catches up (200 >= 150): increment absorbed, used == baseline.
+	c.SetBaseline(sid, MetricUSD, pk, 200)
+	if used() != 200 {
+		t.Errorf("full catch-up: want 200 got %v", used())
+	}
+
+	// unchanged baseline → no-op (local increment, if any, preserved).
+	c.Add(sid, MetricUSD, pk, 10) // used 210
+	c.SetBaseline(sid, MetricUSD, pk, 200)
+	if used() != 210 {
+		t.Errorf("unchanged baseline must be a no-op: want 210 got %v", used())
+	}
+
+	// another partial catch-up keeps monotonic (205 < 210).
+	c.SetBaseline(sid, MetricUSD, pk, 205)
+	if used() != 210 {
+		t.Errorf("partial catch-up 2: used must stay 210, got %v", used())
+	}
+}

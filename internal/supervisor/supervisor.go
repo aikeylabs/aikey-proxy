@@ -28,6 +28,7 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"strconv"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -361,6 +362,15 @@ func (s *Supervisor) managedKeySyncLoop() {
 func (s *Supervisor) syncManagedKeys() {
 	gen := s.active.Load()
 
+	// D-U7/P9 budget-mode freshness: feed the quota snapshot the proxy's last
+	// SUCCESSFUL server contact (reporter upload) every tick. This is the reliable
+	// continuous signal (tied to real traffic) — unlike the per-command CLI sync —
+	// so budget mode's staleness check reflects actual server reachability. nil
+	// reporter (offline / Personal) → leaves lastSyncAt zero → budget mode inert.
+	if gen != nil && gen.reporter != nil {
+		s.quotaSnapshot.SetLastSyncAt(gen.reporter.LastOKUploadAt())
+	}
+
 	vaultSeq, err := vault.ReadConfigU64LE(s.cfg.Vault.Path, VaultChangeSeqKey)
 	if err != nil {
 		return // vault not yet written or unavailable — no-op
@@ -480,6 +490,24 @@ func quotaEnabledFromEnv() bool {
 	}
 }
 
+// quotaBudgetModeFromEnv reads enforce_mode (D-U7/P9, deployment-level).
+// PROXY_QUOTA_ENFORCE_MODE=budget enables strict fail-closed-on-staleness; anything
+// else (default) = availability (offline-first, never fails closed).
+// PROXY_QUOTA_MAX_STALENESS_SECONDS sets the threshold (default 300s). Per-subject
+// override deferred (D-U7).
+func quotaBudgetModeFromEnv() (budget bool, maxStaleness time.Duration) {
+	if strings.ToLower(strings.TrimSpace(os.Getenv("PROXY_QUOTA_ENFORCE_MODE"))) != "budget" {
+		return false, 0
+	}
+	secs := 300
+	if v := strings.TrimSpace(os.Getenv("PROXY_QUOTA_MAX_STALENESS_SECONDS")); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			secs = n
+		}
+	}
+	return true, time.Duration(secs) * time.Second
+}
+
 // reloadQuotaSnapshot loads the quota rules cached in the vault and atomically
 // swaps them into the in-memory snapshot. Fully fault-isolated: gated by the
 // feature flag, and on any error it logs a WARN and KEEPS the last-known-good
@@ -501,6 +529,16 @@ func (s *Supervisor) reloadQuotaSnapshot(gen *generation) {
 	// zero. Idempotent on unchanged baselines (won't wipe local increments).
 	quota.SeedBaselines(s.quotaCounter, subjects, time.Now())
 	slog.Info("quota.snapshot.loaded", "subjects", len(subjects))
+	// D-U8/P6: load the deployment-global edge price summary (for P7 local usd
+	// pricing). Best-effort — a read/parse failure logs WARN and KEEPS the
+	// last-good summary; an absent summary (nil) also keeps last-good. Never
+	// disturbs the snapshot reload or the managed-key path.
+	if ps, err := quota.LoadPriceSummary(gen.vault.DB()); err != nil {
+		slog.Warn("quota.price_summary.load_failed", "error", err.Error())
+	} else if ps != nil {
+		s.quotaSnapshot.SetPriceSummary(ps)
+		slog.Info("quota.price_summary.loaded", "version", ps.Version, "models", len(ps.Models))
+	}
 }
 
 // QuotaSnapshot exposes the live rule snapshot (Stage 3 enforcement + tests).
@@ -943,7 +981,14 @@ func (s *Supervisor) buildGeneration() (*generation, error) {
 	// counter (both supervisor-scoped so the counter survives 5s syncs/reloads).
 	// nil-safe + flag-gated inside the enforcer — a no-op when PROXY_QUOTA_ENABLED
 	// is off, so the request path is unchanged unless quota is explicitly on.
-	p.SetQuotaEnforcer(quota.NewEnforcer(s.quotaSnapshot, s.quotaCounter, s.quotaEnabled))
+	enf := quota.NewEnforcer(s.quotaSnapshot, s.quotaCounter, s.quotaEnabled)
+	// D-U7/P9 enforce_mode=budget (deployment-level): strict customers fail-closed
+	// on a stale baseline; default availability never does (offline-first).
+	if budget, maxStale := quotaBudgetModeFromEnv(); budget {
+		enf.SetBudgetMode(maxStale)
+		slog.Info("quota.enforce_mode.budget_enabled", "max_staleness_seconds", int(maxStale.Seconds()))
+	}
+	p.SetQuotaEnforcer(enf)
 
 	// Phase 4 M2: build the per-generation observer registry. Skipped when
 	// no observer descriptors are registered (e.g. proxy build without the

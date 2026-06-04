@@ -64,19 +64,41 @@ func (c *Counter) Get(subjectID, metric, periodKey string) float64 {
 	return x.baseline + x.increment
 }
 
-// SetBaseline adopts a control-reported baseline for a bucket (Stage 4 回填).
-// It only acts when the baseline VALUE changes: this matters because the snapshot
-// reload fires on every vault_change_seq advance (any vault write, not just quota
-// edits), and blindly reseeding each time would repeatedly wipe the local
-// increment. When the baseline does change, the local increment is reset to 0 —
-// the new baseline already includes reported usage; any not-yet-reported local
-// increment is dropped (accepted slight under-count, design §5.4 / 不变量 9).
+// SetBaseline adopts a control-reported baseline for a bucket (Stage 4 回填 +
+// D-U8/P8 reconnect reconciliation). Acts only when the baseline VALUE changes
+// (the snapshot reload fires on every vault_change_seq advance — any vault write —
+// so a no-op on unchanged value avoids needless churn).
+//
+// On change it reconciles to keep `used` = max(old used, new baseline) — monotonic
+// within a period (P8 截止水位 via monotonicity):
+//   - Adopt the new server baseline (authoritative for the usage it covers).
+//   - KEEP only the local increment the new baseline does NOT yet cover — i.e.
+//     usage the proxy already priced locally (P7) but the server hasn't
+//     uploaded/materialized yet. Once it does, the baseline catches up, the gap
+//     closes, and the increment is absorbed to 0.
+//
+// Why max (not the old reset-to-0): reset dropped not-yet-reported local usage on
+// every sync → a transient UNDER-count (brief over-allow) until the next
+// materialization. max removes that without DOUBLE-counting, because the increment
+// only ever fills the gap ABOVE the baseline. This needs no explicit server-sent
+// watermark: within a period the server baseline is cumulative-monotonic
+// (SUM over usage_fact_dwd). Safe for P7 specifically — its local pricing is EXACT
+// for known models and ZERO for unknown (never an over-estimate), so the
+// "phantom over-estimate lingers" edge of a pure max cannot arise here. A rare
+// server-side DOWNWARD correction is not reflected downward (conservative —
+// favors not exceeding budget); acceptable + rare.
 func (c *Counter) SetBaseline(subjectID, metric, periodKey string, baseline float64) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	x := c.at(counterKey(subjectID, metric, periodKey))
-	if x.baseline != baseline {
-		x.baseline = baseline
+	if x.baseline == baseline {
+		return
+	}
+	oldUsed := x.baseline + x.increment
+	x.baseline = baseline
+	if baseline >= oldUsed {
 		x.increment = 0
+	} else {
+		x.increment = oldUsed - baseline
 	}
 }

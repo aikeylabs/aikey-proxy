@@ -43,6 +43,11 @@ const (
 	EventProxyRequestSlow          = "proxy.request.slow"
 	EventProxyRequestCompleted     = "proxy.request.completed"
 	EventProxyRequestQuotaExceeded = "proxy.request.quota_exceeded"
+	// EventProxyQuotaModelUnpriced: a completed request's model has no entry in
+	// the edge price summary (D-U8/P7), so its usd was NOT counted locally — the
+	// token quota floor backstops it and the server baseline catches up on
+	// re-sync. Recurring hits signal a stale summary needing a price re-sync.
+	EventProxyQuotaModelUnpriced = "proxy.quota.model_unpriced"
 )
 
 // Usage extraction events.
