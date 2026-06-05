@@ -31,9 +31,31 @@ import (
 	"log/slog"
 	"net/http"
 	"time"
+	"unicode/utf8"
 
 	"github.com/AiKeyLabs/aikey-proxy/internal/apphook"
 )
+
+// pipeInputCap bounds how many bytes of a content piece the proxy sends over the
+// detector pipe. It matches the detector's own NLP input cap (16KB): the
+// detector only scans the first 16KB of any piece, so transferring more is pure
+// waste — and a huge piece (e.g. a 180KB context) blocks the pipe long enough to
+// stall the request for seconds and desync the IPC (→ the hook degrades). We cap
+// the transfer and re-attach the untouched tail after masking (same forwarded
+// result, fast IPC). Snapped to a rune boundary so a multibyte char never splits.
+const pipeInputCap = 16 * 1024
+
+// capRuneBoundary returns the largest byte offset ≤ cap on a UTF-8 rune boundary.
+func capRuneBoundary(s string, cap int) int {
+	if cap >= len(s) {
+		return len(s)
+	}
+	b := cap
+	for b > 0 && !utf8.RuneStart(s[b]) {
+		b--
+	}
+	return b
+}
 
 // applyInboundFilter runs the inbound (user → LLM) compliance/filter check and
 // applies the verdict. Returns true if the request should proceed to forwarding,
@@ -127,9 +149,19 @@ func (p *Proxy) applyInboundFilter(
 		degraded    bool
 	)
 	for i := range pieces {
+		// Cap the per-piece payload sent over the pipe (the detector only scans
+		// the first pipeInputCap bytes anyway). The untouched tail is re-attached
+		// after masking below, so the forwarded prompt is identical to sending the
+		// whole piece — but a huge piece can't stall/desync the IPC.
+		head := pieces[i].text
+		var tail string
+		if len(head) > pipeInputCap {
+			b := capRuneBoundary(pieces[i].text, pipeInputCap)
+			head, tail = pieces[i].text[:b], pieces[i].text[b:]
+		}
 		resp := hook.Detect(r.Context(), &apphook.Request{
 			Direction:   apphook.DirectionInbound,
-			Payload:     []byte(pieces[i].text),
+			Payload:     []byte(head),
 			TargetModel: model,
 			RouteClass:  routeClass,
 			// RequestID best-effort from the inbound trace header; child uses it
@@ -180,7 +212,9 @@ func (p *Proxy) applyInboundFilter(
 					"event.name", "proxy.filter.mask_empty")
 				continue
 			}
-			pieces[i].setText(string(m))
+			// Masked head (the scanned first pipeInputCap bytes) + the untouched
+			// tail (forwarded raw, never scanned — same as the detector's own cap).
+			pieces[i].setText(string(m) + tail)
 			maskedCount++
 
 		case apphook.ActionWarn:

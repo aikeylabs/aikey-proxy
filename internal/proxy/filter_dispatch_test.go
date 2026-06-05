@@ -48,6 +48,36 @@ func discardLogger() *slog.Logger {
 	return slog.New(slog.NewTextHandler(io.Discard, nil))
 }
 
+// TestApplyInboundFilter_PipeCapAndSplice — B (2026-06-05): a content piece
+// larger than pipeInputCap is capped before the pipe (the detector only scans
+// the first 16KB anyway), and the untouched tail is re-attached after masking.
+// Without the cap a huge prompt blocks the IPC for seconds and desyncs it.
+func TestApplyInboundFilter_PipeCapAndSplice(t *testing.T) {
+	head := strings.Repeat("A", pipeInputCap+5000) // > 16KB
+	tail := strings.Repeat("B", 3000)
+	full := head + tail
+	hook := &stubHook{resp: &apphook.Response{Action: apphook.ActionMask, MutatedPayload: []byte("[masked]")}}
+	p := &Proxy{filterHook: hook}
+	r := newReq(`{"model":"m","messages":[{"role":"user","content":"` + full + `"}]}`)
+	w := httptest.NewRecorder()
+
+	if proceed := p.applyInboundFilter(w, r, "m", "personal", "", discardLogger()); !proceed {
+		t.Fatal("expected proceed")
+	}
+	// 1. payload over the pipe is capped — the detector never sees the huge tail.
+	if len(hook.gotPayload) > pipeInputCap {
+		t.Errorf("payload not capped: %d bytes > cap %d", len(hook.gotPayload), pipeInputCap)
+	}
+	// 2. forwarded body = masked head + raw tail (the bytes beyond the cap).
+	got := readReqBody(t, r)
+	if !strings.Contains(got, "[masked]") {
+		t.Error("masked head missing from forwarded body")
+	}
+	if !strings.Contains(got, tail) {
+		t.Error("raw tail (beyond cap) not preserved in forwarded body")
+	}
+}
+
 // No hook installed → proceed=true, body untouched, zero cost.
 func TestApplyInboundFilter_NoHook_PassThrough(t *testing.T) {
 	p := &Proxy{} // filterHook nil

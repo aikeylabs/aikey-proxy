@@ -92,6 +92,11 @@ type ChildHook struct {
 
 	// degraded is set when child is unusable; cleared on successful restart.
 	degraded atomic.Bool
+
+	// lastRecoverAt (unix nano) gates the lazy self-heal: when degraded, the next
+	// request synchronously restarts the child, but a storm of requests must not
+	// hammer respawns — only one attempt per recoverCooldown.
+	lastRecoverAt atomic.Int64
 }
 
 // NewChildHook creates a ChildHook in DISABLED state. Caller must call Start
@@ -213,15 +218,60 @@ func (h *ChildHook) markDegraded(reason string) {
 	})
 }
 
+// recoverCooldown bounds how often the lazy self-heal will attempt a respawn,
+// and lazyRestartBound caps how long a hot-path request stalls waiting for the
+// child to come back (don't use the full ReadyTimeout — a user request must not
+// hang that long; a slower-than-bound restart is finished by the next request).
+const (
+	recoverCooldown  = 2 * time.Second
+	lazyRestartBound = 2 * time.Second
+)
+
+// restart kills the current (crashed / pipe-desynced) child and re-spawns a
+// fresh one. The doc-comment's "background restart" was never implemented; this
+// is the on-demand equivalent — recover when a request actually needs the
+// filter, not proactively (a compliance detector is only needed under traffic).
+func (h *ChildHook) restart(ctx context.Context) error {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	if h.cmd != nil && h.cmd.Process != nil {
+		_ = h.cmd.Process.Kill()
+		_ = h.cmd.Wait()
+		h.cmd = nil
+	}
+	old := h.status.Load()
+	h.status.Store(&Status{
+		Healthy:        false,
+		DegradedReason: "restarting",
+		BinaryPath:     h.cfg.BinaryPath,
+		Version:        old.Version,
+		LastSpawnedAt:  old.LastSpawnedAt,
+		RestartCount:   old.RestartCount + 1,
+	})
+	return h.spawnLocked(ctx) // clears degraded on success
+}
+
+// lazyRecoverLocked is the synchronous self-heal, called under detectMu when the
+// child is degraded. Cooldown-guarded (no respawn storm) + time-bounded (a hot
+// request stalls ≤ lazyRestartBound). On success h.degraded is cleared and the
+// caller proceeds with a fresh pipe; on failure the caller fails open and the
+// next request (after the cooldown) retries.
+func (h *ChildHook) lazyRecoverLocked() {
+	now := time.Now().UnixNano()
+	if now-h.lastRecoverAt.Load() < int64(recoverCooldown) {
+		return // recently attempted — fail open until the cooldown elapses
+	}
+	h.lastRecoverAt.Store(now)
+	rctx, cancel := context.WithTimeout(context.Background(), lazyRestartBound)
+	defer cancel()
+	_ = h.restart(rctx) // failure path stays degraded (logged via markDegraded)
+}
+
 // Name implements Hook.
 func (h *ChildHook) Name() string { return h.cfg.Name }
 
 // Detect implements Hook. Single-flight: serializes via detectMu.
 func (h *ChildHook) Detect(ctx context.Context, req *Request) *Response {
-	if h.degraded.Load() {
-		return &Response{Action: ActionAllow, Degraded: true, Reason: "child degraded"}
-	}
-
 	// Enforce internal timeout cap (even if caller passes a longer ctx).
 	ctx, cancel := context.WithTimeout(ctx, h.cfg.Timeout)
 	defer cancel()
@@ -229,9 +279,14 @@ func (h *ChildHook) Detect(ctx context.Context, req *Request) *Response {
 	h.detectMu.Lock()
 	defer h.detectMu.Unlock()
 
-	// Recheck after acquiring lock (state may have changed).
+	// Lazy self-heal: if the child is degraded (crashed / pipe desynced), try a
+	// bounded synchronous restart now (under the lock, so it serializes with all
+	// Detects). If it still can't recover, fail open for this request.
 	if h.degraded.Load() {
-		return &Response{Action: ActionAllow, Degraded: true, Reason: "child degraded (post-lock)"}
+		h.lazyRecoverLocked()
+		if h.degraded.Load() {
+			return &Response{Action: ActionAllow, Degraded: true, Reason: "child degraded (recover pending)"}
+		}
 	}
 
 	start := time.Now()
@@ -304,17 +359,20 @@ var ErrPacksUnavailable = errors.New("apphook: effective packs unavailable")
 // old child returns Allow + empty payload for the unknown op → we return
 // ErrPacksUnavailable, which the admin layer maps to "packs unavailable".
 func (h *ChildHook) ListPacks(ctx context.Context) ([]byte, error) {
-	if h.degraded.Load() {
-		return nil, ErrPacksUnavailable
-	}
 	ctx, cancel := context.WithTimeout(ctx, h.cfg.Timeout)
 	defer cancel()
 	_ = ctx // timeout intent; pipe I/O failure (crash) surfaces as read/write error
 
 	h.detectMu.Lock()
 	defer h.detectMu.Unlock()
+	// Lazy self-heal: the effective-packs query is not on the request hot path —
+	// when degraded it triggers a bounded synchronous restart so the drawer shows
+	// the live packs directly instead of "not running" + a manual refresh.
 	if h.degraded.Load() {
-		return nil, ErrPacksUnavailable
+		h.lazyRecoverLocked()
+		if h.degraded.Load() {
+			return nil, ErrPacksUnavailable
+		}
 	}
 
 	if err := h.writeFrame([]byte{4}); err != nil { // op=4 = ListPacks

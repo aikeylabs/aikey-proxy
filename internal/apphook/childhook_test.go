@@ -35,6 +35,65 @@ func detectorArgs() []string {
 	return []string{"--echo-only"}
 }
 
+// TestChildHook_RestartRecovers — lazy self-heal core (2026-06-05): markDegraded
+// used to be terminal (no respawn) → a degraded hook stayed down until the whole
+// proxy restarted ("本机合规检测未运行"). restart() must kill the dead/desynced
+// child, respawn a fresh one, and clear degraded.
+func TestChildHook_RestartRecovers(t *testing.T) {
+	h := NewChildHook(ChildHookConfig{
+		Name: "recover-test", BinaryPath: findDetectorBinary(t), BinaryArgs: detectorArgs(),
+		Timeout: 1 * time.Second, ReadyTimeout: 5 * time.Second,
+	})
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	if err := h.Start(ctx); err != nil {
+		t.Skipf("child binary unavailable, skipping (build first): %v", err)
+	}
+	defer func() { _ = h.Shutdown(context.Background()) }()
+
+	oldPid := h.cmd.Process.Pid
+	h.markDegraded("simulated degrade")
+	if !h.degraded.Load() {
+		t.Fatal("expected degraded after markDegraded")
+	}
+	if err := h.restart(ctx); err != nil {
+		t.Fatalf("restart: %v", err)
+	}
+	if h.degraded.Load() {
+		t.Fatal("expected recovered (degraded cleared) after restart")
+	}
+	if h.cmd.Process.Pid == oldPid {
+		t.Errorf("expected a NEW child pid after restart, got same pid %d", oldPid)
+	}
+	if res := h.Detect(ctx, &Request{Direction: DirectionInbound, Payload: []byte("hi")}); res.Degraded {
+		t.Fatalf("Detect still degraded after restart: %s", res.Reason)
+	}
+}
+
+// TestChildHook_LazyRecoverOnDetect — the trigger: a degraded Detect lazily
+// restarts the child and serves recovered, instead of failing open forever.
+func TestChildHook_LazyRecoverOnDetect(t *testing.T) {
+	h := NewChildHook(ChildHookConfig{
+		Name: "lazy-test", BinaryPath: findDetectorBinary(t), BinaryArgs: detectorArgs(),
+		Timeout: 1 * time.Second, ReadyTimeout: 5 * time.Second,
+	})
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	if err := h.Start(ctx); err != nil {
+		t.Skipf("child binary unavailable, skipping (build first): %v", err)
+	}
+	defer func() { _ = h.Shutdown(context.Background()) }()
+
+	h.markDegraded("simulated")
+	res := h.Detect(ctx, &Request{Direction: DirectionInbound, Payload: []byte("hi")})
+	if res.Degraded {
+		t.Fatalf("expected lazy recovery on Detect, still degraded: %s", res.Reason)
+	}
+	if h.degraded.Load() {
+		t.Fatal("expected degraded cleared after lazy recover on Detect")
+	}
+}
+
 func TestChildHookEchoRoundtrip(t *testing.T) {
 	binary := findDetectorBinary(t)
 
