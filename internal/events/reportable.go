@@ -234,7 +234,13 @@ func BuildReportableEvent(opts ReportOpts) ReportableEvent {
 	var inTok, outTok, totalTok int64
 	inTok = int64(opts.InputTokens)
 	outTok = int64(opts.OutputTokens)
-	totalTok = inTok + outTok
+	// 方案 A (2026-06-04): inTok is now the PURE (uncached) input. total_tokens must
+	// stay the FULL token count, so add both cache buckets back in: pure input +
+	// cache_read + cache_creation + output. (Pre-方案-A inTok was the total incl.
+	// cache, so total was inTok+outTok; this keeps total_tokens byte-identical while
+	// input_tokens alone became pure.) See
+	// roadmap20260320/技术实现/update/20260604-token-input-纯输入语义治本-方案A.md.
+	totalTok = inTok + int64(opts.CacheReadInputTokens) + int64(opts.CacheCreationInputTokens) + outTok
 
 	status := "success"
 	if opts.StatusCode >= 400 {

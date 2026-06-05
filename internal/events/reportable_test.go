@@ -353,9 +353,11 @@ func TestBuildReportableEvent_StampsContentHash(t *testing.T) {
 	if !usagehash.SchemeKnown(ev.ContentHash) {
 		t.Fatalf("ContentHash %q not a known scheme", ev.ContentHash)
 	}
-	// Independently recompute the same tuple — must match byte-for-byte.
+	// Independently recompute the same tuple — must match byte-for-byte. 方案 A:
+	// InputTokens=100 is PURE; total_tokens = pure + cache_read(10) + cache_creation(20)
+	// + output(50) = 180 (cache added back so total stays the full token count).
 	want := usagehash.Compute(usagehash.Input{
-		InputTokens: 100, OutputTokens: 50, TotalTokens: 150,
+		InputTokens: 100, OutputTokens: 50, TotalTokens: 180,
 		CacheReadInputTokens: 10, CacheCreationInputTokens: 20,
 		Model: "claude-opus-4-7", ProviderCode: "anthropic",
 	})

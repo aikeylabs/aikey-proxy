@@ -90,16 +90,13 @@ func (p *Proxy) accrueQuotaUsage(route *vkeys.ResolvedRoute, b provider.TokenBre
 	// tokens: this sum MUST match the server's DWD token metric so the proxy's local
 	// increment lines up with the baseline it tops up. The server metric is
 	// `input_tokens + output + cached_input + cache_creation + reasoning`
-	// (collector dwdMetricSumExpr), and DWD.input_tokens is the TOTAL input — cache
-	// is a SUBSET of it (verified on real data: total_tokens == input + output, and
-	// cache_read+cache_creation <= input_tokens). So the metric counts the cache
-	// buckets twice (inside input AND added again); the proxy mirrors that EXACTLY
-	// here so enforcement stays consistent with the baseline.
-	// NOTE(2026-06-04): the metric (and billable) double-counting cache vs the true
-	// token/cost is a real but SEPARATE billing-semantics question in the collector
-	// (changes customer bills — large blast radius); do NOT "fix" it here in
-	// isolation or the proxy would drift below the server baseline. See
-	// bugfix/2026-06-04-quota-token-metric-cache-semantics.md.
+	// (collector dwdMetricSumExpr). 方案 A (2026-06-04): b.InputTokens is now the
+	// PURE (uncached) input and DWD.input_tokens is likewise pure, so this sum =
+	// pure + output + cache_read + cache_creation + reasoning = the TRUE token count
+	// (no cache double-count) and stays consistent with the server baseline. Before
+	// 方案 A the adapter reported the TOTAL input, so this same formula double-counted
+	// cache — consistently on both sides, but inflated; the source fix removed it.
+	// See roadmap20260320/技术实现/update/20260604-token-input-纯输入语义治本-方案A.md.
 	delta := float64(b.InputTokens + b.OutputTokens + b.CacheReadInputTokens +
 		b.CacheCreationInputTokens + b.ReasoningTokens)
 	p.quota.AddForSeat(route.SeatID, delta, now)

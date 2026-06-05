@@ -169,7 +169,14 @@ func (a *Anthropic) ExtractTokenBreakdown(data []byte, streaming bool, logger *s
 		}
 		u := resp.Usage
 		return TokenBreakdown{
-			InputTokens:              u.totalInput(),
+			// 方案 A: InputTokens is the PURE (uncached) input — Anthropic's native
+			// usage.input_tokens. Cache lives in the separate buckets below; total
+			// context = InputTokens + CacheRead + CacheCreation. (ExtractTokens still
+			// returns the TOTAL for its stable legacy contract.) This makes
+			// DWD.input_tokens semantically "uncached" so downstream billing/metrics
+			// neither double-count nor over-charge cache. See
+			// roadmap20260320/技术实现/update/20260604-token-input-纯输入语义治本-方案A.md.
+			InputTokens:              u.InputTokens,
 			OutputTokens:             u.OutputTokens,
 			CacheReadInputTokens:     u.CacheReadInputTokens,
 			CacheCreationInputTokens: u.CacheCreationInputTokens,
@@ -208,7 +215,7 @@ func (a *Anthropic) ExtractTokenBreakdown(data []byte, streaming bool, logger *s
 		switch event.Type {
 		case "message_start":
 			u := event.Message.Usage
-			br.InputTokens = u.totalInput()
+			br.InputTokens = u.InputTokens // 方案 A: PURE uncached (cache in fields below)
 			br.CacheReadInputTokens = u.CacheReadInputTokens
 			br.CacheCreationInputTokens = u.CacheCreationInputTokens
 			// Capture upstream model from the same frame. Only

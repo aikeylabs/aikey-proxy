@@ -149,10 +149,29 @@ type openaiUsageData struct {
 	// completion_tokens_details; Responses API under output_tokens_details.
 	CompletionTokensDetails *openaiTokenDetails `json:"completion_tokens_details,omitempty"`
 	OutputTokensDetails     *openaiTokenDetails `json:"output_tokens_details,omitempty"`
+	// Cached prompt tokens (方案 A Phase 2b): Chat Completions nests under
+	// prompt_tokens_details.cached_tokens; Responses API under
+	// input_tokens_details.cached_tokens. cached_tokens is a SUBSET of
+	// prompt_tokens/input_tokens (the OpenAI total), so pure = total - cached.
+	PromptTokensDetails *openaiTokenDetails `json:"prompt_tokens_details,omitempty"`
+	InputTokensDetails  *openaiTokenDetails `json:"input_tokens_details,omitempty"`
 }
 
 type openaiTokenDetails struct {
 	ReasoningTokens int `json:"reasoning_tokens"`
+	CachedTokens    int `json:"cached_tokens"`
+}
+
+// CachedInput returns the cached prompt-token count from whichever API shape
+// carried it (Chat Completions prompt_tokens_details / Responses input_tokens_details).
+func (u *openaiUsageData) CachedInput() int {
+	if u.PromptTokensDetails != nil && u.PromptTokensDetails.CachedTokens > 0 {
+		return u.PromptTokensDetails.CachedTokens
+	}
+	if u.InputTokensDetails != nil {
+		return u.InputTokensDetails.CachedTokens
+	}
+	return 0
 }
 
 // ReasoningTokens returns the reasoning bucket from whichever API shape carried it.
@@ -191,24 +210,66 @@ type openaiUsageEnvelope struct {
 	} `json:"response,omitempty"`
 }
 
-// ExtractTokenBreakdown delegates to ExtractTokens for the token numbers
-// (OpenAI-compatible providers don't expose a separate cache bucket in the
-// way Anthropic does — `prompt_tokens` already reflects the full billable
-// input, cached or not; a future enhancement could surface
-// `prompt_tokens_details.cached_tokens` via CacheReadInputTokens, but the
-// UI consumer treats zero as "no cache info" which is the correct default
-// today), plus extracts `choices[0].finish_reason` for StopReason metadata.
+// ExtractTokenBreakdown returns the PURE (uncached) input plus the cache_read
+// bucket — 方案 A Phase 2b. ExtractTokens gives the OpenAI TOTAL prompt tokens
+// (cached + uncached); we subtract the cached_tokens detail to get the pure input
+// and surface the cached portion as CacheReadInputTokens (OpenAI has no
+// cache-creation bucket). The collector then bills pure at the input rate and
+// cache at the cache-read rate (inputIncludesCache=false). Also extracts
+// `choices[0].finish_reason` for StopReason metadata.
 //
 // Streaming spec: `finish_reason` only appears on the final delta chunk
 // (before `[DONE]`). We scan SSE lines same as ExtractTokens and capture
 // the last non-empty finish_reason seen.
 func (o *OpenAI) ExtractTokenBreakdown(data []byte, streaming bool, logger *slog.Logger) TokenBreakdown {
-	in, out := o.ExtractTokens(data, streaming, logger)
-	br := TokenBreakdown{InputTokens: in, OutputTokens: out}
+	in, out := o.ExtractTokens(data, streaming, logger) // in = TOTAL prompt tokens
+	cached := extractOpenAICachedInput(data, streaming)
+	pure := in - cached
+	if pure < 0 {
+		pure = 0 // defensive: cached_tokens should never exceed prompt_tokens
+	}
+	br := TokenBreakdown{InputTokens: pure, OutputTokens: out, CacheReadInputTokens: cached}
 	br.ReasoningTokens = extractOpenAIReasoning(data, streaming)
 	br.StopReason = extractOpenAIStopReason(data, streaming)
 	br.Model = extractOpenAIModel(data, streaming)
 	return br
+}
+
+// extractOpenAICachedInput reads the cached prompt-token bucket from
+// usage.prompt_tokens_details.cached_tokens (Chat Completions) or
+// input_tokens_details.cached_tokens (Responses API). Streaming: the usage frame
+// only lands on the final chunk, so we keep the last non-zero value seen. Mirrors
+// extractOpenAIReasoning.
+func extractOpenAICachedInput(data []byte, streaming bool) int {
+	parse := func(b []byte) int {
+		var env openaiUsageEnvelope
+		if json.Unmarshal(b, &env) != nil {
+			return 0
+		}
+		if env.Usage != nil {
+			return env.Usage.CachedInput()
+		}
+		if env.Response != nil && env.Response.Usage != nil {
+			return env.Response.Usage.CachedInput()
+		}
+		return 0
+	}
+	if !streaming {
+		return parse(data)
+	}
+	last := 0
+	for _, line := range bytes.Split(data, []byte("\n")) {
+		line = bytes.TrimSpace(line)
+		line = bytes.TrimPrefix(line, []byte("data:"))
+		line = bytes.TrimSpace(line)
+		if len(line) == 0 || bytes.Equal(line, []byte("[DONE]")) {
+			continue
+		}
+		if c := parse(line); c > 0 {
+			last = c
+		}
+	}
+	return last
 }
 
 // extractOpenAIReasoning reads the o-series reasoning bucket from

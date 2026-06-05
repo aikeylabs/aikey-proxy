@@ -360,3 +360,65 @@ func TestKimi_Model_DelegatesToOpenAI(t *testing.T) {
 		t.Fatalf("Model = %q, want kimi-k2.5 (kimi delegates to openai)", br.Model)
 	}
 }
+
+// TestAnthropicBreakdown_PureInput is the 方案 A guard: ExtractTokenBreakdown
+// reports PURE (uncached) input with cache in its own fields, while ExtractTokens
+// keeps its legacy TOTAL contract. Invariant: ExtractTokens.in ==
+// breakdown.InputTokens + CacheRead + CacheCreation.
+func TestAnthropicBreakdown_PureInput(t *testing.T) {
+	body := []byte(`{"usage":{"input_tokens":5,"cache_creation_input_tokens":200,` +
+		`"cache_read_input_tokens":43000,"output_tokens":150}}`)
+	br := (&Anthropic{}).ExtractTokenBreakdown(body, false, nil)
+	if br.InputTokens != 5 {
+		t.Errorf("breakdown InputTokens want 5 (PURE uncached), got %d", br.InputTokens)
+	}
+	if br.CacheReadInputTokens != 43000 || br.CacheCreationInputTokens != 200 {
+		t.Errorf("cache fields want (43000,200), got (%d,%d)", br.CacheReadInputTokens, br.CacheCreationInputTokens)
+	}
+	in, _ := (&Anthropic{}).ExtractTokens(body, false, nil)
+	if in != 43205 {
+		t.Errorf("ExtractTokens must still return TOTAL 43205 (legacy contract), got %d", in)
+	}
+	if in != br.InputTokens+br.CacheReadInputTokens+br.CacheCreationInputTokens {
+		t.Errorf("invariant: ExtractTokens.in (%d) must equal breakdown total (%d)",
+			in, br.InputTokens+br.CacheReadInputTokens+br.CacheCreationInputTokens)
+	}
+}
+
+// TestOpenAIBreakdown_PureInputAndCacheRead is the 方案 A Phase 2b guard: OpenAI
+// prompt_tokens/input_tokens is the TOTAL (incl cached); the breakdown reports
+// pure = total - cached_tokens and surfaces cached as CacheRead (no cache_creation).
+func TestOpenAIBreakdown_PureInputAndCacheRead(t *testing.T) {
+	// Chat Completions shape.
+	body := []byte(`{"usage":{"prompt_tokens":1000,"completion_tokens":50,` +
+		`"prompt_tokens_details":{"cached_tokens":800}}}`)
+	br := (&OpenAI{}).ExtractTokenBreakdown(body, false, nil)
+	if br.InputTokens != 200 {
+		t.Errorf("pure input want 200 (1000-800), got %d", br.InputTokens)
+	}
+	if br.CacheReadInputTokens != 800 {
+		t.Errorf("cache_read want 800, got %d", br.CacheReadInputTokens)
+	}
+	if br.CacheCreationInputTokens != 0 {
+		t.Errorf("OpenAI has no cache_creation, want 0, got %d", br.CacheCreationInputTokens)
+	}
+	if br.OutputTokens != 50 {
+		t.Errorf("output want 50, got %d", br.OutputTokens)
+	}
+	// ExtractTokens still returns TOTAL prompt_tokens (legacy contract).
+	if in, _ := (&OpenAI{}).ExtractTokens(body, false, nil); in != 1000 {
+		t.Errorf("ExtractTokens must return TOTAL 1000, got %d", in)
+	}
+	// Responses API shape (input_tokens_details.cached_tokens).
+	rbody := []byte(`{"usage":{"input_tokens":500,"output_tokens":10,` +
+		`"input_tokens_details":{"cached_tokens":300}}}`)
+	rbr := (&OpenAI{}).ExtractTokenBreakdown(rbody, false, nil)
+	if rbr.InputTokens != 200 || rbr.CacheReadInputTokens != 300 {
+		t.Errorf("Responses API: want pure 200 cache 300, got pure %d cache %d", rbr.InputTokens, rbr.CacheReadInputTokens)
+	}
+	// No-cache OpenAI: pure == prompt_tokens, cache 0 (unchanged behavior).
+	nbr := (&OpenAI{}).ExtractTokenBreakdown([]byte(`{"usage":{"prompt_tokens":7,"completion_tokens":14}}`), false, nil)
+	if nbr.InputTokens != 7 || nbr.CacheReadInputTokens != 0 {
+		t.Errorf("no-cache: want pure 7 cache 0, got pure %d cache %d", nbr.InputTokens, nbr.CacheReadInputTokens)
+	}
+}

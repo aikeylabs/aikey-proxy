@@ -22,22 +22,31 @@ func applyBaseURL(req *http.Request, baseURL string) error {
 // It separates cached input into its two Anthropic-native buckets so the UI
 // can show a breakdown like "↑70K ↓150 · (↑53K ↓32 cached)". OpenAI-style
 // providers fill only InputTokens / OutputTokens and leave the cache fields
-// zero. Why not widen ExtractTokens directly: external tests and several
-// call sites rely on the (int, int) shape — adding a parallel method is
-// cheaper than churning them.
+// zero (until 方案 A Phase 2b surfaces OpenAI cached_tokens). Why not widen
+// ExtractTokens directly: external tests and several call sites rely on the
+// (int, int) shape — adding a parallel method is cheaper than churning them.
+//
+// 方案 A semantics (2026-06-04): InputTokens here is the PURE (uncached) input;
+// ExtractTokens's (in) keeps the legacy TOTAL contract. The invariant linking
+// them is: ExtractTokens.in == InputTokens + CacheReadInputTokens +
+// CacheCreationInputTokens. This makes the reported/persisted input_tokens
+// "uncached" so downstream billing + token metrics neither double-count nor
+// over-charge cache. See
+// roadmap20260320/技术实现/update/20260604-token-input-纯输入语义治本-方案A.md.
 type TokenBreakdown struct {
-	// InputTokens is the *total* input charged against context — for
-	// Anthropic this equals input + cache_creation + cache_read. Callers
-	// that want to split it must use the *InputTokens fields below.
+	// InputTokens is the PURE (uncached) input — billed at the input rate.
+	// Cache is NOT included here (it lives in the two Cache*InputTokens fields);
+	// total context = InputTokens + CacheReadInputTokens + CacheCreationInputTokens.
 	InputTokens int
 	// OutputTokens is the model's generated output in tokens.
 	OutputTokens int
-	// CacheReadInputTokens is the portion of InputTokens that was replayed
-	// from the provider's cache (Anthropic prompt-caching "read"). Zero when
-	// the provider has no cache or the client didn't opt in.
+	// CacheReadInputTokens is the cache-replayed input (Anthropic prompt-caching
+	// "read"), billed at the cache-read rate. Separate from InputTokens. Zero
+	// when the provider has no cache or the client didn't opt in.
 	CacheReadInputTokens int
-	// CacheCreationInputTokens is the portion of InputTokens that was
-	// written to the cache this turn. Zero under the same conditions.
+	// CacheCreationInputTokens is the input written to the cache this turn,
+	// billed at the cache-creation rate. Separate from InputTokens. Zero under
+	// the same conditions.
 	CacheCreationInputTokens int
 	// ReasoningTokens is the model's internal reasoning/thinking tokens
 	// (OpenAI o-series usage.completion_tokens_details.reasoning_tokens;

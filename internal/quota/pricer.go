@@ -13,20 +13,21 @@ package quota
 // once it's priced server-side and re-synced).
 //
 // Token-type split (correctness — the whole point of exact pricing):
-// provider.TokenBreakdown.InputTokens is the TOTAL input (pure + cache_read +
-// cache_creation — see provider anthropic totalInput). Charging that whole amount
-// at the input rate would over-bill cache tokens by up to ~10x (cache_read is
-// 0.1x input). So pricing charges only the PURE input at the input rate and each
-// cache portion at its own rate:
+// 方案 A (2026-06-04): provider.TokenBreakdown.InputTokens is now the PURE
+// (uncached) input — cache lives in its own fields. So pricing charges the pure
+// input at the input rate and each cache portion at its own rate (cache_read is
+// ~0.1x input), with NO subtraction here:
 //
-//	pure_input = inputTotal - cacheRead - cacheCreation   (clamped at 0)
-//	cost = pure_input*input + cacheRead*cache_read + cacheCreation*cache_creation
+//	cost = inputPure*input + cacheRead*cache_read + cacheCreation*cache_creation
 //	       + output*output + reasoning*reasoning
 //
-// This mirrors exactly how the collector computes billable_amount, so the proxy
-// estimate equals the eventual bill for known models (verified 0.000% on real
-// data in the D-U8 spike).
-func (ps *PriceSummary) Cost(model string, inputTotal, output, cacheRead, cacheCreation, reasoning int) (float64, bool) {
+// This mirrors exactly how the collector computes billable_amount (ComputeCost
+// with inputIncludesCache=false post-方案-A), so the proxy estimate equals the
+// eventual bill for known models. Before 方案 A the proxy received the TOTAL input
+// and subtracted cache here; that subtraction moved to the source (the adapter
+// now reports pure). See
+// roadmap20260320/技术实现/update/20260604-token-input-纯输入语义治本-方案A.md.
+func (ps *PriceSummary) Cost(model string, inputPure, output, cacheRead, cacheCreation, reasoning int) (float64, bool) {
 	if ps == nil {
 		return 0, false
 	}
@@ -34,13 +35,7 @@ func (ps *PriceSummary) Cost(model string, inputTotal, output, cacheRead, cacheC
 	if !ok {
 		return 0, false
 	}
-	pureInput := inputTotal - cacheRead - cacheCreation
-	if pureInput < 0 {
-		// Defensive: a provider reporting cache > total input shouldn't happen, but
-		// never let a negative pure-input credit back usd.
-		pureInput = 0
-	}
-	cost := float64(pureInput)*mp.Input +
+	cost := float64(inputPure)*mp.Input +
 		float64(cacheRead)*mp.CacheRead +
 		float64(cacheCreation)*mp.CacheCreation +
 		float64(output)*mp.Output +
