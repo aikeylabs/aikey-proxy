@@ -275,6 +275,7 @@ func (h *ChildHook) Detect(ctx context.Context, req *Request) *Response {
 	// Enforce internal timeout cap (even if caller passes a longer ctx).
 	ctx, cancel := context.WithTimeout(ctx, h.cfg.Timeout)
 	defer cancel()
+	_ = ctx // timeout intent; pipe I/O failure (crash) surfaces as read/write error
 
 	h.detectMu.Lock()
 	defer h.detectMu.Unlock()
