@@ -135,7 +135,7 @@ func TestChildHook_ConcurrentDetectIsSerialized(t *testing.T) {
 	wg.Wait()
 	close(errCh)
 
-	var errs []string
+	errs := make([]string, 0, len(errCh))
 	for e := range errCh {
 		errs = append(errs, e)
 	}

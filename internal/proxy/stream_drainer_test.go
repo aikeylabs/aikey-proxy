@@ -215,7 +215,7 @@ func TestStreamDrainer_StopsOnClientDisconnect(t *testing.T) {
 	}
 }
 
-// TestStreamDrainer_ProxyContextAbort verifies that cancelling the proxy
+// TestStreamDrainer_ProxyContextAbort verifies that canceling the proxy
 // lifecycle context causes the goroutine to exit cleanly.
 func TestStreamDrainer_ProxyContextAbort(t *testing.T) {
 	// Upstream that never sends data.
@@ -241,7 +241,7 @@ func TestStreamDrainer_ProxyContextAbort(t *testing.T) {
 	case <-done:
 		// goroutine exited, pipe closed — correct
 	case <-time.After(2 * time.Second):
-		t.Fatal("drainer goroutine did not exit after proxy context cancelled")
+		t.Fatal("drainer goroutine did not exit after proxy context canceled")
 	}
 
 	// No event should be recorded (proxy aborted cleanly, collector is also closing).

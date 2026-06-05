@@ -4,7 +4,7 @@ import "testing"
 
 // TestExtractProbePath exercises the URL parser for the Probe pipeline.
 // Mirrors the structure of apppipe/router_test.go::TestExtractAppPath so a
-// future reader recognises the pattern immediately.
+// future reader recognizes the pattern immediately.
 func TestExtractProbePath(t *testing.T) {
 	tests := []struct {
 		name       string

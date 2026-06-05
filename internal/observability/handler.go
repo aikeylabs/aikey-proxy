@@ -152,7 +152,7 @@ func (h *MultiHandler) WithGroup(name string) slog.Handler {
 
 // ---- Logger setup ----
 
-// SetupLogger initialises the global slog logger to write:
+// SetupLogger initializes the global slog logger to write:
 //   - human-readable text to stderr (for local development visibility)
 //   - structured JSON Lines to logDir/current.jsonl (for machine parsing)
 //

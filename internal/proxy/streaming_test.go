@@ -2,6 +2,7 @@ package proxy
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"io"
 	"net/http"
@@ -90,12 +91,12 @@ func TestInjectStreamUsageOption_InvalidJSON(t *testing.T) {
 }
 
 func TestInjectStreamUsageOption_NilBody(t *testing.T) {
-	req, _ := http.NewRequest("POST", "/v1/chat/completions", nil)
+	req, _ := http.NewRequestWithContext(context.Background(), "POST", "/v1/chat/completions", nil)
 	injectStreamUsageOption(req) // should not panic
 }
 
 func newReqWithBody(body string) *http.Request {
-	req, _ := http.NewRequest("POST", "/v1/chat/completions",
+	req, _ := http.NewRequestWithContext(context.Background(), "POST", "/v1/chat/completions",
 		io.NopCloser(bytes.NewReader([]byte(body))))
 	req.ContentLength = int64(len(body))
 	return req

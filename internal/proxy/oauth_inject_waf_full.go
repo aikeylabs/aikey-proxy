@@ -14,7 +14,7 @@
 //
 // Strategy
 // --------
-// For non-CLI clients we synthesise the four signals real CLI traffic
+// For non-CLI clients we synthesize the four signals real CLI traffic
 // carries (a 2-block system, a version-derived 3-hex suffix on cc_version,
 // a body-content xxhash64 sealing the billing block, and an ephemeral
 // cache_control on the intro), and we relocate the client's original
@@ -54,7 +54,7 @@ import (
 // Reverse-engineered facts about Claude Code CLI's wire format. These are
 // not original expression — they are observable byte-level constants in
 // the public Anthropic OAuth wire protocol. Tracking the latest CLI we've
-// observed; bump claudeCLIVersion when real CLI advances so the synthesised
+// observed; bump claudeCLIVersion when real CLI advances so the synthesized
 // cc_version stays plausible.
 const (
 	claudeCLIVersion = "2.1.128"
@@ -73,9 +73,9 @@ const (
 	// and an anchor for the placeholder rewrite.
 	billingHeaderPrefix = "x-anthropic-billing-header:"
 
-	// cchPlaceholder is the literal token we emit when synthesising the
+	// cchPlaceholder is the literal token we emit when synthesizing the
 	// billing block; it gets rewritten in place once the body is fully
-	// marshalled (so the hash covers every byte we produced).
+	// marshaled (so the hash covers every byte we produced).
 	cchPlaceholder = "cch=00000;"
 
 	// cchPlaceholderZeros is the 5-byte run that gets overwritten by the
@@ -116,7 +116,7 @@ func clientIsClaudeCode(req *http.Request) bool {
 //     (idempotency for traffic that happens to carry CLI-style markers).
 //
 // Otherwise the body is rewritten with the full four-layer mimicry plus
-// instruction relocation, marshalled, and the cch placeholder is sealed
+// instruction relocation, marshaled, and the cch placeholder is sealed
 // against the final byte stream.
 func injectClaudeWAFFingerprintFull(req *http.Request) {
 	if req.Body == nil {
@@ -150,7 +150,7 @@ func injectClaudeWAFFingerprintFull(req *http.Request) {
 	// (the algorithm samples the *first user text*, which after the
 	// instruction-pair prepend is the synthetic [System Instructions] block).
 	suffixSeed, _ := json.Marshal(map[string]any{"messages": body["messages"]})
-	body["system"] = synthesiseTwoBlockSystem(suffixSeed)
+	body["system"] = synthesizeTwoBlockSystem(suffixSeed)
 
 	rewritten, err := json.Marshal(body)
 	if err != nil {
@@ -250,10 +250,10 @@ func prependInstructionPair(existingMessages any, relocatedSystem string) []any 
 	return append([]any{userTurn, assistantTurn}, existing...)
 }
 
-// synthesiseTwoBlockSystem builds the [billing, intro+cache_control] system
+// synthesizeTwoBlockSystem builds the [billing, intro+cache_control] system
 // array that real CLI emits. The cch field is left as the literal
-// placeholder; it is sealed once the entire body is marshalled.
-func synthesiseTwoBlockSystem(suffixSeed []byte) []any {
+// placeholder; it is sealed once the entire body is marshaled.
+func synthesizeTwoBlockSystem(suffixSeed []byte) []any {
 	suffix := computeClaudeCodeVersionFingerprint(suffixSeed, claudeCLIVersion)
 	billingText := fmt.Sprintf(
 		"%s cc_version=%s.%s; cc_entrypoint=cli; %s",

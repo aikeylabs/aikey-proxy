@@ -44,6 +44,33 @@ func TestManagedKeyToRoute_SetsTeamSource(t *testing.T) {
 	}
 }
 
+// P0-2 (multi-user billing attribution): a team/managed route MUST attribute to
+// the key's own owner account (cache owner_account_id), not a single fallback.
+// In a cluster, one proxy serves N users; the per-VK owner is what keeps billing
+// correct. The reporter only falls back to LoggedInAccountID when AccountID is
+// empty — and a cluster node has no logged-in singleton, so empty would mean ""
+// (unattributed), never another user's account. This pins managedKeyToRoute's
+// OwnerAccountID → AccountID + SeatID mapping so a refactor can't silently drop it.
+func TestManagedKeyToRoute_AttributesToOwnerAccount(t *testing.T) {
+	mk := vault.ManagedKey{
+		VirtualKeyID:   "aikey_team_vk1",
+		ProtocolType:   "anthropic",
+		BaseURL:        "https://api.anthropic.com",
+		PlaintextKey:   "sk-real",
+		OrgID:          "org-1",
+		OwnerAccountID: "acct-user-A",
+		SeatID:         "seat-A",
+		ProviderCode:   "anthropic",
+	}
+	r := managedKeyToRoute(mk)
+	if r.AccountID != "acct-user-A" {
+		t.Errorf("AccountID = %q, want owner_account_id acct-user-A (P0-2 attribution)", r.AccountID)
+	}
+	if r.SeatID != "seat-A" {
+		t.Errorf("SeatID = %q, want seat-A", r.SeatID)
+	}
+}
+
 func TestPersonalTokenToRoute_SetsPersonalSource(t *testing.T) {
 	pt := vault.PersonalRouteToken{
 		RouteToken:   "aikey_personal_abc",
@@ -550,7 +577,7 @@ func TestIsStrictAppRouteToken(t *testing.T) {
 // invariant (memory: no-proxy-restart-for-vault-mutations).
 //
 // Low-fidelity guard: pins source references, not runtime behavior. A
-// behavioural test would boot a real Supervisor with a temp vault, bump
+// behavioral test would boot a real Supervisor with a temp vault, bump
 // change_seq, wait one 5s tick, and assert registry membership — tracked
 // as P1 because it needs vault fixture scaffolding this package doesn't
 // yet have.

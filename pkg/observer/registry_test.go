@@ -23,7 +23,7 @@ import (
 // ---------------------------------------------------------------------------
 
 // recordingObserver is a StreamingObserver that records the events it
-// receives. Default behaviour is "well behaved"; the tests use the
+// receives. Default behavior is "well behaved"; the tests use the
 // options below to make it misbehave (panic, sleep, retain payload).
 type recordingObserver struct {
 	mu         sync.Mutex
@@ -32,7 +32,7 @@ type recordingObserver struct {
 	payloads   [][]byte // copies kept by the observer — used by the aliasing test
 	latencies  []int
 
-	// behaviour knobs
+	// behavior knobs
 	panicEveryEvent bool          // panic on every OnSSEEvent
 	panicOnStart    bool          // panic on OnRequestStart
 	sleepOnEvent    time.Duration // sleep this long inside OnSSEEvent
@@ -212,9 +212,9 @@ func TestNotifySSEEvent_NonBlockingWhenObserverIsSlow(t *testing.T) {
 // ---------------------------------------------------------------------------
 // P1-1 — detached ctx
 //
-// If the client disconnects mid-stream the request ctx is cancelled.
-// Observer work must NOT be cancelled with it — the observer is
-// finalising evidence and reporting independently of the user's
+// If the client disconnects mid-stream the request ctx is canceled.
+// Observer work must NOT be canceled with it — the observer is
+// finalizing evidence and reporting independently of the user's
 // connection. The registry achieves this by building observer ctx via
 // context.WithoutCancel + a separate maxRequestAge timeout.
 // ---------------------------------------------------------------------------

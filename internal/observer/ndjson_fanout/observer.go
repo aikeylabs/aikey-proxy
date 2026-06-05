@@ -6,7 +6,7 @@
 // table.
 //
 // Architecture choice (vs the existing rhythm observer in
-// degrade-detector/proxy-plugin/rhythm/):
+// ai-degrade-detector/proxy-plugin/rhythm/):
 //
 //   - rhythm = degrade-detector-specific in-process scorer + HTTP
 //     reporter; only fires on app_pipeline traffic
@@ -89,7 +89,7 @@ type Event struct {
 //
 // Exposed as a top-level function (not a method on *fanoutObserver) so
 // future observers in the same package — or callers that just want the
-// canonical serialisation shape — can reuse the mapping without
+// canonical serialization shape — can reuse the mapping without
 // instantiating the writer.
 func EventFromContext(req *observer.RequestContext, nChunks, latencyMs int, status string) Event {
 	model := req.ResolvedModel
@@ -136,7 +136,7 @@ type fanoutObserver struct {
 type writerEntry struct {
 	slug   string
 	path   string
-	muFile sync.Mutex // serialise writes to a single file handle
+	muFile sync.Mutex // serialize writes to a single file handle
 	file   *os.File
 }
 

@@ -25,7 +25,7 @@ func (f fakeRefreshTokenSource) GetPlatformRefreshToken() (string, error) {
 // These tests pin the contract that turns user.yaml's
 // `proxy.events.collector_credentials.team` (B3) + vault's
 // `platform_account.refresh_token` into a reporter-consumable
-// events.Credential at proxy startup. Reporter behaviour (the
+// events.Credential at proxy startup. Reporter behavior (the
 // generated Credential's Bearer() semantics) is exercised separately
 // in internal/events/credential_test.go — these tests only cover the
 // wiring path.
@@ -93,7 +93,7 @@ func TestBuildCollectorCredentials_NoRefreshTokenSkipsRoute(t *testing.T) {
 }
 
 // Vault error path: query failed for unrelated reasons (DB locked,
-// transient SQLite error, etc.). Same skip-the-route behaviour as the
+// transient SQLite error, etc.). Same skip-the-route behavior as the
 // empty-token case — operational hint should be in the log; reporter
 // keeps running on the legacy token path.
 func TestBuildCollectorCredentials_VaultErrorSkipsRoute(t *testing.T) {

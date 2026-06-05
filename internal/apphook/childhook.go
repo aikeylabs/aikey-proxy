@@ -194,7 +194,7 @@ func (h *ChildHook) spawnLocked(ctx context.Context) error {
 	case <-ctx.Done():
 		_ = cmd.Process.Kill()
 		_ = cmd.Wait()
-		h.markDegraded("startup_cancelled")
+		h.markDegraded("startup_canceled")
 		return ctx.Err()
 	}
 }

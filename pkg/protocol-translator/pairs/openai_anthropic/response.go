@@ -127,7 +127,7 @@ func ConvertNonStreamResponse(ctx context.Context, body []byte) ([]byte, *transl
 
 	// ── Compose envelope ─────────────────────────────────────────────
 	// We build the JSON literal by hand (string concatenation through
-	// strings.Builder) rather than marshalling a typed struct because
+	// strings.Builder) rather than marshaling a typed struct because
 	// the message.content "null vs empty string" decision is shape-
 	// dependent (null when there are tool_calls and no text; empty
 	// string otherwise) and encoding/json's Marshaler interface doesn't

@@ -187,7 +187,7 @@ func TestRewriteToolNamesReverseJSON_RestoresOriginal(t *testing.T) {
 }
 
 // TestRewriteToolNamesReverseJSON_EmptyMappingByteEqual verifies the no-op
-// path returns the original byte slice (not just a re-marshalled equivalent),
+// path returns the original byte slice (not just a re-marshaled equivalent),
 // avoiding allocation churn for the common claude-CLI traffic case.
 func TestRewriteToolNamesReverseJSON_EmptyMappingByteEqual(t *testing.T) {
 	in := []byte(`{"id":"msg_x","content":[{"type":"text","text":"hi"}]}`)

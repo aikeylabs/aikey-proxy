@@ -48,6 +48,8 @@ func mkReq(stream, traceID string) *observer.RequestContext {
 	}
 }
 
+//nolint:unparam // `stream` kept parameterized so future cases can read
+// other ndjson streams (e.g. agent_chat) without re-plumbing the helper.
 func readEvents(t *testing.T, baseDir, slug, stream string) []Event {
 	t.Helper()
 	path := filepath.Join(baseDir, slug, stream+".ndjson")
@@ -59,8 +61,9 @@ func readEvents(t *testing.T, baseDir, slug, stream string) []Event {
 		}
 		t.Fatalf("read %s: %v", path, err)
 	}
-	var out []Event
-	for _, line := range strings.Split(strings.TrimSpace(string(data)), "\n") {
+	lines := strings.Split(strings.TrimSpace(string(data)), "\n")
+	out := make([]Event, 0, len(lines))
+	for _, line := range lines {
 		if line == "" {
 			continue
 		}

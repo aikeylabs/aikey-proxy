@@ -13,6 +13,8 @@ import (
 
 // --- helpers ---
 
+//nolint:unparam // `method` kept parameterized so non-POST cases can
+// reuse this helper without re-plumbing.
 func newJSONRequest(method, url string, body map[string]any) *http.Request {
 	b, _ := json.Marshal(body)
 	req := httptest.NewRequest(method, url, bytes.NewReader(b))

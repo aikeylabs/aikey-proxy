@@ -110,7 +110,7 @@ func Authenticate(headers requestHeaders, registry *vkeys.Registry, appCtx *AppC
 		return nil, &AuthError{
 			StatusCode: http.StatusServiceUnavailable,
 			ErrorCode:  "REGISTRY_NOT_AVAILABLE",
-			Message:    "Server is not ready (token registry uninitialised). Restart proxy or retry shortly.",
+			Message:    "Server is not ready (token registry uninitialized). Restart proxy or retry shortly.",
 		}
 	}
 

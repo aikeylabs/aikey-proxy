@@ -78,7 +78,7 @@ func TestLiveAnthropic_MaskedRequestAcceptedAndAnswered(t *testing.T) {
 	var forwarded []byte
 	capture := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		forwarded, _ = io.ReadAll(r.Body)
-		up, _ := http.NewRequest("POST", base+"/v1/messages", bytes.NewReader(forwarded))
+		up, _ := http.NewRequestWithContext(r.Context(), "POST", base+"/v1/messages", bytes.NewReader(forwarded))
 		up.Header.Set("content-type", "application/json")
 		up.Header.Set("x-api-key", key)
 		up.Header.Set("authorization", "Bearer "+key) // some Anthropic-compatible proxies use Bearer

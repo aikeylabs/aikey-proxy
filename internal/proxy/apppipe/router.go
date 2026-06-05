@@ -18,7 +18,7 @@
 // 2026-05-21 Phase 2 Day 7 URL redesign:
 //
 // The URL `<protocol>` segment that lived between <slug> and v1 in Phase 1
-// (`/apps/<slug>/<protocol>/v1/...`) was REMOVED in favour of inferring
+// (`/apps/<slug>/<protocol>/v1/...`) was REMOVED in favor of inferring
 // the upstream from body.model at request time. Background: LangChain
 // research confirmed that "protocol via URL segment" is non-standard
 // (LiteLLM / OpenRouter / Kong all route via body.model field, never URL

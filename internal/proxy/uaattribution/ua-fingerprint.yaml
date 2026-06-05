@@ -44,9 +44,16 @@ rules:
     slug: "continue"
     # Continue.dev IDE extension.
 
+  - prefix: "codex-tui/"
+    slug: "codex"
+    # OpenAI Codex CLI — the ACTUAL client UA (the TUI). Format:
+    # codex-tui/<semver> (...). Verified live 2026-06-05 from the proxy's
+    # ua-attribution WARN log; the older "codex/" guess below never matched
+    # the real client, so codex traffic was bucketing to "unknown-app".
+
   - prefix: "codex/"
     slug: "codex"
-    # OpenAI Codex CLI.
+    # Older / hypothetical Codex CLI UA — kept for forward-compat.
 
   - prefix: "openai-cli/"
     slug: "codex"

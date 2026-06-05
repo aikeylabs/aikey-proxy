@@ -422,7 +422,15 @@ func (h *Handler) HealthProviders(w http.ResponseWriter, r *http.Request) {
 	results := make([]result, 0, len(knownProviders))
 	for _, p := range knownProviders {
 		start := time.Now()
-		resp, err := client.Get(p.baseURL)
+		req, reqErr := http.NewRequestWithContext(r.Context(), "GET", p.baseURL, nil)
+		if reqErr != nil {
+			results = append(results, result{
+				Provider: p.code, BaseURL: p.baseURL,
+				Reachable: false, Error: "request_build_failed",
+			})
+			continue
+		}
+		resp, err := client.Do(req)
 		latency := time.Since(start).Milliseconds()
 		if err != nil {
 			results = append(results, result{
@@ -533,7 +541,7 @@ func (h *Handler) HealthKeys(w http.ResponseWriter, r *http.Request) {
 	results := make([]result, 0, len(targets))
 	for _, t := range targets {
 		start := time.Now()
-		code, callErr := probeKey(client, t)
+		code, callErr := probeKey(r.Context(), client, t)
 		latency := time.Since(start).Milliseconds()
 
 		// 200        → key confirmed valid (inference succeeded).
@@ -569,7 +577,7 @@ func (h *Handler) HealthKeys(w http.ResponseWriter, r *http.Request) {
 //   - 401 / 403  → key rejected (invalid or expired)
 //   - other 4xx  → authenticated (auth passed), request/model issue — still treated as ok
 //   - 5xx        → provider-side server error
-func probeKey(client *http.Client, t KeyCheckTarget) (int, error) {
+func probeKey(ctx context.Context, client *http.Client, t KeyCheckTarget) (int, error) {
 	baseURL := strings.TrimRight(t.BaseURL, "/")
 	if baseURL == "" {
 		baseURL = providerDefaultBaseURL(t.Provider)
@@ -581,9 +589,9 @@ func probeKey(client *http.Client, t KeyCheckTarget) (int, error) {
 
 	switch t.Protocol {
 	case "anthropic":
-		return probeAnthropic(client, baseURL, t.APIKey)
+		return probeAnthropic(ctx, client, baseURL, t.APIKey)
 	case "google", "gemini":
-		return probeGoogle(client, baseURL, t.APIKey)
+		return probeGoogle(ctx, client, baseURL, t.APIKey)
 	default: // openai, deepseek, kimi_code, moonshot, etc.
 		// 2026-05-08 Kimi 双平台拆分 review feedback (medium):
 		// probeModelForProtocol 名字误导,实际接收 provider code 而非 protocol。
@@ -592,14 +600,14 @@ func probeKey(client *http.Client, t KeyCheckTarget) (int, error) {
 		// 会 reject。改传 t.Provider (provider_code: kimi_code / moonshot / ...) ,
 		// probeModelForProtocol 内的 kimi_code → kimi-k2.5、moonshot → moonshot-v1-8k
 		// case 才能真正生效。
-		return probeOpenAICompat(client, baseURL, t.APIKey, probeModelForProtocol(t.Provider))
+		return probeOpenAICompat(ctx, client, baseURL, t.APIKey, probeModelForProtocol(t.Provider))
 	}
 }
 
 // probeAnthropic sends a minimal POST /v1/messages (max_tokens=1) to verify the key.
-func probeAnthropic(client *http.Client, baseURL, apiKey string) (int, error) {
+func probeAnthropic(ctx context.Context, client *http.Client, baseURL, apiKey string) (int, error) {
 	body := `{"model":"claude-3-haiku-20240307","max_tokens":1,"messages":[{"role":"user","content":"hi"}]}`
-	req, err := http.NewRequest("POST", baseURL+"/v1/messages", strings.NewReader(body))
+	req, err := http.NewRequestWithContext(ctx, "POST", baseURL+"/v1/messages", strings.NewReader(body))
 	if err != nil {
 		return 0, err
 	}
@@ -615,9 +623,9 @@ func probeAnthropic(client *http.Client, baseURL, apiKey string) (int, error) {
 }
 
 // probeOpenAICompat sends a minimal POST /v1/chat/completions (max_tokens=1) to verify the key.
-func probeOpenAICompat(client *http.Client, baseURL, apiKey, model string) (int, error) {
+func probeOpenAICompat(ctx context.Context, client *http.Client, baseURL, apiKey, model string) (int, error) {
 	body := fmt.Sprintf(`{"model":%q,"max_tokens":1,"messages":[{"role":"user","content":"hi"}]}`, model)
-	req, err := http.NewRequest("POST", baseURL+"/v1/chat/completions", strings.NewReader(body))
+	req, err := http.NewRequestWithContext(ctx, "POST", baseURL+"/v1/chat/completions", strings.NewReader(body))
 	if err != nil {
 		return 0, err
 	}
@@ -632,10 +640,10 @@ func probeOpenAICompat(client *http.Client, baseURL, apiKey, model string) (int,
 }
 
 // probeGoogle sends a minimal POST to the Gemini generateContent endpoint to verify the key.
-func probeGoogle(client *http.Client, baseURL, apiKey string) (int, error) {
+func probeGoogle(ctx context.Context, client *http.Client, baseURL, apiKey string) (int, error) {
 	body := `{"contents":[{"parts":[{"text":"hi"}]}]}`
 	url := fmt.Sprintf("%s/v1beta/models/gemini-1.5-flash:generateContent?key=%s", baseURL, apiKey)
-	req, err := http.NewRequest("POST", url, strings.NewReader(body))
+	req, err := http.NewRequestWithContext(ctx, "POST", url, strings.NewReader(body))
 	if err != nil {
 		return 0, err
 	}
@@ -788,7 +796,7 @@ func (h *Handler) ProbePing(w http.ResponseWriter, r *http.Request) {
 	// Resolve upstream proxy for THIS specific target. Precedence:
 	//   1. config.upstream_proxy.url — explicit config wins.
 	//   2. HTTPS_PROXY / HTTP_PROXY env via Go's ProxyFromEnvironment —
-	//      honours NO_PROXY automatically, so targets like 127.0.0.1 or
+	//      honors NO_PROXY automatically, so targets like 127.0.0.1 or
 	//      localhost correctly bypass the HTTP proxy even when the shell
 	//      has `https_proxy=...` set (the 2026-04-21 test-flake scenario
 	//      from the user's Clash-configured shell).

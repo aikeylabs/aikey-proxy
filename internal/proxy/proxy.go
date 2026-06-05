@@ -75,7 +75,7 @@ type Proxy struct {
 	reporter           *events.Reporter  // usage reporting to collector-service (nil = disabled)
 	wal                *events.WALWriter // local JSONL WAL (shared with reporter when both set; sole writer when reporter is nil)
 	transport          http.RoundTripper // nil → http.DefaultTransport (reads env vars)
-	proxyCtx           context.Context   // cancelled when the proxy shuts down
+	proxyCtx           context.Context   // canceled when the proxy shuts down
 	proxyInstanceID    string
 	// Delivery integrity (2026-05-30). sourceID is the vault's stable source
 	// identity stamped on every reported event; seqAlloc hands out the
@@ -168,7 +168,7 @@ type Proxy struct {
 
 // SetTransport sets a custom RoundTripper for outbound requests to AI providers.
 // Must be called before serving requests. A nil value restores the default
-// behaviour (http.DefaultTransport, which honours HTTP_PROXY / HTTPS_PROXY env vars).
+// behavior (http.DefaultTransport, which honors HTTP_PROXY / HTTPS_PROXY env vars).
 func (p *Proxy) SetTransport(t http.RoundTripper) {
 	p.transport = t
 	if t != nil {
@@ -176,7 +176,7 @@ func (p *Proxy) SetTransport(t http.RoundTripper) {
 	}
 }
 
-// New creates a new Proxy. ctx is the proxy lifecycle context; cancelling it
+// New creates a new Proxy. ctx is the proxy lifecycle context; canceling it
 // stops all detached upstream calls (called on proxy shutdown).
 // If v also implements ActiveKeyReader, path-prefix routing is enabled automatically.
 func New(v VaultGetter, reg *vkeys.Registry, prov *provider.Registry, coll *events.Collector, ctx context.Context) *Proxy {
@@ -260,9 +260,9 @@ func (p *Proxy) AppHealthSnapshot() []apppipe.AppHealth {
 }
 
 // recordAppHealth is the proxy-internal hook called from handleAppPipeline
-// after each request completes (success OR error path). Centralised so the
+// after each request completes (success OR error path). Centralized so the
 // "what counts as a health observation" decision lives in one place: any
-// app-pipeline request whose AppSlug is known at finalisation time updates
+// app-pipeline request whose AppSlug is known at finalization time updates
 // the cache, regardless of where in the pipeline it terminated (400 from
 // the BASE_URL_MISCONFIGURED guard, 401 from authn, 502 from upstream, 200
 // from a clean stream — all record).

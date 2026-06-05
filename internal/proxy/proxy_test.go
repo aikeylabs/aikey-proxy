@@ -1157,7 +1157,7 @@ func TestExtractModel_HugeBody_SkipsParsingAndLeavesBodyAlone(t *testing.T) {
 	}
 }
 
-// Regression guard for 2026-04-21 bug: Kimi 1.36.0 serialises `messages`
+// Regression guard for 2026-04-21 bug: Kimi 1.36.0 serializes `messages`
 // as the first top-level field (huge system prompt + tools + history) and
 // `prompt_cache_key` only after it. An earlier streaming-prefix design
 // that only scanned the first 16 KB missed the session id, so every Kimi

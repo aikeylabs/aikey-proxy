@@ -27,7 +27,7 @@ import (
 //     propagation.
 //
 //  2. A watcher goroutine calls upstream.Close() as soon as reqCtx is
-//     cancelled (Go HTTP server detects client disconnect via backgroundRead).
+//     canceled (Go HTTP server detects client disconnect via backgroundRead).
 //
 //  3. The select at the top of the read loop catches reqCtx cancellation
 //     between Read calls.
@@ -52,14 +52,14 @@ func (d *streamDrainer) Close() error {
 // goroutine fills InputTokens / OutputTokens from whatever SSE data was
 // received before the stream ended or the client disconnected.
 //
-// reqCtx is cancelled when the client disconnects (or proxyCtx when shutting
+// reqCtx is canceled when the client disconnects (or proxyCtx when shutting
 // down).  Either cancellation closes upstream and unblocks the drainer.
 // reporterCallback is called when the stream ends to report usage.
 // completion captures how the stream terminated:
 //   - "complete":    upstream reached normal EOF and we forwarded all bytes
 //   - "partial":     client disconnected before EOF; recorded tokens reflect
 //                    only the prefix we successfully forwarded
-//   - "interrupted": proxy was shutting down (proxyCtx cancelled) or the
+//   - "interrupted": proxy was shutting down (proxyCtx canceled) or the
 //                    upstream read errored mid-stream
 // Nil means no reporting.
 type reporterCallback func(breakdown provider.TokenBreakdown, completion string)
@@ -98,7 +98,7 @@ func newStreamDrainer(
 
 	// Watcher: close upstream as soon as the client disconnects or the proxy
 	// shuts down. Complements the Close() path for cases where the ReverseProxy
-	// does not call Close() before the context is cancelled.
+	// does not call Close() before the context is canceled.
 	// Isolated: per-stream goroutine; a panic here must not kill the whole
 	// proxy for every other caller.
 	observability.GoSafe("proxy.stream_drainer.watcher", observability.Isolated, func() {

@@ -1,7 +1,7 @@
 package provider
 
 import (
-	"net/http"
+	"net/http/httptest"
 	"net/url"
 	"testing"
 )
@@ -135,7 +135,7 @@ func TestApplyBaseURL(t *testing.T) {
 
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			req, _ := http.NewRequest("POST", "http://placeholder"+tc.reqPath, nil)
+			req := httptest.NewRequest("POST", "http://placeholder"+tc.reqPath, nil)
 			req.URL = &url.URL{Path: tc.reqPath}
 			if err := applyBaseURL(req, tc.baseURL); err != nil {
 				t.Fatalf("applyBaseURL: %v", err)

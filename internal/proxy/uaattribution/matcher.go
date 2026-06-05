@@ -26,6 +26,7 @@ package uaattribution
 import (
 	_ "embed"
 	"fmt"
+	"log/slog"
 	"strings"
 	"sync"
 
@@ -73,6 +74,31 @@ func (m *Matcher) Match(userAgent string) string {
 		}
 	}
 	return m.fallback
+}
+
+// MatchOrLog is Match with an observability hook: when a NON-EMPTY User-Agent
+// falls through to the fallback slug (no rule matched), it emits a WARN with the
+// (truncated) raw UA. Without it, an unrecognized client — e.g. a codex / Cursor
+// version whose UA prefix drifted from ua-fingerprint.yaml — is silently
+// bucketed to "unknown-app" with no way to learn the real UA (ODS doesn't
+// persist user_agent; the matcher is the last place that sees it). Per
+// logging-conventions a fallback-to-default path must WARN, not return the
+// default silently. The caller's logger already carries request_id / trace_id.
+func (m *Matcher) MatchOrLog(userAgent string, logger *slog.Logger) string {
+	slug := m.Match(userAgent)
+	if logger == nil {
+		return slug
+	}
+	if ua := strings.TrimSpace(userAgent); ua != "" && slug == m.fallback {
+		const maxLen = 160
+		shown := ua
+		if len(shown) > maxLen {
+			shown = shown[:maxLen]
+		}
+		logger.Warn("ua attribution: unrecognized User-Agent, bucketed to fallback app slug",
+			"user_agent", shown, "fallback_slug", slug)
+	}
+	return slug
 }
 
 // Load parses raw YAML bytes into a Matcher.

@@ -81,7 +81,7 @@ func (e *BindingResolveError) Error() string { return e.ErrorCode + ": " + e.Mes
 //
 // The interface is here (not in proxy) to avoid an import cycle: proxy
 // already imports apppipe, so apppipe owns the contract and proxy
-// fulfills it.
+// fulfillls it.
 type BindingResolver interface {
 	ResolveBindingCredential(
 		r *http.Request,

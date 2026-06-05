@@ -76,7 +76,7 @@ func TestHealthCache_ConcurrentRecordCalls(t *testing.T) {
 	now := time.Now()
 	for g := 0; g < 16; g++ {
 		wg.Add(1)
-		go func(id int) {
+		go func(_ int) {
 			defer wg.Done()
 			for i := 0; i < 1000; i++ {
 				c.RecordCall("slug", 200, "", now)

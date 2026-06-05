@@ -2,6 +2,7 @@ package events
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"fmt"
 	"log/slog"
@@ -219,7 +220,7 @@ func NewReporter(cfg ReporterConfig) (*Reporter, error) {
 	// Start upload loop if any destination is configured (legacy single
 	// CollectorURL OR per-route CollectorRoutes with at least one
 	// non-empty entry). With both unset, events still get WAL'd but
-	// nothing uploads — same as the pre-CollectorRoutes behaviour when
+	// nothing uploads — same as the pre-CollectorRoutes behavior when
 	// CollectorURL was empty.
 	hasAnyURL := cfg.CollectorURL != ""
 	if !hasAnyURL {
@@ -240,7 +241,7 @@ func NewReporter(cfg ReporterConfig) (*Reporter, error) {
 	return r, nil
 }
 
-// urlForEvent picks the upload URL for an event, honouring per-route
+// urlForEvent picks the upload URL for an event, honoring per-route
 // overrides ahead of the legacy single-URL CollectorURL. Returns "" when
 // no destination is configured for the event's RouteSource — caller must
 // skip the upload (event is already WAL'd).
@@ -266,7 +267,7 @@ func (r *Reporter) urlForRouteSource(routeSource string) string {
 // legacy global CollectorToken wrapped in a StaticTokenCredential.
 // Returns nil only when neither path is configured — caller (doUpload)
 // then sends the upload with no Authorization header (matches pre-B
-// behaviour when CollectorToken was "").
+// behavior when CollectorToken was "").
 func (r *Reporter) credentialForRouteSource(routeSource string) Credential {
 	if r.cfg.CollectorRouteCredentials != nil {
 		if c, ok := r.cfg.CollectorRouteCredentials[routeSource]; ok && c != nil {
@@ -444,7 +445,7 @@ func (r *Reporter) drainOnce() {
 		// Partial entries may still be returned; fall through to upload them.
 	}
 
-	var pending []ReportableEvent
+	pending := make([]ReportableEvent, 0, len(entries))
 	for i := range entries {
 		e := &entries[i]
 		ev := e.EventJSON
@@ -616,7 +617,7 @@ func (r *Reporter) seenV1Locked(eventID string) bool {
 // loop. The retry/DLW logic itself is unchanged.
 //
 // cred may be nil — doUpload tolerates that by sending without an
-// Authorization header (matches pre-CollectorToken behaviour).
+// Authorization header (matches pre-CollectorToken behavior).
 func (r *Reporter) uploadGroupTo(collectorURL string, cred Credential, batch []ReportableEvent) {
 	req := batchRequest{
 		Source:          "aikey-proxy",
@@ -743,13 +744,13 @@ func (r *Reporter) onUploadFail(count int, upErr *uploadError, terminal bool) {
 //
 // cred (added 2026-05-11) is the per-RouteSource credential resolved by
 // uploadBatch. If nil, the request goes without an Authorization header —
-// matches pre-CollectorToken behaviour for credential-free deployments.
+// matches pre-CollectorToken behavior for credential-free deployments.
 // Bearer() failures are surfaced as a synthetic 401-class uploadError so
 // the retry/dead-letter loop treats stale credentials the same as a
 // server-side 401 (no infinite retry; lands in dead_letter.jsonl with
 // the credential error message as response body).
 func (r *Reporter) doUpload(url string, body []byte, cred Credential) (*batchResponse, *uploadError) {
-	httpReq, err := http.NewRequest(http.MethodPost, url, bytes.NewReader(body))
+	httpReq, err := http.NewRequestWithContext(context.Background(), http.MethodPost, url, bytes.NewReader(body))
 	if err != nil {
 		return nil, &uploadError{Err: fmt.Errorf("build request: %w", err)}
 	}

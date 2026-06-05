@@ -83,7 +83,7 @@ import (
 type StreamingObserver interface {
 	// OnRequestStart fires once per request, after auth + binding
 	// succeed and before any upstream bytes are read. Use it to
-	// initialise per-request state (typically keyed by req.TraceID).
+	// initialize per-request state (typically keyed by req.TraceID).
 	OnRequestStart(ctx context.Context, req *RequestContext)
 
 	// OnSSEEvent fires once per upstream SSE event. eventType is the
@@ -94,7 +94,7 @@ type StreamingObserver interface {
 
 	// OnRequestEnd fires once per request after upstream EOF /
 	// disconnect / shutdown. totalLatencyMs is wall-clock from
-	// OnRequestStart to here. Use this hook to finalise + submit
+	// OnRequestStart to here. Use this hook to finalize + submit
 	// evidence; the request's state map entry is cleaned up
 	// immediately after this returns.
 	OnRequestEnd(ctx context.Context, req *RequestContext, totalLatencyMs int)
@@ -181,7 +181,7 @@ type metadataPayload struct {
 	StartedAtUnixMs int64  `json:"started_at_unix_ms,omitempty"`
 }
 
-// MetadataJSON returns a stable JSON serialisation of the per-request
+// MetadataJSON returns a stable JSON serialization of the per-request
 // metadata fields observers commonly need. Lazily computed on first call
 // and cached across subsequent calls — including concurrent observer
 // goroutine calls; sync.Once gives us atomic fast path + at-most-once
@@ -192,7 +192,7 @@ type metadataPayload struct {
 // pay one json.Marshal in aggregate, regardless of how many observers
 // call this. Critical optimisation for the 5+ observer / 1000+ req/sec
 // case: with N observers each marshaling independently the proxy spends
-// O(N) CPU per request on duplicate serialisation; this helper collapses
+// O(N) CPU per request on duplicate serialization; this helper collapses
 // that to O(1).
 //
 // Wire format is v=1 (see metadataPayload). Locked — any change is a
@@ -204,7 +204,7 @@ type metadataPayload struct {
 //
 // Returns the marshal error from the first attempt; cached too, so
 // subsequent calls see the same error without re-trying (consistent
-// per-request behaviour — a corrupt RequestContext should produce the
+// per-request behavior — a corrupt RequestContext should produce the
 // same failure for every observer).
 func (r *RequestContext) MetadataJSON() ([]byte, error) {
 	r.metadataJSONOnce.Do(func() {
@@ -239,7 +239,7 @@ func (r *RequestContext) MetadataJSON() ([]byte, error) {
 //  3. Update relevant Observer descriptors' Streams to declare interest
 //
 // We use string typed constants (rather than an enum / iota) so
-// observers from external repositories (degrade-detector/proxy-plugin/*)
+// observers from external repositories (ai-degrade-detector/proxy-plugin/*)
 // can hardcode the literal value when this package's version skews.
 const (
 	// StreamUserChat — traffic on legacy `/v1/...` and `/<provider>/v1/...`
@@ -351,14 +351,14 @@ var FirstPartyAllowlist = map[string]bool{
 //
 // observer packages call RegisterObserver from their own init() functions:
 //
-//     // degrade-detector/proxy-plugin/rhythm/registration.go
+//     // ai-degrade-detector/proxy-plugin/rhythm/registration.go
 //     func init() {
 //         observer.RegisterObserver(observer.Observer{...})
 //     }
 //
 // The proxy main binary picks up registrations via a side-effect import:
 //
-//     import _ "github.com/aikeylabs/degrade-detector/proxy-plugin/rhythm"
+//     import _ "github.com/aikeylabs/ai-degrade-detector/proxy-plugin/rhythm"
 //
 // Adding a new observer therefore touches exactly TWO lines in the proxy
 // main repo: the import line, and the FirstPartyAllowlist entry. No
@@ -376,7 +376,7 @@ var (
 //   - Name is already registered (ambiguous descriptors are a bug)
 //
 // Safe to call from package init() — concurrent init() calls from
-// different packages serialise on `registrationMu`.
+// different packages serialize on `registrationMu`.
 func RegisterObserver(o Observer) {
 	registrationMu.Lock()
 	defer registrationMu.Unlock()

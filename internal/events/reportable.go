@@ -434,7 +434,7 @@ func BuildReportableEvent(opts ReportOpts) ReportableEvent {
 //   - aikey-proxy/internal/vault/route_token_form.go::firstPartyAppBearerWhitelist
 //   - aikey-proxy/internal/supervisor/team_token_normalize.go::firstPartyAppBearerWhitelist
 //   - aikey-cli/src/migrations.rs::DEGRADE_DETECTOR_FIRST_PARTY_BEARER
-//   - degrade-detector/server_local/services/check_orchestrator.py::FIRST_PARTY_APP_KEY
+//   - ai-degrade-detector/server_local/services/check_orchestrator.py::FIRST_PARTY_APP_KEY
 // Adding a new first-party app means touching ALL of these — same
 // lockstep convention as the existing 3 whitelist copies.
 var firstPartyBearerToSlug = map[string]string{

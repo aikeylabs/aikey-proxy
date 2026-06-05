@@ -405,7 +405,7 @@ func TestHandle_AppPath_UpstreamError_LogsForensic(t *testing.T) {
 	p := setupTestProxyWithActive(t, av)
 	seedAppRouteInProxy(p, "err-test-app")
 
-	// Use a model the resolver recognises as claude-family (prefix
+	// Use a model the resolver recognizes as claude-family (prefix
 	// "claude-") so it routes to the anthropic upstream — letting the
 	// test exercise the END-OF-PIPELINE 4xx path (upstream rejects),
 	// not the EARLY-RESOLUTION 4xx path (UPSTREAM_UNINFERRABLE for

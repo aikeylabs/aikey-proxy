@@ -14,7 +14,7 @@ const defaultUpstreamTimeout = 10 * time.Minute
 
 // detachedTransport wraps an http.RoundTripper and replaces the per-request
 // context with one derived from the proxy lifecycle context. This ensures
-// in-flight upstream calls are NOT cancelled when the client disconnects;
+// in-flight upstream calls are NOT canceled when the client disconnects;
 // they run until completion (or the upstream timeout / proxy shutdown).
 type detachedTransport struct {
 	inner      http.RoundTripper
@@ -32,7 +32,7 @@ func (t *detachedTransport) RoundTrip(req *http.Request) (*http.Response, error)
 		return nil, err
 	}
 
-	// Wrap the body so the per-request context is cancelled when it is closed,
+	// Wrap the body so the per-request context is canceled when it is closed,
 	// preventing context leaks for long-lived connections.
 	resp.Body = &cancelOnClose{ReadCloser: resp.Body, cancel: cancel}
 	return resp, nil

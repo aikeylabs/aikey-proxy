@@ -35,6 +35,10 @@ func TestMatch(t *testing.T) {
 		{"cline lowercase", "cline/3.0.1", "cline"},
 		{"Cline capitalized", "Cline/3.0.1", "cline"},
 		{"codex prefix", "codex/1.0.0", "codex"},
+		// Real OpenAI Codex CLI UA (verified live 2026-06-05) — the TUI sends
+		// codex-tui/<semver>, NOT codex/, which is why it bucketed to unknown-app
+		// until the codex-tui/ rule was added.
+		{"codex-tui real client", "codex-tui/0.137.0 (Mac OS 15.0; arm64)", "codex"},
 		{"unknown UA → fallback", "FooBar/1.0", "unknown-app"},
 		{"Mozilla browser → fallback", "Mozilla/5.0 (Macintosh)", "unknown-app"},
 		// Prefix match is anchored at start — a substring match must NOT win.

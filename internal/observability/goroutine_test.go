@@ -76,7 +76,7 @@ func TestGoSafe_IsolatedPanicRecovered(t *testing.T) {
 			}
 			// The all-goroutine traceback section must be present: it is
 			// what turns a single-goroutine panic dump into a
-			// deadlock-diagnosable artefact without risking key material
+			// deadlock-diagnosable artifact without risking key material
 			// leakage (pointer args only, no heap contents).
 			if !bytes.Contains(body, []byte("all_goroutines:")) {
 				t.Fatalf("dump missing all_goroutines section: %s", body)

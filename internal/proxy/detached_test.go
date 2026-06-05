@@ -12,10 +12,10 @@ import (
 
 // ---- detachedTransport tests ------------------------------------------------
 
-// TestDetachedTransport_CompletesAfterClientContextCancelled is the core
+// TestDetachedTransport_CompletesAfterClientContextCanceled is the core
 // correctness test: the upstream call must finish even if the original client
-// context is cancelled mid-flight.
-func TestDetachedTransport_CompletesAfterClientContextCancelled(t *testing.T) {
+// context is canceled mid-flight.
+func TestDetachedTransport_CompletesAfterClientContextCanceled(t *testing.T) {
 	upstreamReady   := make(chan struct{})
 	upstreamProceed := make(chan struct{})
 
@@ -24,8 +24,8 @@ func TestDetachedTransport_CompletesAfterClientContextCancelled(t *testing.T) {
 		select {
 		case <-upstreamProceed:
 		case <-r.Context().Done():
-			// upstream's own context (derived from proxyCtx) should NOT be cancelled
-			// when the client context is cancelled.
+			// upstream's own context (derived from proxyCtx) should NOT be canceled
+			// when the client context is canceled.
 		}
 		w.WriteHeader(200)
 		w.Write([]byte("upstream_done"))
@@ -71,14 +71,14 @@ func TestDetachedTransport_CompletesAfterClientContextCancelled(t *testing.T) {
 			t.Fatalf("body = %q, want %q", string(body), "upstream_done")
 		}
 	case <-time.After(5 * time.Second):
-		t.Fatal("timed out: upstream call was cancelled despite using detachedTransport")
+		t.Fatal("timed out: upstream call was canceled despite using detachedTransport")
 	}
 }
 
-// TestDetachedTransport_AbortedByProxyContext verifies that cancelling the
+// TestDetachedTransport_AbortedByProxyContext verifies that canceling the
 // proxy lifecycle context does abort the upstream call.
 func TestDetachedTransport_AbortedByProxyContext(t *testing.T) {
-	// Upstream that blocks until its own context is cancelled.
+	// Upstream that blocks until its own context is canceled.
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		<-r.Context().Done()
 		w.WriteHeader(503)
@@ -92,7 +92,7 @@ func TestDetachedTransport_AbortedByProxyContext(t *testing.T) {
 		maxTimeout: 30 * time.Second,
 	}
 
-	req, _ := http.NewRequest("GET", upstream.URL, nil)
+	req, _ := http.NewRequestWithContext(context.Background(), "GET", upstream.URL, nil)
 
 	done := make(chan error, 1)
 	go func() {
@@ -106,7 +106,7 @@ func TestDetachedTransport_AbortedByProxyContext(t *testing.T) {
 	select {
 	case err := <-done:
 		if err == nil {
-			t.Fatal("expected error after proxy context cancelled, got nil")
+			t.Fatal("expected error after proxy context canceled, got nil")
 		}
 	case <-time.After(3 * time.Second):
 		t.Fatal("timed out waiting for abort after proxyCtx cancel")
@@ -128,7 +128,7 @@ func TestDetachedTransport_MaxTimeoutBounds(t *testing.T) {
 		maxTimeout: 150 * time.Millisecond, // very short for testing
 	}
 
-	req, _ := http.NewRequest("GET", upstream.URL, nil)
+	req, _ := http.NewRequestWithContext(context.Background(), "GET", upstream.URL, nil)
 	start := time.Now()
 	_, err := dt.RoundTrip(req)
 	elapsed := time.Since(start)
@@ -142,7 +142,7 @@ func TestDetachedTransport_MaxTimeoutBounds(t *testing.T) {
 }
 
 // TestDetachedTransport_BodyWrappedAsCancelOnClose verifies that the transport
-// wraps the response body as *cancelOnClose (so the context is cancelled on close).
+// wraps the response body as *cancelOnClose (so the context is canceled on close).
 func TestDetachedTransport_BodyWrappedAsCancelOnClose(t *testing.T) {
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(200)
@@ -160,7 +160,7 @@ func TestDetachedTransport_BodyWrappedAsCancelOnClose(t *testing.T) {
 		maxTimeout: 5 * time.Second,
 	}
 
-	req, _ := http.NewRequest("GET", upstream.URL, nil)
+	req, _ := http.NewRequestWithContext(context.Background(), "GET", upstream.URL, nil)
 	resp, err := dt.RoundTrip(req)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
@@ -193,7 +193,7 @@ func TestDetachedTransport_NormalResponse(t *testing.T) {
 		maxTimeout: 5 * time.Second,
 	}
 
-	req, _ := http.NewRequest("GET", upstream.URL, nil)
+	req, _ := http.NewRequestWithContext(context.Background(), "GET", upstream.URL, nil)
 	resp, err := dt.RoundTrip(req)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)

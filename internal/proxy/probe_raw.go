@@ -236,7 +236,7 @@ func (p *Proxy) handleProbeRaw(w http.ResponseWriter, r *http.Request, canonical
 	// invariant per spec §4.3).
 	stripAikeyHeaders(upstreamReq.Header)
 
-	// 5. Send + time. Use p.transport so HTTP_PROXY env etc are honoured
+	// 5. Send + time. Use p.transport so HTTP_PROXY env etc are honored
 	// the same way as the regular upstream path.
 	transport := p.transport
 	if transport == nil {
@@ -427,8 +427,8 @@ func writeProbeRawJSON(w http.ResponseWriter, status int, body map[string]any) {
 	_ = json.NewEncoder(w).Encode(body)
 }
 
-// contextWithProbeTimeout returns a child context that is cancelled when
-// either the parent is cancelled (caller disconnect) or probeRawUpstreamTimeout
+// contextWithProbeTimeout returns a child context that is canceled when
+// either the parent is canceled (caller disconnect) or probeRawUpstreamTimeout
 // elapses. Caller is responsible for calling the returned cancel func.
 func contextWithProbeTimeout(parent context.Context) (context.Context, context.CancelFunc) {
 	return context.WithTimeout(parent, probeRawUpstreamTimeout)

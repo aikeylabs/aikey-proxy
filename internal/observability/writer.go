@@ -36,7 +36,7 @@ const (
 // internal channel is full. ERROR/FATAL callers should call Flush to drain
 // the queue before exiting.
 type AsyncWriter struct {
-	ch     chan []byte   // serialised log lines
+	ch     chan []byte   // serialized log lines
 	done   chan struct{} // closed when the writer goroutine exits
 	urgent chan struct{} // non-blocking signal: drain now
 

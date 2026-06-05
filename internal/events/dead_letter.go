@@ -274,7 +274,7 @@ func (r *Reporter) ReplayDeadLetter(ctx context.Context) (ReplayDeadLetterResult
 			// trying. Use a flag.
 			result.EntriesStillFailing++
 			result.EventsStillFailing += len(entry.Events)
-			result.LastError = "context cancelled"
+			result.LastError = "context canceled"
 			// Continue draining to keep remaining lines.
 			continue
 		default:

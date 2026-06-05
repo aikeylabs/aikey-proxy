@@ -9,7 +9,7 @@ require (
 	github.com/AiKeyLabs/pkg/buildinfo v0.0.0
 	github.com/AiKeyLabs/pkg/providerroutes v0.0.0
 	github.com/AiKeyLabs/pkg/usagehash v0.0.0
-	github.com/aikeylabs/degrade-detector/proxy-plugin/rhythm v0.0.0
+	github.com/aikeylabs/ai-degrade-detector/proxy-plugin/rhythm v0.0.0
 	golang.org/x/crypto v0.49.0
 	golang.org/x/term v0.41.0
 	gopkg.in/yaml.v3 v3.0.1
@@ -32,7 +32,7 @@ replace github.com/AiKeyLabs/aikey-auth-broker => ../aikey-auth-broker
 // is a separate Go module living side-by-side in the aikeylabs/ workspace.
 // CI / release pipelines pin to a tagged version + drop this replace; local
 // development uses the path replace so changes propagate without publish.
-replace github.com/aikeylabs/degrade-detector/proxy-plugin/rhythm => ../degrade-detector/proxy-plugin/rhythm
+replace github.com/aikeylabs/ai-degrade-detector/proxy-plugin/rhythm => ../ai-degrade-detector/proxy-plugin/rhythm
 
 require (
 	github.com/andybalholm/brotli v1.2.0 // indirect

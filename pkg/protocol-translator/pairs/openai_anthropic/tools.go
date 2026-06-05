@@ -66,7 +66,7 @@ func convertTools(inTools gjson.Result) ([]byte, *translator.TranslateError) {
 	if len(arr) == 0 {
 		return nil, nil
 	}
-	var entries []string
+	entries := make([]string, 0, len(arr))
 	for i, t := range arr {
 		typ := t.Get("type").String()
 		if typ != "function" && typ != "" {

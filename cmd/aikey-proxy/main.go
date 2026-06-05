@@ -44,7 +44,7 @@ import (
 	// observer.FirstPartyAllowlist (in pkg/observer/registry.go). No
 	// changes to internal/proxy/* or internal/supervisor/* are required —
 	// the framework picks up the new descriptor automatically.
-	_ "github.com/aikeylabs/degrade-detector/proxy-plugin/rhythm"
+	_ "github.com/aikeylabs/ai-degrade-detector/proxy-plugin/rhythm"
 
 	// P3 step 2c (2026-05-23, credential-mode-architecture SPEC §1.4):
 	// proxy-bundled ndjson-fanout observer. Reads vault `observe_streams`
@@ -121,12 +121,12 @@ func main() {
 		os.Exit(1)
 	}
 
-	// 2. Initialise structured logging: stderr text + async JSONL file.
+	// 2. Initialize structured logging: stderr text + async JSONL file.
 	logLevel := parseLogLevel(cfg.Log.Level)
 	logWriter, err := observability.SetupLogger(cfg.Log.Dir, "aikey-proxy", buildinfo.Get().String(), logLevel)
 	if err != nil {
 		// Non-fatal: fall back to text-only stderr logging.
-		slog.Warn("failed to initialise JSONL log writer, falling back to stderr only", "error", err)
+		slog.Warn("failed to initialize JSONL log writer, falling back to stderr only", "error", err)
 		setupTextLogging(logLevel)
 	}
 
@@ -322,7 +322,7 @@ func getVaultPassword() (string, error) {
 
 // buildTransport returns a custom http.Transport that routes outbound provider
 // requests through proxyURL. Returns nil when proxyURL is empty, which makes
-// httputil.ReverseProxy fall back to http.DefaultTransport (itself honouring
+// httputil.ReverseProxy fall back to http.DefaultTransport (itself honoring
 // HTTP_PROXY / HTTPS_PROXY / NO_PROXY environment variables).
 //
 // Supported schemes: http, https, socks5.
@@ -361,7 +361,7 @@ func parseLogLevel(level string) slog.Level {
 }
 
 // setupTextLogging configures the global logger to write text to stderr only
-// (fallback when the JSONL writer cannot be initialised).
+// (fallback when the JSONL writer cannot be initialized).
 func setupTextLogging(level slog.Level) {
 	slog.SetDefault(slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{
 		Level: level,

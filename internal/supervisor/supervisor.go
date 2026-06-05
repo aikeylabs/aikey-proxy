@@ -7,7 +7,7 @@
 //	Supervisor
 //	  ├─ net.Listener  (held for the lifetime of the process)
 //	  ├─ active  atomic.Pointer[generation]  (swapped on reload)
-//	  └─ reload mutex  (serialises concurrent reload requests)
+//	  └─ reload mutex  (serializes concurrent reload requests)
 //
 // On Reload():
 //  1. Build generation N+1: open vault, load keys, build proxy handler.
@@ -252,7 +252,7 @@ type Supervisor struct {
 	broker    proxy.OAuthBroker // OAuth broker (set via SetBroker); nil = OAuth disabled
 
 	active    atomic.Pointer[generation]
-	reloadMu  sync.Mutex // serialise concurrent reload requests
+	reloadMu  sync.Mutex // serialize concurrent reload requests
 	genID     atomic.Int64
 	startedAt time.Time
 
@@ -267,7 +267,7 @@ type Supervisor struct {
 	quotaCounter  *quota.Counter
 
 	// ctx / cancel bound the lifetime of all detached upstream calls.
-	// Cancelled in Shutdown() to stop any in-flight upstream requests.
+	// Canceled in Shutdown() to stop any in-flight upstream requests.
 	ctx    context.Context
 	cancel context.CancelFunc
 }
@@ -415,7 +415,7 @@ func (s *Supervisor) syncManagedKeys() {
 		allRoutes[token] = managedKeyToRoute(mk)
 	}
 
-	// 3. Personal key route tokens. Strict-form filter is centralised in
+	// 3. Personal key route tokens. Strict-form filter is centralized in
 	// buildPersonalRoutesFiltered (route_builders.go) — same helper used
 	// by buildGeneration's startup path so the two never drift. Legacy
 	// `aikey_vk_<64-hex>` and any non-strict shape get WARN-skipped; per
@@ -800,7 +800,7 @@ func providerProtocol(code string) string {
 
 // Reload builds a new generation, swaps it as active if the readiness gate
 // passes, drains the old generation, and records the loaded vault change_seq.
-// It serialises concurrent calls: a second Reload waits for the first to finish.
+// It serializes concurrent calls: a second Reload waits for the first to finish.
 func (s *Supervisor) Reload(ctx context.Context) error {
 	s.reloadMu.Lock()
 	defer s.reloadMu.Unlock()
@@ -895,7 +895,7 @@ func (s *Supervisor) Shutdown(timeout time.Duration) {
 	gen.close()
 }
 
-// buildGeneration creates a fully-initialised generation ready to handle requests.
+// buildGeneration creates a fully-initialized generation ready to handle requests.
 func (s *Supervisor) buildGeneration() (*generation, error) {
 	id := int(s.genID.Add(1))
 
@@ -1075,7 +1075,7 @@ func (s *Supervisor) buildGeneration() (*generation, error) {
 		// user-layer config.collector_credentials block. Today only the
 		// "team" route is wired (user JWT with auto-refresh against
 		// control-service). Personal / OAuth routes fall through to the
-		// legacy CollectorToken inside reporter — no change in behaviour.
+		// legacy CollectorToken inside reporter — no change in behavior.
 		//
 		// refresh_token is read directly from the vault's platform_account
 		// table (proxy already holds the master-derived key for vault
@@ -1181,7 +1181,7 @@ func (s *Supervisor) buildGeneration() (*generation, error) {
 //   - driftOffset: actual port - configured port (0 when no drift occurred)
 //
 // driftMax < 0 disables drift entirely (strict legacy: fail on first
-// EADDRINUSE). driftMax == 0 is honoured by config.applyDefaults() — yaml
+// EADDRINUSE). driftMax == 0 is honored by config.applyDefaults() — yaml
 // "port_drift_max: 0" gets coerced to DefaultPortDriftMax.
 func Listen(cfg *config.Config) (ln net.Listener, configuredAddr, actualAddr string, driftOffset int, err error) {
 	host := cfg.Listen.Host
@@ -1239,7 +1239,7 @@ type refreshTokenSource interface {
 
 // buildCollectorCredentials turns the yaml-merged collector_credentials
 // map into the events.Credential map the reporter consumes. Today only
-// `type: jwt` is recognised; future types (mTLS material, OAuth client
+// `type: jwt` is recognized; future types (mTLS material, OAuth client
 // creds for non-aikey backends, etc.) extend this switch.
 //
 // The refresh_token comes from vault, not yaml — see

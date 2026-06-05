@@ -260,7 +260,7 @@ func isTier1App(token string) bool {
 // §1.3.
 //
 // **Drift 防退化**: this map must equal the matching constants in:
-//   - degrade-detector/server_local/services/check_orchestrator.py
+//   - ai-degrade-detector/server_local/services/check_orchestrator.py
 //     ::FIRST_PARTY_APP_KEY
 //   - aikey-cli/src/migrations.rs::DEGRADE_DETECTOR_FIRST_PARTY_BEARER
 //   - aikey-proxy/internal/events/reportable.go::firstPartyBearerToSlug

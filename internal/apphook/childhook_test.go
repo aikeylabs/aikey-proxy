@@ -2,7 +2,6 @@ package apphook
 
 import (
 	"context"
-	"os/exec"
 	"path/filepath"
 	"runtime"
 	"testing"
@@ -22,9 +21,9 @@ func findDetectorBinary(t *testing.T) string {
 	aikeylabsDir := filepath.Dir(proxyDir)                    // .../aikeylabs
 	binary := filepath.Join(aikeylabsDir, "ai-compliance-detector", "bin", "detector")
 
-	if _, err := exec.LookPath(binary); err != nil {
-		// Not built yet — try the path anyway and let exec.Cmd report.
-	}
+	// Note: not stat-probing here — if the detector isn't built, the actual
+	// exec.Cmd reports a clearer error at run time. Keeping this function
+	// path-only avoids a useless extra stat call.
 	return binary
 }
 

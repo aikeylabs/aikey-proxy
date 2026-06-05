@@ -560,7 +560,7 @@ func resolveSessionID(req *http.Request, protocolType, providerCode string) stri
 //
 // Earlier a 16 KB streaming-prefix scan was added to reduce memory for
 // mid-size bodies, but it turned out to break real Kimi CLI 1.36.0
-// traffic: kosong's Python SDK serialises `messages` (huge array) as the
+// traffic: kosong's Python SDK serializes `messages` (huge array) as the
 // first top-level key and spreads `prompt_cache_key` via `**kwargs` AFTER
 // it. The prefix scan never reached the session id field, so Kimi WAL
 // events landed with empty session_id and the receipt hook did not fire.

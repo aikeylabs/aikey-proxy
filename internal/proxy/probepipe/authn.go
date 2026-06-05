@@ -31,7 +31,7 @@ func (e *AuthError) Error() string { return e.ErrorCode + ": " + e.Message }
 //   - aikey-proxy/internal/proxy/dispatch.go::firstPartyAppBearerWhitelist
 //   - aikey-proxy/internal/vault/route_token_form.go
 //   - aikey-proxy/internal/supervisor/team_token_normalize.go
-//   - degrade-detector/server_local/services/check_orchestrator.py::FIRST_PARTY_APP_KEY
+//   - ai-degrade-detector/server_local/services/check_orchestrator.py::FIRST_PARTY_APP_KEY
 //   - aikey-cli/src/migrations.rs::DEGRADE_DETECTOR_FIRST_PARTY_BEARER
 //
 // SPEC: workflow/CI/requirements/2026-05-23-credential-mode-architecture.md §1.3

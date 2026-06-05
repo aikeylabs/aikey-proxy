@@ -538,7 +538,7 @@ func TestReporter_MixedBatch_EachGroupGetsOwnBearer(t *testing.T) {
 // reporter.ReplayDeadLetter() re-reads dead_letter.jsonl, attempts to
 // re-deliver each entry using the CURRENT reporter config, and rewrites
 // the file with only the still-failing entries. These tests pin the
-// behaviour that backs `aikey proxy replay-dead-letter`.
+// behavior that backs `aikey proxy replay-dead-letter`.
 
 // Helper: build a reporter pointed at a stub server, seed dead_letter
 // with one or more pre-built entries, then drive ReplayDeadLetter()
@@ -571,8 +571,9 @@ func readDeadLetterEntries(t *testing.T, dir string) []deadLetterEntry {
 		}
 		t.Fatalf("read dead_letter: %v", err)
 	}
-	var out []deadLetterEntry
-	for _, line := range strings.Split(string(data), "\n") {
+	lines := strings.Split(string(data), "\n")
+	out := make([]deadLetterEntry, 0, len(lines))
+	for _, line := range lines {
 		if strings.TrimSpace(line) == "" {
 			continue
 		}

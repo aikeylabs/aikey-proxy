@@ -52,7 +52,7 @@ func TestExpandPaths_DefaultsWALDirWhenEmpty(t *testing.T) {
 	}
 }
 
-// An operator-supplied path must be honoured verbatim (after `~` expansion),
+// An operator-supplied path must be honored verbatim (after `~` expansion),
 // so users who do care about placement don't get silently overridden.
 func TestExpandPaths_PreservesExplicitWALDir(t *testing.T) {
 	c := &Config{}
@@ -87,7 +87,7 @@ func TestExpandPaths_ExpandsTildeInWALDir(t *testing.T) {
 //
 // Load() now reads aikey-user.yaml from the same directory and merges its
 // `proxy:` subtree on top of the system yaml. These tests pin the merge
-// behaviour we depend on so a future refactor that drops or weakens it
+// behavior we depend on so a future refactor that drops or weakens it
 // won't silently re-introduce the "make restart-personal wipes team
 // override" bug.
 
@@ -119,6 +119,9 @@ log:
 
 // writeTestPair writes a system yaml + an optional user yaml in a temp
 // dir and returns the path to the system file (the Load() input).
+//
+//nolint:unparam // `system` kept parameterized so future cases can probe
+// alternate system-yaml shapes without re-plumbing the helper.
 func writeTestPair(t *testing.T, system, user string) string {
 	t.Helper()
 	dir := t.TempDir()

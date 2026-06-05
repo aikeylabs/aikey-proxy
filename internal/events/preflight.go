@@ -2,6 +2,7 @@ package events
 
 import (
 	"bytes"
+	"context"
 	"fmt"
 	"io"
 	"log/slog"
@@ -81,7 +82,7 @@ func checkCollector(collectorURL, token string) (reachable, authOK bool, errMsg 
 	url := collectorURL + "/v1/usage-events:batch"
 	body := []byte(`{"source":"preflight","events":[]}`)
 
-	req, err := http.NewRequest(http.MethodPost, url, bytes.NewReader(body))
+	req, err := http.NewRequestWithContext(context.Background(), http.MethodPost, url, bytes.NewReader(body))
 	if err != nil {
 		return false, false, fmt.Sprintf("collector: build request: %v", err)
 	}

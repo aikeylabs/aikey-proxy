@@ -12,7 +12,7 @@ import (
 // handler is captured, logged, and dumped via observability.RecoverHTTP,
 // and a 500 response is written (if headers have not already been flushed).
 // The proxy process keeps running — one bad request must not kill the mux
-// for everyone else. This closes the default net/http behaviour where
+// for everyone else. This closes the default net/http behavior where
 // server.go's recover swallows the panic silently without logging or dump.
 func recoverMiddleware(h http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -27,7 +27,7 @@ func recoverMiddleware(h http.Handler) http.Handler {
 // anything has been written to the response yet. It also passes through
 // Flusher, CloseNotifier, and Hijacker so streaming handlers
 // (httputil.ReverseProxy SSE, stream_drainer watcher, etc.) keep their
-// behaviour unchanged.
+// behavior unchanged.
 type trackedWriter struct {
 	http.ResponseWriter
 	wrote bool
@@ -55,7 +55,7 @@ func (tw *trackedWriter) Flush() {
 // Returns nil when the underlying does not implement it; callers that do
 // `w.(http.CloseNotifier)` then select on the channel will see nil, which
 // select treats as "never ready" (never triggers cancel, which is the old
-// behaviour for handlers that couldn't detect disconnect).
+// behavior for handlers that couldn't detect disconnect).
 //
 //nolint:staticcheck // CloseNotifier is deprecated but still the reliable HTTP/1.1 disconnect signal
 func (tw *trackedWriter) CloseNotify() <-chan bool {

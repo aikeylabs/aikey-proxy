@@ -30,7 +30,7 @@ func TestIsAikeyProbe_HeaderAbsent(t *testing.T) {
 func TestIsAikeyProbe_HeaderZero(t *testing.T) {
 	// Explicit "0" must NOT be treated as probe. We want the opt-in semantics
 	// tight — only literal "1" turns reporting off. Anything else (empty,
-	// "true", "yes", stray values) keeps normal reporting behaviour so we
+	// "true", "yes", stray values) keeps normal reporting behavior so we
 	// fail closed, not open.
 	r := httptest.NewRequest(http.MethodGet, "/", nil)
 	r.Header.Set(headerAikeyProbe, "0")

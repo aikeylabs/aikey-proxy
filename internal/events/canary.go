@@ -1,6 +1,7 @@
 package events
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"log/slog"
@@ -204,7 +205,16 @@ func (p *CanaryProbe) checkArrival(eventID string, sentAt time.Time) CanaryResul
 	}
 
 	url := fmt.Sprintf("%s/internal/canary-check?event_id=%s", p.cfg.DiagnosticsURL, eventID)
-	resp, err := p.client.Get(url)
+	// Background ctx: canary is a long-lived self-test goroutine with no
+	// upstream request to inherit from; http.Client.Timeout (10s) bounds it.
+	req, reqErr := http.NewRequestWithContext(context.Background(), "GET", url, nil)
+	if reqErr != nil {
+		result.Status = "unavailable"
+		result.FailedStage = "request_build_failed"
+		slog.Debug("canary check: request build failed", "url", url, "error", reqErr)
+		return result
+	}
+	resp, err := p.client.Do(req)
 	if err != nil {
 		// Diagnostics endpoint unreachable — deployment/network issue rather
 		// than a pipeline fault. Mark as "unavailable" (not "failed") so the
@@ -267,7 +277,12 @@ func (p *CanaryProbe) checkArrival(eventID string, sentAt time.Time) CanaryResul
 	// where query-service is a separate container with its own DB connection.
 	if p.cfg.QueryURL != "" {
 		queryURL := fmt.Sprintf("%s/internal/canary-check?event_id=%s", p.cfg.QueryURL, eventID)
-		qResp, qErr := p.client.Get(queryURL)
+		qReq, qReqErr := http.NewRequestWithContext(context.Background(), "GET", queryURL, nil)
+		if qReqErr != nil {
+			slog.Debug("canary check: query request build failed", "url", queryURL, "error", qReqErr)
+			return result
+		}
+		qResp, qErr := p.client.Do(qReq)
 		if qErr != nil || qResp.StatusCode != http.StatusOK {
 			// Query-service unreachable or error. Don't demote the overall
 			// status to "failed" — collector side is fine. Report "partial"

@@ -211,13 +211,13 @@ func Load(path string) (*Config, error) {
 
 // loadAndMaybeMerge returns the raw yaml bytes that `yaml.Unmarshal` should
 // see. When `aikey-user.yaml` exists in the same directory as the system
-// path, its `proxy:` subtree is deep-merged on top before re-marshalling.
+// path, its `proxy:` subtree is deep-merged on top before re-marshaling.
 //
 // Why marshal-after-merge: configmerge.LoadAndMerge returns a
 // map[string]any (yaml.v3 keeps that path simple). We re-marshal so the
 // downstream `yaml.Unmarshal(data, *Config)` path is unchanged — same
 // shape, same yaml tags, same struct-validation. Trial-server uses the
-// identical pattern; matching it keeps the two loaders behaviour-aligned.
+// identical pattern; matching it keeps the two loaders behavior-aligned.
 //
 // Missing user file is the personal-no-team-server case: return the
 // system bytes as-is and let the user-layer override stay absent.
@@ -246,7 +246,7 @@ func loadAndMaybeMerge(path string) ([]byte, error) {
 	return out, nil
 }
 
-// applyEnvOverrides honours selected env vars after yaml + defaults
+// applyEnvOverrides honors selected env vars after yaml + defaults
 // have been applied. Currently only AIKEY_PROXY_LOG_LEVEL is supported
 // (Stage C-3 scheme §9 step 10) — log level is归 system per scheme v8
 // SR8, but ad-hoc debug needs a way to bump verbosity without editing

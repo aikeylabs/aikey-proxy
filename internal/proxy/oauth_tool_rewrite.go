@@ -177,7 +177,7 @@ func toolNameMappingFrom(ctx context.Context) map[string]string {
 // rewriteToolNamesReverseJSON reverses the forward rename inside a non-
 // streaming JSON response. It walks `content[]` for tool_use blocks and
 // renames any `name` found in mapping. Returns the original byte slice
-// unchanged when nothing matches; otherwise returns a freshly-marshalled
+// unchanged when nothing matches; otherwise returns a freshly-marshaled
 // copy.
 //
 // Defensive: bodies that aren't JSON or lack a top-level `content` array

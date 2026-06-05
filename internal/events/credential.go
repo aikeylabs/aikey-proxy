@@ -82,7 +82,7 @@ const refreshSkewBeforeExpiry = 5 * time.Minute
 //     collector would refuse anyway.
 //
 // Concurrency: a sync.Mutex guards Token/ExpiresAt mutation. Concurrent
-// Bearer() calls serialise but the post-refresh hot path is O(1)
+// Bearer() calls serialize but the post-refresh hot path is O(1)
 // (single time comparison) and the refresh path runs at most once per
 // access lifetime in practice (7 days × Bearer() call rate).
 type RefreshableJWT struct {

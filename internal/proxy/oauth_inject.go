@@ -17,9 +17,9 @@ import (
 // the request (Claude: 429 business rejection, Kimi: 403 access_terminated_error).
 //
 // Verified patterns from:
-//   workflow/CI/researchs/oauth-token-exchange-test/main.go (Claude)
-//   workflow/CI/researchs/oauth-codex-test/main.go (Codex)
-//   workflow/CI/researchs/oauth-kimi-test/main.go (Kimi)
+//   workflow/CI/research/oauth-token-exchange-test/main.go (Claude)
+//   workflow/CI/research/oauth-codex-test/main.go (Codex)
+//   workflow/CI/research/oauth-kimi-test/main.go (Kimi)
 func oauthInject(req *http.Request, cred *OAuthCredential, providerCode string) {
 	// Remove any existing API Key header (proxy may have set it from vault)
 	req.Header.Del("x-api-key")
@@ -76,7 +76,7 @@ func injectClaudeOAuth(req *http.Request, cred *OAuthCredential) {
 	// 3. ?beta=true query parameter — required for OAuth token access.
 	// Why: research test verified that API URL must include ?beta=true.
 	// Without it, Anthropic returns 401 "OAuth authentication not supported".
-	// Ref: workflow/CI/researchs/oauth-token-exchange-test/main.go line 59-60
+	// Ref: workflow/CI/research/oauth-token-exchange-test/main.go line 59-60
 	q := req.URL.Query()
 	if q.Get("beta") == "" {
 		q.Set("beta", "true")
@@ -145,7 +145,7 @@ func injectClaudeOAuth(req *http.Request, cred *OAuthCredential) {
 		// Why: Anthropic requires metadata.user_id with format:
 		//   user_<64hex_device_id>_account_<account_uuid>_session_<session_uuid>
 		// Missing account_uuid → 429 business rejection (not real rate limit).
-		// Ref: workflow/CI/researchs/oauth-token-exchange-test/main.go line 16-17
+		// Ref: workflow/CI/research/oauth-token-exchange-test/main.go line 16-17
 		deviceHash := sha256.Sum256([]byte(cred.AccountID))
 		deviceID := hex.EncodeToString(deviceHash[:])
 		accountUUID := cred.ExternalID // OAuth provider's account UUID

@@ -185,7 +185,7 @@ func ResolveUpstreamBinding(
 	//
 	// If the row carries a non-empty bound_alias, resolve the credential
 	// from that alias snapshot instead of looking up a user-profile
-	// provider binding. The synthesised binding is shape-compatible with
+	// provider binding. The synthesized binding is shape-compatible with
 	// what GetProviderBindingWithScope would return, so all downstream
 	// stages (ResolveBindingCredential, provider adapter, OAuth inject)
 	// see one uniform binding contract.
@@ -228,7 +228,7 @@ func ResolveUpstreamBinding(
 
 // resolveBoundAliasBinding is the B-mode credential lookup: dereference
 // AppRecord.BoundAlias via the same GetAliasCredential helper the Probe
-// pipeline uses, and return its synthesised binding.
+// pipeline uses, and return its synthesized binding.
 //
 // Errors map to App-pipeline-shape codes so callers don't need a separate
 // branch for B-mode failure handling:

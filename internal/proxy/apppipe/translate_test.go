@@ -55,6 +55,8 @@ func newTestRegistry() *translator.Registry {
 	return r
 }
 
+//nolint:unparam // `method` kept parameterized so non-POST cases can
+// reuse this helper without re-plumbing.
 func freshHTTPRequest(method, target string) *http.Request {
 	r := httptest.NewRequest(method, target, strings.NewReader(""))
 	return r

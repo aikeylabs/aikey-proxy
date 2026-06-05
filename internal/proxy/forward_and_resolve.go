@@ -59,6 +59,11 @@ import (
 // the byte-identical forward semantics path-prefix routing relies on.
 // Event.Model has json:omitempty so the downstream NDJSON consumer
 // survives the absence.
+//
+//nolint:unparam // `stream` kept parameterized for the SPEC §1.4.1
+// stream taxonomy (today only user_chat reaches here; future agent_chat /
+// agent_event branches will reuse this wrapper). Inlining the constant
+// would make adding the next stream branch a re-plumb across 5 call sites.
 func (p *Proxy) serveRouteWithObserver(
 	w http.ResponseWriter, r *http.Request,
 	route *vkeys.ResolvedRoute, prov provider.Provider,
@@ -173,9 +178,16 @@ func (p *Proxy) ResolveBindingCredential(
 		// Why: Codex OAuth uses chatgpt.com/backend-api/codex (Responses API),
 		// NOT api.openai.com/v1 (Chat Completions API). API key users hit
 		// api.openai.com; OAuth users hit chatgpt.com.
-		// Ref: workflow/CI/researchs/oauth-codex-test/main.go
+		// Ref: workflow/CI/research/oauth-codex-test/main.go
 		if canonicalCode == "openai" {
 			out.BaseURL = "https://chatgpt.com/backend-api/codex"
+			// Best-effort: persist the `model` from this request to
+			// ~/.aikey/state/codex_last_model so aikey-cli's connectivity
+			// probe uses the SAME model the user's codex CLI just used.
+			// Self-healing against upstream model retirement — no aikey
+			// release needed when OpenAI rolls a new model.
+			// See codex_model_capture.go for full rationale.
+			captureCodexModel(r)
 		} else {
 			out.BaseURL = providerDefaultBaseURL(canonicalCode)
 		}
@@ -381,7 +393,7 @@ func (p *Proxy) serveRoute(w http.ResponseWriter, r *http.Request, route *vkeys.
 			// stashExtractedFields() for downstream usage-event recording
 			// (see stashExtractedFields, proxy.go:1436). They must NOT
 			// reach the upstream provider — Anthropic's OAuth WAF, in
-			// particular, treats unrecognised headers as a persona signal
+			// particular, treats unrecognized headers as a persona signal
 			// that the request isn't a real Claude Code session, returning
 			// 429 with no X-RateLimit-Reset (business rejection signature).
 			// Strip the whole `x-aikey-*` namespace so future internal
@@ -628,7 +640,7 @@ func (p *Proxy) serveRoute(w http.ResponseWriter, r *http.Request, route *vkeys.
 				sessionID := resolveSessionID(r, route.ProtocolType, route.ProviderCode)
 				// Capture upstreamReqID NOW (response headers are stable from
 				// here onward; the streaming body keeps draining in a goroutine
-				// but headers are already finalised by upstream).
+				// but headers are already finalized by upstream).
 				upstreamReqID := extractUpstreamRequestID(resp)
 				var cb reporterCallback
 				// Fire the completion callback for all non-probe streams (not just

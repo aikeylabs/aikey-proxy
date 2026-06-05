@@ -198,6 +198,9 @@ func TestResolve_NilReaderReturnsServiceUnavailable(t *testing.T) {
 
 // resolvedFixture is a tiny helper that returns a ResolvedAppContext
 // already populated as if Resolve() had succeeded for the slug.
+//
+//nolint:unparam // `kind` kept parameterized so new app_kind variants
+// (e.g. first-party) can reuse this helper without re-plumbing.
 func resolvedFixture(slug, kind string, upstreams []string) *ResolvedAppContext {
 	return &ResolvedAppContext{
 		ProfileID: "app:" + slug,
@@ -325,6 +328,9 @@ func TestResolveUpstreamBinding_ReadErrorBubblesUp(t *testing.T) {
 // ─────────────────────────────────────────────────────────────────────────
 
 // boundFixture builds a ResolvedAppContext for an app in B mode.
+//
+//nolint:unparam // `slug` kept parameterized so different B-mode slugs
+// can reuse this helper without re-plumbing.
 func boundFixture(slug, kind, boundAlias string, upstreams []string) *ResolvedAppContext {
 	return &ResolvedAppContext{
 		// ProfileID is irrelevant in B mode — the alias lookup bypasses

@@ -106,7 +106,7 @@ func (s *appPipelineStatusWriter) Flush() {
 //     operator visibility while the pipeline is being filled in
 //
 // The 501 is intentional vs 503: per RFC 9110, 501 says "the server does
-// not support the functionality required to fulfil the request" which
+// not support the functionality required to fulfill the request" which
 // matches "this endpoint exists in routing but its handler is not yet
 // wired", whereas 503 implies temporary unavailability of a working
 // service. Clients (test scripts, integration probes) can distinguish
@@ -122,7 +122,7 @@ func (p *Proxy) handleAppPipeline(w http.ResponseWriter, r *http.Request, appCtx
 	// per-slug HealthCache update below, which the Web "Connected Apps"
 	// list reads to populate the Health column.
 	//
-	// Default 200 mirrors net/http's own behaviour: if a handler writes a
+	// Default 200 mirrors net/http's own behavior: if a handler writes a
 	// body without calling WriteHeader, Go implicitly uses 200. Capturing
 	// "actually called WriteHeader yet?" via the bool gives us a cheap
 	// way to distinguish "explicit 200" from "implicit 200 because the
@@ -817,6 +817,19 @@ func (p *Proxy) handleProbePipeline(w http.ResponseWriter, r *http.Request, prob
 	}
 }
 
+// uaWarnLogger is the logger handed to the UA matcher's MatchOrLog WARN hook,
+// suppressed (nil) for probe traffic. aikey's own connectivity probes
+// (`X-Aikey-Probe: 1`, UA `ureq/...`) carry an unrecognized UA by design and are
+// NOT counted as usage (the isAikeyProbe guards in forward_and_resolve skip
+// Record/reportUsage), so a WARN on every probe is pure noise — the hook exists
+// to surface unrecognized *real* clients (e.g. a drifted codex / Cursor UA).
+func uaWarnLogger(logger *slog.Logger, r *http.Request) *slog.Logger {
+	if isAikeyProbe(r) {
+		return nil
+	}
+	return logger
+}
+
 // handlePathPrefixRoute resolves the active key for providerCode and forwards
 // the request with the provider prefix stripped from the path.
 // Called when the request path starts with a known provider prefix
@@ -842,7 +855,12 @@ func (p *Proxy) handlePathPrefixRoute(w http.ResponseWriter, r *http.Request, pr
 	// also keeps the proxy's behavior consistent across editions (Personal
 	// without active vault still rejects clearly-bad aikey tokens).
 	if rawAuth := extractRawAuthValue(r); rawAuth != "" {
-		switch ClassifyToken(rawAuth) {
+		// Only two early-reject cases here: malformed aikey_ tokens
+		// (TokenInvalid) and provider-prefix-misrouted App bearers
+		// (Tier1App). Tier3 / Tier2 / Tier1Team / Tier1Personal cases
+		// fall through intentionally — they're resolved by the
+		// activeReader-driven code below.
+		switch ClassifyToken(rawAuth) { //nolint:exhaustive // only Invalid + Tier1App rejected here; rest handled below
 		case TokenInvalid:
 			p.errors.Add(1)
 			logger.Warn("aikey_* token form invalid (namespace authority)",
@@ -1041,7 +1059,7 @@ func (p *Proxy) handlePathPrefixRoute(w http.ResponseWriter, r *http.Request, pr
 		// handler entry before oauthInject below scrubbed the header. See spec
 		// at workflow/CI/requirements/2026-05-26-usage-by-key-app-attribution.md.
 		if tokenRoute.RouteSource == "oauth" {
-			tokenRoute.AppSlug = uaattribution.Default().Match(inboundClientUA)
+			tokenRoute.AppSlug = uaattribution.Default().MatchOrLog(inboundClientUA, uaWarnLogger(logger, r))
 		}
 
 		// Handle OAuth credential injection if this is an OAuth route token.
@@ -1196,7 +1214,7 @@ func (p *Proxy) handlePathPrefixRoute(w http.ResponseWriter, r *http.Request, pr
 					// Matcher always returns a non-empty slug (falls back to
 					// "unknown-app") so OAuth events never render as empty
 					// app_slug in the usage-by-key dashboard.
-					AppSlug: uaattribution.Default().Match(inboundClientUA),
+					AppSlug: uaattribution.Default().MatchOrLog(inboundClientUA, uaWarnLogger(logger, r)),
 				}
 				// SPEC §1.4.1 user_chat — see serveRouteWithObserver docstring.
 				p.serveRouteWithObserver(w, r, oauthRoute, prov, "__oauth__", rawAuthValue, startTime, logger,
@@ -1240,7 +1258,7 @@ func (p *Proxy) handlePathPrefixRoute(w http.ResponseWriter, r *http.Request, pr
 		}
 
 		// Strip provider prefix (e.g. /anthropic/v1/messages → /v1/messages)
-		// before forwarding, matching the tier-1 (Registry) branch behaviour.
+		// before forwarding, matching the tier-1 (Registry) branch behavior.
 		r.URL.Path = strippedPath
 		if r.URL.RawPath != "" {
 			r.URL.RawPath = strippedPath
@@ -1430,7 +1448,7 @@ func (p *Proxy) handlePathPrefixRoute(w http.ResponseWriter, r *http.Request, pr
 		// the usage-by-key dashboard always has a row label. Personal /
 		// team branches deliberately leave AppSlug empty per spec R5
 		// (workflow/CI/requirements/2026-05-26-usage-by-key-app-attribution.md).
-		route.AppSlug = uaattribution.Default().Match(inboundClientUA)
+		route.AppSlug = uaattribution.Default().MatchOrLog(inboundClientUA, uaWarnLogger(logger, r))
 	case mk != nil:
 		route.RouteSource = "team"
 	default:
