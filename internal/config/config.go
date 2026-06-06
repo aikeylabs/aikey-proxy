@@ -45,6 +45,30 @@ type Config struct {
 	// it to the per-observer Build callback. Adding a new observer
 	// doesn't require any change here.
 	Observers map[string]map[string]any `yaml:"observers,omitempty"`
+
+	// Cluster is the V3c cluster-node config block. Absent / Enabled=false ⇒
+	// standard local proxy (Personal/Trial) — zero behavior change. When
+	// Enabled, this proxy is a cluster node: it registers + heartbeats to the
+	// aikey-hub name service and (policy) only serves team/managed virtual keys.
+	Cluster ClusterConfig `yaml:"cluster,omitempty"`
+}
+
+// ClusterConfig configures cluster-node behavior (V3c). All fields are inert
+// unless Enabled is true, so existing single-node configs are unaffected.
+type ClusterConfig struct {
+	Enabled bool `yaml:"enabled"`
+	// HubURL is the aikey-hub name-service base, e.g. http://hub:27400.
+	HubURL string `yaml:"hub_url,omitempty"`
+	// NodeID uniquely identifies this proxy node in the cluster.
+	NodeID string `yaml:"node_id,omitempty"`
+	// NodeAddr is the address clients connect to for this node (host:port),
+	// returned by the hub's /cluster/resolve.
+	NodeAddr string `yaml:"node_addr,omitempty"`
+	// Weight scales this node's share of the consistent-hash ring (≥1).
+	Weight int `yaml:"weight,omitempty"`
+	// ServiceToken authenticates this node to the hub's gated /cluster/* endpoints
+	// (R1). Config-separate per edition: empty for non-cluster, set for cluster.
+	ServiceToken string `yaml:"service_token,omitempty"`
 }
 
 type ListenConfig struct {
@@ -302,8 +326,13 @@ func (c *Config) applyDefaults() {
 }
 
 func (c *Config) validate() error {
-	if c.Listen.Host != "127.0.0.1" && c.Listen.Host != "localhost" && c.Listen.Host != "::1" {
-		return fmt.Errorf("listen.host must be a loopback address (127.0.0.1, localhost, ::1), got %q", c.Listen.Host)
+	// Loopback-only is a Personal/Trial safety rail (the local proxy must not be
+	// network-reachable). A CLUSTER node, by design, IS network-reachable (clients
+	// + nginx connect to it) and is protected by VK-token auth + the internal
+	// network / mTLS instead — so cluster mode lifts this restriction.
+	if !c.Cluster.Enabled &&
+		c.Listen.Host != "127.0.0.1" && c.Listen.Host != "localhost" && c.Listen.Host != "::1" {
+		return fmt.Errorf("listen.host must be a loopback address (127.0.0.1, localhost, ::1) outside cluster mode, got %q", c.Listen.Host)
 	}
 	if c.Listen.Port < 1 || c.Listen.Port > 65535 {
 		return fmt.Errorf("listen.port must be 1-65535, got %d", c.Listen.Port)
@@ -318,6 +347,14 @@ func (c *Config) validate() error {
 		case "openai", "openai_compatible", "anthropic", "kimi", "generic":
 		default:
 			return fmt.Errorf("providers[%s].protocol must be 'openai', 'openai_compatible', or 'anthropic', got %q", name, p.Protocol)
+		}
+	}
+
+	// Cluster fields are required only when cluster mode is on (inert otherwise,
+	// so single-node configs never trip this).
+	if c.Cluster.Enabled {
+		if c.Cluster.HubURL == "" || c.Cluster.NodeID == "" || c.Cluster.NodeAddr == "" {
+			return fmt.Errorf("cluster.enabled requires cluster.hub_url, cluster.node_id, and cluster.node_addr")
 		}
 	}
 

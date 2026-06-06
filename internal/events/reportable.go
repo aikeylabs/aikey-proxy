@@ -197,6 +197,10 @@ type ReportOpts struct {
 	// when empty.
 	StopReason string
 	ErrorType       string
+	// ErrorMessage is the truncated upstream error body (set on 4xx/5xx). The
+	// proxy captures it so the usage-detail expand can show the real provider
+	// reason, not just the generic HTTP status text (which lands in ErrorCode).
+	ErrorMessage    string
 	RealKey         string // decrypted provider key (for hashing only, never stored)
 	SourceVersion      string
 	ClientVersion      string
@@ -344,6 +348,7 @@ func BuildReportableEvent(opts ReportOpts) ReportableEvent {
 		RequestStatus:  status,
 		HTTPStatusCode: &opts.StatusCode,
 		ErrorCode:      opts.ErrorType,
+		ErrorMessage:   opts.ErrorMessage,
 
 		SessionID:  opts.SessionID,
 		KeyLabel:   deriveKeyLabel(route),

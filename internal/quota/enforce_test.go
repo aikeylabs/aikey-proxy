@@ -154,3 +154,59 @@ func TestEnforcerUsdSourceOverride(t *testing.T) {
 type stubUsdSource float64
 
 func (s stubUsdSource) UsdUsed(_, _ string) float64 { return float64(s) }
+
+// TestEnforcer_MetricSwitch_Redelivery is the automated regression for the
+// live E2E case 2026-06-05-quota-metric-switch-redelivery.md: when an admin
+// switches a subject's rule metric (usd ↔ tokens), the re-delivered snapshot
+// (ReplaceAll on the supervisor-scoped snapshot, counter kept across reloads)
+// must STOP enforcing the old metric and START enforcing the new one — both
+// directions. The decisive guard is phase B: usd usage still exceeds the OLD
+// usd limit, yet after switching to a tokens rule there must be NO usd
+// violation, proving the old rule was overwritten rather than lingering.
+func TestEnforcer_MetricSwitch_Redelivery(t *testing.T) {
+	const seat = "seat-a"
+	snap := NewSnapshot()
+	c := NewCounter() // supervisor-scoped: persists across ReplaceAll reloads
+	e := NewEnforcer(snap, c, true)
+	pk := PeriodKey(PeriodMonthly, fixedNow) // "monthly:2026-06"
+
+	usdRule := func(limit float64) []Subject {
+		return []Subject{{SubjectID: seat, SubjectKind: KindSeat,
+			Rules: []Rule{{Metric: MetricUSD, Period: PeriodMonthly, LimitAmount: limit}}}}
+	}
+	tokRule := func(limit float64) []Subject {
+		return []Subject{{SubjectID: seat, SubjectKind: KindSeat,
+			Rules: []Rule{{Metric: MetricTokens, Period: PeriodMonthly, LimitAmount: limit}}}}
+	}
+	// Seed the current-period usage once; it persists across the switches the same
+	// way the supervisor counter does. usd is read from the counter via the usd
+	// source; tokens from the counter directly.
+	c.SetBaseline(seat, MetricUSD, pk, 0.3358086)
+	c.SetBaseline(seat, MetricTokens, pk, 1000)
+
+	// Phase A — usd rule, limit 0.001 < used 0.336 → usd block.
+	snap.ReplaceAll(usdRule(0.001))
+	if _, v := e.Check(seat, fixedNow); v == nil || v.Metric != MetricUSD {
+		t.Fatalf("A: want usd block, got %+v", v)
+	}
+
+	// Phase B — switch to tokens, limit 1e12 > used 1000 → ALLOW. Decisive: usd
+	// usage (0.336) still exceeds the old usd limit (0.001), but there is no usd
+	// rule anymore, so there must be NO violation — the old metric stopped.
+	snap.ReplaceAll(tokRule(1e12))
+	if _, v := e.Check(seat, fixedNow); v != nil {
+		t.Fatalf("B: switch to tokens-under must allow (usd enforcement must stop), got %+v", v)
+	}
+
+	// Phase C — tokens limit 1 < used 1000 → tokens block (new metric enforced).
+	snap.ReplaceAll(tokRule(1))
+	if _, v := e.Check(seat, fixedNow); v == nil || v.Metric != MetricTokens {
+		t.Fatalf("C: want tokens block, got %+v", v)
+	}
+
+	// Phase D — switch back to usd, limit 0.001 → usd block again (reverse overwrite).
+	snap.ReplaceAll(usdRule(0.001))
+	if _, v := e.Check(seat, fixedNow); v == nil || v.Metric != MetricUSD {
+		t.Fatalf("D: reverse switch back to usd must block on usd, got %+v", v)
+	}
+}

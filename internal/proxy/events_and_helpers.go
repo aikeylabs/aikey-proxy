@@ -105,9 +105,24 @@ func (p *Proxy) buildBaseEvent(req *http.Request, resp *http.Response, startTime
 // recordEvent records a usage event for error responses (no token counts).
 func (p *Proxy) recordEvent(req *http.Request, resp *http.Response, startTime time.Time, route *vkeys.ResolvedRoute, bearerToken string, streaming bool) {
 	ev := p.buildBaseEvent(req, resp, startTime, route, streaming)
+	var errMsg string
 	if resp.StatusCode >= 400 {
 		p.errors.Add(1)
-		ev.ErrorType = http.StatusText(resp.StatusCode)
+		// Capture the upstream error envelope (re-buffers resp.Body so the client
+		// still receives the original payload). Returns the provider's error TYPE +
+		// human MESSAGE parsed from the body.
+		errType, msg := captureUpstreamErrorBody(resp)
+		errMsg = msg
+		// error_type: prefer the provider's classification (e.g.
+		// exceeded_current_quota_error / invalid_request_error) so the usage row
+		// tells WHY it failed; fall back to the generic HTTP reason phrase
+		// (http.StatusText(429) = "Too Many Requests") when the body isn't a known
+		// provider envelope.
+		if errType != "" {
+			ev.ErrorType = errType
+		} else {
+			ev.ErrorType = http.StatusText(resp.StatusCode)
+		}
 	}
 	// Probe traffic bypasses all sinks — see isAikeyProbe rationale in
 	// middleware.go. Keep p.errors.Add(1) above so the /metrics view still
@@ -120,7 +135,44 @@ func (p *Proxy) recordEvent(req *http.Request, resp *http.Response, startTime ti
 	// usable result even though the request finished "fast" from our POV.
 	sessionID := resolveSessionID(req, route.ProtocolType, route.ProviderCode)
 	upstreamReqID := extractUpstreamRequestID(resp)
-	p.reportUsage(route, bearerToken, ev.Model, startTime, resp.StatusCode, provider.TokenBreakdown{}, ev.ErrorType, "", sessionID, "interrupted", upstreamReqID)
+	p.reportUsage(route, bearerToken, ev.Model, startTime, resp.StatusCode, provider.TokenBreakdown{}, ev.ErrorType, errMsg, "", sessionID, "interrupted", upstreamReqID)
+}
+
+// errorBodyCap bounds the captured upstream error body (ODS error_message + WAL
+// stay small). Provider error envelopes are tiny JSON; 2KB is ample.
+const errorBodyCap = 2048
+
+// captureUpstreamErrorBody reads the upstream error body, re-buffers it so the
+// client still receives the original payload, and returns the provider error
+// (type, message) for the event. Mirrors the read+rebuffer pattern used by the
+// 4xx debug capture in forward_and_resolve.go.
+//
+//   - errType: the provider's error classification (Anthropic/OpenAI/Kimi share
+//     `error.type`, e.g. exceeded_current_quota_error); "" when unparseable.
+//   - errMsg:  the RAW upstream body (trimmed + capped) stored LOSSLESS — the page
+//     parses/cleans it for display (so we never drop detail at the storage layer;
+//     presentation formatting is the consumer's job).
+func captureUpstreamErrorBody(resp *http.Response) (errType, errMsg string) {
+	if resp == nil || resp.Body == nil {
+		return "", ""
+	}
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return "", ""
+	}
+	_ = resp.Body.Close()
+	resp.Body = io.NopCloser(bytes.NewReader(body))
+	resp.ContentLength = int64(len(body))
+
+	// error_code gets the parsed provider type (structured/queryable); error_message
+	// keeps the RAW body for lossless storage — the page does the human-readable
+	// cleaning at render time.
+	pType, _ := parseUpstreamErrorEnvelope(body)
+	msg := strings.TrimSpace(string(body))
+	if len(msg) > errorBodyCap {
+		msg = msg[:errorBodyCap] + "…"
+	}
+	return strings.TrimSpace(pType), msg
 }
 
 // debug4xxEnabled reports whether AIKEY_PROXY_DEBUG_4XX_BODIES is set to a
@@ -404,7 +456,7 @@ func extractUpstreamRequestID(resp *http.Response) string {
 // surface it, e.g. OpenAI/Kimi).
 // upstreamReqID is the provider-side request id (anthropic `req_xxx` / openai
 // `req_xxx`) extracted from response headers; empty when upstream omitted it.
-func (p *Proxy) reportUsage(route *vkeys.ResolvedRoute, bearerToken, model string, startTime time.Time, statusCode int, breakdown provider.TokenBreakdown, errorType, realKey, sessionID, completion, upstreamReqID string) {
+func (p *Proxy) reportUsage(route *vkeys.ResolvedRoute, bearerToken, model string, startTime time.Time, statusCode int, breakdown provider.TokenBreakdown, errorType, errorMessage, realKey, sessionID, completion, upstreamReqID string) {
 	if p.reporter == nil && p.wal == nil {
 		return
 	}
@@ -451,6 +503,7 @@ func (p *Proxy) reportUsage(route *vkeys.ResolvedRoute, bearerToken, model strin
 		EndpointURL:     routeBaseURL(route),
 		StopReason:      breakdown.StopReason,
 		ErrorType:                errorType,
+		ErrorMessage:             errorMessage,
 		RealKey:                  realKey,
 		ClientVersion:            p.clientVersion,
 		SourceVersion:            p.clientVersion,

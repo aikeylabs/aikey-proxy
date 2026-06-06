@@ -83,6 +83,39 @@ func TestExpandPaths_ExpandsTildeInWALDir(t *testing.T) {
 	}
 }
 
+// Cluster mode lifts the loopback-only listen restriction: a cluster node must
+// be network-reachable (0.0.0.0). Non-cluster (Personal/Trial) keeps loopback-only.
+func TestValidate_ClusterAllowsNonLoopbackListen(t *testing.T) {
+	base := func() *Config {
+		c := &Config{}
+		c.Listen.Host = "0.0.0.0"
+		c.Listen.Port = 27200
+		return c
+	}
+
+	// non-cluster + 0.0.0.0 → rejected
+	if err := base().validate(); err == nil {
+		t.Fatal("non-cluster 0.0.0.0 listen should be rejected (loopback-only safety rail)")
+	}
+
+	// cluster + 0.0.0.0 → allowed (still needs the other cluster fields)
+	c := base()
+	c.Cluster.Enabled = true
+	c.Cluster.HubURL = "http://hub:27400"
+	c.Cluster.NodeID = "node-1"
+	c.Cluster.NodeAddr = "node:27200"
+	if err := c.validate(); err != nil {
+		t.Fatalf("cluster 0.0.0.0 listen should be allowed, got: %v", err)
+	}
+
+	// cluster enabled but missing required fields → rejected
+	bad := base()
+	bad.Cluster.Enabled = true // no hub_url/node_id/node_addr
+	if err := bad.validate(); err == nil {
+		t.Fatal("cluster.enabled without hub_url/node_id/node_addr should be rejected")
+	}
+}
+
 // ── 2026-05-11 F1 fix: aikey-user.yaml proxy: section merge ───────────────
 //
 // Load() now reads aikey-user.yaml from the same directory and merges its

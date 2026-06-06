@@ -205,7 +205,7 @@ func (e *Enforcer) Check(seatID string, now time.Time) ([]TokenBucket, *Violatio
 		// verify it (baseline stale past maxStaleness — server unreachable), so a
 		// strict deployment fail-closes rather than risk silent over-budget.
 		// availability mode (budgetMode=false) skips this entirely (offline-first).
-		// A missing freshness signal (lastSyncAt zero) is treated as fresh — see
+		// A missing freshness signal (lastReachableAt zero) is treated as fresh — see
 		// Snapshot.budgetStale (rollout-safe, never over-blocks on a missing signal).
 		if e.budgetMode && e.snapshot.budgetStale(now, e.maxStaleness) {
 			return tokenBuckets, &Violation{

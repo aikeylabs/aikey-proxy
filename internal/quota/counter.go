@@ -21,6 +21,12 @@ type Counter struct {
 }
 
 type cell struct {
+	// subjectID/metric/periodKey are kept on the cell (not just encoded in the
+	// map key) so IncrementRows can emit them for the write-behind flush without
+	// parsing the joined key.
+	subjectID string
+	metric    string
+	periodKey string
 	baseline  float64
 	increment float64
 }
@@ -34,10 +40,11 @@ func counterKey(subjectID, metric, periodKey string) string {
 	return subjectID + "|" + metric + "|" + periodKey
 }
 
-func (c *Counter) at(k string) *cell {
+func (c *Counter) at(subjectID, metric, periodKey string) *cell {
+	k := counterKey(subjectID, metric, periodKey)
 	x := c.cells[k]
 	if x == nil {
-		x = &cell{}
+		x = &cell{subjectID: subjectID, metric: metric, periodKey: periodKey}
 		c.cells[k] = x
 	}
 	return x
@@ -48,7 +55,7 @@ func (c *Counter) at(k string) *cell {
 func (c *Counter) Add(subjectID, metric, periodKey string, delta float64) float64 {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	x := c.at(counterKey(subjectID, metric, periodKey))
+	x := c.at(subjectID, metric, periodKey)
 	x.increment += delta
 	return x.baseline + x.increment
 }
@@ -90,7 +97,7 @@ func (c *Counter) Get(subjectID, metric, periodKey string) float64 {
 func (c *Counter) SetBaseline(subjectID, metric, periodKey string, baseline float64) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	x := c.at(counterKey(subjectID, metric, periodKey))
+	x := c.at(subjectID, metric, periodKey)
 	if x.baseline == baseline {
 		return
 	}
@@ -101,4 +108,35 @@ func (c *Counter) SetBaseline(subjectID, metric, periodKey string, baseline floa
 	} else {
 		x.increment = oldUsed - baseline
 	}
+}
+
+// SeedIncrement restores a bucket's local increment from the persisted
+// write-behind checkpoint (quota_local_usage), so an OFFLINE proxy restart
+// resumes from the persisted usage instead of zero (design P0). It is a SET (not
+// add) and MUST run once at startup BEFORE any live accrual — re-running it later
+// would clobber in-flight increments. baseline is seeded separately (SeedBaselines)
+// and stays untouched here.
+func (c *Counter) SeedIncrement(subjectID, metric, periodKey string, increment float64) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.at(subjectID, metric, periodKey).increment = increment
+}
+
+// IncrementRows snapshots every bucket carrying a non-zero local increment, for
+// the periodic write-behind flush to quota_local_usage. Zero-increment buckets
+// are skipped (nothing to persist). Returned under the lock so it is a coherent
+// point-in-time view.
+func (c *Counter) IncrementRows() []LocalUsageRow {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	var out []LocalUsageRow
+	for _, x := range c.cells {
+		if x.increment != 0 {
+			out = append(out, LocalUsageRow{
+				SubjectID: x.subjectID, Metric: x.metric,
+				PeriodKey: x.periodKey, Increment: x.increment,
+			})
+		}
+	}
+	return out
 }

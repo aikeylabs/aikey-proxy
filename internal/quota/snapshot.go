@@ -104,7 +104,7 @@ type Snapshot struct {
 	subjects     map[string]*Subject // subject_id → subject
 	seatToGroups map[string][]string // seat_id → [group subject_id...]
 	priceSummary *PriceSummary       // D-U8/P6: edge prices for local usd pricing (P7)
-	lastSyncAt   time.Time           // D-U7/P9: proxy's last successful server contact (reporter upload) — freshness for budget-mode staleness; zero = signal unavailable
+	lastReachableAt time.Time         // D-U7/P9: proxy's last TRAFFIC-INDEPENDENT confirmation the server is reachable (heartbeat probe, pkg/heartbeat) — freshness for budget-mode staleness; zero = never confirmed (treated as fresh, not infinitely stale)
 }
 
 // NewSnapshot returns an empty snapshot (safe to read before the first load).
@@ -151,32 +151,41 @@ func (s *Snapshot) PriceSummary() *PriceSummary {
 	return s.priceSummary
 }
 
-// SetLastSyncAt records when the CLI last successfully synced (D-U7/P9 freshness
-// signal). Zero time = unavailable. nil-safe via the mutex.
-func (s *Snapshot) SetLastSyncAt(t time.Time) {
+// SetLastReachableAt records the last time the proxy confirmed the server is
+// reachable — fed from the traffic-independent heartbeat probe (pkg/heartbeat),
+// NOT from request-driven work. Using a traffic-independent source is the whole
+// fix: a usage-bound signal goes stale when idle even though the server is up,
+// which (under budget mode) blocks an idle node and then deadlocks because the
+// block stops the traffic that would refresh it. Zero time = never confirmed.
+// nil-safe via the mutex.
+func (s *Snapshot) SetLastReachableAt(t time.Time) {
 	s.mu.Lock()
-	s.lastSyncAt = t
+	s.lastReachableAt = t
 	s.mu.Unlock()
 }
 
-// LastSyncAt returns the last successful CLI sync time (zero if unknown).
-func (s *Snapshot) LastSyncAt() time.Time {
+// LastReachableAt returns the last time the server was confirmed reachable (zero
+// if never).
+func (s *Snapshot) LastReachableAt() time.Time {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
-	return s.lastSyncAt
+	return s.lastReachableAt
 }
 
-// budgetStale reports whether the cached baseline is too old to trust under budget
-// mode (D-U7/P9): now − lastSyncAt > maxStaleness. A ZERO lastSyncAt (freshness
-// signal not available — a CLI that doesn't yet write it, or no sync ever) returns
-// false: do NOT fail-closed on a missing signal (rollout-safe, never over-blocks).
+// budgetStale reports whether the server has been unreachable too long to trust
+// the cached baseline under budget mode (D-U7/P9): now − lastReachableAt >
+// maxStaleness. A ZERO lastReachableAt (heartbeat never succeeded yet — fresh
+// boot, or no heartbeat configured) returns false: do NOT fail-closed on a
+// signal that never started (rollout-safe, never over-blocks). Because the
+// signal is traffic-independent, an idle-but-online node keeps its heartbeat
+// fresh and is never wrongly marked stale (the deadlock this replaced).
 func (s *Snapshot) budgetStale(now time.Time, maxStaleness time.Duration) bool {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
-	if s.lastSyncAt.IsZero() {
+	if s.lastReachableAt.IsZero() {
 		return false
 	}
-	return now.Sub(s.lastSyncAt) > maxStaleness
+	return now.Sub(s.lastReachableAt) > maxStaleness
 }
 
 // SubjectsForSeat returns the seat's own subject (if any) plus every group

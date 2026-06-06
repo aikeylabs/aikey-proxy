@@ -147,27 +147,27 @@ func TestEnforcer_BudgetMode_FailClosedOnStale(t *testing.T) {
 
 	// availability (default): stale must NEVER fail-closed (offline-first).
 	e, snap := mkEnf(false)
-	snap.SetLastSyncAt(stale)
+	snap.SetLastReachableAt(stale)
 	if _, v := e.Check("seat-a", now); v != nil {
 		t.Errorf("availability must not fail-closed on stale, got %+v", v)
 	}
 
 	// budget + stale + under-limit usd rule → fail-closed (FailClosedStale).
 	e, snap = mkEnf(true)
-	snap.SetLastSyncAt(stale)
+	snap.SetLastReachableAt(stale)
 	_, v := e.Check("seat-a", now)
 	if v == nil || v.Metric != MetricUSD || !v.FailClosedStale {
 		t.Fatalf("budget+stale: want usd FailClosedStale violation, got %+v", v)
 	}
 
 	// budget + fresh → allow.
-	snap.SetLastSyncAt(fresh)
+	snap.SetLastReachableAt(fresh)
 	if _, v := e.Check("seat-a", now); v != nil {
 		t.Errorf("budget+fresh must allow, got %+v", v)
 	}
 
 	// budget + signal unavailable (zero) → allow (rollout-safe, no over-block).
-	snap.SetLastSyncAt(time.Time{})
+	snap.SetLastReachableAt(time.Time{})
 	if _, v := e.Check("seat-a", now); v != nil {
 		t.Errorf("budget+no-signal must allow (rollout-safe), got %+v", v)
 	}
@@ -178,7 +178,7 @@ func TestEnforcer_BudgetMode_FailClosedOnStale(t *testing.T) {
 		Rules: []Rule{{Metric: MetricTokens, Period: PeriodMonthly, LimitAmount: 1000}}}})
 	et := NewEnforcer(snapTok, NewCounter(), true)
 	et.SetBudgetMode(5 * time.Minute)
-	snapTok.SetLastSyncAt(stale)
+	snapTok.SetLastReachableAt(stale)
 	if _, v := et.Check("seat-t", now); v != nil {
 		t.Errorf("token-only seat must not budget-fail-closed (no usd rule), got %+v", v)
 	}
