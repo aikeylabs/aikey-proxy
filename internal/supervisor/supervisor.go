@@ -30,6 +30,7 @@ import (
 	"os"
 	"strconv"
 	"path/filepath"
+	"sort"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -38,6 +39,7 @@ import (
 
 	"github.com/AiKeyLabs/aikey-proxy/internal/admin"
 	"github.com/AiKeyLabs/aikey-proxy/internal/apphook"
+	"github.com/AiKeyLabs/aikey-proxy/internal/cluster"
 	"github.com/AiKeyLabs/aikey-proxy/internal/config"
 	"github.com/AiKeyLabs/aikey-proxy/internal/events"
 	"github.com/AiKeyLabs/aikey-proxy/internal/observability"
@@ -47,6 +49,7 @@ import (
 	"github.com/AiKeyLabs/aikey-proxy/internal/quota"
 	"github.com/AiKeyLabs/aikey-proxy/internal/vault"
 	"github.com/AiKeyLabs/aikey-proxy/internal/vkeys"
+	"github.com/AiKeyLabs/aikey-proxy/pkg/heartbeat"
 )
 
 // providerToProtocol maps a provider code to its proxy protocol name.
@@ -122,7 +125,7 @@ type generation struct {
 	eventStore *events.Store
 	reporter   *events.Reporter      // usage reporter (nil when collector_url is not configured)
 	canary     *events.CanaryProbe  // synthetic canary probe (nil when reporter or control_url is not configured)
-	filterHook *apphook.ChildHook    // P4 compliance/DLP filter child (nil when no filter app is active)
+	filterHook apphook.FilterTarget  // P4 compliance/DLP filter (single child or M-process pool; nil when no filter app is active)
 
 	// standaloneWAL is only populated when this generation created the
 	// local WAL writer AND no reporter consumed it — i.e. collector_url is
@@ -256,6 +259,17 @@ type Supervisor struct {
 	genID     atomic.Int64
 	startedAt time.Time
 
+	// lastFilterSig is the signature (sorted slug list) of the filter apps the
+	// active generation was built with. syncManagedKeys compares it to the
+	// vault's current filter-app set on each change_seq advance; a difference
+	// means a filter app was enabled/disabled (e.g. the cluster daemon toggling
+	// compliance) — which the lightweight registry-only rebuild does NOT pick up
+	// (the filter child lives on the generation, not the registry). On a change
+	// we trigger a full Reload so the filter hook re-installs. Without this,
+	// daemon-driven compliance enablement only took effect on a manual
+	// /admin/reload (gap found by the 2026-06-05 cluster E2E).
+	lastFilterSig atomic.Pointer[string]
+
 	// Enterprise quota (Phase 2 Stage 2 — design §0.5/§5.2). Snapshot + counter
 	// live on the supervisor (not per-generation) so the counter accumulates
 	// continuously across 5s syncs and /admin/reload; the snapshot is gen-swapped
@@ -265,6 +279,18 @@ type Supervisor struct {
 	quotaEnabled  bool
 	quotaSnapshot *quota.Snapshot
 	quotaCounter  *quota.Counter
+	// quotaIncrementSeeded guards the one-time restore of persisted local
+	// increments (quota_local_usage, P0) into the counter at startup. Seeding is a
+	// SET before any accrual; re-running would clobber in-flight increments, so it
+	// fires exactly once (first reloadQuotaSnapshot, in buildGeneration, before
+	// serving). Later reloads only re-seed baselines.
+	quotaIncrementSeeded bool
+	// quotaHeartbeat is the traffic-independent server-reachability probe behind
+	// budget-mode staleness (D-U7/P9). nil unless enforce_mode=budget AND a
+	// collector URL is configured — so the default availability path (and Personal)
+	// adds NO periodic server call (offline-first preserved). The 5s sync copies its
+	// LastOKAt into the snapshot for budgetStale.
+	quotaHeartbeat *heartbeat.Probe
 
 	// ctx / cancel bound the lifetime of all detached upstream calls.
 	// Canceled in Shutdown() to stop any in-flight upstream requests.
@@ -313,7 +339,88 @@ func New(cfg *config.Config, configPath, password, version string) (*Supervisor,
 	// updates to provider keys never reach this proxy. That's a
 	// long-lived correctness/security risk, not a per-request issue.
 	observability.GoSafe("supervisor.managed_key_sync_loop", observability.Fatal, s.managedKeySyncLoop)
+
+	// Cluster mode (V3c): register this node with the hub name service + heartbeat
+	// so clients discover it via /cluster/resolve. Inert for non-cluster proxies —
+	// Personal/Trial never set Cluster.Enabled, so this is a no-op there. Isolated
+	// (not Fatal): a registrar panic must NOT kill the data path; the proxy keeps
+	// serving locally even if the hub is unreachable.
+	if s.cfg.Cluster.Enabled {
+		reg := cluster.NewRegistrar(
+			s.cfg.Cluster.HubURL,
+			s.cfg.Cluster.NodeID,
+			s.cfg.Cluster.NodeAddr,
+			s.cfg.Cluster.Weight,
+			s.cfg.Cluster.ServiceToken,
+		)
+		observability.GoSafe("supervisor.cluster_registrar", observability.Isolated, func() { reg.Run(s.ctx) })
+		slog.Info("cluster mode enabled", "node_id", s.cfg.Cluster.NodeID, "hub", s.cfg.Cluster.HubURL)
+	}
+
+	// Budget-mode quota staleness heartbeat (D-U7/P9). ONLY started when
+	// enforce_mode=budget AND a collector URL exists — so the default availability
+	// path and Personal add no periodic server call (offline-first preserved).
+	// Isolated: a probe panic must never kill the data path. See startQuotaHeartbeat.
+	s.startQuotaHeartbeat()
+
 	return s, nil
+}
+
+// startQuotaHeartbeat wires the traffic-independent server-reachability probe for
+// budget-mode quota staleness (D-U7/P9). No-op unless quota is enabled, enforce_mode
+// is budget, and a collector URL is configured — keeping availability-mode and
+// Personal deployments free of any new periodic server contact (offline-first).
+//
+// Probe target: the collector's cheap unauthenticated GET /health (the collector
+// is the source of the usd baseline whose freshness budget mode guards). Cadence:
+// maxStaleness/3 clamped to [30s, 120s] so a single transient miss can't trip a
+// fail-closed (≈3 consecutive misses needed). The 5s managed-key sync copies the
+// probe's LastOKAt into the snapshot for budgetStale.
+func (s *Supervisor) startQuotaHeartbeat() {
+	if !s.quotaEnabled {
+		return
+	}
+	budget, maxStaleness := quotaBudgetModeFromEnv()
+	if !budget {
+		return
+	}
+	base := s.cfg.Events.CollectorURL
+	if base == "" {
+		base = s.cfg.Events.ControlURL
+	}
+	if base == "" {
+		slog.Warn("quota budget mode on but no collector/control URL — staleness heartbeat disabled (budget fail-closed cannot trigger)",
+			"event.name", "proxy.quota.heartbeat_no_url")
+		return
+	}
+	healthURL := strings.TrimRight(base, "/") + "/health"
+	interval := maxStaleness / 3
+	if interval < 30*time.Second {
+		interval = 30 * time.Second
+	}
+	if interval > 120*time.Second {
+		interval = 120 * time.Second
+	}
+	client := &http.Client{Timeout: 5 * time.Second}
+	s.quotaHeartbeat = heartbeat.New(interval, func(ctx context.Context) error {
+		req, err := http.NewRequestWithContext(ctx, http.MethodGet, healthURL, nil)
+		if err != nil {
+			return err
+		}
+		resp, err := client.Do(req)
+		if err != nil {
+			return err
+		}
+		defer resp.Body.Close()
+		if resp.StatusCode != http.StatusOK {
+			return fmt.Errorf("collector health: %d", resp.StatusCode)
+		}
+		return nil
+	})
+	observability.GoSafe("supervisor.quota_heartbeat", observability.Isolated, func() { s.quotaHeartbeat.Run(s.ctx) })
+	slog.Info("quota budget-mode staleness heartbeat started",
+		"event.name", "proxy.quota.heartbeat_started",
+		"health_url", healthURL, "interval", interval, "max_staleness", maxStaleness)
 }
 
 // SetTransport sets the outbound RoundTripper used by all generations.
@@ -356,20 +463,55 @@ func (s *Supervisor) managedKeySyncLoop() {
 	}
 }
 
+// computeFilterSig returns a stable signature of the vault's current filter-app
+// set (sorted, comma-joined slugs). ok=false on read error so the caller skips
+// the comparison rather than mistaking an error for a "set changed" → reload storm.
+func computeFilterSig(vaultReader *vault.Reader) (string, bool) {
+	slugs, err := vaultReader.GetFilterAppSlugs()
+	if err != nil {
+		return "", false
+	}
+	sort.Strings(slugs)
+	// R9: fold each slug's filter_record_allow into the signature so a settings
+	// toggle (not just enable/disable) also triggers a reload — installFilterHook
+	// passes record_allow into the detector child's env, so a stale child would
+	// otherwise keep the old value until a manual reload. (filter_stages VALUE
+	// changes stay out of scope: the cluster daemon only flips the column
+	// NULL<->["pre_forward"], which already changes the slug set.) A per-slug read
+	// error defaults to false — harmless: at worst a record_allow flip is missed,
+	// never a spurious reload.
+	parts := make([]string, 0, len(slugs))
+	for _, s := range slugs {
+		ra, _ := vaultReader.GetFilterRecordAllow(s)
+		parts = append(parts, fmt.Sprintf("%s:%t", s, ra))
+	}
+	return strings.Join(parts, ","), true
+}
+
 // syncManagedKeys checks the vault change_seq and, if it has advanced since
 // the active generation was built, merges current active managed keys into the
 // live registry.
 func (s *Supervisor) syncManagedKeys() {
 	gen := s.active.Load()
 
-	// D-U7/P9 budget-mode freshness: feed the quota snapshot the proxy's last
-	// SUCCESSFUL server contact (reporter upload) every tick. This is the reliable
-	// continuous signal (tied to real traffic) — unlike the per-command CLI sync —
-	// so budget mode's staleness check reflects actual server reachability. nil
-	// reporter (offline / Personal) → leaves lastSyncAt zero → budget mode inert.
-	if gen != nil && gen.reporter != nil {
-		s.quotaSnapshot.SetLastSyncAt(gen.reporter.LastOKUploadAt())
+	// D-U7/P9 budget-mode freshness: feed the quota snapshot the last time the
+	// TRAFFIC-INDEPENDENT heartbeat confirmed the server is reachable. Copying the
+	// probe's timestamp on this 5s tick is enough — the probe advances it on its
+	// own cadence. NOT the old reporter-upload time: that was request-driven, so it
+	// went stale whenever the node was simply idle, which (under budget mode)
+	// blocked the node and then deadlocked (the block stops the traffic that would
+	// refresh it). nil heartbeat (availability mode / no collector URL) → leaves
+	// lastReachableAt zero → budget mode inert (rollout-safe).
+	if s.quotaHeartbeat != nil {
+		s.quotaSnapshot.SetLastReachableAt(s.quotaHeartbeat.LastOKAt())
 	}
+
+	// P0 write-behind flush: persist the in-memory counter's local increment to
+	// quota_local_usage every tick (not per request) so an OFFLINE restart resumes
+	// from it. The in-memory counter stays the authority — this is a lossy backstop
+	// (≤1 tick behind, safe side). Runs every tick regardless of vault-seq, before
+	// the early-return below. Best-effort: a write failure only WARNs.
+	s.flushLocalUsage()
 
 	vaultSeq, err := vault.ReadConfigU64LE(s.cfg.Vault.Path, VaultChangeSeqKey)
 	if err != nil {
@@ -381,6 +523,35 @@ func (s *Supervisor) syncManagedKeys() {
 	}
 	if vaultSeq == loadedSeq {
 		return // nothing changed
+	}
+
+	// Filter-app set change → trigger a FULL reload (not the lightweight
+	// registry rebuild below). The compliance/DLP filter child lives on the
+	// generation (g.filterHook), not the route registry, so a registry-only
+	// rebuild cannot spawn/stop it. The cluster daemon toggles compliance by
+	// writing the "cluster-compliance" app_record's filter_stages; without this
+	// check that only took effect on a manual /admin/reload (2026-06-05 E2E gap).
+	// Fault-isolated: a read error skips the check (never a reload storm).
+	if newSig, ok := computeFilterSig(gen.vault); ok {
+		if prev := s.lastFilterSig.Load(); prev == nil || *prev != newSig {
+			// R5: record the attempted signature BEFORE the reload so a
+			// persistently-failing Reload (e.g. transient build error) does NOT
+			// re-fire every 5s tick (reload storm). On success buildGeneration
+			// re-stores the same value + advances loaded_seq; on failure we keep
+			// this stored value and fall through to the lightweight rebuild so
+			// the credential sync still converges (loaded_seq advances) — the
+			// filter just stays as-is until the vault filter set changes again.
+			s.lastFilterSig.Store(&newSig)
+			slog.Info("managed key sync: filter-app set changed; full reload",
+				"event.name", "proxy.filter.set_changed")
+			if err := s.Reload(s.ctx); err != nil {
+				slog.Warn("managed key sync: filter-triggered reload failed; "+
+					"continuing with lightweight sync (filter unchanged)", "error", err)
+				// fall through — do NOT return — so the cred path below still runs.
+			} else {
+				return // Reload rebuilt registry + filter hook + advanced loaded_seq.
+			}
+		}
 	}
 
 	// Full rebuild: load all token sources and atomically replace the registry.
@@ -514,6 +685,24 @@ func quotaBudgetModeFromEnv() (budget bool, maxStaleness time.Duration) {
 // snapshot (design §8) — it never returns an error and never touches the
 // managed-key path. Called at startup / reload (buildGeneration) and on each
 // vault-seq advance (syncManagedKeys).
+// flushLocalUsage persists the counter's current local increments to the vault's
+// quota_local_usage table (P0 write-behind). Best-effort + no-op when quota is off
+// or there's nothing to persist. Writes via its own connection (WriteLocalUsage)
+// so it never contends on the shared read path. A failure only WARNs — the
+// in-memory counter remains authoritative; the persisted copy just lags a tick.
+func (s *Supervisor) flushLocalUsage() {
+	if !s.quotaEnabled || s.quotaCounter == nil {
+		return
+	}
+	rows := s.quotaCounter.IncrementRows()
+	if len(rows) == 0 {
+		return
+	}
+	if err := quota.WriteLocalUsage(s.cfg.Vault.Path, rows); err != nil {
+		slog.Warn("quota.local_usage.flush_failed", "error", err.Error())
+	}
+}
+
 func (s *Supervisor) reloadQuotaSnapshot(gen *generation) {
 	if !s.quotaEnabled || gen == nil || gen.vault == nil {
 		return
@@ -528,6 +717,21 @@ func (s *Supervisor) reloadQuotaSnapshot(gen *generation) {
 	// current-period baseline so a restart/another machine doesn't resume from
 	// zero. Idempotent on unchanged baselines (won't wipe local increments).
 	quota.SeedBaselines(s.quotaCounter, subjects, time.Now())
+	// P0 (write-behind restore): restore the persisted local increment ONCE at
+	// startup, BEFORE serving, so an OFFLINE restart resumes from the usage accrued
+	// since the last server baseline rather than zero. Must be once-only — re-seeding
+	// on a later reload would clobber in-flight increments. A missing table (pre-P0
+	// vault) loads as empty → start from zero, harmless. On a read error, leave the
+	// flag false to retry next reload.
+	if !s.quotaIncrementSeeded {
+		if rows, lerr := quota.LoadLocalUsage(gen.vault.DB()); lerr != nil {
+			slog.Warn("quota.local_usage.load_failed", "error", lerr.Error())
+		} else {
+			quota.SeedLocalIncrements(s.quotaCounter, rows)
+			s.quotaIncrementSeeded = true
+			slog.Info("quota.local_usage.seeded", "rows", len(rows))
+		}
+	}
 	slog.Info("quota.snapshot.loaded", "subjects", len(subjects))
 	// D-U8/P6: load the deployment-global edge price summary (for P7 local usd
 	// pricing). Best-effort — a read/parse failure logs WARN and KEEPS the
@@ -953,7 +1157,15 @@ func (s *Supervisor) buildGeneration() (*generation, error) {
 	// "no double-prefix compatibility window" principle. See review #5 [中],
 	// 2026-04-29 (second pass — wiring evidence is now testable in
 	// `TestLoadVaultRoutesIntoRegistry_StartupPathFiltersLegacy`).
-	loadVaultRoutesIntoRegistry(registry, vaultReader)
+	// Cluster policy (V3c P4.2): a cluster node serves ONLY team/managed virtual
+	// keys. Skip loading personal / OAuth / app bearers so the node never routes
+	// a developer's personal credential. (In practice a node's daemon-managed
+	// vault.db has no personal/oauth/app rows anyway — this is defense-in-depth so
+	// a misconfigured node can't leak them.) Team/managed routes are loaded
+	// separately via the managed-key path, so the registry still gets them.
+	if !s.cfg.Cluster.Enabled {
+		loadVaultRoutesIntoRegistry(registry, vaultReader)
+	}
 
 	// Provider registry.
 	providers := provider.NewRegistry()
@@ -1006,6 +1218,11 @@ func (s *Supervisor) buildGeneration() (*generation, error) {
 	// check is per-generation (cheap), so a vault/env change re-evaluates on
 	// next Reload. See filter_hook.go + SPEC §1.5.7 / §6.6.
 	filterHook := s.installFilterHook(p, vaultReader)
+	// Record the filter-app signature this generation was built with so
+	// syncManagedKeys can detect a later enable/disable and trigger a reload.
+	if sig, ok := computeFilterSig(vaultReader); ok {
+		s.lastFilterSig.Store(&sig)
+	}
 
 	// Create the local WAL writer unconditionally whenever WALDir is set.
 	// This is the canonical event log used by `aikey statusline` / `aikey watch`,

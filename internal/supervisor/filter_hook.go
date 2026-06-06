@@ -66,7 +66,7 @@ const filterDefaultTimeout = 80 * time.Millisecond
 // generation and calls Shutdown on reload-drain. A nil return means "no live
 // child to tear down" — either nothing was declared, or spawn failed and the
 // proxy is in fail-loud 501 mode instead.
-func (s *Supervisor) installFilterHook(p *proxy.Proxy, vaultReader *vault.Reader) *apphook.ChildHook {
+func (s *Supervisor) installFilterHook(p *proxy.Proxy, vaultReader *vault.Reader) apphook.FilterTarget {
 	binPath, binArgs, slug, declaredButMissing := s.resolveFilterBinary(vaultReader)
 	if binPath == "" {
 		if declaredButMissing {
@@ -123,15 +123,35 @@ func (s *Supervisor) installFilterHook(p *proxy.Proxy, vaultReader *vault.Reader
 	// `aikey login --control-url`); the proxy is the conduit, the detector keeps
 	// NO copy. Empty (no team configured) → puller stays offline.
 	extraEnv := []string{recordAllowEnv, localIntakeEnv}
-	if masterURL := readControlPanelURL(); masterURL != "" {
-		// Bound to a team → pull packs from it, and poll every 60s so a newly
+	// Resolve the pack-pull backend + tenant for the detector. Personal/Trial read
+	// the team URL from the CLI's config.json (no tenant scoping — one user, one
+	// view). A CLUSTER node has no CLI config.json; its control URL + org come from
+	// the shared cluster-node.env (the same AIKEY_HUB_* the daemon uses — proxy and
+	// daemon both EnvironmentFile= it). Single-tenant per node (gap2 decision), so
+	// AIKEY_TENANT_ID is a single value scoping the pull to THIS org's packs.
+	// Reusing the existing detector pack-puller (GET /v1/packs/changed, which already
+	// ships phrases + does atomic ruleset swap) means org-custom phrases reach the
+	// node with no new endpoint/protocol — only these two env vars.
+	masterURL := readControlPanelURL()
+	tenantID := ""
+	if s.cfg != nil && s.cfg.Cluster.Enabled {
+		if u := os.Getenv("AIKEY_HUB_CONTROL_URL"); u != "" {
+			masterURL = strings.TrimRight(u, "/")
+		}
+		tenantID = os.Getenv("AIKEY_HUB_ORG_ID")
+	}
+	if masterURL != "" {
+		// Bound to a backend → pull packs from it, and poll every 60s so a newly
 		// published pack appears within ~1 minute (the detector's default is 1h,
 		// too slow for "add pack → see it"). Incremental cursor-based pulls are
-		// cheap. Offline (no team) → neither var is set, puller stays off.
+		// cheap. Offline (no backend) → neither var is set, puller stays off.
 		extraEnv = append(extraEnv,
 			"AIKEY_PACK_MASTER_URL="+masterURL,
 			"AIKEY_PACK_POLL_INTERVAL=60s",
 		)
+		if tenantID != "" {
+			extraEnv = append(extraEnv, "AIKEY_TENANT_ID="+tenantID)
+		}
 	}
 
 	cfg := apphook.ChildHookConfig{
@@ -141,25 +161,35 @@ func (s *Supervisor) installFilterHook(p *proxy.Proxy, vaultReader *vault.Reader
 		Timeout:    filterTimeout(),
 		ExtraEnv:   extraEnv,
 	}
-	hook := apphook.NewChildHook(cfg)
-	if err := hook.Start(s.ctx); err != nil {
-		// We have a binary but can't run it (missing/perm, protocol-version
-		// drift, engine init crash). Fail loud — refuse traffic rather than
-		// silently forwarding unfiltered.
+	// Pool of M independent detector processes (双进程+A: cross-process isolation
+	// on top of each process's internal worker pool). M from AIKEY_PROXY_FILTER_WORKERS
+	// (default 1 = single process / Personal/Trial). Each child inherits the proxy
+	// env, including AIKEY_COMPLIANCE_WORKERS (K, the detector's internal pool size).
+	m := filterWorkerCount()
+	workers := make([]*apphook.ChildHook, m)
+	for i := range workers {
+		workers[i] = apphook.NewChildHook(cfg)
+	}
+	pool := apphook.NewFilterPool("ai-compliance-detector", workers)
+	if err := pool.Start(s.ctx); err != nil {
+		// NONE of the M processes could run (missing/perm, protocol-version drift,
+		// engine init crash). Fail loud — refuse traffic rather than forwarding
+		// unfiltered. (If only some failed, the pool stays up and they self-heal.)
 		slog.Error("supervisor: filter hook spawn failed; enabling fail-loud 501",
 			"event.name", "proxy.filter_spawn_failed",
-			"binary", binPath, "error", err)
+			"binary", binPath, "workers", m, "error", err)
 		p.SetFilterStub501Active(true)
-		_ = hook.Shutdown(context.Background()) // best-effort; never started → no-op
+		_ = pool.Shutdown(context.Background()) // best-effort; never started → no-op
 		return nil
 	}
 
-	p.SetFilterHook(hook)
+	p.SetFilterHook(pool)
 	slog.Info("supervisor: compliance filter hook active",
 		"event.name", "proxy.filter_hook_active",
 		"binary", binPath,
+		"workers", m,
 		"timeout_ms", filterTimeout().Milliseconds())
-	return hook
+	return pool
 }
 
 // resolveFilterBinary picks the filter child binary to spawn:
@@ -226,6 +256,28 @@ func filterTimeout() time.Duration {
 		return filterDefaultTimeout
 	}
 	return time.Duration(ms) * time.Millisecond
+}
+
+// filterWorkersEnv sets M, the number of independent detector PROCESSES the pool
+// spawns. Default 1 (Personal/Trial — behaviour unchanged). Production sets 2 for
+// cross-process fault isolation. K (goroutines per process) is a separate knob,
+// AIKEY_COMPLIANCE_WORKERS, read by the detector itself (inherited from the proxy
+// env).
+const filterWorkersEnv = "AIKEY_PROXY_FILTER_WORKERS"
+
+// filterWorkerCount resolves M from filterWorkersEnv (default 1, clamped ≥1).
+func filterWorkerCount() int {
+	raw := strings.TrimSpace(os.Getenv(filterWorkersEnv))
+	if raw == "" {
+		return 1
+	}
+	n, err := strconv.Atoi(raw)
+	if err != nil || n < 1 {
+		slog.Warn("supervisor: invalid "+filterWorkersEnv+"; using 1",
+			"event.name", "proxy.filter_workers_invalid", "value", raw)
+		return 1
+	}
+	return n
 }
 
 // readControlPanelURL reads the team control-panel URL from the CLI's single
