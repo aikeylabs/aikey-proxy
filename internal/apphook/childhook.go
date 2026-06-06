@@ -5,18 +5,18 @@
 // logic about WHAT the child does belongs to the child itself (it's a separate
 // binary). proxy just spawns, pipes, and respects the contract.
 //
-// Stage A scope:
-//   - Spawn + pipe setup + protocol version handshake (via child's ready
-//     sentinel on stderr)
-//   - Single-flight Detect (single in-flight request, sync write/read)
-//   - Degraded fallback on any IO error
-//   - Background restart with exponential backoff
+// Concurrency model (v3, 2026-06-06 — the "A" half of 双进程+A):
+//   - One dedicated reader goroutine per spawn drains the child's stdout and
+//     demuxes each response to its waiting request by a 4-byte request-id.
+//   - Detect/ListPacks are ASYNC: assign a req-id, register a pending channel,
+//     write the request (writeMu serializes the pipe write), then wait on the
+//     channel up to the per-call timeout. Many Detects can be in flight at once
+//     on a single pipe, so the child (with its own internal worker pool) can
+//     process them concurrently and reply out of order.
+//   - Degraded fallback on any IO error; bounded lazy self-heal on the next call.
 //
-// Stage B+ extensions (out of scope for A):
-//   - Worker pool for concurrent Detect (currently single-flight, sufficient
-//     for client-side proxy QPS < 1000)
-//   - Streaming inbound/outbound (for response body inspection)
-//   - User-role forwarding via Request metadata
+// One ChildHook == one child process == one pipe. The FilterPool (filterpool.go)
+// wraps M of these for cross-process fan-out + isolation (the "C" half).
 package apphook
 
 import (
@@ -57,7 +57,7 @@ func (c *ChildHookConfig) applyDefaults() {
 		c.Timeout = 1 * time.Millisecond
 	}
 	if c.ProtocolVersion == 0 {
-		c.ProtocolVersion = 2 // v2: RouteClass in request + length-prefixed findings + Event in response
+		c.ProtocolVersion = 3 // v3: request-id multiplexing (concurrent in-flight Detects)
 	}
 	if c.ReadyTimeout == 0 {
 		c.ReadyTimeout = 5 * time.Second
@@ -73,29 +73,44 @@ func (c *ChildHookConfig) applyDefaults() {
 	}
 }
 
+// childResponse is a decoded response frame, delivered to the waiting caller by
+// the reader goroutine via the pending map.
+type childResponse struct {
+	action   byte
+	findings []byte // ActionMask → masked payload; ListPacks → JSON report; else per-op
+	event    []byte // team-routed compliance event for the proxy to forward; empty otherwise
+}
+
 // ChildHook is a generic Hook that delegates to a spawned child binary.
 type ChildHook struct {
 	cfg ChildHookConfig
 
-	// Mutex protects spawn/exit state transitions.
-	mu     sync.Mutex
-	cmd    *exec.Cmd
-	stdin  *bufio.Writer
-	stdout *bufio.Reader
+	// mu protects spawn/exit state transitions (cmd, generation).
+	mu  sync.Mutex
+	cmd *exec.Cmd
+	gen atomic.Uint64 // spawn generation; the reader tied to an older gen won't clobber a newer spawn's state
+
+	// writeMu serializes frame writes to the child's stdin AND guards the stdin
+	// pointer (replaced on spawn/restart). Reads happen on a separate pipe owned
+	// by the reader goroutine, so writes and reads never contend.
+	writeMu sync.Mutex
+	stdin   *bufio.Writer
+
+	// pending holds in-flight requests keyed by request-id. The reader delivers
+	// each response to pending[id]; a timed-out caller removes its own entry.
+	pendingMu sync.Mutex
+	pending   map[uint32]chan *childResponse
+	nextReqID atomic.Uint32
 
 	// status is atomically swapped so Status() is wait-free.
 	status atomic.Pointer[Status]
-
-	// detectMu serializes Detect calls so we get clean request/response pairs
-	// on the single pipe. Stage A: sufficient; Stage B+: consider worker pool.
-	detectMu sync.Mutex
 
 	// degraded is set when child is unusable; cleared on successful restart.
 	degraded atomic.Bool
 
 	// lastRecoverAt (unix nano) gates the lazy self-heal: when degraded, the next
 	// request synchronously restarts the child, but a storm of requests must not
-	// hammer respawns — only one attempt per recoverCooldown.
+	// hammer respawns — only one attempt per recoverCooldown (CAS-guarded).
 	lastRecoverAt atomic.Int64
 }
 
@@ -103,7 +118,7 @@ type ChildHook struct {
 // to launch the child.
 func NewChildHook(cfg ChildHookConfig) *ChildHook {
 	cfg.applyDefaults()
-	h := &ChildHook{cfg: cfg}
+	h := &ChildHook{cfg: cfg, pending: make(map[uint32]chan *childResponse)}
 	h.degraded.Store(true) // start degraded; flip after successful Start
 	h.status.Store(&Status{
 		Healthy:        false,
@@ -167,7 +182,7 @@ func (h *ChildHook) spawnLocked(ctx context.Context) error {
 		scanner := bufio.NewScanner(stderr)
 		for scanner.Scan() {
 			line := scanner.Text()
-			if line != "" && (containsReadySentinel(line)) {
+			if line != "" && containsReadySentinel(line) {
 				select {
 				case readyCh <- line:
 				default:
@@ -180,8 +195,10 @@ func (h *ChildHook) spawnLocked(ctx context.Context) error {
 	select {
 	case version := <-readyCh:
 		h.cmd = cmd
+		gen := h.gen.Add(1) // bump generation; the reader below is tied to it
+		h.writeMu.Lock()
 		h.stdin = bufio.NewWriterSize(stdin, 64*1024)
-		h.stdout = bufio.NewReaderSize(stdout, 64*1024)
+		h.writeMu.Unlock()
 		h.degraded.Store(false)
 		h.status.Store(&Status{
 			Healthy:       true,
@@ -190,6 +207,10 @@ func (h *ChildHook) spawnLocked(ctx context.Context) error {
 			LastSpawnedAt: time.Now(),
 			RestartCount:  h.status.Load().RestartCount,
 		})
+		// Reader owns its own stdout reader for this generation. It exits when the
+		// pipe closes (process killed on restart/shutdown); a stale (older-gen)
+		// reader exiting won't clobber a newer spawn (gen check in readLoop).
+		go h.readLoop(bufio.NewReaderSize(stdout, 64*1024), gen)
 		return nil
 	case <-time.After(h.cfg.ReadyTimeout):
 		_ = cmd.Process.Kill()
@@ -202,6 +223,53 @@ func (h *ChildHook) spawnLocked(ctx context.Context) error {
 		h.markDegraded("startup_canceled")
 		return ctx.Err()
 	}
+}
+
+// readLoop drains one generation's stdout, demuxing each response frame to its
+// waiting caller by request-id. It returns when the pipe errors (child died /
+// restart / shutdown). If no newer generation has spawned, it marks the hook
+// degraded so the next call lazily self-heals. In-flight callers are NOT failed
+// here — they time out via their own ctx (fail-open), which avoids racing a
+// concurrent restart's fresh requests.
+func (h *ChildHook) readLoop(r *bufio.Reader, gen uint64) {
+	for {
+		payload, err := h.readFrame(r)
+		if err != nil {
+			if h.gen.Load() == gen {
+				h.markDegraded("read_failed: " + err.Error())
+			}
+			return
+		}
+		// Response payload (v3): [req_id 4B][action 1B][findings_len 4B][findings][event]
+		if len(payload) < 9 {
+			continue // malformed; drop (a real desync surfaces as a read error next)
+		}
+		reqID := binary.LittleEndian.Uint32(payload[0:4])
+		flen := int(binary.LittleEndian.Uint32(payload[5:9]))
+		if 9+flen > len(payload) {
+			continue
+		}
+		resp := &childResponse{
+			action:   payload[4],
+			findings: payload[9 : 9+flen],
+			event:    payload[9+flen:],
+		}
+		h.pendingMu.Lock()
+		ch, ok := h.pending[reqID]
+		if ok {
+			delete(h.pending, reqID)
+		}
+		h.pendingMu.Unlock()
+		if ok {
+			ch <- resp // buffered (cap 1); never blocks even if the caller timed out
+		}
+	}
+}
+
+func (h *ChildHook) removePending(reqID uint32) {
+	h.pendingMu.Lock()
+	delete(h.pending, reqID)
+	h.pendingMu.Unlock()
 }
 
 func (h *ChildHook) markDegraded(reason string) {
@@ -239,6 +307,9 @@ func (h *ChildHook) restart(ctx context.Context) error {
 		_ = h.cmd.Wait()
 		h.cmd = nil
 	}
+	h.writeMu.Lock()
+	h.stdin = nil // old reader will EOF and exit; writes fail until spawnLocked sets a fresh stdin
+	h.writeMu.Unlock()
 	old := h.status.Load()
 	h.status.Store(&Status{
 		Healthy:        false,
@@ -251,17 +322,21 @@ func (h *ChildHook) restart(ctx context.Context) error {
 	return h.spawnLocked(ctx) // clears degraded on success
 }
 
-// lazyRecoverLocked is the synchronous self-heal, called under detectMu when the
-// child is degraded. Cooldown-guarded (no respawn storm) + time-bounded (a hot
-// request stalls ≤ lazyRestartBound). On success h.degraded is cleared and the
+// lazyRecover is the synchronous self-heal, called (without holding any lock)
+// when the child is degraded. CAS-guarded so a storm of concurrent Detects
+// triggers at most one respawn per recoverCooldown; time-bounded so a hot
+// request stalls ≤ lazyRestartBound. On success h.degraded is cleared and the
 // caller proceeds with a fresh pipe; on failure the caller fails open and the
 // next request (after the cooldown) retries.
-func (h *ChildHook) lazyRecoverLocked() {
+func (h *ChildHook) lazyRecover() {
 	now := time.Now().UnixNano()
-	if now-h.lastRecoverAt.Load() < int64(recoverCooldown) {
+	last := h.lastRecoverAt.Load()
+	if now-last < int64(recoverCooldown) {
 		return // recently attempted — fail open until the cooldown elapses
 	}
-	h.lastRecoverAt.Store(now)
+	if !h.lastRecoverAt.CompareAndSwap(last, now) {
+		return // another goroutine won the recovery slot
+	}
 	rctx, cancel := context.WithTimeout(context.Background(), lazyRestartBound)
 	defer cancel()
 	_ = h.restart(rctx) // failure path stays degraded (logged via markDegraded)
@@ -270,64 +345,72 @@ func (h *ChildHook) lazyRecoverLocked() {
 // Name implements Hook.
 func (h *ChildHook) Name() string { return h.cfg.Name }
 
-// Detect implements Hook. Single-flight: serializes via detectMu.
-func (h *ChildHook) Detect(ctx context.Context, req *Request) *Response {
-	// Enforce internal timeout cap (even if caller passes a longer ctx).
-	ctx, cancel := context.WithTimeout(ctx, h.cfg.Timeout)
-	defer cancel()
-	_ = ctx // timeout intent; pipe I/O failure (crash) surfaces as read/write error
-
-	h.detectMu.Lock()
-	defer h.detectMu.Unlock()
-
-	// Lazy self-heal: if the child is degraded (crashed / pipe desynced), try a
-	// bounded synchronous restart now (under the lock, so it serializes with all
-	// Detects). If it still can't recover, fail open for this request.
+// roundtrip sends one request and waits for its response (or the ctx deadline).
+// Concurrency-safe: many roundtrips can be in flight at once, demuxed by req-id.
+func (h *ChildHook) roundtrip(ctx context.Context, op, routeClass byte, body []byte) (*childResponse, error) {
+	// Lazy self-heal: if degraded, try a bounded respawn now; if it still can't
+	// recover, fail open for this request.
 	if h.degraded.Load() {
-		h.lazyRecoverLocked()
+		h.lazyRecover()
 		if h.degraded.Load() {
-			return &Response{Action: ActionAllow, Degraded: true, Reason: "child degraded (recover pending)"}
+			return nil, errDegraded
 		}
 	}
 
-	start := time.Now()
+	reqID := h.nextReqID.Add(1)
+	ch := make(chan *childResponse, 1)
+	h.pendingMu.Lock()
+	h.pending[reqID] = ch
+	h.pendingMu.Unlock()
 
-	// Write request frame (v2): [version][len LE 4B] | [op=1][route_class][payload]
-	payload := append([]byte{1, req.RouteClass}, req.Payload...) // op=1 = Detect
+	// Request frame payload (v3): [op][route_class][req_id 4B][body]
+	payload := make([]byte, 6+len(body))
+	payload[0] = op
+	payload[1] = routeClass
+	binary.LittleEndian.PutUint32(payload[2:6], reqID)
+	copy(payload[6:], body)
 	if err := h.writeFrame(payload); err != nil {
+		h.removePending(reqID)
 		h.markDegraded("write_failed: " + err.Error())
-		return &Response{Action: ActionAllow, Degraded: true, Reason: "child write failed"}
+		return nil, err
 	}
 
-	// Read response frame (v2): [version][len LE 4B] | [action 1B][findings_len 4B][findings][event]
-	respPayload, err := h.readFrame()
+	select {
+	case resp := <-ch:
+		return resp, nil
+	case <-ctx.Done():
+		h.removePending(reqID) // a late response from the reader is dropped
+		return nil, ctx.Err()
+	}
+}
+
+var errDegraded = errors.New("apphook: child degraded")
+
+// Detect implements Hook. Async: writes a request and waits for the matching
+// response, allowing many concurrent in-flight Detects on one pipe.
+func (h *ChildHook) Detect(ctx context.Context, req *Request) *Response {
+	ctx, cancel := context.WithTimeout(ctx, h.cfg.Timeout)
+	defer cancel()
+
+	start := time.Now()
+	resp, err := h.roundtrip(ctx, 1, req.RouteClass, req.Payload) // op=1 = Detect
 	if err != nil {
-		h.markDegraded("read_failed: " + err.Error())
-		return &Response{Action: ActionAllow, Degraded: true, Reason: "child read failed"}
+		reason := "child degraded"
+		if !errors.Is(err, errDegraded) {
+			reason = "child detect failed: " + err.Error()
+		}
+		return &Response{Action: ActionAllow, Degraded: true, Reason: reason}
 	}
-
-	if len(respPayload) < 5 {
-		h.markDegraded("short_response")
-		return &Response{Action: ActionAllow, Degraded: true, Reason: "short response"}
-	}
-
-	flen := int(binary.LittleEndian.Uint32(respPayload[1:5]))
-	if 5+flen > len(respPayload) {
-		h.markDegraded("malformed_response")
-		return &Response{Action: ActionAllow, Degraded: true, Reason: "malformed response framing"}
-	}
-	findings := respPayload[5 : 5+flen] // ActionMask → masked payload; else per-op
-	event := respPayload[5+flen:]       // team-routed compliance event for the proxy to forward
 
 	res := &Response{
-		Action:          Action(respPayload[0]),
+		Action:          Action(resp.action),
 		LatencyObserved: time.Since(start),
 	}
-	if res.Action == ActionMask && len(findings) > 0 {
-		res.MutatedPayload = findings
+	if res.Action == ActionMask && len(resp.findings) > 0 {
+		res.MutatedPayload = resp.findings
 	}
-	if len(event) > 0 {
-		res.Event = event
+	if len(resp.event) > 0 {
+		res.Event = resp.event
 	}
 
 	// Update status (cheap atomic swap).
@@ -351,52 +434,24 @@ var ErrPacksUnavailable = errors.New("apphook: effective packs unavailable")
 
 // ListPacks queries the child for its currently-effective compliance packs
 // (op=4: built-in baseline + pulled packs). Returns the raw JSON report payload.
-//
-// Design (Option A): shares the Detect pipe under detectMu, held ONLY for the
-// brief write+read of this bounded query. The child's handler is lock-free +
-// non-blocking (atomic snapshot + static manifest), so it can't stall a real
-// Detect. A crashed/wedged child surfaces as a write/read error → degraded,
-// same failure mode Detect already has (no new risk). Backward compatible: an
-// old child returns Allow + empty payload for the unknown op → we return
-// ErrPacksUnavailable, which the admin layer maps to "packs unavailable".
+// Shares the multiplexed pipe (its own req-id), so it never blocks a Detect.
 func (h *ChildHook) ListPacks(ctx context.Context) ([]byte, error) {
 	ctx, cancel := context.WithTimeout(ctx, h.cfg.Timeout)
 	defer cancel()
-	_ = ctx // timeout intent; pipe I/O failure (crash) surfaces as read/write error
 
-	h.detectMu.Lock()
-	defer h.detectMu.Unlock()
-	// Lazy self-heal: the effective-packs query is not on the request hot path —
-	// when degraded it triggers a bounded synchronous restart so the drawer shows
-	// the live packs directly instead of "not running" + a manual refresh.
-	if h.degraded.Load() {
-		h.lazyRecoverLocked()
-		if h.degraded.Load() {
+	resp, err := h.roundtrip(ctx, 4, 0, nil) // op=4 = ListPacks
+	if err != nil {
+		if errors.Is(err, errDegraded) {
 			return nil, ErrPacksUnavailable
 		}
-	}
-
-	if err := h.writeFrame([]byte{4}); err != nil { // op=4 = ListPacks
-		h.markDegraded("listpacks_write_failed: " + err.Error())
+		h.markDegraded("listpacks_failed: " + err.Error())
 		return nil, err
 	}
-	respPayload, err := h.readFrame()
-	if err != nil {
-		h.markDegraded("listpacks_read_failed: " + err.Error())
-		return nil, err
-	}
-	// Response (v2): [action 1B][findings_len 4B][JSON report][event]. The report
-	// is the length-prefixed findings slice; ignore the action byte and trailing
-	// event (empty for ListPacks). A child that doesn't implement op=4 returns an
-	// empty report → unavailable. (A v1 child fails earlier on version mismatch.)
-	if len(respPayload) < 5 {
+	// A child that doesn't implement op=4 returns an empty report → unavailable.
+	if len(resp.findings) == 0 {
 		return nil, ErrPacksUnavailable
 	}
-	flen := int(binary.LittleEndian.Uint32(respPayload[1:5]))
-	if flen == 0 || 5+flen > len(respPayload) {
-		return nil, ErrPacksUnavailable
-	}
-	return respPayload[5 : 5+flen], nil
+	return resp.findings, nil
 }
 
 // Status implements Hook.
@@ -411,13 +466,15 @@ func (h *ChildHook) Shutdown(ctx context.Context) error {
 	if h.cmd == nil {
 		return nil
 	}
+	h.gen.Add(1) // invalidate the reader so its exit won't markDegraded over the shutdown
 	// Closing stdin triggers EOF in child's read loop → graceful exit.
+	h.writeMu.Lock()
 	if h.stdin != nil {
 		_ = h.stdin.Flush()
 	}
+	h.stdin = nil
+	h.writeMu.Unlock()
 	if h.cmd.Process != nil {
-		// We don't have direct access to the underlying pipe (it's wrapped in
-		// bufio.Writer). Send SIGTERM as a fallback.
 		_ = h.cmd.Process.Signal(os.Interrupt)
 	}
 
@@ -434,36 +491,35 @@ func (h *ChildHook) Shutdown(ctx context.Context) error {
 	}
 
 	h.cmd = nil
-	h.stdin = nil
-	h.stdout = nil
 	h.markDegraded("shutdown")
 	return nil
 }
 
-// writeFrame writes [version][len][payload] then flushes. Caller must hold detectMu.
+// writeFrame writes [version][len][payload] then flushes, under writeMu (which
+// also guards the stdin pointer against spawn/restart replacement).
 func (h *ChildHook) writeFrame(payload []byte) error {
-	if h.stdin == nil {
+	h.writeMu.Lock()
+	defer h.writeMu.Unlock()
+	w := h.stdin
+	if w == nil {
 		return errors.New("stdin closed")
 	}
 	header := make([]byte, 5)
 	header[0] = h.cfg.ProtocolVersion
 	binary.LittleEndian.PutUint32(header[1:], uint32(len(payload)))
-	if _, err := h.stdin.Write(header); err != nil {
+	if _, err := w.Write(header); err != nil {
 		return err
 	}
-	if _, err := h.stdin.Write(payload); err != nil {
+	if _, err := w.Write(payload); err != nil {
 		return err
 	}
-	return h.stdin.Flush()
+	return w.Flush()
 }
 
-// readFrame reads [version][len][payload]. Caller must hold detectMu.
-func (h *ChildHook) readFrame() ([]byte, error) {
-	if h.stdout == nil {
-		return nil, errors.New("stdout closed")
-	}
+// readFrame reads [version][len][payload] from r (the reader goroutine's stdout).
+func (h *ChildHook) readFrame(r *bufio.Reader) ([]byte, error) {
 	header := make([]byte, 5)
-	if _, err := io.ReadFull(h.stdout, header); err != nil {
+	if _, err := io.ReadFull(r, header); err != nil {
 		return nil, err
 	}
 	if header[0] != h.cfg.ProtocolVersion {
@@ -474,7 +530,7 @@ func (h *ChildHook) readFrame() ([]byte, error) {
 		return nil, fmt.Errorf("frame too large: %d", length)
 	}
 	payload := make([]byte, length)
-	if _, err := io.ReadFull(h.stdout, payload); err != nil {
+	if _, err := io.ReadFull(r, payload); err != nil {
 		return nil, err
 	}
 	return payload, nil

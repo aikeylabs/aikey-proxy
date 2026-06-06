@@ -29,6 +29,9 @@ func TestChildHookFullStackLatency(t *testing.T) {
 	if testing.Short() {
 		t.Skip("skipping latency bench in short mode")
 	}
+	if raceEnabled {
+		t.Skip("latency SLO is meaningless under -race (instrumentation inflates ~10×)")
+	}
 
 	binary := findDetectorBinary(t)
 

@@ -2,11 +2,57 @@ package apphook
 
 import (
 	"context"
+	"fmt"
 	"path/filepath"
 	"runtime"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 )
+
+// TestChildHook_ConcurrentDetect — Phase 1 (v3 request-id multiplexing): many
+// goroutines fire Detect on ONE ChildHook at once. The async demux must match
+// each response to its caller by request-id with no deadlock, no cross-talk, and
+// no spurious degraded. Run under -race. (The echo child is still serial — this
+// validates the proxy-side multiplex; Phase 2 makes the child concurrent.)
+func TestChildHook_ConcurrentDetect(t *testing.T) {
+	h := NewChildHook(ChildHookConfig{
+		Name: "concurrent-test", BinaryPath: findDetectorBinary(t), BinaryArgs: detectorArgs(),
+		Timeout: 2 * time.Second, ReadyTimeout: 5 * time.Second,
+	})
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+	if err := h.Start(ctx); err != nil {
+		t.Skipf("child binary unavailable, skipping (build first): %v", err)
+	}
+	defer func() { _ = h.Shutdown(context.Background()) }()
+
+	const (
+		goroutines = 32
+		iterations = 20
+	)
+	var wg sync.WaitGroup
+	var failures atomic.Int64
+	for g := 0; g < goroutines; g++ {
+		wg.Add(1)
+		go func(seed int) {
+			defer wg.Done()
+			for i := 0; i < iterations; i++ {
+				p := []byte(fmt.Sprintf("req-%d-%d", seed, i))
+				res := h.Detect(ctx, &Request{Direction: DirectionInbound, Payload: p})
+				if res.Degraded || res.Action != ActionAllow { // echo child always Allows
+					failures.Add(1)
+					return
+				}
+			}
+		}(g)
+	}
+	wg.Wait()
+	if n := failures.Load(); n > 0 {
+		t.Fatalf("%d/%d concurrent Detect calls failed — async demux broke under concurrency", n, goroutines*iterations)
+	}
+}
 
 // findDetectorBinary returns path to the ai-compliance-detector binary built
 // by `cd ai-compliance-detector && make build`. Test is skipped if binary
