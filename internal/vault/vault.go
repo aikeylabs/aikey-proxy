@@ -1559,3 +1559,20 @@ func WriteConfigU64LE(dbPath string, key string, value uint64) error {
 	}
 	return nil
 }
+
+// WriteConfigString writes a string value (UTF-8 BLOB) into the vault config
+// table (INSERT OR REPLACE). Mirror of WriteConfigU64LE for non-numeric config
+// such as compliance.master_policy JSON. Opens its own connection.
+func WriteConfigString(dbPath string, key string, value string) error {
+	db, err := sql.Open("sqlite", dbPath)
+	if err != nil {
+		return fmt.Errorf("open vault db for config write: %w", err)
+	}
+	defer db.Close()
+
+	_, err = db.Exec("INSERT OR REPLACE INTO config (key, value) VALUES (?, ?)", key, []byte(value))
+	if err != nil {
+		return fmt.Errorf("write config key %q: %w", key, err)
+	}
+	return nil
+}

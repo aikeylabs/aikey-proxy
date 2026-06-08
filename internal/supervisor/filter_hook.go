@@ -214,6 +214,14 @@ func (s *Supervisor) resolveFilterBinary(vaultReader *vault.Reader) (binPath str
 		return "", nil, "", false
 	}
 	if len(slugs) == 0 {
+		// G3: the user hasn't enabled the local filter, but the org may mandate it.
+		// Spawn decision = user toggle (filter_stages) OR master mandate. When the
+		// master forces compliance, run the detector even with no local filter_stages.
+		if s.masterCompliance.Load() {
+			if bin, sl := resolveAppBinary(s.appsDir(), []string{complianceDetectorSlug}); bin != "" {
+				return bin, nil, sl, false
+			}
+		}
 		return "", nil, "", false
 	}
 	if bin, sl := resolveAppBinary(s.appsDir(), slugs); bin != "" {
@@ -221,6 +229,9 @@ func (s *Supervisor) resolveFilterBinary(vaultReader *vault.Reader) (binPath str
 	}
 	return "", nil, "", true
 }
+
+// complianceDetectorSlug is the app slug force-spawned under a master mandate.
+const complianceDetectorSlug = "ai-compliance-detector"
 
 // appsDir is where `aikey app install` lays out app trees, derived from the
 // vault path (<home>/.aikey/data/vault.db → <home>/.aikey/apps).

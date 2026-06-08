@@ -270,6 +270,14 @@ type Supervisor struct {
 	// /admin/reload (gap found by the 2026-06-05 cluster E2E).
 	lastFilterSig atomic.Pointer[string]
 
+	// masterCompliance is the org-level compliance master switch polled from the
+	// control backend (G3). The supervisor is the LIFECYCLE owner of the
+	// compliance detector: the app pulls its own packs, but whether it runs at
+	// all is decided here. true → force-spawn the detector even when the user's
+	// local filter_stages is NULL (master mandate); the user's local toggle still
+	// governs when this is false. Polled by pollComplianceMasterPolicy.
+	masterCompliance atomic.Bool
+
 	// Enterprise quota (Phase 2 Stage 2 — design §0.5/§5.2). Snapshot + counter
 	// live on the supervisor (not per-generation) so the counter accumulates
 	// continuously across 5s syncs and /admin/reload; the snapshot is gen-swapped
@@ -339,6 +347,11 @@ func New(cfg *config.Config, configPath, password, version string) (*Supervisor,
 	// updates to provider keys never reach this proxy. That's a
 	// long-lived correctness/security risk, not a per-request issue.
 	observability.GoSafe("supervisor.managed_key_sync_loop", observability.Fatal, s.managedKeySyncLoop)
+
+	// G3: poll the org-level compliance master switch so an enterprise can mandate
+	// compliance from the control backend (force-spawn the detector regardless of
+	// the user's local toggle). No-op when no team/org is configured (Personal).
+	observability.GoSafe("supervisor.compliance_policy_poll", observability.Isolated, func() { s.pollComplianceMasterPolicy(s.ctx) })
 
 	// Cluster mode (V3c): register this node with the hub name service + heartbeat
 	// so clients discover it via /cluster/resolve. Inert for non-cluster proxies —
