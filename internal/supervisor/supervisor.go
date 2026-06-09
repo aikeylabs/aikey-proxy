@@ -766,6 +766,14 @@ func (s *Supervisor) QuotaCounter() *quota.Counter { return s.quotaCounter }
 
 // Handler returns an http.Handler that always delegates to the active generation.
 // This is the function passed to the http.Server — it never changes across reloads.
+//
+// Hot path: no nil-check on s.active. The first generation is Load()-ed in the
+// constructor before Serve() ever accepts a connection, and Reload only ever
+// Stores a non-nil generation, so a nil here is an impossible lifecycle bug, not
+// a runtime condition — guarding it would silently swallow that bug instead of
+// crashing visibly. The nil-checked accessors elsewhere (EffectivePacks etc.)
+// differ because admin/test paths can call them before the first generation is
+// ready, where nil is a legitimate "not yet available" state.
 func (s *Supervisor) Handler() http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		s.active.Load().ServeHTTP(w, r)

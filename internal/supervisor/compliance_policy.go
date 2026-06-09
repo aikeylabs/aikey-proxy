@@ -38,14 +38,21 @@ const (
 
 var complianceHTTPClient = &http.Client{Timeout: 10 * time.Second}
 
-// complianceOrgID returns the single org this node follows. Fixed placeholder for
-// now (cluster nodes set AIKEY_HUB_ORG_ID); multi-tenant per-user resolution via
-// /accounts/me/seats is a future extension point (intentionally deferred).
+// defaultComplianceOrgID is a fixed single-tenant placeholder. Resolving WHICH
+// org a node follows (from env / login seat) was error-prone, so for now the
+// node always follows THE org: it sends this constant and the master's policy
+// endpoint resolves its one org (ignoring the value). Multi-tenant per-user
+// resolution is a future extension — swap this for a real lookup then.
+const defaultComplianceOrgID = "default"
+
+// complianceOrgID returns the org this node follows. AIKEY_HUB_ORG_ID still
+// overrides (cluster); otherwise the fixed placeholder drives the poll so a
+// master-connected node always follows the org mandate.
 func complianceOrgID() string {
 	if v := os.Getenv("AIKEY_HUB_ORG_ID"); v != "" {
 		return v
 	}
-	return ""
+	return defaultComplianceOrgID
 }
 
 // pollComplianceMasterPolicy runs until ctx is cancelled, refreshing the org

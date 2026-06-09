@@ -34,6 +34,7 @@ import (
 	"unicode/utf8"
 
 	"github.com/AiKeyLabs/aikey-proxy/internal/apphook"
+	"github.com/AiKeyLabs/aikey-proxy/internal/observability"
 )
 
 // pipeInputCap bounds how many bytes of a content piece the proxy sends over the
@@ -113,7 +114,13 @@ func (p *Proxy) applyInboundFilter(
 			return
 		}
 		evs := teamEvents
-		go func() {
+		// Isolated: a panic in this bypass upload must not crash the proxy. A
+		// bare `go func` would escape recoverMiddleware (it only wraps ServeHTTP,
+		// which has already returned by the time this async upload runs), so a
+		// panic here would take down the whole process — violating bypass
+		// isolation. GoSafe recovers + logs, matching every other bypass
+		// goroutine in this package (stream_drainer, forward_and_resolve).
+		observability.GoSafe("proxy.filter.compliance_upload", observability.Isolated, func() {
 			ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 			defer cancel()
 			if err := p.reporter.UploadComplianceEvents(ctx, routeSource, evs); err != nil {
@@ -121,7 +128,7 @@ func (p *Proxy) applyInboundFilter(
 					"event.name", "proxy.filter.compliance_upload_failed",
 					"error", err, "count", len(evs))
 			}
-		}()
+		})
 	}()
 
 	// Read + re-buffer the body. We must restore r.Body regardless of verdict

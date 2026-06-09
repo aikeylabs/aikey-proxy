@@ -105,6 +105,11 @@ func New(ln net.Listener, dataHandler http.Handler, adminHandler *admin.Handler,
 			// undiagnosable from logs alone.
 			Handler:           recoverMiddleware(mux),
 			ReadHeaderTimeout: 30 * time.Second,
+			// Bound idle keep-alive connections so slow/abandoned clients cannot
+			// pin sockets/file descriptors indefinitely. NOT Read/WriteTimeout:
+			// those would sever long-lived SSE streams (the LLM main path), so
+			// they are intentionally left unset.
+			IdleTimeout: 120 * time.Second,
 		},
 	}
 }
