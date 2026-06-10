@@ -6,6 +6,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/AiKeyLabs/aikey-proxy/internal/observability"
 	"github.com/AiKeyLabs/aikey-proxy/internal/vkeys"
 )
 
@@ -21,7 +22,18 @@ const (
 	// is enabled (see proxy.go); absent on the hot path so we don't pay
 	// the read+stash cost for every successful request.
 	ctxKeyDebugReqBody
+	// ctxKeyTrace stores the request's W3C TraceContext (created at the HTTP
+	// entry in Handle) so deep code paths — notably buildBaseEvent feeding the
+	// async collector — can correlate logs without re-extracting from headers.
+	ctxKeyTrace
 )
+
+// traceFromContext retrieves the request's TraceContext. Returns the zero value
+// (empty ids) when absent, so callers can log unconditionally.
+func traceFromContext(ctx context.Context) observability.TraceContext {
+	tc, _ := ctx.Value(ctxKeyTrace).(observability.TraceContext)
+	return tc
+}
 
 // routeFromContext retrieves the resolved route from request context.
 func routeFromContext(ctx context.Context) *vkeys.ResolvedRoute {

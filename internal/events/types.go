@@ -45,4 +45,16 @@ type UsageEvent struct {
 	// the proxy reports drained from cache. Wire serialization on
 	// ReportableEvent uses the same json:"session_id" tag for parity.
 	SessionID string `json:"session_id,omitempty"`
+
+	// Trace correlation — request-scoped W3C trace identifiers captured at the
+	// HTTP entry (observability.ExtractOrCreate) and threaded here purely so the
+	// async collector can cite them when it has to drop a billing event under
+	// backpressure (logging-conventions: WARN/ERROR must carry trace_id /
+	// span_id / request_id). json:"-" because these are ephemeral log
+	// correlation, NOT a persisted/wire dimension — Insert() uses an explicit
+	// column list and ReportableEvent its own tags, so adding these does not
+	// touch the events.db schema or the upload contract.
+	TraceID   string `json:"-"`
+	SpanID    string `json:"-"`
+	RequestID string `json:"-"`
 }

@@ -12,6 +12,8 @@
 package proxy
 
 import (
+	"context"
+	"errors"
 	"log/slog"
 	"net/http"
 	"time"
@@ -19,6 +21,7 @@ import (
 	"github.com/AiKeyLabs/aikey-proxy/internal/observability"
 	"github.com/AiKeyLabs/aikey-proxy/internal/proxy/apppipe"
 	"github.com/AiKeyLabs/aikey-proxy/internal/proxy/probepipe"
+	"github.com/AiKeyLabs/aikey-proxy/internal/vault"
 	"github.com/AiKeyLabs/aikey-proxy/pkg/observer"
 )
 
@@ -29,6 +32,9 @@ func (p *Proxy) Handle(w http.ResponseWriter, r *http.Request) {
 
 	// Extract or create W3C trace context from the incoming request.
 	tc := observability.ExtractOrCreate(r)
+	// Stash on the request context so deep paths (buildBaseEvent → the async
+	// collector's drop WARN) can correlate without re-parsing headers.
+	r = r.WithContext(context.WithValue(r.Context(), ctxKeyTrace, tc))
 	logger := slog.With(
 		"trace_id", tc.TraceID,
 		"span_id", tc.SpanID,
@@ -229,14 +235,31 @@ func (p *Proxy) Handle(w http.ResponseWriter, r *http.Request) {
 		realKey, err = p.vault.GetSecret(route.KeyAlias)
 		if err != nil {
 			p.errors.Add(1)
+			// Distinguish "key truly missing" from a transient vault infra
+			// error (SQLITE_BUSY / IO / decrypt). Without this split, a
+			// momentary lock — on Trial the cli+proxy+server share one SQLite
+			// — would tell the user to re-add an already-existing key (GAP 5,
+			// 2026-06-09 proxy architecture review). Both stay 503 to preserve
+			// the existing soft-fail contract; only the code + message differ.
+			if errors.Is(err, vault.ErrSecretNotFound) {
+				logger.Error("vault lookup failed",
+					"event.name", observability.EventProxyRequestVaultFailed,
+					"error.code", observability.ErrCodeSecretNotConfigured,
+					"error.message", err.Error(),
+					"key_alias", route.KeyAlias,
+				)
+				writeJSONError(w, http.StatusServiceUnavailable, "server_error", "SECRET_NOT_CONFIGURED",
+					"Provider API Key '"+route.KeyAlias+"' is not in the vault. Run: aikey add "+route.KeyAlias)
+				return
+			}
 			logger.Error("vault lookup failed",
 				"event.name", observability.EventProxyRequestVaultFailed,
-				"error.code", observability.ErrCodeSecretNotConfigured,
+				"error.code", "VAULT_UNAVAILABLE",
 				"error.message", err.Error(),
 				"key_alias", route.KeyAlias,
 			)
-			writeJSONError(w, http.StatusServiceUnavailable, "server_error", "SECRET_NOT_CONFIGURED",
-				"Provider API Key '"+route.KeyAlias+"' is not in the vault. Run: aikey add "+route.KeyAlias)
+			writeJSONError(w, http.StatusServiceUnavailable, "server_error", "VAULT_UNAVAILABLE",
+				"Vault temporarily unavailable, please retry.")
 			return
 		}
 	}

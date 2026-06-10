@@ -21,6 +21,7 @@ package proxy
 
 import (
 	"bytes"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -997,8 +998,18 @@ func (p *Proxy) handlePathPrefixRoute(w http.ResponseWriter, r *http.Request, pr
 			tokenRealKey, err = p.vault.GetSecret(route.KeyAlias)
 			if err != nil {
 				p.errors.Add(1)
-				writeJSONError(w, http.StatusServiceUnavailable, "server_error", "SECRET_NOT_CONFIGURED",
-					"Provider API Key '"+route.KeyAlias+"' is not in the vault. Run: aikey add "+route.KeyAlias)
+				// Distinguish "key truly missing" from a transient vault infra
+				// error (SQLITE_BUSY / IO / decrypt). A momentary lock — on
+				// Trial cli+proxy+server share one SQLite — must not tell the
+				// user to re-add an existing key (GAP 5, 2026-06-09 proxy
+				// architecture review). Both remain 503 (soft-fail contract).
+				if errors.Is(err, vault.ErrSecretNotFound) {
+					writeJSONError(w, http.StatusServiceUnavailable, "server_error", "SECRET_NOT_CONFIGURED",
+						"Provider API Key '"+route.KeyAlias+"' is not in the vault. Run: aikey add "+route.KeyAlias)
+					return
+				}
+				writeJSONError(w, http.StatusServiceUnavailable, "server_error", "VAULT_UNAVAILABLE",
+					"Vault temporarily unavailable, please retry.")
 				return
 			}
 		}

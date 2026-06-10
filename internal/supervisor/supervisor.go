@@ -838,6 +838,18 @@ func (s *Supervisor) ReporterMetrics() *events.ReporterMetrics {
 	return &m
 }
 
+// CollectorMetrics returns the active generation's collector counters (queue-full
+// drops). Returns nil if no collector is active. Mirrors ReporterMetrics so
+// /admin/metrics exposes both billing-loss paths.
+func (s *Supervisor) CollectorMetrics() *events.CollectorMetrics {
+	gen := s.active.Load()
+	if gen == nil || gen.collector == nil {
+		return nil
+	}
+	m := gen.collector.Metrics()
+	return &m
+}
+
 // ReplayDeadLetter triggers a dead-letter replay pass on the active
 // generation's reporter. Returns ErrNoReporter when the reporter isn't
 // configured (no collector_url) so callers (admin handler) can map to
@@ -939,6 +951,20 @@ func (s *Supervisor) GetKeyCheckTargets() ([]admin.KeyCheckTarget, error) {
 		for _, providerCode := range cfg.Providers {
 			mk, err := gen.vault.GetActiveTeamKeyByProvider(providerCode)
 			if err != nil || mk == nil {
+				// WHY: a team key that fails to resolve/decrypt used to be silently
+				// skipped here, so /health/keys just showed fewer keys and ops had no
+				// externally-readable signal that a credential is broken. Surface it as
+				// a structured WARN (health-signal-surface + logging-conventions) before
+				// continuing — control flow is unchanged so one bad provider does not
+				// block probing the others.
+				if err != nil {
+					slog.Warn("team key decrypt/resolve failed for health probe",
+						"event.name", "usage.health.team_key_decrypt_failed",
+						"error.code", "KEY_DECRYPT_FAILED",
+						"provider", providerCode,
+						"error", err,
+					)
+				}
 				continue
 			}
 			baseURL := mk.BaseURL

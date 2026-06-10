@@ -348,13 +348,17 @@ func (h *ChildHook) Name() string { return h.cfg.Name }
 // roundtrip sends one request and waits for its response (or the ctx deadline).
 // Concurrency-safe: many roundtrips can be in flight at once, demuxed by req-id.
 func (h *ChildHook) roundtrip(ctx context.Context, op, routeClass byte, body []byte) (*childResponse, error) {
-	// Lazy self-heal: if degraded, try a bounded respawn now; if it still can't
-	// recover, fail open for this request.
+	// Lazy self-heal: if degraded, kick a bounded respawn off in the BACKGROUND
+	// and fail open immediately. The restart must NOT run on the hot path —
+	// lazyRecover uses context.Background()+lazyRestartBound (2s), ignoring this
+	// request's ctx, so calling it synchronously stalled the very first Detect
+	// after a child died for up to 2s, violating the AppHook fail-open invariant
+	// (a degraded/unreachable child must never block a user request). lazyRecover
+	// is cooldown/CAS-guarded, so concurrent Detects spawn at most one restart;
+	// once it clears `degraded`, the NEXT Detect uses the recovered child.
 	if h.degraded.Load() {
-		h.lazyRecover()
-		if h.degraded.Load() {
-			return nil, errDegraded
-		}
+		go h.lazyRecover()
+		return nil, errDegraded
 	}
 
 	reqID := h.nextReqID.Add(1)

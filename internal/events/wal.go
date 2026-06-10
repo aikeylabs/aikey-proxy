@@ -102,7 +102,13 @@ func (w *WALWriter) Append(ev ReportableEvent) {
 
 	data, err := json.Marshal(entry)
 	if err != nil {
-		slog.Error("wal: marshal failed", "error", err)
+		// Structured event.name/error.code so disk/serialization failures in the
+		// usage outbox are diagnosable centrally, not just as free-text slog
+		// (logging-conventions; matches sibling collector.go's literal style).
+		slog.Error("wal: marshal failed",
+			"event.name", "usage.wal.marshal_failed",
+			"error.code", "WAL_MARSHAL_FAILED",
+			"error", err)
 		w.appendFailed.Add(1)
 		return
 	}
@@ -112,13 +118,23 @@ func (w *WALWriter) Append(ev ReportableEvent) {
 	defer w.mu.Unlock()
 
 	if err := w.ensureFile(); err != nil {
-		slog.Error("wal: open file failed", "error", err)
+		// Disk full / permission / rotation failure opening the WAL file. This is
+		// the primary disk-full diagnosis signal (logging-conventions).
+		slog.Error("wal: open file failed",
+			"event.name", "usage.wal.open_failed",
+			"error.code", "WAL_OPEN_FAILED",
+			"error", err)
 		w.appendFailed.Add(1)
 		return
 	}
 
 	if _, err := w.file.Write(data); err != nil {
-		slog.Error("wal: write failed", "error", err)
+		// Partial/failed write (e.g. disk full mid-append) — externally tracked via
+		// the usage_wal_append_failed_total counter; tagged for central diagnosis.
+		slog.Error("wal: write failed",
+			"event.name", "usage.wal.write_failed",
+			"error.code", "WAL_WRITE_FAILED",
+			"error", err)
 		w.appendFailed.Add(1)
 	}
 }
@@ -132,7 +148,13 @@ func (w *WALWriter) Sync() {
 	defer w.mu.Unlock()
 	if w.file != nil {
 		if err := w.file.Sync(); err != nil {
-			slog.Warn("wal: fsync failed", "error", err)
+			// fsync failure at the group-commit point (e.g. disk full on flush).
+			// Kept at WARN (durability is best-effort here, not hot-path) but
+			// tagged so it's diagnosable centrally (logging-conventions).
+			slog.Warn("wal: fsync failed",
+				"event.name", "usage.wal.fsync_failed",
+				"error.code", "WAL_FSYNC_FAILED",
+				"error", err)
 			w.appendFailed.Add(1)
 		}
 	}

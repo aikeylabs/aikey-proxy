@@ -48,6 +48,12 @@ type CanaryResult struct {
 	Status        string           `json:"status"`       // "ok" | "partial" | "failed" | "unavailable"
 	FailedStage   string           `json:"failed_stage"` // "" | "ingest" | "projection" | "query" | "diagnostics_unreachable"
 	RoundTripMs   int64            `json:"round_trip_ms"`
+	// ConsecutiveFailures surfaces the pipeline-failure streak so it's
+	// externally readable via /metrics (health-signal-surface: canary streak
+	// must not stay log-only — a sustained streak means the pipeline is broken
+	// while everything else "looks fine"). Optional/additive field; "unavailable"
+	// outcomes do NOT increment it (that's an intentional separate semantic).
+	ConsecutiveFailures int `json:"consecutive_failures"`
 }
 
 // CanaryProbe sends periodic synthetic events through the pipeline and verifies arrival.
@@ -61,7 +67,22 @@ type CanaryProbe struct {
 	mu                  sync.RWMutex
 	lastResult          CanaryResult
 	consecutiveFailures int
+	// consecutiveUnavailable tracks a sustained "unavailable" run separately
+	// from consecutiveFailures. "unavailable" (404 / unreachable DiagnosticsURL)
+	// is intentionally NOT a pipeline fault, but a permanently-unavailable
+	// endpoint usually means a misconfiguration that was historically logged
+	// Info once and then silent forever. We escalate to WARN once per crossing
+	// of unavailableEscalateThreshold so a config error eventually alarms
+	// (health-signal-surface: a self-test that's silently broken hides outages).
+	consecutiveUnavailable int
+	unavailableEscalated   bool
 }
+
+// unavailableEscalateThreshold is the number of consecutive "unavailable"
+// probe outcomes after which we emit one escalated WARN. At the default 5min
+// interval this is ~30min — long enough to ride out a transient endpoint blip
+// (deploy / restart) but short enough that a real misconfig alarms.
+const unavailableEscalateThreshold = 6
 
 // NewCanaryProbe creates and starts a canary probe. Pass nil reporter to disable.
 func NewCanaryProbe(reporter *Reporter, cfg CanaryConfig) *CanaryProbe {
@@ -170,7 +191,6 @@ func (p *CanaryProbe) probe() {
 	result := p.checkArrival(eventID, sentAt)
 
 	p.mu.Lock()
-	p.lastResult = result
 	if result.Status == "ok" {
 		if p.consecutiveFailures > 0 {
 			slog.Info("canary probe recovered",
@@ -179,22 +199,47 @@ func (p *CanaryProbe) probe() {
 				"previous_failures", p.consecutiveFailures)
 		}
 		p.consecutiveFailures = 0
+		// Any non-unavailable outcome resets the unavailable streak.
+		p.consecutiveUnavailable = 0
+		p.unavailableEscalated = false
 	} else if result.Status == "unavailable" {
-		// Diagnostics endpoint not available (server-mode without endpoints).
-		// Don't count as failure — log once then suppress.
-		if p.consecutiveFailures == 0 {
+		// Diagnostics endpoint not available (server-mode without endpoints,
+		// OR a misconfigured/unreachable DiagnosticsURL). NOT counted as a
+		// pipeline failure — that semantic is intentional. But we no longer
+		// stay silent forever: track a separate streak and escalate ONCE per
+		// crossing so a real config error eventually alarms instead of being
+		// logged Info a single time.
+		p.consecutiveUnavailable++
+		if p.consecutiveUnavailable == 1 {
 			slog.Info("canary probe: diagnostics endpoint not available, probe results limited to reporter metrics",
 				"diagnostics_url", p.cfg.DiagnosticsURL)
+		}
+		if p.consecutiveUnavailable >= unavailableEscalateThreshold && !p.unavailableEscalated {
+			p.unavailableEscalated = true
+			slog.Warn("canary probe: diagnostics endpoint unavailable for a sustained period — likely misconfigured DiagnosticsURL or wrong/old collector binary",
+				"event.name", "usage.canary.diagnostics_unavailable_sustained",
+				"error.code", "CANARY_DIAGNOSTICS_UNREACHABLE",
+				"diagnostics_url", p.cfg.DiagnosticsURL,
+				"failed_stage", result.FailedStage,
+				"consecutive_unavailable", p.consecutiveUnavailable)
 		}
 		// Keep consecutiveFailures at 0 — "unavailable" is not a pipeline fault.
 	} else {
 		p.consecutiveFailures++
+		// A real pipeline outcome (failed/partial) clears the unavailable streak
+		// so a later misconfig is re-evaluated from scratch.
+		p.consecutiveUnavailable = 0
+		p.unavailableEscalated = false
 		slog.Warn("canary probe failed",
 			"event_id", eventID,
 			"status", result.Status,
 			"failed_stage", result.FailedStage,
 			"consecutive", p.consecutiveFailures)
 	}
+	// Surface the streak on the result so /metrics exposes it (set while holding
+	// the lock so the snapshot is consistent with consecutiveFailures).
+	result.ConsecutiveFailures = p.consecutiveFailures
+	p.lastResult = result
 	p.mu.Unlock()
 }
 

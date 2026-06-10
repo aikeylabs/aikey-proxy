@@ -116,6 +116,44 @@ func TestWAL_MalformedLineTolerated(t *testing.T) {
 	}
 }
 
+// TestWAL_WriteFailureCountsAndTags proves a WAL write failure (here: the
+// underlying file handle is closed out from under the writer, simulating
+// disk/IO loss) increments appendFailed so the externally-readable
+// usage_wal_append_failed_total counter reflects it. The failure log now also
+// carries event.name=usage.wal.write_failed / error.code=WAL_WRITE_FAILED for
+// central diagnosis (logging-conventions); see GAP 3.
+func TestWAL_WriteFailureCountsAndTags(t *testing.T) {
+	dir := t.TempDir()
+	w, err := NewWALWriter(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// First Append succeeds and opens the hour file.
+	w.Append(ReportableEvent{EventID: "ok1", SourceID: "s", SourceSeq: i64(1)})
+	if got := w.AppendFailedTotal(); got != 0 {
+		t.Fatalf("after good append appendFailed=%d, want 0", got)
+	}
+
+	// Close the underlying *os.File directly (not via w.Close, which also nils
+	// w.file). The writer still thinks the file is open and same-hour, so the
+	// next Append's ensureFile is a no-op and Write hits a closed descriptor →
+	// guaranteed write error without depending on filesystem state.
+	w.mu.Lock()
+	if w.file == nil {
+		w.mu.Unlock()
+		t.Fatal("expected an open wal file after first append")
+	}
+	_ = w.file.Close()
+	w.mu.Unlock()
+
+	w.Append(ReportableEvent{EventID: "fail1", SourceID: "s", SourceSeq: i64(2)})
+
+	if got := w.AppendFailedTotal(); got != 1 {
+		t.Fatalf("after write-on-closed-fd appendFailed=%d, want 1", got)
+	}
+}
+
 // TestWAL_ListFilesChronological confirms multi-file read order is chronological
 // (lexical filename order == time order) so cold-start replay resumes oldest-first.
 func TestWAL_ListFilesChronological(t *testing.T) {

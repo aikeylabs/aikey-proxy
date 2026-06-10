@@ -66,6 +66,13 @@ func (p *Proxy) buildBaseEvent(req *http.Request, resp *http.Response, startTime
 		IsStreaming:  streaming,
 		RequestPath:  req.URL.Path,
 	}
+	// Ephemeral trace correlation (not persisted) so the async collector can
+	// cite trace/span/request ids if it has to drop this event under backpressure.
+	if tc := traceFromContext(req.Context()); tc.TraceID != "" {
+		ev.TraceID = tc.TraceID
+		ev.SpanID = tc.SpanID
+		ev.RequestID = tc.RequestID
+	}
 	if model := req.Header.Get("x-aikey-model"); model != "" {
 		ev.Model = model
 		ev.RequestedModel = model // Phase 4 §5.3 — captured at request entry, may differ from upstream `Model` after translator remaps

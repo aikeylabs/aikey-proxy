@@ -125,7 +125,7 @@ type fanoutObserver struct {
 	// routing maps stream name → list of (slug, file handle) for active
 	// subscribers. Built once at Build time; never mutated afterwards
 	// (no runtime subscriber refresh in MVP).
-	routing map[string][]writerEntry
+	routing map[string][]*writerEntry
 
 	// state tracks per-request running counters between OnRequestStart
 	// and OnRequestEnd. Keyed by TraceID.
@@ -176,7 +176,7 @@ func New(logger *slog.Logger, baseDir string, reader VaultReader) (observer.Stre
 		}
 	}
 
-	routing := map[string][]writerEntry{}
+	routing := map[string][]*writerEntry{}
 	for _, s := range subs {
 		// Validate stream name against the SPEC vocabulary so a typo in
 		// vault (e.g. `user-chat` with hyphen) is caught at startup
@@ -210,7 +210,7 @@ func New(logger *slog.Logger, baseDir string, reader VaultReader) (observer.Stre
 			)
 			continue
 		}
-		entry := writerEntry{slug: s.Slug, path: path, file: f}
+		entry := &writerEntry{slug: s.Slug, path: path, file: f}
 		routing[s.Stream] = append(routing[s.Stream], entry)
 		logger.Info("ndjson_fanout: subscriber wired",
 			"event.name", "ndjson_fanout.subscriber_wired",
@@ -331,8 +331,9 @@ func (o *fanoutObserver) OnRequestEnd(ctx context.Context, req *observer.Request
 	}
 	line = append(line, '\n')
 
-	for i := range entries {
-		e := &entries[i] // share with the loop body (avoid value copy)
+	for _, e := range entries {
+		// entries holds *writerEntry, so each e shares the one canonical
+		// per-file mutex (no value copy of the lock — see writerEntry).
 		writeToSubscriber(o.logger, e, line, req.TraceID)
 	}
 }

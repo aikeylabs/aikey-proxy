@@ -3,12 +3,22 @@ package vault
 import (
 	"database/sql"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log/slog"
 	"strings"
 
 	_ "modernc.org/sqlite"
 )
+
+// ErrSecretNotFound is returned (wrapped) by GetSecret when the alias does not
+// exist in the vault — a business condition the caller maps to "Run: aikey add".
+// It is distinct from infrastructure errors (SQLITE_BUSY / IO / decrypt), which
+// GetSecret wraps without this sentinel so callers can use errors.Is to tell
+// "key truly missing" apart from "vault temporarily unavailable". Why this
+// matters: without the split, a transient lock (Trial runs cli+proxy+server on
+// one SQLite) would falsely tell the user to re-add an existing key.
+var ErrSecretNotFound = errors.New("secret not found in vault")
 
 // providerCodeAliases returns all lowercase aliases for a given provider code so
 // that vault lookups match regardless of how the server stored the code
@@ -33,12 +43,31 @@ type Reader struct {
 	cache      *cache
 }
 
+// withBusyTimeoutDSN appends the busy_timeout pragma to a vault DB path,
+// preserving any query params the path already carries. modernc.org/sqlite
+// accepts `?_pragma=busy_timeout(5000)` (and `&_pragma=...` when other params
+// are present). The vault path is normally a bare filesystem path, but we
+// detect an existing `?` so callers passing a DSN don't get a malformed string.
+func withBusyTimeoutDSN(dbPath string) string {
+	const pragma = "_pragma=busy_timeout(5000)"
+	if strings.Contains(dbPath, "?") {
+		return dbPath + "&" + pragma
+	}
+	return dbPath + "?" + pragma
+}
+
 // Open opens the vault database and verifies the password.
 func Open(dbPath string, password string) (*Reader, error) {
 	// Open in read-write mode so the WAL reader can see latest CLI writes.
 	// aikey-proxy does not write to the vault, but read-only mode on WAL
 	// databases may return stale data if the WAL has not been checkpointed.
-	db, err := sql.Open("sqlite", dbPath)
+	//
+	// busy_timeout(5000): on Trial the cli + proxy + server share one SQLite
+	// file, so a transient SQLITE_BUSY can occur when the CLI holds a write
+	// lock. The default modernc busy_timeout is 0 (fail immediately, no retry);
+	// 5s lets a momentary lock retry instead of bubbling up as a spurious
+	// vault error. modernc.org/sqlite honors `_pragma` DSN query params.
+	db, err := sql.Open("sqlite", withBusyTimeoutDSN(dbPath))
 	if err != nil {
 		return nil, fmt.Errorf("open vault db: %w", err)
 	}
@@ -161,7 +190,10 @@ func (r *Reader) GetSecret(alias string) (string, error) {
 		"SELECT nonce, ciphertext FROM entries WHERE alias = ?", alias,
 	).Scan(&nonce, &ciphertext)
 	if err == sql.ErrNoRows {
-		return "", fmt.Errorf("secret %q not found in vault", alias)
+		// Wrap the sentinel so callers can errors.Is(err, ErrSecretNotFound)
+		// to distinguish "key truly missing" (→ aikey add) from infra errors
+		// (BUSY/IO/decrypt → retry) below.
+		return "", fmt.Errorf("secret %q: %w", alias, ErrSecretNotFound)
 	}
 	if err != nil {
 		return "", fmt.Errorf("query secret %q: %w", alias, err)

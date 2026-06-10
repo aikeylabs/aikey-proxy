@@ -1,0 +1,28 @@
+# CI gate — runs unit/in-process tests on every push and PR.
+# Project rule: 持续交付 = CI/CD 失败即失败. A non-zero exit blocks the PR.
+# Scope: native `go test ./...` only (no docker/PG); heavier integration
+# (dbmigrate-test-postgres etc.) is intentionally left to nightly/opt-in so
+# this gate needs nothing beyond a GitHub-hosted runner.
+name: CI
+
+on:
+  push:
+  pull_request:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+      - name: go vet
+        run: go vet ./...
+      - name: go test
+        run: go test ./... -count=1

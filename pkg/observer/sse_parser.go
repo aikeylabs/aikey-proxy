@@ -117,6 +117,27 @@ func (p *SSEParser) Reset() {
 	p.buf = p.buf[:0]
 }
 
+// Flush parses any remaining buffered bytes as a final frame and returns it.
+// Parse() holds a trailing partial frame until its blank-line boundary arrives;
+// at true stream end a provider's last frame is normally \n\n-terminated and
+// already emitted, so the buffer is empty and Flush returns ok=false. But when a
+// stream ends right after a frame's data with NO trailing blank line, that frame
+// would otherwise be lost. Flush recovers it — matching the whole-body token
+// extractor, which processes the final line regardless of a trailing separator
+// (gap7 incremental-extraction byte-identical requirement).
+//
+// Intended for the token-extraction path only; the observer dispatch path
+// deliberately does NOT call Flush (its documented semantic drops trailing
+// partial frames as non-events). Clears the buffer so a second call is a no-op.
+func (p *SSEParser) Flush() (SSEFrame, bool) {
+	if len(p.buf) == 0 {
+		return SSEFrame{}, false
+	}
+	f, ok := parseFrame(p.buf)
+	p.buf = p.buf[:0]
+	return f, ok
+}
+
 // ---------------------------------------------------------------------------
 // Internal helpers (unexported — tests exercise via Parse()).
 // ---------------------------------------------------------------------------

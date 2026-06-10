@@ -116,8 +116,11 @@ func TestChildHook_RestartRecovers(t *testing.T) {
 	}
 }
 
-// TestChildHook_LazyRecoverOnDetect — the trigger: a degraded Detect lazily
-// restarts the child and serves recovered, instead of failing open forever.
+// TestChildHook_LazyRecoverOnDetect — a degraded Detect FAILS OPEN immediately
+// (never blocks the hot path on the restart) and kicks the bounded restart off in
+// the background; a subsequent Detect, once the async restart clears `degraded`,
+// serves recovered. This is the fail-open invariant: synchronous lazyRecover used
+// context.Background()+2s and stalled the first post-degrade Detect up to 2s.
 func TestChildHook_LazyRecoverOnDetect(t *testing.T) {
 	h := NewChildHook(ChildHookConfig{
 		Name: "lazy-test", BinaryPath: findDetectorBinary(t), BinaryArgs: detectorArgs(),
@@ -131,12 +134,33 @@ func TestChildHook_LazyRecoverOnDetect(t *testing.T) {
 	defer func() { _ = h.Shutdown(context.Background()) }()
 
 	h.markDegraded("simulated")
+
+	// The first degraded Detect must fail open IMMEDIATELY — not block on the
+	// background restart (the whole point of the fix).
+	start := time.Now()
 	res := h.Detect(ctx, &Request{Direction: DirectionInbound, Payload: []byte("hi")})
-	if res.Degraded {
-		t.Fatalf("expected lazy recovery on Detect, still degraded: %s", res.Reason)
+	if !res.Degraded {
+		t.Fatalf("expected the first degraded Detect to fail open (degraded), got non-degraded")
 	}
-	if h.degraded.Load() {
-		t.Fatal("expected degraded cleared after lazy recover on Detect")
+	if elapsed := time.Since(start); elapsed > 200*time.Millisecond {
+		t.Errorf("degraded Detect blocked %v — must fail open immediately, not wait on the restart", elapsed)
+	}
+
+	// The background lazyRecover then restarts the child; once it clears `degraded`
+	// a subsequent Detect serves recovered. Poll past the restart bound + margin.
+	recovered := false
+	for deadline := time.Now().Add(8 * time.Second); time.Now().Before(deadline); {
+		if !h.degraded.Load() {
+			recovered = true
+			break
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	if !recovered {
+		t.Fatal("expected the background lazy restart to clear degraded")
+	}
+	if res := h.Detect(ctx, &Request{Direction: DirectionInbound, Payload: []byte("hi")}); res.Degraded {
+		t.Fatalf("Detect still degraded after background recovery: %s", res.Reason)
 	}
 }
 

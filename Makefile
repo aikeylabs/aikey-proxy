@@ -21,7 +21,7 @@ INSTALL_DIR ?= $(HOME)/.aikey/bin
 GOWORK     ?= $(shell cd .. && pwd)/go.work
 export GOWORK
 
-.PHONY: build test run install uninstall restart clean lint cross-compile sync-fingerprint
+.PHONY: build test run install uninstall restart clean lint cross-compile sync-fingerprint chaos-gap7 chaos-gap8 chaos
 
 # v4.3 (2026-05-01): aikey-cli/data/provider_fingerprint.yaml is the single
 # source of truth for provider routing. The pkg/providerroutes Go package
@@ -44,6 +44,26 @@ build: sync-fingerprint
 
 test:
 	go test -race -v ./internal/...
+
+# Chaos experiments (缺口7/8) — build-tagged so they stay OUT of the normal
+# `test` suite. They drive the real newStreamDrainer / http.Server code paths
+# and print quantified memory/connection data for the decision matrix. Plan +
+# evidence: ../workflow/CI/e2e/chaos/2026-06-09-proxy-gap7-gap8-chaos-plan.md
+chaos-gap7: ## chaos: SSE buffer memory vs body-size/concurrency (缺口7)
+	go test -tags chaos -run TestChaosGap7_BufferMemory -v -timeout 120s ./internal/proxy/
+
+chaos-gap8: ## chaos: idle keep-alive connection flood (缺口8)
+	go test -tags chaos -run TestChaosGap8_ConnFlood -v -timeout 180s ./internal/proxy/
+
+chaos: chaos-gap7 chaos-gap8 ## chaos: run all proxy chaos experiments
+
+# gap7 streaming token-extraction regression: the three fences (golden /
+# accumulator-equivalence / chunk-split-invariance) + the full-proxy live-event
+# E2E (real streaming request → incremental drainer → collector → store → assert
+# recorded tokens). Run after any change to stream_drainer / provider extractors.
+e2e-gap7: ## e2e: gap7 streaming token-extraction fences + full-proxy live E2E
+	go test -race -run 'TokenStreamFence|StreamSplitInvariance' ./internal/provider/ ./internal/proxy/
+	go test -race -run 'TestProxy_Streaming_RecordsTokens|TestProxy_Streaming_RecordsModelAndCache|TestProxy_Streaming_LargeBody|TestStreamDrainer' ./internal/proxy/
 
 run: build
 	./bin/aikey-proxy --config bin/$(CONFIG)

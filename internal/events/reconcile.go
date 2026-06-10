@@ -220,12 +220,16 @@ func (r *Reporter) resendWALSeqs(source string, seqs []int64) int {
 	}
 	sent := 0
 	for routeSource, group := range groups {
-		r.uploadGroupTo(r.urlForRouteSource(routeSource), r.credentialForRouteSource(routeSource), group)
-		// Advance sentSeq just like uploadPending does, so a concurrent drainOnce
-		// doesn't re-read and re-upload these same seqs (the server would dedup
-		// them, but the redundant upload violates the outbox cursor invariant).
-		r.markProcessed(group)
-		sent += len(group)
+		// Mark + count only when the group actually landed (uploaded ok or was
+		// terminally dead-lettered). Advancing sentSeq here mirrors uploadPending
+		// so a concurrent drainOnce doesn't re-read these seqs. A retryable
+		// failure (groupRetryLater) is left un-marked: B' (缺口2) no longer
+		// dead-letters retryable failures, so the seqs stay in the WAL and a
+		// re-run of reconcile can recover them — `sent` stays honest.
+		if r.uploadGroupTo(r.urlForRouteSource(routeSource), r.credentialForRouteSource(routeSource), group) == groupDone {
+			r.markProcessed(group)
+			sent += len(group)
+		}
 	}
 	return sent
 }

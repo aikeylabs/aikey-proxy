@@ -152,6 +152,12 @@ type Reporter struct {
 	lastUploadStatus    string // "ok" | "retryable_failed" | "terminal_failed"
 	lastErrorCode       int
 	lastErrorAt         time.Time
+	// nextUploadAttempt is the non-blocking backoff gate (B', 2026-06-09 缺口2):
+	// after a drain pass hits retryable upload failures, drainOnce sets this
+	// ahead and skips upload attempts until it passes — replacing the old in-line
+	// per-batch time.Sleep that blocked the whole pump for up to ~6min. Zero value
+	// = no gate. New events keep landing in the WAL while gated.
+	nextUploadAttempt   time.Time
 	lastBusinessEventAt time.Time
 	lastCanaryEventAt   time.Time
 	terminalFailCount   atomic.Int64
@@ -420,11 +426,11 @@ func (r *Reporter) uploadLoop() {
 	for {
 		select {
 		case <-ticker.C:
-			r.drainOnce()
+			r.drainOnce(false)
 		case <-r.signal:
-			r.drainOnce()
+			r.drainOnce(false)
 		case <-r.done:
-			r.drainOnce() // final flush
+			r.drainOnce(true) // final flush — bypass the backoff gate for one last attempt
 			return
 		}
 	}
@@ -434,10 +440,23 @@ func (r *Reporter) uploadLoop() {
 // (source_seq > sentSeq[source], plus a one-shot pass over legacy v1 entries),
 // uploads them grouped by RouteSource, then prunes confirmed WAL files. One WAL
 // read per pass keeps it simple; the BatchSize cap bounds a single HTTP body.
-func (r *Reporter) drainOnce() {
+func (r *Reporter) drainOnce(force bool) {
 	if r.wal == nil {
 		return
 	}
+	// Non-blocking backoff gate (B', 缺口2): skip upload attempts until
+	// nextUploadAttempt passes after a prior pass hit retryable failures, so we
+	// don't hammer a down collector every tick. `force` (shutdown final flush)
+	// bypasses it for one last attempt. New events keep landing in the WAL.
+	if !force {
+		r.mu.RLock()
+		gated := !r.nextUploadAttempt.IsZero() && time.Now().Before(r.nextUploadAttempt)
+		r.mu.RUnlock()
+		if gated {
+			return
+		}
+	}
+
 	entries, err := ReadAllWAL(r.wal.Dir())
 	if err != nil {
 		slog.Warn("reporter: wal read for upload failed",
@@ -445,6 +464,7 @@ func (r *Reporter) drainOnce() {
 		// Partial entries may still be returned; fall through to upload them.
 	}
 
+	anyRetryable := false
 	pending := make([]ReportableEvent, 0, len(entries))
 	for i := range entries {
 		e := &entries[i]
@@ -480,25 +500,42 @@ func (r *Reporter) drainOnce() {
 		}
 		pending = append(pending, ev)
 		if len(pending) >= r.cfg.BatchSize {
-			r.uploadPending(pending)
+			if r.uploadPending(pending) {
+				anyRetryable = true
+			}
 			pending = pending[:0]
 		}
 	}
 	if len(pending) > 0 {
-		r.uploadPending(pending)
+		if r.uploadPending(pending) {
+			anyRetryable = true
+		}
 	}
 
 	r.pruneConfirmedWAL()
+
+	// Arm or clear the non-blocking backoff gate for the next pass (B', 缺口2):
+	// retryable failures push the next attempt out (capped at 5min); a clean pass
+	// clears the gate so recovery is picked up on the next tick/poke.
+	r.mu.Lock()
+	if anyRetryable {
+		r.nextUploadAttempt = time.Now().Add(backoffForFailures(r.consecutiveFailures))
+	} else {
+		r.nextUploadAttempt = time.Time{}
+	}
+	r.mu.Unlock()
 }
 
-// uploadPending groups events by RouteSource and uploads each group. On a
-// processed group (success OR dead-letter — both mean "we're done with these
-// locally") it advances sentSeq / seenV1 so the next pass won't re-read them.
-// Confirmed-seq (for WAL pruning) is advanced separately from the server's
-// response inside uploadGroupTo.
-func (r *Reporter) uploadPending(batch []ReportableEvent) {
+// uploadPending groups events by RouteSource and uploads each group. A group
+// that is locally DONE (uploaded ok OR terminally dead-lettered) advances
+// sentSeq / seenV1 so the next pass won't re-read it. A group that fails
+// RETRYABLY is left un-marked — it stays in the WAL and the next gated drain
+// re-sends it (B', 缺口2). Returns true if any group failed retryably, so the
+// caller (drainOnce) can arm the non-blocking backoff gate. Confirmed-seq (for
+// WAL pruning) is advanced separately from the server's response in uploadGroupTo.
+func (r *Reporter) uploadPending(batch []ReportableEvent) (anyRetryable bool) {
 	if len(batch) == 0 {
-		return
+		return false
 	}
 	groups := make(map[string][]ReportableEvent, 1)
 	skipped := 0
@@ -518,9 +555,13 @@ func (r *Reporter) uploadPending(batch []ReportableEvent) {
 	for routeSource, group := range groups {
 		url := r.urlForRouteSource(routeSource)
 		cred := r.credentialForRouteSource(routeSource)
-		r.uploadGroupTo(url, cred, group)
-		r.markProcessed(group)
+		if r.uploadGroupTo(url, cred, group) == groupDone {
+			r.markProcessed(group)
+		} else {
+			anyRetryable = true
+		}
 	}
+	return anyRetryable
 }
 
 // markProcessed advances the in-memory cursors after a group has been handed to
@@ -610,15 +651,53 @@ func (r *Reporter) seenV1Locked(eventID string) bool {
 	return r.seenV1[eventID]
 }
 
-// uploadGroupTo handles one (url, credential, batch) triple including
-// retry + dead-letter. Extracted from the old monolithic uploadBatch
-// when per-route routing landed (2026-05-10); credential parameter
-// added 2026-05-11 to thread per-RouteSource bearer through the retry
-// loop. The retry/DLW logic itself is unchanged.
+// uploadGroupResult tells uploadPending / resendWALSeqs whether a group is
+// locally finished (uploaded ok, or terminally dead-lettered → advance the
+// sentSeq / confirmedSeq cursors) or must be retried later (retryable failure →
+// leave it un-marked in the WAL so the next gated drain re-sends it). Added with
+// B' (2026-06-09 缺口2) when the blocking in-line retry backoff was replaced by a
+// non-blocking, WAL-driven retry.
+type uploadGroupResult int
+
+const (
+	groupDone       uploadGroupResult = iota // ok or terminal dead-letter — advance cursors
+	groupRetryLater                          // retryable failure — conserve in WAL, retry next drain
+)
+
+// backoffForFailures maps the consecutive-failure count to the non-blocking gate
+// before the next upload attempt. Same ceiling as the old in-line backoff
+// (5s → 15s → 60s → 5min) but applied once per drain pass at the loop level, so
+// the pump goroutine never blocks and stays responsive to shutdown/new events.
+func backoffForFailures(n int) time.Duration {
+	switch {
+	case n <= 1:
+		return 5 * time.Second
+	case n == 2:
+		return 15 * time.Second
+	case n == 3:
+		return 60 * time.Second
+	default:
+		return 5 * time.Minute
+	}
+}
+
+// uploadGroupTo sends one (url, credential, batch) triple ONCE and classifies
+// the outcome. Extracted from the old monolithic uploadBatch when per-route
+// routing landed (2026-05-10); credential parameter added 2026-05-11.
 //
-// cred may be nil — doUpload tolerates that by sending without an
-// Authorization header (matches pre-CollectorToken behavior).
-func (r *Reporter) uploadGroupTo(collectorURL string, cred Credential, batch []ReportableEvent) {
+// 2026-06-09 (B', 缺口2): the in-line retry loop with blocking time.Sleep
+// (0/5s/15s/60s/5min) was removed because it stalled the single upload pump for
+// up to ~6min on one failing batch. Now it makes a single attempt:
+//   - success            → advance confirmedSeq, return groupDone
+//   - terminal (401/403/400) → dead-letter (won't self-heal), return groupDone
+//   - retryable (5xx/429/network) → NO dead-letter, NO cursor advance; the
+//                          events stay in the WAL and the caller arms a
+//                          non-blocking backoff gate so the next drain re-sends
+//                          them (conserve, never lose). Returns groupRetryLater.
+//
+// cred may be nil — doUpload tolerates that by sending without an Authorization
+// header (matches pre-CollectorToken behavior).
+func (r *Reporter) uploadGroupTo(collectorURL string, cred Credential, batch []ReportableEvent) uploadGroupResult {
 	req := batchRequest{
 		Source:          "aikey-proxy",
 		SourceVersion:   "0.1.0",
@@ -636,70 +715,58 @@ func (r *Reporter) uploadGroupTo(collectorURL string, cred Credential, batch []R
 
 	body, err := json.Marshal(req)
 	if err != nil {
+		// Encoding our own struct should never fail; if it does, retrying won't
+		// help — count it and treat the group as done so the pump doesn't spin.
 		slog.Error("reporter: marshal batch", "error", err)
 		r.uploadFailed.Add(int64(len(batch)))
-		return
+		return groupDone
 	}
 
 	url := collectorURL + "/v1/usage-events:batch"
 
-	// Retry with exponential backoff: 5s, 15s, 60s, 5min
-	delays := []time.Duration{0, 5 * time.Second, 15 * time.Second, 60 * time.Second, 5 * time.Minute}
-	var lastUpErr *uploadError
-
-	for attempt, delay := range delays {
-		if attempt > 0 {
-			slog.Debug("reporter: retrying upload", "attempt", attempt, "delay", delay)
-			time.Sleep(delay)
-		}
-
-		resp, upErr := r.doUpload(url, body, cred)
-		if upErr == nil {
-			r.uploadSuccess.Add(int64(len(batch)))
-			r.onUploadSuccess(len(batch))
-			// Advance the server-confirmed contiguous high-water per source so
-			// pruneConfirmedWAL can reclaim fully-acked files. A nil/absent map
-			// (older collector) leaves confirmedSeq untouched → conserve, the
-			// WAL isn't pruned (no silent loss, just more disk until upgrade).
-			if resp != nil && resp.ContiguousSeq != nil {
-				r.mu.Lock()
-				for src, c := range resp.ContiguousSeq {
-					if c > r.confirmedSeq[src] {
-						r.confirmedSeq[src] = c
-					}
+	resp, upErr := r.doUpload(url, body, cred)
+	if upErr == nil {
+		r.uploadSuccess.Add(int64(len(batch)))
+		r.onUploadSuccess(len(batch))
+		// Advance the server-confirmed contiguous high-water per source so
+		// pruneConfirmedWAL can reclaim fully-acked files. A nil/absent map
+		// (older collector) leaves confirmedSeq untouched → conserve, the
+		// WAL isn't pruned (no silent loss, just more disk until upgrade).
+		if resp != nil && resp.ContiguousSeq != nil {
+			r.mu.Lock()
+			for src, c := range resp.ContiguousSeq {
+				if c > r.confirmedSeq[src] {
+					r.confirmedSeq[src] = c
 				}
-				r.mu.Unlock()
 			}
-			return
+			r.mu.Unlock()
 		}
-		lastUpErr = upErr
-
-		// Terminal failure (401/403/400): write to dead_letter.jsonl, don't retry.
-		// Why not retry: 401 = token mismatch (won't self-heal), 400 = schema
-		// incompatibility (needs code fix). Retrying wastes backoff budget.
-		if classifyUploadError(upErr.StatusCode) == terminalFailure {
-			r.writeDeadLetter(batch, "terminal", upErr, attempt+1)
-			r.onUploadFail(len(batch), upErr, true)
-			slog.Error("reporter: terminal failure, events dead-lettered",
-				"count", len(batch),
-				"status", upErr.StatusCode,
-				"response", upErr.ResponseBody)
-			return
-		}
-
-		slog.Warn("reporter: upload failed (retryable)",
-			"attempt", attempt,
-			"status", upErr.StatusCode,
-			"error", upErr.Err)
+		return groupDone
 	}
 
-	// Retries exhausted → also dead-letter
-	r.writeDeadLetter(batch, "exhausted", lastUpErr, len(delays))
-	r.onUploadFail(len(batch), lastUpErr, false)
-	slog.Error("reporter: retries exhausted, events dead-lettered",
-		"count", len(batch),
-		"last_status", lastUpErr.StatusCode,
-		"last_error", lastUpErr.Err)
+	// Terminal failure (401/403/400): write to dead_letter.jsonl, don't retry.
+	// Why not retry: 401 = token mismatch (won't self-heal), 400 = schema
+	// incompatibility (needs code fix). Re-sending cannot recover these.
+	if classifyUploadError(upErr.StatusCode) == terminalFailure {
+		r.writeDeadLetter(batch, "terminal", upErr, 1)
+		r.onUploadFail(len(batch), upErr, true)
+		slog.Error("reporter: terminal failure, events dead-lettered",
+			"count", len(batch),
+			"status", upErr.StatusCode,
+			"response", upErr.ResponseBody)
+		return groupDone
+	}
+
+	// Retryable failure (network / 5xx / 429): do NOT dead-letter and do NOT
+	// advance cursors. The events stay in the WAL (the outbox); the next gated
+	// drain re-reads and re-sends them. onUploadFail bumps consecutiveFailures,
+	// which lengthens the caller's non-blocking backoff gate.
+	r.onUploadFail(len(batch), upErr, false)
+	slog.Warn("reporter: upload failed (retryable), will retry from WAL",
+		"status", upErr.StatusCode,
+		"error", upErr.Err,
+		"count", len(batch))
+	return groupRetryLater
 }
 
 // onUploadSuccess updates delivery state after a successful upload.

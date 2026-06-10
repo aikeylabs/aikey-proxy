@@ -41,6 +41,9 @@ type Handler struct {
 
 	// ReporterMetricsFn returns usage reporter counters (nil = reporter disabled).
 	ReporterMetricsFn func() *events.ReporterMetrics
+	// CollectorMetricsFn returns async collector counters — notably usage
+	// events dropped under buffer backpressure (nil = collector disabled).
+	CollectorMetricsFn func() *events.CollectorMetrics
 	// ReplayDeadLetterFn re-delivers entries from dead_letter.jsonl using
 	// the *current* reporter config (post-login JWT, fresh route URLs,
 	// etc). Nil = reporter / dead-letter writer disabled. Wired by main.go
@@ -122,18 +125,98 @@ func NewHandler(cfg *config.Config, reg *vkeys.Registry, store *events.Store) *H
 type healthResponse struct {
 	Status  string `json:"status"`
 	Version string `json:"version"`
+	// UsagePipeline is the BYPASS usage/billing pipeline verdict (缺口3). It is
+	// deliberately SEPARATE from the top-level Status (which stays a pure liveness
+	// signal for the MAIN LLM-forwarding path): a degraded bypass pipeline must
+	// not make /health report the process down, or a false restart could take out
+	// healthy main-link forwarding (architecture: 主链路/旁路 isolation). Omitted
+	// when neither reporter nor canary is wired (offline Personal).
+	UsagePipeline *pipelineHealth `json:"usage_pipeline,omitempty"`
 }
 
-// Health returns basic health status.
+// pipelineHealth is a single readable verdict an external monitor / the release
+// E2E can assert on, derived from already-exposed reporter + canary signals.
+type pipelineHealth struct {
+	State   string   `json:"state"`             // "ok" | "degraded"
+	Reasons []string `json:"reasons,omitempty"` // populated when degraded
+}
+
+const (
+	// uploadDegradedThreshold: consecutive upload failures before the usage
+	// pipeline is reported degraded. >1 so a single transient blip (now retried
+	// from the WAL, B' 缺口2) doesn't flap the verdict.
+	uploadDegradedThreshold = 3
+	// canaryDegradedThreshold: consecutive canary pipeline-failures before
+	// degraded. The canary runs every 5min, so 2 ≈ a sustained ~10min fault.
+	canaryDegradedThreshold = 2
+)
+
+// usagePipelineHealth derives the bypass-pipeline verdict from the reporter
+// metrics + latest canary result. Returns nil when neither is wired, so the
+// field is omitted rather than falsely reporting "ok".
+//
+// Why these inputs: the readable counters already exist on /metrics (health-
+// signal-surface), but the principle also requires the health ENDPOINT to carry
+// a derived verdict that escalates — not just raw counters a dashboard might
+// aggregate stale. This computes that verdict from self-healing signals (upload
+// + canary consecutive failures reset on recovery) plus the serious cumulative
+// WAL-append-failure counter.
+func usagePipelineHealth(rm *events.ReporterMetrics, cr *events.CanaryResult) *pipelineHealth {
+	if rm == nil && cr == nil {
+		return nil
+	}
+	var reasons []string
+	if rm != nil {
+		// A WAL append failure means a usage event was lost locally (disk full /
+		// IO). Cumulative + serious: surface degraded until restart so it can't be
+		// missed (reserve-ahead turns it into an auditable gap, but local
+		// integrity is already compromised).
+		if rm.WALAppendFail > 0 {
+			reasons = append(reasons, "wal_append_failed")
+		}
+		// Sustained upload failure → collector unreachable. Self-healing: resets
+		// to 0 on a successful upload, so it clears once delivery resumes.
+		if rm.ConsecutiveFailures >= uploadDegradedThreshold {
+			reasons = append(reasons, "upload_failing")
+		}
+	}
+	if cr != nil {
+		// Canary is the pipeline self-test; a sustained failed streak means the
+		// end-to-end path can't be confirmed.
+		if cr.Status == "failed" && cr.ConsecutiveFailures >= canaryDegradedThreshold {
+			reasons = append(reasons, "canary_pipeline_failed")
+		}
+	}
+	state := "ok"
+	if len(reasons) > 0 {
+		state = "degraded"
+	}
+	return &pipelineHealth{State: state, Reasons: reasons}
+}
+
+// Health returns process liveness (Status) plus the bypass usage-pipeline
+// verdict (UsagePipeline). Always HTTP 200 with Status "ok" while serving — see
+// healthResponse / usagePipelineHealth for the liveness-vs-pipeline split.
 func (h *Handler) Health(w http.ResponseWriter, r *http.Request) {
 	tc := observability.ExtractOrCreate(r)
 	slog.Debug("admin: health check",
 		"trace_id", tc.TraceID,
 		"request_id", tc.RequestID,
 	)
+
+	var rm *events.ReporterMetrics
+	if h.ReporterMetricsFn != nil {
+		rm = h.ReporterMetricsFn()
+	}
+	var cr *events.CanaryResult
+	if h.CanaryResultFn != nil {
+		cr = h.CanaryResultFn()
+	}
+
 	writeJSON(w, http.StatusOK, healthResponse{
-		Status:  "ok",
-		Version: Version,
+		Status:        "ok", // liveness only — NOT flipped by bypass-pipeline degradation
+		Version:       Version,
+		UsagePipeline: usagePipelineHealth(rm, cr),
 	})
 }
 
@@ -183,8 +266,9 @@ type metricsResponse struct {
 	TotalErrors        int64                  `json:"total_errors"`
 	RequestsByVKey     map[string]int64       `json:"requests_by_vkey"`
 	RequestsByProvider map[string]int64       `json:"requests_by_provider"`
-	Reporter           *events.ReporterMetrics `json:"reporter,omitempty"`
-	Canary             *events.CanaryResult    `json:"canary,omitempty"`
+	Reporter           *events.ReporterMetrics  `json:"reporter,omitempty"`
+	Collector          *events.CollectorMetrics `json:"collector,omitempty"`
+	Canary             *events.CanaryResult     `json:"canary,omitempty"`
 }
 
 // Metrics returns aggregated usage metrics.
@@ -207,6 +291,10 @@ func (h *Handler) Metrics(w http.ResponseWriter, r *http.Request) {
 	if h.ReporterMetricsFn != nil {
 		reporterMetrics = h.ReporterMetricsFn()
 	}
+	var collectorMetrics *events.CollectorMetrics
+	if h.CollectorMetricsFn != nil {
+		collectorMetrics = h.CollectorMetricsFn()
+	}
 	var canaryResult *events.CanaryResult
 	if h.CanaryResultFn != nil {
 		canaryResult = h.CanaryResultFn()
@@ -218,6 +306,7 @@ func (h *Handler) Metrics(w http.ResponseWriter, r *http.Request) {
 		RequestsByVKey:     byVKey,
 		RequestsByProvider: byProvider,
 		Reporter:           reporterMetrics,
+		Collector:          collectorMetrics,
 		Canary:             canaryResult,
 	})
 }
@@ -523,7 +612,18 @@ func (h *Handler) HealthKeys(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	targets, err := h.KeyChecksFn()
-	if err != nil || len(targets) == 0 {
+	// WHY: previously `err != nil || len(targets) == 0` collapsed into the same
+	// "no active key configured" message, so a credential that exists but fails
+	// to resolve/decrypt was misreported as "no key configured" and the only
+	// signal lived in logs. Split the error case into a DISTINCT message so the
+	// decrypt/resolve failure is externally readable (health-signal-surface +
+	// "异常需区分原因"). HTTP 200 is preserved to keep the response contract; the
+	// message is terse and does not leak internal install/bundle names.
+	if err != nil {
+		writeJSON(w, http.StatusOK, map[string]any{"keys": []any{}, "message": fmt.Sprintf("key resolution failed: %s", err)})
+		return
+	}
+	if len(targets) == 0 {
 		writeJSON(w, http.StatusOK, map[string]any{"keys": []any{}, "message": "no active key configured"})
 		return
 	}

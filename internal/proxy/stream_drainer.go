@@ -88,11 +88,22 @@ func newStreamDrainer(
 	}
 	pr, pw := io.Pipe()
 
-	// SSEParser is allocated only when observer dispatch is wired —
-	// avoids the 8 KiB buf cost on legacy streams that don't use it.
-	// Nil parser inside the read loop is the "skip observer" signal.
+	// Incremental token extraction (gap7): when the provider supports it, feed
+	// SSE frames to a StreamAccumulator as they arrive and keep only the running
+	// breakdown — no whole-body acc buffer (which cost ≈2× the response size per
+	// concurrent stream). Providers that don't implement the factory fall back to
+	// whole-body accumulation. See
+	// workflow/CI/e2e/chaos/gap7-streaming-buffer-fix-proposal.md.
+	var tokenAcc provider.StreamAccumulator
+	if fac, ok := prov.(provider.StreamAccumulatorFactory); ok {
+		tokenAcc = fac.NewStreamAccumulator()
+	}
+
+	// One SSEParser drives BOTH observer dispatch and incremental token
+	// extraction. Allocated only when at least one is active (avoids the 8 KiB
+	// buf on legacy streams with neither). Nil = skip both in the read loop.
 	var sseParser *observer.SSEParser
-	if obsRegistry != nil && obsReqCtx != nil {
+	if (obsRegistry != nil && obsReqCtx != nil) || tokenAcc != nil {
 		sseParser = observer.NewSSEParser()
 	}
 
@@ -116,8 +127,11 @@ func newStreamDrainer(
 	observability.GoSafe("proxy.stream_drainer.run", observability.Isolated, func() {
 		defer upstream.Close() // idempotent: safe if already closed above
 
+		// acc holds the whole body ONLY in the legacy fallback (tokenAcc == nil);
+		// the incremental path leaves it empty and parses-and-discards per frame.
 		var acc bytes.Buffer
 		buf := make([]byte, 32*1024)
+		forwarded := 0 // bytes successfully forwarded to the client (replaces acc.Len() signal)
 
 		// Default to "complete"; the loop below downgrades to "partial" or
 		// "interrupted" when it detects the corresponding exit paths.
@@ -152,28 +166,37 @@ func newStreamDrainer(
 					completion = "partial"
 					break outer
 				}
-				// Only accumulate bytes that were successfully forwarded.
-				acc.Write(buf[:n])
+				forwarded += n
+				// gap7: the legacy fallback (no incremental accumulator) retains
+				// the whole forwarded body; the incremental path parses-and-discards
+				// per frame below and never grows acc.
+				if tokenAcc == nil {
+					acc.Write(buf[:n])
+				}
 
-				// Phase 4 M2 observer dispatch: feed the just-read bytes
-				// to the SSE parser and emit any complete frames before
-				// the next upstream.Read. ORDERING INVARIANT (per
-				// plugin-架构设计.md §5.1 + proxy.go's doc-anchor):
-				// observers see byte-identical upstream frames BEFORE
-				// any ResponseTransform reshapes them. This loop is
-				// the only place that satisfies that — pw.Write above
-				// only forwards bytes to the client pipe; the
-				// translator's response-side hook (if armed) runs
-				// downstream of THIS loop in serveRoute's
+				// Per-frame dispatch: parse the just-read bytes incrementally and,
+				// for each complete frame, (a) feed the token accumulator (gap7) and
+				// (b) notify observers. ORDERING INVARIANT (per plugin-架构设计.md
+				// §5.1 + proxy.go's doc-anchor): observers see byte-identical
+				// upstream frames BEFORE any ResponseTransform reshapes them. This
+				// loop is the only place that satisfies that — pw.Write above only
+				// forwards bytes to the client pipe; the translator's response-side
+				// hook (if armed) runs downstream of THIS loop in serveRoute's
 				// ModifyResponse path.
 				//
-				// NotifySSEEvent is non-blocking (per its docstring's
-				// P0-2 invariant). A slow / panicking observer can
-				// drop frames or auto-disable itself but cannot stall
-				// this drainer.
+				// NotifySSEEvent is non-blocking (per its docstring's P0-2
+				// invariant). A slow / panicking observer can drop frames or
+				// auto-disable itself but cannot stall this drainer. tokenAcc.Feed
+				// only json-parses the frame (no retain), so the parser-owned Data
+				// slice is safe without a copy.
 				if sseParser != nil {
 					for _, frame := range sseParser.Parse(buf[:n]) {
-						obsRegistry.NotifySSEEvent(reqCtx, obsReqCtx, frame.EventType, frame.Data)
+						if tokenAcc != nil {
+							tokenAcc.Feed(frame.Data)
+						}
+						if obsRegistry != nil && obsReqCtx != nil {
+							obsRegistry.NotifySSEEvent(reqCtx, obsReqCtx, frame.EventType, frame.Data)
+						}
 					}
 				}
 			}
@@ -190,14 +213,33 @@ func newStreamDrainer(
 		// Signal end-of-stream to the client (no-op if already disconnected).
 		pw.Close()
 
+		// gap7: flush a final frame the parser may still hold (stream ended with
+		// no trailing blank line) into the token accumulator, matching the
+		// whole-body extractor which processes the last line regardless. Observers
+		// intentionally do NOT receive this (their semantic drops trailing partials).
+		if tokenAcc != nil && sseParser != nil {
+			if fr, ok := sseParser.Flush(); ok {
+				tokenAcc.Feed(fr.Data)
+			}
+		}
+
 		// Record token usage from however much of the stream was received.
-		breakdown := prov.ExtractTokenBreakdown(acc.Bytes(), true, logger)
+		// gap7: the incremental path returns the accumulator's running result
+		// (no whole-body buffer); the legacy fallback runs the whole-body
+		// extractor on acc. Both yield byte-identical breakdowns — bound by
+		// internal/provider/tokenstream_fence_test.go.
+		var breakdown provider.TokenBreakdown
+		if tokenAcc != nil {
+			breakdown = tokenAcc.Result()
+		} else {
+			breakdown = prov.ExtractTokenBreakdown(acc.Bytes(), true, logger)
+		}
 		// Caller-side double defense per principles/logging-conventions.md.
 		// Only fires when the stream completed normally — partial / interrupted
 		// streams legitimately have zero tokens because we never reached the
 		// usage frame.
 		if completion == "complete" &&
-			acc.Len() > 100 &&
+			forwarded > 100 &&
 			breakdown.InputTokens == 0 && breakdown.OutputTokens == 0 {
 			logger.Warn("streaming: complete stream with non-empty body but extractor produced zero tokens",
 				"event.name", observability.EventProxyExtractionEmpty,

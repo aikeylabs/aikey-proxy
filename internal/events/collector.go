@@ -3,6 +3,7 @@ package events
 import (
 	"log/slog"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/AiKeyLabs/aikey-proxy/internal/observability"
@@ -23,6 +24,24 @@ type Collector struct {
 	flushInterval time.Duration
 	done          chan struct{}
 	wg            sync.WaitGroup
+
+	// dropped counts usage events discarded because the buffer was full.
+	// Mirrors Reporter.dropped so /admin/metrics exposes both discard paths
+	// (queue-full here, no-route in the reporter) — billing loss must be
+	// externally observable, never log-only (health-signal-surface).
+	dropped atomic.Int64
+}
+
+// CollectorMetrics holds observable collector counters. Surfaced via
+// /admin/metrics alongside ReporterMetrics so an operator can see usage events
+// lost to backpressure without scraping logs.
+type CollectorMetrics struct {
+	Dropped int64 `json:"usage_events_dropped_total"`
+}
+
+// Metrics returns a snapshot of the collector's counters.
+func (c *Collector) Metrics() CollectorMetrics {
+	return CollectorMetrics{Dropped: c.dropped.Load()}
 }
 
 // NewCollector creates and starts an async event collector.
@@ -42,12 +61,28 @@ func NewCollector(store EventInserter, batchSize int, flushInterval time.Duratio
 	return c
 }
 
-// Record enqueues a usage event. Non-blocking; drops event if buffer is full.
+// Record enqueues a usage event. Non-blocking by design (must never block the
+// proxy request path). On buffer overflow the event is dropped, but loudly:
+// a billing event lost to backpressure is a correctness risk, so we increment
+// an externally-readable counter AND emit a structured WARN with the trace
+// correlation captured at request entry (logging-conventions, fail-loud).
 func (c *Collector) Record(event UsageEvent) {
 	select {
 	case c.ch <- event:
 	default:
-		slog.Warn("events collector: buffer full, dropping event")
+		dropped := c.dropped.Add(1)
+		slog.Warn("events collector: buffer full, dropping usage event",
+			"event.name", "usage.collector.buffer_full_drop",
+			"error.code", "USAGE_COLLECTOR_BUFFER_FULL",
+			"trace_id", event.TraceID,
+			"span_id", event.SpanID,
+			"request_id", event.RequestID,
+			"virtual_key_id", event.VirtualKeyID,
+			"provider", event.Provider,
+			"model", event.Model,
+			"session_id", event.SessionID,
+			"dropped_total", dropped,
+		)
 	}
 }
 
