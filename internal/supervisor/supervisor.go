@@ -683,16 +683,30 @@ func (s *Supervisor) syncManagedKeys() {
 	}
 }
 
-// quotaEnabledFromEnv reads the PROXY_QUOTA_ENABLED feature flag. Default OFF:
-// Stage 2 only builds the rule-distribution rail (load + count, no enforcement),
-// so until Stage 3 lands the quota path stays bypassed in normal deployments and
-// the proxy behaves exactly as before. Accepts "1"/"true"/"yes" (case-insensitive).
+// quotaEnabledFromEnv reads the PROXY_QUOTA_ENABLED switch. Default ON
+// (2026-06-11 flip, user-approved): the old default-OFF was a Phase-2
+// Stage-2 guard ("rail built, enforcement not landed yet") that outlived
+// its purpose once Stage 3 shipped — and it caused a real incident: the
+// cluster worker role forgot to set the env, so enterprise hard_block
+// quotas were SILENTLY unenforced on fleet nodes (bug
+// 20260611-cluster-worker-quota-not-enabled). Whether quota acts should be
+// decided by ONE truth source — "did an admin configure rules" — not
+// additionally by "did ops remember an env var".
+//
+// Default-ON is safe by the enforcer's invariant 6 (quota_enforce.go): a
+// snapshot with no rules is a pure in-memory no-op — Personal installs and
+// org-less proxies see zero behaviour change; only a confirmed over-limit
+// blocks. PROXY_QUOTA_ENFORCE_MODE=budget (fail-closed) stays strictly
+// opt-in and is NOT affected by this flip.
+//
+// The env is kept as an explicit OPT-OUT kill switch: "0"/"false"/"no"/
+// "off" (case-insensitive) disables enforcement for emergency rollback.
 func quotaEnabledFromEnv() bool {
 	switch strings.ToLower(strings.TrimSpace(os.Getenv("PROXY_QUOTA_ENABLED"))) {
-	case "1", "true", "yes", "on":
-		return true
-	default:
+	case "0", "false", "no", "off":
 		return false
+	default:
+		return true
 	}
 }
 

@@ -81,7 +81,7 @@ func TestApplyInboundFilter_LiveDetector_NSFW(t *testing.T) {
 	for time.Now().Before(deadline) {
 		r := newReq(body)
 		w := httptest.NewRecorder()
-		proceed := p.applyInboundFilter(w, r, "claude-3-5-sonnet", "personal", "", discardLogger())
+		proceed := p.applyInboundFilter(w, r, "claude-3-5-sonnet", "personal", "", "", discardLogger())
 		if !proceed {
 			// Block is also a valid interception verdict.
 			t.Logf("NSFW intercepted via BLOCK (status=%d) — distributed pack effective", w.Code)

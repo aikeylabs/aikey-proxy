@@ -80,6 +80,7 @@ func (p *Proxy) applyInboundFilter(
 	model string,
 	routeSource string,
 	orgID string,
+	virtualKeyID string,
 	logger *slog.Logger,
 ) (proceed bool) {
 	hook := p.filterHook
@@ -190,7 +191,11 @@ func (p *Proxy) applyInboundFilter(
 		// and the master must not trust a client-self-reported tenant.
 		// (update doc 20260603 §2.1)
 		if routeClass == apphook.RouteClassTeam && len(resp.Event) > 0 {
-			teamEvents = append(teamEvents, injectTenant(resp.Event, orgID))
+			// Stamp BOTH authoritative attribution fields the proxy resolved (the
+			// detector has neither): tenant_id = the VK's org, virtual_key_id = the
+			// VK itself (per-seat attribution at a centralized gateway). The VK never
+			// crosses the detector pipe. See 20260611 集中化网关归因改造.
+			teamEvents = append(teamEvents, injectVirtualKey(injectTenant(resp.Event, orgID), virtualKeyID))
 		}
 
 		switch resp.Action {
@@ -290,6 +295,32 @@ func injectTenant(eventJSON []byte, orgID string) []byte {
 		return eventJSON
 	}
 	m["tenant_id"] = q
+	out, err := json.Marshal(m)
+	if err != nil {
+		return eventJSON
+	}
+	return out
+}
+
+// injectVirtualKey stamps the proxy-authoritative virtual_key_id onto the team
+// event JSON — the VK that triggered it, for per-seat attribution at a centralized
+// gateway (one proxy node serves many employees). The proxy resolves the VK per
+// request; it never crosses the detector pipe (credential stays in the proxy).
+// Empty vk (non-team route / unresolved) → unchanged. Fail-safe like injectTenant:
+// any parse/marshal error returns the original event. See 20260611 集中化网关归因改造.
+func injectVirtualKey(eventJSON []byte, virtualKeyID string) []byte {
+	if virtualKeyID == "" {
+		return eventJSON
+	}
+	var m map[string]json.RawMessage
+	if err := json.Unmarshal(eventJSON, &m); err != nil {
+		return eventJSON
+	}
+	q, err := json.Marshal(virtualKeyID)
+	if err != nil {
+		return eventJSON
+	}
+	m["virtual_key_id"] = q
 	out, err := json.Marshal(m)
 	if err != nil {
 		return eventJSON
