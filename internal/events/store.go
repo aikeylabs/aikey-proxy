@@ -4,6 +4,7 @@ import (
 	"database/sql"
 	"fmt"
 	"log/slog"
+	"time"
 
 	_ "modernc.org/sqlite"
 )
@@ -157,6 +158,20 @@ func (s *Store) Insert(events []UsageEvent) error {
 	}
 
 	return tx.Commit()
+}
+
+// PruneOlderThan deletes usage_events rows with timestamp before cutoff and
+// returns the number of rows removed. Part of the retention sweep
+// (retention.go): without it the table grows unbounded and QueryStats'
+// full-table GROUP BY degrades over time (2026-06-10 perf review P6).
+// timestamp is stored as Unix seconds (see Insert), hence cutoff.Unix().
+func (s *Store) PruneOlderThan(cutoff time.Time) (int64, error) {
+	res, err := s.db.Exec("DELETE FROM usage_events WHERE timestamp < ?", cutoff.Unix())
+	if err != nil {
+		return 0, fmt.Errorf("prune usage_events: %w", err)
+	}
+	n, _ := res.RowsAffected()
+	return n, nil
 }
 
 // QueryStats returns aggregated stats for admin metrics.

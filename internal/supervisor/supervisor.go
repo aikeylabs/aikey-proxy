@@ -348,6 +348,28 @@ func New(cfg *config.Config, configPath, password, version string) (*Supervisor,
 	// long-lived correctness/security risk, not a per-request issue.
 	observability.GoSafe("supervisor.managed_key_sync_loop", observability.Fatal, s.managedKeySyncLoop)
 
+	// Local usage-data retention: WAL archive/expiry + usage_events prune
+	// (费用小票 §11 design; 2026-06-10 decision (a)). Process-level (not
+	// per-generation) because the WAL dir and policy never change across
+	// reloads; the store handle DOES, so the loop resolves it via s.active
+	// at each sweep. Isolated: retention is a bypass — a panic here must
+	// never affect forwarding. Negative wal_retention_days disables.
+	if s.cfg.Events.WALDir != "" && s.cfg.Events.WALRetentionDays > 0 {
+		rcfg := events.RetentionConfig{
+			WALDir:        s.cfg.Events.WALDir,
+			RetentionDays: s.cfg.Events.WALRetentionDays,
+			ArchiveDays:   s.cfg.Events.WALArchiveDays,
+		}
+		observability.GoSafe("supervisor.usage_retention_loop", observability.Isolated, func() {
+			events.RetentionLoop(s.ctx, rcfg, func() *events.Store {
+				if g := s.active.Load(); g != nil {
+					return g.eventStore
+				}
+				return nil
+			})
+		})
+	}
+
 	// G3: poll the org-level compliance master switch so an enterprise can mandate
 	// compliance from the control backend (force-spawn the detector regardless of
 	// the user's local toggle). No-op when no team/org is configured (Personal).

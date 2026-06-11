@@ -26,6 +26,15 @@ const (
 	// entry in Handle) so deep code paths — notably buildBaseEvent feeding the
 	// async collector — can correlate logs without re-extracting from headers.
 	ctxKeyTrace
+	// ctxKeyCodexCandidateModel stages a Codex-OAuth request body's `model`
+	// field for deferred persistence. Populated on the request leg by
+	// `captureCodexModel`; read on the response leg by `ModifyResponse`,
+	// which only writes the state file when upstream returned 2xx. This
+	// gates out poisoning scenarios (bug 2026-06-09): a single bad request
+	// — e.g. `model: gpt-4o` against the ChatGPT-account Codex endpoint —
+	// otherwise wrote a permanent stale value that all later connectivity
+	// probes inherited.
+	ctxKeyCodexCandidateModel
 )
 
 // traceFromContext retrieves the request's TraceContext. Returns the zero value

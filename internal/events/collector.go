@@ -44,11 +44,21 @@ func (c *Collector) Metrics() CollectorMetrics {
 	return CollectorMetrics{Dropped: c.dropped.Load()}
 }
 
+// collectorBufferSize bounds the in-flight usage-event queue between the
+// request hot path and the SQLite batch writer. Sizing rationale (2026-06-10
+// perf review P4): at a sustained 200 req/s, a SQLite write stall (checkpoint,
+// disk contention) drains headroom at ~200 events/s — 1000 gave only ~5s
+// before Record() starts dropping billing events; 10000 gives ~50s, enough to
+// ride out WAL checkpoints. Memory cost is negligible (UsageEvent is a small
+// struct; 10k ≈ a few MB worst-case). Drops remain loud either way:
+// usage.collector.buffer_full_drop WARN + usage_events_dropped_total counter.
+const collectorBufferSize = 10000
+
 // NewCollector creates and starts an async event collector.
 func NewCollector(store EventInserter, batchSize int, flushInterval time.Duration) *Collector {
 	c := &Collector{
 		store:         store,
-		ch:            make(chan UsageEvent, 1000),
+		ch:            make(chan UsageEvent, collectorBufferSize),
 		batchSize:     batchSize,
 		flushInterval: flushInterval,
 		done:          make(chan struct{}),

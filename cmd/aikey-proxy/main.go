@@ -16,6 +16,7 @@ import (
 
 	"github.com/AiKeyLabs/aikey-proxy/internal/admin"
 	"github.com/AiKeyLabs/aikey-proxy/internal/config"
+	"github.com/AiKeyLabs/aikey-proxy/internal/events"
 	"github.com/AiKeyLabs/aikey-proxy/internal/observability"
 	"github.com/AiKeyLabs/aikey-proxy/internal/proxy"
 	proxyruntime "github.com/AiKeyLabs/aikey-proxy/internal/runtime"
@@ -93,6 +94,14 @@ func main() {
 			fmt.Println("aikey-proxy", bi.String())
 		}
 		os.Exit(0)
+	}
+
+	// "wal vacuum" subcommand — manually trigger one retention sweep
+	// (费用小票 §12 验收 #3). Safe to run beside a live proxy: the sweep only
+	// touches files days past retention, never the open current-hour file,
+	// and the events DB is WAL-mode SQLite (multi-process safe).
+	if len(os.Args) > 2 && os.Args[1] == "wal" && os.Args[2] == "vacuum" {
+		os.Exit(runWALVacuum(os.Args[3:]))
 	}
 
 	configPath := flag.String("config", "", "path to config file (default: search cwd then ~/.aikey/)")
@@ -254,11 +263,10 @@ func main() {
 	adminHandler.AuditStatusFn = sup.AuditStatus
 	adminHandler.ReconcileGapsFn = sup.ReconcileGaps
 
-	// Build the outbound transport for upstream providers (optional).
+	// Build the outbound transport for upstream providers. Always non-nil now:
+	// even the direct path needs MaxIdleConnsPerHost tuning (see buildTransport).
 	dataHandler := sup.Handler()
-	if t := buildTransport(cfg.UpstreamProxy.URL); t != nil {
-		sup.SetTransport(t)
-	}
+	sup.SetTransport(buildTransport(cfg.UpstreamProxy.URL))
 
 	// 7. Build and start the HTTP server.
 	srv := server.New(ln, dataHandler, adminHandler, oauthHandler)
@@ -321,30 +329,108 @@ func getVaultPassword() (string, error) {
 	return string(pw), nil
 }
 
-// buildTransport returns a custom http.Transport that routes outbound provider
-// requests through proxyURL. Returns nil when proxyURL is empty, which makes
-// httputil.ReverseProxy fall back to http.DefaultTransport (itself honoring
-// HTTP_PROXY / HTTPS_PROXY / NO_PROXY environment variables).
+// buildTransport returns the outbound http.Transport for upstream providers.
 //
-// Supported schemes: http, https, socks5.
+// Direct (no upstream_proxy): a Clone of http.DefaultTransport — preserving
+// ProxyFromEnvironment (HTTP_PROXY / HTTPS_PROXY / NO_PROXY) and HTTP/2 — with
+// MaxIdleConnsPerHost raised. Go's default of 2 idle conns per host means that
+// under >2 concurrent requests to one provider, finished connections are
+// dropped and the next request pays a fresh TCP+TLS handshake. HTTP/2
+// multiplexing masks this against h2 upstreams, but HTTP/1.1 fallbacks and
+// custom gateways hit it directly (2026-06-10 perf review P1).
+//
+// Proxied (upstream_proxy set): explicit HTTP/1.1 transport through proxyURL.
+// MaxIdleConnsPerHost matters MOST here — ForceAttemptHTTP2=false means every
+// in-flight request needs its own connection, so 2 idle slots per host caused
+// a reconnect storm under any real concurrency.
+//
+// Supported proxy schemes: http, https, socks5.
 func buildTransport(proxyURL string) *http.Transport {
+	// All providers resolve to a handful of hosts (api.anthropic.com etc.),
+	// so a generous per-host idle pool is bounded in practice by MaxIdleConns.
+	const perHost = 100
+
 	if proxyURL == "" {
-		return nil
+		t := http.DefaultTransport.(*http.Transport).Clone()
+		t.MaxIdleConnsPerHost = perHost
+		return t
 	}
 	parsed, err := url.Parse(proxyURL)
 	if err != nil {
 		slog.Warn("upstream_proxy.url is invalid, falling back to env vars", "url", proxyURL, "error", err)
-		return nil
+		t := http.DefaultTransport.(*http.Transport).Clone()
+		t.MaxIdleConnsPerHost = perHost
+		return t
 	}
 	t := &http.Transport{
 		Proxy:               http.ProxyURL(parsed),
 		ForceAttemptHTTP2:   false, // keep HTTP/1.1 for widest proxy compat
 		MaxIdleConns:        100,
+		MaxIdleConnsPerHost: perHost,
 		IdleConnTimeout:     90 * time.Second,
 		TLSHandshakeTimeout: 10 * time.Second,
 	}
 	slog.Info("upstream proxy configured", "url", proxyURL)
 	return t
+}
+
+// runWALVacuum implements `aikey-proxy wal vacuum [--config path]`: loads the
+// same config the daemon uses, runs ONE retention sweep (WAL archive/expiry +
+// usage_events prune — see internal/events/retention.go), prints a summary,
+// and exits. Exit codes: 0 = swept clean, 1 = config/setup failure, 2 = sweep
+// finished but some items failed (partial success — details on stderr).
+func runWALVacuum(args []string) int {
+	fs := flag.NewFlagSet("wal vacuum", flag.ContinueOnError)
+	configPath := fs.String("config", "", "path to config file (default: search cwd then ~/.aikey/)")
+	if err := fs.Parse(args); err != nil {
+		return 1
+	}
+	resolvedPath, err := resolveConfigPath(*configPath)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "wal vacuum: config not found:", err)
+		return 1
+	}
+	cfg, err := config.Load(resolvedPath)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "wal vacuum: failed to load config:", err)
+		return 1
+	}
+	if cfg.Events.WALDir == "" {
+		fmt.Fprintln(os.Stderr, "wal vacuum: events.wal_dir is not configured — nothing to sweep")
+		return 1
+	}
+	if cfg.Events.WALRetentionDays <= 0 {
+		fmt.Fprintln(os.Stderr, "wal vacuum: retention disabled (events.wal_retention_days <= 0)")
+		return 1
+	}
+
+	var store *events.Store
+	if cfg.Events.DBPath != "" {
+		if s, serr := events.OpenStore(cfg.Events.DBPath); serr != nil {
+			// WAL-only sweep still proceeds; surface the skip loudly.
+			fmt.Fprintln(os.Stderr, "wal vacuum: events db unavailable, skipping table prune:", serr)
+		} else {
+			store = s
+			defer store.Close()
+		}
+	}
+
+	res := events.RunRetentionSweep(events.RetentionConfig{
+		WALDir:        cfg.Events.WALDir,
+		RetentionDays: cfg.Events.WALRetentionDays,
+		ArchiveDays:   cfg.Events.WALArchiveDays,
+	}, store, time.Now())
+
+	fmt.Printf("wal vacuum: archived=%d archive_deleted=%d events_pruned=%d (retention=%dd archive=%dd, dir=%s)\n",
+		res.WALArchived, res.ArchiveDeleted, res.EventsPruned,
+		cfg.Events.WALRetentionDays, cfg.Events.WALArchiveDays, cfg.Events.WALDir)
+	if len(res.Errors) > 0 {
+		for _, e := range res.Errors {
+			fmt.Fprintln(os.Stderr, "wal vacuum: item failed:", e)
+		}
+		return 2
+	}
+	return 0
 }
 
 // parseLogLevel converts a config string to a slog.Level.

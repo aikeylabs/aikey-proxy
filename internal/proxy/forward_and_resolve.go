@@ -181,13 +181,13 @@ func (p *Proxy) ResolveBindingCredential(
 		// Ref: workflow/CI/research/oauth-codex-test/main.go
 		if canonicalCode == "openai" {
 			out.BaseURL = "https://chatgpt.com/backend-api/codex"
-			// Best-effort: persist the `model` from this request to
-			// ~/.aikey/state/codex_last_model so aikey-cli's connectivity
-			// probe uses the SAME model the user's codex CLI just used.
-			// Self-healing against upstream model retirement — no aikey
-			// release needed when OpenAI rolls a new model.
-			// See codex_model_capture.go for full rationale.
-			captureCodexModel(r)
+			// Stage the `model` field into request context. Actual
+			// persistence is deferred to ModifyResponse, which only
+			// writes the file when upstream returned 2xx — see
+			// codex_model_capture.go for the bug-2026-06-09 rationale.
+			// `captureCodexModel` returns a NEW request with the value
+			// in context; reassign to propagate downstream.
+			r = captureCodexModel(r)
 		} else {
 			out.BaseURL = providerDefaultBaseURL(canonicalCode)
 		}
@@ -432,6 +432,15 @@ func (p *Proxy) serveRoute(w http.ResponseWriter, r *http.Request, route *vkeys.
 			}
 		},
 		ModifyResponse: func(resp *http.Response) error {
+			// Codex OAuth model capture — only persist on 2xx so a bad
+			// `model: gpt-4o` request (rejected by ChatGPT-account
+			// Codex) can't poison the state file the connectivity probe
+			// reads. See codex_model_capture.go §2026-06-09 deferred-
+			// persist redesign. No-op for non-Codex paths because
+			// ctxKeyCodexCandidateModel is only stashed inside the
+			// canonicalCode == "openai" OAuth branch above.
+			persistCodexLastModelIfSuccessful(resp.Request, resp.StatusCode)
+
 			// Upstream-headers debug toggle: log a "response snapshot" with
 			// status + body + selected response headers (rate-limit + retry
 			// hints) for ANY status code. Why every status, not just 4xx:

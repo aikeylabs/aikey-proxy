@@ -161,6 +161,16 @@ type EventsConfig struct {
 	UploadInterval time.Duration `yaml:"upload_interval"`  // max time between uploads (default 5s)
 	WALDir         string        `yaml:"wal_dir"`          // JSONL WAL directory
 
+	// Local usage-data retention (费用小票 §11/§12 design; implemented
+	// 2026-06-10). WAL files older than wal_retention_days move into the
+	// usage-wal-archive/ subdir; archived files older than wal_archive_days
+	// are deleted; usage_events rows older than wal_retention_days are
+	// pruned. 0 (unset) → defaults 30/90 per the design; negative disables
+	// the retention loop entirely (keep everything forever, pre-2026-06
+	// behavior).
+	WALRetentionDays int `yaml:"wal_retention_days"`
+	WALArchiveDays   int `yaml:"wal_archive_days"`
+
 	// Control service URL — historically used for diagnostics/canary-check
 	// queries. As of 2026-04-17 diagnostics live on collector-service, so
 	// CanaryProbe prefers CollectorURL and only falls back here when it is
@@ -304,6 +314,14 @@ func (c *Config) applyDefaults() {
 	}
 	if c.Events.FlushInterval == 0 {
 		c.Events.FlushInterval = DefaultEventsFlushInterval
+	}
+	// 0 (unset) → design defaults; negative honored as "retention disabled"
+	// (same unset-vs-explicit convention as Listen.PortDriftMax above).
+	if c.Events.WALRetentionDays == 0 {
+		c.Events.WALRetentionDays = DefaultWALRetentionDays
+	}
+	if c.Events.WALArchiveDays == 0 {
+		c.Events.WALArchiveDays = DefaultWALArchiveDays
 	}
 	if c.Log.Level == "" {
 		c.Log.Level = DefaultLogLevel

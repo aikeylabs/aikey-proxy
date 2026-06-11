@@ -11,6 +11,7 @@ import (
 // = auto reset with no cron (design invariant 5).
 const (
 	PeriodDaily   = "daily"
+	PeriodWeekly  = "weekly"
 	PeriodMonthly = "monthly"
 )
 
@@ -27,6 +28,12 @@ func PeriodKey(period string, t time.Time) string {
 	switch period {
 	case PeriodDaily:
 		return fmt.Sprintf("daily:%s", t.UTC().Format("2006-01-02"))
+	case PeriodWeekly:
+		// ISO week (Mon-Sun). ISOWeek()'s year is the week-numbering year, which
+		// can differ from the calendar year near Jan 1 — using it keeps the key
+		// monotonic across year boundaries (e.g. 2026-W01 not 2025-W53 collisions).
+		y, w := t.UTC().ISOWeek()
+		return fmt.Sprintf("weekly:%04d-W%02d", y, w)
 	case PeriodMonthly:
 		return fmt.Sprintf("monthly:%s", t.UTC().Format("2006-01"))
 	default:
@@ -44,6 +51,13 @@ func PeriodResetAt(period string, t time.Time) time.Time {
 	case PeriodDaily:
 		d := time.Date(u.Year(), u.Month(), u.Day(), 0, 0, 0, 0, time.UTC)
 		return d.AddDate(0, 0, 1)
+	case PeriodWeekly:
+		// Next Monday 00:00 UTC. Go's Weekday() is Sun=0..Sat=6; offset to make
+		// Monday the week start, then roll to the following Monday.
+		d := time.Date(u.Year(), u.Month(), u.Day(), 0, 0, 0, 0, time.UTC)
+		daysSinceMonday := (int(u.Weekday()) + 6) % 7
+		monday := d.AddDate(0, 0, -daysSinceMonday)
+		return monday.AddDate(0, 0, 7)
 	case PeriodMonthly:
 		m := time.Date(u.Year(), u.Month(), 1, 0, 0, 0, 0, time.UTC)
 		return m.AddDate(0, 1, 0)
