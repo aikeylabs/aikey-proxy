@@ -146,7 +146,19 @@ func (p *Proxy) applyInboundFilter(
 
 	// Extract prompt content from the wire envelope. Non-JSON or no-content
 	// bodies are not something L1 can filter — forward unchanged.
+	//
+	// Incremental mode (form-② lobster): scan ONLY the latest user turn, not the
+	// resent system + full history. extractLatestUserContent returns ok=false on
+	// any shape it can't confidently reduce → we fall back to the full scan, so
+	// incremental never under-scans (it only ever scans LESS when it's certain
+	// the rest is unchanged history). See Proxy.filterIncremental.
 	pieces, parsed, ok := extractFilterableContent(bodyBytes)
+	incremental := false
+	if p.filterIncremental {
+		if ip, ipar, iok := extractLatestUserContent(bodyBytes); iok {
+			pieces, parsed, ok, incremental = ip, ipar, true, true
+		}
+	}
 	if !ok || len(pieces) == 0 {
 		r.Body = io.NopCloser(bytes.NewReader(bodyBytes))
 		// Link-level diagnostic (失败要显眼): a routed LLM request that yielded NO
@@ -289,7 +301,7 @@ func (p *Proxy) applyInboundFilter(
 		"event.name", "proxy.filter.decision",
 		"pieces", len(pieces), "masked", maskedCount, "degraded", degraded,
 		"detect_ms", detectNanos/1e6, "body_bytes", len(bodyBytes),
-		"route_class", routeClass)
+		"incremental", incremental, "route_class", routeClass)
 
 	if maskedCount == 0 {
 		// Nothing changed — forward the original bytes verbatim.

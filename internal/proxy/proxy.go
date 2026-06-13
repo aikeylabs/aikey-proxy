@@ -148,6 +148,20 @@ type Proxy struct {
 	// AND its child binary spawned successfully.
 	filterHook apphook.Hook
 
+	// filterIncremental, when true, makes the inbound filter scan ONLY the
+	// latest user turn (the new content) instead of re-scanning system + the
+	// whole conversation history every request. WHY: clients like OpenClaw
+	// resend the full context (10-28KB) each turn; re-scanning it all is the
+	// dominant latency (12KB varied CJK ≈ 81ms on a 2-core box → straddles the
+	// 80ms detector budget → intermittent fail-open). Scanning only the new user
+	// message cuts that to <5ms. Premise (caller-accepted): sensitive content
+	// only enters via the current user input. Safety: extractLatestUserContent
+	// returns ok=false on any unexpected shape → caller falls back to a full
+	// scan, never silently under-scanning. Default false (full scan); the
+	// form-② lobster install opts in (AIKEY_PROXY_FILTER_INCREMENTAL_SCAN=1).
+	// RCA: 2026-06-13 form-② filter-degrade (NER/CRF size-linear cost).
+	filterIncremental bool
+
 	// Configurable slow-request thresholds (milliseconds).
 	SlowRequestMs     int64
 	VerySlowRequestMs int64
@@ -297,6 +311,13 @@ func (p *Proxy) SetFilterStub501Active(active bool) {
 // nil hook = no filter (serveRoute's injection is a no-op).
 func (p *Proxy) SetFilterHook(h apphook.Hook) {
 	p.filterHook = h
+}
+
+// SetFilterIncrementalScan toggles latest-user-turn-only scanning (see the
+// filterIncremental field). Called once at generation build by the supervisor
+// from AIKEY_PROXY_FILTER_INCREMENTAL_SCAN. Default (unset) = full scan.
+func (p *Proxy) SetFilterIncrementalScan(on bool) {
+	p.filterIncremental = on
 }
 
 // FilterHook returns the installed filter dispatcher hook (nil if none).

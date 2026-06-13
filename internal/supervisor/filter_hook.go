@@ -199,11 +199,17 @@ func (s *Supervisor) installFilterHook(p *proxy.Proxy, vaultReader *vault.Reader
 	}
 
 	p.SetFilterHook(pool)
+	// Incremental scan (latest user turn only) — opt-in via env, set by the
+	// form-② lobster install. Default off = full scan (unchanged for fleet/other
+	// editions). See Proxy.filterIncremental.
+	incremental := filterIncrementalScan()
+	p.SetFilterIncrementalScan(incremental)
 	slog.Info("supervisor: compliance filter hook active",
 		"event.name", "proxy.filter_hook_active",
 		"binary", binPath,
 		"workers", m,
-		"timeout_ms", filterTimeout().Milliseconds())
+		"timeout_ms", filterTimeout().Milliseconds(),
+		"incremental_scan", incremental)
 	return pool
 }
 
@@ -300,6 +306,20 @@ func filterTimeout() time.Duration {
 		return filterDefaultTimeout
 	}
 	return time.Duration(ms) * time.Millisecond
+}
+
+// filterIncrementalScanEnv toggles latest-user-turn-only scanning. Opt-in
+// (default off = full scan); the form-② lobster install sets it to 1. Accepts
+// 1/true/yes (case-insensitive).
+const filterIncrementalScanEnv = "AIKEY_PROXY_FILTER_INCREMENTAL_SCAN"
+
+func filterIncrementalScan() bool {
+	switch strings.ToLower(strings.TrimSpace(os.Getenv(filterIncrementalScanEnv))) {
+	case "1", "true", "yes", "on":
+		return true
+	default:
+		return false
+	}
 }
 
 // filterReadyTimeout resolves the detector spawn ready deadline: env override

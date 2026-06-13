@@ -402,7 +402,29 @@ func New(cfg *config.Config, configPath, password, version string) (*Supervisor,
 			}
 			return nil
 		}
-		reg.SetHealthSource(cluster.NodeHealthSource(s.cfg.Vault.Path, s.version, time.Now(), canaryFn))
+		// Phase-4 runtime metrics: upstream forward counters (cumulative; hub
+		// windows them) + usage-reporter backlog/stall. All cheap in-process
+		// reads; nil-safe (reporter absent on a collector-less node).
+		metricsFn := func() cluster.RuntimeMetrics {
+			rm := cluster.RuntimeMetrics{
+				Requests:             s.TotalRequests(),
+				Errors:               s.TotalErrors(),
+				ReportLastUploadAgeS: -1,
+			}
+			if m := s.ReporterMetrics(); m != nil {
+				rm.ReportConsecutiveFailures = m.ConsecutiveFailures
+				rm.ReportTerminalFails = m.TerminalFailCount
+				if m.LastUploadAt > 0 {
+					age := time.Now().Unix() - int64(m.LastUploadAt)/1000
+					if age < 0 {
+						age = 0
+					}
+					rm.ReportLastUploadAgeS = age
+				}
+			}
+			return rm
+		}
+		reg.SetHealthSource(cluster.NodeHealthSource(s.cfg.Vault.Path, s.version, time.Now(), canaryFn, metricsFn))
 		observability.GoSafe("supervisor.cluster_registrar", observability.Isolated, func() { reg.Run(s.ctx) })
 		slog.Info("cluster mode enabled", "node_id", s.cfg.Cluster.NodeID, "hub", s.cfg.Cluster.HubURL)
 	}

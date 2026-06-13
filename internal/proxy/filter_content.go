@@ -57,6 +57,48 @@ func extractFilterableContent(body []byte) (pieces []contentPiece, parsed map[st
 	return pieces, m, true
 }
 
+// extractLatestUserContent extracts ONLY the latest user turn's text — the NEW
+// content in a request that resends the full conversation (system + history)
+// every turn (OpenClaw, Claude Code, Codex, Cursor all do this). It deliberately
+// skips `system` (static, admin-authored) and all prior messages (already scanned
+// on their own turn), so the detector scans a few-dozen-byte new message instead
+// of re-scanning 10-28KB every request. See Proxy.filterIncremental for the why.
+//
+// SAFETY (never silently under-scan): returns ok=false — caller MUST fall back to
+// a FULL extractFilterableContent scan — on any shape it can't confidently reduce
+// to "the human's new input":
+//   - non-JSON body,
+//   - no messages array / empty,
+//   - last message isn't role=="user" (assistant- or tool-terminated agent loop),
+//   - last user message carries no scannable text (image / tool_result only).
+//
+// Mask write-back: the returned pieces' setText closures mutate parsed (the FULL
+// body map) in place, so re-marshaling parsed yields the original request with
+// only the latest user text masked — identical re-serialization path as the full
+// scan.
+func extractLatestUserContent(body []byte) (pieces []contentPiece, parsed map[string]any, ok bool) {
+	var m map[string]any
+	if err := json.Unmarshal(body, &m); err != nil {
+		return nil, nil, false
+	}
+	msgs, isArr := m["messages"].([]any)
+	if !isArr || len(msgs) == 0 {
+		return nil, m, false
+	}
+	last, isObj := msgs[len(msgs)-1].(map[string]any)
+	if !isObj {
+		return nil, m, false
+	}
+	if role, _ := last["role"].(string); role != "user" {
+		return nil, m, false
+	}
+	collectContentField(last, "content", &pieces)
+	if len(pieces) == 0 {
+		return nil, m, false
+	}
+	return pieces, m, true
+}
+
 // collectContentField appends maskable pieces for a field that is either a
 // string ("content":"…") or an array of typed blocks ("content":[{"type":"text",
 // "text":"…"}, …]). Non-text blocks (image / tool_use / tool_result / …) and

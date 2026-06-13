@@ -43,7 +43,7 @@ func TestNodeHealthSource_ForwardsDaemonFixture(t *testing.T) {
 
 	vaultPath := writeVaultDirWith(t, string(raw))
 	started := time.Unix(1717990005, 0)
-	h := NodeHealthSource(vaultPath, "1.0.1-test", started, nil)()
+	h := NodeHealthSource(vaultPath, "1.0.1-test", started, nil, nil)()
 
 	got, ok := h["daemon"].(map[string]any)
 	if !ok {
@@ -70,7 +70,7 @@ func TestNodeHealthSource_ForwardsDaemonFixture(t *testing.T) {
 
 func TestNodeHealthSource_MissingFileOmitsDaemon(t *testing.T) {
 	vaultPath := writeVaultDirWith(t, "") // no status file: daemon not started yet
-	h := NodeHealthSource(vaultPath, "v", time.Unix(1, 0), nil)()
+	h := NodeHealthSource(vaultPath, "v", time.Unix(1, 0), nil, nil)()
 	if _, present := h["daemon"]; present {
 		t.Fatalf("daemon section must be absent when the status file is missing, got %#v", h["daemon"])
 	}
@@ -82,7 +82,7 @@ func TestNodeHealthSource_MissingFileOmitsDaemon(t *testing.T) {
 func TestNodeHealthSource_CorruptFileOmitsDaemonWithoutPanic(t *testing.T) {
 	for _, corrupt := range []string{"{half written", `"just a string"`, "[]", "null"} {
 		vaultPath := writeVaultDirWith(t, corrupt)
-		fn := NodeHealthSource(vaultPath, "v", time.Unix(1, 0), nil)
+		fn := NodeHealthSource(vaultPath, "v", time.Unix(1, 0), nil, nil)
 		h := fn()
 		if _, present := h["daemon"]; present {
 			t.Fatalf("daemon section must be absent for corrupt content %q", corrupt)
@@ -170,15 +170,41 @@ func TestNodeHealthSource_CanarySection(t *testing.T) {
 
 	withCanary := NodeHealthSource(vaultPath, "v", time.Unix(1, 0), func() any {
 		return map[string]any{"status": "failed", "failed_stage": "ingest", "consecutive_failures": 4}
-	})()
+	}, nil)()
 	c, ok := withCanary["canary"].(map[string]any)
 	if !ok || c["status"] != "failed" {
 		t.Fatalf("canary section not forwarded: %#v", withCanary["canary"])
 	}
 
-	disabled := NodeHealthSource(vaultPath, "v", time.Unix(1, 0), func() any { return nil })()
+	disabled := NodeHealthSource(vaultPath, "v", time.Unix(1, 0), func() any { return nil }, nil)()
 	if _, present := disabled["canary"]; present {
 		t.Fatalf("nil canary result must omit the section, got %#v", disabled["canary"])
+	}
+}
+
+// TestNodeHealthSource_RuntimeMetrics pins the Phase-4 fields: present and
+// forwarded verbatim when metricsFn is set, omitted when nil.
+func TestNodeHealthSource_RuntimeMetrics(t *testing.T) {
+	vaultPath := writeVaultDirWith(t, "")
+
+	with := NodeHealthSource(vaultPath, "v", time.Unix(1, 0), nil, func() RuntimeMetrics {
+		return RuntimeMetrics{
+			Requests: 1000, Errors: 150,
+			ReportConsecutiveFailures: 4, ReportLastUploadAgeS: 320, ReportTerminalFails: 2,
+		}
+	})()
+	p := with["proxy"].(map[string]any)
+	if p["requests"] != int64(1000) || p["errors"] != int64(150) {
+		t.Fatalf("upstream counters not forwarded: %#v", p)
+	}
+	if p["report_consecutive_failures"] != 4 || p["report_last_upload_age_s"] != int64(320) || p["report_terminal_fails"] != int64(2) {
+		t.Fatalf("reporting metrics not forwarded: %#v", p)
+	}
+
+	without := NodeHealthSource(vaultPath, "v", time.Unix(1, 0), nil, nil)()
+	pw := without["proxy"].(map[string]any)
+	if _, present := pw["requests"]; present {
+		t.Fatalf("nil metricsFn must omit runtime metric fields, got %#v", pw)
 	}
 }
 

@@ -39,24 +39,47 @@ const daemonStatusFileName = "daemon-status.json"
 //     the canary grades itself (ok/partial/failed/unavailable), this collector
 //     only ships the verdict.
 //
+// RuntimeMetrics is the proxy-runtime slice forwarded in health.proxy for the
+// Phase-4 signals (upstream error rate + usage-report backlog). All values are
+// cheap in-process reads. Requests/Errors are CUMULATIVE since proxy start —
+// the hub turns them into a windowed rate by differencing consecutive
+// heartbeats (cumulative-lifetime rate would stay stale after a recovery).
+type RuntimeMetrics struct {
+	Requests                  int64 // cumulative upstream forward attempts
+	Errors                    int64 // cumulative upstream forward errors
+	ReportConsecutiveFailures int   // reporter upload retry streak (0 = healthy)
+	ReportLastUploadAgeS      int64 // seconds since last successful usage upload; -1 = never
+	ReportTerminalFails       int64 // events permanently dropped to dead-letter
+}
+
 // The returned func never fails: on any read/parse problem it omits the
 // daemon section (the hub renders the absence as "no health data" — absence
 // is itself a signal) and WARNs once per distinct error, not per heartbeat
 // (a corrupt file would otherwise spam every 5s).
-func NodeHealthSource(vaultPath, version string, startedAt time.Time, canaryFn func() any) func() map[string]any {
+//
+// metricsFn (nil ⇒ omit the upstream/reporting fields) supplies the Phase-4
+// runtime metrics; like canaryFn it is transparent transport — the hub grades.
+func NodeHealthSource(vaultPath, version string, startedAt time.Time, canaryFn func() any, metricsFn func() RuntimeMetrics) func() map[string]any {
 	dir := filepath.Dir(vaultPath)
 	statusPath := filepath.Join(dir, daemonStatusFileName)
 	var lastWarned string // last WARN'd error string, to de-duplicate logs
 
 	return func() map[string]any {
-		h := map[string]any{
-			"proxy": map[string]any{
-				"started_at":   startedAt.Unix(),
-				"version":      version,
-				"node_time":    time.Now().Unix(),
-				"disk_free_mb": diskFreeMB(dir), // -1 = unknown (see disk_windows.go)
-			},
+		proxy := map[string]any{
+			"started_at":   startedAt.Unix(),
+			"version":      version,
+			"node_time":    time.Now().Unix(),
+			"disk_free_mb": diskFreeMB(dir), // -1 = unknown (see disk_windows.go)
 		}
+		if metricsFn != nil {
+			m := metricsFn()
+			proxy["requests"] = m.Requests
+			proxy["errors"] = m.Errors
+			proxy["report_consecutive_failures"] = m.ReportConsecutiveFailures
+			proxy["report_last_upload_age_s"] = m.ReportLastUploadAgeS
+			proxy["report_terminal_fails"] = m.ReportTerminalFails
+		}
+		h := map[string]any{"proxy": proxy}
 		if canaryFn != nil {
 			if cr := canaryFn(); cr != nil {
 				h["canary"] = cr
