@@ -51,6 +51,9 @@ const (
 	// it would constantly time out → degrade → fail-open (nothing masked).
 	// We default to filterDefaultTimeout so detection actually completes.
 	filterTimeoutMsEnv = "AIKEY_PROXY_FILTER_TIMEOUT_MS"
+	// filterReadyTimeoutMsEnv: how long to wait for the detector child to signal
+	// ready at spawn (NOT the per-request deadline above). Override in ms.
+	filterReadyTimeoutMsEnv = "AIKEY_PROXY_FILTER_READY_TIMEOUT_MS"
 )
 
 // filterDefaultTimeout is the per-Detect deadline when no override is set.
@@ -58,6 +61,17 @@ const (
 // realistic prompt while still bounding the hot path. Fail-open on overrun
 // (§6 #11) means a too-low value silently disables masking, so we err generous.
 const filterDefaultTimeout = 80 * time.Millisecond
+
+// filterDefaultReadyTimeout is how long the supervisor waits for the detector
+// child to signal ready at spawn. The apphook default is 5s, but the detector
+// cold-loads CRF models + AC lexicons (~3s idle on a 2-core box) and that
+// stretches past 5s under the load of a concurrent deploy/restart — the spawn
+// then misses the deadline and latches fail-loud 501, even though the child is
+// fine (found 2026-06-13: lobster de-1 flapped 200/501 across restarts, the
+// detector ready'd in 2.9s standalone). 30s gives comfortable headroom on a
+// busy small box while still bounding a genuinely-stuck child. A real engine
+// init crash still fails after this and correctly latches 501 (fail-loud).
+const filterDefaultReadyTimeout = 30 * time.Second
 
 // installFilterHook decides whether this generation runs a compliance/DLP
 // filter hook, spawns it if so, and wires it into p.
@@ -155,11 +169,12 @@ func (s *Supervisor) installFilterHook(p *proxy.Proxy, vaultReader *vault.Reader
 	}
 
 	cfg := apphook.ChildHookConfig{
-		Name:       "ai-compliance-detector",
-		BinaryPath: binPath,
-		BinaryArgs: binArgs,
-		Timeout:    filterTimeout(),
-		ExtraEnv:   extraEnv,
+		Name:         "ai-compliance-detector",
+		BinaryPath:   binPath,
+		BinaryArgs:   binArgs,
+		Timeout:      filterTimeout(),
+		ReadyTimeout: filterReadyTimeout(),
+		ExtraEnv:     extraEnv,
 	}
 	// Pool of M independent detector processes (双进程+A: cross-process isolation
 	// on top of each process's internal worker pool). M from AIKEY_PROXY_FILTER_WORKERS
@@ -221,6 +236,24 @@ func (s *Supervisor) resolveFilterBinary(vaultReader *vault.Reader) (binPath str
 			if bin, sl := resolveAppBinary(s.appsDir(), []string{complianceDetectorSlug}); bin != "" {
 				return bin, nil, sl, false
 			}
+			// Org MANDATES compliance but the detector binary is absent at the
+			// canonical <apps_dir>/ai-compliance-detector/bin/ai-compliance-detector.
+			// FAIL LOUD (declaredButMissing=true → 501) instead of serving
+			// UNFILTERED. Pre-2026-06-12 this fell through to `false` and the proxy
+			// silently passed traffic while the console showed compliance enabled
+			// (虚假安全感). Confirmed broken end-to-end on staging: 政治敏感词
+			// ("08宪章") sailed through BOTH fleet nodes (detector installed under
+			// the WRONG slug "cluster-compliance") AND lobster de-proxies (no
+			// detector). A missing detector under a mandate is a broken install,
+			// not "no filter configured" — block until installed. Self-heals on the
+			// next Reload once the installer lays the binary at the slug path.
+			// Bug: workflow/CI/bugfix/20260612-compliance-chain-silently-bypassed.md
+			slog.Error("supervisor: org mandates compliance but detector binary not found; "+
+				"data-plane returns 501 until installed at <apps_dir>/"+complianceDetectorSlug+
+				"/bin/"+complianceDetectorSlug,
+				"event.name", "proxy.compliance_mandate_binary_missing",
+				"apps_dir", s.appsDir(), "slug", complianceDetectorSlug)
+			return "", nil, complianceDetectorSlug, true
 		}
 		return "", nil, "", false
 	}
@@ -265,6 +298,22 @@ func filterTimeout() time.Duration {
 		slog.Warn("supervisor: invalid "+filterTimeoutMsEnv+"; using default",
 			"event.name", "proxy.filter_timeout_invalid", "value", raw)
 		return filterDefaultTimeout
+	}
+	return time.Duration(ms) * time.Millisecond
+}
+
+// filterReadyTimeout resolves the detector spawn ready deadline: env override
+// (ms) if a valid positive integer, else filterDefaultReadyTimeout.
+func filterReadyTimeout() time.Duration {
+	raw := strings.TrimSpace(os.Getenv(filterReadyTimeoutMsEnv))
+	if raw == "" {
+		return filterDefaultReadyTimeout
+	}
+	ms, err := strconv.Atoi(raw)
+	if err != nil || ms <= 0 {
+		slog.Warn("supervisor: invalid "+filterReadyTimeoutMsEnv+"; using default",
+			"event.name", "proxy.filter_ready_timeout_invalid", "value", raw)
+		return filterDefaultReadyTimeout
 	}
 	return time.Duration(ms) * time.Millisecond
 }

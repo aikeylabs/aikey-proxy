@@ -26,6 +26,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"os"
 	"os/exec"
 	"sync"
@@ -180,14 +181,32 @@ func (h *ChildHook) spawnLocked(ctx context.Context) error {
 	readyCh := make(chan string, 1)
 	go func() {
 		scanner := bufio.NewScanner(stderr)
+		sentReady := false
 		for scanner.Scan() {
 			line := scanner.Text()
-			if line != "" && containsReadySentinel(line) {
+			if line == "" {
+				continue
+			}
+			if !sentReady && containsReadySentinel(line) {
 				select {
 				case readyCh <- line:
 				default:
 				}
-				return
+				sentReady = true
+				continue // KEEP draining — do NOT return (see below)
+			}
+			if sentReady {
+				// Drain + surface child stderr for the life of this generation. WHY
+				// (2026-06-13 form-② filter-degrade RCA): the old code `return`ed
+				// here, so after startup the child's stderr was NEVER read. Two harms:
+				// (1) a 64KB pipe buffer eventually FILLS and the child BLOCKS on its
+				// next stderr write → it can't service Detect → every call times out →
+				// silent fail-open; (2) the child's own warnings/errors (the degrade
+				// reason) were discarded — a diagnosis blind spot. Draining fixes the
+				// deadlock; logging makes the child's voice visible link-side.
+				slog.Warn("apphook: child stderr",
+					"event.name", "proxy.apphook.child_stderr",
+					"name", h.cfg.Name, "line", line)
 			}
 		}
 	}()
@@ -273,7 +292,9 @@ func (h *ChildHook) removePending(reqID uint32) {
 }
 
 func (h *ChildHook) markDegraded(reason string) {
-	h.degraded.Store(true)
+	// Swap returns the PRIOR value: log only on the healthy→degraded transition,
+	// not on every failed call (avoids spam while still surfacing the reason).
+	wasHealthy := !h.degraded.Swap(true)
 	old := h.status.Load()
 	h.status.Store(&Status{
 		Healthy:        false,
@@ -284,6 +305,15 @@ func (h *ChildHook) markDegraded(reason string) {
 		RestartCount:   old.RestartCount,
 		LastErrorAt:    time.Now(),
 	})
+	if wasHealthy {
+		// Why: the dispatcher only logs a generic "hook degraded" with NO reason —
+		// the WHY (read_failed/write_failed/ready_timeout/listpacks_failed/child
+		// detect failed) was computed here but never recorded, making field
+		// root-cause impossible. Surface it. (2026-06-13 form-② filter-degrade RCA.)
+		slog.Warn("apphook: child hook degraded",
+			"event.name", "proxy.apphook.degraded",
+			"name", h.cfg.Name, "reason", reason)
+	}
 }
 
 // recoverCooldown bounds how often the lazy self-heal will attempt a respawn,

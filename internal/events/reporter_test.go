@@ -311,6 +311,57 @@ func recordingServer(t *testing.T, counter *atomic.Int64, gotAuth *atomic.Value)
 	return srv
 }
 
+// TestReporter_PrimaryRouteSource locks the canary's "ride the real route"
+// behavior: the probe must pick a credentialed route first (so it authenticates
+// like business traffic on cluster), fall to a configured route URL when no
+// credential exists (Personal/Trial local collector), and return "" only when
+// nothing is wired (legacy CollectorURL fall-through). Regression guard for
+// 20260612-compliance-chain-audit-and-lobster-gap.md (canary 401 root cause).
+func TestReporter_PrimaryRouteSource(t *testing.T) {
+	cases := []struct {
+		name  string
+		creds map[string]Credential
+		urls  map[string]string
+		want  string
+	}{
+		{
+			name:  "credentialed team wins (cluster)",
+			creds: map[string]Credential{"team": &StaticTokenCredential{Token: "jwt"}},
+			urls:  map[string]string{"personal": "http://local", "team": "http://remote"},
+			want:  "team",
+		},
+		{
+			name:  "no credential falls to configured route url (personal/trial)",
+			creds: nil,
+			urls:  map[string]string{"personal": "http://local"},
+			want:  "personal",
+		},
+		{
+			name:  "nothing configured returns empty (legacy fall-through)",
+			creds: nil,
+			urls:  nil,
+			want:  "",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			r, err := NewReporter(ReporterConfig{
+				CollectorURL:              "http://legacy",
+				CollectorRoutes:           tc.urls,
+				CollectorRouteCredentials: tc.creds,
+				QueueCapacity:             10,
+				WALDir:                    t.TempDir(),
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got := r.PrimaryRouteSource(); got != tc.want {
+				t.Fatalf("PrimaryRouteSource() = %q, want %q", got, tc.want)
+			}
+		})
+	}
+}
+
 func TestReporter_PerRouteCredential_DispatchesCorrectBearer(t *testing.T) {
 	var personalCount, teamCount atomic.Int64
 	var personalAuth, teamAuth atomic.Value

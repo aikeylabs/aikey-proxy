@@ -149,12 +149,35 @@ func (p *Proxy) applyInboundFilter(
 	pieces, parsed, ok := extractFilterableContent(bodyBytes)
 	if !ok || len(pieces) == 0 {
 		r.Body = io.NopCloser(bytes.NewReader(bodyBytes))
+		// Link-level diagnostic (失败要显眼): a routed LLM request that yielded NO
+		// filterable content was forwarded UNMASKED. Previously SILENT — the #1
+		// blind spot behind "OpenClaw chat not masked but the same text via curl
+		// is" (the wire bodies differ). Surface the shape so the reason is readable
+		// without a rebuild. reason=body_not_json (unparseable) vs no_text_content
+		// (parsed but messages[].content/system held no scannable text — e.g. the
+		// text sits in a block type the extractor skips, or only tool/image blocks).
+		// (2026-06-13 form-② filter-skip RCA.)
+		reason := "no_text_content"
+		if !ok {
+			reason = "body_not_json"
+		}
+		logger.Warn("filter: no filterable content extracted; forwarded UNFILTERED",
+			"event.name", "proxy.filter.skipped",
+			"reason", reason,
+			"body_bytes", len(bodyBytes),
+			"content_type", r.Header.Get("content-type"),
+			"top_keys", topLevelKeys(parsed),
+			"messages", messageCount(parsed),
+			"stream", parsed["stream"] == true)
 		return true
 	}
 
 	var (
 		maskedCount int
 		degraded    bool
+		nilResp     int // detector unreachable (pipe dead) — resp == nil
+		selfDeg     int // detector returned Degraded=true (it ran but couldn't decide)
+		detectNanos int64
 	)
 	for i := range pieces {
 		// Cap the per-piece payload sent over the pipe (the detector only scans
@@ -167,6 +190,7 @@ func (p *Proxy) applyInboundFilter(
 			b := capRuneBoundary(pieces[i].text, pipeInputCap)
 			head, tail = pieces[i].text[:b], pieces[i].text[b:]
 		}
+		_t0 := time.Now()
 		resp := hook.Detect(r.Context(), &apphook.Request{
 			Direction:   apphook.DirectionInbound,
 			Payload:     []byte(head),
@@ -178,8 +202,10 @@ func (p *Proxy) applyInboundFilter(
 			// UserRole left empty for MVP — PoC uses default-tenant pack
 			// (方案 §5.4.5: PoC 期 child 忽略 user_role, 统一用 default).
 		})
+		detectNanos += time.Since(_t0).Nanoseconds()
 		if resp == nil { // defensive: a nil response is treated as degraded allow
 			degraded = true
+			nilResp++
 			continue
 		}
 		// Team-routed only: collect the event the detector handed back for the
@@ -236,6 +262,7 @@ func (p *Proxy) applyInboundFilter(
 		default: // ActionAllow (incl. degraded fail-open)
 			if resp.Degraded {
 				degraded = true
+				selfDeg++
 			}
 		}
 	}
@@ -243,10 +270,26 @@ func (p *Proxy) applyInboundFilter(
 	if degraded {
 		// Hook unavailable for one or more pieces — those passed through
 		// unfiltered. Surfaced so operators see degraded detection (失败要显眼);
-		// the request is NOT failed (§6 #11 fail-open).
+		// the request is NOT failed (§6 #11 fail-open). Enriched (2026-06-13 RCA):
+		// nil_resp = pipe dead (child unreachable); self_deg = child ran but
+		// returned Degraded; hook_reason = the child's own DegradedReason; the
+		// detect latency tells timeout-vs-error apart at a glance.
 		logger.Warn("filter: hook degraded; affected content passed through unfiltered",
-			"event.name", "proxy.filter.degraded")
+			"event.name", "proxy.filter.degraded",
+			"pieces", len(pieces), "nil_resp", nilResp, "self_deg", selfDeg,
+			"detect_ms", detectNanos/1e6, "hook_reason", hook.Status().DegradedReason,
+			"body_bytes", len(bodyBytes))
 	}
+
+	// Per-request link-level trace (on-demand via AIKEY_PROXY_LOG_LEVEL=debug):
+	// the full filter decision for ONE request — pieces scanned, masked count,
+	// degrade state, and detect latency. The anomaly paths above are always WARN;
+	// this is the steady-state trace for end-to-end debugging without a rebuild.
+	logger.Debug("filter: decision",
+		"event.name", "proxy.filter.decision",
+		"pieces", len(pieces), "masked", maskedCount, "degraded", degraded,
+		"detect_ms", detectNanos/1e6, "body_bytes", len(bodyBytes),
+		"route_class", routeClass)
 
 	if maskedCount == 0 {
 		// Nothing changed — forward the original bytes verbatim.

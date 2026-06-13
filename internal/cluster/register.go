@@ -31,6 +31,12 @@ type Registrar struct {
 	serviceToken string // R1: Bearer token for the hub's gated /cluster/* endpoints
 	client       *http.Client
 	interval     time.Duration // adopted from the hub's register response
+
+	// healthFn, when set, supplies the optional `health` heartbeat field
+	// (P0-B): node-local health (daemon sync status + proxy metrics) rides
+	// the existing heartbeat so it becomes externally visible with zero new
+	// ports/auth. nil ⇒ bare heartbeat (old wire shape, hub accepts both).
+	healthFn func() map[string]any
 }
 
 // NewRegistrar builds a Registrar. weight < 1 is normalized to 1. serviceToken
@@ -50,13 +56,29 @@ func NewRegistrar(hubURL, nodeID, nodeAddr string, weight int, serviceToken stri
 	}
 }
 
+// SetHealthSource installs the health collector (see Registrar.healthFn).
+// Call before Run; the collector runs once per heartbeat/register.
+func (r *Registrar) SetHealthSource(fn func() map[string]any) { r.healthFn = fn }
+
+// withHealth adds the optional `health` field to a heartbeat/register payload.
+// The collector is transparent transport: the Registrar never interprets the
+// content, so daemon-side schema evolution needs no proxy change.
+func (r *Registrar) withHealth(payload map[string]any) map[string]any {
+	if r.healthFn != nil {
+		if h := r.healthFn(); len(h) > 0 {
+			payload["health"] = h
+		}
+	}
+	return payload
+}
+
 // register POSTs /cluster/register and adopts the hub's heartbeat interval.
 func (r *Registrar) register(ctx context.Context) error {
-	body, _ := json.Marshal(map[string]any{
+	body, _ := json.Marshal(r.withHealth(map[string]any{
 		"node_id": r.nodeID,
 		"addr":    r.nodeAddr,
 		"weight":  r.weight,
-	})
+	}))
 	resp, err := r.post(ctx, "/cluster/register", body)
 	if err != nil {
 		return err
@@ -76,7 +98,7 @@ func (r *Registrar) register(ctx context.Context) error {
 
 // heartbeat POSTs /cluster/heartbeat; returns errUnknownNode on 409.
 func (r *Registrar) heartbeat(ctx context.Context) error {
-	body, _ := json.Marshal(map[string]any{"node_id": r.nodeID})
+	body, _ := json.Marshal(r.withHealth(map[string]any{"node_id": r.nodeID}))
 	resp, err := r.post(ctx, "/cluster/heartbeat", body)
 	if err != nil {
 		return err

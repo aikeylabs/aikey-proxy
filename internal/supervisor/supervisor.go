@@ -388,6 +388,21 @@ func New(cfg *config.Config, configPath, password, version string) (*Supervisor,
 			s.cfg.Cluster.Weight,
 			s.cfg.Cluster.ServiceToken,
 		)
+		// Health piggyback (P0-B): forward the co-located cluster-daemon's
+		// status file + proxy-own metrics + usage-pipeline canary verdict on
+		// every heartbeat so node health is externally readable. Pure
+		// side-channel: collection failures degrade to a bare heartbeat,
+		// never affect the data path. The canary adapter must return an
+		// untyped nil when the probe is disabled — boxing a typed nil
+		// pointer into `any` would serialize as JSON null instead of
+		// omitting the section.
+		canaryFn := func() any {
+			if cr := s.CanaryResult(); cr != nil {
+				return cr
+			}
+			return nil
+		}
+		reg.SetHealthSource(cluster.NodeHealthSource(s.cfg.Vault.Path, s.version, time.Now(), canaryFn))
 		observability.GoSafe("supervisor.cluster_registrar", observability.Isolated, func() { reg.Run(s.ctx) })
 		slog.Info("cluster mode enabled", "node_id", s.cfg.Cluster.NodeID, "hub", s.cfg.Cluster.HubURL)
 	}

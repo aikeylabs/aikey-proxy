@@ -91,3 +91,29 @@ func collectContentField(parent map[string]any, key string, out *[]contentPiece)
 		}
 	}
 }
+
+// topLevelKeys + messageCount are diagnostic helpers for the filter dispatcher's
+// "no filterable content" skip log (proxy.filter.skipped). They expose the SHAPE
+// of a request the extractor found nothing in — the key signal when a client
+// (e.g. OpenClaw) sends a body that masks differently from a hand-rolled curl.
+// Nil-safe: parsed is nil when the body was not JSON. (2026-06-13 form-② RCA.)
+func topLevelKeys(m map[string]any) []string {
+	if m == nil {
+		return nil
+	}
+	ks := make([]string, 0, len(m))
+	for k := range m {
+		ks = append(ks, k)
+	}
+	return ks
+}
+
+func messageCount(m map[string]any) int {
+	if m == nil {
+		return 0
+	}
+	if msgs, ok := m["messages"].([]any); ok {
+		return len(msgs)
+	}
+	return 0
+}

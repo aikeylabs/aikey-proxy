@@ -286,6 +286,39 @@ func (r *Reporter) credentialForRouteSource(routeSource string) Credential {
 	return nil
 }
 
+// routeProbePriority is the deterministic order in which PrimaryRouteSource
+// picks a route to probe. "team" first: on a cluster/remote deployment it's
+// the authenticated remote pipeline most worth self-testing (and the one that
+// 401s if its credential breaks). personal/oauth follow for Personal/Trial.
+var routeProbePriority = []string{"team", "personal", "oauth"}
+
+// PrimaryRouteSource returns the RouteSource the canary should ride so its
+// synthetic probe traverses the SAME transport (URL + credential) as real
+// business traffic — instead of a synthetic "canary" route that has neither
+// (which silently 401s on any authenticated collector; see
+// 20260612-compliance-chain-audit-and-lobster-gap.md). Canary/business
+// isolation is unaffected: it lives entirely on the OrgID/VirtualKeyID
+// "__canary__" markers, which are orthogonal to route_source.
+//
+// Priority: a credentialed route first (the real remote pipeline), then any
+// configured route URL. Empty result ("" — nothing configured) makes the
+// caller fall back to the pre-existing behavior (urlForEvent → CollectorURL,
+// credentialForRouteSource → legacy CollectorToken), so this never regresses
+// a deployment that wired no routes.
+func (r *Reporter) PrimaryRouteSource() string {
+	for _, rs := range routeProbePriority {
+		if c, ok := r.cfg.CollectorRouteCredentials[rs]; ok && c != nil {
+			return rs
+		}
+	}
+	for _, rs := range routeProbePriority {
+		if u, ok := r.cfg.CollectorRoutes[rs]; ok && u != "" {
+			return rs
+		}
+	}
+	return ""
+}
+
 // Report records a reportable event. In the WAL-as-outbox model this only
 // appends to the WAL (the durable upload source) and wakes the upload loop;
 // there is no in-memory queue and thus no "queue full" drop — the WAL itself is

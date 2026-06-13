@@ -162,7 +162,17 @@ func (p *CanaryProbe) probe() {
 	sentAt := time.Now()
 	sentAtMs := aikeytime.FromTime(sentAt)
 
-	// Send canary event through the normal Reporter channel.
+	// Ride the deployment's real upload route so the probe exercises the SAME
+	// transport (URL + credential) as business traffic. A synthetic
+	// RouteSource="canary" has no route/credential mapping, so on an
+	// authenticated (cluster) collector every probe 401'd into the dead-letter
+	// queue forever — the pipeline's own self-test couldn't authenticate, which
+	// both flooded logs and made the health signal permanently red regardless of
+	// real pipeline health. The canary/business split does NOT depend on
+	// route_source: it's carried entirely by the OrgID/VirtualKeyID "__canary__"
+	// markers (seq alloc, watermarks, projector, diagnostics all key on those).
+	// Empty routeSource (no routes configured) reproduces the legacy fall-through
+	// to CollectorURL. See 20260612-compliance-chain-audit-and-lobster-gap.md.
 	ev := ReportableEvent{
 		EventID:       eventID,
 		SchemaVersion: 1,
@@ -172,7 +182,7 @@ func (p *CanaryProbe) probe() {
 		VirtualKeyID:  "__canary__",
 		RequestCount:  1,
 		RequestStatus: "success",
-		RouteSource:   "canary",
+		RouteSource:   p.reporter.PrimaryRouteSource(),
 	}
 	// Set total_tokens to 1 to minimize data pollution.
 	one := int64(1)

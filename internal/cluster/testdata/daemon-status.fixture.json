@@ -1,0 +1,11 @@
+{
+  "schema": 1,
+  "status": "CRIT",
+  "started_at": 1717990000,
+  "consecutive_failures": 86,
+  "written_at": 1718000005,
+  "last_sync_ok_at": 1718000000,
+  "last_error": "fetch org snapshot: connection refused",
+  "applied_vk_count": 42,
+  "snapshot_revision": "r1083"
+}
