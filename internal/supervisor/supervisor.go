@@ -278,6 +278,14 @@ type Supervisor struct {
 	// governs when this is false. Polled by pollComplianceMasterPolicy.
 	masterCompliance atomic.Bool
 
+	// convAuditEnabled / convAuditMaxBytes: org-level conversation-audit capture
+	// switch + per-turn content cap, polled from the control backend by
+	// pollConversationAuditPolicy (mirrors masterCompliance, v1.0.1-alpha.2).
+	// Default OFF. The forward-path capture hook reads these atomics per request —
+	// a flip needs NO spawn/Reload (unlike compliance), it just gates capture.
+	convAuditEnabled  atomic.Bool
+	convAuditMaxBytes atomic.Int64
+
 	// Enterprise quota (Phase 2 Stage 2 — design §0.5/§5.2). Snapshot + counter
 	// live on the supervisor (not per-generation) so the counter accumulates
 	// continuously across 5s syncs and /admin/reload; the snapshot is gen-swapped
@@ -374,6 +382,12 @@ func New(cfg *config.Config, configPath, password, version string) (*Supervisor,
 	// compliance from the control backend (force-spawn the detector regardless of
 	// the user's local toggle). No-op when no team/org is configured (Personal).
 	observability.GoSafe("supervisor.compliance_policy_poll", observability.Isolated, func() { s.pollComplianceMasterPolicy(s.ctx) })
+
+	// Conversation audit (v1.0.1-alpha.2): poll the org-level capture switch so an
+	// enterprise can turn employee conversation capture on from the control backend.
+	// No-op when no team/org (Personal). A flip just gates the forward-path capture
+	// hook (reads the atomic) — no detector to spawn, unlike compliance.
+	observability.GoSafe("supervisor.conversation_audit_policy_poll", observability.Isolated, func() { s.pollConversationAuditPolicy(s.ctx) })
 
 	// Cluster mode (V3c): register this node with the hub name service + heartbeat
 	// so clients discover it via /cluster/resolve. Inert for non-cluster proxies —
