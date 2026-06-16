@@ -211,3 +211,47 @@ func TestCanaryUnavailableStreakResetsOnRealOutcome(t *testing.T) {
 		t.Fatalf("real failed outcome should increment pipeline streak; consecutiveFailures=%d", p.consecutiveFailures)
 	}
 }
+
+// TestCanaryChecksRouteCollectorNotFixedDiagnostics is the regression guard for
+// 2026-06-15-form1-cluster-member-canary-false-ingest-warn.md. Once `aikey login`
+// wires a remote team route, the canary event uploads to the cluster collector,
+// so the arrival check MUST query that same collector — not the fixed local
+// DiagnosticsURL. Before the fix the canary checked DiagnosticsURL (local), got
+// ods_received=false, and reported a permanent false failed_stage=ingest on every
+// form-① (cluster employee, local mode) machine.
+func TestCanaryChecksRouteCollectorNotFixedDiagnostics(t *testing.T) {
+	// The fixed local DiagnosticsURL would say "never arrived".
+	local := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"ods_received":false,"dwd_projected":false}`))
+	}))
+	defer local.Close()
+	// The team route's real collector (cluster) has the event.
+	cluster := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"ods_received":true,"dwd_projected":true}`))
+	}))
+	defer cluster.Close()
+
+	// Reporter with a remote team route (what `aikey login --control-url` wires).
+	r, err := NewReporter(ReporterConfig{
+		WALDir:          t.TempDir(),
+		UploadInterval:  time.Hour,
+		CollectorRoutes: map[string]string{"team": cluster.URL},
+	})
+	if err != nil {
+		t.Fatalf("NewReporter: %v", err)
+	}
+	t.Cleanup(func() { _ = r.Close() })
+
+	// cfg.DiagnosticsURL deliberately points at the WRONG (local) collector: the
+	// fix must ignore it in favor of the team route's real upload URL.
+	p := newProbeNoLoop(r, local.URL)
+
+	p.probe()
+	if got := p.LastResult(); got.Status != "ok" {
+		t.Fatalf("canary checked the wrong collector: status=%q failed_stage=%q; want ok "+
+			"(must follow team route to %s, not fixed DiagnosticsURL %s)",
+			got.Status, got.FailedStage, cluster.URL, local.URL)
+	}
+}

@@ -173,6 +173,7 @@ func (p *CanaryProbe) probe() {
 	// markers (seq alloc, watermarks, projector, diagnostics all key on those).
 	// Empty routeSource (no routes configured) reproduces the legacy fall-through
 	// to CollectorURL. See 20260612-compliance-chain-audit-and-lobster-gap.md.
+	routeSource := p.reporter.PrimaryRouteSource()
 	ev := ReportableEvent{
 		EventID:       eventID,
 		SchemaVersion: 1,
@@ -182,7 +183,7 @@ func (p *CanaryProbe) probe() {
 		VirtualKeyID:  "__canary__",
 		RequestCount:  1,
 		RequestStatus: "success",
-		RouteSource:   p.reporter.PrimaryRouteSource(),
+		RouteSource:   routeSource,
 	}
 	// Set total_tokens to 1 to minimize data pollution.
 	one := int64(1)
@@ -197,8 +198,22 @@ func (p *CanaryProbe) probe() {
 		return
 	}
 
+	// Verify arrival at the SAME collector the event uploaded to. Until
+	// 2026-06-15 checkArrival hit a fixed cfg.DiagnosticsURL (the local
+	// collector). But probe() rides PrimaryRouteSource, so once `aikey login`
+	// wires a remote team route the event uploads to the cluster collector while
+	// the check still queried the local URL → ods_received=false → a permanent
+	// FALSE failed_stage=ingest on every form-① (cluster employee, local mode)
+	// machine. Follow the route's real upload URL; fall back to DiagnosticsURL
+	// only when no route is configured (pure personal). See
+	// 2026-06-15-form1-cluster-member-canary-false-ingest-warn.md.
+	diagBase := p.reporter.URLForRouteSource(routeSource)
+	if diagBase == "" {
+		diagBase = p.cfg.DiagnosticsURL
+	}
+
 	// Check arrival at each stage via the diagnostics endpoint.
-	result := p.checkArrival(eventID, sentAt)
+	result := p.checkArrival(eventID, sentAt, diagBase)
 
 	p.mu.Lock()
 	if result.Status == "ok" {
@@ -222,14 +237,14 @@ func (p *CanaryProbe) probe() {
 		p.consecutiveUnavailable++
 		if p.consecutiveUnavailable == 1 {
 			slog.Info("canary probe: diagnostics endpoint not available, probe results limited to reporter metrics",
-				"diagnostics_url", p.cfg.DiagnosticsURL)
+				"diagnostics_url", diagBase)
 		}
 		if p.consecutiveUnavailable >= unavailableEscalateThreshold && !p.unavailableEscalated {
 			p.unavailableEscalated = true
 			slog.Warn("canary probe: diagnostics endpoint unavailable for a sustained period — likely misconfigured DiagnosticsURL or wrong/old collector binary",
 				"event.name", "usage.canary.diagnostics_unavailable_sustained",
 				"error.code", "CANARY_DIAGNOSTICS_UNREACHABLE",
-				"diagnostics_url", p.cfg.DiagnosticsURL,
+				"diagnostics_url", diagBase,
 				"failed_stage", result.FailedStage,
 				"consecutive_unavailable", p.consecutiveUnavailable)
 		}
@@ -253,13 +268,13 @@ func (p *CanaryProbe) probe() {
 	p.mu.Unlock()
 }
 
-func (p *CanaryProbe) checkArrival(eventID string, sentAt time.Time) CanaryResult {
+func (p *CanaryProbe) checkArrival(eventID string, sentAt time.Time, diagnosticsBaseURL string) CanaryResult {
 	result := CanaryResult{
 		EventID: eventID,
 		SentAt:  aikeytime.FromTime(sentAt),
 	}
 
-	url := fmt.Sprintf("%s/internal/canary-check?event_id=%s", p.cfg.DiagnosticsURL, eventID)
+	url := fmt.Sprintf("%s/internal/canary-check?event_id=%s", diagnosticsBaseURL, eventID)
 	// Background ctx: canary is a long-lived self-test goroutine with no
 	// upstream request to inherit from; http.Client.Timeout (10s) bounds it.
 	req, reqErr := http.NewRequestWithContext(context.Background(), "GET", url, nil)

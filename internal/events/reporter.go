@@ -268,6 +268,16 @@ func (r *Reporter) urlForRouteSource(routeSource string) string {
 	return r.cfg.CollectorURL
 }
 
+// URLForRouteSource exposes urlForRouteSource so the canary probe can verify
+// arrival at the SAME collector an event with this RouteSource uploaded to.
+// Without it the canary checked a fixed DiagnosticsURL (the local collector)
+// while the event rode a remote team route to the cluster collector → a
+// permanent false failed_stage=ingest on form-① (cluster employee, local mode).
+// 2026-06-15. See 2026-06-15-form1-cluster-member-canary-false-ingest-warn.md.
+func (r *Reporter) URLForRouteSource(routeSource string) string {
+	return r.urlForRouteSource(routeSource)
+}
+
 // credentialForRouteSource returns the bearer source for uploads tied
 // to this RouteSource. Per-route credentials win; falls back to the
 // legacy global CollectorToken wrapped in a StaticTokenCredential.
