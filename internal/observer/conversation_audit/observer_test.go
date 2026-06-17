@@ -256,3 +256,59 @@ func TestObserver_CapsTextToMaxBytes(t *testing.T) {
 		t.Fatalf("capped user text %q is not a prefix of the original", r.UserText)
 	}
 }
+
+// TestObserver_SkipsProbeStream: aikey's own connectivity self-tests
+// (X-Aikey-Probe → StreamProbe at the NotifyStart boundary) and /probe/<alias>/
+// pipeline traffic are NOT employee conversations and must not be recorded —
+// mirrors the usage path's `if isAikeyProbe(req) { return }` bypass. Without
+// this, every `aikey use`/login connectivity check would add an empty "hi" turn
+// that inflates a seat's session/turn counts in the audit.
+func TestObserver_SkipsProbeStream(t *testing.T) {
+	enabled := true
+	o, sink := newTestObserver(&enabled, 0)
+	req := &observer.RequestContext{
+		ProtocolFamily: protoAnthropic,
+		// the literal connectivity probe body: "hi" + max_tokens:1
+		RequestBody:    []byte(`{"model":"claude-haiku-4-5-20251001","max_tokens":1,"messages":[{"role":"user","content":"hi"}]}`),
+		TraceID:        "t-probe",
+		OrgID:          "org-1",
+		ProviderID:     "anthropic",
+		Stream:         observer.StreamProbe,
+		StartedAt:      time.Unix(1_700_000_000, 0),
+	}
+	o.OnRequestStart(context.Background(), req)
+	o.OnSSEEvent(context.Background(), req, "content_block_delta",
+		[]byte(`{"type":"content_block_delta","delta":{"type":"text_delta","text":"hi"}}`))
+	o.OnRequestEnd(context.Background(), req, 10)
+
+	if len(sink.recs) != 0 {
+		t.Fatalf("submitted %d records for a probe; want 0 (probes must not be audited)", len(sink.recs))
+	}
+	if _, ok := o.states.Load("t-probe"); ok {
+		t.Fatalf("probe left a dangling turnState; OnRequestStart must not store one for StreamProbe")
+	}
+}
+
+// TestObserver_RecordsUserChatStream is the contrast guard: a normal
+// StreamUserChat turn IS recorded, so the probe skip can't over-match real chat.
+func TestObserver_RecordsUserChatStream(t *testing.T) {
+	enabled := true
+	o, sink := newTestObserver(&enabled, 0)
+	req := &observer.RequestContext{
+		ProtocolFamily: protoAnthropic,
+		RequestBody:    anthropicReqBody(),
+		TraceID:        "t-userchat",
+		OrgID:          "org-1",
+		ProviderID:     "anthropic",
+		Stream:         observer.StreamUserChat,
+		StartedAt:      time.Unix(1_700_000_000, 0),
+	}
+	o.OnRequestStart(context.Background(), req)
+	o.OnSSEEvent(context.Background(), req, "content_block_delta",
+		[]byte(`{"type":"content_block_delta","delta":{"type":"text_delta","text":"Hi"}}`))
+	o.OnSSEEvent(context.Background(), req, "message_stop", []byte(`{"type":"message_stop"}`))
+	o.OnRequestEnd(context.Background(), req, 10)
+	if len(sink.recs) != 1 {
+		t.Fatalf("submitted %d records for user_chat; want 1 (real chat must still record)", len(sink.recs))
+	}
+}

@@ -119,6 +119,16 @@ func (p *Proxy) serveRouteWithObserver(
 		}
 		route.ObserverContext = obsReqCtx
 		route.ObserverRegistry = p.observerRegistry
+		// Probe traffic (X-Aikey-Probe header — e.g. the CLI connectivity self-test
+		// in aikey-cli/src/connectivity, which POSTs "hi" max_tokens=1 to the normal
+		// /v1/messages URL) is surfaced to observers as StreamProbe, mirroring the
+		// usage path's isAikeyProbe bypass (events_and_helpers.go). Without this it
+		// arrives as StreamUserChat (it uses the chat URL, not /probe/), so the
+		// conversation-audit observer would record every self-test as an empty "hi"
+		// turn — inflating a seat's session/turn counts with non-conversations.
+		if isAikeyProbe(r) {
+			stream = observer.StreamProbe
+		}
 		p.observerRegistry.NotifyStart(r.Context(), stream, obsReqCtx)
 	}
 

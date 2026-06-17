@@ -150,6 +150,15 @@ func (o *Observer) OnRequestStart(_ context.Context, req *observer.RequestContex
 	if !o.enabled() || req == nil {
 		return
 	}
+	// Skip probe traffic. aikey's own connectivity self-tests (X-Aikey-Probe,
+	// mapped to StreamProbe at the NotifyStart boundary) and /probe/<alias>/
+	// pipeline traffic are not employee conversations — recording them adds an
+	// empty "hi" turn that inflates a seat's session/turn counts. Mirrors the
+	// usage path's `if isAikeyProbe(req) { return }` bypass. No turnState is
+	// stored, so the matching OnSSEEvent / OnRequestEnd no-op on the TraceID.
+	if req.Stream == observer.StreamProbe {
+		return
+	}
 	st := &turnState{tokenAcc: provider.NewStreamAccumulatorForFamily(req.ProtocolFamily)}
 	st.cacheEnabled = detectCacheEnabled(req.RequestBody)
 	if len(req.RequestBody) > 0 {

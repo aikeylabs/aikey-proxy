@@ -58,7 +58,12 @@ func (s *Supervisor) pollConversationAuditPolicy(ctx context.Context) {
 
 func (s *Supervisor) syncConversationAuditPolicy(ctx context.Context) {
 	masterURL := readControlPanelURL()
-	orgID := complianceOrgID() // same node-follows-the-org resolution as compliance
+	// resolveTeamOrgID() — env → active team VK org → "" (defined in
+	// compliance_policy.go, shared by both team-mandate polls). NOT the old hardcoded
+	// "default" placeholder, which made a form-① employee's local proxy (no
+	// AIKEY_HUB_ORG_ID env) poll the WRONG org → audit never enabled → conversations
+	// silently uncaptured while usage (not gated on this) reported fine. Bugfix 2026-06-17.
+	orgID := s.resolveTeamOrgID()
 	if masterURL == "" || orgID == "" {
 		return // no team / no org → capture stays off (Personal)
 	}

@@ -328,6 +328,12 @@ type Supervisor struct {
 	// adds NO periodic server call (offline-first preserved). The 5s sync copies its
 	// LastOKAt into the snapshot for budgetStale.
 	quotaHeartbeat *heartbeat.Probe
+	// lastQuotaSig is the signature of the last quota policy this node pulled from
+	// the master (C′ 2026-06-17). pollQuotaPolicy uses it to write quota_rules_cache
+	// + Reload ONLY when the policy actually changed — so an admin's limit edit
+	// takes effect within the 60s poll WITHOUT the employee running any command,
+	// and steady state adds no churn. Mirrors lastFilterSig / masterCompliance.
+	lastQuotaSig atomic.Pointer[string]
 
 	// ctx / cancel bound the lifetime of all detached upstream calls.
 	// Canceled in Shutdown() to stop any in-flight upstream requests.
@@ -409,6 +415,13 @@ func New(cfg *config.Config, configPath, password, version string) (*Supervisor,
 	// No-op when no team/org (Personal). A flip just gates the forward-path capture
 	// hook (reads the atomic) — no detector to spawn, unlike compliance.
 	observability.GoSafe("supervisor.conversation_audit_policy_poll", observability.Isolated, func() { s.pollConversationAuditPolicy(s.ctx) })
+
+	// C′ (2026-06-17): poll the org's quota policy so an admin's limit edit on the
+	// master takes effect on this node within 60s WITHOUT the employee running any
+	// aikey command. Quota is the last org policy that was CLI-sync-only; this puts
+	// it on the same master-poll rail as compliance/audit. No-op when no team/org
+	// or no active seats (Personal), or when quota is disabled.
+	observability.GoSafe("supervisor.quota_policy_poll", observability.Isolated, func() { s.pollQuotaPolicy(s.ctx) })
 
 	// Cluster mode (V3c): register this node with the hub name service + heartbeat
 	// so clients discover it via /cluster/resolve. Inert for non-cluster proxies —

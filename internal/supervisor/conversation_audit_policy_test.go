@@ -5,6 +5,8 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"testing"
+
+	"github.com/AiKeyLabs/aikey-proxy/internal/vault"
 )
 
 func TestFetchConversationAuditPolicy(t *testing.T) {
@@ -50,5 +52,24 @@ func TestConversationAuditEnabled_AtomicGate(t *testing.T) {
 	s.convAuditMaxBytes.Store(999)
 	if !s.ConversationAuditEnabled() || s.ConversationAuditMaxBytes() != 999 {
 		t.Fatalf("after store: enabled=%v max=%d want true/999", s.ConversationAuditEnabled(), s.ConversationAuditMaxBytes())
+	}
+}
+
+// TestResolveTeamOrgIDFromKeys pins the form-① fix (2026-06-17): env wins; else the
+// active team VK's real org (the bug — it used to stop at the hardcoded "default"
+// placeholder); else "" so a true Personal proxy stays off.
+func TestResolveTeamOrgIDFromKeys(t *testing.T) {
+	// 1. AIKEY_HUB_ORG_ID env wins (cluster node) even if a team key is present.
+	if got := resolveTeamOrgIDFromKeys("env-org", []vault.ManagedKey{{OrgID: "key-org"}}); got != "env-org" {
+		t.Fatalf("env org must win, got %q", got)
+	}
+	// 2. No env → first team key with a non-empty org (form-① employee proxy). This
+	// is the case complianceOrgID() got wrong (returned "default").
+	if got := resolveTeamOrgIDFromKeys("", []vault.ManagedKey{{OrgID: ""}, {OrgID: "1ba04240-org"}}); got != "1ba04240-org" {
+		t.Fatalf("no env → first team-key org, got %q", got)
+	}
+	// 3. No env, no team key → "" (true Personal → poll early-returns, capture off).
+	if got := resolveTeamOrgIDFromKeys("", nil); got != "" {
+		t.Fatalf("no team/org → empty (capture stays off), got %q", got)
 	}
 }

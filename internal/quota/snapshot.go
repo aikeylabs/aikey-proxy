@@ -214,7 +214,8 @@ func (s *Snapshot) Len() int {
 }
 
 // LoadSubjects reads the cached quota rules from the vault DB's quota_rules_cache
-// table (written by the CLI from the control delivery snapshot — design
+// table (written by the CLI from the control delivery snapshot, AND by the proxy's
+// 60s quota policy poll since C′ 2026-06-17 — see policy_write.go — design
 // §0.5/§5.2). Tolerant by design: a missing table (a vault not yet carrying the
 // Phase 2 schema) returns an empty slice, not an error, so quota degrades to "no
 // rules" rather than disturbing the proxy's vault-sync loop.

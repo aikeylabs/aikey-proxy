@@ -38,21 +38,42 @@ const (
 
 var complianceHTTPClient = &http.Client{Timeout: 10 * time.Second}
 
-// defaultComplianceOrgID is a fixed single-tenant placeholder. Resolving WHICH
-// org a node follows (from env / login seat) was error-prone, so for now the
-// node always follows THE org: it sends this constant and the master's policy
-// endpoint resolves its one org (ignoring the value). Multi-tenant per-user
-// resolution is a future extension — swap this for a real lookup then.
-const defaultComplianceOrgID = "default"
-
-// complianceOrgID returns the org this node follows. AIKEY_HUB_ORG_ID still
-// overrides (cluster); otherwise the fixed placeholder drives the poll so a
-// master-connected node always follows the org mandate.
-func complianceOrgID() string {
-	if v := os.Getenv("AIKEY_HUB_ORG_ID"); v != "" {
-		return v
+// resolveTeamOrgID returns the org this node's team mandates follow — BOTH the
+// compliance master policy (this file) AND the conversation-audit capture switch
+// (conversation_audit_policy.go) poll with it. Priority:
+//   1. AIKEY_HUB_ORG_ID env — a CLUSTER node's fixed org (cluster-node.env).
+//   2. The org_id of the active TEAM managed key — a form-① employee's Personal-
+//      style proxy has NO such env; its team VK (`aikey use <VK>`) carries the org.
+//   3. "" — true Personal (no team key, no env) → caller early-returns, no mandate.
+//
+// Replaces the old hardcoded "default" placeholder, which made a form-① employee's
+// local proxy poll the WRONG org → mandate never applied (audit silently never
+// captured; compliance silently never enforced) while usage (not gated on this)
+// reported fine. The active team VK is the same source route resolution already
+// uses (managedKeyToRoute → mk.OrgID), so this introduces no new source of truth.
+// Bugfix 2026-06-17 (conversation-audit) extended to compliance same day.
+func (s *Supervisor) resolveTeamOrgID() string {
+	envOrg := os.Getenv("AIKEY_HUB_ORG_ID")
+	var mks []vault.ManagedKey
+	if gen := s.active.Load(); gen != nil && gen.vault != nil {
+		mks, _ = gen.vault.GetActiveManagedKeys()
 	}
-	return defaultComplianceOrgID
+	return resolveTeamOrgIDFromKeys(envOrg, mks)
+}
+
+// resolveTeamOrgIDFromKeys is the pure resolution (env wins; else the first team
+// key with a non-empty org; else ""), split out so it is unit-testable without a
+// live vault/generation.
+func resolveTeamOrgIDFromKeys(envOrg string, mks []vault.ManagedKey) string {
+	if envOrg != "" {
+		return envOrg
+	}
+	for _, mk := range mks {
+		if mk.OrgID != "" {
+			return mk.OrgID
+		}
+	}
+	return ""
 }
 
 // pollComplianceMasterPolicy runs until ctx is cancelled, refreshing the org
@@ -73,7 +94,7 @@ func (s *Supervisor) pollComplianceMasterPolicy(ctx context.Context) {
 
 func (s *Supervisor) syncComplianceMasterPolicy(ctx context.Context) {
 	masterURL := readControlPanelURL()
-	orgID := complianceOrgID()
+	orgID := s.resolveTeamOrgID() // env → active team VK org → "" (no longer a "default" placeholder)
 	if masterURL == "" || orgID == "" {
 		return // no team / no org → no mandate; local toggle governs (Personal)
 	}
