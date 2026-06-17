@@ -1,6 +1,7 @@
 package conversation_audit
 
 import (
+	"bytes"
 	"context"
 	"log/slog"
 	"strings"
@@ -57,6 +58,13 @@ type ConversationRecord struct {
 	ReasoningTokens          *int64 `json:"reasoning_tokens,omitempty"`
 	TotalTokens              *int64 `json:"total_tokens,omitempty"`
 
+	// CacheEnabled (decision B): did the client REQUEST prompt caching this turn
+	// (request body carried a cache_control directive)? 1=on, 0=off, nil=couldn't
+	// tell (request body not buffered). Distinct from the cache COUNTS above, which
+	// read 0 both when caching was off AND when it was requested but ineffective —
+	// so the audit drawer can show an explicit caching ON/OFF switch.
+	CacheEnabled *int64 `json:"cache_enabled,omitempty"`
+
 	DurationMs    *int64 `json:"duration_ms,omitempty"`
 	RequestStatus string `json:"request_status"`
 	ContentBytes  *int64 `json:"content_bytes,omitempty"`
@@ -110,8 +118,11 @@ type turnState struct {
 	// arrive (same frames fed to assistant text). nil for families without an
 	// incremental extractor (e.g. gemini) — those turns capture no tokens.
 	tokenAcc provider.StreamAccumulator
-	sawDone  bool
-	sawFrame bool
+	// cacheEnabled (decision B): whether this turn's request asked for prompt
+	// caching (detected from the request body in OnRequestStart). nil = no body.
+	cacheEnabled *int64
+	sawDone      bool
+	sawFrame     bool
 }
 
 // New builds the observer. Returns a typed *Observer (registration.go adapts it
@@ -140,6 +151,7 @@ func (o *Observer) OnRequestStart(_ context.Context, req *observer.RequestContex
 		return
 	}
 	st := &turnState{tokenAcc: provider.NewStreamAccumulatorForFamily(req.ProtocolFamily)}
+	st.cacheEnabled = detectCacheEnabled(req.RequestBody)
 	if len(req.RequestBody) > 0 {
 		// Parse-once: prompt + system + model from a single Unmarshal (see
 		// extractPrompt) — never re-parse the body for model separately.
@@ -230,9 +242,29 @@ func (o *Observer) OnRequestEnd(_ context.Context, req *observer.RequestContext,
 	if st.tokenAcc != nil {
 		stampTokens(rec, st.tokenAcc.Result())
 	}
+	rec.CacheEnabled = st.cacheEnabled
 	if o.cfg.Sink != nil {
 		o.cfg.Sink.Submit(rec)
 	}
+}
+
+// detectCacheEnabled reports whether the request asked for prompt caching this
+// turn, from the buffered request body: 1 when it carries a `cache_control`
+// directive (Anthropic prompt-caching — the only provider with a client-side
+// caching opt-in; OpenAI/Gemini caching is automatic so their bodies never carry
+// it and correctly read 0), 0 when a body was seen without it, nil when no body
+// was buffered (can't tell). A byte-substring check on the JSON key is enough —
+// no full re-parse — and is the request-side analogue of the per-turn token
+// snapshot. Decision B (2026-06-17).
+func detectCacheEnabled(body []byte) *int64 {
+	if len(body) == 0 {
+		return nil // body not buffered → unknown (kept NULL, not a false "off")
+	}
+	var v int64
+	if bytes.Contains(body, []byte(`"cache_control"`)) {
+		v = 1
+	}
+	return &v
 }
 
 // stampTokens copies the accumulated breakdown onto the record as a per-turn

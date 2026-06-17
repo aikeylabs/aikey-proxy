@@ -170,6 +170,39 @@ func TestObserver_NoUsageFrameLeavesTokensNull(t *testing.T) {
 	}
 }
 
+// TestObserver_CacheEnabledFromRequestBody asserts the decision-B caching ON/OFF
+// switch: detected from the request body's cache_control directive, 0 when absent.
+func TestObserver_CacheEnabledFromRequestBody(t *testing.T) {
+	enabled := true
+
+	// No cache_control in the body → off (0), not NULL (a body WAS seen).
+	o, sink := newTestObserver(&enabled, 0)
+	driveAnthropicTurn(o, "t-nocache", true) // anthropicReqBody() has no cache_control
+	if r := sink.recs[0]; r.CacheEnabled == nil || *r.CacheEnabled != 0 {
+		t.Fatalf("no cache_control → CacheEnabled want 0, got %v", r.CacheEnabled)
+	}
+
+	// cache_control present (Anthropic prompt caching) → on (1).
+	o2, sink2 := newTestObserver(&enabled, 0)
+	req := &observer.RequestContext{
+		ProtocolFamily: protoAnthropic,
+		RequestBody:    []byte(`{"model":"claude-x","system":[{"type":"text","text":"sys","cache_control":{"type":"ephemeral"}}],"messages":[{"role":"user","content":"hi"}]}`),
+		TraceID:        "t-cache",
+		OrgID:          "org-1",
+		OwnerAccountID: "acct-7",
+		SessionID:      "sess-9",
+		ProviderID:     "anthropic",
+		StartedAt:      time.Unix(1_700_000_000, 0),
+	}
+	o2.OnRequestStart(context.Background(), req)
+	o2.OnSSEEvent(context.Background(), req, "content_block_delta",
+		[]byte(`{"type":"content_block_delta","delta":{"type":"text_delta","text":"hi"}}`))
+	o2.OnRequestEnd(context.Background(), req, 10)
+	if r := sink2.recs[0]; r.CacheEnabled == nil || *r.CacheEnabled != 1 {
+		t.Fatalf("cache_control present → CacheEnabled want 1, got %v", r.CacheEnabled)
+	}
+}
+
 func TestObserver_PartialWhenNoCompletionMarker(t *testing.T) {
 	enabled := true
 	o, sink := newTestObserver(&enabled, 0)
