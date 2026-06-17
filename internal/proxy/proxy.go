@@ -160,7 +160,20 @@ type Proxy struct {
 	// scan, never silently under-scanning. Default false (full scan); the
 	// form-② lobster install opts in (AIKEY_PROXY_FILTER_INCREMENTAL_SCAN=1).
 	// RCA: 2026-06-13 form-② filter-degrade (NER/CRF size-linear cost).
+	//
+	// DEPRECATED 2026-06-16 (history-leak fix): the "latest-user-turn-only" premise
+	// is false in multi-turn conversations — the user's earlier sensitive message
+	// stays in HISTORY and is resent verbatim every turn, which incremental never
+	// re-scans → forwarded unmasked. applyInboundFilter no longer reads this field;
+	// it always full-scans (+ optional content-hash cache below). Field/setter/env
+	// retained only until the systemd units drop AIKEY_PROXY_FILTER_INCREMENTAL_SCAN.
 	filterIncremental bool
+
+	// filterCache memoizes per-piece scan verdicts so the full-scan path doesn't
+	// re-scan unchanged history every turn (设计 20260616-…-内容哈希缓存 §4). nil =
+	// cache OFF (dispatcher skips the content-hash entirely → stateless full scan).
+	// Lives behind the hook==nil gate, so compliance OFF pays nothing (INV-6).
+	filterCache MaskCache
 
 	// Configurable slow-request thresholds (milliseconds).
 	SlowRequestMs     int64
@@ -318,6 +331,29 @@ func (p *Proxy) SetFilterHook(h apphook.Hook) {
 // from AIKEY_PROXY_FILTER_INCREMENTAL_SCAN. Default (unset) = full scan.
 func (p *Proxy) SetFilterIncrementalScan(on bool) {
 	p.filterIncremental = on
+}
+
+// SetFilterCache installs (or clears, with nil) the per-piece content-hash cache
+// used by the inbound filter. nil = cache OFF (dispatcher does no hashing →
+// stateless full scan). Pluggable: the supervisor wires an lruMaskCache when
+// AIKEY_PROXY_FILTER_CACHE is enabled. See filter_cache.go + 设计 §4.
+func (p *Proxy) SetFilterCache(c MaskCache) {
+	p.filterCache = c
+}
+
+// SetFilterCacheEnabled turns the inbound-filter content-hash cache on/off with
+// the default LRU+TTL. on=false clears it (→ stateless full scan, INV-6). The
+// supervisor calls this from AIKEY_PROXY_FILTER_CACHE; tests inject a custom cache
+// via SetFilterCache instead.
+func (p *Proxy) SetFilterCacheEnabled(on bool, window int) {
+	if on {
+		if window < 1 {
+			window = defaultMaskCacheWindow
+		}
+		p.filterCache = newSessionMaskCache(defaultMaxSessions, window, defaultMaskCacheTTL)
+	} else {
+		p.filterCache = nil
+	}
 }
 
 // FilterHook returns the installed filter dispatcher hook (nil if none).

@@ -108,3 +108,16 @@ func TestInstallFilterHook_SpawnFailure_FailsLoud(t *testing.T) {
 // (The vault-declared-but-no-binary outcome consults a *vault.Reader and is
 // covered by the integration-level buildGeneration tests, not here — building
 // a real vault Reader for a unit test would only re-exercise vault code.)
+
+// Cluster regression (2026-06-17): a cluster node has no Personal config.json;
+// its control URL comes from AIKEY_HUB_CONTROL_URL (cluster-node.env), like
+// complianceOrgID()'s AIKEY_HUB_ORG_ID. readControlPanelURL() must honor that
+// env (trailing slash trimmed), else the conversation-audit + compliance
+// master-policy polls early-return on cluster nodes and capture never turns on.
+// Bugfix: workflow/CI/bugfix/2026-06-17-conversation-audit-cluster-control-url-env.md
+func TestReadControlPanelURL_ClusterEnvFallback(t *testing.T) {
+	t.Setenv("AIKEY_HUB_CONTROL_URL", "http://10.0.0.89:8080/")
+	if got := readControlPanelURL(); got != "http://10.0.0.89:8080" {
+		t.Fatalf("cluster AIKEY_HUB_CONTROL_URL env not honored (trailing-slash-trimmed): got %q", got)
+	}
+}

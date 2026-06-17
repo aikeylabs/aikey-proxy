@@ -35,6 +35,16 @@ const (
 	// otherwise wrote a permanent stale value that all later connectivity
 	// probes inherited.
 	ctxKeyCodexCandidateModel
+	// ctxKeyExtractedModel caches the body.model parsed by the FIRST
+	// extractModel call this request, so the 2-3 later calls (model allowlist
+	// check, inbound filter, usage stash) reuse it instead of re-reading +
+	// re-unmarshaling r.Body. Keyed on the context — NOT the x-aikey-model
+	// header — on purpose: the header is client-spoofable, and short-circuiting
+	// on a client-injected value would bypass the model allowlist. The first
+	// call always parses the real body (overwriting any injected header via
+	// stashExtractedFields), so the security-critical first read is never
+	// skipped; only repeat calls hit this cache.
+	ctxKeyExtractedModel
 )
 
 // traceFromContext retrieves the request's TraceContext. Returns the zero value
@@ -94,8 +104,8 @@ func isAikeyProbe(r *http.Request) bool {
 // the namespace-authority design forbids.
 //
 // Headers checked (in order):
-//   1. Authorization: Bearer <token>
-//   2. x-api-key: <token>
+//  1. Authorization: Bearer <token>
+//  2. x-api-key: <token>
 func extractVirtualKey(req *http.Request) string {
 	// Check Authorization: Bearer <token> (OpenAI-style)
 	if auth := req.Header.Get("Authorization"); auth != "" {
@@ -121,8 +131,9 @@ func extractVirtualKey(req *http.Request) string {
 // extractRawAuthValue extracts the raw API key/token value from request headers,
 // regardless of prefix.  Returns "" if no auth header is present.
 // Used by path-prefix routing for two-phase auth handling:
-//   1. Any aikey_* prefix → namespace-authority dispatch (see ClassifyToken)
-//   2. Anything else (incl. native provider tokens from CLI tools) → fallback to default binding
+//  1. Any aikey_* prefix → namespace-authority dispatch (see ClassifyToken)
+//  2. Anything else (incl. native provider tokens from CLI tools) → fallback to default binding
+//
 // Why non-aikey_-namespace tokens are NOT rejected: CLI tools (claude, cursor, openai) send their own
 // auth headers through the proxy; the binding logic replaces them with the real key.
 func extractRawAuthValue(req *http.Request) string {

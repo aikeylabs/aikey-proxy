@@ -21,7 +21,7 @@ INSTALL_DIR ?= $(HOME)/.aikey/bin
 GOWORK     ?= $(shell cd .. && pwd)/go.work
 export GOWORK
 
-.PHONY: build test run install uninstall restart clean lint cross-compile sync-fingerprint chaos-gap7 chaos-gap8 chaos
+.PHONY: build test run install uninstall restart clean lint cross-compile sync-fingerprint chaos-gap7 chaos-gap8 chaos filter-integration
 
 # v4.3 (2026-05-01): aikey-cli/data/provider_fingerprint.yaml is the single
 # source of truth for provider routing. The pkg/providerroutes Go package
@@ -64,6 +64,14 @@ chaos: chaos-gap7 chaos-gap8 ## chaos: run all proxy chaos experiments
 e2e-gap7: ## e2e: gap7 streaming token-extraction fences + full-proxy live E2E
 	go test -race -run 'TokenStreamFence|StreamSplitInvariance' ./internal/provider/ ./internal/proxy/
 	go test -race -run 'TestProxy_Streaming_RecordsTokens|TestProxy_Streaming_RecordsModelAndCache|TestProxy_Streaming_LargeBody|TestStreamDrainer' ./internal/proxy/
+
+# Compliance filter end-to-end through the REAL ai-compliance-detector child (embedded
+# baseline pack). Reproduces + locks the 2026-06-16 history-leak bug: a sensitive token
+# in HISTORY is masked, assistant reply untouched, identical re-send served from cache
+# (0 extra detector calls). Builds the detector first; the Go test skips if it's missing.
+filter-integration: ## e2e: history-leak fix + cache via real detector (builds detector first)
+	$(MAKE) -C ../ai-compliance-detector build
+	go test -tags integration -count=1 -run 'TestFilterIntegration' -v ./internal/proxy/
 
 run: build
 	./bin/aikey-proxy --config bin/$(CONFIG)

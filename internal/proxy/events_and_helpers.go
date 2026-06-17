@@ -266,6 +266,39 @@ func debugRequestBodyFromContext(ctx context.Context) []byte {
 	return b
 }
 
+// bufferRequestBodyForObserver reads and restores the client request body so a
+// full-payload observer (enterprise conversation audit) can read the prompt in
+// OnRequestStart. Returns the buffered copy, or nil when capture is unsafe or
+// undesirable; the observer then degrades to completion-only and never blocks
+// the request.
+//
+// MAIN-LINK SAFETY (why the guards, not just "read it"): the user_chat path
+// forwards r.Body byte-identically (path-prefix routing relies on it — see
+// serveRouteWithObserver's doc). We therefore ONLY buffer when the length is
+// known and within the hard cap. Unknown-length (chunked, ContentLength < 0)
+// or oversized bodies are skipped untouched — truncating or partially
+// consuming r.Body would corrupt the forward, and a stalled audit feature must
+// never degrade the proxy's core job. On a read error (broken connection) we
+// restore what we read best-effort and return nil. Mirrors
+// stashRequestBodyForDebug's proven buffer+restore, gated by observer appetite
+// rather than the debug flag.
+func bufferRequestBodyForObserver(r *http.Request) []byte {
+	if r.Body == nil || r.ContentLength <= 0 || r.ContentLength > extractBodyHardLimit {
+		return nil
+	}
+	body, err := io.ReadAll(r.Body)
+	if err != nil {
+		// Connection already broken mid-read; put back what we got so the
+		// forward path sees a consistent (if doomed) body, and skip audit.
+		r.Body = io.NopCloser(bytes.NewReader(body))
+		r.ContentLength = int64(len(body))
+		return nil
+	}
+	r.Body = io.NopCloser(bytes.NewReader(body))
+	r.ContentLength = int64(len(body))
+	return body
+}
+
 // logAppUpstreamErrorForensic emits a default-on WARN log whenever an
 // app-pipeline request returns 4xx/5xx from the upstream. The goal is
 // to make third-party APP integration failures debuggable WITHOUT
@@ -505,21 +538,21 @@ func (p *Proxy) reportUsage(route *vkeys.ResolvedRoute, bearerToken, model strin
 		// Cost-pricing audit (v1.0.0-rc.8): reasoning from the breakdown, region
 		// + endpoint derived from the resolved route's upstream URL. Both
 		// flowing through this single reportUsage covers streaming + non-streaming.
-		ReasoningTokens: breakdown.ReasoningTokens,
-		Region:          regionFromBaseURL(routeBaseURL(route)),
-		EndpointURL:     routeBaseURL(route),
-		StopReason:      breakdown.StopReason,
-		ErrorType:                errorType,
-		ErrorMessage:             errorMessage,
-		RealKey:                  realKey,
-		ClientVersion:            p.clientVersion,
-		SourceVersion:            p.clientVersion,
-		ProxyConfigVersion:       p.proxyConfigVersion,
-		LoadedControlSeq:         p.loadedControlSeq,
-		LoggedInAccountID:        p.loggedInAccountID,
-		SessionID:                sessionID,
-		Completion:               completion,
-		UpstreamRequestID:        upstreamReqID,
+		ReasoningTokens:    breakdown.ReasoningTokens,
+		Region:             regionFromBaseURL(routeBaseURL(route)),
+		EndpointURL:        routeBaseURL(route),
+		StopReason:         breakdown.StopReason,
+		ErrorType:          errorType,
+		ErrorMessage:       errorMessage,
+		RealKey:            realKey,
+		ClientVersion:      p.clientVersion,
+		SourceVersion:      p.clientVersion,
+		ProxyConfigVersion: p.proxyConfigVersion,
+		LoadedControlSeq:   p.loadedControlSeq,
+		LoggedInAccountID:  p.loggedInAccountID,
+		SessionID:          sessionID,
+		Completion:         completion,
+		UpstreamRequestID:  upstreamReqID,
 	})
 	if p.reporter != nil {
 		// Reporter writes WAL + enqueues upload; when wal is the shared
@@ -687,6 +720,15 @@ func extractModelLazy(body []byte) string {
 }
 
 func extractModel(r *http.Request) string {
+	// Parse-once: reuse the model the FIRST extractModel call this request
+	// already parsed + cached. Keyed on the context (not the x-aikey-model
+	// header) because the header is client-spoofable — see ctxKeyExtractedModel.
+	// The cache is set only after a successful real-body parse below, so the
+	// allowlist-critical first read is never skipped, and a parse failure
+	// (cache not set) keeps the prior re-parse behavior.
+	if v, ok := r.Context().Value(ctxKeyExtractedModel).(string); ok {
+		return v
+	}
 	if r.Body == nil {
 		return ""
 	}
@@ -711,6 +753,9 @@ func extractModel(r *http.Request) string {
 	}
 
 	stashExtractedFields(r, partial.Model, partial.PromptCacheKey)
+	// Cache for the repeat calls (overwrites any client-injected header value
+	// via stashExtractedFields above, so the cached value is the real model).
+	*r = *r.WithContext(context.WithValue(r.Context(), ctxKeyExtractedModel, partial.Model))
 	return partial.Model
 }
 

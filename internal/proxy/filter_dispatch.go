@@ -152,13 +152,17 @@ func (p *Proxy) applyInboundFilter(
 	// any shape it can't confidently reduce → we fall back to the full scan, so
 	// incremental never under-scans (it only ever scans LESS when it's certain
 	// the rest is unchanged history). See Proxy.filterIncremental.
-	pieces, parsed, ok := extractFilterableContent(bodyBytes)
-	incremental := false
-	if p.filterIncremental {
-		if ip, ipar, iok := extractLatestUserContent(bodyBytes); iok {
-			pieces, parsed, ok, incremental = ip, ipar, true, true
-		}
-	}
+	// 2026-06-16 历史漏扫修复(设计 20260616-AI合规检测-…-内容哈希缓存 §3 第一步):
+	// 停用"只扫最新 user turn"的增量模式 —— 它跳过历史,用户先前说过的敏感词随历史
+	// 每轮原文重发、detector 从不重扫 → 每轮透传给模型(lobster debug 实证)。
+	// 改为每轮扫"全部 USER 角色消息"(extractUserContent):覆盖历史里的用户输入,
+	// 但**跳过 system(admin 指令,mask 会污染 agent)和 assistant(模型返回内容,
+	// 入站合规只管 user→LLM、不 mask 返回)**。只扫 user 还把片段数从"system+全历史"
+	// 骤降到"用户那几条短消息",避免大 agent prompt 全量扫超时 fail-open(2026-06-16
+	// 活体:扫 22 片段→9 片段超时漏 + 4.8s 延迟)。
+	// AIKEY_PROXY_FILTER_INCREMENTAL_SCAN 废弃;content-hash 缓存见设计 §4(第二步)。
+	pieces, parsed, ok := extractUserContent(bodyBytes)
+	incremental := false // 历史漏扫修复后恒为 false(不再切到 latest-turn-only)
 	if !ok || len(pieces) == 0 {
 		r.Body = io.NopCloser(bytes.NewReader(bodyBytes))
 		// Link-level diagnostic (失败要显眼): a routed LLM request that yielded NO
@@ -190,7 +194,20 @@ func (p *Proxy) applyInboundFilter(
 		nilResp     int // detector unreachable (pipe dead) — resp == nil
 		selfDeg     int // detector returned Degraded=true (it ran but couldn't decide)
 		detectNanos int64
+		cacheHits   int // content-hash 缓存命中(复用判定、跳过 detector)
+		cacheMiss   int // content-hash 缓存未命中(真扫 + 回填)
 	)
+
+	// content-hash 缓存(设计 §4):仅当缓存启用时才算 scope/detectorVer。缓存关闭
+	// (p.filterCache == nil)时下面循环根本不碰 hash → 不付 content-hash 代价(INV-6)。
+	// scope = 隔离桶(同会话历史复用、跨会话不串);detectorVer 进 key 让 detector
+	// 重启自动失效旧条目;per-entry TTL 兜底 in-place pack pull 的陈旧 clean 判定。
+	var cacheScopeKey, detectorVer string
+	if p.filterCache != nil {
+		cacheScopeKey = cacheScope(r, parsed, virtualKeyID)
+		detectorVer = hook.Status().Version
+	}
+
 	for i := range pieces {
 		// Cap the per-piece payload sent over the pipe (the detector only scans
 		// the first pipeInputCap bytes anyway). The untouched tail is re-attached
@@ -202,19 +219,45 @@ func (p *Proxy) applyInboundFilter(
 			b := capRuneBoundary(pieces[i].text, pipeInputCap)
 			head, tail = pieces[i].text[:b], pieces[i].text[b:]
 		}
-		_t0 := time.Now()
-		resp := hook.Detect(r.Context(), &apphook.Request{
-			Direction:   apphook.DirectionInbound,
-			Payload:     []byte(head),
-			TargetModel: model,
-			RouteClass:  routeClass,
-			// RequestID best-effort from the inbound trace header; child uses it
-			// only for log correlation. Empty is fine.
-			RequestID: r.Header.Get("x-request-id"),
-			// UserRole left empty for MVP — PoC uses default-tenant pack
-			// (方案 §5.4.5: PoC 期 child 忽略 user_role, 统一用 default).
-		})
-		detectNanos += time.Since(_t0).Nanoseconds()
+		// content-hash 缓存:历史里逐字未变的内容(每轮重发)命中缓存即复用判定、
+		// 跳过 detector IPC;只有新增/被改写(miss)才真扫。命中时合成一个等价 resp,
+		// 走下面同一套处理(mask/allow/...)。缓存关闭(p.filterCache==nil)则直接真扫。
+		var resp *apphook.Response
+		var ckey string
+		if p.filterCache != nil {
+			ckey = cacheKey(detectorVer, hashHead(head)) // level-2 key (scope is separate)
+			if v, ok := p.filterCache.Get(cacheScopeKey, ckey); ok {
+				resp = &apphook.Response{Action: v.action, MutatedPayload: []byte(v.maskedHead), Reason: v.reason}
+				cacheHits++
+			}
+		}
+		if resp == nil { // 缓存 miss 或缓存关闭 → 真扫
+			if p.filterCache != nil {
+				cacheMiss++
+			}
+			_t0 := time.Now()
+			resp = hook.Detect(r.Context(), &apphook.Request{
+				Direction:   apphook.DirectionInbound,
+				Payload:     []byte(head),
+				TargetModel: model,
+				RouteClass:  routeClass,
+				// RequestID best-effort from the inbound trace header; child uses it
+				// only for log correlation. Empty is fine.
+				RequestID: r.Header.Get("x-request-id"),
+				// UserRole left empty for MVP — PoC uses default-tenant pack
+				// (方案 §5.4.5: PoC 期 child 忽略 user_role, 统一用 default).
+			})
+			detectNanos += time.Since(_t0).Nanoseconds()
+			// 只缓存"确定性"判定:degraded(超时/fail-open)与 nil 不缓存,否则会把
+			// "没扫成"误记成 allow、下轮命中缓存就放行(违反 INV-2)。
+			if p.filterCache != nil && resp != nil && !resp.Degraded {
+				p.filterCache.Put(cacheScopeKey, ckey, maskVerdict{
+					action:     resp.Action,
+					maskedHead: string(resp.MutatedPayload),
+					reason:     resp.Reason,
+				})
+			}
+		}
 		if resp == nil { // defensive: a nil response is treated as degraded allow
 			degraded = true
 			nilResp++
@@ -301,7 +344,8 @@ func (p *Proxy) applyInboundFilter(
 		"event.name", "proxy.filter.decision",
 		"pieces", len(pieces), "masked", maskedCount, "degraded", degraded,
 		"detect_ms", detectNanos/1e6, "body_bytes", len(bodyBytes),
-		"incremental", incremental, "route_class", routeClass)
+		"incremental", incremental, "route_class", routeClass,
+		"cache_hits", cacheHits, "cache_miss", cacheMiss)
 
 	if maskedCount == 0 {
 		// Nothing changed — forward the original bytes verbatim.

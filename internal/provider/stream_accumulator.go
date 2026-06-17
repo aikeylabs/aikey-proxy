@@ -39,6 +39,28 @@ type StreamAccumulatorFactory interface {
 	NewStreamAccumulator() StreamAccumulator
 }
 
+// NewStreamAccumulatorForFamily returns a StreamAccumulator for a wire protocol
+// family ("anthropic" | "openai_compatible" | "gemini" | ""), or nil when the
+// family has no incremental extractor (gemini / unknown — caller skips token
+// capture gracefully).
+//
+// Why: a consumer that holds only the wire family — not a full Provider — can
+// reuse the SAME extractors the drainer uses instead of re-implementing usage
+// parsing. The conversation-audit observer uses this to fold a per-turn token
+// snapshot from the same SSE frames it already reads for text, keeping token
+// extraction single-source (no drift from the billing path). Kimi/Generic share
+// the OpenAI wire shape, so "openai_compatible" covers them.
+func NewStreamAccumulatorForFamily(family string) StreamAccumulator {
+	switch family {
+	case "anthropic":
+		return (&Anthropic{}).NewStreamAccumulator()
+	case "openai_compatible":
+		return (&OpenAI{}).NewStreamAccumulator()
+	default:
+		return nil
+	}
+}
+
 // ---- Anthropic ----
 
 // anthropicStreamAcc mirrors the per-line fold in Anthropic.ExtractTokenBreakdown

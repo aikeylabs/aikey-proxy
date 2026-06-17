@@ -28,9 +28,9 @@ import (
 	"net"
 	"net/http"
 	"os"
-	"strconv"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -43,6 +43,7 @@ import (
 	"github.com/AiKeyLabs/aikey-proxy/internal/config"
 	"github.com/AiKeyLabs/aikey-proxy/internal/events"
 	"github.com/AiKeyLabs/aikey-proxy/internal/observability"
+	"github.com/AiKeyLabs/aikey-proxy/internal/observer/conversation_audit"
 	"github.com/AiKeyLabs/aikey-proxy/internal/provider"
 	"github.com/AiKeyLabs/aikey-proxy/internal/proxy"
 	"github.com/AiKeyLabs/aikey-proxy/internal/proxy/apppipe"
@@ -123,9 +124,9 @@ type generation struct {
 	proxy      *proxy.Proxy
 	collector  *events.Collector
 	eventStore *events.Store
-	reporter   *events.Reporter      // usage reporter (nil when collector_url is not configured)
+	reporter   *events.Reporter     // usage reporter (nil when collector_url is not configured)
 	canary     *events.CanaryProbe  // synthetic canary probe (nil when reporter or control_url is not configured)
-	filterHook apphook.FilterTarget  // P4 compliance/DLP filter (single child or M-process pool; nil when no filter app is active)
+	filterHook apphook.FilterTarget // P4 compliance/DLP filter (single child or M-process pool; nil when no filter app is active)
 
 	// standaloneWAL is only populated when this generation created the
 	// local WAL writer AND no reporter consumed it — i.e. collector_url is
@@ -140,6 +141,14 @@ type generation struct {
 	// mark to the actual last-used seq (zero seq burn on the common restart
 	// path; only a hard crash leaves a bounded auditable gap). nil when no WAL.
 	seqAlloc *events.SeqAllocator
+
+	// Conversation-audit content outbox (enterprise Cluster feature). All nil
+	// unless this is a team deployment with a collector + credential — see
+	// conversation_audit_wiring.go. Closed in close() like the usage trio:
+	// reporter first (flushes its upload loop), then WAL, then seq allocator.
+	contentReporter *events.ContentReporter
+	contentWAL      *events.ContentWAL
+	contentSeqAlloc *events.SeqAllocator
 
 	// Drain tracking: incremented when a request enters Handle, decremented on exit.
 	inflight atomic.Int64
@@ -194,6 +203,18 @@ func (g *generation) close() {
 	// exactly there with zero burned (known-loss) seqs.
 	if g.seqAlloc != nil {
 		_ = g.seqAlloc.Close()
+	}
+	// Conversation-audit content outbox: same order as the usage trio — reporter
+	// first (its upload loop does a final flush on Close), then WAL, then the
+	// content seq allocator (shrinks its high-water mark like usage's).
+	if g.contentReporter != nil {
+		_ = g.contentReporter.Close()
+	}
+	if g.contentWAL != nil {
+		_ = g.contentWAL.Close()
+	}
+	if g.contentSeqAlloc != nil {
+		_ = g.contentSeqAlloc.Close()
 	}
 	if g.collector != nil {
 		_ = g.collector.Close()
@@ -1336,6 +1357,40 @@ func (s *Supervisor) buildGeneration() (*generation, error) {
 	}
 	p.SetQuotaEnforcer(enf)
 
+	// Conversation-audit (enterprise Cluster): inject the capture observer's
+	// deps BEFORE buildObserverRegistry, because the framework reads observer
+	// deps at BuildObservers time. Gated on a team collector destination
+	// (route or credential — see the gate below) — a Personal/offline
+	// deployment passes empty Deps (nil sink), so the observer build() skips it
+	// and pays nothing. The sink is attached to the real content outbox later
+	// in this same pass (after the usage reporter block, where the optional team
+	// credential is built). See conversation_audit_wiring.go.
+	var convAuditSink *conversationAuditSink
+	// Wire for TEAM/CLUSTER deployments. Signal = a "team" collector
+	// destination (route OR credential), NOT the credential alone. The Cluster
+	// worker proxy reports to the internal collector over network trust with NO
+	// collector_credentials["team"] — only a collector_routes["team"] URL. The
+	// usage reporter handles that nil-credential case by sending without an
+	// Authorization header (and ContentReporter.doUpload does the same), so the
+	// old credential-only gate silently excluded the Cluster edition — the very
+	// edition this feature targets. Personal/offline (no team route/cred) still
+	// wires nothing. The org-policy gate (Enabled, below) independently controls
+	// whether a wired observer actually captures.
+	_, hasTeamCred := s.cfg.Events.CollectorCredentials["team"]
+	hasTeamRoute := s.cfg.Events.CollectorRoutes["team"] != ""
+	if s.cfg.Events.CollectorURL != "" && (hasTeamCred || hasTeamRoute) {
+		convAuditSink = newConversationAuditSink(slog.Default())
+		conversation_audit.SetDeps(conversation_audit.Deps{
+			Sink:    convAuditSink,
+			Enabled: s.ConversationAuditEnabled,
+			// Adapt int64 policy accessor → observer's func() int cap (the
+			// content cap is small; the conversion is safe).
+			MaxBytes: func() int { return int(s.ConversationAuditMaxBytes()) },
+		})
+	} else {
+		conversation_audit.SetDeps(conversation_audit.Deps{}) // nil sink → observer not built this gen
+	}
+
 	// Phase 4 M2: build the per-generation observer registry. Skipped when
 	// no observer descriptors are registered (e.g. proxy build without the
 	// rhythm plugin blank-imported in main.go); in that path SetObserver
@@ -1414,6 +1469,12 @@ func (s *Supervisor) buildGeneration() (*generation, error) {
 	// 数据隔离与合并显示.md.
 	var reporter *events.Reporter
 	var canary *events.CanaryProbe
+	// Conversation-audit content outbox, assigned inside the hasAnyURL block
+	// below (where the team credential is built) and handed to the generation
+	// for teardown. nil unless this is a wired team deployment.
+	var contentWAL *events.ContentWAL
+	var contentSeqAlloc *events.SeqAllocator
+	var contentReporter *events.ContentReporter
 	hasAnyURL := s.cfg.Events.CollectorURL != ""
 	for _, u := range s.cfg.Events.CollectorRoutes {
 		if u != "" {
@@ -1484,6 +1545,27 @@ func (s *Supervisor) buildGeneration() (*generation, error) {
 				QueryURL:       s.cfg.Events.QueryURL,
 			})
 		}
+
+		// Conversation-audit content outbox — wired here (inside hasAnyURL, so
+		// the team `credentials` built above are in scope), independent of the
+		// usage reporter's success: content has its own WAL + reporter. Prefer a
+		// per-route team URL; fall back to the legacy single CollectorURL.
+		if convAuditSink != nil {
+			convCollectorURL := s.cfg.Events.CollectorRoutes["team"]
+			if convCollectorURL == "" {
+				convCollectorURL = s.cfg.Events.CollectorURL
+			}
+			// credentials["team"] is the per-route team JWT (Personal/lobster,
+			// from vault); CollectorToken is the cluster-node static service
+			// token (cluster worker nodes have no team credential). The content
+			// reporter tries the credential then the token — mirrors the usage
+			// reporter, so cluster-node uploads authenticate (else 401).
+			contentWAL, contentSeqAlloc, contentReporter = wireConversationAudit(
+				s.cfg.Events.WALDir, convCollectorURL, sourceID,
+				fmt.Sprintf("proxy-%d", id), credentials["team"], s.cfg.Events.CollectorToken,
+				convAuditSink, slog.Default(),
+			)
+		}
 	}
 
 	// Only hand the WAL to the generation when nobody else closes it. If a
@@ -1495,20 +1577,23 @@ func (s *Supervisor) buildGeneration() (*generation, error) {
 	}
 
 	gen := &generation{
-		id:            id,
-		vaultPath:     s.cfg.Vault.Path,
-		vault:         vaultReader,
-		registry:      registry,
-		providers:     providers,
-		proxy:         p,
-		collector:     collector,
-		eventStore:    eventStore,
-		reporter:      reporter,
-		canary:        canary,
-		filterHook:    filterHook,
-		standaloneWAL: ownedWAL,
-		seqAlloc:      seqAlloc,
-		drained:       make(chan struct{}),
+		id:              id,
+		vaultPath:       s.cfg.Vault.Path,
+		vault:           vaultReader,
+		registry:        registry,
+		providers:       providers,
+		proxy:           p,
+		collector:       collector,
+		eventStore:      eventStore,
+		reporter:        reporter,
+		canary:          canary,
+		filterHook:      filterHook,
+		standaloneWAL:   ownedWAL,
+		seqAlloc:        seqAlloc,
+		contentReporter: contentReporter,
+		contentWAL:      contentWAL,
+		contentSeqAlloc: contentSeqAlloc,
+		drained:         make(chan struct{}),
 	}
 
 	// Load quota rules for this generation's vault at startup / reload (the 5s

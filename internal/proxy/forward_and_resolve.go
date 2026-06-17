@@ -60,10 +60,11 @@ import (
 // Event.Model has json:omitempty so the downstream NDJSON consumer
 // survives the absence.
 //
-//nolint:unparam // `stream` kept parameterized for the SPEC §1.4.1
 // stream taxonomy (today only user_chat reaches here; future agent_chat /
 // agent_event branches will reuse this wrapper). Inlining the constant
 // would make adding the next stream branch a re-plumb across 5 call sites.
+//
+//nolint:unparam // `stream` kept parameterized for the SPEC §1.4.1
 func (p *Proxy) serveRouteWithObserver(
 	w http.ResponseWriter, r *http.Request,
 	route *vkeys.ResolvedRoute, prov provider.Provider,
@@ -96,6 +97,25 @@ func (p *Proxy) serveRouteWithObserver(
 			SessionID:      resolveSessionID(r, route.ProtocolType, route.ProviderCode),
 			TraceID:        traceID,
 			StartedAt:      startTime,
+			// Multi-tenant attribution — mirror the usage path's single-source
+			// rule (events/reportable.go) so the conversation-audit observer and
+			// usage events agree on who a turn belongs to.
+			OrgID: route.OrgID,
+			OwnerAccountID: func() string {
+				if route.AccountID != "" {
+					return route.AccountID
+				}
+				return p.loggedInAccountID // personal-key fallback, as in usage
+			}(),
+		}
+		// payload_level=full (enterprise conversation audit): when some active
+		// observer wants the raw request body, buffer+restore it here so the
+		// observer sees the prompt in OnRequestStart. Gated by WantsFullPayload
+		// → the common case (no audit observer, or audit off) pays nothing and
+		// r.Body is never touched. Body capture is best-effort; see
+		// bufferRequestBodyForObserver for the main-link safety guards.
+		if p.observerRegistry.WantsFullPayload() {
+			obsReqCtx.RequestBody = bufferRequestBodyForObserver(r)
 		}
 		route.ObserverContext = obsReqCtx
 		route.ObserverRegistry = p.observerRegistry

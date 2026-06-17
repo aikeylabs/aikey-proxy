@@ -56,6 +56,14 @@ import (
 	// supervisor at generation-build time (which is where vault.Open
 	// happens); main.go just blank-imports for init() side effect.
 	_ "github.com/AiKeyLabs/aikey-proxy/internal/observer/ndjson_fanout"
+
+	// Enterprise Cluster conversation-audit capture observer (payload_level=full).
+	// Reuses the "aikey-proxy-core" first-party slug (already allow-listed), so
+	// only this import line is needed. Its deps (content outbox sink + live org
+	// policy) are injected by supervisor.buildGeneration via
+	// conversation_audit.SetDeps before BuildObservers; absent a team collector
+	// the supervisor passes a nil sink and the observer is skipped at build.
+	_ "github.com/AiKeyLabs/aikey-proxy/internal/observer/conversation_audit"
 )
 
 const defaultConfigName = "aikey-proxy.yaml"

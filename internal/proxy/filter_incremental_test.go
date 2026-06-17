@@ -58,33 +58,23 @@ func TestExtractLatestUserContent_SafetyFallbacks(t *testing.T) {
 	}
 }
 
-// TestApplyInboundFilter_IncrementalScansOnlyLatestTurn: with incremental ON the
-// detector is called ONCE on the latest user text — NOT on system + history.
-// This is the perf fix: 28KB resent context → a few-dozen-byte new message.
-func TestApplyInboundFilter_IncrementalScansOnlyLatestTurn(t *testing.T) {
-	body := openClawShape("请登记身份证 110101199003078515")
+// TestApplyInboundFilter_DeprecatedIncrementalNowFullScans: the old
+// "incremental" (latest-user-turn-only) mode is DEPRECATED (2026-06-16 history-leak
+// fix). Even with filterIncremental=true (the env is still set on form-② lobster
+// installs), applyInboundFilter now FULL-SCANS every piece — so a sensitive word the
+// user sent in HISTORY is re-scanned every turn instead of being skipped (→ no leak).
+func TestApplyInboundFilter_DeprecatedIncrementalNowFullScans(t *testing.T) {
+	body := openClawShape("他是谁") // 历史里有"第一轮历史问题";最新 turn 普通追问
 
-	// Incremental ON: 1 Detect call, on the latest user turn only.
-	hookInc := &stubHook{resp: &apphook.Response{Action: apphook.ActionAllow}}
-	pInc := &Proxy{filterHook: hookInc, filterIncremental: true}
-	if proceed := pInc.applyInboundFilter(nil, newReq(body), "m", "personal", "", "", discardLogger()); !proceed {
+	hook := &stubHook{resp: &apphook.Response{Action: apphook.ActionAllow}}
+	// filterIncremental=true:旧 env 仍开,但已被忽略 → 仍走全量扫。
+	p := &Proxy{filterHook: hook, filterIncremental: true}
+	if proceed := p.applyInboundFilter(nil, newReq(body), "m", "personal", "", "", discardLogger()); !proceed {
 		t.Fatal("expected proceed")
 	}
-	if hookInc.called != 1 {
-		t.Errorf("incremental: expected 1 Detect call (latest turn), got %d", hookInc.called)
-	}
-	if got := string(hookInc.gotPayload); !strings.Contains(got, "110101199003078515") || strings.Contains(got, "守则") {
-		t.Errorf("incremental scanned the wrong piece (should be latest user, not system): %.40q", got)
-	}
-
-	// Incremental OFF (default): scans every piece (system + 3 messages) → >1 call.
-	hookFull := &stubHook{resp: &apphook.Response{Action: apphook.ActionAllow}}
-	pFull := &Proxy{filterHook: hookFull}
-	if proceed := pFull.applyInboundFilter(nil, newReq(body), "m", "personal", "", "", discardLogger()); !proceed {
-		t.Fatal("expected proceed")
-	}
-	if hookFull.called <= 1 {
-		t.Errorf("full scan: expected multiple Detect calls (system+history+user), got %d", hookFull.called)
+	// 全量扫:system + 3 条消息都扫 → >1 次。增量(旧漏因)只会 1 次(只扫最新 turn)。
+	if hook.called <= 1 {
+		t.Errorf("历史漏扫修复后必须全量扫(system+history+latest);got %d(=1 说明还在只扫最新 turn、没修)", hook.called)
 	}
 }
 

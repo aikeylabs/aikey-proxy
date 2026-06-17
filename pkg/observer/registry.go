@@ -9,33 +9,33 @@
 // The framework was designed to satisfy the four fault-isolation
 // dimensions enumerated in plugin-架构设计.md §6:
 //
-//   1. Code isolation       — observer business types never appear in
-//                             the observer package's public surface
-//   2. Architecture isolation — observer panics / leaks cannot bring
-//                             the proxy main flow down; reporters use
-//                             their own HTTP transport, etc.
-//   3. Exception isolation  — payload aliasing, fan-out backpressure,
-//                             ctx propagation, panic rate-limiting are
-//                             all P0/P1 invariants pinned into this
-//                             code (see numbered comments below)
-//   4. Decoupling           — adding a new observer requires only
-//                             `init()` self-registration + a single
-//                             `import _` line in proxy main; the
-//                             registry never special-cases any slug
-//                             apart from a hard-coded first-party
-//                             allowlist (R2 first defense line).
+//  1. Code isolation       — observer business types never appear in
+//     the observer package's public surface
+//  2. Architecture isolation — observer panics / leaks cannot bring
+//     the proxy main flow down; reporters use
+//     their own HTTP transport, etc.
+//  3. Exception isolation  — payload aliasing, fan-out backpressure,
+//     ctx propagation, panic rate-limiting are
+//     all P0/P1 invariants pinned into this
+//     code (see numbered comments below)
+//  4. Decoupling           — adding a new observer requires only
+//     `init()` self-registration + a single
+//     `import _` line in proxy main; the
+//     registry never special-cases any slug
+//     apart from a hard-coded first-party
+//     allowlist (R2 first defense line).
 //
 // Lifecycle (per request, in the App pipeline):
 //
-//   1. apppipe handler calls `Registry.NotifyStart(ctx, req)` after
-//      authentication + binding resolution succeed.
-//   2. Drainer reads upstream SSE; for each frame the handler calls
-//      `Registry.NotifySSEEvent(ctx, req, eventType, payload)` BEFORE
-//      `ResponseTransform` (if any) reshapes the chunk. This ordering
-//      is doc-anchored in proxy/apppipe to prevent later refactors
-//      from moving the hook past the translator.
-//   3. After upstream EOF / disconnect, handler calls
-//      `Registry.NotifyEnd(ctx, req, totalLatencyMs)`.
+//  1. apppipe handler calls `Registry.NotifyStart(ctx, req)` after
+//     authentication + binding resolution succeed.
+//  2. Drainer reads upstream SSE; for each frame the handler calls
+//     `Registry.NotifySSEEvent(ctx, req, eventType, payload)` BEFORE
+//     `ResponseTransform` (if any) reshapes the chunk. This ordering
+//     is doc-anchored in proxy/apppipe to prevent later refactors
+//     from moving the hook past the translator.
+//  3. After upstream EOF / disconnect, handler calls
+//     `Registry.NotifyEnd(ctx, req, totalLatencyMs)`.
 //
 // All three Notify* methods are non-blocking: they hand events off to a
 // per-(request × observer) consumer goroutine via a buffered channel
@@ -100,6 +100,24 @@ type StreamingObserver interface {
 	OnRequestEnd(ctx context.Context, req *RequestContext, totalLatencyMs int)
 }
 
+// FullPayloadObserver is an OPTIONAL capability interface. An observer that
+// needs the raw request body (the prompt) — i.e. the reserved
+// "payload_level=full" — implements it; the registry surfaces the union via
+// Registry.WantsFullPayload so the proxy buffers the body ONLY when some
+// active observer actually wants it (zero cost otherwise).
+//
+// It is deliberately a separate optional interface rather than a fourth
+// StreamingObserver hook: the 3-hook contract stays minimal (see the
+// StreamingObserver doc), and observers that don't need the body — the common
+// case (rhythm, billing-on-stream) — neither implement it nor pay for it.
+//
+// WantsFullPayload MAY return a value that changes over the process lifetime
+// (e.g. an enterprise audit observer returns the live org policy flag), so the
+// registry re-evaluates it per request rather than caching at build time.
+type FullPayloadObserver interface {
+	WantsFullPayload() bool
+}
+
 // RequestContext is the per-request metadata observers see. Mirrors the
 // schema documented in plugin-架构设计.md §3.2; new fields require a
 // design-doc update so observers can rely on a stable shape.
@@ -110,9 +128,9 @@ type StreamingObserver interface {
 // /v1/chat/completions while the upstream is Anthropic, or vice-versa).
 // Observers should pick their SSE parser by ProtocolFamily.
 type RequestContext struct {
-	AppKeyID       string
-	AppSlug        string
-	AppMode        string // "isolated" | "follow-active"
+	AppKeyID string
+	AppSlug  string
+	AppMode  string // "isolated" | "follow-active"
 
 	// KeyAlias is the vault-side credential alias that this request
 	// resolved to (e.g. "my-anthropic"). For follow-active first-party
@@ -123,7 +141,7 @@ type RequestContext struct {
 	// valid value (some routes — e.g. team-managed virtual keys — have
 	// no per-user alias); observers in that case should fall back to
 	// AppKeyID for attribution.
-	KeyAlias       string
+	KeyAlias string
 
 	ProviderID     string // canonical provider code, e.g. "anthropic", "kimi_code"
 	ProtocolFamily string // "anthropic" | "openai_compatible" | "gemini" | "" (unknown)
@@ -132,6 +150,17 @@ type RequestContext struct {
 	SessionID      string
 	TraceID        string // per-request UUID; observers use as state-map key
 	StartedAt      time.Time
+
+	// OrgID / OwnerAccountID are the multi-tenant attribution identity — the
+	// tenant and the developer (seat owner) this request is billed/attributed
+	// to. Populated by the proxy from the resolved route, mirroring the usage
+	// path's single-source rule (route.OrgID; route.AccountID ?? logged-in
+	// account) so observers never invent a divergent attribution. These are
+	// request IDENTITY (the same category as SessionID / KeyAlias above), NOT
+	// observer-derived state — so they belong here, not inside an observer.
+	// Empty OrgID means a personal (non-org) request.
+	OrgID          string
+	OwnerAccountID string
 
 	// Stream is the SPEC §1.4.1 stream name this request emits under
 	// (StreamUserChat / StreamAppPipeline / StreamProbe). Set by the
@@ -142,6 +171,18 @@ type RequestContext struct {
 	// OnSSEEvent / OnRequestEnd contract (which never grew its own
 	// stream parameter to keep the StreamingObserver interface stable).
 	Stream string
+
+	// RequestBody is the raw client request body (the prompt), populated by
+	// the proxy ONLY when an active observer declares it wants the full
+	// payload (see FullPayloadObserver / Registry.WantsFullPayload). This is
+	// the framework's reserved "payload_level=full" capability — NOT
+	// observer-derived state (which the §"DO NOT add fields" rule forbids),
+	// but the raw request data itself, the request-side analogue of the
+	// `payload []byte` already handed to OnSSEEvent. Nil when no active
+	// observer wants full payload (the default — zero memory cost), or when
+	// the body exceeded the proxy's capture cap. Observers MUST treat it as
+	// read-only; the proxy hands over its own buffered copy.
+	RequestBody []byte
 
 	// metadataJSON* implement the MetadataJSON() lazy cache. Private —
 	// observers must use the method, not the raw fields. sync.Once gives
@@ -657,10 +698,10 @@ func (r *Registry) BuildObservers(
 			continue
 		}
 		ao := &activeObserver{
-			descriptor:    desc,
-			impl:          impl,
-			panicLimiter:  newTokenLimiter(panicBudget, panicWindow),
-			dumpLimiter:   newTokenLimiter(crashDumpBudget, crashDumpWindow),
+			descriptor:   desc,
+			impl:         impl,
+			panicLimiter: newTokenLimiter(panicBudget, panicWindow),
+			dumpLimiter:  newTokenLimiter(crashDumpBudget, crashDumpWindow),
 		}
 		r.observers = append(r.observers, ao)
 		r.logger.Info("observer: registered + built",
@@ -681,6 +722,24 @@ func (r *Registry) Active() int {
 		}
 	}
 	return n
+}
+
+// WantsFullPayload reports whether any currently-active observer needs the raw
+// request body (the reserved "payload_level=full"). The proxy calls this on the
+// hot path to decide whether to buffer + restore the client request body before
+// forwarding — a cost it must NOT pay when nobody wants it. Re-evaluated per
+// request because an observer's appetite can change at runtime (e.g. an
+// enterprise audit observer tracks the live org policy flag).
+func (r *Registry) WantsFullPayload() bool {
+	for _, ao := range r.observers {
+		if ao.disabled.Load() {
+			continue
+		}
+		if fp, ok := ao.impl.(FullPayloadObserver); ok && fp.WantsFullPayload() {
+			return true
+		}
+	}
+	return false
 }
 
 // Stats returns a snapshot of registry-wide counters. Cheap; safe to
@@ -733,10 +792,10 @@ const (
 // requestState holds per-request fan-out plumbing. Created on
 // NotifyStart, removed on NotifyEnd (or maxRequestAge timeout).
 type requestState struct {
-	ctx     context.Context
-	cancel  context.CancelFunc
+	ctx      context.Context
+	cancel   context.CancelFunc
 	channels map[string]chan observerEvent // observer.Name → channel
-	req     *RequestContext
+	req      *RequestContext
 }
 
 // ---------------------------------------------------------------------------

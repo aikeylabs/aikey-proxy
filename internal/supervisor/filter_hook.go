@@ -81,6 +81,16 @@ const filterDefaultReadyTimeout = 30 * time.Second
 // child to tear down" — either nothing was declared, or spawn failed and the
 // proxy is in fail-loud 501 mode instead.
 func (s *Supervisor) installFilterHook(p *proxy.Proxy, vaultReader *vault.Reader) apphook.FilterTarget {
+	// Operator kill-switch (用户 2026-06-17):AIKEY_DE_COMPLIANCE=off explicitly turns
+	// compliance OFF — no filter hook, and NO fail-loud 501 even on a mandate org. Lets the
+	// de operator toggle compliance by editing one line in the de-proxy.env config + restart,
+	// without uninstalling the detector. Default (unset / "on") → normal wiring below.
+	if complianceDisabledByOperator() {
+		slog.Info("supervisor: compliance disabled by operator (AIKEY_DE_COMPLIANCE=off) — filter hook NOT installed, traffic forwarded unfiltered",
+			"event.name", "proxy.filter.disabled_by_operator")
+		p.SetFilterStub501Active(false) // ensure we are NOT in fail-loud mode
+		return nil
+	}
 	binPath, binArgs, slug, declaredButMissing := s.resolveFilterBinary(vaultReader)
 	if binPath == "" {
 		if declaredButMissing {
@@ -204,12 +214,19 @@ func (s *Supervisor) installFilterHook(p *proxy.Proxy, vaultReader *vault.Reader
 	// editions). See Proxy.filterIncremental.
 	incremental := filterIncrementalScan()
 	p.SetFilterIncrementalScan(incremental)
+	// content-hash 缓存(设计 20260616-…-内容哈希缓存 §4):opt-in via env,默认 off =
+	// 无状态全量扫。开启后历史里逐字未变的内容命中缓存、跳过 detector,降低全量扫延迟。
+	cacheOn := filterCacheEnabled()
+	cacheWindow := filterCacheWindow()
+	p.SetFilterCacheEnabled(cacheOn, cacheWindow)
 	slog.Info("supervisor: compliance filter hook active",
 		"event.name", "proxy.filter_hook_active",
 		"binary", binPath,
 		"workers", m,
 		"timeout_ms", filterTimeout().Milliseconds(),
-		"incremental_scan", incremental)
+		"incremental_scan", incremental,
+		"content_hash_cache", cacheOn,
+		"content_hash_cache_window", cacheWindow)
 	return pool
 }
 
@@ -322,6 +339,51 @@ func filterIncrementalScan() bool {
 	}
 }
 
+// filterCacheEnv toggles the inbound-filter content-hash cache (设计 §4). DEFAULT ON
+// (用户 2026-06-17:复用记忆默认开启) — it replaces the deprecated incremental scan as
+// the standing latency optimization, and is REQUIRED for digital-employee long
+// conversations to hold the 15ms SLO (full re-scan of a 40-msg history ≈ 50ms; cache
+// keeps it ~1.3ms). Explicit opt-out only: 0/false/no/off (case-insensitive). Safe to
+// default on — the history-leak fix (full user coverage) is unconditional regardless.
+const filterCacheEnv = "AIKEY_PROXY_FILTER_CACHE"
+
+func filterCacheEnabled() bool {
+	switch strings.ToLower(strings.TrimSpace(os.Getenv(filterCacheEnv))) {
+	case "0", "false", "no", "off":
+		return false // explicit opt-out
+	default:
+		return true // default on (incl. unset)
+	}
+}
+
+// complianceDisabledEnv is the operator on/off switch for the WHOLE compliance filter
+// (lives in de-proxy.env, 用户 2026-06-17). "off" → installFilterHook installs no hook
+// and does NOT fail-loud (501), so an operator can toggle compliance with one line + a
+// restart, without uninstalling the detector. Default (unset / "on") → normal wiring.
+const complianceDisabledEnv = "AIKEY_DE_COMPLIANCE"
+
+func complianceDisabledByOperator() bool {
+	switch strings.ToLower(strings.TrimSpace(os.Getenv(complianceDisabledEnv))) {
+	case "off", "0", "false", "no", "disabled":
+		return true
+	default:
+		return false // default on (incl. unset / "on")
+	}
+}
+
+// filterCacheWindowEnv sets the per-session cache window (last-N piece verdicts;
+// 设计 §4 / 用户 2026-06-16:默认 5,可配). 0 / invalid → proxy uses its default.
+const filterCacheWindowEnv = "AIKEY_PROXY_FILTER_CACHE_WINDOW"
+
+func filterCacheWindow() int {
+	if v := strings.TrimSpace(os.Getenv(filterCacheWindowEnv)); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			return n
+		}
+	}
+	return 0 // 0 → proxy uses defaultMaskCacheWindow
+}
+
 // filterReadyTimeout resolves the detector spawn ready deadline: env override
 // (ms) if a valid positive integer, else filterDefaultReadyTimeout.
 func filterReadyTimeout() time.Duration {
@@ -368,6 +430,18 @@ func filterWorkerCount() int {
 // conduit (single source). Returns "" on any read/parse miss (no team / fresh
 // install) → puller stays offline, no error.
 func readControlPanelURL() string {
+	// Cluster nodes have NO Personal config.json (no `aikey login` — the proxy
+	// runs as the `aikey` system user, home /home/aikey, no .aikey/config). They
+	// are configured via env (/etc/aikey/cluster-node.env), exactly as
+	// complianceOrgID() reads AIKEY_HUB_ORG_ID. Prefer the cluster control-URL
+	// env; fall back to the Personal config.json for Personal/Trial. WHY: without
+	// the env path readControlPanelURL()=="" on cluster nodes, so BOTH the
+	// compliance and conversation-audit master-policy polls early-return —
+	// conversation-audit (no local-toggle fallback) then never turns capture on.
+	// Bugfix: 2026-06-17-conversation-audit-cluster-control-url-env.md
+	if v := strings.TrimRight(os.Getenv("AIKEY_HUB_CONTROL_URL"), "/"); v != "" {
+		return v
+	}
 	home, err := os.UserHomeDir()
 	if err != nil {
 		return ""

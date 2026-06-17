@@ -57,6 +57,53 @@ func extractFilterableContent(body []byte) (pieces []contentPiece, parsed map[st
 	return pieces, m, true
 }
 
+// extractUserContent extracts the maskable text of EVERY user-role message — the
+// user's own input across all turns (latest + history). This is the history-leak
+// fix's scan set (2026-06-16): the user's earlier sensitive input lives in a HISTORY
+// user message and must be re-masked every turn.
+//
+// It deliberately SKIPS:
+//   - the system prompt (admin-authored instructions, not user input — masking it
+//     would corrupt the agent's directives), and
+//   - assistant / tool messages (the model's own RESPONSES = "returned content";
+//     the inbound compliance filter governs user→LLM, it must NOT mask what the
+//     model returned — 用户明确要求 2026-06-16).
+//
+// Skipping system + assistant also slashes the piece count (a big agent prompt is
+// mostly system + history assistant turns), which is what kept the full scan within
+// the detector budget (no per-piece timeout / fail-open on a 22-piece prompt).
+//
+// Fail-safe role handling: only EXPLICIT assistant/system/tool roles are skipped;
+// a "user" or missing/empty role is scanned (never silently under-scan real input).
+// ok=false only when the body is not a JSON object with a messages[] array → caller
+// falls back to forwarding unfiltered (same fail-open as before for non-chat bodies).
+func extractUserContent(body []byte) (pieces []contentPiece, parsed map[string]any, ok bool) {
+	var m map[string]any
+	if err := json.Unmarshal(body, &m); err != nil {
+		return nil, nil, false
+	}
+	msgs, isArr := m["messages"].([]any)
+	if !isArr {
+		return nil, m, false
+	}
+	for _, mi := range msgs {
+		msg, isObj := mi.(map[string]any)
+		if !isObj {
+			continue
+		}
+		switch role, _ := msg["role"].(string); role {
+		case "assistant", "system", "developer", "tool", "function":
+			// model RESPONSE (assistant) / admin instructions (system, OpenAI
+			// developer) / tool output (tool, OpenAI legacy function) — none are user
+			// input, so the inbound compliance filter must not scan/mask them. Covers
+			// Anthropic + OpenAI-family (Codex/Kimi) + OpenClaw roles uniformly.
+			continue
+		}
+		collectContentField(msg, "content", &pieces)
+	}
+	return pieces, m, true
+}
+
 // extractLatestUserContent extracts ONLY the latest user turn's text — the NEW
 // content in a request that resends the full conversation (system + history)
 // every turn (OpenClaw, Claude Code, Codex, Cursor all do this). It deliberately
