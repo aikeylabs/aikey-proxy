@@ -289,7 +289,7 @@ func (p *Proxy) ResolveBindingCredential(
 
 // serveRoute executes the forwarding pipeline (streaming detection, transport
 // selection, reverse proxy) shared by token-based and path-prefix routing.
-func (p *Proxy) serveRoute(w http.ResponseWriter, r *http.Request, route *vkeys.ResolvedRoute, prov provider.Provider, realKey string, bearerToken string, startTime time.Time, logger *slog.Logger) {
+func (p *Proxy) serveRoute(w http.ResponseWriter, r *http.Request, route *vkeys.ResolvedRoute, prov provider.Provider, realKey, bearerToken string, startTime time.Time, logger *slog.Logger) {
 	// Phase 2 quota gate — UNIVERSAL chokepoint (Stage 3 + D-U8/P7). serveRoute is
 	// the single funnel EVERY real route passes through (Tier1 token, OAuth,
 	// active-sentinel, app pipeline, default binding; serveRouteWithObserver
@@ -356,7 +356,7 @@ func (p *Proxy) serveRoute(w http.ResponseWriter, r *http.Request, route *vkeys.
 			// breaks one streaming request's mid-stream cancel behavior.
 			observability.GoSafe("proxy.request.close_notifier", observability.Isolated, func() {
 				select {
-				case <-cn.CloseNotify(): //nolint:staticcheck
+				case <-cn.CloseNotify(): //nolint:staticcheck // CloseNotifier deprecated but the reliable HTTP/1.1 mid-stream disconnect signal
 					cancel()
 				case <-cancelCtx.Done():
 				}
@@ -659,7 +659,7 @@ func (p *Proxy) serveRoute(w http.ResponseWriter, r *http.Request, route *vkeys.
 				// status code, but must not inflate usage counters or trigger
 				// reporter uploads (it'd be double-counting our own self-tests).
 				if !isAikeyProbe(r) {
-					p.collector.Record(ev)
+					p.collector.Record(&ev)
 					// Non-streaming always terminates atomically — the response is
 					// either the full JSON or it's an error we surface elsewhere.
 					sessionID := resolveSessionID(r, route.ProtocolType, route.ProviderCode)
@@ -733,7 +733,7 @@ func (p *Proxy) serveRoute(w http.ResponseWriter, r *http.Request, route *vkeys.
 				if route.ObserverContext != nil {
 					obsReqCtx, _ = route.ObserverContext.(*observer.RequestContext)
 				}
-				resp.Body = newStreamDrainer(upstream, baseEvent, prov, collector, p.proxyCtx, r.Context(), logger, cb, obsRegistry, obsReqCtx)
+				resp.Body = newStreamDrainer(upstream, &baseEvent, prov, collector, p.proxyCtx, r.Context(), logger, cb, obsRegistry, obsReqCtx)
 			}
 			return nil
 		},

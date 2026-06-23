@@ -17,7 +17,7 @@ import (
 // no spurious degraded. Run under -race. (The echo child is still serial — this
 // validates the proxy-side multiplex; Phase 2 makes the child concurrent.)
 func TestChildHook_ConcurrentDetect(t *testing.T) {
-	h := NewChildHook(ChildHookConfig{
+	h := NewChildHook(&ChildHookConfig{
 		Name: "concurrent-test", BinaryPath: findDetectorBinary(t), BinaryArgs: detectorArgs(),
 		Timeout: 2 * time.Second, ReadyTimeout: 5 * time.Second,
 	})
@@ -62,9 +62,9 @@ func findDetectorBinary(t *testing.T) string {
 
 	// Walk up from internal/apphook → aikey-proxy → aikeylabs/ → ai-compliance-detector/bin/detector
 	_, file, _, _ := runtime.Caller(0)
-	apphookDir := filepath.Dir(file)                          // .../aikey-proxy/internal/apphook
-	proxyDir := filepath.Dir(filepath.Dir(apphookDir))        // .../aikey-proxy
-	aikeylabsDir := filepath.Dir(proxyDir)                    // .../aikeylabs
+	apphookDir := filepath.Dir(file)                   // .../aikey-proxy/internal/apphook
+	proxyDir := filepath.Dir(filepath.Dir(apphookDir)) // .../aikey-proxy
+	aikeylabsDir := filepath.Dir(proxyDir)             // .../aikeylabs
 	binary := filepath.Join(aikeylabsDir, "ai-compliance-detector", "bin", "detector")
 
 	// Note: not stat-probing here — if the detector isn't built, the actual
@@ -86,7 +86,7 @@ func detectorArgs() []string {
 // proxy restarted ("本机合规检测未运行"). restart() must kill the dead/desynced
 // child, respawn a fresh one, and clear degraded.
 func TestChildHook_RestartRecovers(t *testing.T) {
-	h := NewChildHook(ChildHookConfig{
+	h := NewChildHook(&ChildHookConfig{
 		Name: "recover-test", BinaryPath: findDetectorBinary(t), BinaryArgs: detectorArgs(),
 		Timeout: 1 * time.Second, ReadyTimeout: 5 * time.Second,
 	})
@@ -122,7 +122,7 @@ func TestChildHook_RestartRecovers(t *testing.T) {
 // serves recovered. This is the fail-open invariant: synchronous lazyRecover used
 // context.Background()+2s and stalled the first post-degrade Detect up to 2s.
 func TestChildHook_LazyRecoverOnDetect(t *testing.T) {
-	h := NewChildHook(ChildHookConfig{
+	h := NewChildHook(&ChildHookConfig{
 		Name: "lazy-test", BinaryPath: findDetectorBinary(t), BinaryArgs: detectorArgs(),
 		Timeout: 1 * time.Second, ReadyTimeout: 5 * time.Second,
 	})
@@ -167,10 +167,10 @@ func TestChildHook_LazyRecoverOnDetect(t *testing.T) {
 func TestChildHookEchoRoundtrip(t *testing.T) {
 	binary := findDetectorBinary(t)
 
-	h := NewChildHook(ChildHookConfig{
+	h := NewChildHook(&ChildHookConfig{
 		Name:         "ai-compliance-detector-test",
 		BinaryPath:   binary,
-		BinaryArgs:   detectorArgs(), // --echo-only: skip rule load, deterministic for IPC test
+		BinaryArgs:   detectorArgs(),  // --echo-only: skip rule load, deterministic for IPC test
 		Timeout:      1 * time.Second, // generous for first-call test
 		ReadyTimeout: 5 * time.Second,
 	})
@@ -213,7 +213,7 @@ func TestChildHookEchoRoundtrip(t *testing.T) {
 }
 
 func TestChildHookDegradedOnMissingBinary(t *testing.T) {
-	h := NewChildHook(ChildHookConfig{
+	h := NewChildHook(&ChildHookConfig{
 		Name:       "ai-compliance-detector-test-missing",
 		BinaryPath: "/nonexistent/path/detector",
 		Timeout:    1 * time.Second,

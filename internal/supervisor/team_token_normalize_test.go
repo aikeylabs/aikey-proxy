@@ -20,10 +20,10 @@ import (
 )
 
 type fixtureCase struct {
-	Name        string  `json:"name"`
-	Input       string  `json:"input"`
 	ExpectedOK  *string `json:"expected_ok"`
 	ExpectedErr *string `json:"expected_err"`
+	Name        string  `json:"name"`
+	Input       string  `json:"input"`
 }
 
 type fixture struct {
@@ -187,12 +187,12 @@ func TestIsStrictPersonalRouteToken_RejectsLegacyAndMalformed(t *testing.T) {
 func TestTokenPrefixForLog_DoesNotLeakSuffix(t *testing.T) {
 	cases := map[string]string{
 		"aikey_personal_0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef": "aikey_personal_...",
-		"aikey_vk_acc-1234abc":     "aikey_vk_...",
-		"aikey_team_my-team":       "aikey_team_...",
-		"aikey_unknown_xyz":        "aikey_unknown_...",
-		"":                         "<empty>",
-		"sk-real-secret-payload":   "<no-aikey-prefix>",
-		"aikey_personal_short":     "aikey_personal_...",  // legacy alias form — still log just the prefix segment
+		"aikey_vk_acc-1234abc":   "aikey_vk_...",
+		"aikey_team_my-team":     "aikey_team_...",
+		"aikey_unknown_xyz":      "aikey_unknown_...",
+		"":                       "<empty>",
+		"sk-real-secret-payload": "<no-aikey-prefix>",
+		"aikey_personal_short":   "aikey_personal_...", // legacy alias form — still log just the prefix segment
 	}
 	for input, want := range cases {
 		got := tokenPrefixForLog(input)

@@ -45,7 +45,7 @@ import (
 // Day 5 will add parallel_tool_calls reverse (`parallel_tool_calls=false`
 // → `tool_choice.disable_parallel_tool_use=true`) + the
 // "tool_choice=none + disable_parallel_tool_use" special case (new-api
-//踩坑: Anthropic 400s if disable_parallel_tool_use is present when
+// 踩坑: Anthropic 400s if disable_parallel_tool_use is present when
 // tool_choice.type==none).
 
 // convertTools transforms OpenAI tools[] into Anthropic tools[].
@@ -58,7 +58,7 @@ import (
 //     "web_search" are server-side tools not exposed to bring-your-own
 //     models on Anthropic).
 //   - Missing function.name (Anthropic requires name).
-func convertTools(inTools gjson.Result) ([]byte, *translator.TranslateError) {
+func convertTools(inTools *gjson.Result) ([]byte, *translator.TranslateError) {
 	if !inTools.Exists() || !inTools.IsArray() {
 		return nil, nil
 	}
@@ -145,7 +145,7 @@ func convertTools(inTools gjson.Result) ([]byte, *translator.TranslateError) {
 //
 // Day 5 will add the parallel_tool_calls integration (disable_parallel_tool_use
 // added when parallel_tool_calls=false EXCEPT when tool_choice is "none").
-func convertToolChoice(inToolChoice gjson.Result) ([]byte, *translator.TranslateError) {
+func convertToolChoice(inToolChoice *gjson.Result) ([]byte, *translator.TranslateError) {
 	if !inToolChoice.Exists() {
 		return nil, nil
 	}
@@ -228,7 +228,7 @@ func setRawAtKey(body []byte, key string, valueRaw []byte) ([]byte, error) {
 //   - If `tool_choice.type=="none"`, we MUST NOT add disable_parallel_tool_use.
 //     Anthropic 400s on this combination (new-api踩坑 reference:
 //     relay-claude.go L962-1011). The reasoning is that "force no tools
-//     + restrict parallel tool use" is contradictory — Anthropic
+//   - restrict parallel tool use" is contradictory — Anthropic
 //     rejects the inconsistent semantic.
 //
 // Also no-op when no tool_choice exists yet (means caller didn't set
@@ -239,7 +239,7 @@ func setRawAtKey(body []byte, key string, valueRaw []byte) ([]byte, error) {
 // "tool_choice=none" case here detects whichever path produced the
 // none type (explicit string "none" or object form, or potentially
 // future special-cases).
-func applyParallelToolCalls(body []byte, in gjson.Result) []byte {
+func applyParallelToolCalls(body []byte, in *gjson.Result) []byte {
 	ptc := in.Get("parallel_tool_calls")
 	if !ptc.Exists() {
 		return body

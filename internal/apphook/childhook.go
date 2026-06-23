@@ -27,6 +27,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"math"
 	"os"
 	"os/exec"
 	"sync"
@@ -36,21 +37,21 @@ import (
 
 // ChildHookConfig configures a ChildHook.
 type ChildHookConfig struct {
-	Name               string        // app name, e.g. "ai-compliance-detector"
-	BinaryPath         string        // absolute path to child binary
-	BinaryArgs         []string      // extra args to pass to child (e.g. --rules ...)
-	Timeout            time.Duration // per-Detect deadline (default 1ms)
-	ProtocolVersion    byte          // expected — must match child's wire version
-	ReadyTimeout       time.Duration // how long to wait for ready sentinel (default 5s)
-	RestartMaxAttempts int           // 0 = unlimited (default 3)
-	RestartBaseDelay   time.Duration // initial backoff (default 100ms)
-	RestartMaxDelay    time.Duration // backoff cap (default 30s)
+	Name       string   // app name, e.g. "ai-compliance-detector"
+	BinaryPath string   // absolute path to child binary
+	BinaryArgs []string // extra args to pass to child (e.g. --rules ...)
 	// ExtraEnv are "KEY=VALUE" entries appended to the child's environment (on
 	// top of the proxy's inherited env). Used to pass per-app runtime config
 	// the proxy derives from vault — e.g. AIKEY_COMPLIANCE_RECORD_ALLOW from the
 	// app_records.filter_record_allow flag. The child re-reads these at spawn,
 	// so a flag change → vault change_seq → proxy reload → re-spawn picks it up.
-	ExtraEnv []string
+	ExtraEnv           []string
+	Timeout            time.Duration // per-Detect deadline (default 1ms)
+	ReadyTimeout       time.Duration // how long to wait for ready sentinel (default 5s)
+	RestartMaxAttempts int           // 0 = unlimited (default 3)
+	RestartBaseDelay   time.Duration // initial backoff (default 100ms)
+	RestartMaxDelay    time.Duration // backoff cap (default 30s)
+	ProtocolVersion    byte          // expected — must match child's wire version
 }
 
 func (c *ChildHookConfig) applyDefaults() {
@@ -77,47 +78,42 @@ func (c *ChildHookConfig) applyDefaults() {
 // childResponse is a decoded response frame, delivered to the waiting caller by
 // the reader goroutine via the pending map.
 type childResponse struct {
-	action   byte
 	findings []byte // ActionMask → masked payload; ListPacks → JSON report; else per-op
 	event    []byte // team-routed compliance event for the proxy to forward; empty otherwise
+	action   byte
 }
 
 // ChildHook is a generic Hook that delegates to a spawned child binary.
 type ChildHook struct {
-	cfg ChildHookConfig
-
-	// mu protects spawn/exit state transitions (cmd, generation).
-	mu  sync.Mutex
-	cmd *exec.Cmd
-	gen atomic.Uint64 // spawn generation; the reader tied to an older gen won't clobber a newer spawn's state
-
-	// writeMu serializes frame writes to the child's stdin AND guards the stdin
-	// pointer (replaced on spawn/restart). Reads happen on a separate pipe owned
-	// by the reader goroutine, so writes and reads never contend.
-	writeMu sync.Mutex
+	cmd     *exec.Cmd
 	stdin   *bufio.Writer
-
-	// pending holds in-flight requests keyed by request-id. The reader delivers
-	// each response to pending[id]; a timed-out caller removes its own entry.
-	pendingMu sync.Mutex
-	pending   map[uint32]chan *childResponse
-	nextReqID atomic.Uint32
-
+	pending map[uint32]chan *childResponse
 	// status is atomically swapped so Status() is wait-free.
 	status atomic.Pointer[Status]
-
-	// degraded is set when child is unusable; cleared on successful restart.
-	degraded atomic.Bool
-
+	cfg    ChildHookConfig
+	gen    atomic.Uint64 // spawn generation; the reader tied to an older gen won't clobber a newer spawn's state
 	// lastRecoverAt (unix nano) gates the lazy self-heal: when degraded, the next
 	// request synchronously restarts the child, but a storm of requests must not
 	// hammer respawns — only one attempt per recoverCooldown (CAS-guarded).
 	lastRecoverAt atomic.Int64
+	// mu protects spawn/exit state transitions (cmd, generation).
+	mu sync.Mutex
+	// writeMu serializes frame writes to the child's stdin AND guards the stdin
+	// pointer (replaced on spawn/restart). Reads happen on a separate pipe owned
+	// by the reader goroutine, so writes and reads never contend.
+	writeMu sync.Mutex
+	// pending holds in-flight requests keyed by request-id. The reader delivers
+	// each response to pending[id]; a timed-out caller removes its own entry.
+	pendingMu sync.Mutex
+	nextReqID atomic.Uint32
+	// degraded is set when child is unusable; cleared on successful restart.
+	degraded atomic.Bool
 }
 
 // NewChildHook creates a ChildHook in DISABLED state. Caller must call Start
 // to launch the child.
-func NewChildHook(cfg ChildHookConfig) *ChildHook {
+func NewChildHook(in *ChildHookConfig) *ChildHook {
+	cfg := *in // copy so applyDefaults never mutates the caller's value
 	cfg.applyDefaults()
 	h := &ChildHook{cfg: cfg, pending: make(map[uint32]chan *childResponse)}
 	h.degraded.Store(true) // start degraded; flip after successful Start
@@ -147,7 +143,7 @@ func (h *ChildHook) spawnLocked(ctx context.Context) error {
 		return fmt.Errorf("apphook %s: binary not found at %s: %w", h.cfg.Name, h.cfg.BinaryPath, err)
 	}
 
-	cmd := exec.Command(h.cfg.BinaryPath, h.cfg.BinaryArgs...)
+	cmd := exec.Command(h.cfg.BinaryPath, h.cfg.BinaryArgs...) //nolint:gosec // operator-configured app-hook binary, path stat-verified above; args from trusted vault/config, never request input
 	// Inherit the proxy's env (the child relies on it for AIKEY_* config) and
 	// append any per-app ExtraEnv the supervisor derived from vault.
 	if len(h.cfg.ExtraEnv) > 0 {
@@ -538,9 +534,12 @@ func (h *ChildHook) writeFrame(payload []byte) error {
 	if w == nil {
 		return errors.New("stdin closed")
 	}
+	if len(payload) > math.MaxUint32 {
+		return fmt.Errorf("payload too large for frame header: %d bytes", len(payload))
+	}
 	header := make([]byte, 5)
 	header[0] = h.cfg.ProtocolVersion
-	binary.LittleEndian.PutUint32(header[1:], uint32(len(payload)))
+	binary.LittleEndian.PutUint32(header[1:], uint32(len(payload))) //nolint:gosec // len(payload) bounded by the math.MaxUint32 guard above
 	if _, err := w.Write(header); err != nil {
 		return err
 	}

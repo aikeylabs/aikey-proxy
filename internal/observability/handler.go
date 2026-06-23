@@ -122,7 +122,7 @@ func (h *MultiHandler) Enabled(ctx context.Context, level slog.Level) bool {
 }
 
 // Handle forwards rec to all child handlers that are enabled for its level.
-func (h *MultiHandler) Handle(ctx context.Context, rec slog.Record) error {
+func (h *MultiHandler) Handle(ctx context.Context, rec slog.Record) error { //nolint:gocritic // rec type is fixed by the slog.Handler interface; cannot be a pointer
 	for _, hh := range h.handlers {
 		if hh.Enabled(ctx, rec.Level) {
 			// Clone the record so each handler gets an independent copy.

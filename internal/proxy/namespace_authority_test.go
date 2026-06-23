@@ -95,8 +95,8 @@ func TestNamespaceAuthority_ActiveSentinelNotClassifiedAsInvalid(t *testing.T) {
 	cases := []string{
 		"aikey_active_anthropic",
 		"aikey_active_openai",
-		"aikey_active_",                    // empty provider — still falls through; binding lookup will resolve via path
-		"aikey_active_unknown_provider",    // suffix is informational; not validated
+		"aikey_active_",                 // empty provider — still falls through; binding lookup will resolve via path
+		"aikey_active_unknown_provider", // suffix is informational; not validated
 	}
 	for _, tok := range cases {
 		if got := ClassifyToken(tok); got != Tier3ActiveSentinel {
@@ -116,7 +116,7 @@ func TestNamespaceAuthority_NativeTokensClassifiedAsTier3Native(t *testing.T) {
 		"sk-1234567890",
 		"sk-ant-real-secret",
 		"abc-random",
-		"aikeyfoo",  // edge: starts with "aikey" but no underscore — NOT in the namespace
+		"aikeyfoo", // edge: starts with "aikey" but no underscore — NOT in the namespace
 		"",
 	}
 	for _, tok := range cases {

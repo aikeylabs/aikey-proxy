@@ -17,9 +17,9 @@ import (
 
 func TestClassifyToken_Tier1Team(t *testing.T) {
 	cases := []string{
-		"aikey_team_acc-1234",                  // typical server-issued vk_id
-		"aikey_team_vk_abc",                    // vk_-prefixed (legitimate post-helper-normalization)
-		"aikey_team_a",                         // shortest non-empty vk_id
+		"aikey_team_acc-1234", // typical server-issued vk_id
+		"aikey_team_vk_abc",   // vk_-prefixed (legitimate post-helper-normalization)
+		"aikey_team_a",        // shortest non-empty vk_id
 		"aikey_team_arbitrary-text-with-hyphens",
 	}
 	for _, tok := range cases {
@@ -195,12 +195,13 @@ func TestClassifyToken_ProbeChecksBeforePersonal(t *testing.T) {
 // roadmap20260320/技术实现/update/20260526-pre-save-proxy-probe-raw.md §2.1.
 //
 // Three invariants under test:
-//   A. Canonical-only acceptance — suffix must be in the canonicalProviderCodes
-//      allowlist; aliases (claude/gpt/etc) are rejected with TokenInvalid.
-//   B. Order independence vs Tier2Probe — `aikey_probe_raw_<canonical>` shares
-//      the `aikey_probe_` prefix with Tier2Probe; reverse order would silently
-//      misclassify as Tier2Probe with alias="raw_<canonical>". Pin the order.
-//   C. Strict form — empty suffix / non-canonical / case-variations all fail.
+//
+//	A. Canonical-only acceptance — suffix must be in the canonicalProviderCodes
+//	   allowlist; aliases (claude/gpt/etc) are rejected with TokenInvalid.
+//	B. Order independence vs Tier2Probe — `aikey_probe_raw_<canonical>` shares
+//	   the `aikey_probe_` prefix with Tier2Probe; reverse order would silently
+//	   misclassify as Tier2Probe with alias="raw_<canonical>". Pin the order.
+//	C. Strict form — empty suffix / non-canonical / case-variations all fail.
 func TestClassifyToken_Tier2ProbeRaw_Canonical(t *testing.T) {
 	// Every canonical provider must accept.
 	canonicals := []string{
@@ -322,14 +323,14 @@ func TestIsTier1Personal_StrictForm(t *testing.T) {
 
 	// Reject everything else.
 	rejects := []string{
-		"aikey_personal_" + strings.Repeat("0", 63),       // 63
-		"aikey_personal_" + strings.Repeat("0", 65),       // 65
-		"aikey_personal_" + strings.Repeat("A", 64),       // uppercase
-		"aikey_personal_" + strings.Repeat("g", 64),       // non-hex
-		"aikey_personal_my-alias",                          // legacy form
-		"aikey_personal_",                                  // empty suffix
-		"aikey_team_" + hex64,                              // wrong prefix
-		"sk-" + hex64,                                      // not aikey
+		"aikey_personal_" + strings.Repeat("0", 63), // 63
+		"aikey_personal_" + strings.Repeat("0", 65), // 65
+		"aikey_personal_" + strings.Repeat("A", 64), // uppercase
+		"aikey_personal_" + strings.Repeat("g", 64), // non-hex
+		"aikey_personal_my-alias",                   // legacy form
+		"aikey_personal_",                           // empty suffix
+		"aikey_team_" + hex64,                       // wrong prefix
+		"sk-" + hex64,                               // not aikey
 		"",
 	}
 	for _, tok := range rejects {
@@ -352,15 +353,15 @@ func TestIsTier1App_StrictForm(t *testing.T) {
 	}
 
 	rejects := []string{
-		"aikey_app_" + strings.Repeat("0", 63),       // 63
-		"aikey_app_" + strings.Repeat("0", 65),       // 65
-		"aikey_app_" + strings.Repeat("A", 64),       // uppercase
-		"aikey_app_" + strings.Repeat("g", 64),       // non-hex
-		"aikey_app_my-alias",                          // alias-like form
-		"aikey_app_",                                  // empty suffix
-		"aikey_personal_" + hex64,                     // wrong prefix (personal, not app)
-		"aikey_team_" + hex64,                         // wrong prefix (team)
-		"sk-" + hex64,                                 // not aikey
+		"aikey_app_" + strings.Repeat("0", 63), // 63
+		"aikey_app_" + strings.Repeat("0", 65), // 65
+		"aikey_app_" + strings.Repeat("A", 64), // uppercase
+		"aikey_app_" + strings.Repeat("g", 64), // non-hex
+		"aikey_app_my-alias",                   // alias-like form
+		"aikey_app_",                           // empty suffix
+		"aikey_personal_" + hex64,              // wrong prefix (personal, not app)
+		"aikey_team_" + hex64,                  // wrong prefix (team)
+		"sk-" + hex64,                          // not aikey
 		"",
 	}
 	for _, tok := range rejects {

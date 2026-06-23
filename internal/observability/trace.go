@@ -64,7 +64,7 @@ func NewTrace() TraceContext {
 
 // ChildSpan creates a child TraceContext that inherits trace_id but has a new span_id.
 // The caller's span_id becomes parent_span_id.
-func (tc TraceContext) ChildSpan() TraceContext {
+func (tc *TraceContext) ChildSpan() TraceContext {
 	spanID := NewSpanID()
 	return TraceContext{
 		TraceID:      tc.TraceID,

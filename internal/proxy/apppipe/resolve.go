@@ -53,9 +53,9 @@ type VaultReader interface {
 // ResolveError represents a request that passed authn but cannot proceed
 // due to a vault / scope / R2 issue.
 type ResolveError struct {
-	StatusCode int    // HTTP status
 	ErrorCode  string // body.error.code
 	Message    string // body.error.message (English per CLAUDE.md)
+	StatusCode int    // HTTP status
 }
 
 func (e *ResolveError) Error() string { return e.ErrorCode + ": " + e.Message }
@@ -64,14 +64,14 @@ func (e *ResolveError) Error() string { return e.ErrorCode + ": " + e.Message }
 // metadata only; binding lookup happens AFTER body sanitize + upstream
 // inference (see ResolveUpstreamBinding below).
 type ResolvedAppContext struct {
-	// ProfileID is "app:<slug>" (isolated) or "default" (follow-active).
-	ProfileID string
 	// AppRecord holds the metadata side (name, upstreams, app_kind).
 	AppRecord *vault.AppRecord
 	// AppRoute is the *vkeys.ResolvedRoute returned by authn, carrying
 	// AppSlug / AppKind / AppKeyID / FollowUserActive. Pipeline reads
 	// AppKeyID for usage_event's app_key_id column.
 	AppRoute *vkeys.ResolvedRoute
+	// ProfileID is "app:<slug>" (isolated) or "default" (follow-active).
+	ProfileID string
 }
 
 // Resolve performs profile scope decision + app_records read + R2 check.
@@ -235,8 +235,8 @@ func ResolveUpstreamBinding(
 //   - alias lookup vault failure  → 500 BOUND_ALIAS_READ_FAILED
 //   - alias row missing            → 404 BOUND_ALIAS_NOT_FOUND
 //   - alias status != "active"     → 403 BOUND_ALIAS_REVOKED (revoked)
-//                                  / BOUND_ALIAS_PAUSED (paused)
-//                                  / BOUND_ALIAS_INACTIVE (other)
+//     / BOUND_ALIAS_PAUSED (paused)
+//     / BOUND_ALIAS_INACTIVE (other)
 func resolveBoundAliasBinding(reader VaultReader, resolved *ResolvedAppContext) (*vault.ProviderBinding, *ResolveError) {
 	alias := resolved.AppRecord.BoundAlias
 	cred, err := reader.GetAliasCredential(alias)

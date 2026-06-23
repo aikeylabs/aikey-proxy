@@ -51,10 +51,10 @@ type RetentionConfig struct {
 
 // RetentionResult summarizes one sweep for logs / `wal vacuum` output.
 type RetentionResult struct {
-	WALArchived     int
-	ArchiveDeleted  int
-	EventsPruned    int64
-	Errors          []string // non-fatal per-file failures (sweep continues)
+	Errors         []string // non-fatal per-file failures (sweep continues)
+	WALArchived    int
+	ArchiveDeleted int
+	EventsPruned   int64
 }
 
 // walFileTime parses the UTC hour embedded in a WAL filename
@@ -139,7 +139,7 @@ func RunRetentionSweep(cfg RetentionConfig, store *Store, now time.Time) Retenti
 }
 
 // RetentionLoop runs RunRetentionSweep once at start and then daily at 00:00
-// UTC (per the design's "每天 00:00 扫文件名"), until ctx is cancelled.
+// UTC (per the design's "每天 00:00 扫文件名"), until ctx is canceled.
 // Failures degrade per-item and are logged loudly; the loop itself never
 // exits on error (bypass: must not require a restart to resume).
 //

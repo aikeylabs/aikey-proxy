@@ -2,6 +2,7 @@ package cluster
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -65,7 +66,7 @@ func TestRegistrar_HeartbeatUnknownNodeReturns409Sentinel(t *testing.T) {
 	defer srv.Close()
 
 	r := NewRegistrar(srv.URL, "n1", "addr", 1, "")
-	if err := r.heartbeat(context.Background()); err != errUnknownNode {
+	if err := r.heartbeat(context.Background()); !errors.Is(err, errUnknownNode) {
 		t.Fatalf("heartbeat on 409 = %v, want errUnknownNode", err)
 	}
 }

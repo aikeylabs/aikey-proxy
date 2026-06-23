@@ -16,8 +16,8 @@ import "sync"
 // A mutex-guarded map keeps read-modify-write atomic; the per-request,
 // low-cardinality access pattern doesn't need sync.Map.
 type Counter struct {
-	mu    sync.Mutex
 	cells map[string]*cell
+	mu    sync.Mutex
 }
 
 type cell struct {

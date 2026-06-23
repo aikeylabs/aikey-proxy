@@ -5,8 +5,8 @@ import "sync"
 // cache provides thread-safe in-memory caching of decrypted secrets.
 // Keys are cached for the lifetime of the daemon process.
 type cache struct {
-	mu      sync.RWMutex
 	secrets map[string]string
+	mu      sync.RWMutex
 }
 
 func newCache() *cache {
@@ -22,7 +22,7 @@ func (c *cache) get(alias string) (string, bool) {
 	return v, ok
 }
 
-func (c *cache) set(alias string, secret string) {
+func (c *cache) set(alias, secret string) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	c.secrets[alias] = secret

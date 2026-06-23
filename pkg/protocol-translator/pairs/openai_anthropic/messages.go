@@ -56,7 +56,7 @@ type normalizeResult struct {
 // Returns a TranslateError when input violates a rule that can't be
 // auto-repaired (empty messages, message with no content after filter,
 // unknown role).
-func normalizeMessages(inMessages gjson.Result) (*normalizeResult, *translator.TranslateError) {
+func normalizeMessages(inMessages *gjson.Result) (*normalizeResult, *translator.TranslateError) {
 	if !inMessages.Exists() || !inMessages.IsArray() {
 		return nil, &translator.TranslateError{
 			Code:       translator.CodeBadRequest,
@@ -68,8 +68,8 @@ func normalizeMessages(inMessages gjson.Result) (*normalizeResult, *translator.T
 
 	// ── Pass 1: separate system messages from the rest ──────────────
 	var (
-		systemBlocks   []string // each entry is a JSON object literal for one system text block
-		nonSystemMsgs  []gjson.Result
+		systemBlocks  []string // each entry is a JSON object literal for one system text block
+		nonSystemMsgs []gjson.Result
 	)
 	for _, m := range inMessages.Array() {
 		role := m.Get("role").String()
@@ -80,7 +80,8 @@ func normalizeMessages(inMessages gjson.Result) (*normalizeResult, *translator.T
 			// message becomes one text block, preserving order so
 			// multi-system prompts (e.g. "guidelines" + "format hint")
 			// keep their structure.
-			text := contentToText(m.Get("content"))
+			contentNode := m.Get("content")
+			text := contentToText(&contentNode)
 			if text == "" {
 				continue // skip empty system messages — same as empty user text
 			}
@@ -101,13 +102,15 @@ func normalizeMessages(inMessages gjson.Result) (*normalizeResult, *translator.T
 		role := m.Get("role").String()
 		switch role {
 		case "user":
-			blocks, err := convertContentBlocks(m.Get("content"), "user")
+			userContent := m.Get("content")
+			blocks, err := convertContentBlocks(&userContent, "user")
 			if err != nil {
 				return nil, err
 			}
 			transformed = append(transformed, normalizedMsg{role: "user", blocks: blocks})
 		case "assistant":
-			blocks, err := convertContentBlocks(m.Get("content"), "assistant")
+			assistantContent := m.Get("content")
+			blocks, err := convertContentBlocks(&assistantContent, "assistant")
 			if err != nil {
 				return nil, err
 			}
@@ -150,7 +153,8 @@ func normalizeMessages(inMessages gjson.Result) (*normalizeResult, *translator.T
 					Message:    "tool message at index " + strconvIToA(i) + " missing tool_call_id",
 				}
 			}
-			text := contentToText(m.Get("content"))
+			toolContent := m.Get("content")
+			text := contentToText(&toolContent)
 			block := `{"type":"tool_result","tool_use_id":` + jsonQuote(toolCallID) +
 				`,"content":` + jsonQuote(text) + `}`
 			transformed = append(transformed, normalizedMsg{role: "user", blocks: []string{block}})
@@ -257,7 +261,7 @@ type normalizedMsg struct {
 // a single string. Used for system messages + tool result text — both
 // of which Anthropic accepts as flat string. For multi-block content
 // (rare on system), block texts are joined with "\n".
-func contentToText(node gjson.Result) string {
+func contentToText(node *gjson.Result) string {
 	if node.Type == gjson.String {
 		return node.String()
 	}
@@ -287,7 +291,7 @@ func contentToText(node gjson.Result) string {
 //   - file → document (PDF passthrough)
 //   - input_audio (Anthropic doesn't natively support)
 //   - refusal blocks (newer OpenAI output)
-func convertContentBlocks(content gjson.Result, roleHint string) ([]string, *translator.TranslateError) {
+func convertContentBlocks(content *gjson.Result, roleHint string) ([]string, *translator.TranslateError) {
 	_ = roleHint // reserved for future role-specific block validation
 	if content.Type == gjson.String {
 		// Plain string content → single text block.
@@ -317,7 +321,8 @@ func convertContentBlocks(content gjson.Result, roleHint string) ([]string, *tra
 			}
 			blocks = append(blocks, `{"type":"text","text":`+jsonQuote(txt)+`}`)
 		case "image_url":
-			block, err := convertImageBlock(b, i)
+			imgBlock := b
+			block, err := convertImageBlock(&imgBlock, i)
 			if err != nil {
 				return nil, err
 			}
@@ -357,7 +362,7 @@ func convertContentBlocks(content gjson.Result, roleHint string) ([]string, *tra
 //
 //	{"type":"image","source":{"type":"base64","media_type":"image/png","data":"XYZ"}}
 //	{"type":"image","source":{"type":"url","url":"https://example.com/cat.png"}}
-func convertImageBlock(b gjson.Result, idx int) (string, *translator.TranslateError) {
+func convertImageBlock(b *gjson.Result, idx int) (string, *translator.TranslateError) {
 	url := b.Get("image_url.url").String()
 	if url == "" {
 		return "", &translator.TranslateError{

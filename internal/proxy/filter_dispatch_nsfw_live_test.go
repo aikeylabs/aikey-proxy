@@ -21,7 +21,7 @@ import (
 //	  → nsfw prompt through applyInboundFilter
 //	  → masked / blocked (the distributed pack actually intercepts)
 //
-// This is the distributed-pack analogue of TestApplyInboundFilter_LiveDetector,
+// This is the distributed-pack analog of TestApplyInboundFilter_LiveDetector,
 // which only exercises the EMBEDDED baseline. It is the test that answers the
 // open question "does a pulled nsfw pack actually intercept, or is it score-only
 // / not merged into the engine?". Zero external LLM cost.
@@ -56,7 +56,7 @@ func TestApplyInboundFilter_LiveDetector_NSFW(t *testing.T) {
 	t.Setenv("AIKEY_PACK_MASTER_URL", master.URL)
 	t.Setenv("AIKEY_PACK_POLL_INTERVAL", "300ms")
 
-	hook := apphook.NewChildHook(apphook.ChildHookConfig{
+	hook := apphook.NewChildHook(&apphook.ChildHookConfig{
 		Name:         "ai-compliance-detector",
 		BinaryPath:   bin,
 		Timeout:      500 * time.Millisecond,

@@ -17,9 +17,10 @@ import (
 // the request (Claude: 429 business rejection, Kimi: 403 access_terminated_error).
 //
 // Verified patterns from:
-//   workflow/CI/research/oauth-token-exchange-test/main.go (Claude)
-//   workflow/CI/research/oauth-codex-test/main.go (Codex)
-//   workflow/CI/research/oauth-kimi-test/main.go (Kimi)
+//
+//	workflow/CI/research/oauth-token-exchange-test/main.go (Claude)
+//	workflow/CI/research/oauth-codex-test/main.go (Codex)
+//	workflow/CI/research/oauth-kimi-test/main.go (Kimi)
 func oauthInject(req *http.Request, cred *OAuthCredential, providerCode string) {
 	// Remove any existing API Key header (proxy may have set it from vault)
 	req.Header.Del("x-api-key")
@@ -45,15 +46,15 @@ func oauthInject(req *http.Request, cred *OAuthCredential, providerCode string) 
 //
 // Layered requirements:
 //   - 2026-04-16 verified (header layer):
-//       Bearer token alone → 401 "OAuth authentication not supported"
-//       + ?beta=true + anthropic-version → accepted as OAuth
-//       + anthropic-beta + X-Stainless-* → 429 business rejection (no rate-limit headers)
-//       + metadata.user_id + X-Claude-Code-Session-Id → 200 (header layer satisfied)
+//     Bearer token alone → 401 "OAuth authentication not supported"
+//   - ?beta=true + anthropic-version → accepted as OAuth
+//   - anthropic-beta + X-Stainless-* → 429 business rejection (no rate-limit headers)
+//   - metadata.user_id + X-Claude-Code-Session-Id → 200 (header layer satisfied)
 //   - 2026-05-06 verified (body layer): for premium models (Sonnet/Opus),
-//       headers alone are NOT enough. WAF additionally checks system[0]:
-//       must equal claudeCodeSystemPrompt OR contain x-anthropic-billing-header
-//       with cc_entrypoint=. Otherwise: same 429-no-rate-limit-headers signature.
-//       Haiku is exempt from the body check.
+//     headers alone are NOT enough. WAF additionally checks system[0]:
+//     must equal claudeCodeSystemPrompt OR contain x-anthropic-billing-header
+//     with cc_entrypoint=. Otherwise: same 429-no-rate-limit-headers signature.
+//     Haiku is exempt from the body check.
 //
 // See injectClaudeWAFFingerprint + research doc
 // workflow/CI/research/oauth-token-response-identity/2026-04-15-oauth-token-response-identity.md
@@ -137,20 +138,24 @@ func injectClaudeOAuth(req *http.Request, cred *OAuthCredential) {
 	// Other tools (Cursor, Cline) don't — proxy injects them only when absent.
 	// Overwriting CLI's session_id would break session tracking.
 	if req.Header.Get("X-Claude-Code-Session-Id") == "" {
-		sessionID := generateUUID()
-		req.Header.Set("X-Claude-Code-Session-Id", sessionID)
+		// Skip session-id + metadata injection if the CSPRNG fails (effectively
+		// never on a healthy host); a missing session-id header is safe — the
+		// upstream treats it as a fresh session.
+		if sessionID, uuidErr := generateUUID(); uuidErr == nil {
+			req.Header.Set("X-Claude-Code-Session-Id", sessionID)
 
-		// 6. metadata.user_id — only inject if CLI didn't set it
-		// (checked inside injectMetadataUserIDIfAbsent)
-		// Why: Anthropic requires metadata.user_id with format:
-		//   user_<64hex_device_id>_account_<account_uuid>_session_<session_uuid>
-		// Missing account_uuid → 429 business rejection (not real rate limit).
-		// Ref: workflow/CI/research/oauth-token-exchange-test/main.go line 16-17
-		deviceHash := sha256.Sum256([]byte(cred.AccountID))
-		deviceID := hex.EncodeToString(deviceHash[:])
-		accountUUID := cred.ExternalID // OAuth provider's account UUID
-		userID := fmt.Sprintf("user_%s_account_%s_session_%s", deviceID, accountUUID, sessionID)
-		injectMetadataUserIDIfAbsent(req, userID)
+			// 6. metadata.user_id — only inject if CLI didn't set it
+			// (checked inside injectMetadataUserIDIfAbsent)
+			// Why: Anthropic requires metadata.user_id with format:
+			//   user_<64hex_device_id>_account_<account_uuid>_session_<session_uuid>
+			// Missing account_uuid → 429 business rejection (not real rate limit).
+			// Ref: workflow/CI/research/oauth-token-exchange-test/main.go line 16-17
+			deviceHash := sha256.Sum256([]byte(cred.AccountID))
+			deviceID := hex.EncodeToString(deviceHash[:])
+			accountUUID := cred.ExternalID // OAuth provider's account UUID
+			userID := fmt.Sprintf("user_%s_account_%s_session_%s", deviceID, accountUUID, sessionID)
+			injectMetadataUserIDIfAbsent(req, userID)
+		}
 	}
 
 	// 7. WAF body fingerprint dispatch (2026-05-06 research).
@@ -183,8 +188,9 @@ func injectClaudeOAuth(req *http.Request, cred *OAuthCredential) {
 // rate limit.
 //
 // Reference:
-//   workflow/CI/research/oauth-token-response-identity/2026-04-15-oauth-token-response-identity.md
-//   (sections "2026-05-06 增补 I" and "Round 5 / sub2api 对比")
+//
+//	workflow/CI/research/oauth-token-response-identity/2026-04-15-oauth-token-response-identity.md
+//	(sections "2026-05-06 增补 I" and "Round 5 / sub2api 对比")
 const claudeCodeSystemPrompt = "You are Claude Code, Anthropic's official CLI for Claude."
 
 // isHaikuRequest checks the body's "model" field for a haiku marker. WAF
@@ -267,8 +273,9 @@ func injectCodexOAuth(req *http.Request, cred *OAuthCredential) {
 // injectKimiOAuth injects Kimi (Moonshot) headers.
 //
 // Verified 2026-04-15:
-//   Without X-Msh-Platform + KimiCLI UA → 403 "only available for Coding Agents"
-//   With headers → 200 success
+//
+//	Without X-Msh-Platform + KimiCLI UA → 403 "only available for Coding Agents"
+//	With headers → 200 success
 //
 // Why inject-if-absent: Kimi CLI may update its platform tag or UA version.
 // Preserving CLI-set values ensures forward compatibility.
@@ -316,20 +323,6 @@ func injectMetadataUserIDIfAbsent(req *http.Request, userID string) {
 	})
 }
 
-// injectMetadataUserID reads the request body JSON and injects/overwrites
-// metadata.user_id.
-func injectMetadataUserID(req *http.Request, userID string) {
-	mutateJSONBody(req, func(body map[string]any) bool {
-		metadata, ok := body["metadata"].(map[string]any)
-		if !ok {
-			metadata = make(map[string]any)
-		}
-		metadata["user_id"] = userID
-		body["metadata"] = metadata
-		return true
-	})
-}
-
 // mutateJSONBody applies `mutate` to the request's JSON body.
 // `mutate` returns true if the body was changed (re-marshal required),
 // false to keep the original body.
@@ -351,7 +344,7 @@ func mutateJSONBody(req *http.Request, mutate func(body map[string]any) bool) {
 	req.Body.Close()
 
 	var body map[string]any
-	if err := json.Unmarshal(bodyBytes, &body); err != nil {
+	if jErr := json.Unmarshal(bodyBytes, &body); jErr != nil {
 		// Not JSON — restore original body unchanged
 		setRequestBody(req, bodyBytes)
 		return
@@ -372,11 +365,14 @@ func mutateJSONBody(req *http.Request, mutate func(body map[string]any) bool) {
 	setRequestBody(req, newBody)
 }
 
-// generateUUID generates a random UUID v4.
-func generateUUID() string {
+// generateUUID generates a random UUID v4. It returns an error if the system
+// CSPRNG fails so callers never silently fall back to a non-random identifier.
+func generateUUID() (string, error) {
 	b := make([]byte, 16)
-	rand.Read(b)
+	if _, err := rand.Read(b); err != nil {
+		return "", fmt.Errorf("generate uuid: %w", err)
+	}
 	b[6] = (b[6] & 0x0f) | 0x40 // version 4
 	b[8] = (b[8] & 0x3f) | 0x80 // variant bits
-	return fmt.Sprintf("%08x-%04x-%04x-%04x-%012x", b[0:4], b[4:6], b[6:8], b[8:10], b[10:])
+	return fmt.Sprintf("%08x-%04x-%04x-%04x-%012x", b[0:4], b[4:6], b[6:8], b[8:10], b[10:]), nil
 }

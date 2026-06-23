@@ -44,8 +44,8 @@ type rule struct {
 
 // fingerprintFile mirrors the on-disk YAML schema.
 type fingerprintFile struct {
-	Rules        []rule `yaml:"rules"`
 	FallbackSlug string `yaml:"fallback_slug"`
+	Rules        []rule `yaml:"rules"`
 }
 
 // Matcher resolves a raw User-Agent header to an app_slug.
@@ -54,8 +54,8 @@ type fingerprintFile struct {
 // concurrent use. Callers should reuse a single Matcher per process
 // (see Default).
 type Matcher struct {
-	rules    []rule
 	fallback string
+	rules    []rule
 }
 
 // Match returns the app_slug for the given raw User-Agent header.

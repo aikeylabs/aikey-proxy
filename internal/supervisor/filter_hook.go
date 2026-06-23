@@ -14,7 +14,7 @@
 // Three outcomes (see installFilterHook):
 //  1. No filter declared    → no hook, normal serving (zero cost).
 //  2. Binary resolvable      → spawn. Success → real dispatch.
-//                              Spawn failure → fail-loud 501 (anti-example F).
+//     Spawn failure → fail-loud 501 (anti-example F).
 //  3. Declared but no binary → fail-loud 501 (can't honor declaration).
 package supervisor
 
@@ -193,7 +193,7 @@ func (s *Supervisor) installFilterHook(p *proxy.Proxy, vaultReader *vault.Reader
 	m := filterWorkerCount()
 	workers := make([]*apphook.ChildHook, m)
 	for i := range workers {
-		workers[i] = apphook.NewChildHook(cfg)
+		workers[i] = apphook.NewChildHook(&cfg)
 	}
 	pool := apphook.NewFilterPool("ai-compliance-detector", workers)
 	if err := pool.Start(s.ctx); err != nil {
@@ -299,7 +299,7 @@ func (s *Supervisor) appsDir() string {
 // and its slug, or ("","") if none. Pure (filesystem only) — unit-testable with
 // a temp dir. The slug lets the caller read per-app vault config (e.g.
 // filter_record_allow) for the binary it actually resolved.
-func resolveAppBinary(appsDir string, slugs []string) (bin string, slug string) {
+func resolveAppBinary(appsDir string, slugs []string) (bin, slug string) {
 	for _, s := range slugs {
 		b := filepath.Join(appsDir, s, "bin", s)
 		if fi, err := os.Stat(b); err == nil && !fi.IsDir() {
@@ -401,7 +401,7 @@ func filterReadyTimeout() time.Duration {
 }
 
 // filterWorkersEnv sets M, the number of independent detector PROCESSES the pool
-// spawns. Default 1 (Personal/Trial — behaviour unchanged). Production sets 2 for
+// spawns. Default 1 (Personal/Trial — behavior unchanged). Production sets 2 for
 // cross-process fault isolation. K (goroutines per process) is a separate knob,
 // AIKEY_COMPLIANCE_WORKERS, read by the detector itself (inherited from the proxy
 // env).

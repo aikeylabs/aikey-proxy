@@ -38,9 +38,9 @@ const (
 // Threshold is one tier of a Rule (design §5.6). Carried through for Stage 3; the
 // proxy doesn't act on it in Stage 2.
 type Threshold struct {
-	Pct    int            `json:"pct"`
-	Action string         `json:"action"`
 	Config map[string]any `json:"config,omitempty"`
+	Action string         `json:"action"`
+	Pct    int            `json:"pct"`
 }
 
 // Rule is one (metric, period) limit with tiered thresholds. Mirrors the
@@ -48,8 +48,8 @@ type Threshold struct {
 type Rule struct {
 	Metric      string      `json:"metric"`
 	Period      string      `json:"period"`
-	LimitAmount float64     `json:"limit_amount"`
 	Thresholds  []Threshold `json:"thresholds"`
+	LimitAmount float64     `json:"limit_amount"`
 }
 
 // Baseline is the control-reported current-period used for one (metric, period)
@@ -89,8 +89,8 @@ type ModelUnitPrices struct {
 // the CLI in the vault `config` table (quotaPriceSummaryKey), loaded here. P6 only
 // LOADS + holds it; P7 consumes it for enforcement.
 type PriceSummary struct {
-	Version string                     `json:"version"`
 	Models  map[string]ModelUnitPrices `json:"models"`
+	Version string                     `json:"version"`
 }
 
 // quotaPriceSummaryKey mirrors aikey-cli storage_platform.rs QUOTA_PRICE_SUMMARY_KEY.
@@ -100,11 +100,11 @@ const quotaPriceSummaryKey = "quota.price_summary"
 // Read under RLock; replaced wholesale under Lock (gen-swap — mirrors
 // vkeys.Registry.ReplaceAll so a 5s sync never tears a concurrent read).
 type Snapshot struct {
-	mu           sync.RWMutex
-	subjects     map[string]*Subject // subject_id → subject
-	seatToGroups map[string][]string // seat_id → [group subject_id...]
-	priceSummary *PriceSummary       // D-U8/P6: edge prices for local usd pricing (P7)
-	lastReachableAt time.Time         // D-U7/P9: proxy's last TRAFFIC-INDEPENDENT confirmation the server is reachable (heartbeat probe, pkg/heartbeat) — freshness for budget-mode staleness; zero = never confirmed (treated as fresh, not infinitely stale)
+	lastReachableAt time.Time           // D-U7/P9: proxy's last TRAFFIC-INDEPENDENT confirmation the server is reachable (heartbeat probe, pkg/heartbeat) — freshness for budget-mode staleness; zero = never confirmed (treated as fresh, not infinitely stale)
+	subjects        map[string]*Subject // subject_id → subject
+	seatToGroups    map[string][]string // seat_id → [group subject_id...]
+	priceSummary    *PriceSummary       // D-U8/P6: edge prices for local usd pricing (P7)
+	mu              sync.RWMutex
 }
 
 // NewSnapshot returns an empty snapshot (safe to read before the first load).

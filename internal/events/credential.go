@@ -86,38 +86,32 @@ const refreshSkewBeforeExpiry = 5 * time.Minute
 // (single time comparison) and the refresh path runs at most once per
 // access lifetime in practice (7 days × Bearer() call rate).
 type RefreshableJWT struct {
-	mu sync.Mutex
-
-	// AccessToken is the current short-lived bearer. Read on every
-	// Bearer() call; rewritten in-place after a successful refresh.
-	AccessToken string
-
-	// RefreshToken is the long-lived token used to mint new access
-	// tokens. proxy reads this once at startup (from vault) and keeps
-	// it in-memory for the lifetime of the process. We deliberately
-	// do NOT persist refresh_token rotations back to user.yaml —
-	// rotation lands in vault via the CLI on next login.
-	RefreshToken string
-
 	// ExpiresAt is the unix time at which AccessToken stops being
 	// valid. We refresh when (ExpiresAt - now) < refreshSkewBeforeExpiry.
 	ExpiresAt time.Time
-
-	// RefreshURL is the absolute URL the refresh POST hits. Resolved at
-	// config-load time from the collector_routes.team URL (e.g.
-	// https://control.example.com/v1/auth/cli/token/refresh).
-	RefreshURL string
-
 	// HTTPClient lets tests inject a stubbed client. Nil means use the
 	// package default (10-second-timeout http.Client).
 	HTTPClient *http.Client
-
 	// PersistFn is called after each successful refresh with the new
 	// access_token and expires_at. Best-effort — failures are logged
 	// but don't fail the Bearer() call. Used to write the new
 	// access_token back to aikey-user.yaml so a proxy restart picks up
 	// the post-refresh state instead of re-running refresh immediately.
 	PersistFn func(accessToken string, expiresAt time.Time) error
+	// AccessToken is the current short-lived bearer. Read on every
+	// Bearer() call; rewritten in-place after a successful refresh.
+	AccessToken string
+	// RefreshToken is the long-lived token used to mint new access
+	// tokens. proxy reads this once at startup (from vault) and keeps
+	// it in-memory for the lifetime of the process. We deliberately
+	// do NOT persist refresh_token rotations back to user.yaml —
+	// rotation lands in vault via the CLI on next login.
+	RefreshToken string
+	// RefreshURL is the absolute URL the refresh POST hits. Resolved at
+	// config-load time from the collector_routes.team URL (e.g.
+	// https://control.example.com/v1/auth/cli/token/refresh).
+	RefreshURL string
+	mu         sync.Mutex
 }
 
 // Bearer returns a token guaranteed to have at least refreshSkewBeforeExpiry
@@ -176,10 +170,10 @@ func (j *RefreshableJWT) Bearer(ctx context.Context) (string, error) {
 // workflow/CI/bugfix/2026-06-03-team-usage-refresh-contract-mismatch.md.
 type refreshResponse struct {
 	AccessToken string `json:"access_token"`
-	ExpiresIn   int64  `json:"expires_in"`
 	// Server MAY rotate the refresh token. When present we accept it
 	// in-memory but do NOT persist (see RefreshToken docstring).
 	RefreshToken string `json:"refresh_token,omitempty"`
+	ExpiresIn    int64  `json:"expires_in"`
 }
 
 // refreshRequest body — keep small and JWT-style so the same endpoint

@@ -26,17 +26,16 @@ import (
 // receives. Default behavior is "well behaved"; the tests use the
 // options below to make it misbehave (panic, sleep, retain payload).
 type recordingObserver struct {
-	mu         sync.Mutex
-	startCount int
-	endCount   int
-	payloads   [][]byte // copies kept by the observer — used by the aliasing test
-	latencies  []int
-
+	beforeEvent  func()   // arbitrary hook before each OnSSEEvent
+	payloads     [][]byte // copies kept by the observer — used by the aliasing test
+	latencies    []int
+	startCount   int
+	endCount     int
+	sleepOnEvent time.Duration // sleep this long inside OnSSEEvent
+	mu           sync.Mutex
 	// behavior knobs
-	panicEveryEvent bool          // panic on every OnSSEEvent
-	panicOnStart    bool          // panic on OnRequestStart
-	sleepOnEvent    time.Duration // sleep this long inside OnSSEEvent
-	beforeEvent     func()        // arbitrary hook before each OnSSEEvent
+	panicEveryEvent bool // panic on every OnSSEEvent
+	panicOnStart    bool // panic on OnRequestStart
 }
 
 func (r *recordingObserver) OnRequestStart(ctx context.Context, req *RequestContext) {
@@ -106,7 +105,7 @@ func makeRegistry(t *testing.T, obs *recordingObserver) *Registry {
 		// pre-date stream routing, so AllStreams() would also work; the
 		// narrower [StreamAppPipeline] is intentional — it exercises the
 		// "happy path stream match" rather than the wildcard case.
-		Streams:      []string{StreamAppPipeline},
+		Streams: []string{StreamAppPipeline},
 		Build: func(cfg map[string]any) (StreamingObserver, error) {
 			return obs, nil
 		},
@@ -380,10 +379,10 @@ func TestBuildObservers_BuildErrorDoesNotPropagate(t *testing.T) {
 // ---------------------------------------------------------------------------
 
 type fakeVault struct {
-	hasRecord    bool
-	activeTokens int
 	recErr       error
 	tokenErr     error
+	activeTokens int
+	hasRecord    bool
 }
 
 type fakeRecord struct{ slug string }
@@ -406,15 +405,15 @@ func (f *fakeVault) GetActiveAppKeysForSlug(slug string) (int, error) {
 
 func TestDefaultVaultEnableCheck(t *testing.T) {
 	tests := []struct {
-		name string
 		v    *fakeVault
+		name string
 		want bool
 	}{
-		{"app missing", &fakeVault{hasRecord: false}, false},
-		{"app present, no active keys", &fakeVault{hasRecord: true, activeTokens: 0}, false},
-		{"app present + 1 active key", &fakeVault{hasRecord: true, activeTokens: 1}, true},
-		{"app lookup error", &fakeVault{recErr: errors.New("db down")}, false},
-		{"token count error", &fakeVault{hasRecord: true, tokenErr: errors.New("db down")}, false},
+		{name: "app missing", v: &fakeVault{hasRecord: false}, want: false},
+		{name: "app present, no active keys", v: &fakeVault{hasRecord: true, activeTokens: 0}, want: false},
+		{name: "app present + 1 active key", v: &fakeVault{hasRecord: true, activeTokens: 1}, want: true},
+		{name: "app lookup error", v: &fakeVault{recErr: errors.New("db down")}, want: false},
+		{name: "token count error", v: &fakeVault{hasRecord: true, tokenErr: errors.New("db down")}, want: false},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
@@ -664,18 +663,18 @@ func TestRequestContext_MetadataJSON_ContainsExpectedFields(t *testing.T) {
 		t.Fatalf("returned bytes must be valid JSON: %v\nraw: %s", err, raw)
 	}
 	for k, want := range map[string]any{
-		"v":                float64(1),
-		"trace_id":         "trace-xyz",
-		"stream":           "user_chat",
-		"provider":         "anthropic",
-		"alias":            "FreySilvaqzs@qualityservice.com",
-		"app_slug":         "compliance-guard",
-		"app_key_id":       "uuid-app-1",
-		"app_mode":         "isolated",
-		"requested_model":  "claude-sonnet-4-6",
-		"resolved_model":   "claude-sonnet-4-6-20251001",
-		"session_id":       "sess-1",
-		"protocol_family":  "anthropic",
+		"v":                  float64(1),
+		"trace_id":           "trace-xyz",
+		"stream":             "user_chat",
+		"provider":           "anthropic",
+		"alias":              "FreySilvaqzs@qualityservice.com",
+		"app_slug":           "compliance-guard",
+		"app_key_id":         "uuid-app-1",
+		"app_mode":           "isolated",
+		"requested_model":    "claude-sonnet-4-6",
+		"resolved_model":     "claude-sonnet-4-6-20251001",
+		"session_id":         "sess-1",
+		"protocol_family":    "anthropic",
 		"started_at_unix_ms": float64(1716200000 * 1000),
 	} {
 		if got[k] != want {

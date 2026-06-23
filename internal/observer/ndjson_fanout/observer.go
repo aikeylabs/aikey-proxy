@@ -70,18 +70,18 @@ type observerSubscription struct {
 // V=1 fixes the wire format; bumps require coordinated subscriber
 // update.
 type Event struct {
-	V         int    `json:"v"`
 	Stream    string `json:"stream"`
 	TraceID   string `json:"trace_id"`
-	TS        int64  `json:"ts_unix_ms"`
 	Provider  string `json:"provider,omitempty"`
 	Alias     string `json:"alias,omitempty"`
 	AppSlug   string `json:"app_slug,omitempty"`
 	AppKeyID  string `json:"app_key_id,omitempty"`
 	Model     string `json:"model,omitempty"`
+	Status    string `json:"status,omitempty"` // "ok" | "ended" | ...
+	V         int    `json:"v"`
+	TS        int64  `json:"ts_unix_ms"`
 	NChunks   int    `json:"n_chunks,omitempty"`
 	LatencyMs int    `json:"latency_ms,omitempty"`
-	Status    string `json:"status,omitempty"` // "ok" | "ended" | ...
 }
 
 // EventFromContext builds the metadata Event for one request from the
@@ -117,27 +117,24 @@ func EventFromContext(req *observer.RequestContext, nChunks, latencyMs int, stat
 // keyed by TraceID.
 type fanoutObserver struct {
 	logger *slog.Logger
-
-	// baseDir is the on-disk root for per-subscriber files. Default
-	// `~/.aikey/data/observers/`; overrideable via Build cfg for tests.
-	baseDir string
-
 	// routing maps stream name → list of (slug, file handle) for active
 	// subscribers. Built once at Build time; never mutated afterwards
 	// (no runtime subscriber refresh in MVP).
 	routing map[string][]*writerEntry
-
+	state   map[string]*requestState
+	// baseDir is the on-disk root for per-subscriber files. Default
+	// `~/.aikey/data/observers/`; overrideable via Build cfg for tests.
+	baseDir string
 	// state tracks per-request running counters between OnRequestStart
 	// and OnRequestEnd. Keyed by TraceID.
 	stateMu sync.Mutex
-	state   map[string]*requestState
 }
 
 type writerEntry struct {
+	file   *os.File
 	slug   string
 	path   string
 	muFile sync.Mutex // serialize writes to a single file handle
-	file   *os.File
 }
 
 type requestState struct {

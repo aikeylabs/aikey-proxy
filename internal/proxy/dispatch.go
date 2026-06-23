@@ -185,8 +185,9 @@ func ClassifyToken(token string) DispatchAction {
 // the two would silently produce wrong behavior (a provider added to the
 // default-base-URL switch but missing here would reject valid probe_raw
 // tokens). Single source of truth via grep gate in CI:
-//   `grep -A2 "case \"" middleware.go::providerDefaultBaseURL | grep "case"`
-//   must produce same set as keys of canonicalProviderCodes.
+//
+//	`grep -A2 "case \"" middleware.go::providerDefaultBaseURL | grep "case"`
+//	must produce same set as keys of canonicalProviderCodes.
 var canonicalProviderCodes = map[string]struct{}{
 	"anthropic":   {},
 	"openai":      {},

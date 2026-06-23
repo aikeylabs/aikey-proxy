@@ -49,8 +49,8 @@ func TestEnforcerTokenLimitBlocksNextRequest(t *testing.T) {
 
 	// accrue 60 then 50 (the crossing request is allowed; total 110 >= 100)
 	e.Add(buckets, 60)
-	if _, v := e.Check("seat-a", fixedNow); v != nil {
-		t.Fatalf("at 60/100: want allow, got %+v", v)
+	if _, v2 := e.Check("seat-a", fixedNow); v2 != nil {
+		t.Fatalf("at 60/100: want allow, got %+v", v2)
 	}
 	e.Add(buckets, 50)
 

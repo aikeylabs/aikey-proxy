@@ -14,7 +14,7 @@ import (
 // but each completes).
 func TestChildHook_ListPacks(t *testing.T) {
 	binary := findDetectorBinary(t)
-	h := NewChildHook(ChildHookConfig{
+	h := NewChildHook(&ChildHookConfig{
 		Name:         "ai-compliance-detector-listpacks-test",
 		BinaryPath:   binary,
 		Timeout:      2 * time.Second,

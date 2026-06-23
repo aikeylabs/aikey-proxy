@@ -36,17 +36,15 @@ const (
 // internal channel is full. ERROR/FATAL callers should call Flush to drain
 // the queue before exiting.
 type AsyncWriter struct {
-	ch     chan []byte   // serialized log lines
-	done   chan struct{} // closed when the writer goroutine exits
-	urgent chan struct{} // non-blocking signal: drain now
-
-	mu      sync.Mutex
-	file    *os.File
-	written int64 // bytes written to the current file
-
+	ch       chan []byte   // serialized log lines
+	done     chan struct{} // closed when the writer goroutine exits
+	urgent   chan struct{} // non-blocking signal: drain now
+	file     *os.File
 	dir      string
+	written  int64 // bytes written to the current file
 	maxSize  int64
 	maxFiles int
+	mu       sync.Mutex
 }
 
 // NewAsyncWriter creates and starts an AsyncWriter that appends to

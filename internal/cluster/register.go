@@ -9,6 +9,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log/slog"
 	"net/http"
@@ -24,19 +25,18 @@ var errUnknownNode = fmt.Errorf("hub does not know this node")
 
 // Registrar keeps this proxy node registered + alive in the hub name service.
 type Registrar struct {
-	hubURL       string
-	nodeID       string
-	nodeAddr     string
-	weight       int
-	serviceToken string // R1: Bearer token for the hub's gated /cluster/* endpoints
-	client       *http.Client
-	interval     time.Duration // adopted from the hub's register response
-
+	client *http.Client
 	// healthFn, when set, supplies the optional `health` heartbeat field
 	// (P0-B): node-local health (daemon sync status + proxy metrics) rides
 	// the existing heartbeat so it becomes externally visible with zero new
 	// ports/auth. nil ⇒ bare heartbeat (old wire shape, hub accepts both).
-	healthFn func() map[string]any
+	healthFn     func() map[string]any
+	hubURL       string
+	nodeID       string
+	nodeAddr     string
+	serviceToken string // R1: Bearer token for the hub's gated /cluster/* endpoints
+	weight       int
+	interval     time.Duration // adopted from the hub's register response
 }
 
 // NewRegistrar builds a Registrar. weight < 1 is normalized to 1. serviceToken
@@ -144,7 +144,7 @@ func (r *Registrar) Run(ctx context.Context) {
 			return
 		case <-ticker.C:
 			switch err := r.heartbeat(ctx); {
-			case err == errUnknownNode:
+			case errors.Is(err, errUnknownNode):
 				slog.Warn("cluster: hub lost this node; re-registering")
 				if rerr := r.register(ctx); rerr != nil {
 					slog.Warn("cluster: re-register failed", "error", rerr)

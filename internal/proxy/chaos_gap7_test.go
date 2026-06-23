@@ -64,7 +64,7 @@ func holdConcurrentStreams(t *testing.T, n, bodySize int) (perStream float64, bo
 		baseEvent := events.UsageEvent{Timestamp: time.Now()}
 		// nil collector → probe path, no store needed; the acc accumulation is
 		// identical regardless of collector.
-		d := newStreamDrainer(pr, baseEvent, &provider.Anthropic{}, nil,
+		d := newStreamDrainer(pr, &baseEvent, &provider.Anthropic{}, nil,
 			context.Background(), context.Background(), nil, nil, nil, nil)
 		drainers[i] = d
 		// Drain the client side so the drainer's pw.Write never blocks; bytes are

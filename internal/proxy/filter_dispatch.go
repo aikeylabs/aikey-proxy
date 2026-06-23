@@ -47,11 +47,11 @@ import (
 const pipeInputCap = 16 * 1024
 
 // capRuneBoundary returns the largest byte offset ≤ cap on a UTF-8 rune boundary.
-func capRuneBoundary(s string, cap int) int {
-	if cap >= len(s) {
+func capRuneBoundary(s string, limit int) int {
+	if limit >= len(s) {
 		return len(s)
 	}
-	b := cap
+	b := limit
 	for b > 0 && !utf8.RuneStart(s[b]) {
 		b--
 	}
@@ -314,11 +314,26 @@ func (p *Proxy) applyInboundFilter(
 			logger.Info("filter: content warned (passed through)",
 				"event.name", "proxy.filter.warned", "reason", resp.Reason)
 
-		default: // ActionAllow (incl. degraded fail-open)
+		case apphook.ActionAllow: // incl. degraded fail-open
 			if resp.Degraded {
 				degraded = true
 				selfDeg++
 			}
+
+		default:
+			// Unknown / future Action value. childhook converts the child's raw
+			// wire byte straight to Action (childhook.go), so a misbehaving child
+			// or a protocol version skew can yield a value outside the known set.
+			// Fail-OPEN per §6 #11 (a detector anomaly must not block traffic),
+			// but surface it LOUDLY (失败要显眼) and count it as degraded so it is
+			// visible in metrics/alerts and never silently treated as a clean
+			// Allow verdict. Without this the request would slip through unscanned
+			// with zero signal (regression guarded by 2026-06-22 review).
+			logger.Warn("filter: unknown apphook action; forwarding as degraded fail-open",
+				"event.name", "proxy.filter.unknown_action",
+				"action", int(resp.Action), "reason", resp.Reason)
+			degraded = true
+			selfDeg++
 		}
 	}
 

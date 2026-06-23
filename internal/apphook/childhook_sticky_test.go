@@ -23,7 +23,7 @@ func TestChildHook_NoStickyPacketsUnderRapidFire(t *testing.T) {
 
 	binary := findDetectorBinary(t)
 
-	h := NewChildHook(ChildHookConfig{
+	h := NewChildHook(&ChildHookConfig{
 		Name:         "ai-compliance-detector-sticky-test",
 		BinaryPath:   binary,
 		BinaryArgs:   detectorArgs(), // --echo-only, always returns Allow
@@ -92,7 +92,7 @@ func TestChildHook_ConcurrentDetectIsSerialized(t *testing.T) {
 
 	binary := findDetectorBinary(t)
 
-	h := NewChildHook(ChildHookConfig{
+	h := NewChildHook(&ChildHookConfig{
 		Name:         "ai-compliance-detector-concurrent-test",
 		BinaryPath:   binary,
 		BinaryArgs:   detectorArgs(),

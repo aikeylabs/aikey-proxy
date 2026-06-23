@@ -9,7 +9,7 @@
 // process) is the cost — paid only when M>1 (Production), where servers have RAM.
 //
 // Total parallelism = M processes × K goroutines-per-process. Personal/Trial run
-// M=1 (this pool degenerates to a single ChildHook, behaviour unchanged).
+// M=1 (this pool degenerates to a single ChildHook, behavior unchanged).
 package apphook
 
 import (
@@ -58,7 +58,7 @@ func (p *FilterPool) pick() *ChildHook {
 		return p.workers[0]
 	}
 	i := p.next.Add(1)
-	return p.workers[int(i%uint64(len(p.workers)))]
+	return p.workers[i%uint64(len(p.workers))]
 }
 
 // Detect implements Hook — routes to the next worker round-robin.

@@ -43,7 +43,7 @@ func TestReporter_RetryableFailure_WALDrivenRetry(t *testing.T) {
 	defer srv.Close()
 
 	walDir := t.TempDir()
-	reporter, err := NewReporter(ReporterConfig{
+	reporter, err := NewReporter(&ReporterConfig{
 		CollectorURL: srv.URL,
 		WALDir:       walDir,
 		BatchSize:    10,
@@ -59,7 +59,7 @@ func TestReporter_RetryableFailure_WALDrivenRetry(t *testing.T) {
 
 	const n = 3
 	for i := 0; i < n; i++ {
-		reporter.Report(ReportableEvent{
+		reporter.Report(&ReportableEvent{
 			EventID:       "e" + string(rune('0'+i)),
 			OrgID:         "org1",
 			EventTime:     aikeytime.Now(),

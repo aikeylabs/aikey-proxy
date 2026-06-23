@@ -16,8 +16,10 @@ import (
 
 // ContentReporterConfig configures the conversation-audit content reporter.
 type ContentReporterConfig struct {
-	CollectorURL string // team collector base URL (control-master :3000 ingress)
 	Credential   Credential
+	SeqAlloc     *SeqAllocator // content stream reserve-ahead allocator (nil → omit allocated_seq)
+	HTTPClient   *http.Client
+	CollectorURL string // team collector base URL (control-master :3000 ingress)
 	// CollectorToken is the legacy static bearer used when Credential is nil —
 	// MIRRORS the usage Reporter. Cluster worker nodes have NO per-route
 	// "team" credential (no Personal vault/login); they authenticate the
@@ -29,8 +31,6 @@ type ContentReporterConfig struct {
 	ProxyInstanceID string
 	UploadInterval  time.Duration
 	BatchSize       int
-	SeqAlloc        *SeqAllocator // content stream reserve-ahead allocator (nil → omit allocated_seq)
-	HTTPClient      *http.Client
 }
 
 // contentBatchRequest / contentBatchResponse mirror the collector
@@ -38,19 +38,19 @@ type ContentReporterConfig struct {
 // shape, not Go types — Records are the raw conversation-record JSONs the capture
 // hook marshaled into the WAL, forwarded verbatim.
 type contentBatchRequest struct {
+	AllocatedSeq    *int64            `json:"allocated_seq,omitempty"`
 	Source          string            `json:"source"`
 	SourceVersion   string            `json:"source_version,omitempty"`
 	ProxyInstanceID string            `json:"proxy_instance_id,omitempty"`
 	Records         []json.RawMessage `json:"records"`
-	AllocatedSeq    *int64            `json:"allocated_seq,omitempty"`
 }
 
 type contentBatchResponse struct {
+	ContiguousSeq map[string]int64 `json:"contiguous_seq,omitempty"`
 	Accepted      int              `json:"accepted"`
 	Duplicated    int              `json:"duplicated"`
 	Quarantined   int              `json:"quarantined"`
 	Rejected      int              `json:"rejected"`
-	ContiguousSeq map[string]int64 `json:"contiguous_seq,omitempty"`
 }
 
 // ContentReporter is the conversation-audit content WAL-as-outbox pump — SEPARATE
@@ -65,24 +65,23 @@ type contentBatchResponse struct {
 // (org,event_id) dedup absorbs the overlap). Terminal (4xx) drops the batch
 // (advances sentSeq, no retry) — the gap is server-detectable via source_seq.
 type ContentReporter struct {
-	cfg ContentReporterConfig
-	wal *ContentWAL
-
-	mu                  sync.Mutex
-	sentSeq             map[string]int64
-	confirmedSeq        map[string]int64
-	consecutiveFailures int
 	nextUploadAttempt   time.Time
 	lastOKUploadAt      time.Time
-
-	signal chan struct{}
-	done   chan struct{}
-	wg     sync.WaitGroup
+	wal                 *ContentWAL
+	sentSeq             map[string]int64
+	confirmedSeq        map[string]int64
+	signal              chan struct{}
+	done                chan struct{}
+	cfg                 ContentReporterConfig
+	wg                  sync.WaitGroup
+	consecutiveFailures int
+	mu                  sync.Mutex
 }
 
 // NewContentReporter builds the content reporter. Defaults: 5s interval, 100/batch,
 // 30s HTTP timeout.
-func NewContentReporter(cfg ContentReporterConfig, wal *ContentWAL) *ContentReporter {
+func NewContentReporter(in *ContentReporterConfig, wal *ContentWAL) *ContentReporter {
+	cfg := *in // local copy so default-fills never mutate the caller's value
 	if cfg.UploadInterval <= 0 {
 		cfg.UploadInterval = 5 * time.Second
 	}

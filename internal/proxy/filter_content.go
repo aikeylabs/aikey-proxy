@@ -25,8 +25,8 @@ import "encoding/json"
 // contentPiece is one maskable text value located in the request envelope,
 // paired with a setter that writes a replacement back into the parsed structure.
 type contentPiece struct {
-	text    string
 	setText func(string)
+	text    string
 }
 
 // extractFilterableContent parses an LLM request body and returns the maskable

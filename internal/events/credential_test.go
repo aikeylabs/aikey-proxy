@@ -63,10 +63,10 @@ func TestRefreshableJWT_Bearer_ReturnsAccessWhenFresh(t *testing.T) {
 // control-service's POST /v1/auth/cli/token/refresh. callCount lets tests assert
 // "refresh was actually hit" / "refresh ran exactly once".
 type refreshServerSpy struct {
-	calls    atomic.Int32
-	respFn   func(req refreshRequest) (refreshResponse, int)
+	respFn                func(req refreshRequest) (refreshResponse, int)
 	receivedRefreshTokens []string
-	mu       sync.Mutex
+	mu                    sync.Mutex
+	calls                 atomic.Int32
 }
 
 func newRefreshServer(t *testing.T, respFn func(req refreshRequest) (refreshResponse, int)) (*httptest.Server, *refreshServerSpy) {

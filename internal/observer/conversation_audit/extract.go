@@ -62,7 +62,7 @@ func extractPrompt(protocolFamily string, body []byte) (userText, systemText, mo
 // frame, or "" when the frame carries no text (control frames, usage frames,
 // the [DONE] sentinel). Called once per frame in OnSSEEvent; the observer
 // concatenates the non-empty results.
-func extractAssistantDelta(protocolFamily, eventType string, payload []byte) string {
+func extractAssistantDelta(protocolFamily, eventType string, payload []byte) string { //nolint:unparam // eventType kept for symmetry with isCompletionMarker + future event-type-aware extraction
 	if len(payload) == 0 {
 		return ""
 	}

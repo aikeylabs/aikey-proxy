@@ -265,7 +265,7 @@ proxychains4 ./bin/aikey-proxy --config aikey-proxy.yaml
 |----------|--------------------|
 | Clash for Windows (HTTP) | `upstream_proxy.url: http://127.0.0.1:7890` |
 | Clash SOCKS5 | `upstream_proxy.url: socks5://127.0.0.1:7891` |
-| System VPN (all traffic tunnelled) | No config needed — works transparently |
+| System VPN (all traffic tunneled) | No config needed — works transparently |
 | proxychains on Linux | Run with `proxychains4`, no config needed |
 
 ## Admin API

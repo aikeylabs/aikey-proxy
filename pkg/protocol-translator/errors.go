@@ -22,34 +22,29 @@ type TranslateError struct {
 	// dashboards / alert rules can pattern-match on it. See the const
 	// block below for the enumeration.
 	Code string
-
 	// Upstream is the original provider error code, when one exists
 	// (e.g. Anthropic's `invalid_request_error` / `rate_limit_error`).
 	// Empty for errors AiKey detected before forwarding.
 	Upstream string
-
-	// HTTPStatus is the status code the App pipeline writes to the
-	// client. MUST be set; default zero is invalid.
-	HTTPStatus int
-
 	// Message is the user-facing English string. Pairs SHOULD include
 	// enough context to help a developer debug (which field failed,
 	// what was expected) without leaking secrets (no body bytes, no
 	// bearer tokens).
 	Message string
-
+	// Param names the specific request parameter that caused the error,
+	// when known (e.g. "messages", "tool_choice"). Surfaces in the
+	// OpenAI error response's `param` field, which standard SDKs render
+	// in their error messages. Empty when not applicable.
+	Param string
+	// HTTPStatus is the status code the App pipeline writes to the
+	// client. MUST be set; default zero is invalid.
+	HTTPStatus int
 	// Retriable hints whether the client should retry the request as-is.
 	// True for transient upstream conditions (5xx, 429); false for
 	// permanent failures (malformed request body, validation errors).
 	// Pairs that don't differentiate set false (safer default — don't
 	// loop forever on permanent errors).
 	Retriable bool
-
-	// Param names the specific request parameter that caused the error,
-	// when known (e.g. "messages", "tool_choice"). Surfaces in the
-	// OpenAI error response's `param` field, which standard SDKs render
-	// in their error messages. Empty when not applicable.
-	Param string
 }
 
 // Error implements the standard `error` interface so TranslateError can

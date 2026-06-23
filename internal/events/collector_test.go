@@ -26,7 +26,7 @@ func TestCollectorRecord_BufferFull_DropsLoudly(t *testing.T) {
 	c := &Collector{ch: make(chan UsageEvent, 1)}
 	c.ch <- UsageEvent{} // occupy the only slot
 
-	c.Record(UsageEvent{
+	c.Record(&UsageEvent{
 		TraceID: "trace-abc", SpanID: "span-1", RequestID: "req-9",
 		VirtualKeyID: "vk_test", Provider: "anthropic", Model: "claude-x",
 		SessionID: "sess-7",
@@ -72,7 +72,7 @@ func TestCollectorRecord_HappyPath_NoDropNoWarn(t *testing.T) {
 	t.Cleanup(func() { slog.SetDefault(prev) })
 
 	c := &Collector{ch: make(chan UsageEvent, 4)}
-	c.Record(UsageEvent{VirtualKeyID: "vk_ok"})
+	c.Record(&UsageEvent{VirtualKeyID: "vk_ok"})
 
 	if got := c.Metrics().Dropped; got != 0 {
 		t.Errorf("Metrics().Dropped = %d, want 0", got)

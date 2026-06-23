@@ -40,32 +40,30 @@ type CanaryConfig struct {
 // ReportableEvent.EventTime, so downstream diagnostics consumers
 // don't need a second format parser (bugfix 20260424).
 type CanaryResult struct {
-	EventID       string           `json:"event_id"`
-	SentAt        aikeytime.Millis `json:"sent_at"`
-	ODSReceived   bool             `json:"ods_received"`
-	DWDProjected  bool             `json:"dwd_projected"`
-	QueryReadable bool             `json:"query_readable"`
-	Status        string           `json:"status"`       // "ok" | "partial" | "failed" | "unavailable"
-	FailedStage   string           `json:"failed_stage"` // "" | "ingest" | "projection" | "query" | "diagnostics_unreachable"
-	RoundTripMs   int64            `json:"round_trip_ms"`
+	EventID     string           `json:"event_id"`
+	Status      string           `json:"status"`       // "ok" | "partial" | "failed" | "unavailable"
+	FailedStage string           `json:"failed_stage"` // "" | "ingest" | "projection" | "query" | "diagnostics_unreachable"
+	SentAt      aikeytime.Millis `json:"sent_at"`
+	RoundTripMs int64            `json:"round_trip_ms"`
 	// ConsecutiveFailures surfaces the pipeline-failure streak so it's
 	// externally readable via /metrics (health-signal-surface: canary streak
 	// must not stay log-only — a sustained streak means the pipeline is broken
 	// while everything else "looks fine"). Optional/additive field; "unavailable"
 	// outcomes do NOT increment it (that's an intentional separate semantic).
-	ConsecutiveFailures int `json:"consecutive_failures"`
+	ConsecutiveFailures int  `json:"consecutive_failures"`
+	ODSReceived         bool `json:"ods_received"`
+	DWDProjected        bool `json:"dwd_projected"`
+	QueryReadable       bool `json:"query_readable"`
 }
 
 // CanaryProbe sends periodic synthetic events through the pipeline and verifies arrival.
 type CanaryProbe struct {
-	reporter *Reporter
-	cfg      CanaryConfig
-	client   *http.Client
-	done     chan struct{}
-	wg       sync.WaitGroup
-
-	mu                  sync.RWMutex
+	reporter            *Reporter
+	client              *http.Client
+	done                chan struct{}
+	cfg                 CanaryConfig
 	lastResult          CanaryResult
+	wg                  sync.WaitGroup
 	consecutiveFailures int
 	// consecutiveUnavailable tracks a sustained "unavailable" run separately
 	// from consecutiveFailures. "unavailable" (404 / unreachable DiagnosticsURL)
@@ -75,6 +73,7 @@ type CanaryProbe struct {
 	// of unavailableEscalateThreshold so a config error eventually alarms
 	// (health-signal-surface: a self-test that's silently broken hides outages).
 	consecutiveUnavailable int
+	mu                     sync.RWMutex
 	unavailableEscalated   bool
 }
 
@@ -189,7 +188,7 @@ func (p *CanaryProbe) probe() {
 	one := int64(1)
 	ev.TotalTokens = &one
 
-	p.reporter.Report(ev)
+	p.reporter.Report(&ev)
 
 	// Wait for the event to traverse the pipeline.
 	select {
@@ -216,7 +215,8 @@ func (p *CanaryProbe) probe() {
 	result := p.checkArrival(eventID, sentAt, diagBase)
 
 	p.mu.Lock()
-	if result.Status == "ok" {
+	switch result.Status {
+	case "ok":
 		if p.consecutiveFailures > 0 {
 			slog.Info("canary probe recovered",
 				"event_id", eventID,
@@ -227,7 +227,7 @@ func (p *CanaryProbe) probe() {
 		// Any non-unavailable outcome resets the unavailable streak.
 		p.consecutiveUnavailable = 0
 		p.unavailableEscalated = false
-	} else if result.Status == "unavailable" {
+	case "unavailable":
 		// Diagnostics endpoint not available (server-mode without endpoints,
 		// OR a misconfigured/unreachable DiagnosticsURL). NOT counted as a
 		// pipeline failure — that semantic is intentional. But we no longer
@@ -249,7 +249,7 @@ func (p *CanaryProbe) probe() {
 				"consecutive_unavailable", p.consecutiveUnavailable)
 		}
 		// Keep consecutiveFailures at 0 — "unavailable" is not a pipeline fault.
-	} else {
+	default:
 		p.consecutiveFailures++
 		// A real pipeline outcome (failed/partial) clears the unavailable streak
 		// so a later misconfig is re-evaluated from scratch.
@@ -277,7 +277,7 @@ func (p *CanaryProbe) checkArrival(eventID string, sentAt time.Time, diagnostics
 	url := fmt.Sprintf("%s/internal/canary-check?event_id=%s", diagnosticsBaseURL, eventID)
 	// Background ctx: canary is a long-lived self-test goroutine with no
 	// upstream request to inherit from; http.Client.Timeout (10s) bounds it.
-	req, reqErr := http.NewRequestWithContext(context.Background(), "GET", url, nil)
+	req, reqErr := http.NewRequestWithContext(context.Background(), "GET", url, http.NoBody)
 	if reqErr != nil {
 		result.Status = "unavailable"
 		result.FailedStage = "request_build_failed"
@@ -347,7 +347,7 @@ func (p *CanaryProbe) checkArrival(eventID string, sentAt time.Time, diagnostics
 	// where query-service is a separate container with its own DB connection.
 	if p.cfg.QueryURL != "" {
 		queryURL := fmt.Sprintf("%s/internal/canary-check?event_id=%s", p.cfg.QueryURL, eventID)
-		qReq, qReqErr := http.NewRequestWithContext(context.Background(), "GET", queryURL, nil)
+		qReq, qReqErr := http.NewRequestWithContext(context.Background(), "GET", queryURL, http.NoBody)
 		if qReqErr != nil {
 			slog.Debug("canary check: query request build failed", "url", queryURL, "error", qReqErr)
 			return result

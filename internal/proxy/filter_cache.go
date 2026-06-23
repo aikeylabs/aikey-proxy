@@ -9,13 +9,13 @@
 // busy session/tenant evict a quiet one's entries (thrashing) and gives no
 // per-session memory bound. So the cache is two levels:
 //
-//	{ sessionScope → LRU(window) of (version|contentHash → verdict) }
+//		{ sessionScope → LRU(window) of (version|contentHash → verdict) }
 //
-//   - level 1: a session-LRU bounds the number of sessions (maxSessions).
-//   - level 2: per session, an LRU of the last `window` (default 5, env-tunable)
-//     piece verdicts — bounds per-session memory + matches "recent turns are what
-//     get resent". Older history beyond the window is re-scanned (≠ leaked: a
-//     re-scan still masks it), so correctness is unaffected; it just caches less.
+//	  - level 1: a session-LRU bounds the number of sessions (maxSessions).
+//	  - level 2: per session, an LRU of the last `window` (default 5, env-tunable)
+//	    piece verdicts — bounds per-session memory + matches "recent turns are what
+//	    get resent". Older history beyond the window is re-scanned (≠ leaked: a
+//	    re-scan still masks it), so correctness is unaffected; it just caches less.
 //
 // PLUGGABLE / ZERO-COST WHEN OFF (设计 §3.1, INV-6): lives behind the hook==nil
 // early-return in applyInboundFilter; when the cache is off p.filterCache is nil
@@ -43,9 +43,9 @@ import (
 // maskVerdict is the cached outcome of scanning one content piece's head. Stores
 // only the masked head + action — never the raw original.
 type maskVerdict struct {
-	action     apphook.Action
 	maskedHead string // present iff action == ActionMask
 	reason     string // for ActionBlock
+	action     apphook.Action
 }
 
 // MaskCache memoizes per-piece scan verdicts, bucketed by session scope. Safe for
@@ -117,30 +117,23 @@ func cacheKey(detectorVersion, contentHash string) string {
 	return detectorVersion + "|" + contentHash
 }
 
-// --- no-op (cache explicitly disabled while compliance is on) ---
-
-type noopMaskCache struct{}
-
-func (noopMaskCache) Get(string, string) (maskVerdict, bool) { return maskVerdict{}, false }
-func (noopMaskCache) Put(string, string, maskVerdict)        {}
-
 // ─────────────────────────────────────────────────────────────────────────────
 // level 2: per-session LRU(window) of key→verdict (with per-entry TTL)
 // ─────────────────────────────────────────────────────────────────────────────
 
 type lruEntry struct {
+	exp time.Time
 	key string
 	v   maskVerdict
-	exp time.Time
 }
 
 type lruMaskCache struct {
-	mu  sync.Mutex
-	cap int
-	ttl time.Duration
 	ll  *list.List
 	m   map[string]*list.Element
 	now func() time.Time
+	cap int
+	ttl time.Duration
+	mu  sync.Mutex
 }
 
 func newLRUMaskCache(capacity int, ttl time.Duration) *lruMaskCache {
@@ -157,7 +150,7 @@ func (c *lruMaskCache) Get(key string) (maskVerdict, bool) {
 	if !ok {
 		return maskVerdict{}, false
 	}
-	ent := el.Value.(*lruEntry)
+	ent, _ := el.Value.(*lruEntry)
 	if c.now().After(ent.exp) {
 		c.ll.Remove(el)
 		delete(c.m, key)
@@ -173,7 +166,7 @@ func (c *lruMaskCache) Put(key string, v maskVerdict) {
 	defer c.mu.Unlock()
 	exp := c.now().Add(c.ttl)
 	if el, ok := c.m[key]; ok {
-		ent := el.Value.(*lruEntry)
+		ent, _ := el.Value.(*lruEntry)
 		ent.v, ent.exp = v, exp
 		c.ll.MoveToFront(el)
 		return
@@ -185,7 +178,9 @@ func (c *lruMaskCache) Put(key string, v maskVerdict) {
 			break
 		}
 		c.ll.Remove(back)
-		delete(c.m, back.Value.(*lruEntry).key)
+		if ent, ok := back.Value.(*lruEntry); ok {
+			delete(c.m, ent.key)
+		}
 	}
 }
 
@@ -194,21 +189,21 @@ func (c *lruMaskCache) Put(key string, v maskVerdict) {
 // ─────────────────────────────────────────────────────────────────────────────
 
 type sessionBucket struct {
-	scope string
 	cache *lruMaskCache
 	el    *list.Element // position in the session LRU
+	scope string
 }
 
 // sessionMaskCache is the two-level cache: a bounded LRU of sessions, each holding
 // a bounded LRU(window) of piece verdicts.
 type sessionMaskCache struct {
-	mu          sync.Mutex
-	maxSessions int
-	window      int
-	ttl         time.Duration
 	sessions    map[string]*sessionBucket
 	ll          *list.List // session LRU (front = MRU)
 	now         func() time.Time
+	maxSessions int
+	window      int
+	ttl         time.Duration
+	mu          sync.Mutex
 }
 
 func newSessionMaskCache(maxSessions, window int, ttl time.Duration) *sessionMaskCache {
@@ -252,7 +247,9 @@ func (c *sessionMaskCache) Put(scope, key string, v maskVerdict) {
 				break
 			}
 			c.ll.Remove(back)
-			delete(c.sessions, back.Value.(*sessionBucket).scope)
+			if sb, ok := back.Value.(*sessionBucket); ok {
+				delete(c.sessions, sb.scope)
+			}
 		}
 	} else {
 		c.ll.MoveToFront(b.el)

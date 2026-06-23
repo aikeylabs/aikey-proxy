@@ -14,18 +14,18 @@ import (
 // capturedReq records one inbound collector call for assertions.
 type capturedReq struct {
 	auth string
-	body contentBatchRequest
 	raw  string
+	body contentBatchRequest
 }
 
 // mockContentCollector is an httptest server standing in for the team collector's
 // /v1/conversation-records:batch endpoint. status/contiguous are set per test.
 type mockContentCollector struct {
 	srv        *httptest.Server
-	mu         sync.Mutex
+	contiguous map[string]int64
 	reqs       []capturedReq
 	status     int
-	contiguous map[string]int64
+	mu         sync.Mutex
 }
 
 func newMockCollector(t *testing.T, status int, contiguous map[string]int64) *mockContentCollector {
@@ -67,7 +67,7 @@ func (m *mockContentCollector) calls() []capturedReq {
 
 // seedContentWAL writes seq 1..n for one source, each in its own file (small
 // maxBytes forces a roll per entry), and Syncs. Returns the WAL.
-func seedContentWAL(t *testing.T, n int, source string) *ContentWAL {
+func seedContentWAL(t *testing.T, n int) *ContentWAL {
 	t.Helper()
 	w, err := NewContentWAL(t.TempDir(), 150, 100) // ~1 entry/file, high cap → no eviction
 	if err != nil {
@@ -75,14 +75,14 @@ func seedContentWAL(t *testing.T, n int, source string) *ContentWAL {
 	}
 	for i := int64(1); i <= int64(n); i++ {
 		rec := json.RawMessage(fmt.Sprintf(`{"event_id":"ev%02d","pad":"xxxxxxxxxxxxxxxxxxxx"}`, i))
-		w.Append(source, i, rec)
+		w.Append("p1", i, rec)
 	}
 	w.Sync()
 	return w
 }
 
 func newTestContentReporter(collectorURL string, wal *ContentWAL) *ContentReporter {
-	return NewContentReporter(ContentReporterConfig{
+	return NewContentReporter(&ContentReporterConfig{
 		CollectorURL:    collectorURL,
 		Credential:      &StaticTokenCredential{Token: "test-token"},
 		ProxyInstanceID: "proxy-1",
@@ -98,8 +98,8 @@ func newTestContentReporter(collectorURL string, wal *ContentWAL) *ContentReport
 // 2026-06-17-conversation-audit-cluster-content-reporter-collector-token.md
 func TestContentReporter_CollectorTokenFallbackWhenNoCredential(t *testing.T) {
 	m := newMockCollector(t, http.StatusOK, map[string]int64{"p1": 2})
-	wal := seedContentWAL(t, 2, "p1")
-	r := NewContentReporter(ContentReporterConfig{
+	wal := seedContentWAL(t, 2)
+	r := NewContentReporter(&ContentReporterConfig{
 		CollectorURL:    m.srv.URL,
 		Credential:      nil, // cluster worker node: no per-route team credential
 		CollectorToken:  "cluster-svc-token",
@@ -121,7 +121,7 @@ func TestContentReporter_CollectorTokenFallbackWhenNoCredential(t *testing.T) {
 // (current file survives); a second drain is a no-op (no re-upload).
 func TestContentReporter_HappyPathUploadsAdvancesPrunes(t *testing.T) {
 	m := newMockCollector(t, http.StatusOK, map[string]int64{"p1": 5})
-	wal := seedContentWAL(t, 5, "p1")
+	wal := seedContentWAL(t, 5)
 	r := newTestContentReporter(m.srv.URL, wal)
 
 	r.drainOnce(true)
@@ -183,7 +183,7 @@ func TestContentReporter_HappyPathUploadsAdvancesPrunes(t *testing.T) {
 // nothing pruned.
 func TestContentReporter_RetryableLeavesCursorsAndArmsBackoff(t *testing.T) {
 	m := newMockCollector(t, http.StatusInternalServerError, nil)
-	wal := seedContentWAL(t, 5, "p1")
+	wal := seedContentWAL(t, 5)
 	r := newTestContentReporter(m.srv.URL, wal)
 
 	r.drainOnce(true)
@@ -217,7 +217,7 @@ func TestContentReporter_RetryableLeavesCursorsAndArmsBackoff(t *testing.T) {
 // but no backoff gate (drop is immediate, not a retry) and no prune.
 func TestContentReporter_TerminalDropsBatchNoBackoff(t *testing.T) {
 	m := newMockCollector(t, http.StatusBadRequest, nil)
-	wal := seedContentWAL(t, 3, "p1")
+	wal := seedContentWAL(t, 3)
 	r := newTestContentReporter(m.srv.URL, wal)
 
 	r.drainOnce(true)
@@ -247,7 +247,7 @@ func TestContentReporter_TerminalDropsBatchNoBackoff(t *testing.T) {
 // reporter's classifyUploadError.
 func TestContentReporter_TooManyRequestsIsRetryable(t *testing.T) {
 	m := newMockCollector(t, http.StatusTooManyRequests, nil)
-	wal := seedContentWAL(t, 2, "p1")
+	wal := seedContentWAL(t, 2)
 	r := newTestContentReporter(m.srv.URL, wal)
 
 	r.drainOnce(true)

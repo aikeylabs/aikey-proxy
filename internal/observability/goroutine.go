@@ -100,7 +100,7 @@ func recoverPanic(name string, sev Severity) {
 	if r == nil {
 		return
 	}
-	stack := debug.Stack()           // current goroutine only → slog field
+	stack := debug.Stack()            // current goroutine only → slog field
 	allStacks := allGoroutineStacks() // every goroutine → crash dump file
 	dumpPath := writeCrashDump(name, r, stack, allStacks)
 
@@ -147,7 +147,7 @@ func recoverPanic(name string, sev Severity) {
 // of the crash file. A full OS core dump would be unsafe here because the
 // proxy holds decrypted key material in memory; see
 // workflow/CI/bugfix/2026-04-22-connectivity-probe-through-proxy.md.
-func writeCrashDump(name string, panicVal any, stack []byte, allStacks []byte) string {
+func writeCrashDump(name string, panicVal any, stack, allStacks []byte) string {
 	dirAny := crashDumpDir.Load()
 	dir, _ := dirAny.(string)
 	if dir == "" {
@@ -175,7 +175,7 @@ func writeCrashDump(name string, panicVal any, stack []byte, allStacks []byte) s
 		buf = append(buf, allStacks...)
 	}
 
-	if err := os.WriteFile(path, buf, 0o640); err != nil {
+	if err := os.WriteFile(path, buf, 0o600); err != nil {
 		return ""
 	}
 	return path

@@ -77,27 +77,27 @@ func TestGetAllPersonalRouteTokens_FiltersNonStrictForms(t *testing.T) {
 		alias       string
 		routeToken  string
 		providerCD  string
-		shouldPass  bool
 		description string
+		shouldPass  bool
 	}{
-		{"keyA-strict", "aikey_personal_" + hex64A, "anthropic", true,
-			"strict aikey_personal_<64-lowercase-hex>"},
-		{"keyB-strict", "aikey_personal_" + hex64B, "openai", true,
-			"strict aikey_personal_<64-lowercase-hex> different value"},
-		{"keyC-legacy-vk", "aikey_vk_" + hex64A, "anthropic", false,
-			"legacy aikey_vk_<64-hex> — pre-migration residue"},
-		{"keyD-old-alias", "aikey_personal_my-claude-account", "anthropic", false,
-			"legacy aikey_personal_<alias> sentinel form"},
-		{"keyE-uuid", "aikey_personal_54f8a3e1-b4d9-4e21-9fa0-0e3c5b7d8a91", "anthropic", false,
-			"legacy aikey_personal_<UUID> form (early OAuth)"},
-		{"keyF-63hex", "aikey_personal_" + hex63, "anthropic", false,
-			"63-hex suffix — short by one"},
-		{"keyG-uppercase", "aikey_personal_" + hex64U, "anthropic", false,
-			"uppercase hex — strict form rejects"},
-		{"keyH-empty-suffix", "aikey_personal_", "anthropic", false,
-			"empty hex suffix"},
-		{"keyI-other-prefix", "aikey_team_acc-1234", "anthropic", false,
-			"team form in entries.route_token (shape-wrong for personal table)"},
+		{alias: "keyA-strict", routeToken: "aikey_personal_" + hex64A, providerCD: "anthropic", shouldPass: true,
+			description: "strict aikey_personal_<64-lowercase-hex>"},
+		{alias: "keyB-strict", routeToken: "aikey_personal_" + hex64B, providerCD: "openai", shouldPass: true,
+			description: "strict aikey_personal_<64-lowercase-hex> different value"},
+		{alias: "keyC-legacy-vk", routeToken: "aikey_vk_" + hex64A, providerCD: "anthropic", shouldPass: false,
+			description: "legacy aikey_vk_<64-hex> — pre-migration residue"},
+		{alias: "keyD-old-alias", routeToken: "aikey_personal_my-claude-account", providerCD: "anthropic", shouldPass: false,
+			description: "legacy aikey_personal_<alias> sentinel form"},
+		{alias: "keyE-uuid", routeToken: "aikey_personal_54f8a3e1-b4d9-4e21-9fa0-0e3c5b7d8a91", providerCD: "anthropic", shouldPass: false,
+			description: "legacy aikey_personal_<UUID> form (early OAuth)"},
+		{alias: "keyF-63hex", routeToken: "aikey_personal_" + hex63, providerCD: "anthropic", shouldPass: false,
+			description: "63-hex suffix — short by one"},
+		{alias: "keyG-uppercase", routeToken: "aikey_personal_" + hex64U, providerCD: "anthropic", shouldPass: false,
+			description: "uppercase hex — strict form rejects"},
+		{alias: "keyH-empty-suffix", routeToken: "aikey_personal_", providerCD: "anthropic", shouldPass: false,
+			description: "empty hex suffix"},
+		{alias: "keyI-other-prefix", routeToken: "aikey_team_acc-1234", providerCD: "anthropic", shouldPass: false,
+			description: "team form in entries.route_token (shape-wrong for personal table)"},
 	}
 
 	for _, row := range rows {
@@ -153,17 +153,17 @@ func TestGetAllOAuthRouteTokens_FiltersNonStrictForms(t *testing.T) {
 	rows := []struct {
 		accountID   string
 		routeToken  string
-		shouldPass  bool
 		description string
+		shouldPass  bool
 	}{
-		{"acc-A", "aikey_personal_" + hex64A, true,
-			"strict aikey_personal_<64-lowercase-hex>"},
-		{"acc-B-legacy-vk", "aikey_vk_" + hex64B, false,
-			"legacy aikey_vk_<64-hex> — pre-migration residue"},
-		{"acc-C-uuid", "aikey_personal_a1b2c3d4-5678-90ab-cdef-1234567890ab", false,
-			"legacy UUID-shaped aikey_personal_ (pre-migration OAuth)"},
-		{"acc-D-uppercase", "aikey_personal_" + hex64U, false,
-			"uppercase hex — strict form rejects"},
+		{accountID: "acc-A", routeToken: "aikey_personal_" + hex64A, shouldPass: true,
+			description: "strict aikey_personal_<64-lowercase-hex>"},
+		{accountID: "acc-B-legacy-vk", routeToken: "aikey_vk_" + hex64B, shouldPass: false,
+			description: "legacy aikey_vk_<64-hex> — pre-migration residue"},
+		{accountID: "acc-C-uuid", routeToken: "aikey_personal_a1b2c3d4-5678-90ab-cdef-1234567890ab", shouldPass: false,
+			description: "legacy UUID-shaped aikey_personal_ (pre-migration OAuth)"},
+		{accountID: "acc-D-uppercase", routeToken: "aikey_personal_" + hex64U, shouldPass: false,
+			description: "uppercase hex — strict form rejects"},
 	}
 
 	for _, row := range rows {
@@ -243,17 +243,17 @@ func TestIsStrictPersonalBearerForm(t *testing.T) {
 		{"aikey_personal_" + strings.Repeat("0", 64), true},
 		{"aikey_personal_" + strings.Repeat("f", 64), true},
 		// Negatives.
-		{"aikey_personal_" + hex63, false},                      // 63 hex
-		{"aikey_personal_" + hex64A + "x", false},               // 65 chars
-		{"aikey_personal_" + hex64U, false},                     // mixed case
-		{"aikey_personal_my-alias", false},                      // legacy alias
+		{"aikey_personal_" + hex63, false},                             // 63 hex
+		{"aikey_personal_" + hex64A + "x", false},                      // 65 chars
+		{"aikey_personal_" + hex64U, false},                            // mixed case
+		{"aikey_personal_my-alias", false},                             // legacy alias
 		{"aikey_personal_a1b2c3d4-5678-90ab-cdef-1234567890ab", false}, // legacy UUID
-		{"aikey_personal_", false},                              // empty
-		{"aikey_vk_" + hex64A, false},                           // legacy vk_ prefix
-		{"aikey_team_acc-1234", false},                          // team prefix
-		{"aikey_active_anthropic", false},                       // active sentinel
-		{"sk-1234", false},                                      // native
-		{"", false},                                             // empty string
+		{"aikey_personal_", false},                                     // empty
+		{"aikey_vk_" + hex64A, false},                                  // legacy vk_ prefix
+		{"aikey_team_acc-1234", false},                                 // team prefix
+		{"aikey_active_anthropic", false},                              // active sentinel
+		{"sk-1234", false},                                             // native
+		{"", false},                                                    // empty string
 	}
 	for _, c := range cases {
 		if got := isStrictPersonalBearerForm(c.token); got != c.want {

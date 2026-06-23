@@ -156,7 +156,7 @@ func (p *SSEParser) Flush() (SSEFrame, bool) {
 // We search for the four primary forms in order of frequency. Mixed
 // forms fall through to a per-byte scan only when the primary search
 // misses (very rare).
-func findFrameBoundary(buf []byte) (int, int) {
+func findFrameBoundary(buf []byte) (offset, length int) {
 	if i := bytes.Index(buf, []byte("\n\n")); i >= 0 {
 		// Also check for preceding \r (CRLF before blank LF): rewind
 		// one byte if so, so the boundary covers the full \r\n\n.
@@ -249,16 +249,16 @@ func splitLines(frame []byte) [][]byte {
 // per the SSE spec. The value has a single leading space stripped if
 // present (also per spec — "data: foo" yields value "foo", but
 // "data:  foo" yields value " foo").
-func splitField(line []byte) (string, string) {
+func splitField(line []byte) (field, value string) {
 	colon := bytes.IndexByte(line, ':')
 	if colon < 0 {
 		// Field-name-only line; value is the empty string per spec.
 		return string(line), ""
 	}
-	field := string(line[:colon])
-	value := line[colon+1:]
-	if len(value) > 0 && value[0] == ' ' {
-		value = value[1:]
+	field = string(line[:colon])
+	raw := line[colon+1:]
+	if len(raw) > 0 && raw[0] == ' ' {
+		raw = raw[1:]
 	}
-	return field, string(value)
+	return field, string(raw)
 }

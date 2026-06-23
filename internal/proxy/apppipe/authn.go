@@ -33,9 +33,9 @@ import (
 // writeJSONError; the caller does NOT need to know the structure of
 // authn's internal failure modes.
 type AuthError struct {
-	StatusCode int    // HTTP status to return (401 or 403)
 	ErrorCode  string // body.error.code (matches the codes documented in 主方案 §11.E)
 	Message    string // body.error.message (user-actionable; English per CLAUDE.md)
+	StatusCode int    // HTTP status to return (401 or 403)
 }
 
 func (e *AuthError) Error() string { return e.ErrorCode + ": " + e.Message }
@@ -84,17 +84,17 @@ type requestHeaders interface {
 //
 //   - TOKEN_MISSING (401)           — no Authorization / x-api-key header at all
 //   - APP_KEY_NOT_FOUND (401)       — token not in Registry (Registry holds
-//                                     only strict + active app/personal/oauth
-//                                     bearers, so this catches malformed,
-//                                     revoked, and pre-Phase-4 vault states)
+//     only strict + active app/personal/oauth
+//     bearers, so this catches malformed,
+//     revoked, and pre-Phase-4 vault states)
 //   - APP_TOKEN_REQUIRED (401)      — token resolves to a personal / team /
-//                                     oauth route, NOT an app route; user
-//                                     presented the wrong token type at the
-//                                     /apps/ URL
+//     oauth route, NOT an app route; user
+//     presented the wrong token type at the
+//     /apps/ URL
 //   - APP_MISMATCH (403)            — token resolves to an app route, but
-//                                     the route's AppSlug doesn't match the
-//                                     URL slug — caller pasted the wrong
-//                                     app's token into this URL
+//     the route's AppSlug doesn't match the
+//     URL slug — caller pasted the wrong
+//     app's token into this URL
 //
 // Why APP_TOKEN_REQUIRED vs reusing AKL-208's APP_TOKEN_WRONG_PATH: those
 // two codes are mirror images — APP_TOKEN_WRONG_PATH is "app token at

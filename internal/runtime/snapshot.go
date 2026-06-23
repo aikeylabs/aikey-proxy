@@ -28,11 +28,11 @@ import (
 
 // Snapshot is the on-disk runtime state.
 type Snapshot struct {
-	SchemaVersion int       `json:"schema_version"`
-	IncarnationID string    `json:"incarnation_id"`
-	PID           int       `json:"pid"`
-	Listen        Listen    `json:"listen"`
 	StartedAt     time.Time `json:"started_at"`
+	IncarnationID string    `json:"incarnation_id"`
+	Listen        Listen    `json:"listen"`
+	SchemaVersion int       `json:"schema_version"`
+	PID           int       `json:"pid"`
 }
 
 // Listen carries the port-drift outcome.
@@ -61,7 +61,8 @@ func Path() (string, error) {
 }
 
 // Write atomically persists the snapshot (temp + rename).
-func Write(s Snapshot) error {
+func Write(in *Snapshot) error {
+	s := *in
 	if s.SchemaVersion == 0 {
 		s.SchemaVersion = currentSchemaVersion
 	}
@@ -69,8 +70,8 @@ func Write(s Snapshot) error {
 	if err != nil {
 		return err
 	}
-	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
-		return fmt.Errorf("create run dir: %w", err)
+	if mkErr := os.MkdirAll(filepath.Dir(path), 0o700); mkErr != nil {
+		return fmt.Errorf("create run dir: %w", mkErr)
 	}
 	data, err := json.MarshalIndent(s, "", "  ")
 	if err != nil {

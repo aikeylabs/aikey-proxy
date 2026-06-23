@@ -17,11 +17,11 @@ import (
 // far (a minimal stand-in for the real collector). Lets outbox tests assert
 // both delivery and WAL pruning.
 type captureServer struct {
-	mu            sync.Mutex
 	seenSeqs      map[string]map[int64]bool // source -> set of seqs
+	lastAllocated *int64                    // last batchRequest.AllocatedSeq seen (nil if never sent)
 	ids           []string
-	dropV2        bool   // if true, omit contiguous_seq (simulates an older collector)
-	lastAllocated *int64 // last batchRequest.AllocatedSeq seen (nil if never sent)
+	mu            sync.Mutex
+	dropV2        bool // if true, omit contiguous_seq (simulates an older collector)
 }
 
 func newCaptureServer(dropV2 bool) *captureServer {
@@ -92,7 +92,7 @@ func TestOutbox_UploadsFromWAL(t *testing.T) {
 	srv := httptest.NewServer(cs.handler())
 	defer srv.Close()
 
-	r, err := NewReporter(ReporterConfig{
+	r, err := NewReporter(&ReporterConfig{
 		CollectorURL:   srv.URL,
 		WALDir:         t.TempDir(),
 		BatchSize:      10,
@@ -102,7 +102,8 @@ func TestOutbox_UploadsFromWAL(t *testing.T) {
 		t.Fatal(err)
 	}
 	for seq := int64(1); seq <= 3; seq++ {
-		r.Report(v2Event("e"+string(rune('0'+seq)), "srcA", seq))
+		e := v2Event("e"+string(rune('0'+seq)), "srcA", seq)
+		r.Report(&e)
 	}
 	time.Sleep(150 * time.Millisecond)
 	r.Close()
@@ -122,7 +123,7 @@ func TestOutbox_NoReSendWithinProcess(t *testing.T) {
 	srv := httptest.NewServer(cs.handler())
 	defer srv.Close()
 
-	r, err := NewReporter(ReporterConfig{
+	r, err := NewReporter(&ReporterConfig{
 		CollectorURL:   srv.URL,
 		WALDir:         t.TempDir(),
 		BatchSize:      10,
@@ -131,7 +132,8 @@ func TestOutbox_NoReSendWithinProcess(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	r.Report(v2Event("only", "srcA", 1))
+	eOnly := v2Event("only", "srcA", 1)
+	r.Report(&eOnly)
 	// Let several drain intervals elapse — must still upload exactly once.
 	time.Sleep(150 * time.Millisecond)
 	r.Close()
@@ -149,12 +151,13 @@ func TestOutbox_RestartReplaysUnconfirmed(t *testing.T) {
 	dir := t.TempDir()
 
 	// Reporter #1 with NO collector → events only WAL'd, never uploaded.
-	r1, err := NewReporter(ReporterConfig{WALDir: dir})
+	r1, err := NewReporter(&ReporterConfig{WALDir: dir})
 	if err != nil {
 		t.Fatal(err)
 	}
 	for seq := int64(1); seq <= 3; seq++ {
-		r1.Report(v2Event("e"+string(rune('0'+seq)), "srcA", seq))
+		e := v2Event("e"+string(rune('0'+seq)), "srcA", seq)
+		r1.Report(&e)
 	}
 	r1.Close() // graceful close, but no upload destination was set
 
@@ -163,7 +166,7 @@ func TestOutbox_RestartReplaysUnconfirmed(t *testing.T) {
 	cs := newCaptureServer(false)
 	srv := httptest.NewServer(cs.handler())
 	defer srv.Close()
-	r2, err := NewReporter(ReporterConfig{
+	r2, err := NewReporter(&ReporterConfig{
 		CollectorURL:   srv.URL,
 		WALDir:         dir,
 		BatchSize:      10,
@@ -193,7 +196,7 @@ func TestOutbox_OldServerConservesWAL(t *testing.T) {
 	defer srv.Close()
 
 	dir := t.TempDir()
-	r, err := NewReporter(ReporterConfig{
+	r, err := NewReporter(&ReporterConfig{
 		CollectorURL:   srv.URL,
 		WALDir:         dir,
 		BatchSize:      10,
@@ -202,7 +205,8 @@ func TestOutbox_OldServerConservesWAL(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	r.Report(v2Event("e1", "srcA", 1))
+	e1 := v2Event("e1", "srcA", 1)
+	r.Report(&e1)
 	time.Sleep(120 * time.Millisecond)
 
 	// Event delivered, but confirmedSeq must NOT have advanced (no contiguous in
@@ -229,7 +233,7 @@ func TestOutbox_ConfirmedSeqAdvances(t *testing.T) {
 	srv := httptest.NewServer(cs.handler())
 	defer srv.Close()
 
-	r, err := NewReporter(ReporterConfig{
+	r, err := NewReporter(&ReporterConfig{
 		CollectorURL:   srv.URL,
 		WALDir:         t.TempDir(),
 		BatchSize:      10,
@@ -239,7 +243,8 @@ func TestOutbox_ConfirmedSeqAdvances(t *testing.T) {
 		t.Fatal(err)
 	}
 	for seq := int64(1); seq <= 3; seq++ {
-		r.Report(v2Event("e"+string(rune('0'+seq)), "srcA", seq))
+		e := v2Event("e"+string(rune('0'+seq)), "srcA", seq)
+		r.Report(&e)
 	}
 	time.Sleep(150 * time.Millisecond)
 
@@ -271,15 +276,15 @@ func TestOutbox_CarriesAllocatedSeq(t *testing.T) {
 	defer sa.Close()
 	// Hand out seqs 1..5 (allocator high-water = 5) but only deliver 1..3.
 	for i := 0; i < 5; i++ {
-		if _, err := sa.Next(); err != nil {
-			t.Fatal(err)
+		if _, nErr := sa.Next(); nErr != nil {
+			t.Fatal(nErr)
 		}
 	}
 	if got := sa.Allocated(); got != 5 {
 		t.Fatalf("Allocated()=%d, want 5", got)
 	}
 
-	r, err := NewReporter(ReporterConfig{
+	r, err := NewReporter(&ReporterConfig{
 		CollectorURL:   srv.URL,
 		WALDir:         dir,
 		SeqAlloc:       sa,
@@ -290,7 +295,8 @@ func TestOutbox_CarriesAllocatedSeq(t *testing.T) {
 		t.Fatal(err)
 	}
 	for seq := int64(1); seq <= 3; seq++ {
-		r.Report(v2Event("e"+string(rune('0'+seq)), "srcA", seq))
+		e := v2Event("e"+string(rune('0'+seq)), "srcA", seq)
+		r.Report(&e)
 	}
 	time.Sleep(150 * time.Millisecond)
 	r.Close()
@@ -314,7 +320,7 @@ func TestOutbox_NoAllocatedSeqWithoutAllocator(t *testing.T) {
 	srv := httptest.NewServer(cs.handler())
 	defer srv.Close()
 
-	r, err := NewReporter(ReporterConfig{
+	r, err := NewReporter(&ReporterConfig{
 		CollectorURL:   srv.URL,
 		WALDir:         t.TempDir(),
 		BatchSize:      10,
@@ -323,7 +329,8 @@ func TestOutbox_NoAllocatedSeqWithoutAllocator(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	r.Report(v2Event("e1", "srcA", 1))
+	e1 := v2Event("e1", "srcA", 1)
+	r.Report(&e1)
 	time.Sleep(150 * time.Millisecond)
 	r.Close()
 

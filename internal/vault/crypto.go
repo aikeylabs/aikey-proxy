@@ -26,12 +26,12 @@ const (
 
 // DeriveKey derives a 256-bit key using Argon2id with parameters compatible
 // with the Rust vault implementation.
-func DeriveKey(password []byte, salt []byte) []byte {
+func DeriveKey(password, salt []byte) []byte {
 	return argon2.IDKey(password, salt, Argon2Iterations, Argon2Memory, Argon2Parallelism, Argon2KeyLen)
 }
 
 // DeriveKeyWithParams derives a key using custom Argon2id parameters read from vault DB.
-func DeriveKeyWithParams(password []byte, salt []byte, mCost, tCost uint32, pCost uint8) []byte {
+func DeriveKeyWithParams(password, salt []byte, mCost, tCost uint32, pCost uint8) []byte {
 	return argon2.IDKey(password, salt, tCost, mCost, pCost, Argon2KeyLen)
 }
 
@@ -42,7 +42,7 @@ func VerifyKey(derivedKey, storedHash []byte) bool {
 }
 
 // Decrypt decrypts ciphertext using AES-256-GCM.
-func Decrypt(key []byte, nonce []byte, ciphertext []byte) ([]byte, error) {
+func Decrypt(key, nonce, ciphertext []byte) ([]byte, error) {
 	if len(key) != KeySize {
 		return nil, fmt.Errorf("key must be %d bytes, got %d", KeySize, len(key))
 	}
@@ -71,7 +71,7 @@ func Decrypt(key []byte, nonce []byte, ciphertext []byte) ([]byte, error) {
 // Encrypt encrypts plaintext using AES-256-GCM with a random nonce.
 // Returns (nonce, ciphertext) for storage. The caller stores both.
 // Symmetric to Decrypt(): Decrypt(key, nonce, ciphertext) recovers plaintext.
-func Encrypt(key []byte, plaintext []byte) (nonce []byte, ciphertext []byte, err error) {
+func Encrypt(key, plaintext []byte) (nonce, ciphertext []byte, err error) {
 	if len(key) != KeySize {
 		return nil, nil, fmt.Errorf("key must be %d bytes, got %d", KeySize, len(key))
 	}

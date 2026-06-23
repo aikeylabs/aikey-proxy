@@ -20,7 +20,7 @@ specifically:
 
   - the cc_version trailing 3-hex fingerprint is derived from
     SHA-256(constant-salt || sampled-bytes-of-first-user-text || cli-version);
-  - the cch field is an xxhash64 digest of the marshalled body keyed by
+  - the cch field is an xxhash64 digest of the marshaled body keyed by
     a constant 64-bit seed;
   - the byte indices [4, 7, 20] are the canonical sample positions used
     by the upstream client.

@@ -137,7 +137,7 @@ func (p *Proxy) recordEvent(req *http.Request, resp *http.Response, startTime ti
 	if isAikeyProbe(req) {
 		return
 	}
-	p.collector.Record(ev)
+	p.collector.Record(&ev)
 	// Error responses are treated as interrupted — the client never got a
 	// usable result even though the request finished "fast" from our POV.
 	sessionID := resolveSessionID(req, route.ProtocolType, route.ProviderCode)
@@ -459,11 +459,11 @@ func parseUpstreamErrorEnvelope(body []byte) (errType, errMessage string) {
 // an explicit truncation marker so the reader knows the captured snippet
 // is incomplete.
 func truncateBodyForLog(b []byte) string {
-	cap := resolvedBodyLogCap()
-	if len(b) <= cap {
+	logCap := resolvedBodyLogCap()
+	if len(b) <= logCap {
 		return string(b)
 	}
-	return string(b[:cap]) + "...<truncated>"
+	return string(b[:logCap]) + "...<truncated>"
 }
 
 // extractUpstreamRequestID pulls the provider's own request id out of the
@@ -520,7 +520,7 @@ func (p *Proxy) reportUsage(route *vkeys.ResolvedRoute, bearerToken, model strin
 		}
 	}
 
-	ev := events.BuildReportableEvent(events.ReportOpts{
+	ev := events.BuildReportableEvent(&events.ReportOpts{
 		EventID:                  observability.NewID(),
 		ProxyInstanceID:          p.proxyInstanceID,
 		SourceID:                 sourceID,
@@ -557,12 +557,12 @@ func (p *Proxy) reportUsage(route *vkeys.ResolvedRoute, bearerToken, model strin
 	if p.reporter != nil {
 		// Reporter writes WAL + enqueues upload; when wal is the shared
 		// instance no duplicate append happens.
-		p.reporter.Report(ev)
+		p.reporter.Report(&ev)
 		return
 	}
 	// Offline path: no collector_url, but WAL is still desired so local
 	// statusline / watch can consume it.
-	p.wal.Append(ev)
+	p.wal.Append(&ev)
 }
 
 // routeBaseURL returns the resolved upstream base URL, nil-safe.

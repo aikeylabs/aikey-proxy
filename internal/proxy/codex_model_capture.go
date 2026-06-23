@@ -50,6 +50,7 @@ import (
 //   - canonicalCode == "openai"
 //   - credential kind is OAuth
 //   - we're about to forward to chatgpt.com/backend-api/codex
+//
 // (forward_and_resolve.go's OAuth branch). Calling it elsewhere would
 // pick up API-key requests too, contaminating the state with the wrong
 // model name.
@@ -122,8 +123,8 @@ func writeCodexLastModel(model string) error {
 		return err
 	}
 	dir := filepath.Join(home, ".aikey", "state")
-	if err := os.MkdirAll(dir, 0o755); err != nil {
-		return err
+	if mkErr := os.MkdirAll(dir, 0o755); mkErr != nil {
+		return mkErr
 	}
 	finalPath := filepath.Join(dir, "codex_last_model")
 	tmp, err := os.CreateTemp(dir, ".codex_last_model.*.tmp")

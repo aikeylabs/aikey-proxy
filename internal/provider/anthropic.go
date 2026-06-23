@@ -14,7 +14,7 @@ type Anthropic struct{}
 
 func (a *Anthropic) Name() string { return "anthropic" }
 
-func (a *Anthropic) RewriteRequest(req *http.Request, realKey string, baseURL string) error {
+func (a *Anthropic) RewriteRequest(req *http.Request, realKey, baseURL string) error {
 	if err := applyBaseURL(req, baseURL); err != nil {
 		return err
 	}
@@ -56,7 +56,7 @@ func (a *Anthropic) RewriteRequest(req *http.Request, realKey string, baseURL st
 // that has filled the cache. Summing into the returned input preserves the
 // "how much did I send" semantics; a later cost-accounting pass can re-split
 // the fields with their respective price multipliers (~1.25x write / ~0.1x read).
-func (a *Anthropic) ExtractTokens(data []byte, streaming bool, logger *slog.Logger) (int, int) {
+func (a *Anthropic) ExtractTokens(data []byte, streaming bool, logger *slog.Logger) (inputTokens, outputTokens int) {
 	if logger == nil {
 		logger = slog.Default()
 	}
@@ -70,7 +70,7 @@ func (a *Anthropic) ExtractTokens(data []byte, streaming bool, logger *slog.Logg
 				"error.code", observability.ErrCodeUsageExtractionFailed,
 				"error", err.Error(),
 				"body_len", len(data),
-				"body_preview", previewBody(data, 200),
+				"body_preview", previewBody(data),
 			)
 			return 0, 0
 		}
@@ -80,14 +80,13 @@ func (a *Anthropic) ExtractTokens(data []byte, streaming bool, logger *slog.Logg
 				"event.name", observability.EventProxyExtractionMismatch,
 				"error.code", observability.ErrCodeUsageExtractionFailed,
 				"body_len", len(data),
-				"body_preview", previewBody(data, 200),
+				"body_preview", previewBody(data),
 			)
 		}
 		return in, out
 	}
 
 	// Streaming: scan SSE lines.
-	var inputTokens, outputTokens int
 	for _, line := range bytes.Split(data, []byte("\n")) {
 		line = bytes.TrimSpace(line)
 		line = bytes.TrimPrefix(line, []byte("data: "))
@@ -119,7 +118,7 @@ func (a *Anthropic) ExtractTokens(data []byte, streaming bool, logger *slog.Logg
 			"event.name", observability.EventProxyExtractionMismatch,
 			"error.code", observability.ErrCodeUsageExtractionFailed,
 			"body_len", len(data),
-			"body_preview", previewBody(data, 200),
+			"body_preview", previewBody(data),
 		)
 	}
 	return inputTokens, outputTokens
@@ -154,8 +153,8 @@ func (a *Anthropic) ExtractTokenBreakdown(data []byte, streaming bool, logger *s
 	if !streaming {
 		var resp struct {
 			Model      string         `json:"model"`
-			Usage      anthropicUsage `json:"usage"`
 			StopReason string         `json:"stop_reason"`
+			Usage      anthropicUsage `json:"usage"`
 		}
 		if err := json.Unmarshal(data, &resp); err != nil {
 			logger.Warn("anthropic breakdown: unmarshal failed",
@@ -163,7 +162,7 @@ func (a *Anthropic) ExtractTokenBreakdown(data []byte, streaming bool, logger *s
 				"error.code", observability.ErrCodeUsageExtractionFailed,
 				"error", err.Error(),
 				"body_len", len(data),
-				"body_preview", previewBody(data, 200),
+				"body_preview", previewBody(data),
 			)
 			return TokenBreakdown{}
 		}
@@ -197,17 +196,16 @@ func (a *Anthropic) ExtractTokenBreakdown(data []byte, streaming bool, logger *s
 			continue
 		}
 		var event struct {
-			Type    string `json:"type"`
-			Message struct {
-				// Anthropic streaming: model is on the message envelope
-				// of the first `message_start` frame, alongside usage.
-				Model string         `json:"model"`
-				Usage anthropicUsage `json:"usage"`
-			} `json:"message"`
+			Type  string `json:"type"`
 			Delta struct {
 				StopReason string `json:"stop_reason"`
 			} `json:"delta"`
-			Usage anthropicUsage `json:"usage"`
+			Message struct {
+				Model string         `json:"model"`
+				Usage anthropicUsage `json:"usage"`
+			} `json:"message"`
+			Usage anthropicUsage `json:"usage"` // Anthropic streaming: model is on the message envelope
+			// of the first `message_start` frame, alongside usage.
 		}
 		if json.Unmarshal(line, &event) != nil {
 			continue

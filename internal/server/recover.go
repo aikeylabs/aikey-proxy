@@ -59,7 +59,7 @@ func (tw *trackedWriter) Flush() {
 //
 //nolint:staticcheck // CloseNotifier is deprecated but still the reliable HTTP/1.1 disconnect signal
 func (tw *trackedWriter) CloseNotify() <-chan bool {
-	//nolint:staticcheck
+	//nolint:staticcheck // CloseNotifier deprecated but reliable for HTTP/1.1 disconnect detection
 	if cn, ok := tw.ResponseWriter.(http.CloseNotifier); ok {
 		return cn.CloseNotify()
 	}

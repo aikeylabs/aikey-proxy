@@ -38,13 +38,13 @@ func TestCaptureUpstreamErrorBody(t *testing.T) {
 
 	// Unparseable / unknown shape → empty type, raw body for the message.
 	raw := "upstream exploded, not json"
-	if gt, gm := captureUpstreamErrorBody(respWithBody(raw)); gt != "" || gm != raw {
+	if gt, gm := captureUpstreamErrorBody(respWithBody(raw)); gt != "" || gm != raw { //nolint:bodyclose // respWithBody is a NopCloser; captureUpstreamErrorBody reads and closes it
 		t.Errorf("unparseable body: want (\"\", raw), got (%q, %q)", gt, gm)
 	}
 
 	// Truncation: an oversized raw body is trimmed + marked.
 	bigBody := strings.Repeat("x", errorBodyCap+500)
-	if _, gm := captureUpstreamErrorBody(respWithBody(bigBody)); len(gm) <= errorBodyCap || !strings.HasSuffix(gm, "…") {
+	if _, gm := captureUpstreamErrorBody(respWithBody(bigBody)); len(gm) <= errorBodyCap || !strings.HasSuffix(gm, "…") { //nolint:bodyclose // respWithBody is a NopCloser; captureUpstreamErrorBody reads and closes it
 		t.Errorf("oversized body must be truncated to cap + marker, got len=%d", len(gm))
 	}
 

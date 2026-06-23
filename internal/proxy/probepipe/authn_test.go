@@ -11,7 +11,7 @@ type stubHeaders http.Header
 
 func (s stubHeaders) Get(k string) string { return http.Header(s).Get(k) }
 
-const validFirstPartyBearer = "aikey_app_internal_degrade_detector_v1"
+const validFirstPartyBearer = "aikey_app_internal_degrade_detector_v1" //nolint:gosec // test fixture, not a real credential
 
 // TestAuthenticate_AcceptsAuthorizationBearer pins the happy path with the
 // OpenAI-style header form.

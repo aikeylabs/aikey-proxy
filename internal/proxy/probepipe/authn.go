@@ -15,9 +15,9 @@ import (
 
 // AuthError carries probe-pipeline auth failures with HTTP status + code + message.
 type AuthError struct {
-	StatusCode int    // HTTP status to return (401 for probe)
 	ErrorCode  string // body.error.code — always PROBE_AUTH_FAILED for this pipeline
 	Message    string // body.error.message — user-actionable English per CLAUDE.md
+	StatusCode int    // HTTP status to return (401 for probe)
 }
 
 func (e *AuthError) Error() string { return e.ErrorCode + ": " + e.Message }

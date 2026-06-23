@@ -24,13 +24,7 @@ import (
 // personal_route_token, oauth_route_token). Removal record:
 // workflow/CD/templates/removed-registry.yaml entry "virtual_keys".
 type Config struct {
-	Listen        ListenConfig              `yaml:"listen"`
-	Vault         VaultConfig               `yaml:"vault"`
-	Providers     map[string]ProviderConfig `yaml:"providers"`
-	Events        EventsConfig              `yaml:"events"`
-	Log           LogConfig                 `yaml:"log"`
-	UpstreamProxy UpstreamProxyConfig       `yaml:"upstream_proxy"`
-
+	Providers map[string]ProviderConfig `yaml:"providers"`
 	// Observers is the Phase 4 M2 first-party observer config block.
 	// Keyed by observer.Name (e.g. "rhythm"); each value is a free-form
 	// map that the observer package's Build callback decodes into its
@@ -44,19 +38,22 @@ type Config struct {
 	// just forwards `Observers[obsName]` to BuildObservers, which hands
 	// it to the per-observer Build callback. Adding a new observer
 	// doesn't require any change here.
-	Observers map[string]map[string]any `yaml:"observers,omitempty"`
-
+	Observers     map[string]map[string]any `yaml:"observers,omitempty"`
+	Vault         VaultConfig               `yaml:"vault"`
+	UpstreamProxy UpstreamProxyConfig       `yaml:"upstream_proxy"`
 	// Cluster is the V3c cluster-node config block. Absent / Enabled=false ⇒
 	// standard local proxy (Personal/Trial) — zero behavior change. When
 	// Enabled, this proxy is a cluster node: it registers + heartbeats to the
 	// aikey-hub name service and (policy) only serves team/managed virtual keys.
 	Cluster ClusterConfig `yaml:"cluster,omitempty"`
+	Log     LogConfig     `yaml:"log"`
+	Listen  ListenConfig  `yaml:"listen"`
+	Events  EventsConfig  `yaml:"events"`
 }
 
 // ClusterConfig configures cluster-node behavior (V3c). All fields are inert
 // unless Enabled is true, so existing single-node configs are unaffected.
 type ClusterConfig struct {
-	Enabled bool `yaml:"enabled"`
 	// HubURL is the aikey-hub name-service base, e.g. http://hub:27400.
 	HubURL string `yaml:"hub_url,omitempty"`
 	// NodeID uniquely identifies this proxy node in the cluster.
@@ -64,11 +61,12 @@ type ClusterConfig struct {
 	// NodeAddr is the address clients connect to for this node (host:port),
 	// returned by the hub's /cluster/resolve.
 	NodeAddr string `yaml:"node_addr,omitempty"`
-	// Weight scales this node's share of the consistent-hash ring (≥1).
-	Weight int `yaml:"weight,omitempty"`
 	// ServiceToken authenticates this node to the hub's gated /cluster/* endpoints
 	// (R1). Config-separate per edition: empty for non-cluster, set for cluster.
 	ServiceToken string `yaml:"service_token,omitempty"`
+	// Weight scales this node's share of the consistent-hash ring (≥1).
+	Weight  int  `yaml:"weight,omitempty"`
+	Enabled bool `yaml:"enabled"`
 }
 
 type ListenConfig struct {
@@ -115,19 +113,11 @@ type ProviderConfig struct {
 type CollectorCredential struct {
 	Type       string `yaml:"type"`
 	Token      string `yaml:"token"`
-	ExpiresAt  int64  `yaml:"expires_at"`
 	RefreshURL string `yaml:"refresh_url"`
+	ExpiresAt  int64  `yaml:"expires_at"`
 }
 
 type EventsConfig struct {
-	DBPath        string        `yaml:"db_path"`
-	BatchSize     int           `yaml:"batch_size"`
-	FlushInterval time.Duration `yaml:"flush_interval"`
-
-	// Usage reporting to collector-service
-	CollectorURL   string        `yaml:"collector_url"`    // e.g. "http://localhost:27300"
-	CollectorToken string        `yaml:"collector_token"`  // Bearer token for auth
-
 	// CollectorRoutes maps RouteSource ("personal" / "team" / "oauth") →
 	// upload URL. When the lookup hits, this URL takes precedence over
 	// CollectorURL for that event. Misses fall through to CollectorURL.
@@ -140,7 +130,6 @@ type EventsConfig struct {
 	// for the "team" key; never touches "personal" / "oauth" defaults.
 	// See roadmap20260320/技术实现/update/20260510-personal-team-数据隔离与合并显示.md.
 	CollectorRoutes map[string]string `yaml:"collector_routes"`
-
 	// CollectorCredentials maps RouteSource → credential bundle. Written
 	// by aikey-cli's `aikey account login --control-url <REMOTE>` (B3
 	// phase) into the **user** layer of the config split — proxy's Load
@@ -155,12 +144,25 @@ type EventsConfig struct {
 	//
 	// See roadmap20260320/技术实现/update/20260511-user-jwt-collector-ingest.md.
 	CollectorCredentials map[string]CollectorCredential `yaml:"collector_credentials"`
-
-	QueueCapacity  int           `yaml:"queue_capacity"`   // bounded queue size (default 10000)
-	UploadBatchSize int          `yaml:"upload_batch_size"` // events per upload (default 100)
-	UploadInterval time.Duration `yaml:"upload_interval"`  // max time between uploads (default 5s)
-	WALDir         string        `yaml:"wal_dir"`          // JSONL WAL directory
-
+	WALDir               string                         `yaml:"wal_dir"` // JSONL WAL directory
+	// QueryURL, when set, enables the query-stage canary probe. Canary hits
+	// GET {QueryURL}/internal/canary-check to verify query-service can read
+	// the projector-acked ODS row. Leave empty in trial (single-port, shared
+	// DB — the collector-side DWD ack is already the signal). Set in
+	// production to the query-service base URL for full end-to-end coverage.
+	QueryURL     string `yaml:"query_url"`
+	ServiceToken string `yaml:"service_token"`
+	// Usage reporting to collector-service
+	CollectorURL   string `yaml:"collector_url"`   // e.g. "http://localhost:27300"
+	CollectorToken string `yaml:"collector_token"` // Bearer token for auth
+	// Control service URL — historically used for diagnostics/canary-check
+	// queries. As of 2026-04-17 diagnostics live on collector-service, so
+	// CanaryProbe prefers CollectorURL and only falls back here when it is
+	// empty (older trial configs). Kept for backward compatibility.
+	ControlURL      string        `yaml:"control_url"`
+	DBPath          string        `yaml:"db_path"`
+	UploadBatchSize int           `yaml:"upload_batch_size"` // events per upload (default 100)
+	UploadInterval  time.Duration `yaml:"upload_interval"`   // max time between uploads (default 5s)
 	// Local usage-data retention (费用小票 §11/§12 design; implemented
 	// 2026-06-10). WAL files older than wal_retention_days move into the
 	// usage-wal-archive/ subdir; archived files older than wal_archive_days
@@ -168,22 +170,11 @@ type EventsConfig struct {
 	// pruned. 0 (unset) → defaults 30/90 per the design; negative disables
 	// the retention loop entirely (keep everything forever, pre-2026-06
 	// behavior).
-	WALRetentionDays int `yaml:"wal_retention_days"`
-	WALArchiveDays   int `yaml:"wal_archive_days"`
-
-	// Control service URL — historically used for diagnostics/canary-check
-	// queries. As of 2026-04-17 diagnostics live on collector-service, so
-	// CanaryProbe prefers CollectorURL and only falls back here when it is
-	// empty (older trial configs). Kept for backward compatibility.
-	ControlURL   string `yaml:"control_url"`
-	ServiceToken string `yaml:"service_token"`
-
-	// QueryURL, when set, enables the query-stage canary probe. Canary hits
-	// GET {QueryURL}/internal/canary-check to verify query-service can read
-	// the projector-acked ODS row. Leave empty in trial (single-port, shared
-	// DB — the collector-side DWD ack is already the signal). Set in
-	// production to the query-service base URL for full end-to-end coverage.
-	QueryURL string `yaml:"query_url"`
+	WALRetentionDays int           `yaml:"wal_retention_days"`
+	WALArchiveDays   int           `yaml:"wal_archive_days"`
+	QueueCapacity    int           `yaml:"queue_capacity"` // bounded queue size (default 10000)
+	FlushInterval    time.Duration `yaml:"flush_interval"`
+	BatchSize        int           `yaml:"batch_size"`
 }
 
 type LogConfig struct {

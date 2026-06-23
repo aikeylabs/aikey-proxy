@@ -34,7 +34,7 @@ func NewImpersonateChromeHTTPClient() *ImpersonateChromeHTTPClient {
 	return &ImpersonateChromeHTTPClient{client: c}
 }
 
-func (c *ImpersonateChromeHTTPClient) PostForm(_ context.Context, targetURL string, values url.Values, _ ...broker.HTTPOption) ([]byte, int, error) {
+func (c *ImpersonateChromeHTTPClient) PostForm(_ context.Context, targetURL string, values url.Values, _ ...broker.HTTPOption) (body []byte, statusCode int, err error) {
 	// Always use minimal headers for token endpoints (verified 2026-04-15).
 	// User-Agent: axios/1.13.6 matches the verified working pattern.
 	// No Sec-Fetch, no Origin, no Referer.

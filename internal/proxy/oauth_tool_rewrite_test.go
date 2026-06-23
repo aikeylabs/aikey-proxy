@@ -14,20 +14,20 @@ import (
 // ASCII, empty) returns unchanged with changed=false.
 func TestTitleCaseLeadingASCII(t *testing.T) {
 	cases := []struct {
-		in        string
-		want      string
-		changed   bool
+		in         string
+		want       string
 		commentary string
+		changed    bool
 	}{
-		{"bash", "Bash", true, "lowercase single word"},
-		{"read_file", "Read_file", true, "snake_case — only first byte changes"},
-		{"question", "Question", true, "lowercase multi-byte word"},
-		{"Bash", "Bash", false, "already uppercase — no change"},
-		{"WebFetch", "WebFetch", false, "already PascalCase — no change"},
-		{"123tool", "123tool", false, "leading digit — no change"},
-		{"_underscored", "_underscored", false, "leading underscore — no change"},
-		{"", "", false, "empty"},
-		{"中文", "中文", false, "non-ASCII leading byte — pass-through"},
+		{in: "bash", want: "Bash", changed: true, commentary: "lowercase single word"},
+		{in: "read_file", want: "Read_file", changed: true, commentary: "snake_case — only first byte changes"},
+		{in: "question", want: "Question", changed: true, commentary: "lowercase multi-byte word"},
+		{in: "Bash", want: "Bash", changed: false, commentary: "already uppercase — no change"},
+		{in: "WebFetch", want: "WebFetch", changed: false, commentary: "already PascalCase — no change"},
+		{in: "123tool", want: "123tool", changed: false, commentary: "leading digit — no change"},
+		{in: "_underscored", want: "_underscored", changed: false, commentary: "leading underscore — no change"},
+		{in: "", want: "", changed: false, commentary: "empty"},
+		{in: "中文", want: "中文", changed: false, commentary: "non-ASCII leading byte — pass-through"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.in+"_"+tc.commentary, func(t *testing.T) {

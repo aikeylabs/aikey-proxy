@@ -34,9 +34,11 @@ func (m *mockVault) GetSecret(alias string) (string, error) {
 // mockEventStore satisfies events.Store interface for collector.
 type mockEventStore struct{}
 
-func (m *mockEventStore) Insert(_ []events.UsageEvent) error                              { return nil }
-func (m *mockEventStore) QueryStats() (map[string]int64, map[string]int64, error) { return nil, nil, nil }
-func (m *mockEventStore) Close() error                                             { return nil }
+func (m *mockEventStore) Insert(_ []events.UsageEvent) error { return nil }
+func (m *mockEventStore) QueryStats() (map[string]int64, map[string]int64, error) {
+	return nil, nil, nil
+}
+func (m *mockEventStore) Close() error { return nil }
 
 func setupTestProxy(t *testing.T, upstreamURL string) *Proxy {
 	t.Helper()
@@ -143,7 +145,7 @@ func TestProxy_Anthropic_KeyReplacement(t *testing.T) {
 		t.Fatalf("expected 200, got %d: %s", w.Code, w.Body.String())
 	}
 
-	if receivedAPIKey != "sk-ant-real-key-456" {
+	if receivedAPIKey != "sk-ant-real-key-456" { //nolint:gosec // test fixture, not a real credential
 		t.Fatalf("upstream should receive real Anthropic key, got %q", receivedAPIKey)
 	}
 	if receivedVersion == "" {
@@ -467,21 +469,21 @@ func TestExtractProviderFromPath(t *testing.T) {
 type mockActiveVault struct {
 	secrets          map[string]string
 	activeKeyConfig  *vault.ActiveKeyConfig
-	activeTeamKeys   map[string]*vault.ManagedKey // keyed by lowercase provider code
-	personalAlias    string
-	personalText     string
-	personalProv     string
-	personalBaseURL  string
+	activeTeamKeys   map[string]*vault.ManagedKey      // keyed by lowercase provider code
 	providerBindings map[string]*vault.ProviderBinding // keyed by lowercase provider code (default profile)
 	// App-pipeline-specific fields (AKL-207). nil values are fine; the App
 	// pipeline methods return nil/nil for the no-op case which equals
 	// "no app registered" / "no scope binding" — graceful.
-	appRecord    *vault.AppRecord
-	appBindings  map[string]*vault.ProviderBinding // keyed by `<profileID>|<providerCode>`
+	appRecord   *vault.AppRecord
+	appBindings map[string]*vault.ProviderBinding // keyed by `<profileID>|<providerCode>`
 	// Mode B / Mode C alias lookup (2026-05-23, credential-mode-architecture
 	// SPEC §1.1.B + §1.1.C). nil keeps GetAliasCredential returning
 	// "not found" so legacy tests (mode A flows) need no changes.
-	aliasCreds   map[string]*vault.AliasCredential // keyed by alias name
+	aliasCreds      map[string]*vault.AliasCredential // keyed by alias name
+	personalAlias   string
+	personalText    string
+	personalProv    string
+	personalBaseURL string
 }
 
 func (m *mockActiveVault) GetSecret(alias string) (string, error) {

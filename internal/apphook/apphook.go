@@ -15,7 +15,7 @@
 //   - ai-compliance-detector  → AppHook implementation that runs Stage 1 detection
 //   - degrade-detector        → AppHook implementation that runs trust check
 //   - future apps (e.g. quality-evaluator, safety-classifier) → just add another
-//                              AppHook implementation, proxy unchanged
+//     AppHook implementation, proxy unchanged
 //
 // Anti-patterns that violate this (and MUST be rejected in code review):
 //   - naming the interface ComplianceHook
@@ -79,12 +79,12 @@ const (
 // text, JSON, even binary). Apps that want structured access decode it
 // themselves.
 type Request struct {
-	Direction Direction // inbound (prompt) or outbound (response)
-	Payload   []byte    // raw payload, app-interpreted
 	// Optional metadata (apps may ignore):
-	UserRole    string // e.g. "customer-service" (used by compliance to pick pack)
-	TargetModel string // e.g. "claude-sonnet-4-6"
-	RequestID   string // for tracing
+	UserRole    string    // e.g. "customer-service" (used by compliance to pick pack)
+	TargetModel string    // e.g. "claude-sonnet-4-6"
+	RequestID   string    // for tracing
+	Payload     []byte    // raw payload, app-interpreted
+	Direction   Direction // inbound (prompt) or outbound (response)
 	// RouteClass tells the child where this request's event should be reported:
 	// 0 = personal (child uploads locally, current behavior), 1 = team (child
 	// returns the event in Response.Event for the proxy to forward to master).
@@ -95,16 +95,16 @@ type Request struct {
 
 // Response is what the child app returns to proxy.
 type Response struct {
-	Action          Action
-	MutatedPayload  []byte        // present iff Action == ActionMask
-	Reason          string        // human-readable (for error messages, logs)
-	LatencyObserved time.Duration // measured by proxy, set by Hook.Detect not by child
-	Degraded        bool          // true if child unreachable / timed out — proxy already fell back to Allow
+	Reason         string // human-readable (for error messages, logs)
+	MutatedPayload []byte // present iff Action == ActionMask
 	// Event is the compliance event JSON the child hands back for the proxy to
 	// forward to master, populated ONLY for team-routed requests (RouteClass=1).
 	// Empty for personal-routed (child uploaded locally) and non-Detect ops.
 	// (v2 protocol, update doc 20260603 §2.2/§3.2.)
-	Event []byte
+	Event           []byte
+	LatencyObserved time.Duration // measured by proxy, set by Hook.Detect not by child
+	Action          Action
+	Degraded        bool // true if child unreachable / timed out — proxy already fell back to Allow
 }
 
 // Hook is the contract between aikey-proxy main loop and a first-party app.
@@ -141,14 +141,14 @@ type Hook interface {
 // Status describes a hook's current health.
 // Stable across reads — implementations update this from background goroutines.
 type Status struct {
-	Healthy        bool      // true iff child reachable and last detect succeeded
+	LastSpawnedAt  time.Time // wall-clock of last spawn
+	LastDetectAt   time.Time // wall-clock of last successful Detect roundtrip
+	LastErrorAt    time.Time // wall-clock of last failed Detect (any reason)
 	DegradedReason string    // populated when Healthy == false: crash | timeout | not_installed | protocol_mismatch | unauthorized
 	BinaryPath     string    // absolute path to child binary (e.g. ~/.aikey/apps/ai-compliance-detector/bin/detector)
 	Version        string    // protocol version + binary version from child's ready sentinel
-	LastSpawnedAt  time.Time // wall-clock of last spawn
 	RestartCount   uint64    // cumulative restart count since proxy start
-	LastDetectAt   time.Time // wall-clock of last successful Detect roundtrip
-	LastErrorAt    time.Time // wall-clock of last failed Detect (any reason)
+	Healthy        bool      // true iff child reachable and last detect succeeded
 }
 
 // Disabled is the no-op Hook used when no app is registered for a slot.

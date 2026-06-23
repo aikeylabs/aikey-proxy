@@ -1,12 +1,12 @@
 // Tests for the deferred-persist Codex model capture (2026-06-09 bugfix).
 //
 // The state-poisoning bug we're guarding against:
-//   1. some client sends `model: gpt-4o` through aikey-proxy Codex OAuth
-//   2. ChatGPT-account Codex returns 400 (gpt-4o not supported there)
-//   3. pre-fix, the model was written to disk BEFORE forwarding — so
-//      `gpt-4o` stayed in ~/.aikey/state/codex_last_model and every
-//      subsequent connectivity probe re-failed against it
-//   4. post-fix, the write is gated on response status 2xx
+//  1. some client sends `model: gpt-4o` through aikey-proxy Codex OAuth
+//  2. ChatGPT-account Codex returns 400 (gpt-4o not supported there)
+//  3. pre-fix, the model was written to disk BEFORE forwarding — so
+//     `gpt-4o` stayed in ~/.aikey/state/codex_last_model and every
+//     subsequent connectivity probe re-failed against it
+//  4. post-fix, the write is gated on response status 2xx
 //
 // These tests pin the gating contract end-to-end via the two public
 // hooks: captureCodexModel (request-leg stash) and

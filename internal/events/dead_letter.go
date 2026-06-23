@@ -40,9 +40,9 @@ func classifyUploadError(statusCode int) failureType {
 // doUpload returns *uploadError (not plain error) so uploadBatch can access
 // status code and response body for dead letter records.
 type uploadError struct {
-	StatusCode   int
-	ResponseBody string // truncated to 512 bytes
 	Err          error
+	ResponseBody string // truncated to 512 bytes
+	StatusCode   int
 }
 
 func (e *uploadError) Error() string {
@@ -56,7 +56,7 @@ func (e *uploadError) Error() string {
 func readTruncated(r io.Reader, maxBytes int) string {
 	buf := make([]byte, maxBytes)
 	n, _ := io.ReadFull(r, buf)
-	io.Copy(io.Discard, r) // drain remaining
+	_, _ = io.Copy(io.Discard, r) // drain remaining
 	return string(buf[:n])
 }
 
@@ -66,25 +66,25 @@ func readTruncated(r io.Reader, maxBytes int) string {
 // DeadAt is int64 Unix epoch milliseconds (UTC) — consistent with the
 // rest of the usage pipeline's timestamp format (bugfix 20260424).
 type deadLetterEntry struct {
-	DeadAt       aikeytime.Millis  `json:"dead_at"`
-	Reason       string            `json:"reason"` // "terminal" or "exhausted"
-	ErrorCode    int               `json:"error_code"`
-	ErrorMsg     string            `json:"error_msg"`
-	ResponseBody string            `json:"response_body"`
-	CollectorURL string            `json:"collector_url"`
-	ConfigHash   string            `json:"config_hash"`
-	ProxyBuildID string            `json:"proxy_build_id"`
-	AttemptCount int               `json:"attempt_count"`
-	BatchSize    int               `json:"batch_size"`
-	SchemaVersion int              `json:"schema_version"`
-	EventIDs     []string          `json:"event_ids"`
-	Events       []ReportableEvent `json:"events"`
+	ConfigHash    string            `json:"config_hash"`
+	Reason        string            `json:"reason"` // "terminal" or "exhausted"
+	ErrorMsg      string            `json:"error_msg"`
+	ResponseBody  string            `json:"response_body"`
+	CollectorURL  string            `json:"collector_url"`
+	ProxyBuildID  string            `json:"proxy_build_id"`
+	EventIDs      []string          `json:"event_ids"`
+	Events        []ReportableEvent `json:"events"`
+	ErrorCode     int               `json:"error_code"`
+	DeadAt        aikeytime.Millis  `json:"dead_at"`
+	AttemptCount  int               `json:"attempt_count"`
+	BatchSize     int               `json:"batch_size"`
+	SchemaVersion int               `json:"schema_version"`
 }
 
 // deadLetterWriter appends failed batches to dead_letter.jsonl.
 type deadLetterWriter struct {
-	mu   sync.Mutex
 	path string
+	mu   sync.Mutex
 }
 
 func newDeadLetterWriter(walDir string) *deadLetterWriter {
@@ -112,7 +112,7 @@ func (w *deadLetterWriter) Count() int {
 	return n
 }
 
-func (w *deadLetterWriter) write(entry deadLetterEntry) {
+func (w *deadLetterWriter) write(entry *deadLetterEntry) {
 	data, err := json.Marshal(entry)
 	if err != nil {
 		slog.Error("dead_letter: marshal failed", "error", err)
@@ -139,6 +139,9 @@ func (w *deadLetterWriter) write(entry deadLetterEntry) {
 // Surfaced to operators via the admin endpoint so they can tell at a
 // glance whether replay made progress.
 type ReplayDeadLetterResult struct {
+	// LastError is the most recent error message seen on a re-upload
+	// (empty if all succeeded). Useful for one-line diagnostics.
+	LastError string `json:"last_error,omitempty"`
 	// EntriesScanned is the total number of records read from
 	// dead_letter.jsonl (one per failed batch from the original
 	// upload run).
@@ -153,11 +156,8 @@ type ReplayDeadLetterResult struct {
 	EntriesStillFailing int `json:"entries_still_failing"`
 	// EventsReplayedOK / EventsStillFailing sum the per-entry batch
 	// sizes — useful when batches are large (one entry, 100 events).
-	EventsReplayedOK    int `json:"events_replayed_ok"`
-	EventsStillFailing  int `json:"events_still_failing"`
-	// LastError is the most recent error message seen on a re-upload
-	// (empty if all succeeded). Useful for one-line diagnostics.
-	LastError string `json:"last_error,omitempty"`
+	EventsReplayedOK   int `json:"events_replayed_ok"`
+	EventsStillFailing int `json:"events_still_failing"`
 }
 
 // ReplayDeadLetter scans dead_letter.jsonl line by line and tries to
@@ -311,7 +311,7 @@ func (r *Reporter) ReplayDeadLetter(ctx context.Context) (ReplayDeadLetterResult
 	if len(keepLines) > 0 {
 		out = append(out, '\n')
 	}
-	if err := os.WriteFile(tmpPath, out, 0o644); err != nil {
+	if err := os.WriteFile(tmpPath, out, 0o600); err != nil {
 		return result, fmt.Errorf("write dead_letter.tmp: %w", err)
 	}
 	if err := os.Rename(tmpPath, path); err != nil {
@@ -336,7 +336,8 @@ func (r *Reporter) writeDeadLetter(batch []ReportableEvent, reason string, upErr
 
 	eventIDs := make([]string, len(batch))
 	schemaVersion := 0
-	for i, ev := range batch {
+	for i := range batch {
+		ev := &batch[i]
 		eventIDs[i] = ev.EventID
 		if ev.SchemaVersion > schemaVersion {
 			schemaVersion = ev.SchemaVersion
@@ -359,5 +360,5 @@ func (r *Reporter) writeDeadLetter(batch []ReportableEvent, reason string, upErr
 		Events:        batch,
 	}
 
-	r.dlw.write(entry)
+	r.dlw.write(&entry)
 }

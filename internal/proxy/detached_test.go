@@ -16,7 +16,7 @@ import (
 // correctness test: the upstream call must finish even if the original client
 // context is canceled mid-flight.
 func TestDetachedTransport_CompletesAfterClientContextCanceled(t *testing.T) {
-	upstreamReady   := make(chan struct{})
+	upstreamReady := make(chan struct{})
 	upstreamProceed := make(chan struct{})
 
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -47,7 +47,7 @@ func TestDetachedTransport_CompletesAfterClientContextCanceled(t *testing.T) {
 	}
 	resultCh := make(chan result, 1)
 	go func() {
-		resp, err := dt.RoundTrip(req)
+		resp, err := dt.RoundTrip(req) //nolint:bodyclose // resp.Body is read and closed by the result-channel consumer below
 		resultCh <- result{resp, err}
 	}()
 
@@ -96,7 +96,10 @@ func TestDetachedTransport_AbortedByProxyContext(t *testing.T) {
 
 	done := make(chan error, 1)
 	go func() {
-		_, err := dt.RoundTrip(req)
+		resp, err := dt.RoundTrip(req)
+		if resp != nil {
+			_ = resp.Body.Close()
+		}
 		done <- err
 	}()
 
@@ -130,7 +133,10 @@ func TestDetachedTransport_MaxTimeoutBounds(t *testing.T) {
 
 	req, _ := http.NewRequestWithContext(context.Background(), "GET", upstream.URL, nil)
 	start := time.Now()
-	_, err := dt.RoundTrip(req)
+	resp, err := dt.RoundTrip(req)
+	if resp != nil {
+		_ = resp.Body.Close()
+	}
 	elapsed := time.Since(start)
 
 	if err == nil {

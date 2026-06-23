@@ -35,13 +35,12 @@ import (
 // failures. A nil *Probe is a no-op (LastOKAt returns zero), so callers that
 // only create it under a feature flag can pass nil around freely.
 type Probe struct {
-	interval time.Duration
-	probe    func(ctx context.Context) error
-	now      func() time.Time
-
-	mu                  sync.RWMutex
 	lastOKAt            time.Time
+	probe               func(ctx context.Context) error
+	now                 func() time.Time
+	interval            time.Duration
 	consecutiveFailures int
+	mu                  sync.RWMutex
 }
 
 // New builds a Probe that runs probe every interval. A non-positive interval is

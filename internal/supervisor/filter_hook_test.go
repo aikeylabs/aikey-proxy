@@ -21,7 +21,7 @@ func TestResolveAppBinary(t *testing.T) {
 		t.Fatal(err)
 	}
 	bin := filepath.Join(binDir, "myfilter")
-	if err := os.WriteFile(bin, []byte("#!/bin/sh\n"), 0o755); err != nil {
+	if err := os.WriteFile(bin, []byte("#!/bin/sh\n"), 0o600); err != nil {
 		t.Fatal(err)
 	}
 

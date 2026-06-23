@@ -76,14 +76,14 @@ func (s *anthropicStreamAcc) Feed(frameData []byte) {
 		return
 	}
 	var event struct {
-		Type    string `json:"type"`
+		Type  string `json:"type"`
+		Delta struct {
+			StopReason string `json:"stop_reason"`
+		} `json:"delta"`
 		Message struct {
 			Model string         `json:"model"`
 			Usage anthropicUsage `json:"usage"`
 		} `json:"message"`
-		Delta struct {
-			StopReason string `json:"stop_reason"`
-		} `json:"delta"`
 		Usage anthropicUsage `json:"usage"`
 	}
 	if json.Unmarshal(frameData, &event) != nil {
@@ -118,6 +118,7 @@ func (s *anthropicStreamAcc) Result() TokenBreakdown { return s.br }
 //   - model:     FIRST non-empty wins        (extractOpenAIModel returns first)
 //   - stop:      LAST  non-empty wins        (extractOpenAIStopReason keeps last)
 //   - InputTokens (pure) = first-frame raw input − last-frame cached  (clamped ≥0)
+//
 // The first/last split is preserved verbatim so the fence is byte-identical even
 // on pathological multi-usage-frame streams, not just the single-usage realistic case.
 type openaiStreamAcc struct {
@@ -127,7 +128,7 @@ type openaiStreamAcc struct {
 	modelSeen bool
 }
 
-func (o *OpenAI) NewStreamAccumulator() StreamAccumulator { return &openaiStreamAcc{} }
+func (o *OpenAI) NewStreamAccumulator() StreamAccumulator  { return &openaiStreamAcc{} }
 func (k *Kimi) NewStreamAccumulator() StreamAccumulator    { return (&OpenAI{}).NewStreamAccumulator() }
 func (g *Generic) NewStreamAccumulator() StreamAccumulator { return (&OpenAI{}).NewStreamAccumulator() }
 
@@ -136,14 +137,14 @@ func (s *openaiStreamAcc) Feed(frameData []byte) {
 		return
 	}
 	var f struct {
-		Model   string `json:"model"`
-		Choices []struct {
-			FinishReason string `json:"finish_reason"`
-		} `json:"choices"`
 		Usage    *openaiUsageData `json:"usage"`
 		Response *struct {
 			Usage *openaiUsageData `json:"usage"`
 		} `json:"response"`
+		Model   string `json:"model"`
+		Choices []struct {
+			FinishReason string `json:"finish_reason"`
+		} `json:"choices"`
 	}
 	if json.Unmarshal(frameData, &f) != nil {
 		return

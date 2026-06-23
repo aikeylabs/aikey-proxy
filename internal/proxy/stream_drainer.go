@@ -58,15 +58,16 @@ func (d *streamDrainer) Close() error {
 // completion captures how the stream terminated:
 //   - "complete":    upstream reached normal EOF and we forwarded all bytes
 //   - "partial":     client disconnected before EOF; recorded tokens reflect
-//                    only the prefix we successfully forwarded
+//     only the prefix we successfully forwarded
 //   - "interrupted": proxy was shutting down (proxyCtx canceled) or the
-//                    upstream read errored mid-stream
+//     upstream read errored mid-stream
+//
 // Nil means no reporting.
 type reporterCallback func(breakdown provider.TokenBreakdown, completion string)
 
 func newStreamDrainer(
 	upstream io.ReadCloser,
-	baseEvent events.UsageEvent,
+	baseEvent *events.UsageEvent,
 	prov provider.Provider,
 	collector *events.Collector,
 	proxyCtx context.Context,
@@ -248,7 +249,7 @@ func newStreamDrainer(
 				"body_len", acc.Len(),
 			)
 		}
-		ev := baseEvent
+		ev := *baseEvent
 		ev.InputTokens = breakdown.InputTokens
 		ev.OutputTokens = breakdown.OutputTokens
 		ev.DurationMs = time.Since(baseEvent.Timestamp).Milliseconds()
@@ -267,7 +268,7 @@ func newStreamDrainer(
 		// a successful streaming response — observed as "chat ok" in CLI
 		// followed by connection-refused on the next request (2026-04-22).
 		if collector != nil {
-			collector.Record(ev)
+			collector.Record(&ev)
 		}
 		if onComplete != nil {
 			onComplete(breakdown, completion)

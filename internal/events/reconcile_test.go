@@ -13,10 +13,10 @@ import (
 // mockCollector serves the D3 reconciliation endpoints + the batch ingest, and
 // records what the client re-sent / confirmed-lost.
 type mockCollector struct {
-	mu            sync.Mutex
 	gaps          []int64 // what /gaps returns
 	reSentSeqs    []int64 // source_seqs received on the batch endpoint (re-sends)
 	confirmedSeqs []int64 // seqs received on /confirm-lost
+	mu            sync.Mutex
 }
 
 func (m *mockCollector) mux(srcID string) *http.ServeMux {
@@ -72,7 +72,7 @@ func TestReconcileGaps_ResendAndConfirmLost(t *testing.T) {
 	srv := httptest.NewServer(mc.mux("srcR"))
 	defer srv.Close()
 
-	r, err := NewReporter(ReporterConfig{
+	r, err := NewReporter(&ReporterConfig{
 		CollectorURL:   srv.URL,
 		WALDir:         t.TempDir(),
 		SourceID:       "srcR",
@@ -84,7 +84,8 @@ func TestReconcileGaps_ResendAndConfirmLost(t *testing.T) {
 	}
 	// WAL now holds seqs 1,2,3 for srcR (Report appends synchronously).
 	for seq := int64(1); seq <= 3; seq++ {
-		r.Report(v2Event("e"+string(rune('0'+seq)), "srcR", seq))
+		e := v2Event("e"+string(rune('0'+seq)), "srcR", seq)
+		r.Report(&e)
 	}
 
 	res, err := r.ReconcileGaps(context.Background())
@@ -122,7 +123,7 @@ func TestAuditStatus_LocalState(t *testing.T) {
 	for i := 0; i < 4; i++ {
 		_, _ = sa.Next()
 	}
-	r, err := NewReporter(ReporterConfig{
+	r, err := NewReporter(&ReporterConfig{
 		WALDir:   dir,
 		SourceID: "srcA",
 		SeqAlloc: sa,
@@ -130,7 +131,8 @@ func TestAuditStatus_LocalState(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	r.Report(v2Event("e1", "srcA", 1))
+	e1 := v2Event("e1", "srcA", 1)
+	r.Report(&e1)
 
 	st := r.AuditStatus()
 	if st.SourceID != "srcA" {

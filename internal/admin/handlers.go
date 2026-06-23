@@ -123,8 +123,6 @@ func NewHandler(cfg *config.Config, reg *vkeys.Registry, store *events.Store) *H
 }
 
 type healthResponse struct {
-	Status  string `json:"status"`
-	Version string `json:"version"`
 	// UsagePipeline is the BYPASS usage/billing pipeline verdict (缺口3). It is
 	// deliberately SEPARATE from the top-level Status (which stays a pure liveness
 	// signal for the MAIN LLM-forwarding path): a degraded bypass pipeline must
@@ -132,6 +130,8 @@ type healthResponse struct {
 	// healthy main-link forwarding (architecture: 主链路/旁路 isolation). Omitted
 	// when neither reporter nor canary is wired (offline Personal).
 	UsagePipeline *pipelineHealth `json:"usage_pipeline,omitempty"`
+	Status        string          `json:"status"`
+	Version       string          `json:"version"`
 }
 
 // pipelineHealth is a single readable verdict an external monitor / the release
@@ -225,9 +225,9 @@ type statusResponse struct {
 	Version     string `json:"version"`
 	Uptime      string `json:"uptime"`
 	ListenAddr  string `json:"listen_addr"`
-	VirtualKeys int    `json:"virtual_keys_loaded"`
 	VaultPath   string `json:"vault_path"`
 	StartedAt   string `json:"started_at"`
+	VirtualKeys int    `json:"virtual_keys_loaded"`
 	TotalReqs   int64  `json:"total_requests"`
 	TotalErrs   int64  `json:"total_errors"`
 }
@@ -262,13 +262,13 @@ func (h *Handler) Status(w http.ResponseWriter, r *http.Request) {
 }
 
 type metricsResponse struct {
-	TotalRequests      int64                  `json:"total_requests"`
-	TotalErrors        int64                  `json:"total_errors"`
-	RequestsByVKey     map[string]int64       `json:"requests_by_vkey"`
-	RequestsByProvider map[string]int64       `json:"requests_by_provider"`
+	RequestsByVKey     map[string]int64         `json:"requests_by_vkey"`
+	RequestsByProvider map[string]int64         `json:"requests_by_provider"`
 	Reporter           *events.ReporterMetrics  `json:"reporter,omitempty"`
 	Collector          *events.CollectorMetrics `json:"collector,omitempty"`
 	Canary             *events.CanaryResult     `json:"canary,omitempty"`
+	TotalRequests      int64                    `json:"total_requests"`
+	TotalErrors        int64                    `json:"total_errors"`
 }
 
 // Metrics returns aggregated usage metrics.
@@ -503,15 +503,15 @@ func (h *Handler) HealthProviders(w http.ResponseWriter, r *http.Request) {
 	type result struct {
 		Provider  string `json:"provider"`
 		BaseURL   string `json:"base_url"`
-		Reachable bool   `json:"reachable"`
-		LatencyMs int64  `json:"latency_ms,omitempty"`
 		Error     string `json:"error,omitempty"`
+		LatencyMs int64  `json:"latency_ms,omitempty"`
+		Reachable bool   `json:"reachable"`
 	}
 
 	results := make([]result, 0, len(knownProviders))
 	for _, p := range knownProviders {
 		start := time.Now()
-		req, reqErr := http.NewRequestWithContext(r.Context(), "GET", p.baseURL, nil)
+		req, reqErr := http.NewRequestWithContext(r.Context(), "GET", p.baseURL, http.NoBody)
 		if reqErr != nil {
 			results = append(results, result{
 				Provider: p.code, BaseURL: p.baseURL,
@@ -577,8 +577,8 @@ func (h *Handler) AppHealth(w http.ResponseWriter, r *http.Request) {
 // Web can distinguish "no compliance filter active" (available:false) from a
 // real report. report is the detector's {built_in,pulled,cursor} JSON verbatim.
 type CompliancePacksEnvelope struct {
-	Available bool            `json:"available"`
 	Report    json.RawMessage `json:"report,omitempty"`
+	Available bool            `json:"available"`
 }
 
 // CompliancePacks returns the compliance packs currently effective in the LIVE
@@ -631,15 +631,16 @@ func (h *Handler) HealthKeys(w http.ResponseWriter, r *http.Request) {
 	type result struct {
 		Provider   string `json:"provider"`
 		KeyRef     string `json:"key_ref"`
-		Ok         bool   `json:"ok"`
+		Error      string `json:"error,omitempty"`
 		LatencyMs  int64  `json:"latency_ms,omitempty"`
 		StatusCode int    `json:"status_code,omitempty"`
-		Error      string `json:"error,omitempty"`
+		Ok         bool   `json:"ok"`
 	}
 
 	client := &http.Client{Timeout: 15 * time.Second}
 	results := make([]result, 0, len(targets))
-	for _, t := range targets {
+	for i := range targets {
+		t := &targets[i]
 		start := time.Now()
 		code, callErr := probeKey(r.Context(), client, t)
 		latency := time.Since(start).Milliseconds()
@@ -650,13 +651,14 @@ func (h *Handler) HealthKeys(w http.ResponseWriter, r *http.Request) {
 		// 5xx        → provider-side server error (treat as failure).
 		ok := callErr == nil && code != http.StatusUnauthorized && code != http.StatusForbidden && code < 500
 		var errMsg string
-		if callErr != nil {
+		switch {
+		case callErr != nil:
 			ok = false
 			errMsg = classifyNetError(callErr)
-		} else if code == http.StatusUnauthorized || code == http.StatusForbidden {
+		case code == http.StatusUnauthorized || code == http.StatusForbidden:
 			ok = false
 			errMsg = fmt.Sprintf("HTTP %d — key may be invalid or expired", code)
-		} else if code >= 500 {
+		case code >= 500:
 			ok = false
 			errMsg = fmt.Sprintf("HTTP %d — provider service error", code)
 		}
@@ -677,7 +679,7 @@ func (h *Handler) HealthKeys(w http.ResponseWriter, r *http.Request) {
 //   - 401 / 403  → key rejected (invalid or expired)
 //   - other 4xx  → authenticated (auth passed), request/model issue — still treated as ok
 //   - 5xx        → provider-side server error
-func probeKey(ctx context.Context, client *http.Client, t KeyCheckTarget) (int, error) {
+func probeKey(ctx context.Context, client *http.Client, t *KeyCheckTarget) (int, error) {
 	baseURL := strings.TrimRight(t.BaseURL, "/")
 	if baseURL == "" {
 		baseURL = providerDefaultBaseURL(t.Provider)
@@ -815,17 +817,17 @@ func providerDefaultBaseURL(code string) string {
 
 // ProbePingRequest is the POST body for /admin/probe/ping.
 type ProbePingRequest struct {
-	Provider string `json:"provider"` // canonical code: "anthropic", "openai", "kimi", ...
+	Provider string `json:"provider"`           // canonical code: "anthropic", "openai", "kimi", ...
 	BaseURL  string `json:"base_url,omitempty"` // optional override; empty → default for provider
 }
 
 // ProbePingResponse is what the CLI reads back. `OK` is true iff the TCP
 // handshake completed within the timeout — no HTTP call, no authentication.
 type ProbePingResponse struct {
-	OK        bool   `json:"ok"`
-	LatencyMs int64  `json:"latency_ms"`
-	Host      string `json:"host,omitempty"`  // echoed back for debugging
+	Host      string `json:"host,omitempty"` // echoed back for debugging
 	Error     string `json:"error,omitempty"`
+	LatencyMs int64  `json:"latency_ms"`
+	OK        bool   `json:"ok"`
 }
 
 // ProbePing handles POST /admin/probe/ping.
@@ -907,7 +909,7 @@ func (h *Handler) ProbePing(w http.ResponseWriter, r *http.Request) {
 	} else {
 		// Build a synthetic request so ProxyFromEnvironment can apply
 		// NO_PROXY matching against the actual target URL.
-		if probeReq, perr := http.NewRequest(http.MethodHead, baseURL, nil); perr == nil {
+		if probeReq, perr := http.NewRequestWithContext(context.Background(), http.MethodHead, baseURL, http.NoBody); perr == nil {
 			if p, _ := http.ProxyFromEnvironment(probeReq); p != nil {
 				proxyURL = p.String()
 			}
@@ -978,7 +980,7 @@ func httpHeadViaProxy(targetURL, proxyURL string, timeout time.Duration) error {
 	}
 	// Some upstreams 405 on HEAD /; that still proves reachability. A
 	// transport-level failure is what we want to detect, not HTTP status.
-	req, err := http.NewRequest(http.MethodHead, targetURL, nil)
+	req, err := http.NewRequestWithContext(context.Background(), http.MethodHead, targetURL, http.NoBody)
 	if err != nil {
 		return fmt.Errorf("build request: %w", err)
 	}
@@ -993,7 +995,7 @@ func httpHeadViaProxy(targetURL, proxyURL string, timeout time.Duration) error {
 // extractHostPort parses a URL-ish string "https://host:port/..." into
 // (host, port). Defaults to 443 (https) / 80 (http) when port is absent.
 // Returns ("", 0) on malformed input.
-func extractHostPort(rawURL string) (string, int) {
+func extractHostPort(rawURL string) (host string, port int) {
 	trimmed := strings.TrimPrefix(rawURL, "https://")
 	isHTTP := false
 	if trimmed == rawURL {
@@ -1013,9 +1015,9 @@ func extractHostPort(rawURL string) (string, int) {
 	}
 	// Parse optional :port.
 	if i := strings.LastIndex(trimmed, ":"); i >= 0 {
-		host := trimmed[:i]
+		host = trimmed[:i]
 		portStr := trimmed[i+1:]
-		port := 0
+		port = 0
 		for _, c := range portStr {
 			if c < '0' || c > '9' {
 				port = 0
@@ -1052,7 +1054,7 @@ func classifyNetError(err error) string {
 func writeJSON(w http.ResponseWriter, status int, v any) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(status)
-	json.NewEncoder(w).Encode(v)
+	_ = json.NewEncoder(w).Encode(v)
 }
 
 // DebugUpstreamHeadersGet returns the current state of the upstream-headers

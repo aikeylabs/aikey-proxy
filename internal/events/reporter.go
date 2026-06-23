@@ -20,9 +20,18 @@ import (
 
 // ReporterConfig configures the usage reporter.
 type ReporterConfig struct {
-	CollectorURL    string        // e.g. "http://localhost:27300"
-	CollectorToken  string        // Bearer token
-
+	// SharedWAL, when non-nil, takes precedence over WALDir.  This lets the
+	// supervisor create a single WALWriter shared with the proxy — so even
+	// when the reporter is disabled (no collector_url) the proxy can still
+	// append to the same WAL for local consumers (statusline / watch).
+	SharedWAL *WALWriter
+	// SeqAlloc is the per-source reserve-ahead sequence allocator, shared with
+	// the proxy (same instance the proxy stamps source_seq from). The reporter
+	// only READS Allocated() from it to stamp batchRequest.AllocatedSeq for
+	// tail-gap detection — it does NOT own its lifecycle (the supervisor's
+	// generation.close() owns the zero-burn Close()). nil → batches carry no
+	// allocated_seq (offline / degraded). Added 2026-05-30 (delivery integrity).
+	SeqAlloc *SeqAllocator
 	// CollectorRoutes maps RouteSource ("personal" / "team" / "oauth") →
 	// upload URL. When ev.RouteSource has a non-empty mapping, that URL
 	// is used for the event; misses fall through to CollectorURL.
@@ -32,7 +41,6 @@ type ReporterConfig struct {
 	// team-key events go to remote team collector after `aikey login`.
 	// Single channel + grouped per-URL upload — see uploadBatch.
 	CollectorRoutes map[string]string
-
 	// CollectorRouteCredentials maps RouteSource → Credential (added
 	// 2026-05-11 B-phase, see roadmap update
 	// 20260511-user-jwt-collector-ingest.md). When ev.RouteSource has a
@@ -47,42 +55,23 @@ type ReporterConfig struct {
 	// tests inject either independently and lets a future config field
 	// (e.g. per-route mTLS material) follow the same pattern.
 	CollectorRouteCredentials map[string]Credential
-
-	QueueCapacity   int           // bounded queue size (default 10000)
-	BatchSize       int           // events per upload batch (default 100)
-	UploadInterval  time.Duration // max time between uploads (default 5s)
-	WALDir          string        // JSONL WAL directory (used only when SharedWAL is nil)
-	ProxyInstanceID string
-	ConfigHash      string // pipeline config hash for dead letter diagnostics
-	DBPath          string // events DB path, used as dead letter fallback dir
-
-	// SharedWAL, when non-nil, takes precedence over WALDir.  This lets the
-	// supervisor create a single WALWriter shared with the proxy — so even
-	// when the reporter is disabled (no collector_url) the proxy can still
-	// append to the same WAL for local consumers (statusline / watch).
-	SharedWAL *WALWriter
-
-	// SeqAlloc is the per-source reserve-ahead sequence allocator, shared with
-	// the proxy (same instance the proxy stamps source_seq from). The reporter
-	// only READS Allocated() from it to stamp batchRequest.AllocatedSeq for
-	// tail-gap detection — it does NOT own its lifecycle (the supervisor's
-	// generation.close() owns the zero-burn Close()). nil → batches carry no
-	// allocated_seq (offline / degraded). Added 2026-05-30 (delivery integrity).
-	SeqAlloc *SeqAllocator
-
+	ConfigHash                string // pipeline config hash for dead letter diagnostics
+	WALDir                    string // JSONL WAL directory (used only when SharedWAL is nil)
+	ProxyInstanceID           string
+	CollectorURL              string // e.g. "http://localhost:27300"
+	DBPath                    string // events DB path, used as dead letter fallback dir
+	CollectorToken            string // Bearer token
 	// SourceID is this vault's stable source identity (runtime.source_identity).
 	// Used by ReconcileGaps/AuditStatus (D2.5/D3) to filter the collector's
 	// per-source completeness to "my" source. Empty disables reconcile.
-	SourceID string
+	SourceID       string
+	BatchSize      int           // events per upload batch (default 100)
+	UploadInterval time.Duration // max time between uploads (default 5s)
+	QueueCapacity  int           // bounded queue size (default 10000)
 }
 
 // batchRequest mirrors the collector-service ingest API request body.
 type batchRequest struct {
-	Source          string            `json:"source"`
-	SourceVersion   string            `json:"source_version"`
-	ProxyInstanceID string            `json:"proxy_instance_id"`
-	Events          []ReportableEvent `json:"events"`
-
 	// AllocatedSeq carries this source's allocator high-water mark (the highest
 	// source_seq ever handed out, reserve-ahead) so the server can detect a
 	// TAIL gap — allocated > delivered-contiguous past a timeout ⇒ suspected
@@ -92,19 +81,23 @@ type batchRequest struct {
 	// up-to-date). nil when no allocator is wired (degraded/offline) → server
 	// omits tail detection for this source. Added 2026-05-30 (delivery
 	// integrity, B'). See design doc 阶段6-企业定制/20260530-财务对账级用量审计.
-	AllocatedSeq *int64 `json:"allocated_seq,omitempty"`
+	AllocatedSeq    *int64            `json:"allocated_seq,omitempty"`
+	Source          string            `json:"source"`
+	SourceVersion   string            `json:"source_version"`
+	ProxyInstanceID string            `json:"proxy_instance_id"`
+	Events          []ReportableEvent `json:"events"`
 }
 
 type batchResponse struct {
-	Accepted   int `json:"accepted"`
-	Duplicated int `json:"duplicated"`
-	Rejected   int `json:"rejected"`
 	// ContiguousSeq is the server's per-source connected-no-gap high-water mark
 	// after ingesting this batch (delivery integrity, 2026-05-30). The uploader
 	// advances confirmedSeq to this and prunes WAL files at/below it. A nil map
 	// (older collector that doesn't return the field) means "don't advance /
 	// don't prune" — conserve, never lose. Keyed by source_id.
 	ContiguousSeq map[string]int64 `json:"contiguous_seq,omitempty"`
+	Accepted      int              `json:"accepted"`
+	Duplicated    int              `json:"duplicated"`
+	Rejected      int              `json:"rejected"`
 }
 
 // Reporter handles usage event reporting: WAL write + async upload to collector-service.
@@ -115,9 +108,9 @@ type batchResponse struct {
 // advances two IN-MEMORY cursors (not persisted — rebuilt on restart):
 //
 //   - sentSeq[source]:      highest source_seq this process has handed to an
-//                           upload attempt. Filters "what to read next time".
+//     upload attempt. Filters "what to read next time".
 //   - confirmedSeq[source]: highest server-acked contiguous seq. Used ONLY to
-//                           prune WAL files (files whose max seq ≤ confirmed).
+//     prune WAL files (files whose max seq ≤ confirmed).
 //
 // On restart both cursors are empty, so the loop replays from the oldest
 // un-pruned WAL file; the server's (org_id,event_id) dedup absorbs the overlap.
@@ -125,33 +118,8 @@ type batchResponse struct {
 // on restart, in exchange for zero persisted upload state and a model that
 // CANNOT silently skip (conserve-on-uncertainty everywhere).
 type Reporter struct {
-	cfg    ReporterConfig
-	wal    *WALWriter
-	dlw    *deadLetterWriter // dead letter writer for terminal failures
-	signal chan struct{}     // cap-1 wakeup poke from Report → uploadLoop
-	done   chan struct{}
-	wg     sync.WaitGroup
-	client *http.Client
-
-	// delivery-integrity cursors (memory only; see type doc). Guarded by mu.
-	sentSeq      map[string]int64 // source_id → highest seq handed to upload
-	confirmedSeq map[string]int64 // source_id → server contiguous high-water
-	seenV1       map[string]bool  // event_id → uploaded; A1 one-shot for v1 entries
-
-	// metrics
-	generated     atomic.Int64
-	enqueued      atomic.Int64
-	dropped       atomic.Int64
-	uploadSuccess atomic.Int64
-	uploadFailed  atomic.Int64
-
-	// delivery state (memory only, not persisted)
-	mu                  sync.RWMutex
-	consecutiveFailures int
-	lastUploadAt        time.Time
-	lastUploadStatus    string // "ok" | "retryable_failed" | "terminal_failed"
-	lastErrorCode       int
-	lastErrorAt         time.Time
+	lastCanaryEventAt time.Time
+	lastErrorAt       time.Time
 	// nextUploadAttempt is the non-blocking backoff gate (B', 2026-06-09 缺口2):
 	// after a drain pass hits retryable upload failures, drainOnce sets this
 	// ahead and skips upload attempts until it passes — replacing the old in-line
@@ -159,12 +127,35 @@ type Reporter struct {
 	// = no gate. New events keep landing in the WAL while gated.
 	nextUploadAttempt   time.Time
 	lastBusinessEventAt time.Time
-	lastCanaryEventAt   time.Time
-	terminalFailCount   atomic.Int64
+	lastUploadAt        time.Time
+	wal                 *WALWriter
+	done                chan struct{}
+	// delivery-integrity cursors (memory only; see type doc). Guarded by mu.
+	sentSeq             map[string]int64  // source_id → highest seq handed to upload
+	confirmedSeq        map[string]int64  // source_id → server contiguous high-water
+	seenV1              map[string]bool   // event_id → uploaded; A1 one-shot for v1 entries
+	signal              chan struct{}     // cap-1 wakeup poke from Report → uploadLoop
+	dlw                 *deadLetterWriter // dead letter writer for terminal failures
+	client              *http.Client
+	lastUploadStatus    string // "ok" | "retryable_failed" | "terminal_failed"
+	cfg                 ReporterConfig
+	wg                  sync.WaitGroup
+	consecutiveFailures int
+	uploadFailed        atomic.Int64
+	uploadSuccess       atomic.Int64
+	lastErrorCode       int
+	dropped             atomic.Int64
+	enqueued            atomic.Int64
+	// metrics
+	generated         atomic.Int64
+	terminalFailCount atomic.Int64
+	// delivery state (memory only, not persisted)
+	mu sync.RWMutex
 }
 
 // NewReporter creates and starts a usage event reporter.
-func NewReporter(cfg ReporterConfig) (*Reporter, error) {
+func NewReporter(in *ReporterConfig) (*Reporter, error) {
+	cfg := *in // local copy so default-fills never mutate the caller's value
 	if cfg.QueueCapacity <= 0 {
 		cfg.QueueCapacity = 10000
 	}
@@ -204,7 +195,10 @@ func NewReporter(cfg ReporterConfig) (*Reporter, error) {
 		}
 	}
 	if dlDir != "" {
-		os.MkdirAll(dlDir, 0o755)
+		if mkErr := os.MkdirAll(dlDir, 0o755); mkErr != nil {
+			slog.Warn("reporter: dead-letter dir create failed; failed events may not be persisted",
+				"dir", dlDir, "error", mkErr)
+		}
 		// Stage 2.5 windows-compat: dead-letter contains failed event
 		// payloads — harden NTFS ACL.
 		_ = aikeycompat.EnforceOwnerOnly(dlDir)
@@ -251,7 +245,7 @@ func NewReporter(cfg ReporterConfig) (*Reporter, error) {
 // overrides ahead of the legacy single-URL CollectorURL. Returns "" when
 // no destination is configured for the event's RouteSource — caller must
 // skip the upload (event is already WAL'd).
-func (r *Reporter) urlForEvent(ev ReportableEvent) string {
+func (r *Reporter) urlForEvent(ev *ReportableEvent) string {
 	return r.urlForRouteSource(ev.RouteSource)
 }
 
@@ -335,7 +329,7 @@ func (r *Reporter) PrimaryRouteSource() string {
 // the buffer (disk backpressure). If the WAL write fails it is counted in
 // usage_wal_append_failed_total and the event is lost locally, which a hard
 // crash would do anyway; reserve-ahead turns that into an auditable gap.
-func (r *Reporter) Report(ev ReportableEvent) {
+func (r *Reporter) Report(ev *ReportableEvent) {
 	r.generated.Add(1)
 
 	// Track business vs canary event timestamps separately so canary events
@@ -429,19 +423,18 @@ func (r *Reporter) Metrics() ReporterMetrics {
 // format as every other pipeline timestamp lets automation parse
 // once without a format-detection step (bugfix 20260424).
 type ReporterMetrics struct {
+	LastUploadStatus string           `json:"last_upload_status,omitempty"`
+	UploadSuccess    int64            `json:"usage_events_upload_success_total"`
+	LastUploadAt     aikeytime.Millis `json:"last_upload_at,omitempty"`
 	// counters
 	Generated     int64 `json:"usage_events_generated_total"`
-	Enqueued      int64 `json:"usage_events_enqueued_total"`
-	Dropped       int64 `json:"usage_events_dropped_total"`
-	UploadSuccess int64 `json:"usage_events_upload_success_total"`
 	UploadFailed  int64 `json:"usage_events_upload_failed_total"`
 	QueueDepth    int64 `json:"usage_queue_depth"`
 	WALAppendFail int64 `json:"usage_wal_append_failed_total"`
-
 	// delivery state
 	ConsecutiveFailures int              `json:"consecutive_failures"`
-	LastUploadAt        aikeytime.Millis `json:"last_upload_at,omitempty"`
-	LastUploadStatus    string           `json:"last_upload_status,omitempty"`
+	Dropped             int64            `json:"usage_events_dropped_total"`
+	Enqueued            int64            `json:"usage_events_enqueued_total"`
 	LastErrorCode       int              `json:"last_error_code,omitempty"`
 	LastErrorAt         aikeytime.Millis `json:"last_error_at,omitempty"`
 	TerminalFailCount   int64            `json:"terminal_fail_count"`
@@ -582,12 +575,13 @@ func (r *Reporter) uploadPending(batch []ReportableEvent) (anyRetryable bool) {
 	}
 	groups := make(map[string][]ReportableEvent, 1)
 	skipped := 0
-	for _, ev := range batch {
+	for i := range batch {
+		ev := &batch[i]
 		if r.urlForEvent(ev) == "" {
 			skipped++
 			continue
 		}
-		groups[ev.RouteSource] = append(groups[ev.RouteSource], ev)
+		groups[ev.RouteSource] = append(groups[ev.RouteSource], *ev)
 	}
 	if skipped > 0 {
 		// No destination for this route_source (e.g. team route on a pure
@@ -613,7 +607,8 @@ func (r *Reporter) uploadPending(batch []ReportableEvent) (anyRetryable bool) {
 func (r *Reporter) markProcessed(group []ReportableEvent) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	for _, ev := range group {
+	for i := range group {
+		ev := &group[i]
 		if ev.SourceSeq != nil {
 			if *ev.SourceSeq > r.sentSeq[ev.SourceID] {
 				r.sentSeq[ev.SourceID] = *ev.SourceSeq
@@ -666,12 +661,10 @@ func (r *Reporter) pruneConfirmedWAL() {
 					prunable = false
 					break
 				}
-			} else {
+			} else if e.EventJSON.EventID == "" || !r.seenV1Locked(e.EventJSON.EventID) {
 				// A v1 (or seq-less) entry: only prunable once uploaded (seenV1).
-				if e.EventJSON.EventID == "" || !r.seenV1Locked(e.EventJSON.EventID) {
-					prunable = false
-					break
-				}
+				prunable = false
+				break
 			}
 		}
 		if prunable && sawV2 {
@@ -734,9 +727,9 @@ func backoffForFailures(n int) time.Duration {
 //   - success            → advance confirmedSeq, return groupDone
 //   - terminal (401/403/400) → dead-letter (won't self-heal), return groupDone
 //   - retryable (5xx/429/network) → NO dead-letter, NO cursor advance; the
-//                          events stay in the WAL and the caller arms a
-//                          non-blocking backoff gate so the next drain re-sends
-//                          them (conserve, never lose). Returns groupRetryLater.
+//     events stay in the WAL and the caller arms a
+//     non-blocking backoff gate so the next drain re-sends
+//     them (conserve, never lose). Returns groupRetryLater.
 //
 // cred may be nil — doUpload tolerates that by sending without an Authorization
 // header (matches pre-CollectorToken behavior).

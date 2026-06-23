@@ -28,7 +28,7 @@ func anthropicReqBody() []byte {
 	return []byte(`{"model":"claude-x","system":"sys","messages":[{"role":"user","content":"hello"}]}`)
 }
 
-func driveAnthropicTurn(o *Observer, traceID string, withStop bool) *observer.RequestContext {
+func driveAnthropicTurn(o *Observer, traceID string, withStop bool) {
 	req := &observer.RequestContext{
 		ProtocolFamily: protoAnthropic,
 		RequestBody:    anthropicReqBody(),
@@ -46,7 +46,6 @@ func driveAnthropicTurn(o *Observer, traceID string, withStop bool) *observer.Re
 		o.OnSSEEvent(context.Background(), req, "message_stop", []byte(`{"type":"message_stop"}`))
 	}
 	o.OnRequestEnd(context.Background(), req, 1234)
-	return req
 }
 
 func TestObserver_DisabledCapturesNothing(t *testing.T) {
@@ -269,12 +268,12 @@ func TestObserver_SkipsProbeStream(t *testing.T) {
 	req := &observer.RequestContext{
 		ProtocolFamily: protoAnthropic,
 		// the literal connectivity probe body: "hi" + max_tokens:1
-		RequestBody:    []byte(`{"model":"claude-haiku-4-5-20251001","max_tokens":1,"messages":[{"role":"user","content":"hi"}]}`),
-		TraceID:        "t-probe",
-		OrgID:          "org-1",
-		ProviderID:     "anthropic",
-		Stream:         observer.StreamProbe,
-		StartedAt:      time.Unix(1_700_000_000, 0),
+		RequestBody: []byte(`{"model":"claude-haiku-4-5-20251001","max_tokens":1,"messages":[{"role":"user","content":"hi"}]}`),
+		TraceID:     "t-probe",
+		OrgID:       "org-1",
+		ProviderID:  "anthropic",
+		Stream:      observer.StreamProbe,
+		StartedAt:   time.Unix(1_700_000_000, 0),
 	}
 	o.OnRequestStart(context.Background(), req)
 	o.OnSSEEvent(context.Background(), req, "content_block_delta",

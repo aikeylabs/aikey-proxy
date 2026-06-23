@@ -31,45 +31,38 @@ import (
 // partial/interrupted stream). source_id / source_seq are stamped by the
 // RecordSink, not the observer.
 type ConversationRecord struct {
-	EventID        string `json:"event_id"`
-	OrgID          string `json:"org_id"`
-	SessionID      string `json:"session_id"`
-	OwnerAccountID string `json:"owner_account_id"`
-	VirtualKeyID   string `json:"virtual_key_id,omitempty"`
-
-	SourceID  string `json:"source_id,omitempty"`
-	SourceSeq *int64 `json:"source_seq,omitempty"`
-
-	Model        string `json:"model,omitempty"`
-	ProviderCode string `json:"provider_code,omitempty"`
-
-	UserText      string `json:"user_text,omitempty"`
-	AssistantText string `json:"assistant_text,omitempty"`
-	SystemText    string `json:"system_text,omitempty"`
-
 	// Token snapshot (display only). Pointers so an absent field is NULL, not 0
 	// — kept NULL when no usage frame arrived. Names/tags mirror the collector's
 	// conversation.ConversationRecord (cached_input_tokens = cache READ, matching
 	// the usage column naming; TokenBreakdown calls the same field CacheRead).
-	InputTokens              *int64 `json:"input_tokens,omitempty"`
-	OutputTokens             *int64 `json:"output_tokens,omitempty"`
-	CachedInputTokens        *int64 `json:"cached_input_tokens,omitempty"`
-	CacheCreationInputTokens *int64 `json:"cache_creation_input_tokens,omitempty"`
-	ReasoningTokens          *int64 `json:"reasoning_tokens,omitempty"`
-	TotalTokens              *int64 `json:"total_tokens,omitempty"`
-
+	InputTokens  *int64 `json:"input_tokens,omitempty"`
+	ContentBytes *int64 `json:"content_bytes,omitempty"`
+	DurationMs   *int64 `json:"duration_ms,omitempty"`
 	// CacheEnabled (decision B): did the client REQUEST prompt caching this turn
 	// (request body carried a cache_control directive)? 1=on, 0=off, nil=couldn't
 	// tell (request body not buffered). Distinct from the cache COUNTS above, which
 	// read 0 both when caching was off AND when it was requested but ineffective —
 	// so the audit drawer can show an explicit caching ON/OFF switch.
-	CacheEnabled *int64 `json:"cache_enabled,omitempty"`
-
-	DurationMs    *int64 `json:"duration_ms,omitempty"`
-	RequestStatus string `json:"request_status"`
-	ContentBytes  *int64 `json:"content_bytes,omitempty"`
-
-	CreatedAt aikeytime.Millis `json:"created_at"`
+	CacheEnabled             *int64           `json:"cache_enabled,omitempty"`
+	TotalTokens              *int64           `json:"total_tokens,omitempty"`
+	ReasoningTokens          *int64           `json:"reasoning_tokens,omitempty"`
+	SourceSeq                *int64           `json:"source_seq,omitempty"`
+	CacheCreationInputTokens *int64           `json:"cache_creation_input_tokens,omitempty"`
+	CachedInputTokens        *int64           `json:"cached_input_tokens,omitempty"`
+	OutputTokens             *int64           `json:"output_tokens,omitempty"`
+	SourceID                 string           `json:"source_id,omitempty"`
+	SystemText               string           `json:"system_text,omitempty"`
+	AssistantText            string           `json:"assistant_text,omitempty"`
+	UserText                 string           `json:"user_text,omitempty"`
+	ProviderCode             string           `json:"provider_code,omitempty"`
+	Model                    string           `json:"model,omitempty"`
+	EventID                  string           `json:"event_id"`
+	VirtualKeyID             string           `json:"virtual_key_id,omitempty"`
+	OwnerAccountID           string           `json:"owner_account_id"`
+	SessionID                string           `json:"session_id"`
+	RequestStatus            string           `json:"request_status"`
+	OrgID                    string           `json:"org_id"`
+	CreatedAt                aikeytime.Millis `json:"created_at"`
 }
 
 // RecordSink is the durable outbox the observer hands assembled records to. The
@@ -110,10 +103,6 @@ type Observer struct {
 // three hooks serially on one per-request goroutine, so a single request's state
 // needs no internal lock; only the cross-request `states` map is synchronized.
 type turnState struct {
-	userText   string
-	systemText string
-	model      string
-	assistant  strings.Builder
 	// tokenAcc folds the per-turn token snapshot from the SSE frames as they
 	// arrive (same frames fed to assistant text). nil for families without an
 	// incremental extractor (e.g. gemini) — those turns capture no tokens.
@@ -121,6 +110,10 @@ type turnState struct {
 	// cacheEnabled (decision B): whether this turn's request asked for prompt
 	// caching (detected from the request body in OnRequestStart). nil = no body.
 	cacheEnabled *int64
+	userText     string
+	systemText   string
+	model        string
+	assistant    strings.Builder
 	sawDone      bool
 	sawFrame     bool
 }
@@ -178,7 +171,7 @@ func (o *Observer) OnSSEEvent(_ context.Context, req *observer.RequestContext, e
 	if !ok {
 		return
 	}
-	st := v.(*turnState)
+	st, _ := v.(*turnState)
 	st.sawFrame = true
 	// Fold the per-turn token snapshot from the same frame (the accumulator
 	// ignores non-usage frames). Same goroutine as text accumulation, so no lock.
@@ -202,7 +195,7 @@ func (o *Observer) OnRequestEnd(_ context.Context, req *observer.RequestContext,
 	if !ok || !o.enabled() {
 		return
 	}
-	st := v.(*turnState)
+	st, _ := v.(*turnState)
 
 	maxB := o.cfg.MaxBytes()
 	userText := capText(st.userText, maxB)
@@ -263,7 +256,7 @@ func (o *Observer) OnRequestEnd(_ context.Context, req *observer.RequestContext,
 // caching opt-in; OpenAI/Gemini caching is automatic so their bodies never carry
 // it and correctly read 0), 0 when a body was seen without it, nil when no body
 // was buffered (can't tell). A byte-substring check on the JSON key is enough —
-// no full re-parse — and is the request-side analogue of the per-turn token
+// no full re-parse — and is the request-side analog of the per-turn token
 // snapshot. Decision B (2026-06-17).
 func detectCacheEnabled(body []byte) *int64 {
 	if len(body) == 0 {
@@ -304,11 +297,11 @@ func stampTokens(rec *ConversationRecord, br provider.TokenBreakdown) {
 
 // capText truncates s to at most max bytes on a UTF-8 rune boundary (never
 // splits a multi-byte rune, which would corrupt display). max<=0 → no cap.
-func capText(s string, max int) string {
-	if max <= 0 || len(s) <= max {
+func capText(s string, maxBytes int) string {
+	if maxBytes <= 0 || len(s) <= maxBytes {
 		return s
 	}
-	cut := max
+	cut := maxBytes
 	for cut > 0 && !utf8.RuneStart(s[cut]) {
 		cut--
 	}

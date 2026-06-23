@@ -33,7 +33,7 @@ func TestApplyInboundFilter_LiveDetector(t *testing.T) {
 		t.Skip("set AIKEY_TEST_DETECTOR_BINARY to the built detector binary to run the live closed-loop test")
 	}
 
-	hook := apphook.NewChildHook(apphook.ChildHookConfig{
+	hook := apphook.NewChildHook(&apphook.ChildHookConfig{
 		Name:       "ai-compliance-detector",
 		BinaryPath: bin,
 		// Generous deadline — real char+token CRF NER on a full prompt needs
@@ -113,7 +113,7 @@ func TestApplyInboundFilter_LiveDetector_ASCII(t *testing.T) {
 		t.Skip("set AIKEY_TEST_DETECTOR_BINARY to run the live closed-loop test")
 	}
 
-	hook := apphook.NewChildHook(apphook.ChildHookConfig{
+	hook := apphook.NewChildHook(&apphook.ChildHookConfig{
 		Name:         "ai-compliance-detector",
 		BinaryPath:   bin,
 		Timeout:      500 * time.Millisecond,

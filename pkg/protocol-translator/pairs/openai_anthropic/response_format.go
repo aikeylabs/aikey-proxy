@@ -46,10 +46,10 @@ const JSONResponseToolName = "respond_in_json"
 //
 //   - "text" or absent  — no-op, return body unchanged.
 //   - "json_object"     — append synthetic tool with empty-object schema,
-//                         override tool_choice to force its use.
+//     override tool_choice to force its use.
 //   - "json_schema"     — same, but the schema comes from
-//                         response_format.json_schema.schema; auto-inject
-//                         `"type":"object"` at top of schema if missing.
+//     response_format.json_schema.schema; auto-inject
+//     `"type":"object"` at top of schema if missing.
 //   - anything else     — TranslateError (AIKEY_UNSUPPORTED_PARAMETER).
 //
 // Interaction with existing tools[] and tool_choice:
@@ -62,7 +62,7 @@ const JSONResponseToolName = "respond_in_json"
 // can only point at one tool). This matches LiteLLM behavior; OpenAI
 // itself has the same restriction (response_format=json_object disables
 // tool_calls in practice).
-func applyResponseFormat(body []byte, in gjson.Result) ([]byte, *translator.TranslateError) {
+func applyResponseFormat(body []byte, in *gjson.Result) ([]byte, *translator.TranslateError) {
 	rf := in.Get("response_format")
 	if !rf.Exists() || !rf.IsObject() {
 		return body, nil
@@ -85,7 +85,7 @@ func applyResponseFormat(body []byte, in gjson.Result) ([]byte, *translator.Tran
 				Code:       translator.CodeBadRequest,
 				HTTPStatus: 400,
 				Param:      "response_format",
-				Message: `response_format={"type":"json_schema",...} requires response_format.json_schema.schema`,
+				Message:    `response_format={"type":"json_schema",...} requires response_format.json_schema.schema`,
 			}
 		}
 		// Patch schema to ensure top-level type=object (Anthropic
@@ -117,8 +117,8 @@ func applyResponseFormat(body []byte, in gjson.Result) ([]byte, *translator.Tran
 }
 
 // appendSyntheticJSONTool mutates the translated body to:
-//   1. Append a synthetic tool entry to tools[] (creating tools if absent).
-//   2. Set tool_choice to {"type":"tool","name":"respond_in_json"}.
+//  1. Append a synthetic tool entry to tools[] (creating tools if absent).
+//  2. Set tool_choice to {"type":"tool","name":"respond_in_json"}.
 //
 // Why sjson "tools.-1" append rather than rebuilding the whole array:
 // preserves user-declared tools verbatim (with their schemas, descriptions,
@@ -127,7 +127,7 @@ func applyResponseFormat(body []byte, in gjson.Result) ([]byte, *translator.Tran
 // (respond_in_json) that collision with a user tool is unlikely; we
 // don't dedupe (if user happened to declare a tool with the same name,
 // they'd have a name collision; LiteLLM doesn't handle this either).
-func appendSyntheticJSONTool(body []byte, inputSchema []byte, description string) ([]byte, *translator.TranslateError) {
+func appendSyntheticJSONTool(body, inputSchema []byte, description string) ([]byte, *translator.TranslateError) {
 	// Build the synthetic tool object.
 	tool := []byte(`{"name":` + jsonQuote(JSONResponseToolName) +
 		`,"description":` + jsonQuote(description) +

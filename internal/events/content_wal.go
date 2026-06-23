@@ -22,11 +22,11 @@ import (
 // is the per-source reserve-ahead integrity sequence the server uses for gap
 // detection and the reporter uses for contiguous-confirmed WAL pruning.
 type ContentWALEntry struct {
+	SourceID  string           `json:"source_id,omitempty"`
+	Record    json.RawMessage  `json:"record"`
 	WALSeq    int64            `json:"wal_seq"`
 	WrittenAt aikeytime.Millis `json:"written_at"`
-	SourceID  string           `json:"source_id,omitempty"`
 	SourceSeq int64            `json:"source_seq,omitempty"`
-	Record    json.RawMessage  `json:"record"`
 }
 
 // Content WAL roll defaults (design decision ⑬): 20MB per file, ≤100 files (≈2GB).
@@ -49,18 +49,16 @@ const (
 //
 // Mirrors WALWriter's best-effort, lock-guarded, fsync-on-group-commit style.
 type ContentWAL struct {
-	dir      string
-	maxBytes int64
-	maxFiles int
-
-	seq      atomic.Int64
-	mu       sync.Mutex
-	file     *os.File
-	curBytes int64
-	rotCtr   int
-
+	file         *os.File
+	dir          string
+	maxBytes     int64
+	maxFiles     int
+	seq          atomic.Int64
+	curBytes     int64
+	rotCtr       int
 	appendFailed atomic.Int64
 	evicted      atomic.Int64
+	mu           sync.Mutex
 }
 
 // NewContentWAL creates a content WAL writer. Zero maxBytes/maxFiles fall back to
@@ -104,10 +102,10 @@ func (w *ContentWAL) Append(sourceID string, sourceSeq int64, record json.RawMes
 
 	w.mu.Lock()
 	defer w.mu.Unlock()
-	if err := w.ensureFile(int64(len(data))); err != nil {
+	if efErr := w.ensureFile(int64(len(data))); efErr != nil {
 		slog.Error("content wal: open file failed",
 			"event.name", "conversation.wal.open_failed",
-			"error.code", "CONTENT_WAL_OPEN_FAILED", "error", err)
+			"error.code", "CONTENT_WAL_OPEN_FAILED", "error", efErr)
 		w.appendFailed.Add(1)
 		return
 	}

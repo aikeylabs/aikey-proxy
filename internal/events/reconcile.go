@@ -16,10 +16,10 @@ import (
 // health. Read-only.
 type AuditStatus struct {
 	SourceID        string          `json:"source_id"`
+	Reporter        ReporterMetrics `json:"reporter"`
 	AllocatedSeq    int64           `json:"allocated_seq"`
 	WALFiles        int             `json:"wal_files"`
 	DeadLetterCount int             `json:"dead_letter_count"`
-	Reporter        ReporterMetrics `json:"reporter"`
 }
 
 // AuditStatus gathers the local delivery state.
@@ -174,7 +174,8 @@ func (r *Reporter) walSeqSet(source string) map[int64]bool {
 	if err != nil {
 		return set
 	}
-	for _, e := range entries {
+	for i := range entries {
+		e := &entries[i]
 		if e.SourceID == source && e.SourceSeq > 0 {
 			set[e.SourceSeq] = true
 		}
@@ -200,7 +201,8 @@ func (r *Reporter) resendWALSeqs(source string, seqs []int64) int {
 		return 0
 	}
 	groups := make(map[string][]ReportableEvent)
-	for _, e := range entries {
+	for i := range entries {
+		e := &entries[i]
 		if e.SourceID != source || e.SourceSeq <= 0 || !want[e.SourceSeq] {
 			continue
 		}
@@ -213,7 +215,7 @@ func (r *Reporter) resendWALSeqs(source string, seqs []int64) int {
 			seq := e.SourceSeq
 			ev.SourceSeq = &seq
 		}
-		if r.urlForEvent(ev) == "" {
+		if r.urlForEvent(&ev) == "" {
 			continue // no destination for this route_source
 		}
 		groups[ev.RouteSource] = append(groups[ev.RouteSource], ev)
@@ -235,7 +237,7 @@ func (r *Reporter) resendWALSeqs(source string, seqs []int64) int {
 }
 
 func (r *Reporter) httpGetJSON(ctx context.Context, u string, out any) error {
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u, nil)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u, http.NoBody)
 	if err != nil {
 		return err
 	}

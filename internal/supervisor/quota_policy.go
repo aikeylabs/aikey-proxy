@@ -37,7 +37,7 @@ const quotaPollInterval = 60 * time.Second
 
 var quotaHTTPClient = &http.Client{Timeout: 10 * time.Second}
 
-// pollQuotaPolicy runs until ctx is cancelled, refreshing the org quota policy
+// pollQuotaPolicy runs until ctx is canceled, refreshing the org quota policy
 // every quotaPollInterval (plus once immediately).
 func (s *Supervisor) pollQuotaPolicy(ctx context.Context) {
 	s.syncQuotaPolicy(ctx)

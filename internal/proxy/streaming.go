@@ -5,7 +5,6 @@ import (
 	"encoding/json"
 	"io"
 	"net/http"
-	"strings"
 )
 
 // isStreamingRequest peeks at the request body to check for "stream": true.
@@ -83,10 +82,4 @@ func injectStreamUsageOption(req *http.Request) {
 
 	req.Body = io.NopCloser(bytes.NewReader(newBody))
 	req.ContentLength = int64(len(newBody))
-}
-
-// isSSEResponse checks if the response is a Server-Sent Events stream.
-func isSSEResponse(resp *http.Response) bool {
-	ct := resp.Header.Get("Content-Type")
-	return strings.Contains(ct, "text/event-stream")
 }

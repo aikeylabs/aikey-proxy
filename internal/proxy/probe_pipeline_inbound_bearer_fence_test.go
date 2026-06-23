@@ -20,13 +20,13 @@ import (
 // re-orders the calls and reads Authorization AFTER oauthInject, two
 // distinct user-visible bugs surface at the same time:
 //
-//   1. /user/apps/<slug>'s Usage chart shows app_slug=NULL for all probe
-//      events (the first-party reverse-lookup fails because the bearer no
-//      longer matches the whitelisted constant) → chart misleads users
-//      into thinking Trust Check isn't working.
-//   2. The `virtual_key_hash` column in ODS/DWD silently becomes a hash of
-//      a SECRET (the OAuth access token, which rotates) instead of the
-//      stable client token, breaking audit traceability.
+//  1. /user/apps/<slug>'s Usage chart shows app_slug=NULL for all probe
+//     events (the first-party reverse-lookup fails because the bearer no
+//     longer matches the whitelisted constant) → chart misleads users
+//     into thinking Trust Check isn't working.
+//  2. The `virtual_key_hash` column in ODS/DWD silently becomes a hash of
+//     a SECRET (the OAuth access token, which rotates) instead of the
+//     stable client token, breaking audit traceability.
 //
 // This test does NOT exercise the full pipeline (that would need a fake
 // vault + credential broker). Instead it pins the SHAPE of the bug: if
@@ -35,8 +35,8 @@ import (
 // extractRawAuthValue runs post-oauthInject will fail this test loudly,
 // even before the user-visible symptom shows up.
 func TestInboundBearer_MustBeCapturedBeforeOAuthInject(t *testing.T) {
-	const clientBearer = "aikey_app_internal_degrade_detector_v1"
-	const upstreamOAuthToken = "oauth-token-abc" // matches claudeCred()
+	const clientBearer = "aikey_app_internal_degrade_detector_v1" //nolint:gosec // test fixture, not a real credential
+	const upstreamOAuthToken = "oauth-token-abc"                  //nolint:gosec // test fixture, not a real credential (matches claudeCred())
 
 	req := httptest.NewRequest("POST", "/probe/some-alias/v1/messages", nil)
 	req.Header.Set("Authorization", "Bearer "+clientBearer)

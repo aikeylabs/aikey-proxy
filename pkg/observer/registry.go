@@ -128,10 +128,15 @@ type FullPayloadObserver interface {
 // /v1/chat/completions while the upstream is Anthropic, or vice-versa).
 // Observers should pick their SSE parser by ProtocolFamily.
 type RequestContext struct {
-	AppKeyID string
-	AppSlug  string
-	AppMode  string // "isolated" | "follow-active"
-
+	StartedAt       time.Time
+	metadataJSONErr error
+	SessionID       string
+	TraceID         string // per-request UUID; observers use as state-map key
+	ProviderID      string // canonical provider code, e.g. "anthropic", "kimi_code"
+	ProtocolFamily  string // "anthropic" | "openai_compatible" | "gemini" | "" (unknown)
+	RequestedModel  string // body.model as sent by the client
+	ResolvedModel   string // upstream-reported model, may differ (alias resolution)
+	AppKeyID        string
 	// KeyAlias is the vault-side credential alias that this request
 	// resolved to (e.g. "my-anthropic"). For follow-active first-party
 	// apps it equals the user's `aikey use` selection. trust-local's
@@ -142,15 +147,7 @@ type RequestContext struct {
 	// no per-user alias); observers in that case should fall back to
 	// AppKeyID for attribution.
 	KeyAlias string
-
-	ProviderID     string // canonical provider code, e.g. "anthropic", "kimi_code"
-	ProtocolFamily string // "anthropic" | "openai_compatible" | "gemini" | "" (unknown)
-	RequestedModel string // body.model as sent by the client
-	ResolvedModel  string // upstream-reported model, may differ (alias resolution)
-	SessionID      string
-	TraceID        string // per-request UUID; observers use as state-map key
-	StartedAt      time.Time
-
+	AppMode  string // "isolated" | "follow-active"
 	// OrgID / OwnerAccountID are the multi-tenant attribution identity — the
 	// tenant and the developer (seat owner) this request is billed/attributed
 	// to. Populated by the proxy from the resolved route, mirroring the usage
@@ -161,7 +158,6 @@ type RequestContext struct {
 	// Empty OrgID means a personal (non-org) request.
 	OrgID          string
 	OwnerAccountID string
-
 	// Stream is the SPEC §1.4.1 stream name this request emits under
 	// (StreamUserChat / StreamAppPipeline / StreamProbe). Set by the
 	// Registry on the way into NotifyStart so observers can read it
@@ -170,20 +166,20 @@ type RequestContext struct {
 	// surface the same value through the existing OnRequestStart /
 	// OnSSEEvent / OnRequestEnd contract (which never grew its own
 	// stream parameter to keep the StreamingObserver interface stable).
-	Stream string
-
+	Stream       string
+	AppSlug      string
+	metadataJSON []byte
 	// RequestBody is the raw client request body (the prompt), populated by
 	// the proxy ONLY when an active observer declares it wants the full
 	// payload (see FullPayloadObserver / Registry.WantsFullPayload). This is
 	// the framework's reserved "payload_level=full" capability — NOT
 	// observer-derived state (which the §"DO NOT add fields" rule forbids),
-	// but the raw request data itself, the request-side analogue of the
+	// but the raw request data itself, the request-side analog of the
 	// `payload []byte` already handed to OnSSEEvent. Nil when no active
 	// observer wants full payload (the default — zero memory cost), or when
 	// the body exceeded the proxy's capture cap. Observers MUST treat it as
 	// read-only; the proxy hands over its own buffered copy.
 	RequestBody []byte
-
 	// metadataJSON* implement the MetadataJSON() lazy cache. Private —
 	// observers must use the method, not the raw fields. sync.Once gives
 	// us thread-safe "marshal at most once, even under concurrent observer
@@ -193,8 +189,6 @@ type RequestContext struct {
 	// only; nothing outside this file can poke the cache (and accidentally
 	// produce inconsistent bytes per observer).
 	metadataJSONOnce sync.Once
-	metadataJSON     []byte
-	metadataJSONErr  error
 }
 
 // metadataPayload is the lazy-cached JSON shape MetadataJSON() emits.
@@ -207,18 +201,18 @@ type RequestContext struct {
 // doc comment; tests pin this so a future refactor sees the breakage
 // rather than silently shifting field names.
 type metadataPayload struct {
-	V               int    `json:"v"`
+	AppKeyID        string `json:"app_key_id,omitempty"`
 	TraceID         string `json:"trace_id,omitempty"`
 	Stream          string `json:"stream,omitempty"`
 	Provider        string `json:"provider,omitempty"`
 	Alias           string `json:"alias,omitempty"`
 	AppSlug         string `json:"app_slug,omitempty"`
-	AppKeyID        string `json:"app_key_id,omitempty"`
 	AppMode         string `json:"app_mode,omitempty"`
 	RequestedModel  string `json:"requested_model,omitempty"`
 	ResolvedModel   string `json:"resolved_model,omitempty"`
 	SessionID       string `json:"session_id,omitempty"`
 	ProtocolFamily  string `json:"protocol_family,omitempty"`
+	V               int    `json:"v"`
 	StartedAtUnixMs int64  `json:"started_at_unix_ms,omitempty"`
 }
 
@@ -310,14 +304,19 @@ func AllStreams() []string {
 // same Name will panic at startup (deliberate; ambiguous instances are
 // a bug, not a runtime condition).
 type Observer struct {
+	// Build constructs the observer implementation from the proxy
+	// config block (e.g. yaml `observers.<name>` map). Build is
+	// called once at proxy startup; if it returns an error the
+	// observer is logged as unavailable and skipped — the proxy
+	// continues to start. This is intentional: a misconfigured
+	// observer must NEVER block proxy main flow.
+	Build func(cfg map[string]any) (StreamingObserver, error)
 	// Name uniquely identifies this observer within the proxy
 	// process. Lowercase letters / digits / dashes.
 	Name string
-
 	// OwnerAppSlug is the first-party application this observer
 	// belongs to. Must be present in FirstPartyAllowlist below.
 	OwnerAppSlug string
-
 	// Streams is the explicit list of stream names this observer cares
 	// about (see Stream* constants and SPEC §1.4.1). The Registry skips
 	// Notify dispatch for any stream not in this list. MUST be non-empty —
@@ -332,14 +331,6 @@ type Observer struct {
 	// Entries are validated against AllStreams() at registration time;
 	// any unknown stream name panics.
 	Streams []string
-
-	// Build constructs the observer implementation from the proxy
-	// config block (e.g. yaml `observers.<name>` map). Build is
-	// called once at proxy startup; if it returns an error the
-	// observer is logged as unavailable and skipped — the proxy
-	// continues to start. This is intentional: a misconfigured
-	// observer must NEVER block proxy main flow.
-	Build func(cfg map[string]any) (StreamingObserver, error)
 }
 
 // HandlesStream reports whether the observer's Streams declaration
@@ -624,16 +615,14 @@ const (
 
 // Registry is the runtime fan-out instance held by the proxy.
 type Registry struct {
-	observers []*activeObserver
-	requests  sync.Map // map[TraceID]*requestState
-	logger    *slog.Logger
-
+	logger *slog.Logger
 	// detachedCtxFn is the seam used to build the observer-side
 	// context. Production path uses context.WithoutCancel + a
 	// max-age timeout; tests substitute their own. Keeping this as a
 	// var avoids importing 1.21+ assumptions deeper into the package.
 	detachedCtxFn func(parent context.Context) (context.Context, context.CancelFunc)
-
+	requests      sync.Map // map[TraceID]*requestState
+	observers     []*activeObserver
 	// counters surfaced to Prometheus exporters; not owned here, the
 	// observability package wires them.
 	droppedEventsTotal atomic.Int64
@@ -764,21 +753,21 @@ type Stats struct {
 // reading from a per-observer channel; the activeObserver itself is
 // shared across requests and holds only safety state.
 type activeObserver struct {
-	descriptor   Observer
 	impl         StreamingObserver
 	panicLimiter *tokenLimiter // P1-2: 60/min => auto-disable
 	dumpLimiter  *tokenLimiter // P1-2: 10/min => skip crash dump
-	disabled     atomic.Bool   // flips true after panicLimiter spent
+	descriptor   Observer
+	disabled     atomic.Bool // flips true after panicLimiter spent
 }
 
 // observerEvent is the message type sent to per-(request × observer)
 // consumer goroutines. The single struct (kind discriminator) keeps the
 // channel typed without a sum-type per kind.
 type observerEvent struct {
-	kind      eventKind
 	eventType string
 	payload   []byte // already copied by NotifySSEEvent — observer may retain
 	latencyMs int
+	kind      eventKind
 }
 
 type eventKind uint8
@@ -891,7 +880,7 @@ func (r *Registry) NotifySSEEvent(ctx context.Context, req *RequestContext, even
 	if !ok {
 		return
 	}
-	rs := rsAny.(*requestState)
+	rs, _ := rsAny.(*requestState)
 	if len(rs.channels) == 0 {
 		return
 	}
@@ -938,7 +927,7 @@ func (r *Registry) NotifyEnd(ctx context.Context, req *RequestContext, totalLate
 	if !ok {
 		return
 	}
-	rs := rsAny.(*requestState)
+	rs, _ := rsAny.(*requestState)
 
 	// Send end event; if a consumer is slow we still close the channel
 	// so it eventually drains. We send non-blocking to keep symmetry

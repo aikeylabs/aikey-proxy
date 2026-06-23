@@ -39,7 +39,6 @@
 package proxy
 
 import (
-	"bytes"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
@@ -47,8 +46,6 @@ import (
 	"io"
 	"net/http"
 	"strings"
-
-	"github.com/cespare/xxhash/v2"
 )
 
 // Reverse-engineered facts about Claude Code CLI's wire format. These are
@@ -64,24 +61,22 @@ const (
 	// chars. A discovered protocol constant, not authored by us.
 	fingerprintSalt = "59cf53e54c78"
 
-	// cchSeed is the xxhash64 seed real CLI uses to compute the cch body
-	// digest. Same provenance as the salt — discovered, not authored.
-	cchSeed uint64 = 0x6E52736AC806831E
-
 	// billingHeaderPrefix is the leading wire-format marker of the
-	// billing-attribution text block. Used as both an idempotency probe
-	// and an anchor for the placeholder rewrite.
+	// billing-attribution text block. Used as an idempotency probe.
 	billingHeaderPrefix = "x-anthropic-billing-header:"
 
-	// cchPlaceholder is the literal token we emit when synthesizing the
-	// billing block; it gets rewritten in place once the body is fully
-	// marshaled (so the hash covers every byte we produced).
+	// cchPlaceholder is the cch token we emit in the billing block.
+	//
+	// We deliberately leave it a STABLE constant (cch=00000) instead of a
+	// body digest. Why:
+	//   - The WAF does NOT verify cch (research doc Round 5B: cch=00000 /
+	//     ffffe / zzzzz / removed all return 200 — only the cc_entrypoint=
+	//     key is checked). A real digest buys nothing for WAF passage.
+	//   - A body-derived cch changes every turn (the trailing user message
+	//     varies), mutating system[0] and invalidating the prompt-cache
+	//     prefix on every request. Keeping cch constant makes system[0]
+	//     stable so prompt caching actually works on the OAuth path.
 	cchPlaceholder = "cch=00000;"
-
-	// cchPlaceholderZeros is the 5-byte run that gets overwritten by the
-	// hex digest. Defined separately to make the surgical replace boundary
-	// obvious at the call site.
-	cchPlaceholderZeros = "00000"
 
 	// instructionInjectionPreamble is prepended to the client's original
 	// system text when it's relocated into messages — keeps the model
@@ -129,7 +124,7 @@ func injectClaudeWAFFingerprintFull(req *http.Request) {
 	_ = req.Body.Close()
 
 	var body map[string]any
-	if err := json.Unmarshal(originalBytes, &body); err != nil {
+	if jErr := json.Unmarshal(originalBytes, &body); jErr != nil {
 		setRequestBody(req, originalBytes)
 		return
 	}
@@ -143,12 +138,19 @@ func injectClaudeWAFFingerprintFull(req *http.Request) {
 		return
 	}
 
-	preservedSystemText := flattenClientSystemText(body["system"])
-	body["messages"] = prependInstructionPair(body["messages"], preservedSystemText)
+	// Relocate the client's system text into a leading user message, and
+	// CARRY OVER its cache_control so the relocated (often large) prompt is
+	// still a prompt-cache breakpoint. If the client set no cache_control we
+	// auto-fill ephemeral — the relocated block is the natural cache boundary
+	// for non-CLI clients. (Pre-fix bug: the client's cache_control was
+	// dropped here, so non-CLI OAuth traffic never cached.)
+	preservedSystemText, preservedCacheControl := flattenClientSystemText(body["system"])
+	body["messages"] = prependInstructionPair(body["messages"], preservedSystemText, preservedCacheControl)
 
 	// Compute the cc_version suffix against the rewritten messages array
 	// (the algorithm samples the *first user text*, which after the
-	// instruction-pair prepend is the synthetic [System Instructions] block).
+	// instruction-pair prepend is the synthetic [System Instructions] block —
+	// stable across a conversation, so cc_version stays stable too).
 	suffixSeed, _ := json.Marshal(map[string]any{"messages": body["messages"]})
 	body["system"] = synthesizeTwoBlockSystem(suffixSeed)
 
@@ -157,12 +159,18 @@ func injectClaudeWAFFingerprintFull(req *http.Request) {
 		setRequestBody(req, originalBytes)
 		return
 	}
-	setRequestBody(req, sealCCHPlaceholder(rewritten))
+	// No cch sealing: cch stays the stable cch=00000 placeholder (see the
+	// cchPlaceholder doc). A body hash here would mutate system[0] every turn
+	// and break prompt caching, and the WAF doesn't verify cch anyway.
+	setRequestBody(req, rewritten)
 }
 
 // flattenClientSystemText reduces the client's pre-rewrite system payload
 // (string | []block | nil | misc) to a single trimmed text string suitable
-// for relocation into messages. Empty result means "nothing to relocate".
+// for relocation into messages, and reports the client's own cache_control
+// (the last kept block's — i.e. the effective breakpoint) so the caller can
+// carry it onto the relocated block. Empty text means "nothing to relocate";
+// nil cacheControl means "client set none" (caller auto-fills ephemeral).
 //
 // Filtered out:
 //   - blank or whitespace-only content
@@ -171,14 +179,14 @@ func injectClaudeWAFFingerprintFull(req *http.Request) {
 //   - blocks whose content begins with the billing-header prefix (those
 //     are persona signals, not user instructions)
 //   - non-text block types
-func flattenClientSystemText(rawSystem any) string {
+func flattenClientSystemText(rawSystem any) (text string, cacheControl any) {
 	switch sys := rawSystem.(type) {
 	case string:
-		text := strings.TrimSpace(sys)
-		if textIsClaudeCodeMarker(text) {
-			return ""
+		t := strings.TrimSpace(sys)
+		if textIsClaudeCodeMarker(t) {
+			return "", nil
 		}
-		return text
+		return t, nil
 
 	case []any:
 		buf := make([]string, 0, len(sys))
@@ -190,18 +198,23 @@ func flattenClientSystemText(rawSystem any) string {
 			if blockType, _ := block["type"].(string); blockType != "text" {
 				continue
 			}
-			text, _ := block["text"].(string)
-			text = strings.TrimSpace(text)
-			if textIsClaudeCodeMarker(text) {
+			t, _ := block["text"].(string)
+			t = strings.TrimSpace(t)
+			if textIsClaudeCodeMarker(t) {
 				continue
 			}
-			buf = append(buf, text)
+			buf = append(buf, t)
+			// Carry the client's cache_control intent; the last kept block
+			// with one wins (that's where the client put their breakpoint).
+			if cc, ok := block["cache_control"]; ok && cc != nil {
+				cacheControl = cc
+			}
 		}
-		return strings.Join(buf, "\n\n")
+		return strings.Join(buf, "\n\n"), cacheControl
 
 	default:
 		// nil, map, or unknown — nothing to relocate.
-		return ""
+		return "", nil
 	}
 }
 
@@ -221,20 +234,29 @@ func textIsClaudeCodeMarker(text string) bool {
 
 // prependInstructionPair returns a messages array with a synthetic
 // user/assistant pair at the front carrying the relocated system text.
-// When relocatedSystem is empty, the existing messages slice is returned
-// unchanged.
-func prependInstructionPair(existingMessages any, relocatedSystem string) []any {
+// The relocated user block carries cache_control so it stays a prompt-cache
+// breakpoint: the client's own cache_control when it had one, otherwise an
+// auto-filled ephemeral one. When relocatedSystem is empty, the existing
+// messages slice is returned unchanged.
+func prependInstructionPair(existingMessages any, relocatedSystem string, cacheControl any) []any {
 	existing, _ := existingMessages.([]any)
 	if relocatedSystem == "" {
 		return existing
+	}
+
+	if cacheControl == nil {
+		// Client passed no cache_control — auto-fill ephemeral so the
+		// relocated prompt still caches.
+		cacheControl = map[string]any{"type": "ephemeral"}
 	}
 
 	userTurn := map[string]any{
 		"role": "user",
 		"content": []any{
 			map[string]any{
-				"type": "text",
-				"text": instructionInjectionPreamble + relocatedSystem,
+				"type":          "text",
+				"text":          instructionInjectionPreamble + relocatedSystem,
+				"cache_control": cacheControl,
 			},
 		},
 	}
@@ -351,36 +373,4 @@ func firstUserTextContent(body []byte) string {
 		return ""
 	}
 	return ""
-}
-
-// sealCCHPlaceholder rewrites the literal "cch=00000;" inside the billing
-// block with a 5-hex digest of the entire body. The byte-level surgical
-// replace (rather than a regex back-reference rewrite) keeps the
-// implementation transparent: locate the billing-header anchor, locate
-// the placeholder relative to it, then overwrite five bytes in place.
-//
-// No-op when no billing header is present, or when the placeholder is
-// absent (idempotent for already-sealed bodies).
-func sealCCHPlaceholder(body []byte) []byte {
-	headerStart := bytes.Index(body, []byte(billingHeaderPrefix))
-	if headerStart < 0 {
-		return body
-	}
-	relativeIdx := bytes.Index(body[headerStart:], []byte(cchPlaceholder))
-	if relativeIdx < 0 {
-		return body
-	}
-	zerosStart := headerStart + relativeIdx + len("cch=")
-
-	digest := xxhash.NewWithSeed(cchSeed)
-	_, _ = digest.Write(body)
-	hexDigest := fmt.Sprintf("%05x", digest.Sum64()&0xFFFFF)
-
-	// Surgical 5-byte overwrite. Allocate a copy so we don't mutate the
-	// caller's slice (Go's marshal output is the caller in our case, and
-	// they don't expect us to mutate).
-	out := make([]byte, len(body))
-	copy(out, body)
-	copy(out[zerosStart:zerosStart+len(cchPlaceholderZeros)], []byte(hexDigest))
-	return out
 }

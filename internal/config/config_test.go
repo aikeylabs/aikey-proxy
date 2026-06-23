@@ -153,18 +153,19 @@ log:
 // writeTestPair writes a system yaml + an optional user yaml in a temp
 // dir and returns the path to the system file (the Load() input).
 //
-//nolint:unparam // `system` kept parameterized so future cases can probe
 // alternate system-yaml shapes without re-plumbing the helper.
+//
+//nolint:unparam // `system` kept parameterized so future cases can probe
 func writeTestPair(t *testing.T, system, user string) string {
 	t.Helper()
 	dir := t.TempDir()
 	sysPath := filepath.Join(dir, "aikey-proxy.yaml")
-	if err := os.WriteFile(sysPath, []byte(system), 0o644); err != nil {
+	if err := os.WriteFile(sysPath, []byte(system), 0o600); err != nil {
 		t.Fatalf("write system yaml: %v", err)
 	}
 	if user != "" {
 		userPath := filepath.Join(dir, "aikey-user.yaml")
-		if err := os.WriteFile(userPath, []byte(user), 0o644); err != nil {
+		if err := os.WriteFile(userPath, []byte(user), 0o600); err != nil {
 			t.Fatalf("write user yaml: %v", err)
 		}
 	}
@@ -242,7 +243,7 @@ func TestLoad_EmptyUserYamlIsNoOp(t *testing.T) {
 	sysPath := writeTestPair(t, systemProxyYaml, "")
 	// Re-write an explicit empty user file alongside the system file.
 	userPath := filepath.Join(filepath.Dir(sysPath), "aikey-user.yaml")
-	if err := os.WriteFile(userPath, []byte(""), 0o644); err != nil {
+	if err := os.WriteFile(userPath, []byte(""), 0o600); err != nil {
 		t.Fatalf("write empty user yaml: %v", err)
 	}
 	cfg, err := Load(sysPath)

@@ -57,58 +57,55 @@ type OAuthCredential struct {
 	Provider    string
 	AccountID   string
 	ExternalID  string // Account UUID from OAuth provider (e.g. Claude account.uuid)
-	ExpiresAt   int64
 	Identity    string // Email or display name (for logging only, never sent upstream)
+	ExpiresAt   int64
 }
 
 // Proxy is the core reverse proxy that handles virtual key resolution
 // and request forwarding.
 type Proxy struct {
-	vault              VaultGetter
-	activeReader       ActiveKeyReader       // non-nil when vault implements ActiveKeyReader
-	appVault           apppipe.VaultReader   // non-nil when vault implements the App pipeline read surface (Phase 4)
-	probeVault         probepipe.VaultReader // non-nil when vault implements the Probe pipeline read surface (mode C, SPEC 2026-05-23)
-	broker             OAuthBroker           // OAuth credential provider (nil = OAuth not available)
-	registry           *vkeys.Registry
-	providers          *provider.Registry
-	collector          *events.Collector
-	reporter           *events.Reporter  // usage reporting to collector-service (nil = disabled)
-	wal                *events.WALWriter // local JSONL WAL (shared with reporter when both set; sole writer when reporter is nil)
-	transport          http.RoundTripper // nil → http.DefaultTransport (reads env vars)
-	proxyCtx           context.Context   // canceled when the proxy shuts down
-	proxyInstanceID    string
-	// Delivery integrity (2026-05-30). sourceID is the vault's stable source
-	// identity stamped on every reported event; seqAlloc hands out the
-	// per-source never-reused sequence. Both nil/empty until SetDeliveryIntegrity
-	// wires them (offline-only or pre-seqalloc builds report v1-shaped events).
-	sourceID           string
-	seqAlloc           *events.SeqAllocator
-	clientVersion      string // build version for audit metadata in usage events
-	proxyConfigVersion string // generation ID or config revision
-	loadedControlSeq   int64  // vault change_seq loaded at generation build time
-	loggedInAccountID  string // current platform_account.account_id (for personal key events)
-
+	transport    http.RoundTripper     // nil → http.DefaultTransport (reads env vars)
+	activeReader ActiveKeyReader       // non-nil when vault implements ActiveKeyReader
+	appVault     apppipe.VaultReader   // non-nil when vault implements the App pipeline read surface (Phase 4)
+	probeVault   probepipe.VaultReader // non-nil when vault implements the Probe pipeline read surface (mode C, SPEC 2026-05-23)
+	broker       OAuthBroker           // OAuth credential provider (nil = OAuth not available)
+	vault        VaultGetter
+	// filterHook is the P4 filter dispatcher — a generic apphook.Hook
+	// (ai-compliance-detector / DLP / etc.) that inspects the inbound
+	// request body before forwarding. Nil = no filter (the common default
+	// for traffic without a filter app installed); when nil, serveRoute's
+	// filter injection is a no-op (zero hot-path cost).
+	//
+	// CRITICAL: proxy MUST NOT know what business the hook does (方案 §6
+	// 不变量 #16). It calls Detect, gets a generic Action verdict, applies it.
+	// Set during supervisor.buildGeneration when a filter app is registered
+	// AND its child binary spawned successfully.
+	filterHook apphook.Hook
+	// filterCache memoizes per-piece scan verdicts so the full-scan path doesn't
+	// re-scan unchanged history every turn (设计 20260616-…-内容哈希缓存 §4). nil =
+	// cache OFF (dispatcher skips the content-hash entirely → stateless full scan).
+	// Lives behind the hook==nil gate, so compliance OFF pays nothing (INV-6).
+	filterCache MaskCache
+	proxyCtx    context.Context   // canceled when the proxy shuts down
+	reporter    *events.Reporter  // usage reporting to collector-service (nil = disabled)
+	wal         *events.WALWriter // local JSONL WAL (shared with reporter when both set; sole writer when reporter is nil)
 	// quota is the Phase 2 enterprise token-quota gate (Stage 3). nil-safe +
 	// flag-gated: when nil or disabled it is a pure no-op, so the request path is
 	// never blocked by quota machinery — only by an actual confirmed over-limit.
 	// Wired via SetQuotaEnforcer from the supervisor's snapshot+counter.
 	quota *quota.Enforcer
-
-	requests atomic.Int64
-	errors   atomic.Int64
-
-	// translatorRegistry holds the protocol-translator pair registry the
-	// App pipeline consults when an inbound URL protocol differs from
-	// the binding's upstream protocol (Phase 2). Defaults to
-	// translator.DefaultRegistry() in New() — pair packages register
-	// themselves via blank-import side effect in cmd/aikey-proxy/main.go.
-	// Tests can swap via SetTranslatorRegistry to isolate from globals.
-	//
-	// Tier 1 / Tier 2 routes never read this field — it is referenced
-	// only inside handleAppPipeline, so the field's existence has no
-	// effect on the legacy proxy path.
-	translatorRegistry *translator.Registry
-
+	// appHealthCache records the most recent app-pipeline call per slug,
+	// in process memory only (no persistence). Powers the Web "Connected
+	// Apps" list Health column via the admin /admin/apps/health endpoint.
+	// Always non-nil after New(); the cache itself is safe for concurrent
+	// readers/writers (sync.RWMutex internal). See
+	// apppipe/health.go for the rationale on why this isn't a DWD-side
+	// projection.
+	appHealthCache *apppipe.HealthCache
+	collector      *events.Collector
+	seqAlloc       *events.SeqAllocator
+	providers      *provider.Registry
+	registry       *vkeys.Registry
 	// observerRegistry holds the Phase 4 M2 plugin observer fan-out.
 	// Nil when no first-party observer is built (the common default for
 	// rc.5 ship traffic without degrade-detector installed). When set:
@@ -121,7 +118,35 @@ type Proxy struct {
 	// fire inside the App pipeline branch), so the field being non-nil
 	// has zero cost on the legacy proxy path.
 	observerRegistry *observer.Registry
-
+	// translatorRegistry holds the protocol-translator pair registry the
+	// App pipeline consults when an inbound URL protocol differs from
+	// the binding's upstream protocol (Phase 2). Defaults to
+	// translator.DefaultRegistry() in New() — pair packages register
+	// themselves via blank-import side effect in cmd/aikey-proxy/main.go.
+	// Tests can swap via SetTranslatorRegistry to isolate from globals.
+	//
+	// Tier 1 / Tier 2 routes never read this field — it is referenced
+	// only inside handleAppPipeline, so the field's existence has no
+	// effect on the legacy proxy path.
+	translatorRegistry *translator.Registry
+	proxyConfigVersion string // generation ID or config revision
+	loggedInAccountID  string // current platform_account.account_id (for personal key events)
+	clientVersion      string // build version for audit metadata in usage events
+	// Delivery integrity (2026-05-30). sourceID is the vault's stable source
+	// identity stamped on every reported event; seqAlloc hands out the
+	// per-source never-reused sequence. Both nil/empty until SetDeliveryIntegrity
+	// wires them (offline-only or pre-seqalloc builds report v1-shaped events).
+	sourceID         string
+	proxyInstanceID  string
+	requests         atomic.Int64
+	errors           atomic.Int64
+	loadedControlSeq int64 // vault change_seq loaded at generation build time
+	// Configurable slow-request thresholds (milliseconds).
+	SlowRequestMs     int64
+	VerySlowRequestMs int64
+	// UpstreamTimeout caps how long a detached upstream call may run after
+	// the client disconnects. Default: defaultUpstreamTimeout (10 min).
+	UpstreamTimeout time.Duration
 	// filterStub501Active is set at proxy generation build time when the
 	// vault contains any app_records row with filter_stages != NULL BUT no
 	// working filter dispatcher could be constructed (e.g. detector binary
@@ -135,19 +160,6 @@ type Proxy struct {
 	// filterHook (dispatcher present) OR filterStub501Active (declared but
 	// no working dispatcher), never both.
 	filterStub501Active bool
-
-	// filterHook is the P4 filter dispatcher — a generic apphook.Hook
-	// (ai-compliance-detector / DLP / etc.) that inspects the inbound
-	// request body before forwarding. Nil = no filter (the common default
-	// for traffic without a filter app installed); when nil, serveRoute's
-	// filter injection is a no-op (zero hot-path cost).
-	//
-	// CRITICAL: proxy MUST NOT know what business the hook does (方案 §6
-	// 不变量 #16). It calls Detect, gets a generic Action verdict, applies it.
-	// Set during supervisor.buildGeneration when a filter app is registered
-	// AND its child binary spawned successfully.
-	filterHook apphook.Hook
-
 	// filterIncremental, when true, makes the inbound filter scan ONLY the
 	// latest user turn (the new content) instead of re-scanning system + the
 	// whole conversation history every request. WHY: clients like OpenClaw
@@ -168,29 +180,6 @@ type Proxy struct {
 	// it always full-scans (+ optional content-hash cache below). Field/setter/env
 	// retained only until the systemd units drop AIKEY_PROXY_FILTER_INCREMENTAL_SCAN.
 	filterIncremental bool
-
-	// filterCache memoizes per-piece scan verdicts so the full-scan path doesn't
-	// re-scan unchanged history every turn (设计 20260616-…-内容哈希缓存 §4). nil =
-	// cache OFF (dispatcher skips the content-hash entirely → stateless full scan).
-	// Lives behind the hook==nil gate, so compliance OFF pays nothing (INV-6).
-	filterCache MaskCache
-
-	// Configurable slow-request thresholds (milliseconds).
-	SlowRequestMs     int64
-	VerySlowRequestMs int64
-
-	// UpstreamTimeout caps how long a detached upstream call may run after
-	// the client disconnects. Default: defaultUpstreamTimeout (10 min).
-	UpstreamTimeout time.Duration
-
-	// appHealthCache records the most recent app-pipeline call per slug,
-	// in process memory only (no persistence). Powers the Web "Connected
-	// Apps" list Health column via the admin /admin/apps/health endpoint.
-	// Always non-nil after New(); the cache itself is safe for concurrent
-	// readers/writers (sync.RWMutex internal). See
-	// apppipe/health.go for the rationale on why this isn't a DWD-side
-	// projection.
-	appHealthCache *apppipe.HealthCache
 }
 
 // SetTransport sets a custom RoundTripper for outbound requests to AI providers.

@@ -13,7 +13,7 @@ import (
 // under test comes from the diagnostics HTTP server, not from upload.
 func newTestReporter(t *testing.T) *Reporter {
 	t.Helper()
-	r, err := NewReporter(ReporterConfig{
+	r, err := NewReporter(&ReporterConfig{
 		WALDir:         t.TempDir(),
 		UploadInterval: time.Hour, // keep the upload loop idle during the test
 	})
@@ -234,7 +234,7 @@ func TestCanaryChecksRouteCollectorNotFixedDiagnostics(t *testing.T) {
 	defer cluster.Close()
 
 	// Reporter with a remote team route (what `aikey login --control-url` wires).
-	r, err := NewReporter(ReporterConfig{
+	r, err := NewReporter(&ReporterConfig{
 		WALDir:          t.TempDir(),
 		UploadInterval:  time.Hour,
 		CollectorRoutes: map[string]string{"team": cluster.URL},

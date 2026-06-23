@@ -290,3 +290,36 @@ func TestItoaInt64(t *testing.T) {
 		}
 	}
 }
+
+// TestApplyInboundFilter_UnknownAction_FailsLoudDegraded — regression for the
+// 2026-06-22 third-party review: an exhaustive-switch refactor replaced the
+// switch's `default` with an explicit `case ActionAllow`, dropping the catch-all.
+// childhook converts the child's raw wire byte straight to Action, so a
+// misbehaving child / protocol skew can yield a value outside {Allow,Mask,Block,
+// Warn}. Such an unknown action MUST fail-OPEN (content proceeds, per §6 #11)
+// but LOUDLY: a WARN is logged and it counts as degraded — never a silent clean
+// Allow that slips through unscanned with zero signal.
+func TestApplyInboundFilter_UnknownAction_FailsLoudDegraded(t *testing.T) {
+	const unknownAction = apphook.Action(99) // outside the defined action set
+	hook := &stubHook{resp: &apphook.Response{Action: unknownAction}}
+	p := &Proxy{filterHook: hook}
+	r := newReq(`{"model":"m","messages":[{"role":"user","content":"hello world"}]}`)
+	w := httptest.NewRecorder()
+
+	var logBuf bytes.Buffer
+	logger := slog.New(slog.NewTextHandler(&logBuf, &slog.HandlerOptions{Level: slog.LevelWarn}))
+
+	proceed := p.applyInboundFilter(w, r, "m", "personal", "", "", logger)
+
+	// 1. fail-OPEN: the request proceeds and content is forwarded unchanged.
+	if !proceed {
+		t.Fatal("unknown action must fail-OPEN (proceed=true), got proceed=false")
+	}
+	if got := readReqBody(t, r); !strings.Contains(got, "hello world") {
+		t.Errorf("content must pass through unchanged on unknown action, got %q", got)
+	}
+	// 2. fail-LOUD: a WARN names the unknown action (not a silent clean Allow).
+	if logs := logBuf.String(); !strings.Contains(logs, "proxy.filter.unknown_action") {
+		t.Errorf("expected a WARN (proxy.filter.unknown_action) for the unknown action, got logs:\n%s", logs)
+	}
+}

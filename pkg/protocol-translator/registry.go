@@ -24,12 +24,12 @@ import (
 // DefaultRegistry() which is what pair `init()` functions register
 // against.
 type Registry struct {
-	mu sync.RWMutex
 	// Internal storage is three-tuple (from, to, endpoint) keyed —
 	// MVP only uses EndpointDefault but the storage shape is fixed
 	// for forward compatibility. Public API hides the endpoint
 	// dimension; see TranslateRequest etc.
 	pairs map[pairKey]*pair
+	mu    sync.RWMutex
 }
 
 // pairKey is the internal map key. Defined as a struct (not a string)

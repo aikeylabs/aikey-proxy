@@ -27,8 +27,8 @@ package sessionid
 
 import (
 	"bytes"
-	"encoding/json"
 	_ "embed"
+	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"

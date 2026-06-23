@@ -41,7 +41,7 @@ func main() {
 
 	hooks := make([]*apphook.ChildHook, *workers)
 	for i := range hooks {
-		hooks[i] = apphook.NewChildHook(apphook.ChildHookConfig{
+		hooks[i] = apphook.NewChildHook(&apphook.ChildHookConfig{
 			Name:         "filterbench",
 			BinaryPath:   *detector,
 			Timeout:      5 * time.Second, // generous: measure TRUE latency, flag >budget separately

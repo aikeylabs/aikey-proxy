@@ -23,11 +23,6 @@ import (
 // parse the WAL envelope (e.g. the CLI's usage_wal.rs) don't need a
 // second format path. See bugfix 20260424 chain-consistency round.
 type WALEntry struct {
-	WALSeq        int64            `json:"wal_seq"`
-	WrittenAt     aikeytime.Millis `json:"written_at"`
-	SchemaVersion int              `json:"schema_version"`
-	EventJSON     ReportableEvent  `json:"event_json"`
-
 	// Delivery-integrity fields (WAL schema v2, 2026-05-30). Populated only on
 	// v2 entries; absent (omitempty) on legacy v1 entries which remain readable.
 	//   SourceID:    this vault's stable source identity (runtime.source_identity).
@@ -38,9 +33,13 @@ type WALEntry struct {
 	//   ContentHash: hash of normalized metering fields (filled in phase C; "" now).
 	// v1 entries (no SourceSeq) are shown locally by statusline/watch but do NOT
 	// participate in upload gap detection — see design doc §5.2 / §6 invariant 6.
-	SourceID    string `json:"source_id,omitempty"`
-	SourceSeq   int64  `json:"source_seq,omitempty"`
-	ContentHash string `json:"content_hash,omitempty"`
+	SourceID      string           `json:"source_id,omitempty"`
+	ContentHash   string           `json:"content_hash,omitempty"`
+	EventJSON     ReportableEvent  `json:"event_json"`
+	WALSeq        int64            `json:"wal_seq"`
+	WrittenAt     aikeytime.Millis `json:"written_at"`
+	SchemaVersion int              `json:"schema_version"`
+	SourceSeq     int64            `json:"source_seq,omitempty"`
 }
 
 // WALSchemaV2 is the entry schema version that carries the delivery-integrity
@@ -51,13 +50,12 @@ const WALSchemaV2 = 2
 // the delivery-integrity outbox is provided by the package functions
 // ListWALFiles / ReadWALFile / ReadAllWAL (the WAL is no longer write-only).
 type WALWriter struct {
-	dir     string
-	seq     atomic.Int64
-	mu      sync.Mutex
-	file    *os.File
-	curHour string
-
+	file         *os.File
+	dir          string
+	curHour      string
+	seq          atomic.Int64
 	appendFailed atomic.Int64
+	mu           sync.Mutex
 }
 
 // NewWALWriter creates a WAL writer that writes to the given directory.
@@ -85,11 +83,11 @@ func NewWALWriter(dir string) (*WALWriter, error) {
 // a synchronous disk flush. Append remains best-effort; a hard crash may lose
 // the last un-fsync'd group, which reserve-ahead turns into an auditable gap
 // rather than silent loss (§6.1 H2).
-func (w *WALWriter) Append(ev ReportableEvent) {
+func (w *WALWriter) Append(ev *ReportableEvent) {
 	entry := WALEntry{
 		WALSeq:      w.seq.Add(1),
 		WrittenAt:   aikeytime.Now(),
-		EventJSON:   ev,
+		EventJSON:   *ev,
 		SourceID:    ev.SourceID,
 		ContentHash: ev.ContentHash, // stamped in BuildReportableEvent (stage C)
 	}

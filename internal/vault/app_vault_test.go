@@ -544,25 +544,25 @@ func TestGetAllAppRouteTokens_SkipsNonStrictFormWithWarn(t *testing.T) {
 	rows := []struct {
 		keyID       string
 		routeToken  string
-		shouldPass  bool
 		description string
+		shouldPass  bool
 	}{
-		{"strict", appHex64A, true, "strict aikey_app_<64 lowercase hex>"},
-		{"too-short", "aikey_app_" + strings.Repeat("0", 63), false, "63 hex suffix"},
-		{"too-long", "aikey_app_" + strings.Repeat("0", 65), false, "65 hex suffix"},
-		{"uppercase", "aikey_app_" + strings.Repeat("A", 64), false, "uppercase hex"},
-		{"non-hex", "aikey_app_" + strings.Repeat("g", 64), false, "non-hex char"},
-		{"wrong-prefix", "aikey_personal_" + strings.Repeat("0", 64), false, "personal prefix in app_keys.route_token (writer bug)"},
-		{"alias-form", "aikey_app_my-agent", false, "alias-shaped suffix"},
+		{keyID: "strict", routeToken: appHex64A, shouldPass: true, description: "strict aikey_app_<64 lowercase hex>"},
+		{keyID: "too-short", routeToken: "aikey_app_" + strings.Repeat("0", 63), shouldPass: false, description: "63 hex suffix"},
+		{keyID: "too-long", routeToken: "aikey_app_" + strings.Repeat("0", 65), shouldPass: false, description: "65 hex suffix"},
+		{keyID: "uppercase", routeToken: "aikey_app_" + strings.Repeat("A", 64), shouldPass: false, description: "uppercase hex"},
+		{keyID: "non-hex", routeToken: "aikey_app_" + strings.Repeat("g", 64), shouldPass: false, description: "non-hex char"},
+		{keyID: "wrong-prefix", routeToken: "aikey_personal_" + strings.Repeat("0", 64), shouldPass: false, description: "personal prefix in app_keys.route_token (writer bug)"},
+		{keyID: "alias-form", routeToken: "aikey_app_my-agent", shouldPass: false, description: "alias-shaped suffix"},
 	}
 
 	for _, row := range rows {
-		_, err := r.db.Exec(
+		_, insErr := r.db.Exec(
 			`INSERT INTO app_keys (key_id, app_slug, route_token, status) VALUES (?, 'agent-a', ?, 'active')`,
 			row.keyID, row.routeToken,
 		)
-		if err != nil {
-			t.Fatalf("insert %s: %v", row.keyID, err)
+		if insErr != nil {
+			t.Fatalf("insert %s: %v", row.keyID, insErr)
 		}
 	}
 
@@ -661,13 +661,13 @@ func TestIsStrictAppBearerForm(t *testing.T) {
 		{"aikey_app_" + strings.Repeat("0", 64), true},
 		{"aikey_app_" + strings.Repeat("f", 64), true},
 		// Negatives.
-		{"aikey_app_" + strings.Repeat("0", 63), false},        // 63 hex
-		{"aikey_app_" + strings.Repeat("0", 65), false},        // 65 hex
-		{"aikey_app_" + strings.Repeat("A", 64), false},        // uppercase
-		{"aikey_app_my-agent", false},                          // alias form
-		{"aikey_app_", false},                                  // empty
-		{"aikey_personal_" + strings.Repeat("0", 64), false},   // personal prefix
-		{"aikey_team_acc-1234", false},                         // team prefix
+		{"aikey_app_" + strings.Repeat("0", 63), false},      // 63 hex
+		{"aikey_app_" + strings.Repeat("0", 65), false},      // 65 hex
+		{"aikey_app_" + strings.Repeat("A", 64), false},      // uppercase
+		{"aikey_app_my-agent", false},                        // alias form
+		{"aikey_app_", false},                                // empty
+		{"aikey_personal_" + strings.Repeat("0", 64), false}, // personal prefix
+		{"aikey_team_acc-1234", false},                       // team prefix
 		{"", false},
 	}
 	for _, c := range cases {

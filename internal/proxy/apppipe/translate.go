@@ -37,17 +37,15 @@ import (
 // log accurately and tests can assert end-state. Zero value means "no
 // translation applied for this request" (fast path).
 type TranslateOutcome struct {
-	// Engaged is true iff translation was performed.
-	Engaged bool
-
+	// UpstreamFormat is the target wire format we translated TO (or
+	// would have, if Engaged=true). Surfaced for structured logging.
+	UpstreamFormat translator.Format
 	// Body is what serveRoute should forward. When Engaged is true this
 	// is the translated bytes; when false it's the sanitized bytes
 	// echoed back unchanged (so callers can use one statement).
 	Body []byte
-
-	// UpstreamFormat is the target wire format we translated TO (or
-	// would have, if Engaged=true). Surfaced for structured logging.
-	UpstreamFormat translator.Format
+	// Engaged is true iff translation was performed.
+	Engaged bool
 }
 
 // MaybeTranslateRequest decides whether protocol translation is needed
@@ -266,6 +264,9 @@ func CanonicalUpstreamPath(to translator.Format) string {
 		return "/v1/messages"
 	case translator.FormatOpenAI:
 		return "/v1/chat/completions"
+	case translator.FormatOpenAIResponses, translator.FormatGemini, translator.FormatBedrock:
+		// No path rewrite — these formats are not translated to Anthropic here.
+		return ""
 	default:
 		return ""
 	}

@@ -184,30 +184,26 @@ type ResponseTransforms struct {
 //     doesn't already model, the pair can stash it here instead of
 //     extending the public struct.
 type StreamState struct {
-	// Stamped on every chunk emitted to the client.
-	ResponseID string
-	Model      string
-	CreatedAt  int64
-
-	// json_object forced tool-call workaround tracking. HasResponseFormat
-	// is true iff the inbound request had response_format=json_object;
-	// JSONFallbackName is the synthetic tool name (e.g. "respond_in_json").
-	HasResponseFormat bool
-	JSONFallbackName  string
-
 	// Per-tool-call argument deltas, indexed by OpenAI tool_calls index
 	// (not by Anthropic tool id, which can be hex-flavored).
 	ToolCallsAccum map[int]*ToolCallAccum
-
-	// Cumulative token counts across the stream.
-	InputUsage  Usage
-	OutputUsage Usage
-
 	// Pair-specific scratch space. Translator core never reads Extra;
 	// pair authors are responsible for namespacing keys to avoid
 	// collisions when multiple pairs share a StreamState (rare but
 	// possible in Endpoint-aware setups).
 	Extra map[string]any
+	// Stamped on every chunk emitted to the client.
+	ResponseID       string
+	Model            string
+	JSONFallbackName string
+	// Cumulative token counts across the stream.
+	InputUsage  Usage
+	OutputUsage Usage
+	CreatedAt   int64
+	// json_object forced tool-call workaround tracking. HasResponseFormat
+	// is true iff the inbound request had response_format=json_object;
+	// JSONFallbackName is the synthetic tool name (e.g. "respond_in_json").
+	HasResponseFormat bool
 }
 
 // ToolCallAccum accumulates one tool-call's incremental JSON arguments

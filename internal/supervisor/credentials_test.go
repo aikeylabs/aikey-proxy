@@ -12,8 +12,8 @@ import (
 // fakeRefreshTokenSource is a minimal vault stub so we can exercise
 // buildCollectorCredentials without standing up SQLite + Argon2id.
 type fakeRefreshTokenSource struct {
-	token string
 	err   error
+	token string
 }
 
 func (f fakeRefreshTokenSource) GetPlatformRefreshToken() (string, error) {
@@ -116,7 +116,7 @@ func TestBuildCollectorCredentials_VaultErrorSkipsRoute(t *testing.T) {
 // Partial yaml bundle (e.g. token written but refresh_url missing): we
 // can't construct a usable Bearer pipeline so the route is skipped —
 // catches misconfigured deployments early instead of failing at the
-// first upload attempt with an opaque "POST to '' failed".
+// first upload attempt with an opaque "POST to ” failed".
 func TestBuildCollectorCredentials_PartialYAMLBundleSkipsRoute(t *testing.T) {
 	cases := []struct {
 		name string

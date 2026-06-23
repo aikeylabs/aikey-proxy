@@ -15,7 +15,7 @@ import (
 
 func newPoolWorker(t *testing.T) *ChildHook {
 	t.Helper()
-	return NewChildHook(ChildHookConfig{
+	return NewChildHook(&ChildHookConfig{
 		Name: "pool-w", BinaryPath: findDetectorBinary(t), BinaryArgs: detectorArgs(),
 		Timeout: 2 * time.Second, ReadyTimeout: 5 * time.Second,
 	})

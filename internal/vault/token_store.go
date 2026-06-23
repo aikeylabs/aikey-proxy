@@ -3,6 +3,7 @@ package vault
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
 
 	broker "github.com/AiKeyLabs/aikey-auth-broker"
@@ -21,14 +22,14 @@ func NewTokenStore(db *sql.DB, derivedKey []byte) *VaultTokenStore {
 	return &VaultTokenStore{db: db, key: derivedKey}
 }
 
-func (s *VaultTokenStore) GetAccessToken(_ context.Context, accountID string) (string, int64, error) {
+func (s *VaultTokenStore) GetAccessToken(_ context.Context, accountID string) (accessToken string, expiresUnix int64, retErr error) {
 	var nonce, ciphertext []byte
 	var expiresAt int64
 	err := s.db.QueryRow(
 		"SELECT access_token_nonce, access_token_ciphertext, token_expires_at FROM provider_account_tokens WHERE provider_account_id = ?",
 		accountID,
 	).Scan(&nonce, &ciphertext, &expiresAt)
-	if err == sql.ErrNoRows {
+	if errors.Is(err, sql.ErrNoRows) {
 		return "", 0, fmt.Errorf("no token for account %s", accountID)
 	}
 	if err != nil {
@@ -51,7 +52,7 @@ func (s *VaultTokenStore) GetRefreshToken(_ context.Context, accountID string) (
 		"SELECT refresh_token_nonce, refresh_token_ciphertext FROM provider_account_tokens WHERE provider_account_id = ?",
 		accountID,
 	).Scan(&nonce, &ciphertext)
-	if err == sql.ErrNoRows {
+	if errors.Is(err, sql.ErrNoRows) {
 		return "", fmt.Errorf("no token for account %s", accountID)
 	}
 	if err != nil {

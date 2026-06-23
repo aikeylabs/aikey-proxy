@@ -354,8 +354,8 @@ func TestStripResponseHeaders_RemovesXAiKeyFamily(t *testing.T) {
 	h := http.Header{}
 	h.Set("Content-Type", "application/json")
 	h.Set("X-AiKey-Trace-Id", "should-strip")
-	h.Set("X-Aikey-Route-Source", "should-strip")  // lowercase variant
-	h.Set("X-AIKEY-LOWER-CHECK", "should-strip")   // uppercase variant
+	h.Set("X-Aikey-Route-Source", "should-strip") // lowercase variant
+	h.Set("X-AIKEY-LOWER-CHECK", "should-strip")  // uppercase variant
 	h.Set("X-Other-Header", "should-keep")
 
 	StripResponseHeaders(h)

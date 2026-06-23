@@ -5,9 +5,13 @@ import (
 	"net/http"
 )
 
+// Generic implements a generic OpenAI-compatible provider protocol.
+// This is a fallback for any provider that follows the OpenAI API convention.
+type Generic struct{}
+
 // ExtractTokens delegates to the OpenAI-compatible implementation
 // since Generic follows the same response format convention.
-func (g *Generic) ExtractTokens(data []byte, streaming bool, logger *slog.Logger) (int, int) {
+func (g *Generic) ExtractTokens(data []byte, streaming bool, logger *slog.Logger) (inputTokens, outputTokens int) {
 	return (&OpenAI{}).ExtractTokens(data, streaming, logger)
 }
 
@@ -17,13 +21,9 @@ func (g *Generic) ExtractTokenBreakdown(data []byte, streaming bool, logger *slo
 	return (&OpenAI{}).ExtractTokenBreakdown(data, streaming, logger)
 }
 
-// Generic implements a generic OpenAI-compatible provider protocol.
-// This is a fallback for any provider that follows the OpenAI API convention.
-type Generic struct{}
-
 func (g *Generic) Name() string { return "generic" }
 
-func (g *Generic) RewriteRequest(req *http.Request, realKey string, baseURL string) error {
+func (g *Generic) RewriteRequest(req *http.Request, realKey, baseURL string) error {
 	if err := applyBaseURL(req, baseURL); err != nil {
 		return err
 	}

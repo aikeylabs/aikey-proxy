@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"flag"
 	"fmt"
 	"log/slog"
@@ -212,21 +213,28 @@ func main() {
 		},
 		StartedAt: time.Now().UTC(),
 	}
-	if err := proxyruntime.Write(snapshot); err != nil {
-		slog.Warn("failed to write proxy-runtime.json (non-fatal)", "error", err)
+	if wErr := proxyruntime.Write(&snapshot); wErr != nil {
+		slog.Warn("failed to write proxy-runtime.json (non-fatal)", "error", wErr)
+	}
+
+	// 5. Create the Supervisor (starts the initial generation).
+	// NB: the proxy-runtime.json cleanup defer is registered AFTER this check —
+	// os.Exit below would skip a defer (gocritic exitAfterDefer), so on this
+	// fatal path we remove the snapshot explicitly and defer it only once the
+	// supervisor is up (normal-shutdown cleanup).
+	sup, err := supervisor.New(cfg, resolvedPath, password, buildinfo.Get().Version)
+	if err != nil {
+		slog.Error("failed to start supervisor", "error", err)
+		if rmErr := proxyruntime.Remove(); rmErr != nil {
+			slog.Warn("failed to remove proxy-runtime.json on shutdown", "error", rmErr)
+		}
+		os.Exit(1)
 	}
 	defer func() {
 		if err := proxyruntime.Remove(); err != nil {
 			slog.Warn("failed to remove proxy-runtime.json on shutdown", "error", err)
 		}
 	}()
-
-	// 5. Create the Supervisor (starts the initial generation).
-	sup, err := supervisor.New(cfg, resolvedPath, password, buildinfo.Get().Version)
-	if err != nil {
-		slog.Error("failed to start supervisor", "error", err)
-		os.Exit(1)
-	}
 
 	slog.Info("aikey-proxy started",
 		"event.name", observability.EventProxyProcessStarted,
@@ -289,7 +297,7 @@ func main() {
 	// restart us rather than lingering as a zombie that accepts nothing.
 	observability.GoSafe("main.server.serve", observability.Fatal, func() {
 		fmt.Fprintf(os.Stderr, "\naikey-proxy %s listening on %s\n\n", buildinfo.Get().String(), ln.Addr())
-		if err := srv.Serve(); err != nil && err != http.ErrServerClosed {
+		if err := srv.Serve(); err != nil && !errors.Is(err, http.ErrServerClosed) {
 			slog.Error("server error", "error", err)
 			os.Exit(1)
 		}
@@ -353,20 +361,30 @@ func getVaultPassword() (string, error) {
 // a reconnect storm under any real concurrency.
 //
 // Supported proxy schemes: http, https, socks5.
+// cloneDefaultTransport returns a clone of http.DefaultTransport, falling back
+// to a fresh *http.Transport if the standard library ever changes the concrete
+// type (the comma-ok keeps the type assertion safe).
+func cloneDefaultTransport() *http.Transport {
+	if dt, ok := http.DefaultTransport.(*http.Transport); ok {
+		return dt.Clone()
+	}
+	return &http.Transport{}
+}
+
 func buildTransport(proxyURL string) *http.Transport {
 	// All providers resolve to a handful of hosts (api.anthropic.com etc.),
 	// so a generous per-host idle pool is bounded in practice by MaxIdleConns.
 	const perHost = 100
 
 	if proxyURL == "" {
-		t := http.DefaultTransport.(*http.Transport).Clone()
+		t := cloneDefaultTransport()
 		t.MaxIdleConnsPerHost = perHost
 		return t
 	}
 	parsed, err := url.Parse(proxyURL)
 	if err != nil {
 		slog.Warn("upstream_proxy.url is invalid, falling back to env vars", "url", proxyURL, "error", err)
-		t := http.DefaultTransport.(*http.Transport).Clone()
+		t := cloneDefaultTransport()
 		t.MaxIdleConnsPerHost = perHost
 		return t
 	}

@@ -16,12 +16,11 @@ import (
 // classic token bucket — we just need "max N events per sliding
 // window", which is a few lines to write directly.
 type tokenLimiter struct {
-	budget int
-	window time.Duration
-
-	mu       sync.Mutex
-	stamps   []time.Time // event timestamps inside the current window
-	nowFunc  func() time.Time
+	nowFunc func() time.Time
+	stamps  []time.Time // event timestamps inside the current window
+	budget  int
+	window  time.Duration
+	mu      sync.Mutex
 }
 
 func newTokenLimiter(budget int, window time.Duration) *tokenLimiter {

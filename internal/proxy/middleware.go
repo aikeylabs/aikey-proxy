@@ -4,7 +4,6 @@ import (
 	"context"
 	"net/http"
 	"strings"
-	"time"
 
 	"github.com/AiKeyLabs/aikey-proxy/internal/observability"
 	"github.com/AiKeyLabs/aikey-proxy/internal/vkeys"
@@ -52,24 +51,6 @@ const (
 func traceFromContext(ctx context.Context) observability.TraceContext {
 	tc, _ := ctx.Value(ctxKeyTrace).(observability.TraceContext)
 	return tc
-}
-
-// routeFromContext retrieves the resolved route from request context.
-func routeFromContext(ctx context.Context) *vkeys.ResolvedRoute {
-	r, _ := ctx.Value(ctxKeyRoute).(*vkeys.ResolvedRoute)
-	return r
-}
-
-// startTimeFromContext retrieves the request start time from context.
-func startTimeFromContext(ctx context.Context) time.Time {
-	t, _ := ctx.Value(ctxKeyStartTime).(time.Time)
-	return t
-}
-
-// isStreamingFromContext checks if the request was a streaming request.
-func isStreamingFromContext(ctx context.Context) bool {
-	v, _ := ctx.Value(ctxKeyIsStreaming).(bool)
-	return v
 }
 
 // isAikeyProbe returns true when the caller (typically `aikey test` / doctor /
@@ -317,7 +298,7 @@ func writeJSONError(w http.ResponseWriter, statusCode int, errType, code, messag
 	w.Header().Set(HeaderAikeyErrorSource, code)
 	w.WriteHeader(statusCode)
 	// Write error JSON inline to avoid encoding/json import for this simple case.
-	w.Write([]byte(`{"error":{"message":"` + escapeJSON(message) + `","type":"` + errType + `","code":"` + code + `"}}`))
+	_, _ = w.Write([]byte(`{"error":{"message":"` + escapeJSON(message) + `","type":"` + errType + `","code":"` + code + `"}}`))
 }
 
 func escapeJSON(s string) string {

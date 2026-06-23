@@ -26,7 +26,7 @@ func TestManagedKeyToRoute_SetsTeamSource(t *testing.T) {
 		OrgID:        "org-abc",
 		ProviderCode: "openai",
 	}
-	r := managedKeyToRoute(mk)
+	r := managedKeyToRoute(&mk)
 	if r == nil {
 		t.Fatal("expected non-nil route")
 	}
@@ -62,7 +62,7 @@ func TestManagedKeyToRoute_AttributesToOwnerAccount(t *testing.T) {
 		SeatID:         "seat-A",
 		ProviderCode:   "anthropic",
 	}
-	r := managedKeyToRoute(mk)
+	r := managedKeyToRoute(&mk)
 	if r.AccountID != "acct-user-A" {
 		t.Errorf("AccountID = %q, want owner_account_id acct-user-A (P0-2 attribution)", r.AccountID)
 	}
@@ -211,12 +211,12 @@ func TestBuildOAuthRoutesFiltered_KeepsStrictAndDropsLegacy(t *testing.T) {
 // It returns whatever the test caller seeds — including legacy /
 // malformed shapes — so we can verify the filter at the real call site.
 type fakeVaultRouteTokenReader struct {
-	personal    []vault.PersonalRouteToken
-	oauth       []vault.OAuthRouteToken
-	app         []vault.AppRouteToken
 	personalErr error
 	oauthErr    error
 	appErr      error
+	personal    []vault.PersonalRouteToken
+	oauth       []vault.OAuthRouteToken
+	app         []vault.AppRouteToken
 }
 
 func (f *fakeVaultRouteTokenReader) GetAllPersonalRouteTokens() ([]vault.PersonalRouteToken, error) {
@@ -306,8 +306,8 @@ func TestLoadVaultRoutesIntoRegistry_HandlesMissingColumnGracefully(t *testing.T
 // TestLoadVaultRoutesIntoRegistry_NilSafety covers the defensive
 // nil-arg branches so a future caller mishap doesn't panic the proxy.
 func TestLoadVaultRoutesIntoRegistry_NilSafety(t *testing.T) {
-	loadVaultRoutesIntoRegistry(nil, nil)         // both nil
-	loadVaultRoutesIntoRegistry(vkeys.NewRegistry(), nil)  // nil reader
+	loadVaultRoutesIntoRegistry(nil, nil)                          // both nil
+	loadVaultRoutesIntoRegistry(vkeys.NewRegistry(), nil)          // nil reader
 	loadVaultRoutesIntoRegistry(nil, &fakeVaultRouteTokenReader{}) // nil reg
 	// No assertions beyond "did not panic".
 }
@@ -333,10 +333,10 @@ func keysOf(m map[string]*vkeys.ResolvedRoute) []string {
 }
 
 func TestAllBuildersSetRouteSource(t *testing.T) {
-	managed := managedKeyToRoute(vault.ManagedKey{VirtualKeyID: "x", ProtocolType: "openai"})
+	managed := managedKeyToRoute(&vault.ManagedKey{VirtualKeyID: "x", ProtocolType: "openai"})
 	personal := personalTokenToRoute(vault.PersonalRouteToken{Alias: "a", ProviderCode: "anthropic"})
 	oauth := oauthTokenToRoute(vault.OAuthRouteToken{AccountID: "x", Provider: "anthropic"})
-	app := appRouteTokenToRoute(vault.AppRouteToken{KeyID: "k", AppSlug: "x", AppKind: "third-party"})
+	app := appRouteTokenToRoute(&vault.AppRouteToken{KeyID: "k", AppSlug: "x", AppKind: "third-party"})
 
 	for label, r := range map[string]struct{ Got, Want string }{
 		"managed":  {managed.RouteSource, "team"},
@@ -375,7 +375,7 @@ func TestAppRouteTokenToRoute_SetsAppFields(t *testing.T) {
 		FollowUserActive: true,
 		AllowedUpstreams: []string{"openai", "anthropic"},
 	}
-	r := appRouteTokenToRoute(at)
+	r := appRouteTokenToRoute(&at)
 	if r == nil {
 		t.Fatal("expected non-nil route")
 	}
@@ -416,7 +416,7 @@ func TestBuildAppRoutesFiltered_KeepsStrictAndDropsLegacy(t *testing.T) {
 		{KeyID: "k2", AppSlug: "agent-b", RouteToken: appHex64B, AppKind: "third-party"},
 		// Malformed shapes that MUST be filtered out:
 		{KeyID: "k-bad1", AppSlug: "agent-c", RouteToken: "aikey_app_tooshort", AppKind: "third-party"},
-		{KeyID: "k-bad2", AppSlug: "agent-d", RouteToken: "aikey_personal_" + hex64Strict, AppKind: "third-party"}, // wrong prefix
+		{KeyID: "k-bad2", AppSlug: "agent-d", RouteToken: "aikey_personal_" + hex64Strict, AppKind: "third-party"},                                                   // wrong prefix
 		{KeyID: "k-bad3", AppSlug: "agent-e", RouteToken: "aikey_app_" + "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA", AppKind: "third-party"}, // uppercase
 	}
 
@@ -567,7 +567,6 @@ func TestIsStrictAppRouteToken(t *testing.T) {
 		}
 	}
 }
-
 
 // TestSyncManagedKeys_IncludesAppTokenLoadingBlock is a source-level fence
 // against accidental deletion of the app-route-token loading inside

@@ -28,7 +28,7 @@ func TestUploadComplianceEvents_ReusesRouteAndCredential(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	r, err := NewReporter(ReporterConfig{
+	r, err := NewReporter(&ReporterConfig{
 		CollectorRoutes:           map[string]string{"team": srv.URL},
 		CollectorRouteCredentials: map[string]Credential{"team": &StaticTokenCredential{Token: "member-jwt-x"}},
 	})

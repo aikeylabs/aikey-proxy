@@ -45,7 +45,7 @@ const (
 	// Header names. Lowercase canonical (Go http.Header normalizes to
 	// MIME-style on Get/Set, but match input casing exactly for clarity in
 	// allowlist checks below).
-	headerProbeRawBearer  = "X-Aikey-Probe-Bearer"
+	headerProbeRawBearer  = "X-Aikey-Probe-Bearer" //nolint:gosec // HTTP header name, not a credential
 	headerProbeRawBaseURL = "X-Aikey-Probe-BaseURL"
 
 	// Caps. probeBearer max length: provider keys today are ≤ 256 chars (sk-ant
@@ -127,14 +127,14 @@ var outboundHeaderAllowlist = map[string]struct{}{
 //
 // Pipeline:
 //
-//	1. flag gate (defense rollback)
-//	2. header presence + length validation
-//	3. resolve upstream base URL
-//	4. construct upstream request with allowlist headers + fixed UA + injected auth
-//	5. send + time the upstream call
-//	6. emit JSON response with probe_ok + upstream_status + latency_ms
-//	7. NEVER call p.recordEvent (no reporter/WAL — isAikeyProbe enforces
-//	   for shared paths; we never enter them in the first place)
+//  1. flag gate (defense rollback)
+//  2. header presence + length validation
+//  3. resolve upstream base URL
+//  4. construct upstream request with allowlist headers + fixed UA + injected auth
+//  5. send + time the upstream call
+//  6. emit JSON response with probe_ok + upstream_status + latency_ms
+//  7. NEVER call p.recordEvent (no reporter/WAL — isAikeyProbe enforces
+//     for shared paths; we never enter them in the first place)
 func (p *Proxy) handleProbeRaw(w http.ResponseWriter, r *http.Request, canonicalCode, strippedPath string, logger *slog.Logger) {
 	logger = logger.With(
 		"routing", "probe-raw",
@@ -433,4 +433,3 @@ func writeProbeRawJSON(w http.ResponseWriter, status int, body map[string]any) {
 func contextWithProbeTimeout(parent context.Context) (context.Context, context.CancelFunc) {
 	return context.WithTimeout(parent, probeRawUpstreamTimeout)
 }
-

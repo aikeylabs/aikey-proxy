@@ -238,11 +238,11 @@ func rewriteToolNamesReverseJSON(body []byte, mapping map[string]string) []byte 
 // will fail and the line is forwarded unchanged (graceful degradation).
 type sseToolNameRewriter struct {
 	upstream io.ReadCloser
+	upstrErr error
 	mapping  map[string]string
 	buf      bytes.Buffer
 	out      bytes.Buffer
 	eofSeen  bool
-	upstrErr error
 }
 
 // newSSEToolNameRewriter wraps body for tool_use.name reverse rewrite.

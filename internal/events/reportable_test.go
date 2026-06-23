@@ -177,7 +177,7 @@ func TestBuildReportableEvent_AppPipelineFieldsIsolated(t *testing.T) {
 		AppKeyID:         "key-uuid-abc",
 		FollowUserActive: false, // isolated mode
 	}
-	ev := BuildReportableEvent(ReportOpts{
+	ev := BuildReportableEvent(&ReportOpts{
 		EventID:    "evt-1",
 		Route:      route,
 		Model:      "claude-3-5-sonnet-20241022",
@@ -219,7 +219,7 @@ func TestBuildReportableEvent_AppPipelineFieldsFollowActive(t *testing.T) {
 		AppKeyID:         "key-uuid-xyz",
 		FollowUserActive: true, // dynamic follow mode
 	}
-	ev := BuildReportableEvent(ReportOpts{
+	ev := BuildReportableEvent(&ReportOpts{
 		EventID:    "evt-2",
 		Route:      route,
 		Model:      "claude-3-5-sonnet-20241022",
@@ -247,7 +247,7 @@ func TestBuildReportableEvent_LegacyRoutesOmitAppFields(t *testing.T) {
 		AppSlug:  "ghost-app",
 		AppKeyID: "ghost-key",
 	}
-	ev := BuildReportableEvent(ReportOpts{
+	ev := BuildReportableEvent(&ReportOpts{
 		EventID:    "evt-3",
 		Route:      route,
 		Model:      "gpt-4o",
@@ -279,7 +279,7 @@ func TestBuildReportableEvent_ProbeBearerFirstPartyAttribution(t *testing.T) {
 		RouteSource:  "probe",
 		ProviderCode: "anthropic",
 	}
-	ev := BuildReportableEvent(ReportOpts{
+	ev := BuildReportableEvent(&ReportOpts{
 		EventID:     "evt-probe-1",
 		Route:       route,
 		BearerToken: "aikey_app_internal_degrade_detector_v1",
@@ -311,7 +311,7 @@ func TestBuildReportableEvent_ProbeUnknownBearerNoAttribution(t *testing.T) {
 		RouteSource:  "probe",
 		ProviderCode: "anthropic",
 	}
-	ev := BuildReportableEvent(ReportOpts{
+	ev := BuildReportableEvent(&ReportOpts{
 		EventID:     "evt-probe-2",
 		Route:       route,
 		BearerToken: "aikey_app_unknown_third_party_xyz_64hex_xyz_64hex_xyz_64hex_xyz_64hex",
@@ -345,7 +345,7 @@ func TestBuildReportableEvent_StampsContentHash(t *testing.T) {
 		CacheReadInputTokens:     10,
 		CacheCreationInputTokens: 20,
 	}
-	ev := BuildReportableEvent(opts)
+	ev := BuildReportableEvent(&opts)
 
 	if ev.ContentHash == "" {
 		t.Fatal("ContentHash not stamped")
@@ -367,7 +367,7 @@ func TestBuildReportableEvent_StampsContentHash(t *testing.T) {
 
 	// Corrupting a token value must change the stamp (the whole point of C).
 	opts.OutputTokens = 0
-	if BuildReportableEvent(opts).ContentHash == ev.ContentHash {
+	if BuildReportableEvent(&opts).ContentHash == ev.ContentHash {
 		t.Fatal("output_tokens 50→0 did not change ContentHash — corruption would slip through")
 	}
 }

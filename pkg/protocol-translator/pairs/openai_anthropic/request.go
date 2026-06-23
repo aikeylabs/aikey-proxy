@@ -110,7 +110,7 @@ func ConvertRequest(ctx context.Context, model string, body []byte, stream bool)
 	// Anthropic: `stop_sequences` is always string array.
 	// Filter pure-whitespace entries (Anthropic rejects them with 400).
 	if s := in.Get("stop"); s.Exists() {
-		stops := normalizeStopSequences(s)
+		stops := normalizeStopSequences(&s)
 		if len(stops) > 0 {
 			rawArr := buildStringArray(stops)
 			out = sjsonSetRawMust(out, "stop_sequences", rawArr)
@@ -160,7 +160,8 @@ func ConvertRequest(ctx context.Context, model string, body []byte, stream bool)
 	// role=user with tool_result, merges same-role consecutive, filters
 	// empty text blocks, validates non-empty after normalization.
 	// See messages.go for the full rule set.
-	norm, mErr := normalizeMessages(in.Get("messages"))
+	inMessages := in.Get("messages")
+	norm, mErr := normalizeMessages(&inMessages)
 	if mErr != nil {
 		return nil, mErr
 	}
@@ -173,12 +174,14 @@ func ConvertRequest(ctx context.Context, model string, body []byte, stream bool)
 	// Wraps OpenAI's function-typed tools[] into Anthropic's name +
 	// description + input_schema shape; converts tool_choice string
 	// or object into Anthropic's typed object.
-	if toolsRaw, tErr := convertTools(in.Get("tools")); tErr != nil {
+	inTools := in.Get("tools")
+	if toolsRaw, tErr := convertTools(&inTools); tErr != nil {
 		return nil, tErr
 	} else if toolsRaw != nil {
 		out = sjsonSetRawMust(out, "tools", toolsRaw)
 	}
-	if tcRaw, tcErr := convertToolChoice(in.Get("tool_choice")); tcErr != nil {
+	inToolChoice := in.Get("tool_choice")
+	if tcRaw, tcErr := convertToolChoice(&inToolChoice); tcErr != nil {
 		return nil, tcErr
 	} else if tcRaw != nil {
 		out = sjsonSetRawMust(out, "tool_choice", tcRaw)
@@ -191,7 +194,7 @@ func ConvertRequest(ctx context.Context, model string, body []byte, stream bool)
 	// is appended to whatever user-declared tools[] already exist, and
 	// so the forced tool_choice cleanly overwrites any prior choice.
 	// See response_format.go for the rationale.
-	rfOut, rfErr := applyResponseFormat(out, in)
+	rfOut, rfErr := applyResponseFormat(out, &in)
 	if rfErr != nil {
 		return nil, rfErr
 	}
@@ -208,7 +211,7 @@ func ConvertRequest(ctx context.Context, model string, body []byte, stream bool)
 	// because response_format may have overwritten tool_choice to
 	// {"type":"tool",...}, which is NOT "none" — the parallel reverse
 	// then correctly applies on top of it.
-	out = applyParallelToolCalls(out, in)
+	out = applyParallelToolCalls(out, &in)
 
 	// ── Silently dropped fields (Anthropic doesn't support) ──────────
 	// presence_penalty / frequency_penalty / logit_bias / audio /
@@ -248,7 +251,7 @@ func sjsonSetRawMust(body []byte, path string, raw []byte) []byte {
 // normalizeStopSequences flattens OpenAI's `stop` (string or string-array)
 // into a Go slice + filters pure-whitespace + empty entries. Anthropic
 // rejects empty / whitespace-only stop_sequences with a 400.
-func normalizeStopSequences(node gjson.Result) []string {
+func normalizeStopSequences(node *gjson.Result) []string {
 	if node.Type == gjson.String {
 		s := node.String()
 		if strings.TrimSpace(s) == "" {

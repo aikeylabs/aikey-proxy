@@ -20,11 +20,10 @@ type EventInserter interface {
 type Collector struct {
 	store         EventInserter
 	ch            chan UsageEvent
-	batchSize     int
-	flushInterval time.Duration
 	done          chan struct{}
 	wg            sync.WaitGroup
-
+	batchSize     int
+	flushInterval time.Duration
 	// dropped counts usage events discarded because the buffer was full.
 	// Mirrors Reporter.dropped so /admin/metrics exposes both discard paths
 	// (queue-full here, no-route in the reporter) — billing loss must be
@@ -76,9 +75,9 @@ func NewCollector(store EventInserter, batchSize int, flushInterval time.Duratio
 // a billing event lost to backpressure is a correctness risk, so we increment
 // an externally-readable counter AND emit a structured WARN with the trace
 // correlation captured at request entry (logging-conventions, fail-loud).
-func (c *Collector) Record(event UsageEvent) {
+func (c *Collector) Record(event *UsageEvent) {
 	select {
-	case c.ch <- event:
+	case c.ch <- *event:
 	default:
 		dropped := c.dropped.Add(1)
 		slog.Warn("events collector: buffer full, dropping usage event",

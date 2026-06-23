@@ -39,7 +39,7 @@ func startFloodServer(t *testing.T) (addr string, stop func()) {
 	})
 	srv := &http.Server{
 		Handler:           mux,
-		ReadHeaderTimeout: 30 * time.Second, // mirrors server.go — kills slowloris
+		ReadHeaderTimeout: 30 * time.Second,  // mirrors server.go — kills slowloris
 		IdleTimeout:       120 * time.Second, // mirrors server.go — reaps idle keep-alives
 	}
 	go srv.Serve(ln)

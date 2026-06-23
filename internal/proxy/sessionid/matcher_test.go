@@ -235,9 +235,9 @@ func TestExtract_ProviderScopedRule(t *testing.T) {
 func TestExtract_ClaudeHeaderCrossProtocol(t *testing.T) {
 	m := Default()
 	cases := []struct {
-		name             string
-		protocol         string
-		provider         string
+		name     string
+		protocol string
+		provider string
 	}{
 		{"openai_protocol", "openai", "openai"},
 		{"openai_compatible_kimi", "openai_compatible", "kimi_code"},

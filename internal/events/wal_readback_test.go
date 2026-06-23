@@ -18,14 +18,14 @@ func TestWAL_AppendThenReadBack(t *testing.T) {
 		t.Fatal(err)
 	}
 	for seq := int64(1); seq <= 3; seq++ {
-		w.Append(ReportableEvent{
+		w.Append(&ReportableEvent{
 			EventID:   "e" + string(rune('0'+seq)),
 			SourceID:  "srcA",
 			SourceSeq: i64(seq),
 		})
 	}
-	if err := w.Close(); err != nil {
-		t.Fatal(err)
+	if cErr := w.Close(); cErr != nil {
+		t.Fatal(cErr)
 	}
 
 	entries, err := ReadAllWAL(dir)
@@ -61,7 +61,7 @@ func TestWAL_V1EntryStaysV1(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	w.Append(ReportableEvent{EventID: "legacy"}) // no SourceSeq
+	w.Append(&ReportableEvent{EventID: "legacy"}) // no SourceSeq
 	w.Close()
 
 	entries, err := ReadAllWAL(dir)
@@ -85,7 +85,7 @@ func TestWAL_V1EntryStaysV1(t *testing.T) {
 func TestWAL_MalformedLineTolerated(t *testing.T) {
 	dir := t.TempDir()
 	w, _ := NewWALWriter(dir)
-	w.Append(ReportableEvent{EventID: "good1", SourceID: "s", SourceSeq: i64(1)})
+	w.Append(&ReportableEvent{EventID: "good1", SourceID: "s", SourceSeq: i64(1)})
 	w.Close()
 
 	// Append a garbage line directly to the (single) WAL file.
@@ -99,7 +99,7 @@ func TestWAL_MalformedLineTolerated(t *testing.T) {
 
 	// Re-open writer (same hour file) and append another good entry.
 	w2, _ := NewWALWriter(dir)
-	w2.Append(ReportableEvent{EventID: "good2", SourceID: "s", SourceSeq: i64(2)})
+	w2.Append(&ReportableEvent{EventID: "good2", SourceID: "s", SourceSeq: i64(2)})
 	w2.Close()
 
 	entries, err := ReadAllWAL(dir)
@@ -130,7 +130,7 @@ func TestWAL_WriteFailureCountsAndTags(t *testing.T) {
 	}
 
 	// First Append succeeds and opens the hour file.
-	w.Append(ReportableEvent{EventID: "ok1", SourceID: "s", SourceSeq: i64(1)})
+	w.Append(&ReportableEvent{EventID: "ok1", SourceID: "s", SourceSeq: i64(1)})
 	if got := w.AppendFailedTotal(); got != 0 {
 		t.Fatalf("after good append appendFailed=%d, want 0", got)
 	}
@@ -147,7 +147,7 @@ func TestWAL_WriteFailureCountsAndTags(t *testing.T) {
 	_ = w.file.Close()
 	w.mu.Unlock()
 
-	w.Append(ReportableEvent{EventID: "fail1", SourceID: "s", SourceSeq: i64(2)})
+	w.Append(&ReportableEvent{EventID: "fail1", SourceID: "s", SourceSeq: i64(2)})
 
 	if got := w.AppendFailedTotal(); got != 1 {
 		t.Fatalf("after write-on-closed-fd appendFailed=%d, want 1", got)
@@ -160,7 +160,7 @@ func TestWAL_ListFilesChronological(t *testing.T) {
 	dir := t.TempDir()
 	// Hand-create two hour files out of natural order to prove sorting.
 	for _, name := range []string{"usage-20260530-18.jsonl", "usage-20260530-09.jsonl"} {
-		if err := os.WriteFile(filepath.Join(dir, name), []byte(""), 0o644); err != nil {
+		if err := os.WriteFile(filepath.Join(dir, name), []byte(""), 0o600); err != nil {
 			t.Fatal(err)
 		}
 	}

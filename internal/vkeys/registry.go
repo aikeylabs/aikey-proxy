@@ -8,8 +8,8 @@ import (
 // Registry maps virtual key tokens to resolved routes.
 // Thread-safe for concurrent proxy use.
 type Registry struct {
-	mu      sync.RWMutex
 	byToken map[string]*ResolvedRoute
+	mu      sync.RWMutex
 }
 
 // NewRegistry creates an empty registry.

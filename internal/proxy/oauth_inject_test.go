@@ -13,8 +13,9 @@ import (
 
 // --- helpers ---
 
-//nolint:unparam // `method` kept parameterized so non-POST cases can
 // reuse this helper without re-plumbing.
+//
+//nolint:unparam // `method` kept parameterized so non-POST cases can
 func newJSONRequest(method, url string, body map[string]any) *http.Request {
 	b, _ := json.Marshal(body)
 	req := httptest.NewRequest(method, url, bytes.NewReader(b))
@@ -413,7 +414,10 @@ func TestInjectMetadataUserIDIfAbsent(t *testing.T) {
 // --- generateUUID ---
 
 func TestGenerateUUID(t *testing.T) {
-	uuid := generateUUID()
+	uuid, err := generateUUID()
+	if err != nil {
+		t.Fatalf("generateUUID: %v", err)
+	}
 
 	// Format: 8-4-4-4-12 hex chars
 	parts := strings.Split(uuid, "-")
@@ -430,7 +434,10 @@ func TestGenerateUUID(t *testing.T) {
 	}
 
 	// Uniqueness sanity
-	uuid2 := generateUUID()
+	uuid2, err := generateUUID()
+	if err != nil {
+		t.Fatalf("generateUUID: %v", err)
+	}
 	if uuid == uuid2 {
 		t.Error("two UUIDs should not be identical")
 	}
@@ -608,10 +615,15 @@ func TestInjectClaudeOAuth_RealClaudeCodeUA_Preserved(t *testing.T) {
 //   - Anthropic OAuth-path WAF gates premium models on body.system[0]; without
 //     the magic intro / billing-header form, the WAF returns 429 with no
 //     rate-limit headers (business rejection masquerading as rate limit).
-//   - We apply the FULL sub2api 4-layer strategy ONLY for non-Claude-CLI
+//   - We apply the sub2api system-rewrite strategy (billing+intro at system[0]
+//     + relocate the client's system into messages) ONLY for non-Claude-CLI
 //     clients (UA-detected at start of injectClaudeOAuth). Real CLI traffic
 //     already carries its own fingerprint and is skipped to avoid wasted I/O
 //     and accidental damage.
+//   - cch is kept a STABLE constant (not body-hashed): the WAF doesn't verify
+//     it (Round 5B) and a body hash would mutate system[0] every turn and
+//     break prompt caching. The relocated client system carries cache_control
+//     (client's own, else auto-filled ephemeral) so it still caches.
 //
 // Tests below exercise injectClaudeWAFFingerprintFull directly (UA dispatch
 // is tested separately via injectClaudeOAuth end-to-end).
@@ -812,7 +824,7 @@ func TestClientIsClaudeCode(t *testing.T) {
 		{"Cursor/0.42.0", false},
 		{"node", false},
 		{"", false},
-		{"Claude-CLI/2.1.0", false}, // case-sensitive
+		{"Claude-CLI/2.1.0", false},  // case-sensitive
 		{"my-claude-cli/1.0", false}, // prefix must be exact
 	}
 	for _, tc := range cases {
@@ -872,7 +884,7 @@ func TestInjectClaudeOAuth_NonClaudeCLI_AppliesFullWAFInjection(t *testing.T) {
 	}
 }
 
-// ─── algorithms (computeClaudeCodeVersionFingerprint, sealCCHPlaceholder) ────
+// ─── algorithms (computeClaudeCodeVersionFingerprint) ───────────────────────
 
 func TestComputeClaudeCodeVersionFingerprint_Deterministic(t *testing.T) {
 	body := []byte(`{"messages":[{"role":"user","content":"hello world this is a test"}]}`)
@@ -904,34 +916,79 @@ func TestComputeClaudeCodeVersionFingerprint_ShortText(t *testing.T) {
 	}
 }
 
-func TestSealCCHPlaceholder_ReplacesPlaceholder(t *testing.T) {
-	body := []byte(`{"system":[{"type":"text","text":"x-anthropic-billing-header: cc_version=2.1.128.abc; cc_entrypoint=cli; cch=00000;"}],"messages":[{"role":"user","content":"hello"}]}`)
-	out := sealCCHPlaceholder(body)
-	if strings.Contains(string(out), "cch=00000") {
-		t.Errorf("placeholder should be replaced, got %s", out)
+// ─── cache_control preservation + cch stability (prompt-cache fix) ───────────
+
+// relocatedFirstBlock returns messages[0].content[0] (the relocated [System
+// Instructions] block) from a WAF-rewritten body.
+func relocatedFirstBlock(t *testing.T, body map[string]any) map[string]any {
+	t.Helper()
+	msgs, ok := body["messages"].([]any)
+	if !ok || len(msgs) == 0 {
+		t.Fatalf("no messages in rewritten body: %v", body["messages"])
 	}
-	if !regexp.MustCompile(`cch=[0-9a-f]{5};`).Match(out) {
-		t.Errorf("expected cch=<5hex>;, got %s", out)
+	return msgs[0].(map[string]any)["content"].([]any)[0].(map[string]any)
+}
+
+func TestInjectClaudeWAFFingerprintFull_RelocatedBlock_DefaultsCacheControl(t *testing.T) {
+	// Client sent a plain-string system with NO cache_control. The relocated
+	// instruction block must get an auto-filled ephemeral cache_control so the
+	// (often large) prompt still caches on the OAuth path.
+	req := newJSONRequest("POST", "/v1/messages", map[string]any{
+		"model":    "claude-opus-4-7",
+		"system":   "You are a helpful assistant. Be terse.",
+		"messages": []any{map[string]any{"role": "user", "content": "Hi"}},
+	})
+
+	injectClaudeWAFFingerprintFull(req)
+
+	block := relocatedFirstBlock(t, readBodyJSON(t, req))
+	cc, ok := block["cache_control"].(map[string]any)
+	if !ok || cc["type"] != "ephemeral" {
+		t.Errorf("relocated block should default to ephemeral cache_control, got %v", block["cache_control"])
 	}
 }
 
-func TestSealCCHPlaceholder_NoPlaceholderUnchanged(t *testing.T) {
-	body := []byte(`{"system":[{"type":"text","text":"x-anthropic-billing-header: cc_version=2.1.63; cc_entrypoint=cli; cch=abcde;"}],"messages":[]}`)
-	if string(sealCCHPlaceholder(body)) != string(body) {
-		t.Errorf("body without placeholder should be unchanged")
+func TestInjectClaudeWAFFingerprintFull_RelocatedBlock_PreservesClientCacheControl(t *testing.T) {
+	// Client sent a system block WITH its own cache_control (1h ttl). The
+	// relocated block must carry the client's exact value, not the default.
+	clientCC := map[string]any{"type": "ephemeral", "ttl": "1h"}
+	req := newJSONRequest("POST", "/v1/messages", map[string]any{
+		"model": "claude-sonnet-4-6",
+		"system": []any{
+			map[string]any{"type": "text", "text": "big project context", "cache_control": clientCC},
+		},
+		"messages": []any{map[string]any{"role": "user", "content": "Hi"}},
+	})
+
+	injectClaudeWAFFingerprintFull(req)
+
+	block := relocatedFirstBlock(t, readBodyJSON(t, req))
+	cc, ok := block["cache_control"].(map[string]any)
+	if !ok || cc["type"] != "ephemeral" || cc["ttl"] != "1h" {
+		t.Errorf("relocated block should preserve client cache_control {ephemeral,1h}, got %v", block["cache_control"])
 	}
 }
 
-func TestSealCCHPlaceholder_BodyContentChangesHash(t *testing.T) {
-	a := []byte(`{"system":[{"type":"text","text":"x-anthropic-billing-header: cc_version=2.1.128.abc; cc_entrypoint=cli; cch=00000;"}],"messages":[{"role":"user","content":"hello"}]}`)
-	b := []byte(`{"system":[{"type":"text","text":"x-anthropic-billing-header: cc_version=2.1.128.abc; cc_entrypoint=cli; cch=00000;"}],"messages":[{"role":"user","content":"world"}]}`)
-	cchRe := regexp.MustCompile(`cch=([0-9a-f]{5})`)
-	mA := cchRe.FindStringSubmatch(string(sealCCHPlaceholder(a)))
-	mB := cchRe.FindStringSubmatch(string(sealCCHPlaceholder(b)))
-	if mA == nil || mB == nil {
-		t.Fatalf("cch regex didn't match: %v %v", mA, mB)
+func TestInjectClaudeWAFFingerprintFull_CCHStaysConstant_AcrossBodies(t *testing.T) {
+	// system[0] (billing) must be byte-identical across two requests whose
+	// only difference is the trailing user message — otherwise the prompt
+	// cache prefix invalidates every turn. cch must stay the stable 00000
+	// placeholder (not a body digest).
+	billing := func(lastMsg string) string {
+		req := newJSONRequest("POST", "/v1/messages", map[string]any{
+			"model":    "claude-opus-4-7",
+			"system":   "stable system prompt for caching",
+			"messages": []any{map[string]any{"role": "user", "content": lastMsg}},
+		})
+		injectClaudeWAFFingerprintFull(req)
+		return readBodyJSON(t, req)["system"].([]any)[0].(map[string]any)["text"].(string)
 	}
-	if mA[1] == mB[1] {
-		t.Errorf("expected different cch for different bodies, both got %q", mA[1])
+	a := billing("first question")
+	b := billing("a totally different second question")
+	if a != b {
+		t.Errorf("system[0] billing must be stable across bodies for caching:\n a=%q\n b=%q", a, b)
+	}
+	if !strings.Contains(a, "cch=00000;") {
+		t.Errorf("cch should stay the stable 00000 placeholder, got %q", a)
 	}
 }

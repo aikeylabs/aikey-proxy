@@ -112,7 +112,7 @@ func (s *Store) Insert(events []UsageEvent) error {
 	if err != nil {
 		return fmt.Errorf("begin tx: %w", err)
 	}
-	defer tx.Rollback()
+	defer func() { _ = tx.Rollback() }()
 
 	stmt, err := tx.Prepare(`
 		INSERT INTO usage_events
@@ -127,7 +127,8 @@ func (s *Store) Insert(events []UsageEvent) error {
 	}
 	defer stmt.Close()
 
-	for _, e := range events {
+	for i := range events {
+		e := &events[i]
 		streaming := 0
 		if e.IsStreaming {
 			streaming = 1
@@ -175,9 +176,9 @@ func (s *Store) PruneOlderThan(cutoff time.Time) (int64, error) {
 }
 
 // QueryStats returns aggregated stats for admin metrics.
-func (s *Store) QueryStats() (map[string]int64, map[string]int64, error) {
-	byVKey := make(map[string]int64)
-	byProvider := make(map[string]int64)
+func (s *Store) QueryStats() (byVKey, byProvider map[string]int64, err error) {
+	byVKey = make(map[string]int64)
+	byProvider = make(map[string]int64)
 
 	rows, err := s.db.Query("SELECT virtual_key_id, COUNT(*) FROM usage_events GROUP BY virtual_key_id")
 	if err != nil {
@@ -187,7 +188,9 @@ func (s *Store) QueryStats() (map[string]int64, map[string]int64, error) {
 	for rows.Next() {
 		var key string
 		var count int64
-		rows.Scan(&key, &count)
+		if scanErr := rows.Scan(&key, &count); scanErr != nil {
+			return nil, nil, scanErr
+		}
 		byVKey[key] = count
 	}
 
@@ -199,7 +202,9 @@ func (s *Store) QueryStats() (map[string]int64, map[string]int64, error) {
 	for rows2.Next() {
 		var prov string
 		var count int64
-		rows2.Scan(&prov, &count)
+		if err := rows2.Scan(&prov, &count); err != nil {
+			return nil, nil, err
+		}
 		byProvider[prov] = count
 	}
 

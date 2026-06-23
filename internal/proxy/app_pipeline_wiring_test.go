@@ -156,16 +156,16 @@ func TestHandle_AppPath_HappyPathForwardsToUpstream(t *testing.T) {
 // supported (OpenAI→Anthropic translation)"), but until now there was
 // NO end-to-end test that exercised:
 //
-//   inbound OpenAI wire (URL path /v1/chat/completions)
-//        ↓
-//   translator pairs/openai_anthropic.ConvertRequest
-//        ↓
-//   outbound Anthropic wire (URL path /v1/messages, top-level
-//        `messages` + `max_tokens`, no OpenAI `choices`)
-//        ↓
-//   translator pairs/openai_anthropic.ConvertNonStream
-//        ↓
-//   inbound-shaped OpenAI response (`choices[0].message.content`)
+//	inbound OpenAI wire (URL path /v1/chat/completions)
+//	     ↓
+//	translator pairs/openai_anthropic.ConvertRequest
+//	     ↓
+//	outbound Anthropic wire (URL path /v1/messages, top-level
+//	     `messages` + `max_tokens`, no OpenAI `choices`)
+//	     ↓
+//	translator pairs/openai_anthropic.ConvertNonStream
+//	     ↓
+//	inbound-shaped OpenAI response (`choices[0].message.content`)
 //
 // Direct passthrough is covered by HappyPathForwardsToUpstream above
 // (OpenAI → OpenAI) and the rhythm-test-app tests further down
@@ -180,10 +180,10 @@ func TestHandle_AppPath_HappyPathForwardsToUpstream(t *testing.T) {
 // claim we can validate today.
 func TestHandle_AppPath_OpenAIWireToAnthropicUpstream_TranslatesEndToEnd(t *testing.T) {
 	var (
-		upstreamPath    string
-		upstreamBody    []byte
-		upstreamAuth    string
-		upstreamAPIKey  string
+		upstreamPath   string
+		upstreamBody   []byte
+		upstreamAuth   string
+		upstreamAPIKey string
 	)
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		upstreamPath = r.URL.Path
@@ -247,7 +247,7 @@ func TestHandle_AppPath_OpenAIWireToAnthropicUpstream_TranslatesEndToEnd(t *test
 	//    one must carry the secret AND neither must carry the app
 	//    bearer (that would mean the credential resolver failed to swap
 	//    in the upstream key).
-	hasKey := upstreamAPIKey == "sk-ant-real" || upstreamAuth == "Bearer sk-ant-real"
+	hasKey := upstreamAPIKey == "sk-ant-real" || upstreamAuth == "Bearer sk-ant-real" //nolint:gosec // test fixture, not a real credential
 	if !hasKey {
 		t.Errorf("upstream got NO vault-decrypted key (x-api-key=%q, Authorization=%q); credential resolver failed",
 			upstreamAPIKey, upstreamAuth)
@@ -948,8 +948,8 @@ func TestProtocolFamilyLookup_UnknownProviderReturnsEmpty(t *testing.T) {
 type rhythmHooksRecorder struct {
 	startSeen map[string]*observer.RequestContext // keyed by TraceID
 	endSeen   map[string]int                      // TraceID → latencyMs
+	done      chan struct{}                       // closed when end has been seen
 	mu        sync.Mutex
-	done      chan struct{} // closed when end has been seen
 }
 
 func newRhythmHooksRecorder() *rhythmHooksRecorder {
@@ -1123,12 +1123,12 @@ func TestHandle_AppPath_NotifyStartEndFireWithRequestContext(t *testing.T) {
 // via NotifySSEEvent. Used by TestHandle_AppPath_SSEFramesDispatched
 // to assert end-to-end per-frame delivery.
 type rhythmFramesRecorder struct {
-	mu     sync.Mutex
+	done   chan struct{}
 	frames []struct {
 		EventType string
 		Payload   []byte
 	}
-	done chan struct{}
+	mu sync.Mutex
 }
 
 func newRhythmFramesRecorder() *rhythmFramesRecorder {

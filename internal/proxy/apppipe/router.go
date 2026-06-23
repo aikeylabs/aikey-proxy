@@ -4,16 +4,16 @@
 //
 // Pipeline layout (built across multiple sub-tasks):
 //
-//   router.go    — URL parsing (this file)
-//   authn.go     — Bearer token validation + slug cross-check
-//   resolve.go   — profile_id decision + binding lookup by inferred upstream
-//   egress.go    — request body sanitizer (strip X-AiKey-* / body.aikey /
-//                  metadata, hard-rejects, etc.)
-//   translate.go — protocol translator engagement (body.model → upstream,
-//                  set ResolvedRoute.ResponseTransform, path canonicalization)
-//   pipeline.go  — top-level orchestrator: authn → resolve → sanitize →
-//                  translate → forward upstream → SSE passthrough → emit
-//                  usage event
+//	router.go    — URL parsing (this file)
+//	authn.go     — Bearer token validation + slug cross-check
+//	resolve.go   — profile_id decision + binding lookup by inferred upstream
+//	egress.go    — request body sanitizer (strip X-AiKey-* / body.aikey /
+//	               metadata, hard-rejects, etc.)
+//	translate.go — protocol translator engagement (body.model → upstream,
+//	               set ResolvedRoute.ResponseTransform, path canonicalization)
+//	pipeline.go  — top-level orchestrator: authn → resolve → sanitize →
+//	               translate → forward upstream → SSE passthrough → emit
+//	               usage event
 //
 // 2026-05-21 Phase 2 Day 7 URL redesign:
 //
@@ -76,8 +76,8 @@ type AppContext struct {
 //   - /apps/                → nil
 //   - /apps/X               → nil (missing v1)
 //   - /apps/X/Y             → nil (Y is not "v1"; reject — Phase 1 used
-//                             /apps/<slug>/<protocol>/v1/ which Phase 2
-//                             Day 7 removed)
+//     /apps/<slug>/<protocol>/v1/ which Phase 2
+//     Day 7 removed)
 //   - /apps/X/v2/foo        → nil (v1 only — bump explicitly when /v2 lands)
 //   - /openai/v1/chat       → nil (legacy provider-prefix routing)
 //   - /v1/chat              → nil (legacy entry)
@@ -98,11 +98,11 @@ type AppContext struct {
 //
 // Mapping:
 //   - "/v1/messages"  → Anthropic wire (anthropic-python / ChatAnthropic /
-//                       Claude Code / Cursor Anthropic endpoint)
+//     Claude Code / Cursor Anthropic endpoint)
 //   - "/messages"     → Anthropic wire (after the /apps/<slug>/v1 prefix
-//                       is stripped, the tail begins at /messages)
+//     is stripped, the tail begins at /messages)
 //   - anything else   → OpenAI wire (default — covers /chat/completions,
-//                       /embeddings, and any future OpenAI-compatible path)
+//     /embeddings, and any future OpenAI-compatible path)
 //
 // Why default to OpenAI: the OpenAI Chat Completions API has the broadest
 // surface area (chat / embeddings / images / audio); other SDK paths that

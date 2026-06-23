@@ -33,7 +33,7 @@ func TestReporter_ReportAndUpload(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	reporter, err := NewReporter(ReporterConfig{
+	reporter, err := NewReporter(&ReporterConfig{
 		CollectorURL:   srv.URL,
 		QueueCapacity:  100,
 		WALDir:         t.TempDir(), // WAL is the upload outbox in the new model
@@ -45,7 +45,7 @@ func TestReporter_ReportAndUpload(t *testing.T) {
 	}
 
 	for i := 0; i < 3; i++ {
-		reporter.Report(ReportableEvent{
+		reporter.Report(&ReportableEvent{
 			EventID:       "e" + string(rune('0'+i)),
 			OrgID:         "org1",
 			EventTime:     aikeytime.Now(),
@@ -102,7 +102,7 @@ func TestReporter_PerRouteRouting(t *testing.T) {
 	defer teamSrv.Close()
 	defer fallbackSrv.Close()
 
-	reporter, err := NewReporter(ReporterConfig{
+	reporter, err := NewReporter(&ReporterConfig{
 		CollectorURL: fallbackSrv.URL, // catches RouteSource not in map (e.g. "oauth")
 		CollectorRoutes: map[string]string{
 			"personal": personalSrv.URL,
@@ -128,10 +128,14 @@ func TestReporter_PerRouteRouting(t *testing.T) {
 			RequestCount:  1,
 		}
 	}
-	reporter.Report(mkEvent("p1", "personal"))
-	reporter.Report(mkEvent("p2", "personal"))
-	reporter.Report(mkEvent("t1", "team"))
-	reporter.Report(mkEvent("o1", "oauth")) // fall through to CollectorURL
+	evP1 := mkEvent("p1", "personal")
+	reporter.Report(&evP1)
+	evP2 := mkEvent("p2", "personal")
+	reporter.Report(&evP2)
+	evT1 := mkEvent("t1", "team")
+	reporter.Report(&evT1)
+	evO1 := mkEvent("o1", "oauth") // fall through to CollectorURL
+	reporter.Report(&evO1)
 
 	time.Sleep(200 * time.Millisecond)
 	reporter.Close()
@@ -162,7 +166,7 @@ func TestReporter_PerRouteIsolation(t *testing.T) {
 
 	// Team URL empty → team events have nowhere to go (dropped at
 	// uploadBatch). Personal events still reach their server.
-	reporter, err := NewReporter(ReporterConfig{
+	reporter, err := NewReporter(&ReporterConfig{
 		CollectorRoutes: map[string]string{
 			"personal": personalSrv.URL,
 			"team":     "", // explicitly empty: pre-login state
@@ -186,8 +190,10 @@ func TestReporter_PerRouteIsolation(t *testing.T) {
 			RequestCount:  1,
 		}
 	}
-	reporter.Report(mkEvent("p1", "personal"))
-	reporter.Report(mkEvent("t1", "team")) // dropped — no destination
+	evP1 := mkEvent("p1", "personal")
+	reporter.Report(&evP1)
+	evT1 := mkEvent("t1", "team") // dropped — no destination
+	reporter.Report(&evT1)
 
 	time.Sleep(200 * time.Millisecond)
 	reporter.Close()
@@ -210,7 +216,7 @@ func TestReporter_PerRouteIsolation(t *testing.T) {
 func TestReporter_NoDropAllWALd(t *testing.T) {
 	dir := t.TempDir()
 	// No collector URL → upload loop not started; events must still all WAL.
-	reporter, err := NewReporter(ReporterConfig{
+	reporter, err := NewReporter(&ReporterConfig{
 		WALDir: dir,
 	})
 	if err != nil {
@@ -219,7 +225,7 @@ func TestReporter_NoDropAllWALd(t *testing.T) {
 	defer reporter.Close()
 
 	for i := 0; i < 5; i++ {
-		reporter.Report(ReportableEvent{
+		reporter.Report(&ReportableEvent{
 			EventID:       "e" + string(rune('0'+i)),
 			OrgID:         "org1",
 			EventTime:     aikeytime.Now(),
@@ -254,7 +260,7 @@ func TestWALWriter_Append(t *testing.T) {
 	}
 	defer wal.Close()
 
-	wal.Append(ReportableEvent{
+	wal.Append(&ReportableEvent{
 		EventID:       "e1",
 		OrgID:         "org1",
 		EventTime:     aikeytime.Now(),
@@ -263,7 +269,7 @@ func TestWALWriter_Append(t *testing.T) {
 		RequestCount:  1,
 	})
 
-	wal.Append(ReportableEvent{
+	wal.Append(&ReportableEvent{
 		EventID:       "e2",
 		OrgID:         "org1",
 		EventTime:     aikeytime.Now(),
@@ -345,7 +351,7 @@ func TestReporter_PrimaryRouteSource(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			r, err := NewReporter(ReporterConfig{
+			r, err := NewReporter(&ReporterConfig{
 				CollectorURL:              "http://legacy",
 				CollectorRoutes:           tc.urls,
 				CollectorRouteCredentials: tc.creds,
@@ -371,7 +377,7 @@ func TestReporter_PerRouteCredential_DispatchesCorrectBearer(t *testing.T) {
 	personalSrv := recordingServer(t, &personalCount, &personalAuth)
 	teamSrv := recordingServer(t, &teamCount, &teamAuth)
 
-	reporter, err := NewReporter(ReporterConfig{
+	reporter, err := NewReporter(&ReporterConfig{
 		CollectorRoutes: map[string]string{
 			"personal": personalSrv.URL,
 			"team":     teamSrv.URL,
@@ -400,8 +406,10 @@ func TestReporter_PerRouteCredential_DispatchesCorrectBearer(t *testing.T) {
 			RequestStatus: "success", RequestCount: 1,
 		}
 	}
-	reporter.Report(mk("p1", "personal"))
-	reporter.Report(mk("t1", "team"))
+	evP1 := mk("p1", "personal")
+	reporter.Report(&evP1)
+	evT1 := mk("t1", "team")
+	reporter.Report(&evT1)
 
 	time.Sleep(200 * time.Millisecond)
 	reporter.Close()
@@ -428,7 +436,7 @@ func TestReporter_NoPerRouteCredential_FallsBackToLegacyToken(t *testing.T) {
 
 	srv := recordingServer(t, &count, &gotAuth)
 
-	reporter, err := NewReporter(ReporterConfig{
+	reporter, err := NewReporter(&ReporterConfig{
 		CollectorURL:   srv.URL,
 		CollectorToken: "legacy-only",
 		// No CollectorRouteCredentials at all.
@@ -441,7 +449,7 @@ func TestReporter_NoPerRouteCredential_FallsBackToLegacyToken(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	reporter.Report(ReportableEvent{
+	reporter.Report(&ReportableEvent{
 		EventID: "e1", OrgID: "o", RouteSource: "team",
 		EventTime: aikeytime.Now(), OccurredAt: aikeytime.Now(),
 		RequestStatus: "success", RequestCount: 1,
@@ -479,7 +487,7 @@ func TestReporter_CredentialBearerError_LandsInDeadLetter(t *testing.T) {
 	srv := recordingServer(t, &count, &gotAuth)
 
 	dlDir := t.TempDir()
-	reporter, err := NewReporter(ReporterConfig{
+	reporter, err := NewReporter(&ReporterConfig{
 		CollectorRoutes: map[string]string{
 			"team": srv.URL,
 		},
@@ -496,7 +504,7 @@ func TestReporter_CredentialBearerError_LandsInDeadLetter(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	reporter.Report(ReportableEvent{
+	reporter.Report(&ReportableEvent{
 		EventID: "t1", OrgID: "o", RouteSource: "team",
 		EventTime: aikeytime.Now(), OccurredAt: aikeytime.Now(),
 		RequestStatus: "success", RequestCount: 1,
@@ -539,7 +547,7 @@ func TestReporter_MixedBatch_EachGroupGetsOwnBearer(t *testing.T) {
 	pSrv := recordingServer(t, &pCount, &pAuth)
 	tSrv := recordingServer(t, &tCount, &tAuth)
 
-	reporter, err := NewReporter(ReporterConfig{
+	reporter, err := NewReporter(&ReporterConfig{
 		CollectorRoutes: map[string]string{
 			"personal": pSrv.URL,
 			"team":     tSrv.URL,
@@ -559,12 +567,12 @@ func TestReporter_MixedBatch_EachGroupGetsOwnBearer(t *testing.T) {
 	}
 
 	now := aikeytime.Now()
-	reporter.Report(ReportableEvent{
+	reporter.Report(&ReportableEvent{
 		EventID: "p1", OrgID: "o", RouteSource: "personal",
 		EventTime: now, OccurredAt: now,
 		RequestStatus: "success", RequestCount: 1,
 	})
-	reporter.Report(ReportableEvent{
+	reporter.Report(&ReportableEvent{
 		EventID: "t1", OrgID: "o", RouteSource: "team",
 		EventTime: now, OccurredAt: now,
 		RequestStatus: "success", RequestCount: 1,
@@ -646,7 +654,7 @@ func TestReporter_ReplayDeadLetter_AllReDelivered(t *testing.T) {
 	srv := recordingServer(t, &accepted, &auth)
 
 	dir := t.TempDir()
-	reporter, err := NewReporter(ReporterConfig{
+	reporter, err := NewReporter(&ReporterConfig{
 		CollectorURL:   srv.URL,
 		CollectorToken: "rotated-but-now-correct-token",
 		QueueCapacity:  10,
@@ -663,20 +671,20 @@ func TestReporter_ReplayDeadLetter_AllReDelivered(t *testing.T) {
 	// Seed two entries — each carries a 1-event batch.
 	seedDeadLetter(t, dir,
 		deadLetterEntry{
-			DeadAt:        aikeytime.Now(),
-			Reason:        "terminal",
-			ErrorCode:     401,
-			ErrorMsg:      "old token rejected",
-			Events:        []ReportableEvent{{EventID: "ev-A", OrgID: "o", RouteSource: "team", EventTime: aikeytime.Now(), OccurredAt: aikeytime.Now(), RequestStatus: "success", RequestCount: 1}},
-			EventIDs:      []string{"ev-A"},
+			DeadAt:    aikeytime.Now(),
+			Reason:    "terminal",
+			ErrorCode: 401,
+			ErrorMsg:  "old token rejected",
+			Events:    []ReportableEvent{{EventID: "ev-A", OrgID: "o", RouteSource: "team", EventTime: aikeytime.Now(), OccurredAt: aikeytime.Now(), RequestStatus: "success", RequestCount: 1}},
+			EventIDs:  []string{"ev-A"},
 		},
 		deadLetterEntry{
-			DeadAt:        aikeytime.Now(),
-			Reason:        "terminal",
-			ErrorCode:     401,
-			ErrorMsg:      "old token rejected",
-			Events:        []ReportableEvent{{EventID: "ev-B", OrgID: "o", RouteSource: "team", EventTime: aikeytime.Now(), OccurredAt: aikeytime.Now(), RequestStatus: "success", RequestCount: 1}},
-			EventIDs:      []string{"ev-B"},
+			DeadAt:    aikeytime.Now(),
+			Reason:    "terminal",
+			ErrorCode: 401,
+			ErrorMsg:  "old token rejected",
+			Events:    []ReportableEvent{{EventID: "ev-B", OrgID: "o", RouteSource: "team", EventTime: aikeytime.Now(), OccurredAt: aikeytime.Now(), RequestStatus: "success", RequestCount: 1}},
+			EventIDs:  []string{"ev-B"},
 		},
 	)
 
@@ -709,7 +717,7 @@ func TestReporter_ReplayDeadLetter_StillFailingStays(t *testing.T) {
 	defer srv.Close()
 
 	dir := t.TempDir()
-	reporter, err := NewReporter(ReporterConfig{
+	reporter, err := NewReporter(&ReporterConfig{
 		CollectorURL:   srv.URL,
 		CollectorToken: "still-wrong",
 		QueueCapacity:  10,
@@ -751,7 +759,7 @@ func TestReporter_ReplayDeadLetter_StillFailingStays(t *testing.T) {
 // freshly-installed proxy with no failures yet).
 func TestReporter_ReplayDeadLetter_NoFileIsNoOp(t *testing.T) {
 	dir := t.TempDir()
-	reporter, err := NewReporter(ReporterConfig{
+	reporter, err := NewReporter(&ReporterConfig{
 		CollectorURL:   "http://nope.invalid",
 		QueueCapacity:  10,
 		BatchSize:      5,
@@ -782,7 +790,7 @@ func TestReporter_ReplayDeadLetter_MalformedLineSkipped(t *testing.T) {
 	srv := recordingServer(t, &accepted, &auth)
 
 	dir := t.TempDir()
-	reporter, err := NewReporter(ReporterConfig{
+	reporter, err := NewReporter(&ReporterConfig{
 		CollectorURL:   srv.URL,
 		CollectorToken: "ok",
 		QueueCapacity:  10,
@@ -804,7 +812,7 @@ func TestReporter_ReplayDeadLetter_MalformedLineSkipped(t *testing.T) {
 		EventIDs: []string{"ev-OK"},
 	})
 	path := filepath.Join(dir, "dead_letter.jsonl")
-	os.WriteFile(path, []byte("{not-json garbage line\n"+string(validJSON)+"\n"), 0o644)
+	os.WriteFile(path, []byte("{not-json garbage line\n"+string(validJSON)+"\n"), 0o600)
 
 	result, err := reporter.ReplayDeadLetter(context.Background())
 	if err != nil {

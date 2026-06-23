@@ -7,11 +7,11 @@ import "testing"
 // future reader recognizes the pattern immediately.
 func TestExtractProbePath(t *testing.T) {
 	tests := []struct {
-		name       string
-		path       string
-		wantAlias  string
-		wantStrip  string
-		wantNil    bool
+		name      string
+		path      string
+		wantAlias string
+		wantStrip string
+		wantNil   bool
 	}{
 		// Happy path — Anthropic /messages tail.
 		{

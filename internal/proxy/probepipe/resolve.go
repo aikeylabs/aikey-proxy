@@ -24,9 +24,9 @@ type VaultReader interface {
 // status non-active, or vault read failure. Carries HTTP status + error
 // code + message so the handler can render JSON without further mapping.
 type ResolveError struct {
-	StatusCode int
 	ErrorCode  string
 	Message    string
+	StatusCode int
 }
 
 func (e *ResolveError) Error() string { return e.ErrorCode + ": " + e.Message }

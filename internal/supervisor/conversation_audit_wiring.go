@@ -31,12 +31,12 @@ import (
 // wires the real outbox once it exists. A Submit before attach (impossible in
 // practice: no requests flow during buildGeneration) drops safely.
 type conversationAuditSink struct {
-	mu       sync.RWMutex
 	wal      *events.ContentWAL
 	seqAlloc *events.SeqAllocator
 	reporter *events.ContentReporter
-	sourceID string
 	logger   *slog.Logger
+	sourceID string
+	mu       sync.RWMutex
 }
 
 func newConversationAuditSink(logger *slog.Logger) *conversationAuditSink {
@@ -130,7 +130,7 @@ func wireConversationAudit(
 		_ = wal.Close()
 		return nil, nil, nil
 	}
-	reporter := events.NewContentReporter(events.ContentReporterConfig{
+	reporter := events.NewContentReporter(&events.ContentReporterConfig{
 		CollectorURL:    collectorURL,
 		Credential:      teamCred,
 		CollectorToken:  collectorToken,

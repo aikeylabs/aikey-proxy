@@ -35,9 +35,8 @@ import (
 
 type probeRawRecordingUpstream struct {
 	server *httptest.Server
-	mu     sync.Mutex
 	last   http.Header
-	body   []byte
+	mu     sync.Mutex
 }
 
 func newProbeRawRecordingUpstream(status int, respBody string) *probeRawRecordingUpstream {
@@ -54,8 +53,8 @@ func newProbeRawRecordingUpstream(status int, respBody string) *probeRawRecordin
 	return u
 }
 
-func (u *probeRawRecordingUpstream) close()             { u.server.Close() }
-func (u *probeRawRecordingUpstream) URL() string        { return u.server.URL }
+func (u *probeRawRecordingUpstream) close()      { u.server.Close() }
+func (u *probeRawRecordingUpstream) URL() string { return u.server.URL }
 func (u *probeRawRecordingUpstream) capturedHeaders() http.Header {
 	u.mu.Lock()
 	defer u.mu.Unlock()
@@ -227,18 +226,18 @@ func TestProbeRaw_OutboundHeadersAllowlistOnly(t *testing.T) {
 	upstream := newProbeRawRecordingUpstream(200, `{"data":[]}`)
 	defer upstream.close()
 
-	const probeBearer = "sk-ant-api03-PROBE-SECRET-VALUE"
+	const probeBearer = "sk-ant-api03-PROBE-SECRET-VALUE" //nolint:gosec // test fixture, not a real credential
 	p := minimalProbeRawProxy(t)
 
 	// Caller smuggles many sensitive / custom headers — none should reach upstream.
 	extra := map[string]string{
-		"X-Internal-Hostname":       "dev-laptop-jake.local",
-		"X-Forwarded-For":           "192.168.1.100",
-		"X-Custom-Telemetry":        "session_xxx",
-		"X-Trace-Id":                "trace_abc123",
-		"User-Agent":                "Mozilla/5.0 (sensitive UA with IP info)",
-		"Anthropic-Version":         "2023-06-01",   // ALLOWED — should reach upstream
-		"Content-Type":              "application/json", // ALLOWED
+		"X-Internal-Hostname": "dev-laptop-jake.local",
+		"X-Forwarded-For":     "192.168.1.100",
+		"X-Custom-Telemetry":  "session_xxx",
+		"X-Trace-Id":          "trace_abc123",
+		"User-Agent":          "Mozilla/5.0 (sensitive UA with IP info)",
+		"Anthropic-Version":   "2023-06-01",       // ALLOWED — should reach upstream
+		"Content-Type":        "application/json", // ALLOWED
 	}
 	rec := sendProbeRaw(t, p, "anthropic", upstream.URL(), probeBearer, extra)
 
@@ -303,7 +302,7 @@ func TestProbeRaw_OutboundHeadersAllowlist_OpenAI(t *testing.T) {
 	upstream := newProbeRawRecordingUpstream(200, `{"data":[]}`)
 	defer upstream.close()
 
-	const probeBearer = "sk-openai-PROBE-SECRET"
+	const probeBearer = "sk-openai-PROBE-SECRET" //nolint:gosec // test fixture, not a real credential
 	p := minimalProbeRawProxy(t)
 
 	extra := map[string]string{
@@ -351,7 +350,7 @@ func TestProbeRaw_OutboundHeadersAllowlist_OpenAI(t *testing.T) {
 // ─────────────────────────────────────────────────────────────────────────
 
 func TestProbeRaw_RedactBearerInError(t *testing.T) {
-	const probeBearer = "sk-ant-DO-NOT-LEAK-ME"
+	const probeBearer = "sk-ant-DO-NOT-LEAK-ME" //nolint:gosec // test fixture, not a real credential
 	// Point baseURL at a closed port to force a connection-refused error
 	// that may (in some Go versions) include the URL in the error text.
 	// More robust: use a dead IP that gets connect-refused fast.

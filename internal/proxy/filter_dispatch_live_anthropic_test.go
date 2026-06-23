@@ -51,7 +51,7 @@ func TestLiveAnthropic_MaskedRequestAcceptedAndAnswered(t *testing.T) {
 	}
 
 	// Real detector hook.
-	hook := apphook.NewChildHook(apphook.ChildHookConfig{
+	hook := apphook.NewChildHook(&apphook.ChildHookConfig{
 		Name:         "ai-compliance-detector",
 		BinaryPath:   bin,
 		Timeout:      500 * time.Millisecond,

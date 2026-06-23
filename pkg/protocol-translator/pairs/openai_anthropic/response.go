@@ -119,7 +119,8 @@ func ConvertNonStreamResponse(ctx context.Context, body []byte) ([]byte, *transl
 	model := in.Get("model").String()
 
 	// ── Content blocks → message.content + tool_calls ────────────────
-	contentText, toolCalls, syntheticUsed := convertResponseContentBlocks(in.Get("content"))
+	contentNode := in.Get("content")
+	contentText, toolCalls, syntheticUsed := convertResponseContentBlocks(&contentNode)
 
 	// ── stop_reason → finish_reason ─────────────────────────────────
 	stopReason := in.Get("stop_reason").String()
@@ -154,7 +155,8 @@ func ConvertNonStreamResponse(ctx context.Context, body []byte) ([]byte, *transl
 	out.WriteString(`}]`)
 
 	out.WriteString(`,"usage":`)
-	writeUsage(&out, in.Get("usage"))
+	usageNode := in.Get("usage")
+	writeUsage(&out, &usageNode)
 
 	out.WriteByte('}')
 	return []byte(out.String()), nil
@@ -195,7 +197,7 @@ func writeMessageObject(out *strings.Builder, contentText string, toolCalls []st
 // cache_read/cache_creation tokens are dropped at MVP — the OpenAI
 // `prompt_tokens_details` extension is too new to be reliable across
 // client SDKs.
-func writeUsage(out *strings.Builder, usage gjson.Result) {
+func writeUsage(out *strings.Builder, usage *gjson.Result) {
 	prompt := int(usage.Get("input_tokens").Int())
 	completion := int(usage.Get("output_tokens").Int())
 	total := prompt + completion
@@ -220,13 +222,11 @@ func writeUsage(out *strings.Builder, usage gjson.Result) {
 // Blocks of unknown type are silently skipped. Anthropic's content array
 // can contain server-tool-use / web-search-result frames that don't have
 // OpenAI equivalents at MVP — better to drop them than 5xx the response.
-func convertResponseContentBlocks(content gjson.Result) (string, []string, bool) {
+func convertResponseContentBlocks(content *gjson.Result) (contentText string, toolCalls []string, syntheticUsed bool) {
 	if !content.IsArray() {
 		return "", nil, false
 	}
 	var textParts []string
-	var toolCalls []string
-	syntheticUsed := false
 	for _, block := range content.Array() {
 		blockType := block.Get("type").String()
 		switch blockType {
@@ -274,7 +274,7 @@ func convertResponseContentBlocks(content gjson.Result) (string, []string, bool)
 //	                 want a tool call)
 //	(unknown)      → stop (safe fallback; better than emitting an
 //	                 OpenAI-illegal value)
-func mapStopReason(anthropicReason string, hasToolCalls bool, syntheticUsed bool) string {
+func mapStopReason(anthropicReason string, hasToolCalls, syntheticUsed bool) string {
 	switch anthropicReason {
 	case "end_turn", "stop_sequence":
 		return "stop"

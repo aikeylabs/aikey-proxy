@@ -62,9 +62,9 @@ type SanitizeContext struct {
 // AuthError / ResolveError; once a 3rd similar struct appears these
 // will be factored to a shared PipelineError type.
 type SanitizeError struct {
-	StatusCode int
 	ErrorCode  string
 	Message    string
+	StatusCode int
 }
 
 func (e *SanitizeError) Error() string { return e.ErrorCode + ": " + e.Message }
@@ -149,12 +149,9 @@ func SanitizeRequestBody(body []byte) ([]byte, *SanitizeContext, *SanitizeError)
 		delete(parsed, "logprobs")
 		ctx.Warnings = append(ctx.Warnings, "logprobs_dropped")
 	}
-	if _, ok := parsed["top_logprobs"]; ok {
-		delete(parsed, "top_logprobs")
-		// No separate warning — top_logprobs is meaningful only with
-		// logprobs, so the single "logprobs_dropped" covers the user
-		// signal. We just silently remove the orphan field too.
-	}
+	// top_logprobs is meaningful only with logprobs, so the single
+	// "logprobs_dropped" warning covers it; silently drop the orphan field.
+	delete(parsed, "top_logprobs")
 	if _, ok := parsed["seed"]; ok {
 		delete(parsed, "seed")
 		ctx.Warnings = append(ctx.Warnings, "seed_dropped")
@@ -248,4 +245,3 @@ func asInt(v interface{}) (int, bool) {
 	}
 	return 0, false
 }
-

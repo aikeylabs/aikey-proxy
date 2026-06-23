@@ -39,6 +39,13 @@ import (
 	"github.com/AiKeyLabs/aikey-proxy/pkg/observer"
 )
 
+// oauthSentinelKey is the placeholder value stored in the "real key" slot for
+// OAuth routes. It is NOT a credential: the actual bearer token is injected
+// into the upstream request headers by oauthInject. Keeping it as a named
+// constant gives a single source of truth and avoids the literal being
+// (mis)read as a hardcoded secret.
+const oauthSentinelKey = "__oauth__"
+
 // appPipelineStatusWriter wraps an http.ResponseWriter so handleAppPipeline
 // can observe the final HTTP status (and optional proxy-side error
 // category) on every exit path — early proxy-synthesized 4xx as well as
@@ -57,8 +64,8 @@ import (
 // of the request — no mutex needed.
 type appPipelineStatusWriter struct {
 	http.ResponseWriter
-	statusCode int
 	errorType  string
+	statusCode int
 	written    bool
 }
 
@@ -986,14 +993,15 @@ func (p *Proxy) handlePathPrefixRoute(w http.ResponseWriter, r *http.Request, pr
 
 		// Resolve real key.
 		var tokenRealKey string
-		if route.PlaintextKey != "" {
+		switch {
+		case route.PlaintextKey != "":
 			tokenRealKey = route.PlaintextKey
-		} else if route.KeyAlias == "__oauth__" {
+		case route.KeyAlias == oauthSentinelKey:
 			// OAuth route token — broker handles credential injection in serveRoute.
-			tokenRealKey = "__oauth__"
+			tokenRealKey = oauthSentinelKey
 			oauthIdentity = route.OAuthIdentity
 			oauthAccountID = route.AccountID
-		} else {
+		default:
 			var err error
 			tokenRealKey, err = p.vault.GetSecret(route.KeyAlias)
 			if err != nil {
@@ -1047,7 +1055,7 @@ func (p *Proxy) handlePathPrefixRoute(w http.ResponseWriter, r *http.Request, pr
 			// OAuth uses OAuthIdentity instead so we skip KeyAlias for the
 			// sentinel __oauth__ value.
 			KeyAlias: func() string {
-				if route.KeyAlias == "__oauth__" {
+				if route.KeyAlias == oauthSentinelKey {
 					return ""
 				}
 				return route.KeyAlias
@@ -1074,7 +1082,7 @@ func (p *Proxy) handlePathPrefixRoute(w http.ResponseWriter, r *http.Request, pr
 		}
 
 		// Handle OAuth credential injection if this is an OAuth route token.
-		if tokenRealKey == "__oauth__" && oauthAccountID != "" && p.broker != nil {
+		if tokenRealKey == oauthSentinelKey && oauthAccountID != "" && p.broker != nil {
 			if err := p.broker.EnsureFresh(r.Context(), oauthAccountID); err != nil {
 				p.errors.Add(1)
 				writeJSONError(w, http.StatusUnauthorized, "auth_error", "OAUTH_TOKEN_EXPIRED",
@@ -1213,7 +1221,7 @@ func (p *Proxy) handlePathPrefixRoute(w http.ResponseWriter, r *http.Request, pr
 					VirtualKeyID:  "oauth:" + alias,
 					Provider:      providerCode,
 					BaseURL:       oauthBase,
-					PlaintextKey:  "__oauth__", // sentinel — header injection done by oauthInject above
+					PlaintextKey:  oauthSentinelKey, // sentinel — header injection done by oauthInject above
 					ProviderCode:  canonicalCode,
 					ProtocolType:  protocolType,
 					KeyAlias:      "", // OAuth uses Identity, not alias
@@ -1228,7 +1236,7 @@ func (p *Proxy) handlePathPrefixRoute(w http.ResponseWriter, r *http.Request, pr
 					AppSlug: uaattribution.Default().MatchOrLog(inboundClientUA, uaWarnLogger(logger, r)),
 				}
 				// SPEC §1.4.1 user_chat — see serveRouteWithObserver docstring.
-				p.serveRouteWithObserver(w, r, oauthRoute, prov, "__oauth__", rawAuthValue, startTime, logger,
+				p.serveRouteWithObserver(w, r, oauthRoute, prov, oauthSentinelKey, rawAuthValue, startTime, logger,
 					observer.StreamUserChat, traceID)
 				return
 			}
@@ -1382,11 +1390,12 @@ func (p *Proxy) handlePathPrefixRoute(w http.ResponseWriter, r *http.Request, pr
 					realKey = plaintext
 					virtualKeyID = "personal:" + cfg.KeyRef
 					keyAlias = cfg.KeyRef
-					if entryBaseURL != "" {
+					switch {
+					case entryBaseURL != "":
 						baseURL = entryBaseURL
-					} else if pcode != "" {
+					case pcode != "":
 						baseURL = providerDefaultBaseURL(pcode)
-					} else {
+					default:
 						baseURL = providerDefaultBaseURL(canonicalCode)
 					}
 				}

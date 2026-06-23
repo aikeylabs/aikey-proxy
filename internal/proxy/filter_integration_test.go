@@ -43,7 +43,7 @@ func integDetectorBinary() string {
 // pack) behind a FilterPool, skipping the test if the binary isn't built. Cleanup on test end.
 func startRealDetectorPool(t *testing.T) *apphook.FilterPool {
 	t.Helper()
-	ch := apphook.NewChildHook(apphook.ChildHookConfig{
+	ch := apphook.NewChildHook(&apphook.ChildHookConfig{
 		Name:         "ai-compliance-detector-integ",
 		BinaryPath:   integDetectorBinary(),
 		BinaryArgs:   nil,              // real engine + embedded baseline pack
@@ -224,7 +224,7 @@ func TestFilterIntegration_DetectorMaskIsDeterministic(t *testing.T) {
 // IPC overhead is ≪ a real scan (~ms), then batching (which only saves N-1 IPC round-trips)
 // can't help. Also stresses the lock under concurrency. Run via `make filter-integration`.
 func TestFilterIntegration_IPCOverhead(t *testing.T) {
-	ch := apphook.NewChildHook(apphook.ChildHookConfig{
+	ch := apphook.NewChildHook(&apphook.ChildHookConfig{
 		Name:         "ai-compliance-detector-echo",
 		BinaryPath:   integDetectorBinary(),
 		BinaryArgs:   []string{"--echo-only"}, // skip rule load + scan → PURE IPC

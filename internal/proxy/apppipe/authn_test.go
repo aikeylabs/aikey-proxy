@@ -91,15 +91,15 @@ func TestExtractBearer_AuthorizationTakesPrecedence(t *testing.T) {
 
 func TestExtractBearer_EmptyOrMalformed(t *testing.T) {
 	cases := []struct {
-		name    string
 		headers headerMap
+		name    string
 	}{
-		{"no headers", headerMap{}},
-		{"empty Authorization", headerMap{"Authorization": ""}},
-		{"no Bearer prefix", headerMap{"Authorization": bearerAgentA}},
-		{"Bearer but empty token", headerMap{"Authorization": "Bearer "}},
-		{"Bearer with whitespace only", headerMap{"Authorization": "Bearer    "}},
-		{"empty x-api-key", headerMap{"x-api-key": ""}},
+		{name: "no headers", headers: headerMap{}},
+		{name: "empty Authorization", headers: headerMap{"Authorization": ""}},
+		{name: "no Bearer prefix", headers: headerMap{"Authorization": bearerAgentA}},
+		{name: "Bearer but empty token", headers: headerMap{"Authorization": "Bearer "}},
+		{name: "Bearer with whitespace only", headers: headerMap{"Authorization": "Bearer    "}},
+		{name: "empty x-api-key", headers: headerMap{"x-api-key": ""}},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {

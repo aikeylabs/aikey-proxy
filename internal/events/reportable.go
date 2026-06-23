@@ -13,87 +13,14 @@ import (
 // ReportableEvent contains all anchor fields required by collector-service.
 // Built from request context after response completion.
 type ReportableEvent struct {
-	// identifiers
-	EventID         string    `json:"event_id"`
-	RequestID       string    `json:"request_id,omitempty"`
-	TraceID         string    `json:"trace_id,omitempty"`
-	ProxyInstanceID string    `json:"proxy_instance_id,omitempty"`
-	DeviceID        string    `json:"device_id,omitempty"`
-	// UpstreamRequestID carries the provider's own request id (e.g. anthropic's
-	// `req_011CaQVp...` / openai's `req_xxx` / kimi's `cid-xxx`). Captured from
-	// response headers when present so support can correlate a 4xx/5xx in our
-	// ODS with the provider's audit log without us having to log full bodies.
-	// Always populated for both success + error paths when upstream sets it.
-	UpstreamRequestID string `json:"upstream_request_id,omitempty"`
-
-	// Delivery integrity (2026-05-30). SourceID is this vault's stable source
-	// identity (runtime.source_identity — a vault-scoped install id, NOT a
-	// hardware fingerprint). SourceSeq is its per-source, never-reused sequence
-	// from SeqAllocator; the collector uses (SourceID, SourceSeq) to detect gaps
-	// and prove completeness. Dedicated fields (not overloaded onto DeviceID) so
-	// the wire contract is explicit and matches the server's
-	// usage_event_ods.source_id/source_seq columns. Empty/nil on legacy events —
-	// those store fine but skip gap detection. SourceSeq is a pointer so
-	// "absent" (v1) is distinguishable from a real 0.
-	SourceID  string `json:"source_id,omitempty"`
-	SourceSeq *int64 `json:"source_seq,omitempty"`
-
-	// ContentHash is the financial-grade tamper/corruption fingerprint over the
-	// metering tuple (pkg/usagehash, stage C). The collector RECOMPUTES it and
-	// compares; a mismatch quarantines the event instead of billing a silently
-	// corrupted value (e.g. a token count that became 0 in transit). Empty on
-	// events built before stage C / by older proxies — the collector then skips
-	// validation (conserve, never false-quarantine). Carried on the wire so the
-	// collector receives the client-stamped value alongside the fields it hashes.
-	ContentHash string `json:"content_hash,omitempty"`
-
-	// schema + source metadata
-	SchemaVersion      int    `json:"schema_version"`
-	SourceVersion      string `json:"source_version,omitempty"`
-	ClientVersion      string `json:"client_version,omitempty"`
-	ProxyConfigVersion string `json:"proxy_config_version,omitempty"`
-	ProxyLoadedControlSeq *int64 `json:"proxy_loaded_control_seq,omitempty"`
-
-	// timestamps: int64 Unix epoch milliseconds (UTC). Wire format switched
-	// from RFC3339 strings in v1.0.3-alpha — see the design doc at
-	// roadmap20260320/技术实现/update/20260424-时间戳统一为int64毫秒-data-service.md.
-	// Why: SQLite storage of time.Time via Go's default String format
-	// broke strftime-based hour bucketing on the query side.
-	EventTime  aikeytime.Millis  `json:"event_time"`
-	OccurredAt aikeytime.Millis  `json:"occurred_at"`
-	StartedAt  *aikeytime.Millis `json:"started_at,omitempty"`
-	FinishedAt *aikeytime.Millis `json:"finished_at,omitempty"`
-
-	// ownership (D3 naming)
-	OrgID     string `json:"org_id"`
-	AccountID string `json:"account_id,omitempty"`
-	SeatID    string `json:"seat_id,omitempty"`
-
-	// routing — audit anchor fields
-	VirtualKeyID               string `json:"virtual_key_id,omitempty"`
-	VirtualKeyRevision         string `json:"virtual_key_revision,omitempty"`
-	VirtualKeyHash             string `json:"virtual_key_hash,omitempty"`     // SHA-256 of bearer token (not just ID)
-	BindingID                  string `json:"binding_id,omitempty"`           // from local cache if available
-	CredentialID               string `json:"credential_id,omitempty"`
-	CredentialRevision         string `json:"credential_revision,omitempty"`
-	RealKeyHash                string `json:"real_key_hash,omitempty"`        // SHA-256 of decrypted provider key
-	CredentialFingerprint      string `json:"credential_fingerprint,omitempty"` // SHA-256 of credential_id+revision
-	ProviderAccountFingerprint string `json:"provider_account_fingerprint,omitempty"`
-	OAuthIdentity              string `json:"oauth_identity,omitempty"` // Email/display name for OAuth accounts (personal)
-
-	// provider / protocol
-	ProviderID   string `json:"provider_id,omitempty"`
-	ProviderCode string `json:"provider_code,omitempty"`
-	ProtocolType string `json:"protocol_type,omitempty"`
-	RouteSource  string `json:"route_source,omitempty"`
-
-	// usage
-	Model        string `json:"model,omitempty"`
-	RequestCount int    `json:"request_count"`
-	InputTokens  *int64 `json:"input_tokens,omitempty"`
-	OutputTokens *int64 `json:"output_tokens,omitempty"`
-	TotalTokens  *int64 `json:"total_tokens,omitempty"`
-
+	ProxyLoadedControlSeq *int64  `json:"proxy_loaded_control_seq,omitempty"`
+	HTTPStatusCode        *int    `json:"http_status_code,omitempty"`
+	EndpointURL           *string `json:"endpoint_url,omitempty"`
+	Region                *string `json:"region,omitempty"`
+	// Cost-pricing audit (v1.0.0-rc.8): reasoning tokens (o-series) + upstream
+	// region/endpoint. omitempty keeps them off the wire for events lacking them.
+	ReasoningTokens          *int64 `json:"reasoning_tokens,omitempty"`
+	CacheCreationInputTokens *int64 `json:"cache_creation_input_tokens,omitempty"`
 	// Cache-aware input breakdown. Populated by Anthropic; zero (and omitted)
 	// for providers that don't expose prompt caching. InputTokens remains the
 	// authoritative total — these are diagnostic splits for UI rendering and
@@ -112,27 +39,82 @@ type ReportableEvent struct {
 	//      cache_read values on the wire (DB column `cached_input_tokens`
 	//      is the legacy storage name; collector struct tag now bridges
 	//      the two). See bugfix 2026-04-29-cached-tokens-wire-mismatch.md.
-	CacheReadInputTokens     *int64 `json:"cache_read_input_tokens,omitempty"`
-	CacheCreationInputTokens *int64 `json:"cache_creation_input_tokens,omitempty"`
-	// Cost-pricing audit (v1.0.0-rc.8): reasoning tokens (o-series) + upstream
-	// region/endpoint. omitempty keeps them off the wire for events lacking them.
-	ReasoningTokens *int64  `json:"reasoning_tokens,omitempty"`
-	Region          *string `json:"region,omitempty"`
-	EndpointURL     *string `json:"endpoint_url,omitempty"`
-
+	CacheReadInputTokens  *int64            `json:"cache_read_input_tokens,omitempty"`
+	SourceSeq             *int64            `json:"source_seq,omitempty"`
+	TotalTokens           *int64            `json:"total_tokens,omitempty"`
+	OutputTokens          *int64            `json:"output_tokens,omitempty"`
+	InputTokens           *int64            `json:"input_tokens,omitempty"`
+	FinishedAt            *aikeytime.Millis `json:"finished_at,omitempty"`
+	StartedAt             *aikeytime.Millis `json:"started_at,omitempty"`
+	CredentialFingerprint string            `json:"credential_fingerprint,omitempty"` // SHA-256 of credential_id+revision
+	RequestID             string            `json:"request_id,omitempty"`
+	ResolvedProvider      string            `json:"resolved_provider,omitempty"` // post-binding provider_code (anthropic / openai / kimi_code / ...)
+	ProxyConfigVersion    string            `json:"proxy_config_version,omitempty"`
+	ClientVersion         string            `json:"client_version,omitempty"`
+	// ownership (D3 naming)
+	OrgID     string `json:"org_id"`
+	AccountID string `json:"account_id,omitempty"`
+	SeatID    string `json:"seat_id,omitempty"`
+	// routing — audit anchor fields
+	VirtualKeyID       string `json:"virtual_key_id,omitempty"`
+	VirtualKeyRevision string `json:"virtual_key_revision,omitempty"`
+	VirtualKeyHash     string `json:"virtual_key_hash,omitempty"` // SHA-256 of bearer token (not just ID)
+	BindingID          string `json:"binding_id,omitempty"`       // from local cache if available
+	CredentialID       string `json:"credential_id,omitempty"`
+	CredentialRevision string `json:"credential_revision,omitempty"`
+	RealKeyHash        string `json:"real_key_hash,omitempty"` // SHA-256 of decrypted provider key
+	// identifiers
+	EventID                    string `json:"event_id"`
+	ProviderAccountFingerprint string `json:"provider_account_fingerprint,omitempty"`
+	OAuthIdentity              string `json:"oauth_identity,omitempty"` // Email/display name for OAuth accounts (personal)
+	// provider / protocol
+	ProviderID   string `json:"provider_id,omitempty"`
+	ProviderCode string `json:"provider_code,omitempty"`
+	ProtocolType string `json:"protocol_type,omitempty"`
+	RouteSource  string `json:"route_source,omitempty"`
+	// usage
+	Model          string `json:"model,omitempty"`
+	RequestedModel string `json:"requested_model,omitempty"` // body.model captured at request entry
+	SourceVersion  string `json:"source_version,omitempty"`
+	BoundVia       string `json:"bound_via,omitempty"` // "app:<slug>" (isolated) | "default" (follow-active)
+	// ContentHash is the financial-grade tamper/corruption fingerprint over the
+	// metering tuple (pkg/usagehash, stage C). The collector RECOMPUTES it and
+	// compares; a mismatch quarantines the event instead of billing a silently
+	// corrupted value (e.g. a token count that became 0 in transit). Empty on
+	// events built before stage C / by older proxies — the collector then skips
+	// validation (conserve, never false-quarantine). Carried on the wire so the
+	// collector receives the client-stamped value alongside the fields it hashes.
+	ContentHash string `json:"content_hash,omitempty"`
+	// Delivery integrity (2026-05-30). SourceID is this vault's stable source
+	// identity (runtime.source_identity — a vault-scoped install id, NOT a
+	// hardware fingerprint). SourceSeq is its per-source, never-reused sequence
+	// from SeqAllocator; the collector uses (SourceID, SourceSeq) to detect gaps
+	// and prove completeness. Dedicated fields (not overloaded onto DeviceID) so
+	// the wire contract is explicit and matches the server's
+	// usage_event_ods.source_id/source_seq columns. Empty/nil on legacy events —
+	// those store fine but skip gap detection. SourceSeq is a pointer so
+	// "absent" (v1) is distinguishable from a real 0.
+	SourceID string `json:"source_id,omitempty"`
+	// UpstreamRequestID carries the provider's own request id (e.g. anthropic's
+	// `req_011CaQVp...` / openai's `req_xxx` / kimi's `cid-xxx`). Captured from
+	// response headers when present so support can correlate a 4xx/5xx in our
+	// ODS with the provider's audit log without us having to log full bodies.
+	// Always populated for both success + error paths when upstream sets it.
+	UpstreamRequestID string `json:"upstream_request_id,omitempty"`
+	DeviceID          string `json:"device_id,omitempty"`
+	ProxyInstanceID   string `json:"proxy_instance_id,omitempty"`
+	TraceID           string `json:"trace_id,omitempty"`
 	// StopReason is the raw provider-specific termination reason (Anthropic
 	// `stop_reason` or OpenAI/Kimi `choices[0].finish_reason`), passed
 	// through un-normalized. Used by UI to hint at "max_tokens"/"length"
 	// truncation; also reserved as a fallback turn-boundary signal for
 	// clients without a Stop hook (see 费用小票-Kimi集成方案 §0.2).
 	StopReason string `json:"stop_reason,omitempty"`
-
 	// result
-	RequestStatus  string `json:"request_status"`
-	HTTPStatusCode *int   `json:"http_status_code,omitempty"`
-	ErrorCode      string `json:"error_code,omitempty"`
-	ErrorMessage   string `json:"error_message,omitempty"`
-
+	RequestStatus string `json:"request_status"`
+	AppMode       string `json:"app_mode,omitempty"` // "isolated" | "follow-active"
+	ErrorCode     string `json:"error_code,omitempty"`
+	ErrorMessage  string `json:"error_message,omitempty"`
 	// UI anchor fields (费用小票/仪表盘).  omitempty so downstream consumers
 	// expecting the pre-v5 schema continue to parse.
 	//
@@ -147,7 +129,6 @@ type ReportableEvent struct {
 	SessionID  string `json:"session_id,omitempty"`
 	KeyLabel   string `json:"key_label,omitempty"`
 	Completion string `json:"completion,omitempty"`
-
 	// Phase 4 App pipeline attribution fields (主方案 §5.3).
 	//
 	// Populated only when RouteSource == "app" (i.e. request flowed through
@@ -164,72 +145,75 @@ type ReportableEvent struct {
 	// in 2026-05-20 but ReportableEvent shape was left unattributed —
 	// degrade-detector traffic would have shown up in the collector with
 	// app_slug = "" had M2 launched today. This block closes that gap.
-	AppSlug          string `json:"app_slug,omitempty"`
-	AppKeyID         string `json:"app_key_id,omitempty"`
-	AppMode          string `json:"app_mode,omitempty"`          // "isolated" | "follow-active"
-	BoundVia         string `json:"bound_via,omitempty"`         // "app:<slug>" (isolated) | "default" (follow-active)
-	RequestedModel   string `json:"requested_model,omitempty"`   // body.model captured at request entry
-	ResolvedProvider string `json:"resolved_provider,omitempty"` // post-binding provider_code (anthropic / openai / kimi_code / ...)
+	AppSlug  string `json:"app_slug,omitempty"`
+	AppKeyID string `json:"app_key_id,omitempty"`
+	// timestamps: int64 Unix epoch milliseconds (UTC). Wire format switched
+	// from RFC3339 strings in v1.0.3-alpha — see the design doc at
+	// roadmap20260320/技术实现/update/20260424-时间戳统一为int64毫秒-data-service.md.
+	// Why: SQLite storage of time.Time via Go's default String format
+	// broke strftime-based hour bucketing on the query side.
+	EventTime aikeytime.Millis `json:"event_time"`
+	// schema + source metadata
+	SchemaVersion int              `json:"schema_version"`
+	RequestCount  int              `json:"request_count"`
+	OccurredAt    aikeytime.Millis `json:"occurred_at"`
 }
 
 // ReportOpts collects all context needed to build a ReportableEvent.
 type ReportOpts struct {
-	EventID         string
-	ProxyInstanceID string
-	Route           *vkeys.ResolvedRoute
-	BearerToken     string // the full aikey-namespace bearer token from the request (aikey_team_* / aikey_personal_* etc.)
-	Model           string
-	StartTime       time.Time
-	FinishedAt      time.Time
-	StatusCode      int
-	InputTokens     int
-	OutputTokens    int
-	// Optional cache breakdown. Leave zero for providers without caching;
-	// BuildReportableEvent will omit these fields from the JSON event.
-	CacheReadInputTokens     int
-	CacheCreationInputTokens int
-	// Cost-pricing audit (v1.0.0-rc.8): reasoning tokens + upstream region/endpoint.
-	ReasoningTokens int
-	Region          string
-	EndpointURL     string
-	// StopReason is the raw termination string from the provider; pass
-	// through un-normalized. BuildReportableEvent omits the JSON field
-	// when empty.
-	StopReason string
-	ErrorType       string
-	// ErrorMessage is the truncated upstream error body (set on 4xx/5xx). The
-	// proxy captures it so the usage-detail expand can show the real provider
-	// reason, not just the generic HTTP status text (which lands in ErrorCode).
-	ErrorMessage    string
-	RealKey         string // decrypted provider key (for hashing only, never stored)
-	SourceVersion      string
-	ClientVersion      string
+	StartTime          time.Time
+	FinishedAt         time.Time
+	SourceSeq          *int64
+	Route              *vkeys.ResolvedRoute
 	ProxyConfigVersion string
-	LoadedControlSeq   int64
 	LoggedInAccountID  string // fallback account_id for personal keys
-
-	// UI anchor fields (see ReportableEvent docs for semantics).
-	// SessionID comes from the X-Claude-Code-Session-Id request header.
-	// Completion defaults to "complete" if left empty.
-	SessionID  string
-	Completion string
-
+	BearerToken        string // the full aikey-namespace bearer token from the request (aikey_team_* / aikey_personal_* etc.)
+	ProxyInstanceID    string
+	// Delivery integrity (2026-05-30). SourceID is the vault's stable source
+	// identity; SourceSeq is the per-source never-reused sequence allocated by
+	// the proxy's SeqAllocator just before building this event. Leave SourceSeq
+	// nil for events that must not participate in gap detection (e.g. canary).
+	SourceID string
 	// UpstreamRequestID is the provider's own request id from response headers
 	// (anthropic: `request-id`, openai/kimi: `x-request-id` or
 	// `openai-request-id`). Carried through so support can pivot from a local
 	// ODS row to provider-side logs.
 	UpstreamRequestID string
-
-	// Delivery integrity (2026-05-30). SourceID is the vault's stable source
-	// identity; SourceSeq is the per-source never-reused sequence allocated by
-	// the proxy's SeqAllocator just before building this event. Leave SourceSeq
-	// nil for events that must not participate in gap detection (e.g. canary).
-	SourceID  string
-	SourceSeq *int64
+	Completion        string
+	// UI anchor fields (see ReportableEvent docs for semantics).
+	// SessionID comes from the X-Claude-Code-Session-Id request header.
+	// Completion defaults to "complete" if left empty.
+	SessionID   string
+	Model       string
+	Region      string
+	EndpointURL string
+	// StopReason is the raw termination string from the provider; pass
+	// through un-normalized. BuildReportableEvent omits the JSON field
+	// when empty.
+	StopReason string
+	ErrorType  string
+	// ErrorMessage is the truncated upstream error body (set on 4xx/5xx). The
+	// proxy captures it so the usage-detail expand can show the real provider
+	// reason, not just the generic HTTP status text (which lands in ErrorCode).
+	ErrorMessage     string
+	RealKey          string // decrypted provider key (for hashing only, never stored)
+	SourceVersion    string
+	ClientVersion    string
+	EventID          string
+	LoadedControlSeq int64
+	// Cost-pricing audit (v1.0.0-rc.8): reasoning tokens + upstream region/endpoint.
+	ReasoningTokens          int
+	CacheCreationInputTokens int
+	// Optional cache breakdown. Leave zero for providers without caching;
+	// BuildReportableEvent will omit these fields from the JSON event.
+	CacheReadInputTokens int
+	OutputTokens         int
+	InputTokens          int
+	StatusCode           int
 }
 
 // BuildReportableEvent creates a ReportableEvent from the proxy request context.
-func BuildReportableEvent(opts ReportOpts) ReportableEvent {
+func BuildReportableEvent(opts *ReportOpts) ReportableEvent {
 	route := opts.Route
 	now := opts.FinishedAt
 	nowMs := aikeytime.FromTime(now)
@@ -282,12 +266,12 @@ func BuildReportableEvent(opts ReportOpts) ReportableEvent {
 	}
 
 	ev := ReportableEvent{
-		EventID:           opts.EventID,
-		UpstreamRequestID: opts.UpstreamRequestID,
-		ProxyInstanceID:   opts.ProxyInstanceID,
-		SourceID:          opts.SourceID,
-		SourceSeq:         opts.SourceSeq,
-		SchemaVersion:     1,
+		EventID:            opts.EventID,
+		UpstreamRequestID:  opts.UpstreamRequestID,
+		ProxyInstanceID:    opts.ProxyInstanceID,
+		SourceID:           opts.SourceID,
+		SourceSeq:          opts.SourceSeq,
+		SchemaVersion:      1,
 		SourceVersion:      opts.SourceVersion,
 		ClientVersion:      opts.ClientVersion,
 		ProxyConfigVersion: opts.ProxyConfigVersion,
@@ -359,7 +343,8 @@ func BuildReportableEvent(opts ReportOpts) ReportableEvent {
 	// logic in proxy.go so the two event shapes (local + wire) agree on
 	// what app made the call. Gated on RouteSource == "app" so legacy
 	// /v1/... requests omit these fields (omitempty drops them on wire).
-	if route.RouteSource == "app" {
+	switch route.RouteSource {
+	case "app":
 		ev.AppSlug = route.AppSlug
 		ev.AppKeyID = route.AppKeyID
 		if route.FollowUserActive {
@@ -371,7 +356,7 @@ func BuildReportableEvent(opts ReportOpts) ReportableEvent {
 		}
 		ev.RequestedModel = opts.Model
 		ev.ResolvedProvider = route.ProviderCode
-	} else if route.RouteSource == "probe" {
+	case "probe":
 		// Probe pipeline attribution (BR-rc.5-54, 2026-05-25): when
 		// trust-local (or any future first-party plugin) fires a
 		// `/probe/<alias>/v1/messages` request with its compile-time
@@ -394,7 +379,10 @@ func BuildReportableEvent(opts ReportOpts) ReportableEvent {
 		if slug := firstPartyAppSlugForBearer(opts.BearerToken); slug != "" {
 			ev.AppSlug = slug
 		}
-	} else if route.RouteSource == "oauth" && route.AppSlug != "" {
+	case "oauth":
+		if route.AppSlug == "" {
+			break
+		}
 		// OAuth-direct attribution (2026-05-26, usage-by-key dashboard fix):
 		// the OAuth path now carries a UA-derived AppSlug (see
 		// pipelines.go's handlePathPrefixRoute and the requirements doc
@@ -440,6 +428,7 @@ func BuildReportableEvent(opts ReportOpts) ReportableEvent {
 //   - aikey-proxy/internal/supervisor/team_token_normalize.go::firstPartyAppBearerWhitelist
 //   - aikey-cli/src/migrations.rs::DEGRADE_DETECTOR_FIRST_PARTY_BEARER
 //   - ai-degrade-detector/server_local/services/check_orchestrator.py::FIRST_PARTY_APP_KEY
+//
 // Adding a new first-party app means touching ALL of these — same
 // lockstep convention as the existing 3 whitelist copies.
 var firstPartyBearerToSlug = map[string]string{

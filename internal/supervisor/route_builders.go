@@ -32,7 +32,7 @@ import (
 // managedKeyToRoute builds a team-managed virtual-key route from a vault
 // record. Used by both the startup sync in `buildGeneration` and the
 // periodic managed-key sync goroutine.
-func managedKeyToRoute(mk vault.ManagedKey) *vkeys.ResolvedRoute {
+func managedKeyToRoute(mk *vault.ManagedKey) *vkeys.ResolvedRoute {
 	return &vkeys.ResolvedRoute{
 		// Provider points at the provider *adapter* (protocol), while
 		// ProviderCode retains the canonical provider identifier.
@@ -105,7 +105,7 @@ func oauthTokenToRoute(ot vault.OAuthRouteToken) *vkeys.ResolvedRoute {
 // VirtualKeyID prefix is "app:" mirroring "personal:" / "oauth:" so the
 // existing deriveKeyLabel observability codepath produces a sensible
 // label without special-casing.
-func appRouteTokenToRoute(at vault.AppRouteToken) *vkeys.ResolvedRoute {
+func appRouteTokenToRoute(at *vault.AppRouteToken) *vkeys.ResolvedRoute {
 	return &vkeys.ResolvedRoute{
 		VirtualKeyID:     "app:" + at.AppSlug,
 		RouteSource:      "app",
@@ -189,7 +189,7 @@ func buildAppRoutesFiltered(tokens []vault.AppRouteToken) map[string]*vkeys.Reso
 				"hint", "expected aikey_app_<64 lowercase hex> or first-party whitelist entry")
 			continue
 		}
-		out[at.RouteToken] = appRouteTokenToRoute(at)
+		out[at.RouteToken] = appRouteTokenToRoute(&at)
 	}
 	return out
 }

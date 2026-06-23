@@ -175,7 +175,7 @@ func (p *Proxy) Handle(w http.ResponseWriter, r *http.Request) {
 			"Token is in the aikey_ namespace but doesn't match any recognized form. "+
 				"Run 'aikey route' to see valid tokens.")
 		return
-	default: // Tier3Native — extractVirtualKey only returns aikey_* tokens, so this is unreachable
+	case Tier3Native: // extractVirtualKey only returns aikey_* tokens, so this is unreachable (kept explicit for exhaustiveness)
 		p.errors.Add(1)
 		writeJSONError(w, http.StatusUnauthorized, "authentication_error", "TOKEN_INVALID",
 			"Unexpected token classification at legacy entry.")

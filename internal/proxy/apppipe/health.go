@@ -33,25 +33,25 @@ import (
 // are admin-endpoint requests (one per Web page load). Lock contention is
 // negligible.
 type HealthCache struct {
-	mu      sync.RWMutex
 	entries map[string]AppHealth
+	mu      sync.RWMutex
 }
 
 // AppHealth describes the most recent observed call for one app_slug.
 // Fields are all valued (not pointers) — a zero StatusCode means "we have
 // no recorded call for this slug" which is also the absent-from-map case.
 type AppHealth struct {
+	LastCallAt time.Time `json:"last_call_at"`
 	// AppSlug is redundant when this struct is held as a map value, but
 	// kept for the JSON snapshot the admin endpoint returns so the Web
 	// side can consume an array form without re-key projecting.
-	AppSlug    string    `json:"app_slug"`
-	LastCallAt time.Time `json:"last_call_at"`
-	StatusCode int       `json:"status_code"`
+	AppSlug string `json:"app_slug"`
 	// ErrorType carries the upstream error envelope's `type` field (e.g.
 	// "rate_limit_error") or one of the proxy-side categories ("timeout",
 	// "binding_not_found") when the proxy itself synthesized the response.
 	// Empty for 2xx success.
-	ErrorType string `json:"error_type,omitempty"`
+	ErrorType  string `json:"error_type,omitempty"`
+	StatusCode int    `json:"status_code"`
 }
 
 // NewHealthCache returns an empty cache. Tests may call this directly; the

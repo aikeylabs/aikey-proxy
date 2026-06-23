@@ -40,7 +40,7 @@ func (s *Supervisor) ConversationAuditEnabled() bool { return s.convAuditEnabled
 // capture's built-in default applies). Atomic read.
 func (s *Supervisor) ConversationAuditMaxBytes() int64 { return s.convAuditMaxBytes.Load() }
 
-// pollConversationAuditPolicy runs until ctx is cancelled, refreshing the org
+// pollConversationAuditPolicy runs until ctx is canceled, refreshing the org
 // capture mandate every conversationAuditPollInterval (plus once immediately).
 func (s *Supervisor) pollConversationAuditPolicy(ctx context.Context) {
 	s.syncConversationAuditPolicy(ctx)
@@ -88,7 +88,7 @@ func (s *Supervisor) syncConversationAuditPolicy(ctx context.Context) {
 // error so the caller keeps the last-known value.
 func fetchConversationAuditPolicy(ctx context.Context, masterURL, orgID string) (enabled bool, maxBytes int64, ok bool) {
 	u := masterURL + "/v1/conversation-audit/policy?tenant=" + url.QueryEscape(orgID)
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u, nil)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u, http.NoBody)
 	if err != nil {
 		return false, 0, false
 	}

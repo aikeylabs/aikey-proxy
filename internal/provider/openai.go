@@ -15,7 +15,7 @@ type OpenAI struct{}
 
 func (o *OpenAI) Name() string { return "openai" }
 
-func (o *OpenAI) RewriteRequest(req *http.Request, realKey string, baseURL string) error {
+func (o *OpenAI) RewriteRequest(req *http.Request, realKey, baseURL string) error {
 	if err := applyBaseURL(req, baseURL); err != nil {
 		return err
 	}
@@ -42,7 +42,7 @@ func (o *OpenAI) RewriteRequest(req *http.Request, realKey string, baseURL strin
 // Per principles/logging-conventions.md: every silent-zero path emits a WARN
 // with event.name=proxy.extraction.shape_mismatch + body_preview so an
 // operator can tell from one log line which wire format was unrecognized.
-func (o *OpenAI) ExtractTokens(data []byte, streaming bool, logger *slog.Logger) (int, int) {
+func (o *OpenAI) ExtractTokens(data []byte, streaming bool, logger *slog.Logger) (inputTokens, outputTokens int) {
 	if logger == nil {
 		logger = slog.Default()
 	}
@@ -54,7 +54,7 @@ func (o *OpenAI) ExtractTokens(data []byte, streaming bool, logger *slog.Logger)
 				"error.code", observability.ErrCodeUsageExtractionFailed,
 				"error", err.Error(),
 				"body_len", len(data),
-				"body_preview", previewBody(data, 200),
+				"body_preview", previewBody(data),
 			)
 			return 0, 0
 		}
@@ -63,7 +63,7 @@ func (o *OpenAI) ExtractTokens(data []byte, streaming bool, logger *slog.Logger)
 				"event.name", observability.EventProxyExtractionMismatch,
 				"error.code", observability.ErrCodeUsageExtractionFailed,
 				"body_len", len(data),
-				"body_preview", previewBody(data, 200),
+				"body_preview", previewBody(data),
 			)
 			return 0, 0
 		}
@@ -73,7 +73,7 @@ func (o *OpenAI) ExtractTokens(data []byte, streaming bool, logger *slog.Logger)
 				"event.name", observability.EventProxyExtractionMismatch,
 				"error.code", observability.ErrCodeUsageExtractionFailed,
 				"body_len", len(data),
-				"body_preview", previewBody(data, 200),
+				"body_preview", previewBody(data),
 			)
 		}
 		return in, out
@@ -108,7 +108,7 @@ func (o *OpenAI) ExtractTokens(data []byte, streaming bool, logger *slog.Logger)
 				logger.Warn("openai extractor: streaming usage frame had all-zero tokens",
 					"event.name", observability.EventProxyExtractionMismatch,
 					"error.code", observability.ErrCodeUsageExtractionFailed,
-					"frame_preview", previewBody(line, 200),
+					"frame_preview", previewBody(line),
 				)
 			}
 			return in, out
@@ -121,7 +121,7 @@ func (o *OpenAI) ExtractTokens(data []byte, streaming bool, logger *slog.Logger)
 				logger.Warn("openai extractor: Responses API streaming usage had all-zero tokens",
 					"event.name", observability.EventProxyExtractionMismatch,
 					"error.code", observability.ErrCodeUsageExtractionFailed,
-					"frame_preview", previewBody(line, 200),
+					"frame_preview", previewBody(line),
 				)
 			}
 			return in, out
@@ -131,7 +131,7 @@ func (o *OpenAI) ExtractTokens(data []byte, streaming bool, logger *slog.Logger)
 		"event.name", observability.EventProxyExtractionMismatch,
 		"error.code", observability.ErrCodeUsageExtractionFailed,
 		"body_len", len(data),
-		"body_preview", previewBody(data, 200),
+		"body_preview", previewBody(data),
 	)
 	return 0, 0
 }
@@ -139,12 +139,6 @@ func (o *OpenAI) ExtractTokens(data []byte, streaming bool, logger *slog.Logger)
 // openaiUsageData mirrors fields from both Chat Completions and Responses APIs.
 // Resolve() picks whichever pair is non-zero so a single struct handles both.
 type openaiUsageData struct {
-	// Chat Completions API
-	PromptTokens     int `json:"prompt_tokens"`
-	CompletionTokens int `json:"completion_tokens"`
-	// Responses API (codex, GPT-5, etc.)
-	InputTokens  int `json:"input_tokens"`
-	OutputTokens int `json:"output_tokens"`
 	// Reasoning tokens (o-series): Chat Completions nests under
 	// completion_tokens_details; Responses API under output_tokens_details.
 	CompletionTokensDetails *openaiTokenDetails `json:"completion_tokens_details,omitempty"`
@@ -155,6 +149,12 @@ type openaiUsageData struct {
 	// prompt_tokens/input_tokens (the OpenAI total), so pure = total - cached.
 	PromptTokensDetails *openaiTokenDetails `json:"prompt_tokens_details,omitempty"`
 	InputTokensDetails  *openaiTokenDetails `json:"input_tokens_details,omitempty"`
+	// Chat Completions API
+	PromptTokens     int `json:"prompt_tokens"`
+	CompletionTokens int `json:"completion_tokens"`
+	// Responses API (codex, GPT-5, etc.)
+	InputTokens  int `json:"input_tokens"`
+	OutputTokens int `json:"output_tokens"`
 }
 
 type openaiTokenDetails struct {
@@ -187,7 +187,7 @@ func (u *openaiUsageData) ReasoningTokens() int {
 
 // Resolve returns (input, output) from whichever wire format populated them.
 // If both are populated (shouldn't happen but tolerated), Chat Completions wins.
-func (u *openaiUsageData) Resolve() (int, int) {
+func (u *openaiUsageData) Resolve() (input, output int) {
 	in := u.PromptTokens
 	if in == 0 {
 		in = u.InputTokens
@@ -388,24 +388,26 @@ func extractOpenAIStopReason(data []byte, streaming bool) string {
 // inclusion in WARN logs. Trims any trailing newlines and replaces non-ASCII
 // control bytes with '?' so the log line stays grep-friendly. Long bodies
 // get a "..." suffix.
-func previewBody(data []byte, max int) string {
+func previewBody(data []byte) string {
+	const maxLen = 200
 	if len(data) == 0 {
 		return ""
 	}
 	end := len(data)
 	suffix := ""
-	if end > max {
-		end = max
+	if end > maxLen {
+		end = maxLen
 		suffix = "..."
 	}
 	// Make a sanitized copy: replace control bytes other than \t with '?'.
 	out := make([]byte, end)
 	for i, b := range data[:end] {
-		if b < 0x20 && b != '\t' {
+		switch {
+		case b < 0x20 && b != '\t':
 			out[i] = '?'
-		} else if b == 0x7f {
+		case b == 0x7f:
 			out[i] = '?'
-		} else {
+		default:
 			out[i] = b
 		}
 	}

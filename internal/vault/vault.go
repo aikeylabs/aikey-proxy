@@ -39,8 +39,8 @@ func providerCodeAliases(code string) []string {
 // Reader provides read-only access to the Rust-compatible AiKey vault.
 type Reader struct {
 	db         *sql.DB
-	derivedKey []byte
 	cache      *cache
+	derivedKey []byte
 }
 
 // withBusyTimeoutDSN appends the busy_timeout pragma to a vault DB path,
@@ -57,7 +57,7 @@ func withBusyTimeoutDSN(dbPath string) string {
 }
 
 // Open opens the vault database and verifies the password.
-func Open(dbPath string, password string) (*Reader, error) {
+func Open(dbPath, password string) (*Reader, error) {
 	// Open in read-write mode so the WAL reader can see latest CLI writes.
 	// aikey-proxy does not write to the vault, but read-only mode on WAL
 	// databases may return stale data if the WAL has not been checkpointed.
@@ -73,9 +73,9 @@ func Open(dbPath string, password string) (*Reader, error) {
 	}
 
 	// Verify the database is accessible.
-	if err := db.Ping(); err != nil {
+	if pingErr := db.Ping(); pingErr != nil {
 		db.Close()
-		return nil, fmt.Errorf("ping vault db: %w", err)
+		return nil, fmt.Errorf("ping vault db: %w", pingErr)
 	}
 
 	// Read salt: try 'master_salt' first, fall back to 'salt'.
@@ -96,7 +96,7 @@ func Open(dbPath string, password string) (*Reader, error) {
 	slog.Debug("vault KDF params", "m_cost", mCost, "t_cost", tCost, "p_cost", pCost)
 
 	// Derive key using Argon2id.
-	derivedKey := DeriveKeyWithParams([]byte(password), salt, mCost, tCost, uint8(pCost))
+	derivedKey := DeriveKeyWithParams([]byte(password), salt, mCost, tCost, uint8(pCost)) //nolint:gosec // Argon2 parallelism is 1..255 (written as uint8 at vault creation)
 
 	// Verify against stored password_hash.
 	storedHash, err := readConfigBlob(db, "password_hash")
@@ -189,7 +189,7 @@ func (r *Reader) GetSecret(alias string) (string, error) {
 	err := r.db.QueryRow(
 		"SELECT nonce, ciphertext FROM entries WHERE alias = ?", alias,
 	).Scan(&nonce, &ciphertext)
-	if err == sql.ErrNoRows {
+	if errors.Is(err, sql.ErrNoRows) {
 		// Wrap the sentinel so callers can errors.Is(err, ErrSecretNotFound)
 		// to distinguish "key truly missing" (→ aikey add) from infra errors
 		// (BUSY/IO/decrypt → retry) below.
@@ -304,7 +304,7 @@ func (r *Reader) GetActiveManagedKeys() ([]ManagedKey, error) {
 	`)
 	if err != nil {
 		// Table may not exist on older vaults — treat as empty, not an error.
-		return nil, nil //nolint:nilerr
+		return nil, nil //nolint:nilerr // older vaults lack this table; missing-table error means empty result, not a failure
 	}
 	defer rows.Close()
 
@@ -634,7 +634,10 @@ func (r *Reader) GetActiveTeamKeyByProvider(providerCode string) (*ManagedKey, e
 	}
 	// 2026-05-09: include effective alias (COALESCE local_alias / alias) for
 	// receipt / WAL surfacing of team key alias.
-	query := fmt.Sprintf(`
+	// The only dynamic part of the query is the placeholder list ("?,?,...")
+	// derived from len(aliases); all real values are bound via args, so this
+	// concatenation carries no SQL-injection risk.
+	const queryPrefix = `
 		SELECT virtual_key_id,
 		       COALESCE(NULLIF(local_alias, ''), alias) AS effective_alias,
 		       provider_code, protocol_type, base_url,
@@ -644,10 +647,12 @@ func (r *Reader) GetActiveTeamKeyByProvider(providerCode string) (*ManagedKey, e
 		WHERE key_status = 'active'
 		  AND provider_key_ciphertext IS NOT NULL
 		  AND COALESCE(local_state, '') != 'stale'
-		  AND COALESCE(local_state, '') NOT LIKE 'disabled_by_%%'
-		  AND LOWER(provider_code) IN (%s)
+		  AND COALESCE(local_state, '') NOT LIKE 'disabled_by_%'
+		  AND LOWER(provider_code) IN (`
+	const querySuffix = `)
 		LIMIT 1
-	`, strings.Join(placeholders, ","))
+	`
+	query := queryPrefix + strings.Join(placeholders, ",") + querySuffix
 	rows, err := r.db.Query(query, args...)
 	if err != nil {
 		return nil, nil //nolint:nilerr // table may not exist on older vaults
@@ -663,9 +668,9 @@ func (r *Reader) GetActiveTeamKeyByProvider(providerCode string) (*ManagedKey, e
 	var providerBaseURLsJSON *string
 	var orgID, seatID string
 	var ownerAccountID *string
-	if err := rows.Scan(&vkID, &effectiveAlias, &provCode, &protType, &baseURL, &nonce, &ciphertext, &providerBaseURLsJSON,
-		&orgID, &seatID, &ownerAccountID); err != nil {
-		return nil, fmt.Errorf("scan managed key: %w", err)
+	if scanErr := rows.Scan(&vkID, &effectiveAlias, &provCode, &protType, &baseURL, &nonce, &ciphertext, &providerBaseURLsJSON,
+		&orgID, &seatID, &ownerAccountID); scanErr != nil {
+		return nil, fmt.Errorf("scan managed key: %w", scanErr)
 	}
 
 	plaintext, err := Decrypt(r.derivedKey, nonce, ciphertext)
@@ -882,7 +887,7 @@ func readU32LEOrDefault(db *sql.DB, key string, defaultVal uint32) uint32 {
 // the vault config table.  Returns 0 if the key is absent or the vault does
 // not yet exist.  Opens a fresh read-write connection so callers do not need
 // an existing Reader (e.g. the Supervisor calling this before vault.Open).
-func ReadConfigU64LE(dbPath string, key string) (uint64, error) {
+func ReadConfigU64LE(dbPath, key string) (uint64, error) {
 	db, err := sql.Open("sqlite", dbPath)
 	if err != nil {
 		return 0, fmt.Errorf("open vault db for config read: %w", err)
@@ -891,7 +896,7 @@ func ReadConfigU64LE(dbPath string, key string) (uint64, error) {
 
 	var value []byte
 	err = db.QueryRow("SELECT value FROM config WHERE key = ?", key).Scan(&value)
-	if err == sql.ErrNoRows {
+	if errors.Is(err, sql.ErrNoRows) {
 		return 0, nil
 	}
 	if err != nil {
@@ -911,7 +916,7 @@ func ReadConfigU64LE(dbPath string, key string) (uint64, error) {
 // vault.Open (same contract as ReadConfigU64LE). Used to read
 // runtime.source_identity for delivery-integrity event stamping — written by
 // the CLI side (storage.rs SOURCE_IDENTITY_KEY).
-func ReadConfigString(dbPath string, key string) (string, error) {
+func ReadConfigString(dbPath, key string) (string, error) {
 	db, err := sql.Open("sqlite", dbPath)
 	if err != nil {
 		return "", fmt.Errorf("open vault db for config read: %w", err)
@@ -920,7 +925,7 @@ func ReadConfigString(dbPath string, key string) (string, error) {
 
 	var value string
 	err = db.QueryRow("SELECT CAST(value AS TEXT) FROM config WHERE key = ?", key).Scan(&value)
-	if err == sql.ErrNoRows {
+	if errors.Is(err, sql.ErrNoRows) {
 		return "", nil
 	}
 	if err != nil {
@@ -948,10 +953,10 @@ type PersonalRouteToken struct {
 
 // OAuthRouteToken represents an OAuth account's route token for Registry registration.
 type OAuthRouteToken struct {
-	AccountID    string
-	RouteToken   string
-	Provider     string
-	Identity     string // display identity (email or display name)
+	AccountID  string
+	RouteToken string
+	Provider   string
+	Identity   string // display identity (email or display name)
 }
 
 // hasColumn checks if a column exists on a table (via PRAGMA table_info).
@@ -1101,17 +1106,17 @@ func (r *Reader) GetAllOAuthRouteTokens() ([]OAuthRouteToken, error) {
 // for the A vs B mode contract; mutex with FollowUserActive is
 // enforced at the writer side (aikey-cli migrations + `aikey app create`).
 type AppRecord struct {
-	Slug                  string
-	Name                  string
-	Vendor                string
-	Upstreams             []string // decoded from JSON column
-	AppKind               string   // "third-party" | "first-party"
-	FollowUserActive      bool
-	BoundAlias            string // "" = not in B mode (use FollowUserActive)
-	BoundAt               int64  // 0 when BoundAlias is unset
-	RequestedPermissions  []string // decoded from JSON column (nil if NULL)
-	CreatedAt             int64
-	UpdatedAt             int64
+	Slug                 string
+	Name                 string
+	Vendor               string
+	AppKind              string   // "third-party" | "first-party"
+	BoundAlias           string   // "" = not in B mode (use FollowUserActive)
+	Upstreams            []string // decoded from JSON column
+	RequestedPermissions []string // decoded from JSON column (nil if NULL)
+	BoundAt              int64    // 0 when BoundAlias is unset
+	CreatedAt            int64
+	UpdatedAt            int64
+	FollowUserActive     bool
 }
 
 // GetSlug returns the app slug. Implemented as a method (not just a
@@ -1138,8 +1143,8 @@ type AppRouteToken struct {
 	RouteToken       string // ★ plaintext aikey_app_<64hex>
 	Status           string // "active" (loader only returns active)
 	AppKind          string
-	FollowUserActive bool
 	AllowedUpstreams []string
+	FollowUserActive bool
 }
 
 // LogValue implements slog.LogValuer to redact the plaintext RouteToken
@@ -1147,7 +1152,7 @@ type AppRouteToken struct {
 // attribute. Critical R6-mitigation per Day 3 spike report §6 — without
 // this, the routine vault loader trace logging would dump every app
 // token to disk.
-func (t AppRouteToken) LogValue() slog.Value {
+func (t AppRouteToken) LogValue() slog.Value { //nolint:gocritic // value receiver required: a pointer receiver makes slog skip LogValuer on value attrs and leak the plaintext token (security)
 	return slog.GroupValue(
 		slog.String("key_id", t.KeyID),
 		slog.String("app_slug", t.AppSlug),
@@ -1574,7 +1579,7 @@ func (r *Reader) GetActiveAppKeysForSlug(slug string) (int, error) {
 // WriteConfigU64LE writes a uint64 as an 8-byte little-endian BLOB into the
 // vault config table (INSERT OR REPLACE).  Opens its own connection so it can
 // be called independently of an existing Reader.
-func WriteConfigU64LE(dbPath string, key string, value uint64) error {
+func WriteConfigU64LE(dbPath, key string, value uint64) error {
 	db, err := sql.Open("sqlite", dbPath)
 	if err != nil {
 		return fmt.Errorf("open vault db for config write: %w", err)
@@ -1595,7 +1600,7 @@ func WriteConfigU64LE(dbPath string, key string, value uint64) error {
 // WriteConfigString writes a string value (UTF-8 BLOB) into the vault config
 // table (INSERT OR REPLACE). Mirror of WriteConfigU64LE for non-numeric config
 // such as compliance.master_policy JSON. Opens its own connection.
-func WriteConfigString(dbPath string, key string, value string) error {
+func WriteConfigString(dbPath, key, value string) error {
 	db, err := sql.Open("sqlite", dbPath)
 	if err != nil {
 		return fmt.Errorf("open vault db for config write: %w", err)

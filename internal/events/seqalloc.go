@@ -42,11 +42,11 @@ import (
 // contend on WALWriter.mu, and its tiny (one integer) fsync is unrelated to the
 // WAL's group-commit cadence.
 type SeqAllocator struct {
-	mu         sync.Mutex
 	statePath  string
 	blockSize  int64
 	next       int64 // next seq to hand out
 	reservedHi int64 // highest seq persisted as reserved in statePath
+	mu         sync.Mutex
 }
 
 // DefaultSeqBlockSize is the reserve-ahead block size. Larger = fewer

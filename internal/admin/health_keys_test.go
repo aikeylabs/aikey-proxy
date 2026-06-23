@@ -32,8 +32,8 @@ func getHealthKeys(t *testing.T, h *Handler) *httptest.ResponseRecorder {
 func decodeHealthKeysMessage(t *testing.T, rr *httptest.ResponseRecorder) string {
 	t.Helper()
 	var resp struct {
-		Keys    []any  `json:"keys"`
 		Message string `json:"message"`
+		Keys    []any  `json:"keys"`
 	}
 	if err := json.Unmarshal(rr.Body.Bytes(), &resp); err != nil {
 		t.Fatalf("decode response: %v; body = %q", err, rr.Body.String())

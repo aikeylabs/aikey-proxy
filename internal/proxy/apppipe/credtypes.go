@@ -35,6 +35,10 @@ import (
 // binding. See BindingResolver.ResolveBindingCredential's docstring for
 // per-KeySourceType semantics.
 type BindingCredential struct {
+	// ManagedKey carries team-key metadata (OrgID / SeatID / CredentialID /
+	// VirtualKeyRevision) that flows into usage events for team-key paths.
+	// nil for OAuth and personal paths.
+	ManagedKey *vault.ManagedKey
 	// RealKey is the plaintext upstream secret. Empty for the OAuth
 	// path (KeyAlias = "__oauth__" sentinel signals oauthInject already
 	// mutated request headers); non-empty for team / personal paths
@@ -55,10 +59,6 @@ type BindingCredential struct {
 	OAuthIdentity string
 	// OAuthAccountID is the broker account identifier for OAuth credentials.
 	OAuthAccountID string
-	// ManagedKey carries team-key metadata (OrgID / SeatID / CredentialID /
-	// VirtualKeyRevision) that flows into usage events for team-key paths.
-	// nil for OAuth and personal paths.
-	ManagedKey *vault.ManagedKey
 }
 
 // BindingResolveError represents an OAuth resolution failure that the
@@ -66,10 +66,10 @@ type BindingCredential struct {
 // OAuth path; team / personal paths fail soft (empty BindingCredential
 // fields → caller falls back to legacy resolution).
 type BindingResolveError struct {
-	StatusCode int    // HTTP status code (503 / 401)
 	ErrorType  string // body.error.type (server_error / auth_error)
 	ErrorCode  string // body.error.code
 	Message    string // body.error.message
+	StatusCode int    // HTTP status code (503 / 401)
 }
 
 func (e *BindingResolveError) Error() string { return e.ErrorCode + ": " + e.Message }

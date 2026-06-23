@@ -77,8 +77,8 @@ func TestSeqAllocator_GracefulCloseZeroBurn(t *testing.T) {
 	_, _ = a.Next() // 1
 	_, _ = a.Next() // 2
 	_, _ = a.Next() // 3
-	if err := a.Close(); err != nil {
-		t.Fatalf("Close: %v", err)
+	if cErr := a.Close(); cErr != nil {
+		t.Fatalf("Close: %v", cErr)
 	}
 
 	a2, err := NewSeqAllocator(p, 256)
@@ -138,7 +138,7 @@ func TestSeqAllocator_ReserveFailureBlocksAllocation(t *testing.T) {
 // construction rather than silently resetting to 0 (which would reuse seqs).
 func TestSeqAllocator_CorruptStateErrors(t *testing.T) {
 	p := statePath(t)
-	if err := os.WriteFile(p, []byte("not-a-number"), 0o644); err != nil {
+	if err := os.WriteFile(p, []byte("not-a-number"), 0o600); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := NewSeqAllocator(p, 4); err == nil {

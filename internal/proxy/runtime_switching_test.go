@@ -51,8 +51,8 @@ import (
 // proxy injected on the upstream call.
 type recordingUpstream struct {
 	server *httptest.Server
-	mu     sync.Mutex
 	last   string
+	mu     sync.Mutex
 }
 
 func newRecordingUpstream() *recordingUpstream {
@@ -72,8 +72,8 @@ func newRecordingUpstream() *recordingUpstream {
 	return u
 }
 
-func (u *recordingUpstream) close()            { u.server.Close() }
-func (u *recordingUpstream) URL() string       { return u.server.URL }
+func (u *recordingUpstream) close()      { u.server.Close() }
+func (u *recordingUpstream) URL() string { return u.server.URL }
 func (u *recordingUpstream) lastSeenKey() string {
 	u.mu.Lock()
 	defer u.mu.Unlock()

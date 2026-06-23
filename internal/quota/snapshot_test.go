@@ -57,23 +57,23 @@ func TestLoadPriceSummary(t *testing.T) {
 	defer db.Close()
 
 	// Tolerance: no config table (pre-Phase-2 vault) → (nil, nil), not an error.
-	if ps, err := LoadPriceSummary(db); err != nil || ps != nil {
-		t.Fatalf("missing config table: want (nil,nil) got (%v,%v)", ps, err)
+	if ps, lerr := LoadPriceSummary(db); lerr != nil || ps != nil {
+		t.Fatalf("missing config table: want (nil,nil) got (%v,%v)", ps, lerr)
 	}
 
 	// config kv table mirrors aikey-cli vault (key TEXT PK, value BLOB).
-	if _, err := db.Exec(`CREATE TABLE config (key TEXT PRIMARY KEY, value BLOB NOT NULL)`); err != nil {
-		t.Fatal(err)
+	if _, cerr := db.Exec(`CREATE TABLE config (key TEXT PRIMARY KEY, value BLOB NOT NULL)`); cerr != nil {
+		t.Fatal(cerr)
 	}
 	// Absent key → still (nil, nil) (fall back to floor, don't error).
-	if ps, err := LoadPriceSummary(db); err != nil || ps != nil {
-		t.Fatalf("absent key: want (nil,nil) got (%v,%v)", ps, err)
+	if ps, lerr := LoadPriceSummary(db); lerr != nil || ps != nil {
+		t.Fatalf("absent key: want (nil,nil) got (%v,%v)", ps, lerr)
 	}
 
 	// Insert the summary exactly as the CLI persists it (key quota.price_summary).
 	const summary = `{"version":"v1","models":{"claude-opus-4-8":{"input":5e-6,"output":2.5e-5,"cache_creation":6.25e-6,"cache_read":5e-7,"reasoning":2.5e-5}}}`
-	if _, err := db.Exec(`INSERT INTO config (key, value) VALUES (?, ?)`, quotaPriceSummaryKey, []byte(summary)); err != nil {
-		t.Fatal(err)
+	if _, ierr := db.Exec(`INSERT INTO config (key, value) VALUES (?, ?)`, quotaPriceSummaryKey, []byte(summary)); ierr != nil {
+		t.Fatal(ierr)
 	}
 	ps, err := LoadPriceSummary(db)
 	if err != nil {
@@ -116,19 +116,19 @@ func TestLoadSubjects(t *testing.T) {
 
 	// Schema MUST mirror aikey-cli/src/migrations.rs quota_rules_cache (the
 	// proxy can't run the Rust migration; keep this in lockstep with it).
-	if _, err := db.Exec(`CREATE TABLE quota_rules_cache (
+	if _, cerr := db.Exec(`CREATE TABLE quota_rules_cache (
 		subject_id   TEXT PRIMARY KEY,
 		subject_kind TEXT NOT NULL,
 		members      TEXT,
 		rules        TEXT NOT NULL DEFAULT '[]',
 		baseline     TEXT,
-		synced_at    INTEGER NOT NULL DEFAULT 0)`); err != nil {
-		t.Fatal(err)
+		synced_at    INTEGER NOT NULL DEFAULT 0)`); cerr != nil {
+		t.Fatal(cerr)
 	}
-	if _, err := db.Exec(`INSERT INTO quota_rules_cache (subject_id, subject_kind, members, rules, baseline, synced_at) VALUES
+	if _, ierr := db.Exec(`INSERT INTO quota_rules_cache (subject_id, subject_kind, members, rules, baseline, synced_at) VALUES
 		('seat-a','seat',NULL,'[{"metric":"usd","period":"monthly","limit_amount":50,"thresholds":[{"pct":100,"action":"hard_block"}]}]','[{"metric":"tokens","period":"monthly","used":42}]',0),
-		('grp-1','group','["seat-a","seat-b"]','[{"metric":"tokens","period":"daily","limit_amount":1000000}]',NULL,0)`); err != nil {
-		t.Fatal(err)
+		('grp-1','group','["seat-a","seat-b"]','[{"metric":"tokens","period":"daily","limit_amount":1000000}]',NULL,0)`); ierr != nil {
+		t.Fatal(ierr)
 	}
 
 	subs, err = LoadSubjects(db)

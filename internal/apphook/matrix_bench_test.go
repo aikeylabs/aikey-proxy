@@ -34,7 +34,7 @@ func TestComplianceLatencyMatrix(t *testing.T) {
 		t.Skip("latency meaningless under -race")
 	}
 	binary := findDetectorBinary(t)
-	h := NewChildHook(ChildHookConfig{
+	h := NewChildHook(&ChildHookConfig{
 		Name:         "ai-compliance-detector-matrix",
 		BinaryPath:   binary,
 		Timeout:      5 * time.Second, // generous: measure true latency, not the 80ms cap

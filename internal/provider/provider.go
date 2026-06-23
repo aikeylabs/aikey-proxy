@@ -34,25 +34,6 @@ func applyBaseURL(req *http.Request, baseURL string) error {
 // over-charge cache. See
 // roadmap20260320/技术实现/update/20260604-token-input-纯输入语义治本-方案A.md.
 type TokenBreakdown struct {
-	// InputTokens is the PURE (uncached) input — billed at the input rate.
-	// Cache is NOT included here (it lives in the two Cache*InputTokens fields);
-	// total context = InputTokens + CacheReadInputTokens + CacheCreationInputTokens.
-	InputTokens int
-	// OutputTokens is the model's generated output in tokens.
-	OutputTokens int
-	// CacheReadInputTokens is the cache-replayed input (Anthropic prompt-caching
-	// "read"), billed at the cache-read rate. Separate from InputTokens. Zero
-	// when the provider has no cache or the client didn't opt in.
-	CacheReadInputTokens int
-	// CacheCreationInputTokens is the input written to the cache this turn,
-	// billed at the cache-creation rate. Separate from InputTokens. Zero under
-	// the same conditions.
-	CacheCreationInputTokens int
-	// ReasoningTokens is the model's internal reasoning/thinking tokens
-	// (OpenAI o-series usage.completion_tokens_details.reasoning_tokens;
-	// Gemini thoughtsTokenCount). Billed at the output rate. Zero for models
-	// without a separate reasoning bucket (Anthropic folds thinking into output).
-	ReasoningTokens int
 	// StopReason is the raw termination reason emitted by the provider in
 	// the final response chunk. Values are provider-specific and passed
 	// through un-normalized so consumers can pattern-match against the
@@ -81,6 +62,25 @@ type TokenBreakdown struct {
 	// 2026-05-09: added so receipts surface the actual billed version
 	// instead of the client-side alias. See receipt design doc.
 	Model string
+	// InputTokens is the PURE (uncached) input — billed at the input rate.
+	// Cache is NOT included here (it lives in the two Cache*InputTokens fields);
+	// total context = InputTokens + CacheReadInputTokens + CacheCreationInputTokens.
+	InputTokens int
+	// OutputTokens is the model's generated output in tokens.
+	OutputTokens int
+	// CacheReadInputTokens is the cache-replayed input (Anthropic prompt-caching
+	// "read"), billed at the cache-read rate. Separate from InputTokens. Zero
+	// when the provider has no cache or the client didn't opt in.
+	CacheReadInputTokens int
+	// CacheCreationInputTokens is the input written to the cache this turn,
+	// billed at the cache-creation rate. Separate from InputTokens. Zero under
+	// the same conditions.
+	CacheCreationInputTokens int
+	// ReasoningTokens is the model's internal reasoning/thinking tokens
+	// (OpenAI o-series usage.completion_tokens_details.reasoning_tokens;
+	// Gemini thoughtsTokenCount). Billed at the output rate. Zero for models
+	// without a separate reasoning bucket (Anthropic folds thinking into output).
+	ReasoningTokens int
 }
 
 // Provider adapts requests for a specific AI provider protocol.

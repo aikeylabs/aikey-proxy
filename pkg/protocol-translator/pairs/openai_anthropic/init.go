@@ -3,15 +3,15 @@
 //
 // Phase 2 阶段 0 MVP scope (this package's current state):
 //
-//   ✅ Top-level field mapping (model / max_tokens / temperature cap /
-//      top_p / top_k / stop / reasoning_effort → thinking / user → metadata)
-//   ⏳ Messages normalization (system extraction / user-start / role
-//      alternation / same-role merge / empty text filter) — Day 4
-//   ⏳ tools / tool_choice (incl. type=none + parallel_tool_calls reverse) — Day 4
-//   ✅ response_format=json_object → forced tool-call — Day 5
-//   ✅ Non-stream response (Anthropic → OpenAI) — Day 6
-//   ❌ Streaming SSE response (Anthropic → OpenAI chunk state machine) — 阶段 1
-//   ❌ json_schema variant (complex schema passthrough) — 阶段 1
+//	✅ Top-level field mapping (model / max_tokens / temperature cap /
+//	   top_p / top_k / stop / reasoning_effort → thinking / user → metadata)
+//	⏳ Messages normalization (system extraction / user-start / role
+//	   alternation / same-role merge / empty text filter) — Day 4
+//	⏳ tools / tool_choice (incl. type=none + parallel_tool_calls reverse) — Day 4
+//	✅ response_format=json_object → forced tool-call — Day 5
+//	✅ Non-stream response (Anthropic → OpenAI) — Day 6
+//	❌ Streaming SSE response (Anthropic → OpenAI chunk state machine) — 阶段 1
+//	❌ json_schema variant (complex schema passthrough) — 阶段 1
 //
 // Import for side-effect to register the pair with the default Registry:
 //

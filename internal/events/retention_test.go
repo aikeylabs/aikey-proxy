@@ -12,7 +12,7 @@ func mkWALFile(t *testing.T, dir string, now time.Time, ageDays int) string {
 	t.Helper()
 	name := "usage-" + now.UTC().AddDate(0, 0, -ageDays).Format("20060102-15") + ".jsonl"
 	p := filepath.Join(dir, name)
-	if err := os.WriteFile(p, []byte("{}\n"), 0o644); err != nil {
+	if err := os.WriteFile(p, []byte("{}\n"), 0o600); err != nil {
 		t.Fatalf("write %s: %v", name, err)
 	}
 	return p
@@ -38,7 +38,7 @@ func TestRetentionSweep_ArchivesExpiresPrunes(t *testing.T) {
 	archDelete := mkWALFile(t, archiveDir, now, 100) // 100d > 90d → deleted
 	// Malformed name: parser must skip, never guess.
 	malformed := filepath.Join(dir, "usage-notadate.jsonl")
-	if err := os.WriteFile(malformed, nil, 0o644); err != nil {
+	if err := os.WriteFile(malformed, nil, 0o600); err != nil {
 		t.Fatal(err)
 	}
 
@@ -47,11 +47,11 @@ func TestRetentionSweep_ArchivesExpiresPrunes(t *testing.T) {
 		t.Fatalf("open store: %v", err)
 	}
 	defer store.Close()
-	if err := store.Insert([]UsageEvent{
+	if insErr := store.Insert([]UsageEvent{
 		{Timestamp: now.AddDate(0, 0, -40), VirtualKeyID: "vk_old", Provider: "anthropic"},
 		{Timestamp: now.AddDate(0, 0, -5), VirtualKeyID: "vk_new", Provider: "anthropic"},
-	}); err != nil {
-		t.Fatalf("seed events: %v", err)
+	}); insErr != nil {
+		t.Fatalf("seed events: %v", insErr)
 	}
 
 	res := RunRetentionSweep(RetentionConfig{WALDir: dir, RetentionDays: 30, ArchiveDays: 90}, store, now)

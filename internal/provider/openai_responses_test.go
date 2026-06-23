@@ -122,6 +122,7 @@ func TestOpenAI_Warn_OnUsageMissing(t *testing.T) {
 //   - parser found `usage` non-nil
 //   - extracted `prompt_tokens`/`completion_tokens` (both zero)
 //   - returned (0, 0) with no log
+//
 // After the fix: Resolve() picks up input_tokens/output_tokens. So this case
 // no longer emits a WARN — it succeeds. Verify that.
 func TestOpenAI_Responses_NoLongerSilentZero(t *testing.T) {

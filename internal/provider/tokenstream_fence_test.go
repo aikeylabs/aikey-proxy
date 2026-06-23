@@ -17,28 +17,33 @@ import "testing"
 // drops one would be a billing regression invisible to an in/out-only test.
 
 type tbGolden struct {
-	in, out, cacheRead, cacheCreate, reasoning int
-	stop, model                                string
+	stop        string
+	model       string
+	in          int
+	out         int
+	cacheRead   int
+	cacheCreate int
+	reasoning   int
 }
 
 var streamGoldens = map[string]tbGolden{
-	"anthropic_basic":             {10, 25, 0, 0, 0, "end_turn", ""},
-	"anthropic_cache":             {1, 463, 43000, 200, 0, "", ""},
-	"anthropic_model":             {10, 5, 0, 0, 0, "end_turn", "claude-opus-4-7-20251015"},
-	"anthropic_max_tokens":        {5, 100, 0, 0, 0, "max_tokens", ""},
-	"anthropic_partial_start_only": {8, 0, 0, 0, 0, "", ""},
-	"anthropic_partial_delta_only": {0, 1, 0, 0, 0, "", ""},
-	"anthropic_empty":             {0, 0, 0, 0, 0, "", ""},
-	"openai_basic":                {5, 12, 0, 0, 0, "stop", ""},
-	"openai_cached":               {70, 50, 30, 0, 0, "", ""},
-	"openai_reasoning":            {100, 500, 0, 0, 400, "", ""},
-	"openai_model":                {7, 3, 0, 0, 0, "stop", "gpt-4o-mini"},
-	"openai_no_space":             {9, 5, 0, 0, 0, "", ""},
-	"openai_tool_calls":           {20, 30, 0, 0, 0, "tool_calls", ""},
-	"openai_partial_no_usage":     {0, 0, 0, 0, 0, "", ""},
-	"openai_empty":                {0, 0, 0, 0, 0, "", ""},
-	"kimi_basic":                  {11, 4, 0, 0, 0, "stop", ""},
-	"generic_basic":               {13, 6, 0, 0, 0, "stop", ""},
+	"anthropic_basic":              {in: 10, out: 25, cacheRead: 0, cacheCreate: 0, reasoning: 0, stop: "end_turn", model: ""},
+	"anthropic_cache":              {in: 1, out: 463, cacheRead: 43000, cacheCreate: 200, reasoning: 0, stop: "", model: ""},
+	"anthropic_model":              {in: 10, out: 5, cacheRead: 0, cacheCreate: 0, reasoning: 0, stop: "end_turn", model: "claude-opus-4-7-20251015"},
+	"anthropic_max_tokens":         {in: 5, out: 100, cacheRead: 0, cacheCreate: 0, reasoning: 0, stop: "max_tokens", model: ""},
+	"anthropic_partial_start_only": {in: 8, out: 0, cacheRead: 0, cacheCreate: 0, reasoning: 0, stop: "", model: ""},
+	"anthropic_partial_delta_only": {in: 0, out: 1, cacheRead: 0, cacheCreate: 0, reasoning: 0, stop: "", model: ""},
+	"anthropic_empty":              {in: 0, out: 0, cacheRead: 0, cacheCreate: 0, reasoning: 0, stop: "", model: ""},
+	"openai_basic":                 {in: 5, out: 12, cacheRead: 0, cacheCreate: 0, reasoning: 0, stop: "stop", model: ""},
+	"openai_cached":                {in: 70, out: 50, cacheRead: 30, cacheCreate: 0, reasoning: 0, stop: "", model: ""},
+	"openai_reasoning":             {in: 100, out: 500, cacheRead: 0, cacheCreate: 0, reasoning: 400, stop: "", model: ""},
+	"openai_model":                 {in: 7, out: 3, cacheRead: 0, cacheCreate: 0, reasoning: 0, stop: "stop", model: "gpt-4o-mini"},
+	"openai_no_space":              {in: 9, out: 5, cacheRead: 0, cacheCreate: 0, reasoning: 0, stop: "", model: ""},
+	"openai_tool_calls":            {in: 20, out: 30, cacheRead: 0, cacheCreate: 0, reasoning: 0, stop: "tool_calls", model: ""},
+	"openai_partial_no_usage":      {in: 0, out: 0, cacheRead: 0, cacheCreate: 0, reasoning: 0, stop: "", model: ""},
+	"openai_empty":                 {in: 0, out: 0, cacheRead: 0, cacheCreate: 0, reasoning: 0, stop: "", model: ""},
+	"kimi_basic":                   {in: 11, out: 4, cacheRead: 0, cacheCreate: 0, reasoning: 0, stop: "stop", model: ""},
+	"generic_basic":                {in: 13, out: 6, cacheRead: 0, cacheCreate: 0, reasoning: 0, stop: "stop", model: ""},
 }
 
 func assertGolden(t *testing.T, name string, br TokenBreakdown, g tbGolden) {

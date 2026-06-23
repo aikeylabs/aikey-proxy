@@ -25,6 +25,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"math"
 	"net"
 	"net/http"
 	"os"
@@ -116,44 +117,40 @@ const (
 // generation holds all per-reload state: vault reader, virtual key registry,
 // proxy handler, and event infrastructure.
 type generation struct {
-	id         int
-	vaultPath  string
-	vault      *vault.Reader
-	registry   *vkeys.Registry
-	providers  *provider.Registry
-	proxy      *proxy.Proxy
-	collector  *events.Collector
-	eventStore *events.Store
-	reporter   *events.Reporter     // usage reporter (nil when collector_url is not configured)
-	canary     *events.CanaryProbe  // synthetic canary probe (nil when reporter or control_url is not configured)
 	filterHook apphook.FilterTarget // P4 compliance/DLP filter (single child or M-process pool; nil when no filter app is active)
-
+	reporter   *events.Reporter     // usage reporter (nil when collector_url is not configured)
 	// standaloneWAL is only populated when this generation created the
 	// local WAL writer AND no reporter consumed it — i.e. collector_url is
 	// empty. When a reporter is present it owns the WAL and its Close()
 	// closes it, so we leave standaloneWAL nil to avoid double-close. This
 	// split is what keeps `generation.close()` from leaking file handles
 	// on every reload in offline/standalone deployments.
-	standaloneWAL *events.WALWriter
-
+	standaloneWAL   *events.WALWriter
+	registry        *vkeys.Registry
+	providers       *provider.Registry
+	proxy           *proxy.Proxy
+	collector       *events.Collector
+	eventStore      *events.Store
+	drained         chan struct{} // closed when inflight reaches 0 after draining is set
+	vault           *vault.Reader
+	canary          *events.CanaryProbe // synthetic canary probe (nil when reporter or control_url is not configured)
+	contentSeqAlloc *events.SeqAllocator
 	// seqAlloc is the delivery-integrity sequence allocator for this generation.
 	// Closed in close() so a graceful shutdown shrinks the persisted high-water
 	// mark to the actual last-used seq (zero seq burn on the common restart
 	// path; only a hard crash leaves a bounded auditable gap). nil when no WAL.
 	seqAlloc *events.SeqAllocator
-
 	// Conversation-audit content outbox (enterprise Cluster feature). All nil
 	// unless this is a team deployment with a collector + credential — see
 	// conversation_audit_wiring.go. Closed in close() like the usage trio:
 	// reporter first (flushes its upload loop), then WAL, then seq allocator.
 	contentReporter *events.ContentReporter
 	contentWAL      *events.ContentWAL
-	contentSeqAlloc *events.SeqAllocator
-
+	vaultPath       string
 	// Drain tracking: incremented when a request enters Handle, decremented on exit.
 	inflight atomic.Int64
+	id       int
 	draining atomic.Bool
-	drained  chan struct{} // closed when inflight reaches 0 after draining is set
 }
 
 // ServeHTTP dispatches to the generation's proxy handler, tracking inflight count.
@@ -267,19 +264,12 @@ func (g *generation) drain(timeout time.Duration, reloadID string) {
 
 // Supervisor manages the proxy lifecycle and exposes the data-plane handler.
 type Supervisor struct {
-	cfg        *config.Config
-	configPath string // path to the YAML config file, re-read on reload
-	password   string
-	version    string // build version, passed to proxy for audit metadata
-
-	transport http.RoundTripper // optional upstream proxy transport; nil = default
-	broker    proxy.OAuthBroker // OAuth broker (set via SetBroker); nil = OAuth disabled
-
-	active    atomic.Pointer[generation]
-	reloadMu  sync.Mutex // serialize concurrent reload requests
-	genID     atomic.Int64
 	startedAt time.Time
-
+	transport http.RoundTripper // optional upstream proxy transport; nil = default
+	// ctx / cancel bound the lifetime of all detached upstream calls.
+	// Canceled in Shutdown() to stop any in-flight upstream requests.
+	ctx    context.Context
+	broker proxy.OAuthBroker // OAuth broker (set via SetBroker); nil = OAuth disabled
 	// lastFilterSig is the signature (sorted slug list) of the filter apps the
 	// active generation was built with. syncManagedKeys compares it to the
 	// vault's current filter-app set on each change_seq advance; a difference
@@ -290,7 +280,35 @@ type Supervisor struct {
 	// daemon-driven compliance enablement only took effect on a manual
 	// /admin/reload (gap found by the 2026-06-05 cluster E2E).
 	lastFilterSig atomic.Pointer[string]
-
+	quotaSnapshot *quota.Snapshot
+	active        atomic.Pointer[generation]
+	cancel        context.CancelFunc
+	cfg           *config.Config
+	// lastQuotaSig is the signature of the last quota policy this node pulled from
+	// the master (C′ 2026-06-17). pollQuotaPolicy uses it to write quota_rules_cache
+	// + Reload ONLY when the policy actually changed — so an admin's limit edit
+	// takes effect within the 60s poll WITHOUT the employee running any command,
+	// and steady state adds no churn. Mirrors lastFilterSig / masterCompliance.
+	lastQuotaSig atomic.Pointer[string]
+	// quotaHeartbeat is the traffic-independent server-reachability probe behind
+	// budget-mode staleness (D-U7/P9). nil unless enforce_mode=budget AND a
+	// collector URL is configured — so the default availability path (and Personal)
+	// adds NO periodic server call (offline-first preserved). The 5s sync copies its
+	// LastOKAt into the snapshot for budgetStale.
+	quotaHeartbeat    *heartbeat.Probe
+	quotaCounter      *quota.Counter
+	configPath        string // path to the YAML config file, re-read on reload
+	password          string
+	version           string // build version, passed to proxy for audit metadata
+	convAuditMaxBytes atomic.Int64
+	genID             atomic.Int64
+	reloadMu          sync.Mutex // serialize concurrent reload requests
+	// convAuditEnabled / convAuditMaxBytes: org-level conversation-audit capture
+	// switch + per-turn content cap, polled from the control backend by
+	// pollConversationAuditPolicy (mirrors masterCompliance, v1.0.1-alpha.2).
+	// Default OFF. The forward-path capture hook reads these atomics per request —
+	// a flip needs NO spawn/Reload (unlike compliance), it just gates capture.
+	convAuditEnabled atomic.Bool
 	// masterCompliance is the org-level compliance master switch polled from the
 	// control backend (G3). The supervisor is the LIFECYCLE owner of the
 	// compliance detector: the app pulls its own packs, but whether it runs at
@@ -298,47 +316,19 @@ type Supervisor struct {
 	// local filter_stages is NULL (master mandate); the user's local toggle still
 	// governs when this is false. Polled by pollComplianceMasterPolicy.
 	masterCompliance atomic.Bool
-
-	// convAuditEnabled / convAuditMaxBytes: org-level conversation-audit capture
-	// switch + per-turn content cap, polled from the control backend by
-	// pollConversationAuditPolicy (mirrors masterCompliance, v1.0.1-alpha.2).
-	// Default OFF. The forward-path capture hook reads these atomics per request —
-	// a flip needs NO spawn/Reload (unlike compliance), it just gates capture.
-	convAuditEnabled  atomic.Bool
-	convAuditMaxBytes atomic.Int64
-
 	// Enterprise quota (Phase 2 Stage 2 — design §0.5/§5.2). Snapshot + counter
 	// live on the supervisor (not per-generation) so the counter accumulates
 	// continuously across 5s syncs and /admin/reload; the snapshot is gen-swapped
 	// on each vault-seq advance. quotaEnabled gates LOADING only (off = the
 	// rule-distribution rail is fully bypassed, proxy == pre-quota behavior).
 	// Stage 2 only loads + counts; request interception is Stage 3.
-	quotaEnabled  bool
-	quotaSnapshot *quota.Snapshot
-	quotaCounter  *quota.Counter
+	quotaEnabled bool
 	// quotaIncrementSeeded guards the one-time restore of persisted local
 	// increments (quota_local_usage, P0) into the counter at startup. Seeding is a
 	// SET before any accrual; re-running would clobber in-flight increments, so it
 	// fires exactly once (first reloadQuotaSnapshot, in buildGeneration, before
 	// serving). Later reloads only re-seed baselines.
 	quotaIncrementSeeded bool
-	// quotaHeartbeat is the traffic-independent server-reachability probe behind
-	// budget-mode staleness (D-U7/P9). nil unless enforce_mode=budget AND a
-	// collector URL is configured — so the default availability path (and Personal)
-	// adds NO periodic server call (offline-first preserved). The 5s sync copies its
-	// LastOKAt into the snapshot for budgetStale.
-	quotaHeartbeat *heartbeat.Probe
-	// lastQuotaSig is the signature of the last quota policy this node pulled from
-	// the master (C′ 2026-06-17). pollQuotaPolicy uses it to write quota_rules_cache
-	// + Reload ONLY when the policy actually changed — so an admin's limit edit
-	// takes effect within the 60s poll WITHOUT the employee running any command,
-	// and steady state adds no churn. Mirrors lastFilterSig / masterCompliance.
-	lastQuotaSig atomic.Pointer[string]
-
-	// ctx / cancel bound the lifetime of all detached upstream calls.
-	// Canceled in Shutdown() to stop any in-flight upstream requests.
-	ctx    context.Context
-	cancel context.CancelFunc
 }
 
 // VaultReader opens a vault connection for use by the OAuth broker.
@@ -523,7 +513,7 @@ func (s *Supervisor) startQuotaHeartbeat() {
 	}
 	client := &http.Client{Timeout: 5 * time.Second}
 	s.quotaHeartbeat = heartbeat.New(interval, func(ctx context.Context) error {
-		req, err := http.NewRequestWithContext(ctx, http.MethodGet, healthURL, nil)
+		req, err := http.NewRequestWithContext(ctx, http.MethodGet, healthURL, http.NoBody)
 		if err != nil {
 			return err
 		}
@@ -664,9 +654,9 @@ func (s *Supervisor) syncManagedKeys() {
 			s.lastFilterSig.Store(&newSig)
 			slog.Info("managed key sync: filter-app set changed; full reload",
 				"event.name", "proxy.filter.set_changed")
-			if err := s.Reload(s.ctx); err != nil {
+			if rlErr := s.Reload(s.ctx); rlErr != nil {
 				slog.Warn("managed key sync: filter-triggered reload failed; "+
-					"continuing with lightweight sync (filter unchanged)", "error", err)
+					"continuing with lightweight sync (filter unchanged)", "error", rlErr)
 				// fall through — do NOT return — so the cred path below still runs.
 			} else {
 				return // Reload rebuilt registry + filter hook + advanced loaded_seq.
@@ -687,19 +677,20 @@ func (s *Supervisor) syncManagedKeys() {
 	if err != nil {
 		slog.Warn("managed key sync: GetActiveManagedKeys failed", "error", err)
 	}
-	for _, mk := range managedKeys {
+	for i := range managedKeys {
+		mk := &managedKeys[i]
 		// 2026-04-29 prefix rename: team token = aikey_team_<vk_id>.
 		// Use NormalizeTeamToken so historical-prefix dirty data in
 		// mk.VirtualKeyID gets stripped+rebuilt (defense-in-depth: should
 		// be bare vk_id in cache, but we don't trust it). Empty vk_id is
 		// upstream bug — log warning and skip the row rather than register
 		// a degenerate "aikey_team_" token.
-		token, err := NormalizeTeamToken(mk.VirtualKeyID)
-		if err != nil {
+		token, terr := NormalizeTeamToken(mk.VirtualKeyID)
+		if terr != nil {
 			slog.Warn("managed key sync: skip team key with invalid vk_id",
 				"vk_id", mk.VirtualKeyID,
 				"credential_id", mk.CredentialID,
-				"error", err.Error(),
+				"error", terr.Error(),
 			)
 			continue
 		}
@@ -780,7 +771,7 @@ func (s *Supervisor) syncManagedKeys() {
 //
 // Default-ON is safe by the enforcer's invariant 6 (quota_enforce.go): a
 // snapshot with no rules is a pure in-memory no-op — Personal installs and
-// org-less proxies see zero behaviour change; only a confirmed over-limit
+// org-less proxies see zero behavior change; only a confirmed over-limit
 // blocks. PROXY_QUOTA_ENFORCE_MODE=budget (fail-closed) stays strictly
 // opt-in and is NOT affected by this flip.
 //
@@ -1289,11 +1280,12 @@ func (s *Supervisor) buildGeneration() (*generation, error) {
 	// Post-2026-04-29 prefix rename: bearer token = NormalizeTeamToken(vk_id),
 	// which produces `aikey_team_<vk_id>` (with defensive strip of any
 	// historical-prefix dirty data in the cache).
-	if managedKeys, err := vaultReader.GetActiveManagedKeys(); err != nil {
-		slog.Warn("could not load managed virtual keys", "error", err)
+	if managedKeys, mkErr := vaultReader.GetActiveManagedKeys(); mkErr != nil {
+		slog.Warn("could not load managed virtual keys", "error", mkErr)
 	} else if len(managedKeys) > 0 {
 		managedRoutes := make(map[string]*vkeys.ResolvedRoute, len(managedKeys))
-		for _, mk := range managedKeys {
+		for i := range managedKeys {
+			mk := &managedKeys[i]
 			token, terr := NormalizeTeamToken(mk.VirtualKeyID)
 			if terr != nil {
 				slog.Warn("buildGeneration: skip team key with invalid vk_id",
@@ -1468,7 +1460,7 @@ func (s *Supervisor) buildGeneration() (*generation, error) {
 			// the offline path.  SetReporter below would overwrite these
 			// with the same values when a reporter is present.
 			var loadedSeq int64
-			if seq, err := vault.ReadConfigU64LE(s.cfg.Vault.Path, VaultChangeSeqKey); err == nil {
+			if seq, err := vault.ReadConfigU64LE(s.cfg.Vault.Path, VaultChangeSeqKey); err == nil && seq <= math.MaxInt64 {
 				loadedSeq = int64(seq)
 			}
 			p.SetReporter(nil, fmt.Sprintf("proxy-%d", id), s.version, fmt.Sprintf("gen-%d", id), loadedSeq, vaultReader.GetLoggedInAccountID())
@@ -1513,7 +1505,7 @@ func (s *Supervisor) buildGeneration() (*generation, error) {
 		)
 
 		var err error
-		reporter, err = events.NewReporter(events.ReporterConfig{
+		reporter, err = events.NewReporter(&events.ReporterConfig{
 			CollectorURL:              s.cfg.Events.CollectorURL,
 			CollectorRoutes:           s.cfg.Events.CollectorRoutes,
 			CollectorRouteCredentials: credentials,
@@ -1534,7 +1526,7 @@ func (s *Supervisor) buildGeneration() (*generation, error) {
 			reporter = nil
 		} else {
 			var loadedSeq int64
-			if seq, err := vault.ReadConfigU64LE(s.cfg.Vault.Path, VaultChangeSeqKey); err == nil {
+			if seq, err := vault.ReadConfigU64LE(s.cfg.Vault.Path, VaultChangeSeqKey); err == nil && seq <= math.MaxInt64 {
 				loadedSeq = int64(seq)
 			}
 			p.SetReporter(reporter, fmt.Sprintf("proxy-%d", id), s.version, fmt.Sprintf("gen-%d", id), loadedSeq, vaultReader.GetLoggedInAccountID())
@@ -1655,7 +1647,7 @@ func Listen(cfg *config.Config) (ln net.Listener, configuredAddr, actualAddr str
 		lastErr = lerr
 	}
 	return nil, configuredAddr, "", 0, fmt.Errorf(
-		"port drift exhausted: %s:%d..%d all occupied (last error: %v)",
+		"port drift exhausted: %s:%d..%d all occupied (last error: %w)",
 		host, port, port+driftMax, lastErr,
 	)
 }

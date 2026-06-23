@@ -41,10 +41,10 @@ var complianceHTTPClient = &http.Client{Timeout: 10 * time.Second}
 // resolveTeamOrgID returns the org this node's team mandates follow — BOTH the
 // compliance master policy (this file) AND the conversation-audit capture switch
 // (conversation_audit_policy.go) poll with it. Priority:
-//   1. AIKEY_HUB_ORG_ID env — a CLUSTER node's fixed org (cluster-node.env).
-//   2. The org_id of the active TEAM managed key — a form-① employee's Personal-
-//      style proxy has NO such env; its team VK (`aikey use <VK>`) carries the org.
-//   3. "" — true Personal (no team key, no env) → caller early-returns, no mandate.
+//  1. AIKEY_HUB_ORG_ID env — a CLUSTER node's fixed org (cluster-node.env).
+//  2. The org_id of the active TEAM managed key — a form-① employee's Personal-
+//     style proxy has NO such env; its team VK (`aikey use <VK>`) carries the org.
+//  3. "" — true Personal (no team key, no env) → caller early-returns, no mandate.
 //
 // Replaces the old hardcoded "default" placeholder, which made a form-① employee's
 // local proxy poll the WRONG org → mandate never applied (audit silently never
@@ -68,15 +68,15 @@ func resolveTeamOrgIDFromKeys(envOrg string, mks []vault.ManagedKey) string {
 	if envOrg != "" {
 		return envOrg
 	}
-	for _, mk := range mks {
-		if mk.OrgID != "" {
-			return mk.OrgID
+	for i := range mks {
+		if mks[i].OrgID != "" {
+			return mks[i].OrgID
 		}
 	}
 	return ""
 }
 
-// pollComplianceMasterPolicy runs until ctx is cancelled, refreshing the org
+// pollComplianceMasterPolicy runs until ctx is canceled, refreshing the org
 // mandate every compliancePollInterval (plus once immediately).
 func (s *Supervisor) pollComplianceMasterPolicy(ctx context.Context) {
 	s.syncComplianceMasterPolicy(ctx)
@@ -123,9 +123,9 @@ func (s *Supervisor) syncComplianceMasterPolicy(ctx context.Context) {
 // fetchComplianceMasterPolicy GETs the PUBLIC tenant policy endpoint (no JWT,
 // mirrors the pack-pull). Returns (enabled, ok); ok=false on any error so the
 // caller keeps the last-known value.
-func fetchComplianceMasterPolicy(ctx context.Context, masterURL, orgID string) (bool, bool) {
+func fetchComplianceMasterPolicy(ctx context.Context, masterURL, orgID string) (enabled, ok bool) {
 	u := masterURL + "/v1/compliance/policy?tenant=" + url.QueryEscape(orgID)
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u, nil)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u, http.NoBody)
 	if err != nil {
 		return false, false
 	}

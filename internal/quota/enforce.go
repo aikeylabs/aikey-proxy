@@ -277,7 +277,7 @@ func (e *Enforcer) AddForSeat(seatID string, delta float64, now time.Time) {
 //
 // No-op (0,false,false) when disabled / unwired / no seat. Token-type ints come
 // straight from provider.TokenBreakdown (InputTokens is the TOTAL input).
-func (e *Enforcer) AccrueUsdForSeat(seatID, model string, inputTotal, output, cacheRead, cacheCreation, reasoning int, now time.Time) (float64, bool, bool) {
+func (e *Enforcer) AccrueUsdForSeat(seatID, model string, inputTotal, output, cacheRead, cacheCreation, reasoning int, now time.Time) (usd float64, priced, hadSummary bool) {
 	if e == nil || !e.enabled || e.snapshot == nil || e.counter == nil || seatID == "" {
 		return 0, false, false
 	}
@@ -285,7 +285,7 @@ func (e *Enforcer) AccrueUsdForSeat(seatID, model string, inputTotal, output, ca
 	if ps == nil {
 		return 0, false, false
 	}
-	usd, priced := ps.Cost(model, inputTotal, output, cacheRead, cacheCreation, reasoning)
+	usd, priced = ps.Cost(model, inputTotal, output, cacheRead, cacheCreation, reasoning)
 	if !priced || usd <= 0 {
 		// priced-but-zero (free model / zero tokens) is a no-op, not a WARN.
 		return usd, priced, true

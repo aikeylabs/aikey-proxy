@@ -17,8 +17,8 @@ import (
 // production vault.Reader so test cases stay focused on observer
 // behavior rather than vault wiring.
 type stubVault struct {
-	subs []observerSubscription
 	err  error
+	subs []observerSubscription
 }
 
 func (s *stubVault) ListObserveSubscriptions() ([]observerSubscription, error) {
@@ -39,17 +39,18 @@ func newTestObserver(t *testing.T, subs []observerSubscription) (observer.Stream
 
 func mkReq(stream, traceID string) *observer.RequestContext {
 	return &observer.RequestContext{
-		TraceID:        traceID,
-		Stream:         stream,
-		ProviderID:     "anthropic",
-		KeyAlias:       "FreySilvaqzs@qualityservice.com",
-		ResolvedModel:  "claude-sonnet-4-6",
-		StartedAt:      time.Now(),
+		TraceID:       traceID,
+		Stream:        stream,
+		ProviderID:    "anthropic",
+		KeyAlias:      "FreySilvaqzs@qualityservice.com",
+		ResolvedModel: "claude-sonnet-4-6",
+		StartedAt:     time.Now(),
 	}
 }
 
-//nolint:unparam // `stream` kept parameterized so future cases can read
 // other ndjson streams (e.g. agent_chat) without re-plumbing the helper.
+//
+//nolint:unparam // `stream` kept parameterized so future cases can read
 func readEvents(t *testing.T, baseDir, slug, stream string) []Event {
 	t.Helper()
 	path := filepath.Join(baseDir, slug, stream+".ndjson")
@@ -263,12 +264,12 @@ func TestObserver_WriteFailureDoesNotCrash(t *testing.T) {
 // tailer in P3 step 8) break — bump the V field and document migration.
 func TestEventFromContext_StableJSONShape(t *testing.T) {
 	req := &observer.RequestContext{
-		Stream:        "user_chat",
-		TraceID:       "tid-xyz",
-		ProviderID:    "anthropic",
-		KeyAlias:      "myalias",
-		AppSlug:       "",
-		AppKeyID:      "",
+		Stream:         "user_chat",
+		TraceID:        "tid-xyz",
+		ProviderID:     "anthropic",
+		KeyAlias:       "myalias",
+		AppSlug:        "",
+		AppKeyID:       "",
 		RequestedModel: "claude-sonnet-4-6",
 		ResolvedModel:  "claude-sonnet-4-6-20251001",
 	}

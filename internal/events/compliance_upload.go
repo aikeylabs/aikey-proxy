@@ -45,9 +45,9 @@ func (r *Reporter) UploadComplianceEvents(ctx context.Context, routeSource strin
 	}
 	req.Header.Set("Content-Type", "application/json")
 	if cred := r.credentialForRouteSource(routeSource); cred != nil {
-		bearer, err := cred.Bearer(ctx)
-		if err != nil {
-			return fmt.Errorf("compliance upload: credential for %q: %w", routeSource, err)
+		bearer, bErr := cred.Bearer(ctx)
+		if bErr != nil {
+			return fmt.Errorf("compliance upload: credential for %q: %w", routeSource, bErr)
 		}
 		if bearer != "" {
 			req.Header.Set("Authorization", "Bearer "+bearer)

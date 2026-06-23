@@ -144,11 +144,12 @@ func hasStrictHex64Suffix(token, prefix string) bool {
 // after `aikey_`, or "<empty>" / "<no-aikey-prefix>" for edge cases.
 //
 // Examples:
-//   "aikey_personal_0123abcd..."  → "aikey_personal_..."
-//   "aikey_vk_acc-1234abc"        → "aikey_vk_..."
-//   "aikey_unknown_xyz"           → "aikey_unknown_..."
-//   ""                            → "<empty>"
-//   "sk-real-secret"              → "<no-aikey-prefix>"
+//
+//	"aikey_personal_0123abcd..."  → "aikey_personal_..."
+//	"aikey_vk_acc-1234abc"        → "aikey_vk_..."
+//	"aikey_unknown_xyz"           → "aikey_unknown_..."
+//	""                            → "<empty>"
+//	"sk-real-secret"              → "<no-aikey-prefix>"
 //
 // Why not log the full token: even legacy bearers are local-proxy
 // credentials; leaking them into stderr / log files broadens the blast

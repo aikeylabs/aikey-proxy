@@ -5,6 +5,7 @@ import (
 	"crypto/rand"
 	"database/sql"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"time"
 
@@ -83,11 +84,11 @@ func (s *VaultAccountStore) Save(_ context.Context, acct *broker.ProviderAccount
 	defer func() { _ = tx.Rollback() }() // no-op after Commit
 
 	var existing sql.NullString
-	if err := tx.QueryRow(
+	if qErr := tx.QueryRow(
 		"SELECT route_token FROM provider_accounts WHERE provider_account_id = ?",
 		acct.ProviderAccountID,
-	).Scan(&existing); err != nil && err != sql.ErrNoRows {
-		return fmt.Errorf("save provider account: read existing route_token: %w", err)
+	).Scan(&existing); qErr != nil && qErr != sql.ErrNoRows {
+		return fmt.Errorf("save provider account: read existing route_token: %w", qErr)
 	}
 
 	routeToken := existing.String
@@ -150,7 +151,7 @@ func (s *VaultAccountStore) ListByProvider(_ context.Context, provider string) (
 
 func (s *VaultAccountStore) ListAll(_ context.Context) ([]*broker.ProviderAccount, error) {
 	return s.queryMany(
-		"SELECT "+accountCols+" FROM provider_accounts ORDER BY provider, created_at",
+		"SELECT " + accountCols + " FROM provider_accounts ORDER BY provider, created_at",
 	)
 }
 
@@ -195,7 +196,7 @@ const accountCols = "provider_account_id, provider, auth_type, credential_type, 
 func (s *VaultAccountStore) queryOne(query string, args ...any) (*broker.ProviderAccount, error) {
 	row := s.db.QueryRow(query, args...)
 	acct, err := scanAccount(row)
-	if err == sql.ErrNoRows {
+	if errors.Is(err, sql.ErrNoRows) {
 		return nil, nil
 	}
 	if err != nil {
@@ -222,17 +223,12 @@ func (s *VaultAccountStore) queryMany(query string, args ...any) ([]*broker.Prov
 	return result, rows.Err()
 }
 
-// scannable is an interface satisfied by both *sql.Row and *sql.Rows.
-type scannable interface {
-	Scan(dest ...any) error
-}
-
 func scanAccount(row *sql.Row) (*broker.ProviderAccount, error) {
 	var (
 		id, provider, authType, credType, status string
-		extID, display, orgUUID, tier             sql.NullString
-		createdAt                                 int64
-		lastUsedAt                                sql.NullInt64
+		extID, display, orgUUID, tier            sql.NullString
+		createdAt                                int64
+		lastUsedAt                               sql.NullInt64
 	)
 	err := row.Scan(&id, &provider, &authType, &credType, &status,
 		&extID, &display, &orgUUID, &tier, &createdAt, &lastUsedAt)
@@ -246,9 +242,9 @@ func scanAccount(row *sql.Row) (*broker.ProviderAccount, error) {
 func scanAccountFromRows(rows *sql.Rows) (*broker.ProviderAccount, error) {
 	var (
 		id, provider, authType, credType, status string
-		extID, display, orgUUID, tier             sql.NullString
-		createdAt                                 int64
-		lastUsedAt                                sql.NullInt64
+		extID, display, orgUUID, tier            sql.NullString
+		createdAt                                int64
+		lastUsedAt                               sql.NullInt64
 	)
 	err := rows.Scan(&id, &provider, &authType, &credType, &status,
 		&extID, &display, &orgUUID, &tier, &createdAt, &lastUsedAt)
