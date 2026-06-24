@@ -4,6 +4,7 @@ import (
 	"context"
 	"os"
 	"path/filepath"
+	"runtime"
 	"testing"
 	"time"
 
@@ -20,7 +21,11 @@ func TestResolveAppBinary(t *testing.T) {
 	if err := os.MkdirAll(binDir, 0o755); err != nil {
 		t.Fatal(err)
 	}
-	bin := filepath.Join(binDir, "myfilter")
+	// Lay the binary down under the SAME OS-native name `aikey app install` uses
+	// (myfilter.exe on Windows, myfilter elsewhere) — the bug was the resolver
+	// looking for the extensionless name on Windows and missing the installed
+	// .exe. Using appBinaryFileName here keeps the test honest cross-platform.
+	bin := filepath.Join(binDir, appBinaryFileName("myfilter"))
 	if err := os.WriteFile(bin, []byte("#!/bin/sh\n"), 0o600); err != nil {
 		t.Fatal(err)
 	}
@@ -35,9 +40,24 @@ func TestResolveAppBinary(t *testing.T) {
 		t.Errorf("should find the second slug, got (%q,%q)", got, slug)
 	}
 	// a directory at the binary path must NOT count as a binary.
-	_ = os.MkdirAll(filepath.Join(dir, "dirapp", "bin", "dirapp"), 0o755)
+	_ = os.MkdirAll(filepath.Join(dir, "dirapp", "bin", appBinaryFileName("dirapp")), 0o755)
 	if got, _ := resolveAppBinary(dir, []string{"dirapp"}); got != "" {
 		t.Errorf("a dir is not a binary, got %q", got)
+	}
+}
+
+// appBinaryFileName must match the OS-native name the installer writes: bare on
+// Unix, .exe on Windows. The Windows arm is the regression guard for the
+// 2026-06-23 bug where an extensionless lookup missed the installed
+// ai-compliance-detector.exe and latched the proxy into fail-loud 501.
+func TestAppBinaryFileName(t *testing.T) {
+	got := appBinaryFileName("ai-compliance-detector")
+	want := "ai-compliance-detector"
+	if runtime.GOOS == "windows" {
+		want = "ai-compliance-detector.exe"
+	}
+	if got != want {
+		t.Errorf("appBinaryFileName=%q want %q (GOOS=%s)", got, want, runtime.GOOS)
 	}
 }
 

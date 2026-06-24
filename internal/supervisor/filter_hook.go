@@ -24,6 +24,7 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strconv"
 	"strings"
 	"time"
@@ -301,12 +302,32 @@ func (s *Supervisor) appsDir() string {
 // filter_record_allow) for the binary it actually resolved.
 func resolveAppBinary(appsDir string, slugs []string) (bin, slug string) {
 	for _, s := range slugs {
-		b := filepath.Join(appsDir, s, "bin", s)
+		b := filepath.Join(appsDir, s, "bin", appBinaryFileName(s))
 		if fi, err := os.Stat(b); err == nil && !fi.IsDir() {
 			return b, s
 		}
 	}
 	return "", ""
+}
+
+// appBinaryFileName returns the on-disk filename `aikey app install` lays an
+// app's binary down as: "<slug>.exe" on Windows, "<slug>" elsewhere. The proxy
+// MUST resolve the binary with the SAME OS-native name the installer wrote.
+//
+// Why this exists (bug 2026-06-23): the lookup used to be unconditionally
+// extensionless (`bin/<slug>`). On Windows the installer lays the binary down as
+// `<slug>.exe`, so os.Stat of the extensionless path always missed →
+// resolveFilterBinary reported declaredButMissing=true → the supervisor latched
+// fail-loud 501 (filterStub501Active) and the proxy refused ALL data-plane
+// traffic the moment a user registered the compliance filter (`aikey app
+// register --filter-stages ...`). I.e. installing the compliance plugin broke
+// every LLM call on Windows. Linux/macOS were unaffected (no extension).
+// Bugfix: workflow/CI/bugfix/2026-06-23-windows-filter-binary-missing-exe-501.md
+func appBinaryFileName(slug string) string {
+	if runtime.GOOS == "windows" {
+		return slug + ".exe"
+	}
+	return slug
 }
 
 // filterTimeout resolves the per-Detect deadline: env override (ms) if a valid
