@@ -170,6 +170,19 @@ type ResolvedRoute struct {
 	// own active profile). first-party only; see AppKind above for the
 	// defense-in-depth check.
 	FollowUserActive bool
+
+	// ── Seat-group (channel ③) route fields (N7c) ─────────────────────────
+	// SeatGroupID != "" marks a GROUP virtual key: PlaintextKey is empty and the
+	// dispatch resolver (N8) picks a candidate account from GroupAccounts (ranked
+	// via pkg/seatassign for SeatID), reads its token from GroupRuntime, and
+	// injects it. Empty for direct-bind VKs → existing path, byte-unchanged.
+	SeatGroupID string
+	// GroupAccounts: candidate account list JSON (structural). GroupRuntime:
+	// per-account token/key material JSON (channel ③, encrypted, proxy-pulled;
+	// NEVER refresh_token). RoutingConfig: the group's routing knobs JSON.
+	GroupAccounts string
+	GroupRuntime  string
+	RoutingConfig string
 }
 
 // IsModelAllowed checks if the given model is permitted by this route.

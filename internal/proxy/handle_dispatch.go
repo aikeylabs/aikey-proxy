@@ -224,6 +224,19 @@ func (p *Proxy) Handle(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// 3c. Seat-group routing (N8). A group VK carries no static key — its
+	// per-account material is in route.GroupRuntime; pick a candidate account +
+	// inject its credential via the dedicated handler. Gated on the field, not a
+	// re-read of the feature flag: group VKs are only ever registered when the
+	// flag is on (N7c-1), so route.SeatGroupID is empty in the flag-off build and
+	// the direct-bind path below stays byte-identical. A registered group VK MUST
+	// be served as a group — never fall through to the static-key path (that
+	// misroute is exactly what the registration gate prevents).
+	if route.SeatGroupID != "" {
+		p.handleSeatGroupRoute(w, r, route, token, startTime, logger, tc.TraceID)
+		return
+	}
+
 	// 4. Get real key — either from the pre-decrypted managed cache or from vault.
 	var realKey string
 	if route.PlaintextKey != "" {

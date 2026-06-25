@@ -257,6 +257,25 @@ type ManagedKey struct {
 	CredentialRevision string
 	VirtualKeyRevision string
 	OwnerAccountID     string
+
+	// ── Seat-group (channel ③) fields (N7c) ───────────────────────────────
+	// Populated only for group VKs (binding.target = seat_group). For these,
+	// PlaintextKey is EMPTY — the real per-account material lives in GroupRuntime
+	// and the route resolver (N8) picks a candidate account + injects its token.
+	//
+	// SeatGroupID != "" is the discriminator: empty = direct-bind VK (existing
+	// path, byte-unchanged); non-empty = group VK.
+	SeatGroupID string
+	// GroupAccounts: the candidate account list JSON (structural, CLI-synced) —
+	// [{account_id, identity, provider_code, priority, assigned}].
+	GroupAccounts string
+	// GroupRuntime: per-account token/key material JSON (channel ③, proxy-pulled,
+	// encrypted at rest) — {account_id:{access_token ciphertext, expires, window}/
+	// {key ciphertext, base_url, revision}}. NEVER refresh_token.
+	GroupRuntime string
+	// RoutingConfig: the group's routing knobs JSON (exhaustion_signals/util_cap/
+	// ratios), structural-synced; the resolver reads it for classification.
+	RoutingConfig string
 }
 
 // GetActiveManagedKeys reads all team keys from managed_virtual_keys_cache that
@@ -280,31 +299,51 @@ type ManagedKey struct {
 // different master password or corrupted data) so a single bad entry does not
 // block the proxy from starting.
 func (r *Reader) GetActiveManagedKeys() ([]ManagedKey, error) {
-	// 2026-05-09 alias surfacing: COALESCE(local_alias, alias) — the cache
-	// has two alias-like columns:
-	//   - `alias` (NOT NULL): server-side canonical alias (e.g.
-	//     "key-335923591-0011-1") set when the key was provisioned. Always
-	//     populated.
-	//   - `local_alias` (nullable, retrofit): per-client rename overlay
-	//     populated by `aikey key rename`. NULL until the user explicitly
-	//     renames.
-	// Use local_alias when set, fall back to alias. Either way the WAL /
-	// receipt now shows a meaningful name instead of the vk_id tail.
+	// Try the group-aware query first (reads the seat_group columns added by
+	// N0/N6). Fall back to the legacy query on error — an older vault that lacks
+	// those columns must still load its direct-bind keys, never lose all keys
+	// over a missing column. Mirrors the CLI's column-cascade (storage_platform.rs).
+	keys, err := r.queryManagedKeys(true)
+	if err != nil {
+		keys, err = r.queryManagedKeys(false)
+		if err != nil {
+			// Table missing on very old vaults — treat as empty, not an error.
+			return nil, nil //nolint:nilerr // missing table → empty result, not a failure
+		}
+	}
+	return keys, nil
+}
+
+// queryManagedKeys reads active managed keys. withGroup=true also selects the
+// seat-group columns (group VKs); false is the legacy shape for older vaults.
+//
+// 2026-05-09 alias surfacing: COALESCE(local_alias, alias) — the cache has two
+// alias-like columns (`alias` server-canonical NOT NULL, `local_alias` nullable
+// per-client rename overlay). Use local_alias when set, fall back to alias.
+func (r *Reader) queryManagedKeys(withGroup bool) ([]ManagedKey, error) {
+	groupCols := ""
+	// Direct-bind keys require provider_key_ciphertext; group VKs have NONE
+	// (material rides group_runtime), so when reading group columns we also admit
+	// rows whose only target is a seat_group.
+	targetFilter := "provider_key_ciphertext IS NOT NULL"
+	if withGroup {
+		groupCols = ", seat_group_id, group_accounts, group_runtime, routing_config"
+		targetFilter = "(provider_key_ciphertext IS NOT NULL OR seat_group_id IS NOT NULL)"
+	}
 	rows, err := r.db.Query(`
 		SELECT virtual_key_id, COALESCE(NULLIF(local_alias, ''), alias) AS effective_alias,
 		       provider_code, protocol_type, base_url,
 		       provider_key_nonce, provider_key_ciphertext, provider_base_urls,
 		       org_id, seat_id, credential_id, credential_revision,
-		       virtual_key_revision, owner_account_id
+		       virtual_key_revision, owner_account_id` + groupCols + `
 		FROM managed_virtual_keys_cache
 		WHERE key_status = 'active'
-		  AND provider_key_ciphertext IS NOT NULL
+		  AND ` + targetFilter + `
 		  AND COALESCE(local_state, '') != 'stale'
 		  AND COALESCE(local_state, '') NOT LIKE 'disabled_by_%'
 	`)
 	if err != nil {
-		// Table may not exist on older vaults — treat as empty, not an error.
-		return nil, nil //nolint:nilerr // older vaults lack this table; missing-table error means empty result, not a failure
+		return nil, err
 	}
 	defer rows.Close()
 
@@ -316,62 +355,83 @@ func (r *Reader) GetActiveManagedKeys() ([]ManagedKey, error) {
 		var providerBaseURLsJSON *string
 		var orgID, seatID, credID, credRev, vkRev string
 		var ownerAccountID *string
-		if err := rows.Scan(&vkID, &localAlias, &provCode, &protType, &baseURL, &nonce, &ciphertext, &providerBaseURLsJSON,
-			&orgID, &seatID, &credID, &credRev, &vkRev, &ownerAccountID); err != nil {
+		var seatGroupID, groupAccounts, groupRuntime, routingConfig *string // group cols (nullable)
+
+		dest := []any{&vkID, &localAlias, &provCode, &protType, &baseURL, &nonce, &ciphertext, &providerBaseURLsJSON,
+			&orgID, &seatID, &credID, &credRev, &vkRev, &ownerAccountID}
+		if withGroup {
+			dest = append(dest, &seatGroupID, &groupAccounts, &groupRuntime, &routingConfig)
+		}
+		if err := rows.Scan(dest...); err != nil {
 			slog.Warn("managed key: scan error, skipping", "error", err)
 			continue
 		}
-		plaintext, err := Decrypt(r.derivedKey, nonce, ciphertext)
-		if err != nil {
-			// 2026-05-11: was WARN, upgraded to ERROR. A decrypt failure on
-			// the proxy's hot path means this team key was written with a
-			// vault_key that no longer matches the current password_hash —
-			// downstream requests routed via aikey_team_<vk_id> will surface
-			// as 401 "Route token not found in registry" with no actionable
-			// signal. ERROR + an actionable hint forces the operator to see
-			// it (no silent registry shrink). See
-			// workflow/CI/bugfix/2026-05-11-team-key-decrypt-inconsistent.md.
-			slog.Error(
-				"managed key ciphertext was written with an inconsistent vault_key — proxy cannot decrypt. Recovery: aikey key sync --force-reencrypt",
-				"event.name", "vault.managed_key.decrypt_inconsistent",
-				"error.code", "VAULT_MANAGED_KEY_DECRYPT_INCONSISTENT",
-				"vk_id", vkID,
-				"error.message", err.Error(),
-			)
+
+		sgID := derefStr(seatGroupID)
+		// Direct-bind keys decrypt their provider_key_ciphertext. Group VKs have
+		// NO ciphertext (material rides group_runtime, per-account) → skip decrypt,
+		// leave PlaintextKey empty; the route resolver (N8) picks an account.
+		var plaintextKey string
+		if len(ciphertext) > 0 {
+			plaintext, err := Decrypt(r.derivedKey, nonce, ciphertext)
+			if err != nil {
+				// 2026-05-11: ERROR (not WARN). A decrypt failure means this team
+				// key was written with a vault_key that no longer matches the
+				// current password_hash — requests via aikey_team_<vk_id> 401 with
+				// no actionable signal. See
+				// workflow/CI/bugfix/2026-05-11-team-key-decrypt-inconsistent.md.
+				slog.Error(
+					"managed key ciphertext was written with an inconsistent vault_key — proxy cannot decrypt. Recovery: aikey key sync --force-reencrypt",
+					"event.name", "vault.managed_key.decrypt_inconsistent",
+					"error.code", "VAULT_MANAGED_KEY_DECRYPT_INCONSISTENT",
+					"vk_id", vkID,
+					"error.message", err.Error(),
+				)
+				continue
+			}
+			plaintextKey = string(plaintext)
+		} else if sgID == "" {
+			// No ciphertext AND not a group VK — shouldn't pass the WHERE, but
+			// guard: skip rather than register an empty-key route.
 			continue
 		}
+
 		providerBaseURLs := make(map[string]string)
 		if providerBaseURLsJSON != nil && *providerBaseURLsJSON != "" {
 			_ = json.Unmarshal([]byte(*providerBaseURLsJSON), &providerBaseURLs)
 		}
-		var accountID string
-		if ownerAccountID != nil {
-			accountID = *ownerAccountID
-		}
-		var aliasStr string
-		if localAlias != nil {
-			aliasStr = *localAlias
-		}
 		keys = append(keys, ManagedKey{
 			VirtualKeyID:       vkID,
-			LocalAlias:         aliasStr,
+			LocalAlias:         derefStr(localAlias),
 			ProviderCode:       provCode,
 			ProtocolType:       protType,
 			BaseURL:            baseURL,
-			PlaintextKey:       string(plaintext),
+			PlaintextKey:       plaintextKey,
 			ProviderBaseURLs:   providerBaseURLs,
 			OrgID:              orgID,
 			SeatID:             seatID,
 			CredentialID:       credID,
 			CredentialRevision: credRev,
 			VirtualKeyRevision: vkRev,
-			OwnerAccountID:     accountID,
+			OwnerAccountID:     derefStr(ownerAccountID),
+			SeatGroupID:        sgID,
+			GroupAccounts:      derefStr(groupAccounts),
+			GroupRuntime:       derefStr(groupRuntime),
+			RoutingConfig:      derefStr(routingConfig),
 		})
 	}
 	if err := rows.Err(); err != nil {
 		return nil, fmt.Errorf("managed keys scan: %w", err)
 	}
 	return keys, nil
+}
+
+// derefStr returns the pointed-at string, or "" when nil (nullable columns).
+func derefStr(p *string) string {
+	if p == nil {
+		return ""
+	}
+	return *p
 }
 
 // GetPersonalKeyByAlias returns the plaintext key, provider_code, and custom base_url
@@ -1610,6 +1670,27 @@ func WriteConfigString(dbPath, key, value string) error {
 	_, err = db.Exec("INSERT OR REPLACE INTO config (key, value) VALUES (?, ?)", key, []byte(value))
 	if err != nil {
 		return fmt.Errorf("write config key %q: %w", key, err)
+	}
+	return nil
+}
+
+// WriteGroupRuntime updates the group_runtime column for one group VK (N7c-2).
+// jsonValue is the proxy-built per-account material JSON (token/key ciphertext +
+// window/meta). Only managed_virtual_keys_cache.group_runtime is touched — never
+// the CLI-owned structural columns (which the CLI's sync fences this out of). A
+// separate write connection mirrors WriteConfigString's pattern.
+func WriteGroupRuntime(dbPath, virtualKeyID, jsonValue string) error {
+	db, err := sql.Open("sqlite", dbPath)
+	if err != nil {
+		return fmt.Errorf("open vault db for group_runtime write: %w", err)
+	}
+	defer db.Close()
+
+	_, err = db.Exec(
+		"UPDATE managed_virtual_keys_cache SET group_runtime = ? WHERE virtual_key_id = ?",
+		jsonValue, virtualKeyID)
+	if err != nil {
+		return fmt.Errorf("write group_runtime for vk %q: %w", virtualKeyID, err)
 	}
 	return nil
 }

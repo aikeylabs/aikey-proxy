@@ -290,6 +290,11 @@ type Supervisor struct {
 	// takes effect within the 60s poll WITHOUT the employee running any command,
 	// and steady state adds no churn. Mirrors lastFilterSig / masterCompliance.
 	lastQuotaSig atomic.Pointer[string]
+	// lastGroupRuntimeSig is the signature (raw response body) of the last group
+	// runtime this node pulled (N7c-2). pollGroupRuntime rewrites group_runtime +
+	// Reloads ONLY when the material actually changed (a token refreshed), so a
+	// 60s poll over unchanged tokens adds no churn. Mirrors lastQuotaSig.
+	lastGroupRuntimeSig atomic.Pointer[string]
 	// quotaHeartbeat is the traffic-independent server-reachability probe behind
 	// budget-mode staleness (D-U7/P9). nil unless enforce_mode=budget AND a
 	// collector URL is configured — so the default availability path (and Personal)
@@ -412,6 +417,13 @@ func New(cfg *config.Config, configPath, password, version string) (*Supervisor,
 	// it on the same master-poll rail as compliance/audit. No-op when no team/org
 	// or no active seats (Personal), or when quota is disabled.
 	observability.GoSafe("supervisor.quota_policy_poll", observability.Isolated, func() { s.pollQuotaPolicy(s.ctx) })
+
+	// N7c-2: pull the account's group runtime (channel ③ token/key material) on
+	// the same master-poll rail, so a group OAuth token refreshed on master reaches
+	// this node without any CLI command. No-op unless AIKEY_PROXY_SEAT_GROUP_ENABLED
+	// (and there is a local group VK). Isolated: a poller panic must not kill the
+	// data path.
+	observability.GoSafe("supervisor.group_runtime_poll", observability.Isolated, func() { s.pollGroupRuntime(s.ctx) })
 
 	// Cluster mode (V3c): register this node with the hub name service + heartbeat
 	// so clients discover it via /cluster/resolve. Inert for non-cluster proxies —
@@ -679,6 +691,15 @@ func (s *Supervisor) syncManagedKeys() {
 	}
 	for i := range managedKeys {
 		mk := &managedKeys[i]
+		// N7c safety gate: a group VK (SeatGroupID != "") carries NO PlaintextKey —
+		// its per-account material lives in GroupRuntime and routing requires the
+		// group resolver (N8). Until that's enabled, do NOT register group VKs;
+		// otherwise the hot path's `PlaintextKey != ""` check fails and the request
+		// falls to the personal-key path and 401s. Gated by
+		// AIKEY_PROXY_SEAT_GROUP_ENABLED (default off) → direct-bind path unchanged.
+		if mk.SeatGroupID != "" && !seatGroupRoutingEnabled() {
+			continue
+		}
 		// 2026-04-29 prefix rename: team token = aikey_team_<vk_id>.
 		// Use NormalizeTeamToken so historical-prefix dirty data in
 		// mk.VirtualKeyID gets stripped+rebuilt (defense-in-depth: should

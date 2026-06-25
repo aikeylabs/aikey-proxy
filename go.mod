@@ -9,6 +9,7 @@ require (
 	github.com/AiKeyLabs/pkg/aikeytime v0.0.0
 	github.com/AiKeyLabs/pkg/buildinfo v0.0.0
 	github.com/AiKeyLabs/pkg/providerroutes v0.0.0
+	github.com/AiKeyLabs/pkg/seatassign v0.0.0
 	github.com/AiKeyLabs/pkg/usagehash v0.0.0
 	github.com/aikeylabs/ai-degrade-detector/proxy-plugin/rhythm v0.0.0
 	github.com/cespare/xxhash/v2 v2.3.0
@@ -28,6 +29,8 @@ replace github.com/AiKeyLabs/pkg/aikeytime => ../pkg/aikeytime
 replace github.com/AiKeyLabs/pkg/aikeycompat => ../pkg/aikeycompat
 
 replace github.com/AiKeyLabs/pkg/providerroutes => ../pkg/providerroutes
+
+replace github.com/AiKeyLabs/pkg/seatassign => ../pkg/seatassign
 
 replace github.com/AiKeyLabs/pkg/usagehash => ../pkg/usagehash
 

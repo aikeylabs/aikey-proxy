@@ -24,6 +24,13 @@ type VaultGetter interface {
 	GetSecret(alias string) (string, error)
 }
 
+// groupKeyProvider exposes the vault's derived key so the seat-group resolver
+// (N8) can decrypt per-account group material at request time. *vault.Reader
+// implements it; an injected mock that doesn't disables group routing (safe).
+type groupKeyProvider interface {
+	DerivedKey() []byte
+}
+
 // ActiveKeyReader extends VaultGetter with active-key lookups used by
 // path-prefix routing (/anthropic/v1/..., /openai/v1/...).
 // Implemented by *vault.Reader when the vault supports managed and personal keys.
@@ -59,6 +66,15 @@ type OAuthCredential struct {
 	ExternalID  string // Account UUID from OAuth provider (e.g. Claude account.uuid)
 	Identity    string // Email or display name (for logging only, never sent upstream)
 	ExpiresAt   int64
+	// Pooled marks this credential as a seat_group POOL account shared by many
+	// seats. When true, injectClaudeOAuth applies AccountPersona identity
+	// normalization (device_id / session collapse / OS-arch-UA lock) so the
+	// upstream sees ONE consistent device per account_uuid instead of N
+	// employees' real fingerprints — the §3.1 防封 floor for safe pooling.
+	// false (direct-bind / personal OAuth) → existing fill-if-absent behavior,
+	// byte-identical. Only load-bearing on the anthropic path. Design:
+	// 20260624-动态决策账号分配引擎-技术方案.md §3.1/§3.3.
+	Pooled bool
 }
 
 // Proxy is the core reverse proxy that handles virtual key resolution
@@ -70,6 +86,10 @@ type Proxy struct {
 	probeVault   probepipe.VaultReader // non-nil when vault implements the Probe pipeline read surface (mode C, SPEC 2026-05-23)
 	broker       OAuthBroker           // OAuth credential provider (nil = OAuth not available)
 	vault        VaultGetter
+	// groupKey exposes the vault derived key for seat-group material decryption
+	// (N8). nil when the injected vault doesn't implement DerivedKey() (tests) →
+	// group routing degrades to GROUP_KEY_UNAVAILABLE rather than panicking.
+	groupKey groupKeyProvider
 	// filterHook is the P4 filter dispatcher — a generic apphook.Hook
 	// (ai-compliance-detector / DLP / etc.) that inspects the inbound
 	// request body before forwarding. Nil = no filter (the common default
@@ -225,6 +245,14 @@ func New(v VaultGetter, reg *vkeys.Registry, prov *provider.Registry, coll *even
 	if pv, ok := v.(probepipe.VaultReader); ok {
 		p.probeVault = pv
 	}
+	// Seat-group routing (N8) decrypts per-account group material at request
+	// time with the vault derived key. *vault.Reader exposes DerivedKey(); a
+	// mock that doesn't simply leaves p.groupKey nil → group routing degrades
+	// (GROUP_KEY_UNAVAILABLE) instead of panicking. Tests can swap via
+	// SetGroupKeyProvider.
+	if kp, ok := v.(groupKeyProvider); ok {
+		p.groupKey = kp
+	}
 	return p
 }
 
@@ -249,6 +277,14 @@ func (p *Proxy) SetAppVault(av apppipe.VaultReader) {
 // also implements probepipe.VaultReader.
 func (p *Proxy) SetProbeVault(pv probepipe.VaultReader) {
 	p.probeVault = pv
+}
+
+// SetGroupKeyProvider injects the vault derived-key accessor for seat-group
+// material decryption (N8). Mirrors SetProbeVault — auto-wired by New(...) when
+// the VaultGetter argument implements DerivedKey(); tests that exercise group
+// routing inject it explicitly.
+func (p *Proxy) SetGroupKeyProvider(kp groupKeyProvider) {
+	p.groupKey = kp
 }
 
 // SetQuotaEnforcer injects the Phase 2 token-quota gate (Stage 3). Wired by the

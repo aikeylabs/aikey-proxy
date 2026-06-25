@@ -55,6 +55,13 @@ func managedKeyToRoute(mk *vault.ManagedKey) *vkeys.ResolvedRoute {
 		CredentialRevision: mk.CredentialRevision,
 		VirtualKeyRevision: mk.VirtualKeyRevision,
 		RouteSource:        "team",
+		// Seat-group fields (N7c): empty for direct-bind VKs (PlaintextKey set,
+		// existing path unchanged); populated for group VKs (PlaintextKey empty,
+		// resolver picks an account from GroupRuntime). See dispatch N8.
+		SeatGroupID:   mk.SeatGroupID,
+		GroupAccounts: mk.GroupAccounts,
+		GroupRuntime:  mk.GroupRuntime,
+		RoutingConfig: mk.RoutingConfig,
 	}
 }
 
