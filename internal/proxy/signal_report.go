@@ -8,8 +8,13 @@ import (
 	"net/http"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 )
+
+// ponytail: flush cadence doubles as the rate-limit count window — one constant
+// so loop()'s ticker and the reported window_secs can never drift apart.
+const signalFlushInterval = 30 * time.Second
 
 // signal_report.go — I5 proxy emit. The proxy parses the upstream's unified-*
 // 5h-utilization off the response headers and ships it best-effort to master's
@@ -39,12 +44,28 @@ type revokedSample struct {
 	Reason       string `json:"reason"`
 }
 
+// rateLimitSample reports how many 429/403 responses a credential drew in the
+// last flush window. Master normalizes count/window into the allocation engine's
+// §5.1 w5 "Recent429FreqNorm" risk signal (near-window 429/403 rhythm). Unlike
+// util/revoked these are a per-credential COUNTER (a map+mutex, not a channel):
+// 429s are frequent — a rate-limited account can draw a burst per second — so a
+// per-event channel send would be a POST storm. The integer is reset every flush,
+// which bounds the map to the credentials seen in one window. WindowSecs = the
+// flush cadence so master can divide count by it without assuming the interval.
+type rateLimitSample struct {
+	CredentialID string `json:"credential_id"`
+	Count        int    `json:"count"`
+	WindowSecs   int    `json:"window_secs"`
+}
+
 type signalReporter struct {
 	url       string
 	bearer    func(ctx context.Context) (string, error) // account-JWT (reuses the group-runtime poll credential)
 	client    *http.Client
 	in        chan signalSample
 	revokedIn chan revokedSample
+	rlMu      sync.Mutex     // guards rlCounts
+	rlCounts  map[string]int // per-credential 429/403 tally, reset each flush
 	logger    *slog.Logger
 }
 
@@ -60,6 +81,7 @@ func newSignalReporter(controlURL string, bearer func(context.Context) (string, 
 		client:    &http.Client{Timeout: 10 * time.Second},
 		in:        make(chan signalSample, 256),
 		revokedIn: make(chan revokedSample, 64),
+		rlCounts:  make(map[string]int),
 		logger:    logger,
 	}
 	go r.loop()
@@ -95,16 +117,62 @@ func (r *signalReporter) enqueueRevoked(credentialID, reason string) {
 	}
 }
 
+// incrRateLimit tallies one upstream 429/403 for a credential. Same MAIN-LINK
+// safety contract as enqueue (see file header): nil receiver / empty id are
+// dropped, and the bump is a short-held map lock that never blocks forwarding.
+// A counter (not a channel) collapses a 429 burst to O(1) memory per credential;
+// the map is reset every flush (see snapshotRateLimits), so it stays bounded by
+// the live credential set. Lazy-inits the map so a directly-constructed reporter
+// (tests, future call sites) can't nil-panic.
+func (r *signalReporter) incrRateLimit(credentialID string) {
+	if r == nil || credentialID == "" {
+		return
+	}
+	r.rlMu.Lock()
+	if r.rlCounts == nil {
+		r.rlCounts = make(map[string]int)
+	}
+	r.rlCounts[credentialID]++
+	r.rlMu.Unlock()
+}
+
+// snapshotRateLimits atomically reads + clears the 429/403 counters into wire
+// samples. Reset-on-read is what bounds the map: each window only retains the
+// credentials seen since the previous flush. Returns nil when nothing was seen
+// (so an empty window omits the rate_limits array entirely).
+func (r *signalReporter) snapshotRateLimits() []rateLimitSample {
+	r.rlMu.Lock()
+	defer r.rlMu.Unlock()
+	if len(r.rlCounts) == 0 {
+		return nil
+	}
+	out := make([]rateLimitSample, 0, len(r.rlCounts))
+	for id, n := range r.rlCounts {
+		out = append(out, rateLimitSample{
+			CredentialID: id,
+			Count:        n,
+			WindowSecs:   int(signalFlushInterval / time.Second),
+		})
+	}
+	r.rlCounts = make(map[string]int) // reset the window
+	return out
+}
+
 func (r *signalReporter) loop() {
-	ticker := time.NewTicker(30 * time.Second)
+	ticker := time.NewTicker(signalFlushInterval)
 	defer ticker.Stop()
 	var batch []signalSample
 	var revoked []revokedSample
-	flush := func() {
-		if len(batch) == 0 && len(revoked) == 0 {
+	// flush takes the rate-limit snapshot as an arg rather than reading the
+	// counter itself: the size-triggered early flushes below pass nil so they
+	// DON'T disturb the 429/403 window, keeping its span exactly one ticker
+	// period — only the ticker case snapshots, so the reported window_secs stays
+	// accurate even when a util/revoked burst forces an early flush.
+	flush := func(rl []rateLimitSample) {
+		if len(batch) == 0 && len(revoked) == 0 && len(rl) == 0 {
 			return
 		}
-		r.post(batch, revoked)
+		r.post(batch, revoked, rl)
 		batch = batch[:0]
 		revoked = revoked[:0]
 	}
@@ -112,7 +180,7 @@ func (r *signalReporter) loop() {
 		select {
 		case s := <-r.in:
 			if batch = append(batch, s); len(batch) >= 64 {
-				flush()
+				flush(nil)
 			}
 		case rv := <-r.revokedIn:
 			// Revoked rides the SAME 30s batch flush rather than an immediate
@@ -122,23 +190,27 @@ func (r *signalReporter) loop() {
 			// tolerating ≤30s quarantine latency is an acceptable best-effort
 			// trade. The >=64 cap bounds a burst so it doesn't wait the full tick.
 			if revoked = append(revoked, rv); len(revoked) >= 64 {
-				flush()
+				flush(nil)
 			}
 		case <-ticker.C:
-			flush()
+			flush(r.snapshotRateLimits())
 		}
 	}
 }
 
-func (r *signalReporter) post(samples []signalSample, revoked []revokedSample) {
-	// Both arrays are optional: marshal only the non-empty ones so an all-samples
-	// or all-revoked flush still posts a valid body the master can decode.
-	payload := make(map[string]any, 2)
+func (r *signalReporter) post(samples []signalSample, revoked []revokedSample, rateLimits []rateLimitSample) {
+	// All arrays are optional: marshal only the non-empty ones so an all-samples,
+	// all-revoked, or all-rate_limits flush still posts a valid body the master
+	// can decode.
+	payload := make(map[string]any, 3)
 	if len(samples) > 0 {
 		payload["samples"] = samples
 	}
 	if len(revoked) > 0 {
 		payload["revoked"] = revoked
+	}
+	if len(rateLimits) > 0 {
+		payload["rate_limits"] = rateLimits
 	}
 	if len(payload) == 0 {
 		return

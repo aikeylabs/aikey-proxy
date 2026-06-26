@@ -7,6 +7,7 @@ import (
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"sync"
 	"sync/atomic"
 	"testing"
 )
@@ -84,7 +85,7 @@ func TestSignalPostSendsBatch(t *testing.T) {
 	if r == nil {
 		t.Fatal("newSignalReporter returned nil")
 	}
-	r.post([]signalSample{{CredentialID: "c1", TS: 100, Util5h: 0.6}}, nil)
+	r.post([]signalSample{{CredentialID: "c1", TS: 100, Util5h: 0.6}}, nil, nil)
 
 	c := <-got
 	if c.method != http.MethodPost {
@@ -120,7 +121,7 @@ func TestSignalPostBearerErrorDoesNotPost(t *testing.T) {
 	if r == nil {
 		t.Fatal("newSignalReporter returned nil")
 	}
-	r.post([]signalSample{{CredentialID: "c1", TS: 100, Util5h: 0.6}}, nil) // must not panic
+	r.post([]signalSample{{CredentialID: "c1", TS: 100, Util5h: 0.6}}, nil, nil) // must not panic
 
 	if n := atomic.LoadInt32(&hits); n != 0 {
 		t.Fatalf("server hit %d times, want 0 (bearer error short-circuits)", n)
@@ -174,7 +175,7 @@ func TestSignalPostSendsRevoked(t *testing.T) {
 	}
 
 	// all-revoked batch: body omits "samples" and carries only "revoked".
-	r.post(nil, []revokedSample{{CredentialID: "c1", Reason: "revoked"}})
+	r.post(nil, []revokedSample{{CredentialID: "c1", Reason: "revoked"}}, nil)
 	c := <-got
 	if c.method != http.MethodPost {
 		t.Errorf("method = %q, want POST", c.method)
@@ -188,7 +189,7 @@ func TestSignalPostSendsRevoked(t *testing.T) {
 
 	// mixed batch: both arrays serialize.
 	r.post([]signalSample{{CredentialID: "c1", TS: 100, Util5h: 0.6}},
-		[]revokedSample{{CredentialID: "c2", Reason: "revoked"}})
+		[]revokedSample{{CredentialID: "c2", Reason: "revoked"}}, nil)
 	c = <-got
 	var decoded struct {
 		Samples []signalSample  `json:"samples"`
@@ -202,6 +203,121 @@ func TestSignalPostSendsRevoked(t *testing.T) {
 	}
 	if len(decoded.Revoked) != 1 || decoded.Revoked[0] != (revokedSample{CredentialID: "c2", Reason: "revoked"}) {
 		t.Fatalf("decoded revoked = %+v, want one {c2,revoked}", decoded.Revoked)
+	}
+}
+
+func TestIncrRateLimitNilAndEmpty(t *testing.T) {
+	// nil receiver guard: feature-off reporter must not panic.
+	var nilR *signalReporter
+	nilR.incrRateLimit("c1") // must not panic
+
+	// nil rlCounts map → incrRateLimit must lazy-init, not panic; empty id drops.
+	r := &signalReporter{}
+	r.incrRateLimit("") // empty credentialID dropped (no lazy-init needed)
+	if len(r.snapshotRateLimits()) != 0 {
+		t.Fatal("empty credentialID should be dropped")
+	}
+	r.incrRateLimit("c1") // lazy-inits the map
+	if rl := r.snapshotRateLimits(); len(rl) != 1 || rl[0].Count != 1 {
+		t.Fatalf("after lazy init = %+v, want one {c1, count 1}", rl)
+	}
+}
+
+func TestRateLimitCounting(t *testing.T) {
+	r := &signalReporter{rlCounts: make(map[string]int)}
+	// two 429s + one 403 for c1 → count 3; c2 is never seen → stays absent.
+	r.incrRateLimit("c1")
+	r.incrRateLimit("c1")
+	r.incrRateLimit("c1")
+	rl := r.snapshotRateLimits()
+	if len(rl) != 1 {
+		t.Fatalf("snapshot = %+v, want exactly one entry", rl)
+	}
+	if rl[0] != (rateLimitSample{CredentialID: "c1", Count: 3, WindowSecs: 30}) {
+		t.Fatalf("snapshot[0] = %+v, want {c1, 3, 30}", rl[0])
+	}
+}
+
+func TestRateLimitResetAfterFlush(t *testing.T) {
+	r := &signalReporter{rlCounts: make(map[string]int)}
+	r.incrRateLimit("c1")
+	r.incrRateLimit("c1")
+	if rl := r.snapshotRateLimits(); len(rl) != 1 || rl[0].Count != 2 {
+		t.Fatalf("first window = %+v, want c1 count 2", rl)
+	}
+	// next window starts empty (counter was reset on snapshot).
+	if rl := r.snapshotRateLimits(); rl != nil {
+		t.Fatalf("after flush snapshot = %+v, want nil (reset)", rl)
+	}
+	// new increments count up from 0, not from the prior window.
+	r.incrRateLimit("c1")
+	if rl := r.snapshotRateLimits(); len(rl) != 1 || rl[0].Count != 1 {
+		t.Fatalf("second window = %+v, want c1 count 1", rl)
+	}
+}
+
+func TestRateLimitConcurrent(t *testing.T) {
+	// map+mutex concurrency smoke: many goroutines incrementing the same
+	// credential must total exactly N*per (run under -race to catch data races).
+	r := &signalReporter{rlCounts: make(map[string]int)}
+	const goroutines, per = 8, 100
+	var wg sync.WaitGroup
+	for i := 0; i < goroutines; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for j := 0; j < per; j++ {
+				r.incrRateLimit("c1")
+			}
+		}()
+	}
+	wg.Wait()
+	rl := r.snapshotRateLimits()
+	if len(rl) != 1 || rl[0].Count != goroutines*per {
+		t.Fatalf("concurrent count = %+v, want one {c1, %d}", rl, goroutines*per)
+	}
+}
+
+func TestSignalPostSendsRateLimits(t *testing.T) {
+	got := make(chan []byte, 2)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+		b, _ := io.ReadAll(req.Body)
+		got <- b
+	}))
+	defer srv.Close()
+
+	r := newSignalReporter(srv.URL, func(context.Context) (string, error) { return "tok-123", nil }, slog.Default())
+	if r == nil {
+		t.Fatal("newSignalReporter returned nil")
+	}
+
+	// rate-limits-only batch: body omits samples + revoked, exact wire contract.
+	r.post(nil, nil, []rateLimitSample{{CredentialID: "c1", Count: 3, WindowSecs: 30}})
+	if want := `{"rate_limits":[{"credential_id":"c1","count":3,"window_secs":30}]}`; string(<-got) != want {
+		t.Fatalf("rate-limits-only body mismatch, want %s", want)
+	}
+
+	// mixed batch: samples + revoked + rate_limits all serialize.
+	r.post([]signalSample{{CredentialID: "c1", TS: 100, Util5h: 0.6}},
+		[]revokedSample{{CredentialID: "c2", Reason: "revoked"}},
+		[]rateLimitSample{{CredentialID: "c3", Count: 5, WindowSecs: 30}})
+	var decoded struct {
+		Samples    []signalSample    `json:"samples"`
+		Revoked    []revokedSample   `json:"revoked"`
+		RateLimits []rateLimitSample `json:"rate_limits"`
+	}
+	body := <-got
+	if err := json.Unmarshal(body, &decoded); err != nil {
+		t.Fatalf("body not valid JSON: %v (raw %s)", err, body)
+	}
+	if len(decoded.Samples) != 1 || decoded.Samples[0] != (signalSample{CredentialID: "c1", TS: 100, Util5h: 0.6}) {
+		t.Fatalf("decoded samples = %+v, want one {c1,100,0.6}", decoded.Samples)
+	}
+	if len(decoded.Revoked) != 1 || decoded.Revoked[0] != (revokedSample{CredentialID: "c2", Reason: "revoked"}) {
+		t.Fatalf("decoded revoked = %+v, want one {c2,revoked}", decoded.Revoked)
+	}
+	if len(decoded.RateLimits) != 1 || decoded.RateLimits[0] != (rateLimitSample{CredentialID: "c3", Count: 5, WindowSecs: 30}) {
+		t.Fatalf("decoded rate_limits = %+v, want one {c3,5,30}", decoded.RateLimits)
 	}
 }
 

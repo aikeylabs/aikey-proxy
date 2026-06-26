@@ -161,6 +161,18 @@ func (p *Proxy) recordEvent(req *http.Request, resp *http.Response, startTime ti
 	if isHardRevoked(resp.StatusCode, errType, errMsg) {
 		p.signalReporter.enqueueRevoked(route.CredentialID, "revoked")
 	}
+	// Rate-limit-feed emit (best-effort, OFF the hot path, mirrors the revoked
+	// hook above): the proxy sees every upstream 429 (rate limit) / 403 (forbidden);
+	// counting them per credential lets master normalize a near-window 429/403
+	// frequency into the allocation engine's §5.1 w5 "Recent429FreqNorm" risk
+	// signal. We do NOT alter the response — it flows to the client unchanged. The
+	// status is the one captureUpstreamErrorBody already read; we don't re-read the
+	// body. incrRateLimit is nil-safe (reporter off → no-op) and non-blocking (a
+	// short map lock, reset every flush bounds it); an empty CredentialID (no route)
+	// is dropped inside.
+	if resp.StatusCode == http.StatusTooManyRequests || resp.StatusCode == http.StatusForbidden {
+		p.signalReporter.incrRateLimit(route.CredentialID)
+	}
 	p.collector.Record(&ev)
 	// Error responses are treated as interrupted — the client never got a
 	// usable result even though the request finished "fast" from our POV.
