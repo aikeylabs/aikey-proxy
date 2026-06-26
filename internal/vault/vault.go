@@ -258,7 +258,7 @@ type ManagedKey struct {
 	VirtualKeyRevision string
 	OwnerAccountID     string
 
-	// ── Seat-group (channel ③) fields (N7c) ───────────────────────────────
+	// ── Oauth-group (channel ③) fields (N7c) ───────────────────────────────
 	// Populated only for group VKs (binding.target = oauth_group). For these,
 	// PlaintextKey is EMPTY — the real per-account material lives in GroupRuntime
 	// and the route resolver (N8) picks a candidate account + injects its token.
@@ -315,7 +315,7 @@ func (r *Reader) GetActiveManagedKeys() ([]ManagedKey, error) {
 }
 
 // queryManagedKeys reads active managed keys. withGroup=true also selects the
-// seat-group columns (group VKs); false is the legacy shape for older vaults.
+// oauth-group columns (group VKs); false is the legacy shape for older vaults.
 //
 // 2026-05-09 alias surfacing: COALESCE(local_alias, alias) — the cache has two
 // alias-like columns (`alias` server-canonical NOT NULL, `local_alias` nullable

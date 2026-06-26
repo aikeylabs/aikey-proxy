@@ -415,7 +415,7 @@ func (p *Proxy) serveRoute(w http.ResponseWriter, r *http.Request, route *vkeys.
 					logger.Error("rewrite request failed", "error", err)
 				}
 			}
-			// Seat-group POOL identity disguise (NP-4): applied to the OUTBOUND
+			// Oauth-group POOL identity disguise (NP-4): applied to the OUTBOUND
 			// clone ONLY, so the original r kept the real employee identity for
 			// our usage + conversation-audit + filter-cache. A one-type-assert
 			// no-op for every non-pool request. After the URL rewrite so it sees
@@ -426,7 +426,7 @@ func (p *Proxy) serveRoute(w http.ResponseWriter, r *http.Request, route *vkeys.
 			// the shared account. The single pool-serving path always stashes, so
 			// this is silent today — it makes a future path that forgets loud.
 			if poolOAuthLacksDisguise(route, realKey, req) {
-				logger.Warn("seat-group OAuth forwarded without identity disguise — pool account leak risk",
+				logger.Warn("oauth-group OAuth forwarded without identity disguise — pool account leak risk",
 					"event.name", observability.EventProxyGroupPersonaMissing,
 					"oauth_group_id", route.OauthGroupID,
 					"virtual_key_id", route.VirtualKeyID)

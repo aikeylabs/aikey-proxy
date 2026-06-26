@@ -960,7 +960,7 @@ func (s *Supervisor) AppHealthSnapshot() []apppipe.AppHealth {
 	return s.active.Load().proxy.AppHealthSnapshot()
 }
 
-// PoolCooldownSnapshot returns seat-group accounts currently cooling down
+// PoolCooldownSnapshot returns oauth-group accounts currently cooling down
 // (account_id → seconds remaining) from the active generation's proxy, for the
 // admin /status pool-routing health surface (N9).
 func (s *Supervisor) PoolCooldownSnapshot() map[string]int {

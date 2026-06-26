@@ -224,7 +224,7 @@ func (p *Proxy) Handle(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// 3c. Seat-group routing (N8). A group VK carries no static key — its
+	// 3c. Oauth-group routing (N8). A group VK carries no static key — its
 	// per-account material is in route.GroupRuntime; pick a candidate account +
 	// inject its credential via the dedicated handler. Gated on the field, not a
 	// re-read of the feature flag: group VKs are only ever registered when the

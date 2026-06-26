@@ -1,4 +1,4 @@
-// group_serve.go — N8b: serve a seat-group virtual key on the legacy /v1 entry.
+// group_serve.go — N8b: serve a oauth-group virtual key on the legacy /v1 entry.
 //
 // A group VK carries no static key (route.PlaintextKey == ""); its per-account
 // material was pulled into route.GroupRuntime by N7c-2. handleOauthGroupRoute
@@ -126,7 +126,7 @@ func (p *Proxy) handleOauthGroupRoute(
 	// N9 #8: audit a fallback — the seat's primary account was unusable (cooled /
 	// exhausted / expired / no material) so we routed to a different candidate.
 	if res.Primary != "" && res.Primary != res.AccountID {
-		logger.Info("seat-group account switched (primary unusable)",
+		logger.Info("oauth-group account switched (primary unusable)",
 			"event.name", observability.EventProxyGroupAccountSwitched,
 			"oauth_group_id", rc.OauthGroupID,
 			"from_account_id", res.Primary,

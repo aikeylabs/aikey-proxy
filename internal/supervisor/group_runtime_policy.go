@@ -37,7 +37,7 @@ const groupRuntimePollInterval = 60 * time.Second
 
 // pollGroupRuntime runs until ctx is canceled, pulling the account's group
 // runtime every groupRuntimePollInterval (plus once at start). No-op unless the
-// seat-group feature is enabled. The account-JWT credential is built ONCE and
+// oauth-group feature is enabled. The account-JWT credential is built ONCE and
 // reused across cycles (one Bearer refresh window, not one per cycle); the
 // control-plane refresh_token is reusable (same as the collector credential's
 // re-refresh-on-restart design), so reuse is safe.

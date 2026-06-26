@@ -8,7 +8,7 @@ import (
 )
 
 // managedKeysSchema builds an in-memory managed_virtual_keys_cache. withGroup
-// controls whether the seat-group columns exist (false = older vault, exercises
+// controls whether the oauth-group columns exist (false = older vault, exercises
 // GetActiveManagedKeys' legacy fallback).
 func newManagedKeysReader(t *testing.T, withGroup bool) *Reader {
 	t.Helper()
@@ -95,7 +95,7 @@ func TestGetActiveManagedKeys_GroupAndDirectCoexist(t *testing.T) {
 }
 
 func TestGetActiveManagedKeys_LegacyVaultFallback(t *testing.T) {
-	// A vault WITHOUT the seat-group columns: the group-aware query errors and
+	// A vault WITHOUT the oauth-group columns: the group-aware query errors and
 	// GetActiveManagedKeys must fall back to the legacy query (never lose keys).
 	r := newManagedKeysReader(t, false)
 	insertDirectBind(t, r, "vk-direct", "sk-real-key")

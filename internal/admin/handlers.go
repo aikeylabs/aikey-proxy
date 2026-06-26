@@ -74,7 +74,7 @@ type Handler struct {
 	// from "feature disabled" (503).
 	AppHealthFn func() []apppipe.AppHealth
 
-	// PoolHealthFn returns seat-group routing health for /status (N9). nil → the
+	// PoolHealthFn returns oauth-group routing health for /status (N9). nil → the
 	// pool_routing field is omitted (non-pool deployments unchanged).
 	PoolHealthFn func() *PoolRoutingHealth
 
@@ -234,13 +234,13 @@ type statusResponse struct {
 	VirtualKeys int    `json:"virtual_keys_loaded"`
 	TotalReqs   int64  `json:"total_requests"`
 	TotalErrs   int64  `json:"total_errors"`
-	// PoolRouting is the seat-group routing health (N9). Omitted unless the
+	// PoolRouting is the oauth-group routing health (N9). Omitted unless the
 	// feature is on, so non-pool deployments' /status is unchanged. Lets the
 	// operator monitoring the first pool batch see which accounts are cooled.
 	PoolRouting *PoolRoutingHealth `json:"pool_routing,omitempty"`
 }
 
-// PoolRoutingHealth is the seat-group account-routing health surface (N9). Built
+// PoolRoutingHealth is the oauth-group account-routing health surface (N9). Built
 // by the cmd layer from the proxy's reactive cooldown state.
 type PoolRoutingHealth struct {
 	Enabled        bool            `json:"enabled"`

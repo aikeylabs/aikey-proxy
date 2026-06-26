@@ -278,7 +278,7 @@ func main() {
 	adminHandler.DebugUpstreamHeadersStateFn = proxy.UpstreamHeadersDebugState
 	adminHandler.DebugUpstreamHeadersSetFn = proxy.SetUpstreamHeadersDebugAPIOverride
 	adminHandler.AppHealthFn = sup.AppHealthSnapshot
-	// Seat-group routing health (N9): omitted from /status unless the feature is
+	// Oauth-group routing health (N9): omitted from /status unless the feature is
 	// on, so non-pool deployments are unchanged. Surfaces which pool accounts are
 	// currently cooled, for the operator monitoring the first pool batch.
 	adminHandler.PoolHealthFn = func() *admin.PoolRoutingHealth {

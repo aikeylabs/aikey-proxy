@@ -2,7 +2,7 @@ package supervisor
 
 import "github.com/AiKeyLabs/aikey-proxy/internal/vkeys"
 
-// Seat-group (channel ③) proxy-side gating (N7c). The env gate's single source
+// Oauth-group (channel ③) proxy-side gating (N7c). The env gate's single source
 // of truth is vkeys.OauthGroupRoutingEnabled (read by both supervisor and the
 // proxy data plane); this thin wrapper keeps supervisor call sites unchanged.
 //

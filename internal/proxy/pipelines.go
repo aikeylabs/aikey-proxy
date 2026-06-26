@@ -975,7 +975,7 @@ func (p *Proxy) handlePathPrefixRoute(w http.ResponseWriter, r *http.Request, pr
 			return
 		}
 
-		// Seat-group VK: serve via the group handler — the path-prefix entry must
+		// Oauth-group VK: serve via the group handler — the path-prefix entry must
 		// wire this exactly like the legacy /v1 dispatch (handle_dispatch.go:235).
 		// A group VK carries NO VK-level provider (it's per-account in the group
 		// runtime), so without this branch it falls through to the provider-
@@ -984,7 +984,7 @@ func (p *Proxy) handlePathPrefixRoute(w http.ResponseWriter, r *http.Request, pr
 		// path-prefix entry), so ONLY this entry was affected — real Claude Code
 		// uses the /v1 entry which already had the branch. Same empty-provider
 		// root cause as 2026-06-25-group-vk-empty-provider-code-502. group VKs are
-		// only registered when the seat-group flag is on, so OauthGroupID is empty
+		// only registered when the oauth-group flag is on, so OauthGroupID is empty
 		// in flag-off builds and the direct-bind path stays byte-identical.
 		if route.OauthGroupID != "" {
 			// Strip the provider prefix BEFORE handing off to the group handler.

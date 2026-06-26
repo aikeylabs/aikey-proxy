@@ -1,6 +1,6 @@
-// group_runtime.go — shared seat-group routing contracts (N8).
+// group_runtime.go — shared oauth-group routing contracts (N8).
 //
-// Two JSON shapes the seat-group feature passes between components live here,
+// Two JSON shapes the oauth-group feature passes between components live here,
 // in vkeys (the bottom of the proxy dependency graph), so the WRITER
 // (supervisor.group_runtime_policy — pulls + encrypts) and the READER
 // (proxy.group_resolve — ranks + decrypts + injects) share ONE definition

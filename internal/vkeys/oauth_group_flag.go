@@ -2,7 +2,7 @@ package vkeys
 
 import "os"
 
-// Seat-group (channel ③) routing feature flag — the single source of truth for
+// Oauth-group (channel ③) routing feature flag — the single source of truth for
 // the env gate, read by BOTH the supervisor (registry gate + group-runtime pull
 // loop, N7c) and the proxy data plane (hot-path group resolver, N8). Keeping the
 // env key in one place (here, the bottom of the dependency graph) avoids two
@@ -19,7 +19,7 @@ const OauthGroupEnvKey = "AIKEY_PROXY_OAUTH_GROUP_ENABLED"
 
 // OauthGroupRoutingEnabled reports whether proxy-side group VK routing is on.
 //
-// Default ON since 2026-06-26 (user decision): seat-group is the supported way an
+// Default ON since 2026-06-26 (user decision): oauth-group is the supported way an
 // enterprise shares a credential pool, so a freshly-installed proxy must route
 // group VKs without an extra env toggle — otherwise a user who was issued a group
 // VK can't use it after a plain install. Set AIKEY_PROXY_OAUTH_GROUP_ENABLED=0 (or
