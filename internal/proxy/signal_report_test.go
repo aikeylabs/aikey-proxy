@@ -84,7 +84,7 @@ func TestSignalPostSendsBatch(t *testing.T) {
 	if r == nil {
 		t.Fatal("newSignalReporter returned nil")
 	}
-	r.post([]signalSample{{CredentialID: "c1", TS: 100, Util5h: 0.6}})
+	r.post([]signalSample{{CredentialID: "c1", TS: 100, Util5h: 0.6}}, nil)
 
 	c := <-got
 	if c.method != http.MethodPost {
@@ -120,9 +120,110 @@ func TestSignalPostBearerErrorDoesNotPost(t *testing.T) {
 	if r == nil {
 		t.Fatal("newSignalReporter returned nil")
 	}
-	r.post([]signalSample{{CredentialID: "c1", TS: 100, Util5h: 0.6}}) // must not panic
+	r.post([]signalSample{{CredentialID: "c1", TS: 100, Util5h: 0.6}}, nil) // must not panic
 
 	if n := atomic.LoadInt32(&hits); n != 0 {
 		t.Fatalf("server hit %d times, want 0 (bearer error short-circuits)", n)
+	}
+}
+
+func TestEnqueueRevokedNilEmptyAndNonBlocking(t *testing.T) {
+	// nil receiver guard: feature-off reporter must not panic.
+	var nilR *signalReporter
+	nilR.enqueueRevoked("c1", "revoked") // must not panic
+
+	// empty credentialID is dropped; valid one is queued; empty reason defaults.
+	r := &signalReporter{revokedIn: make(chan revokedSample, 4)}
+	r.enqueueRevoked("", "revoked")
+	if len(r.revokedIn) != 0 {
+		t.Fatalf("empty credentialID should be dropped, buffered = %d", len(r.revokedIn))
+	}
+	r.enqueueRevoked("c1", "") // empty reason → defaults to "revoked"
+	if len(r.revokedIn) != 1 {
+		t.Fatalf("valid revoked should be queued, buffered = %d", len(r.revokedIn))
+	}
+	if rv := <-r.revokedIn; rv != (revokedSample{CredentialID: "c1", Reason: "revoked"}) {
+		t.Fatalf("queued = %+v, want {c1, revoked}", rv)
+	}
+
+	// non-blocking: a full buffer drops rather than blocks the forward path.
+	full := &signalReporter{revokedIn: make(chan revokedSample, 1)}
+	full.enqueueRevoked("c1", "revoked")
+	full.enqueueRevoked("c2", "revoked") // buffer full → dropped, must not block
+	if len(full.revokedIn) != 1 {
+		t.Fatalf("full buffer should drop, buffered = %d", len(full.revokedIn))
+	}
+}
+
+func TestSignalPostSendsRevoked(t *testing.T) {
+	type captured struct {
+		method string
+		auth   string
+		body   []byte
+	}
+	got := make(chan captured, 2)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+		b, _ := io.ReadAll(req.Body)
+		got <- captured{req.Method, req.Header.Get("Authorization"), b}
+	}))
+	defer srv.Close()
+
+	r := newSignalReporter(srv.URL, func(context.Context) (string, error) { return "tok-123", nil }, slog.Default())
+	if r == nil {
+		t.Fatal("newSignalReporter returned nil")
+	}
+
+	// all-revoked batch: body omits "samples" and carries only "revoked".
+	r.post(nil, []revokedSample{{CredentialID: "c1", Reason: "revoked"}})
+	c := <-got
+	if c.method != http.MethodPost {
+		t.Errorf("method = %q, want POST", c.method)
+	}
+	if c.auth != "Bearer tok-123" {
+		t.Errorf("Authorization = %q, want %q", c.auth, "Bearer tok-123")
+	}
+	if want := `{"revoked":[{"credential_id":"c1","reason":"revoked"}]}`; string(c.body) != want {
+		t.Fatalf("body = %s, want %s", c.body, want)
+	}
+
+	// mixed batch: both arrays serialize.
+	r.post([]signalSample{{CredentialID: "c1", TS: 100, Util5h: 0.6}},
+		[]revokedSample{{CredentialID: "c2", Reason: "revoked"}})
+	c = <-got
+	var decoded struct {
+		Samples []signalSample  `json:"samples"`
+		Revoked []revokedSample `json:"revoked"`
+	}
+	if err := json.Unmarshal(c.body, &decoded); err != nil {
+		t.Fatalf("body not valid JSON: %v (raw %s)", err, c.body)
+	}
+	if len(decoded.Samples) != 1 || decoded.Samples[0] != (signalSample{CredentialID: "c1", TS: 100, Util5h: 0.6}) {
+		t.Fatalf("decoded samples = %+v, want one {c1,100,0.6}", decoded.Samples)
+	}
+	if len(decoded.Revoked) != 1 || decoded.Revoked[0] != (revokedSample{CredentialID: "c2", Reason: "revoked"}) {
+		t.Fatalf("decoded revoked = %+v, want one {c2,revoked}", decoded.Revoked)
+	}
+}
+
+func TestIsHardRevoked(t *testing.T) {
+	tests := []struct {
+		name    string
+		status  int
+		errType string
+		errMsg  string
+		want    bool
+	}{
+		{"401_revoked_msg", 401, "authentication_error", "OAuth token has been revoked", true},
+		{"401_revoked_in_type", 401, "token_revoked", "", true},
+		{"401_plain_expiry", 401, "authentication_error", "token expired", false},
+		{"429_revoked", 429, "", "revoked", false},
+		{"200_ok", 200, "", "", false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := isHardRevoked(tt.status, tt.errType, tt.errMsg); got != tt.want {
+				t.Fatalf("isHardRevoked(%d,%q,%q) = %v, want %v", tt.status, tt.errType, tt.errMsg, got, tt.want)
+			}
+		})
 	}
 }

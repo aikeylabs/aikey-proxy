@@ -29,12 +29,23 @@ type signalSample struct {
 	Util5h       float64 `json:"util_5h"`
 }
 
+// revokedSample flags a credential whose OAuth token the upstream hard-revoked
+// (401 "OAuth token has been revoked") — master quarantines the account so the
+// allocation engine stops picking it. Same best-effort, fault-isolated delivery
+// as signalSample (see file header); a dropped flag just delays quarantine until
+// the next 401 re-emits it, so loss is self-healing.
+type revokedSample struct {
+	CredentialID string `json:"credential_id"`
+	Reason       string `json:"reason"`
+}
+
 type signalReporter struct {
-	url    string
-	bearer func(ctx context.Context) (string, error) // account-JWT (reuses the group-runtime poll credential)
-	client *http.Client
-	in     chan signalSample
-	logger *slog.Logger
+	url       string
+	bearer    func(ctx context.Context) (string, error) // account-JWT (reuses the group-runtime poll credential)
+	client    *http.Client
+	in        chan signalSample
+	revokedIn chan revokedSample
+	logger    *slog.Logger
 }
 
 // newSignalReporter returns nil (feature off) unless both a control URL and an
@@ -44,11 +55,12 @@ func newSignalReporter(controlURL string, bearer func(context.Context) (string, 
 		return nil
 	}
 	r := &signalReporter{
-		url:    strings.TrimRight(controlURL, "/") + "/accounts/me/signals",
-		bearer: bearer,
-		client: &http.Client{Timeout: 10 * time.Second},
-		in:     make(chan signalSample, 256),
-		logger: logger,
+		url:       strings.TrimRight(controlURL, "/") + "/accounts/me/signals",
+		bearer:    bearer,
+		client:    &http.Client{Timeout: 10 * time.Second},
+		in:        make(chan signalSample, 256),
+		revokedIn: make(chan revokedSample, 64),
+		logger:    logger,
 	}
 	go r.loop()
 	return r
@@ -65,21 +77,51 @@ func (r *signalReporter) enqueue(credentialID string, ts int64, util float64) {
 	}
 }
 
+// enqueueRevoked is the revoked-feed sibling of enqueue: a non-blocking,
+// best-effort hand-off from the forward path's 401 detection. Same MAIN-LINK
+// safety contract — nil receiver / empty id are dropped silently and a full
+// buffer drops rather than blocks (a hard-ban 401s many in-flight requests at
+// once, so the queue can fill; a dropped flag self-heals on the next 401).
+func (r *signalReporter) enqueueRevoked(credentialID, reason string) {
+	if r == nil || credentialID == "" {
+		return
+	}
+	if reason == "" {
+		reason = "revoked"
+	}
+	select {
+	case r.revokedIn <- revokedSample{CredentialID: credentialID, Reason: reason}:
+	default: // buffer full → drop (best-effort; never block forwarding)
+	}
+}
+
 func (r *signalReporter) loop() {
 	ticker := time.NewTicker(30 * time.Second)
 	defer ticker.Stop()
 	var batch []signalSample
+	var revoked []revokedSample
 	flush := func() {
-		if len(batch) == 0 {
+		if len(batch) == 0 && len(revoked) == 0 {
 			return
 		}
-		r.post(batch)
+		r.post(batch, revoked)
 		batch = batch[:0]
+		revoked = revoked[:0]
 	}
 	for {
 		select {
 		case s := <-r.in:
 			if batch = append(batch, s); len(batch) >= 64 {
+				flush()
+			}
+		case rv := <-r.revokedIn:
+			// Revoked rides the SAME 30s batch flush rather than an immediate
+			// per-event POST: a hard-ban 401s many concurrent in-flight requests
+			// at once, so per-event posting would be a POST storm; batching reuses
+			// one flush path (simplicity + main-link isolation) and the engine
+			// tolerating ≤30s quarantine latency is an acceptable best-effort
+			// trade. The >=64 cap bounds a burst so it doesn't wait the full tick.
+			if revoked = append(revoked, rv); len(revoked) >= 64 {
 				flush()
 			}
 		case <-ticker.C:
@@ -88,8 +130,20 @@ func (r *signalReporter) loop() {
 	}
 }
 
-func (r *signalReporter) post(samples []signalSample) {
-	body, err := json.Marshal(map[string]any{"samples": samples})
+func (r *signalReporter) post(samples []signalSample, revoked []revokedSample) {
+	// Both arrays are optional: marshal only the non-empty ones so an all-samples
+	// or all-revoked flush still posts a valid body the master can decode.
+	payload := make(map[string]any, 2)
+	if len(samples) > 0 {
+		payload["samples"] = samples
+	}
+	if len(revoked) > 0 {
+		payload["revoked"] = revoked
+	}
+	if len(payload) == 0 {
+		return
+	}
+	body, err := json.Marshal(payload)
 	if err != nil {
 		return
 	}
@@ -133,4 +187,21 @@ func parseUnifiedUtil5h(h http.Header) (float64, bool) {
 		return 0, false
 	}
 	return v, true
+}
+
+// isHardRevoked reports whether a 401 upstream response means the credential's
+// OAuth token was HARD-revoked (gone for good) vs a routine expiry the refresh
+// path recovers from. Anthropic returns 401 with an "OAuth token has been
+// revoked" message in the hard case. We gate on status==401 AND the "revoked"
+// keyword in the parsed error type/message so a plain token-expiry 401 does NOT
+// quarantine an otherwise-healthy account.
+//
+// ponytail: keyword match on the documented "revoked" string only — narrow on
+// purpose to avoid false-positive quarantines; widen the term list here if other
+// hard-ban phrasings show up.
+func isHardRevoked(statusCode int, errType, errMsg string) bool {
+	if statusCode != http.StatusUnauthorized {
+		return false
+	}
+	return strings.Contains(strings.ToLower(errType+" "+errMsg), "revoked")
 }
