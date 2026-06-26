@@ -80,7 +80,7 @@ func migrate(db *sql.DB) error {
 		// new column lives at end of the table to keep INSERT ordering
 		// of pre-existing columns stable.
 		{"session_id", "ALTER TABLE usage_events ADD COLUMN session_id TEXT DEFAULT ''"},
-		// seat_group account attribution (2026-06-25): the REAL account that
+		// oauth_group account attribution (2026-06-25): the REAL account that
 		// actually served the request, following pool fallback (A→B). Lets
 		// local audit/metrics answer "which account served" without querying
 		// the collector/ODS. Same idempotent ADD-with-pragma-probe pattern;
@@ -105,7 +105,7 @@ func migrate(db *sql.DB) error {
 	if _, err := db.Exec(`CREATE INDEX IF NOT EXISTS idx_events_app_slug ON usage_events(app_slug) WHERE app_slug != ''`); err != nil {
 		return err
 	}
-	// Per-account index for "usage by account" (seat_group attribution view).
+	// Per-account index for "usage by account" (oauth_group attribution view).
 	if _, err := db.Exec(`CREATE INDEX IF NOT EXISTS idx_events_account ON usage_events(account_id) WHERE account_id != ''`); err != nil {
 		return err
 	}
@@ -225,7 +225,7 @@ func (s *Store) QueryStats() (byVKey, byProvider map[string]int64, err error) {
 // QueryByAccount returns request counts grouped by the REAL serving account
 // (account_id), excluding rows with no account dimension (legacy single-binding
 // paths). This is the local "which account served how much" audit view for
-// seat_group pools — it reflects fallback (a request that switched A→B counts
+// oauth_group pools — it reflects fallback (a request that switched A→B counts
 // toward B). Additive to QueryStats so existing callers/mocks are untouched.
 func (s *Store) QueryByAccount() (map[string]int64, error) {
 	byAccount := make(map[string]int64)

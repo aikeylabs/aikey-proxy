@@ -14,19 +14,19 @@ import "os"
 // path is complete + trusted, group VKs MUST NOT serve. Default OFF → the
 // direct-bind path is byte-unchanged.
 
-// SeatGroupEnvKey enables proxy-side group VK routing.
-const SeatGroupEnvKey = "AIKEY_PROXY_SEAT_GROUP_ENABLED"
+// OauthGroupEnvKey enables proxy-side group VK routing.
+const OauthGroupEnvKey = "AIKEY_PROXY_OAUTH_GROUP_ENABLED"
 
-// SeatGroupRoutingEnabled reports whether proxy-side group VK routing is on.
+// OauthGroupRoutingEnabled reports whether proxy-side group VK routing is on.
 //
 // Default ON since 2026-06-26 (user decision): seat-group is the supported way an
 // enterprise shares a credential pool, so a freshly-installed proxy must route
 // group VKs without an extra env toggle — otherwise a user who was issued a group
-// VK can't use it after a plain install. Set AIKEY_PROXY_SEAT_GROUP_ENABLED=0 (or
+// VK can't use it after a plain install. Set AIKEY_PROXY_OAUTH_GROUP_ENABLED=0 (or
 // "false") to force it off. Builds with no group VKs are unaffected: the registry
 // has no group VK to register and the group-runtime pull returns empty (no-op).
-func SeatGroupRoutingEnabled() bool {
-	v := os.Getenv(SeatGroupEnvKey)
+func OauthGroupRoutingEnabled() bool {
+	v := os.Getenv(OauthGroupEnvKey)
 	if v == "" {
 		return true
 	}

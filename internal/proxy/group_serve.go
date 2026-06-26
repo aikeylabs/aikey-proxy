@@ -1,11 +1,11 @@
 // group_serve.go — N8b: serve a seat-group virtual key on the legacy /v1 entry.
 //
 // A group VK carries no static key (route.PlaintextKey == ""); its per-account
-// material was pulled into route.GroupRuntime by N7c-2. handleSeatGroupRoute
+// material was pulled into route.GroupRuntime by N7c-2. handleOauthGroupRoute
 // picks a candidate account (N8a resolver), injects its credential exactly the
 // way the personal-OAuth / team-key paths do, and forwards through the shared
 // serveRouteWithObserver. The direct-bind path in handle_dispatch is untouched —
-// this whole branch is reached only when route.SeatGroupID != "" AND the feature
+// this whole branch is reached only when route.OauthGroupID != "" AND the feature
 // flag is on, and group VKs aren't even registered when the flag is off (N7c-1).
 //
 // SECURITY / CORRECTNESS:
@@ -28,11 +28,11 @@ import (
 	"github.com/AiKeyLabs/aikey-proxy/pkg/observer"
 )
 
-// handleSeatGroupRoute resolves + serves a group VK request. Called from Handle
+// handleOauthGroupRoute resolves + serves a group VK request. Called from Handle
 // after route resolution, model-allowlist, and quota gating, in place of the
 // static-key step-4 path. Always writes a response (success forward or a 503
 // degrade) — the caller returns immediately after.
-func (p *Proxy) handleSeatGroupRoute(
+func (p *Proxy) handleOauthGroupRoute(
 	w http.ResponseWriter, r *http.Request,
 	route *vkeys.ResolvedRoute, inboundBearer string,
 	startTime time.Time, logger *slog.Logger, traceID string,
@@ -53,9 +53,7 @@ func (p *Proxy) handleSeatGroupRoute(
 		if ge, ok := err.(*groupResolveError); ok {
 			code = ge.Code
 		}
-		p.degradeGroup(w, logger, route, code,
-			"No usable account is available in this credential-sharing group right now. "+
-				"Please retry shortly or contact your administrator.")
+		p.degradeGroup(w, logger, route, code, groupDegradeMessage(code))
 		return
 	}
 
@@ -63,7 +61,7 @@ func (p *Proxy) handleSeatGroupRoute(
 	rc := *route
 	rc.AccountID = res.AccountID // usage attribution → the account actually used
 
-	// A group VK is bound to a seat_group, NOT a single provider, so the VK-level
+	// A group VK is bound to a oauth_group, NOT a single provider, so the VK-level
 	// ProviderCode is EMPTY — the provider lives per-account in group_accounts.
 	// Use the RESOLVED account's provider_code (the candidate ref the resolver
 	// picked); fall back to the route's only for safety. Using rc.ProviderCode
@@ -130,7 +128,7 @@ func (p *Proxy) handleSeatGroupRoute(
 	if res.Primary != "" && res.Primary != res.AccountID {
 		logger.Info("seat-group account switched (primary unusable)",
 			"event.name", observability.EventProxyGroupAccountSwitched,
-			"seat_group_id", rc.SeatGroupID,
+			"oauth_group_id", rc.OauthGroupID,
 			"from_account_id", res.Primary,
 			"to_account_id", res.AccountID,
 		)
@@ -138,7 +136,7 @@ func (p *Proxy) handleSeatGroupRoute(
 
 	logger.Info("group route resolved",
 		"event.name", observability.EventProxyGroupRouteResolved,
-		"seat_group_id", rc.SeatGroupID,
+		"oauth_group_id", rc.OauthGroupID,
 		"account_id", res.AccountID,
 		"credential_type", res.CredentialType,
 		"provider", canonicalCode,
@@ -152,13 +150,37 @@ func (p *Proxy) handleSeatGroupRoute(
 // route is about to be forwarded to Anthropic WITHOUT the AccountPersona stash,
 // so the outbound request would carry the employee's REAL identity under the
 // shared account — the exact "一号多设备" ban condition the identity floor
-// prevents. Today the single pool-serving path (handleSeatGroupRoute) always
+// prevents. Today the single pool-serving path (handleOauthGroupRoute) always
 // stashes, so this never fires; it is the backstop that makes a FUTURE
 // pool-routing path that forgets to stash observable instead of silently leaking.
 func poolOAuthLacksDisguise(route *vkeys.ResolvedRoute, realKey string, req *http.Request) bool {
-	return route.SeatGroupID != "" &&
+	return route.OauthGroupID != "" &&
 		realKey == oauthSentinelKey &&
 		req.Context().Value(ctxKeyPoolPersona) == nil
+}
+
+// groupDegradeMessage maps a resolver failure code to an actionable, end-user
+// (Claude Code) message. The three modes mean very different things and need
+// different guidance — collapsing them into one "retry shortly" misleads a member
+// whose access is permanently gone (unbound) into retrying forever.
+func groupDegradeMessage(code string) string {
+	switch code {
+	case groupErrNoCandidates:
+		// Permanent until an admin acts: the seat isn't (or is no longer) a member
+		// of the group, so it has no candidate accounts. Retrying will not help.
+		return "Your seat is not a member of this credential-sharing group (it may have been removed). " +
+			"Contact your administrator — this will not resolve on its own."
+	case groupErrNoMaterial:
+		// Transient: candidates exist but the proxy hasn't pulled their material
+		// yet (channel ③ poll in flight). Retrying shortly is the right action.
+		return "This group's credentials are still syncing to the proxy. Please retry shortly."
+	case groupErrAllUnusable:
+		// Every candidate is expired / quota-exhausted / undecryptable right now.
+		return "All accounts in this credential-sharing group are currently unavailable " +
+			"(rate-limited or expired). Contact your administrator if this persists."
+	default:
+		return "Group routing is temporarily unavailable. Please retry shortly."
+	}
 }
 
 // degradeGroup fails a group request loudly (never silently routes it to a wrong
@@ -170,7 +192,7 @@ func (p *Proxy) degradeGroup(w http.ResponseWriter, logger *slog.Logger, route *
 	logger.Warn("group route degraded",
 		"event.name", observability.EventProxyGroupRouteDegraded,
 		"error.code", code,
-		"seat_group_id", route.SeatGroupID,
+		"oauth_group_id", route.OauthGroupID,
 		"virtual_key_id", route.VirtualKeyID,
 	)
 	writeJSONError(w, http.StatusServiceUnavailable, "server_error", code, clientMsg)

@@ -984,13 +984,13 @@ func (p *Proxy) handlePathPrefixRoute(w http.ResponseWriter, r *http.Request, pr
 		// path-prefix entry), so ONLY this entry was affected — real Claude Code
 		// uses the /v1 entry which already had the branch. Same empty-provider
 		// root cause as 2026-06-25-group-vk-empty-provider-code-502. group VKs are
-		// only registered when the seat-group flag is on, so SeatGroupID is empty
+		// only registered when the seat-group flag is on, so OauthGroupID is empty
 		// in flag-off builds and the direct-bind path stays byte-identical.
-		if route.SeatGroupID != "" {
+		if route.OauthGroupID != "" {
 			// Strip the provider prefix BEFORE handing off to the group handler.
 			// The path-prefix entry normally defers the strip to below (after the
 			// provider-compat check: `r.URL.Path = strippedPath`), but
-			// handleSeatGroupRoute forwards r.URL.Path VERBATIM to the upstream —
+			// handleOauthGroupRoute forwards r.URL.Path VERBATIM to the upstream —
 			// so an unstripped `/anthropic/v1/models` would hit
 			// `api.anthropic.com/anthropic/v1/models` → 404 (verified: Cf-Ray 404
 			// from api.anthropic.com). The legacy /v1 entry (handle_dispatch.go) is
@@ -1000,7 +1000,7 @@ func (p *Proxy) handlePathPrefixRoute(w http.ResponseWriter, r *http.Request, pr
 			if r.URL.RawPath != "" {
 				r.URL.RawPath = strippedPath
 			}
-			p.handleSeatGroupRoute(w, r, route, rawAuthValue, startTime, logger, traceID)
+			p.handleOauthGroupRoute(w, r, route, rawAuthValue, startTime, logger, traceID)
 			return
 		}
 

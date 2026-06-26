@@ -1,6 +1,6 @@
 // group_resolve.go — N8a: seat-group credential resolver (pure, no I/O).
 //
-// Given a resolved group VK route (route.SeatGroupID != ""), this picks one
+// Given a resolved group VK route (route.OauthGroupID != ""), this picks one
 // candidate account for the request and produces the credential to inject:
 //
 //	route.GroupAccounts  (candidate set, ranking inputs + identity, NO secrets)

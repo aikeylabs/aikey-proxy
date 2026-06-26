@@ -1,5 +1,5 @@
 // oauth_pool_persona.go — NP-1: AccountPersona identity normalization for
-// seat_group POOL accounts (the §3.1 防封 floor for safe account pooling).
+// oauth_group POOL accounts (the §3.1 防封 floor for safe account pooling).
 //
 // THE PROBLEM (design 20260624-动态决策账号分配引擎-技术方案.md §3.1): Anthropic
 // clusters abuse by account_uuid. Every inference request is forced to carry
@@ -35,7 +35,7 @@ import (
 
 // poolPersonaCtx is the minimal pool-account identity the Director needs to
 // disguise the OUTBOUND request. Stashed on the request context by a pool-
-// routing site (e.g. handleSeatGroupRoute); consumed once in serveRoute's
+// routing site (e.g. handleOauthGroupRoute); consumed once in serveRoute's
 // Director. Kept tiny so it carries no secret material.
 type poolPersonaCtx struct {
 	accountID  string

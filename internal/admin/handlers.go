@@ -291,7 +291,7 @@ func (h *Handler) Status(w http.ResponseWriter, r *http.Request) {
 type metricsResponse struct {
 	RequestsByVKey     map[string]int64         `json:"requests_by_vkey"`
 	RequestsByProvider map[string]int64         `json:"requests_by_provider"`
-	// RequestsByAccount: per real serving account (seat_group attribution).
+	// RequestsByAccount: per real serving account (oauth_group attribution).
 	// Counts follow pool fallback (A→B counts toward B). Empty when no group
 	// routing has happened. Lets local audit see "which account served" without
 	// the collector/ODS.

@@ -42,7 +42,7 @@ const groupRuntimePollInterval = 60 * time.Second
 // control-plane refresh_token is reusable (same as the collector credential's
 // re-refresh-on-restart design), so reuse is safe.
 func (s *Supervisor) pollGroupRuntime(ctx context.Context) {
-	if !seatGroupRoutingEnabled() {
+	if !oauthGroupRoutingEnabled() {
 		return // feature off → the whole rail is bypassed (direct-bind unchanged)
 	}
 	gen := s.active.Load()
@@ -85,7 +85,7 @@ func (s *Supervisor) syncGroupRuntime(ctx context.Context, cred events.Credentia
 	mks, _ := gen.vault.GetActiveManagedKeys()
 	hasGroup := false
 	for i := range mks {
-		if mks[i].SeatGroupID != "" {
+		if mks[i].OauthGroupID != "" {
 			hasGroup = true
 			break
 		}
@@ -132,7 +132,7 @@ type grDeliveryResp struct {
 }
 
 type grGroup struct {
-	SeatGroupID   string      `json:"seat_group_id"`
+	OauthGroupID   string      `json:"oauth_group_id"`
 	RoutingConfig string      `json:"routing_config"`
 	Accounts      []grAccount `json:"accounts"`
 }
@@ -249,18 +249,20 @@ func buildGroupRuntimeJSON(derivedKey []byte, accounts []grAccount) (string, err
 }
 
 // writeGroupRuntimeForGroups writes the encrypted material into every group VK's
-// group_runtime column. A VK belongs to a group when its SeatGroupID matches; a
+// group_runtime column. A VK belongs to a group when its OauthGroupID matches; a
 // group with no local VK is simply skipped (the proxy only stores what it routes).
 func writeGroupRuntimeForGroups(dbPath string, derivedKey []byte, mks []vault.ManagedKey, groups []grGroup) error {
 	// group_id → its VK ids (from the locally-known managed keys).
 	vksByGroup := make(map[string][]string)
 	for i := range mks {
-		if mks[i].SeatGroupID != "" {
-			vksByGroup[mks[i].SeatGroupID] = append(vksByGroup[mks[i].SeatGroupID], mks[i].VirtualKeyID)
+		if mks[i].OauthGroupID != "" {
+			vksByGroup[mks[i].OauthGroupID] = append(vksByGroup[mks[i].OauthGroupID], mks[i].VirtualKeyID)
 		}
 	}
+	delivered := make(map[string]bool, len(groups))
 	for _, g := range groups {
-		vkIDs := vksByGroup[g.SeatGroupID]
+		delivered[g.OauthGroupID] = true
+		vkIDs := vksByGroup[g.OauthGroupID]
 		if len(vkIDs) == 0 {
 			continue
 		}
@@ -270,6 +272,25 @@ func writeGroupRuntimeForGroups(dbPath string, derivedKey []byte, mks []vault.Ma
 		}
 		for _, vkID := range vkIDs {
 			if err := vault.WriteGroupRuntime(dbPath, vkID, jsonVal); err != nil {
+				return err
+			}
+		}
+	}
+	// Access gate (defense-in-depth): a local group VK whose group is NO LONGER in
+	// the delivery — its seat was unbound, so master stopped delivering it (channel
+	// ③'s oauth_group_member gate) — must have its cached token WIPED, so a stale
+	// secret can't keep serving. The master-side snapshot candidate-set gate already
+	// cuts the route on the next key sync; this clears the residual material on the
+	// proxy's own poll (independent of the CLI), closing the window either way.
+	// group_runtime is a JSON object {account_id:{...}}, so empty = "{}".
+	// Only reached after a SUCCESSFUL delivery fetch (caller gates on ok), so this
+	// never wipes on a transient master error.
+	for gid, vkIDs := range vksByGroup {
+		if delivered[gid] {
+			continue
+		}
+		for _, vkID := range vkIDs {
+			if err := vault.WriteGroupRuntime(dbPath, vkID, "{}"); err != nil {
 				return err
 			}
 		}

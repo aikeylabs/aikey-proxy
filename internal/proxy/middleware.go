@@ -44,8 +44,8 @@ const (
 	// stashExtractedFields), so the security-critical first read is never
 	// skipped; only repeat calls hit this cache.
 	ctxKeyExtractedModel
-	// ctxKeyPoolPersona carries a *poolPersonaCtx for a seat_group POOL request,
-	// stashed by the pool-routing site (handleSeatGroupRoute). It is consumed
+	// ctxKeyPoolPersona carries a *poolPersonaCtx for a oauth_group POOL request,
+	// stashed by the pool-routing site (handleOauthGroupRoute). It is consumed
 	// ONLY in serveRoute's Director, which applies the AccountPersona identity
 	// disguise to the OUTBOUND clone — so the original request `r` keeps the real
 	// employee identity (session / metadata) for our usage + conversation-audit +

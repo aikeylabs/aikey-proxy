@@ -97,12 +97,12 @@ func TestFetchGroupRuntime_ParsesAndSendsBearer(t *testing.T) {
 			w.WriteHeader(404)
 			return
 		}
-		_, _ = w.Write([]byte(`{"groups":[{"seat_group_id":"grp-1","routing_config":"{}","accounts":[{"account_id":"a1","credential_type":"oauth_account","access_token":"tok","expires_at":9}]}]}`))
+		_, _ = w.Write([]byte(`{"groups":[{"oauth_group_id":"grp-1","routing_config":"{}","accounts":[{"account_id":"a1","credential_type":"oauth_account","access_token":"tok","expires_at":9}]}]}`))
 	}))
 	defer srv.Close()
 
 	groups, body, ok := fetchGroupRuntime(context.Background(), srv.URL, "JWT123", map[string]int64{"acc-1": 1750000000})
-	if !ok || len(groups) != 1 || groups[0].SeatGroupID != "grp-1" || len(groups[0].Accounts) != 1 {
+	if !ok || len(groups) != 1 || groups[0].OauthGroupID != "grp-1" || len(groups[0].Accounts) != 1 {
 		t.Fatalf("fetch: ok=%v groups=%+v", ok, groups)
 	}
 	if body == "" || !strings.Contains(body, "grp-1") {
@@ -149,20 +149,20 @@ func TestWriteGroupRuntimeForGroups_PerVKEncrypted(t *testing.T) {
 		t.Fatalf("open: %v", err)
 	}
 	if _, err := db.Exec(`CREATE TABLE managed_virtual_keys_cache (
-		virtual_key_id TEXT PRIMARY KEY, seat_group_id TEXT, group_runtime TEXT)`); err != nil {
+		virtual_key_id TEXT PRIMARY KEY, oauth_group_id TEXT, group_runtime TEXT)`); err != nil {
 		t.Fatalf("create: %v", err)
 	}
 	// vk-g1 → grp-1, vk-direct → no group.
-	db.Exec(`INSERT INTO managed_virtual_keys_cache (virtual_key_id, seat_group_id) VALUES ('vk-g1','grp-1')`)
-	db.Exec(`INSERT INTO managed_virtual_keys_cache (virtual_key_id, seat_group_id) VALUES ('vk-direct','')`)
+	db.Exec(`INSERT INTO managed_virtual_keys_cache (virtual_key_id, oauth_group_id) VALUES ('vk-g1','grp-1')`)
+	db.Exec(`INSERT INTO managed_virtual_keys_cache (virtual_key_id, oauth_group_id) VALUES ('vk-direct','')`)
 	db.Close()
 
 	key := testKey()
 	mks := []vault.ManagedKey{
-		{VirtualKeyID: "vk-g1", SeatGroupID: "grp-1"},
+		{VirtualKeyID: "vk-g1", OauthGroupID: "grp-1"},
 		{VirtualKeyID: "vk-direct"},
 	}
-	groups := []grGroup{{SeatGroupID: "grp-1", Accounts: []grAccount{
+	groups := []grGroup{{OauthGroupID: "grp-1", Accounts: []grAccount{
 		{AccountID: "a1", CredentialType: "oauth_account", AccessToken: "tok-1", ExpiresAt: 5},
 	}}}
 
@@ -190,5 +190,57 @@ func TestWriteGroupRuntimeForGroups_PerVKEncrypted(t *testing.T) {
 	db.QueryRow(`SELECT group_runtime FROM managed_virtual_keys_cache WHERE virtual_key_id='vk-direct'`).Scan(&grD)
 	if grD.Valid && grD.String != "" {
 		t.Fatalf("direct-bind VK group_runtime must stay empty, got %q", grD.String)
+	}
+}
+
+// TestWriteGroupRuntimeForGroups_ClearsUndeliveredGroupVK: a local group VK whose
+// group is NO LONGER in the delivery (its seat was unbound → master stopped
+// delivering it) gets its cached token WIPED to "{}" (access gate, defense-in-
+// depth), while a still-delivered group VK keeps fresh material.
+func TestWriteGroupRuntimeForGroups_ClearsUndeliveredGroupVK(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "vault.db")
+	db, err := sql.Open("sqlite", dbPath)
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	if _, err := db.Exec(`CREATE TABLE managed_virtual_keys_cache (
+		virtual_key_id TEXT PRIMARY KEY, oauth_group_id TEXT, group_runtime TEXT)`); err != nil {
+		t.Fatalf("create: %v", err)
+	}
+	// vk-gone (grp-gone) carries a STALE cached token; vk-stay (grp-stay) is still a member.
+	db.Exec(`INSERT INTO managed_virtual_keys_cache (virtual_key_id, oauth_group_id, group_runtime)
+		VALUES ('vk-gone','grp-gone','{"a-old":{"secret_ciphertext":"stale","secret_nonce":"x"}}')`)
+	db.Exec(`INSERT INTO managed_virtual_keys_cache (virtual_key_id, oauth_group_id, group_runtime)
+		VALUES ('vk-stay','grp-stay','{"a-old":{}}')`)
+	db.Close()
+
+	key := testKey()
+	mks := []vault.ManagedKey{
+		{VirtualKeyID: "vk-gone", OauthGroupID: "grp-gone"},
+		{VirtualKeyID: "vk-stay", OauthGroupID: "grp-stay"},
+	}
+	// Delivery includes grp-stay ONLY — grp-gone dropped out (seat unbound).
+	groups := []grGroup{{OauthGroupID: "grp-stay", Accounts: []grAccount{
+		{AccountID: "a1", CredentialType: "oauth_account", AccessToken: "tok-1", ExpiresAt: 5},
+	}}}
+
+	if err := writeGroupRuntimeForGroups(dbPath, key, mks, groups); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+
+	db, _ = sql.Open("sqlite", dbPath)
+	defer db.Close()
+	// vk-gone: stale token WIPED to "{}".
+	var grGone sql.NullString
+	db.QueryRow(`SELECT group_runtime FROM managed_virtual_keys_cache WHERE virtual_key_id='vk-gone'`).Scan(&grGone)
+	if grGone.String != "{}" {
+		t.Fatalf("undelivered group VK token must be wiped to {}, got %q", grGone.String)
+	}
+	// vk-stay: fresh material delivered (still a member).
+	var grStay sql.NullString
+	db.QueryRow(`SELECT group_runtime FROM managed_virtual_keys_cache WHERE virtual_key_id='vk-stay'`).Scan(&grStay)
+	var m map[string]vkeys.GroupRuntimeAccount
+	if err := json.Unmarshal([]byte(grStay.String), &m); err != nil || decryptSecret(t, key, m["a1"]) != "tok-1" {
+		t.Fatalf("still-member group VK must keep fresh material, got %q", grStay.String)
 	}
 }

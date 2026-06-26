@@ -420,7 +420,7 @@ func New(cfg *config.Config, configPath, password, version string) (*Supervisor,
 
 	// N7c-2: pull the account's group runtime (channel ③ token/key material) on
 	// the same master-poll rail, so a group OAuth token refreshed on master reaches
-	// this node without any CLI command. No-op unless AIKEY_PROXY_SEAT_GROUP_ENABLED
+	// this node without any CLI command. No-op unless AIKEY_PROXY_OAUTH_GROUP_ENABLED
 	// (and there is a local group VK). Isolated: a poller panic must not kill the
 	// data path.
 	observability.GoSafe("supervisor.group_runtime_poll", observability.Isolated, func() { s.pollGroupRuntime(s.ctx) })
@@ -691,13 +691,13 @@ func (s *Supervisor) syncManagedKeys() {
 	}
 	for i := range managedKeys {
 		mk := &managedKeys[i]
-		// N7c safety gate: a group VK (SeatGroupID != "") carries NO PlaintextKey —
+		// N7c safety gate: a group VK (OauthGroupID != "") carries NO PlaintextKey —
 		// its per-account material lives in GroupRuntime and routing requires the
 		// group resolver (N8). Until that's enabled, do NOT register group VKs;
 		// otherwise the hot path's `PlaintextKey != ""` check fails and the request
 		// falls to the personal-key path and 401s. Gated by
-		// AIKEY_PROXY_SEAT_GROUP_ENABLED (default off) → direct-bind path unchanged.
-		if mk.SeatGroupID != "" && !seatGroupRoutingEnabled() {
+		// AIKEY_PROXY_OAUTH_GROUP_ENABLED (default off) → direct-bind path unchanged.
+		if mk.OauthGroupID != "" && !oauthGroupRoutingEnabled() {
 			continue
 		}
 		// 2026-04-29 prefix rename: team token = aikey_team_<vk_id>.

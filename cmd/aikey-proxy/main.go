@@ -282,7 +282,7 @@ func main() {
 	// on, so non-pool deployments are unchanged. Surfaces which pool accounts are
 	// currently cooled, for the operator monitoring the first pool batch.
 	adminHandler.PoolHealthFn = func() *admin.PoolRoutingHealth {
-		if !vkeys.SeatGroupRoutingEnabled() {
+		if !vkeys.OauthGroupRoutingEnabled() {
 			return nil
 		}
 		h := &admin.PoolRoutingHealth{Enabled: true}

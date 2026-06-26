@@ -3,7 +3,7 @@ package supervisor
 import "github.com/AiKeyLabs/aikey-proxy/internal/vkeys"
 
 // Seat-group (channel ③) proxy-side gating (N7c). The env gate's single source
-// of truth is vkeys.SeatGroupRoutingEnabled (read by both supervisor and the
+// of truth is vkeys.OauthGroupRoutingEnabled (read by both supervisor and the
 // proxy data plane); this thin wrapper keeps supervisor call sites unchanged.
 //
 // Group virtual keys carry no PlaintextKey — their per-account material lives in
@@ -13,5 +13,5 @@ import "github.com/AiKeyLabs/aikey-proxy/internal/vkeys"
 // complete, group VKs MUST NOT enter the route registry (they'd fall to the
 // personal-key path and 401). Default OFF → the direct-bind path is byte-unchanged.
 
-// seatGroupRoutingEnabled reports whether proxy-side group VK routing is on.
-func seatGroupRoutingEnabled() bool { return vkeys.SeatGroupRoutingEnabled() }
+// oauthGroupRoutingEnabled reports whether proxy-side group VK routing is on.
+func oauthGroupRoutingEnabled() bool { return vkeys.OauthGroupRoutingEnabled() }

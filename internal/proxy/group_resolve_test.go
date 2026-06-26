@@ -68,7 +68,7 @@ func TestResolveGroup_OAuthPrimaryDecrypts(t *testing.T) {
 		"acc-a": encMat(t, key, vkeys.GroupRuntimeAccount{CredentialType: "oauth_account", ExpiresAt: 9_000_000_000, ExternalID: "uuid-a"}, "tok-a"),
 		"acc-b": encMat(t, key, vkeys.GroupRuntimeAccount{CredentialType: "oauth_account", ExpiresAt: 9_000_000_000, ExternalID: "uuid-b"}, "tok-b"),
 	}
-	route := &vkeys.ResolvedRoute{SeatID: seat, SeatGroupID: "grp", GroupAccounts: mustJSON(t, refs), GroupRuntime: mustJSON(t, mat)}
+	route := &vkeys.ResolvedRoute{SeatID: seat, OauthGroupID: "grp", GroupAccounts: mustJSON(t, refs), GroupRuntime: mustJSON(t, mat)}
 
 	res, err := resolveGroupCredential(route, key, 1_000_000, nil)
 	if err != nil {
