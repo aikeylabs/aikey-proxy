@@ -295,6 +295,12 @@ type Supervisor struct {
 	// Reloads ONLY when the material actually changed (a token refreshed), so a
 	// 60s poll over unchanged tokens adds no churn. Mirrors lastQuotaSig.
 	lastGroupRuntimeSig atomic.Pointer[string]
+	// routingOverrides is the allocation engine's seat→account routing-override
+	// cache (I-side §6.5). Supervisor-scoped (not per-generation) so a reload never
+	// loses it — the same instance is injected into every Proxy. Populated by
+	// pollRoutingOverrides; read on the group-route hot path to redirect a seat off
+	// an unhealthy account. nil-safe everywhere → empty means "use the local pick".
+	routingOverrides *proxy.RoutingOverrideCache
 	// quotaHeartbeat is the traffic-independent server-reachability probe behind
 	// budget-mode staleness (D-U7/P9). nil unless enforce_mode=budget AND a
 	// collector URL is configured — so the default availability path (and Personal)
@@ -354,16 +360,17 @@ func (s *Supervisor) VaultReader() *vault.Reader {
 func New(cfg *config.Config, configPath, password, version string) (*Supervisor, error) {
 	ctx, cancel := context.WithCancel(context.Background())
 	s := &Supervisor{
-		cfg:           cfg,
-		configPath:    configPath,
-		password:      password,
-		version:       version,
-		startedAt:     time.Now(),
-		ctx:           ctx,
-		cancel:        cancel,
-		quotaEnabled:  quotaEnabledFromEnv(),
-		quotaSnapshot: quota.NewSnapshot(),
-		quotaCounter:  quota.NewCounter(),
+		cfg:              cfg,
+		configPath:       configPath,
+		password:         password,
+		version:          version,
+		startedAt:        time.Now(),
+		ctx:              ctx,
+		cancel:           cancel,
+		quotaEnabled:     quotaEnabledFromEnv(),
+		quotaSnapshot:    quota.NewSnapshot(),
+		quotaCounter:     quota.NewCounter(),
+		routingOverrides: proxy.NewRoutingOverrideCache(),
 	}
 	gen, err := s.buildGeneration()
 	if err != nil {
@@ -424,6 +431,14 @@ func New(cfg *config.Config, configPath, password, version string) (*Supervisor,
 	// (and there is a local group VK). Isolated: a poller panic must not kill the
 	// data path.
 	observability.GoSafe("supervisor.group_runtime_poll", observability.Isolated, func() { s.pollGroupRuntime(s.ctx) })
+
+	// I-side §6.5: pull the allocation engine's seat→account routing overrides on
+	// the same master-poll rail, so the engine's redirect of a seat off an unhealthy
+	// account reaches this node without any CLI command. No-op unless oauth-group
+	// routing is enabled (and there is a team credential). Isolated: a poller panic
+	// must never kill the data path — and the override is a pure redirect the
+	// resolver always falls back from.
+	observability.GoSafe("supervisor.routing_override_poll", observability.Isolated, func() { s.pollRoutingOverrides(s.ctx) })
 
 	// Cluster mode (V3c): register this node with the hub name service + heartbeat
 	// so clients discover it via /cluster/resolve. Inert for non-cluster proxies —
@@ -1369,6 +1384,11 @@ func (s *Supervisor) buildGeneration() (*generation, error) {
 
 	// Build the proxy handler with configured thresholds.
 	p := proxy.New(vaultReader, registry, providers, collector, s.ctx)
+	// Inject the shared, supervisor-owned routing-override cache (I-side §6.5) so
+	// the group-route hot path can read the engine's seat→account redirects.
+	// Unconditional + nil-safe: an empty cache (no team cred / control URL / poll
+	// not landed) just means every request uses the local seatassign pick.
+	p.SetRoutingOverrides(s.routingOverrides)
 	p.SlowRequestMs = int64(s.cfg.Log.SlowRequestMs)
 	p.VerySlowRequestMs = int64(s.cfg.Log.VerySlowRequestMs)
 	if s.transport != nil {
@@ -1558,6 +1578,12 @@ func (s *Supervisor) buildGeneration() (*generation, error) {
 				loadedSeq = int64(seq)
 			}
 			p.SetReporter(reporter, fmt.Sprintf("proxy-%d", id), s.version, fmt.Sprintf("gen-%d", id), loadedSeq, vaultReader.GetLoggedInAccountID())
+			// I5: wire the allocation-engine util signal reporter with the team
+			// account-JWT (same credential the group-runtime poll uses) → master
+			// /accounts/me/signals. Off unless a team credential + control URL exist.
+			if teamCred := buildCollectorCredentials(s.cfg.Events.CollectorCredentials, vaultReader)["team"]; teamCred != nil {
+				p.EnableSignalReporting(readControlPanelURL(), teamCred.Bearer)
+			}
 			slog.Info("usage reporter enabled", "collector_url", s.cfg.Events.CollectorURL)
 
 			// Start canary probe. As of 2026-04-17 diagnostics live on the

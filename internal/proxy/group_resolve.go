@@ -82,12 +82,15 @@ type groupResolution struct {
 // caller's clock (injected for deterministic tests); `derivedKey` is the vault
 // key used to decrypt the at-rest material. `skip` (may be nil) names accounts
 // the caller already tried this request — used by N8c fallback to advance past a
-// candidate the upstream just rejected.
+// candidate the upstream just rejected. `overrideAccountID` (may be "") is the
+// allocation engine's seat→account routing override (I-side §6.5): when the
+// engine has redirected this seat off an unhealthy default, the caller passes the
+// engine's healthy pick here.
 //
 // A candidate is skipped when: it has no material in group_runtime (not pulled
 // yet), its OAuth token is expired, its quota window is exhausted, or its secret
 // fails to decrypt (corrupt). If every candidate is skipped → GROUP_ALL_UNUSABLE.
-func resolveGroupCredential(route *vkeys.ResolvedRoute, derivedKey []byte, nowUnix int64, skip map[string]bool) (*groupResolution, error) {
+func resolveGroupCredential(route *vkeys.ResolvedRoute, derivedKey []byte, nowUnix int64, skip map[string]bool, overrideAccountID string) (*groupResolution, error) {
 	var refs []vkeys.GroupAccountRef
 	if route.GroupAccounts == "" || json.Unmarshal([]byte(route.GroupAccounts), &refs) != nil || len(refs) == 0 {
 		return nil, &groupResolveError{Code: groupErrNoCandidates, Reason: "no parseable group candidates on route"}
@@ -109,28 +112,60 @@ func resolveGroupCredential(route *vkeys.ResolvedRoute, derivedKey []byte, nowUn
 	ordered := seatassign.Rank(route.SeatID, accounts)
 	primary := ordered[0].AccountID // rank-0; audited when the actual pick differs
 
+	// §6.5 allocation-engine routing override (I-side keystone). The engine
+	// re-ran seatassign over only the HEALTHY accounts and named the override as
+	// this seat's healthy pick. Apply it ONLY when it is STILL a valid, serving
+	// candidate in THIS group right now — member-validity re-check: the account
+	// may have been removed/disabled since the engine computed it. resolveCandidate
+	// runs the SAME validity gate the ranked loop below uses (candidate ref present
+	// + material delivered + usable + decryptable), so the override can never route
+	// to an account the proxy has no material for. Any miss (stale / no material /
+	// expired / exhausted / undecryptable / in skip) falls through to the local
+	// ranked pick — the existing path stays the default.
+	if overrideAccountID != "" && !skip[overrideAccountID] {
+		if res, ok := resolveCandidate(overrideAccountID, refByID, material, derivedKey, nowUnix); ok {
+			res.Primary = primary // engine redirect audited as a switch (primary != pick)
+			return res, nil
+		}
+	}
+
 	for _, a := range ordered {
 		if skip[a.AccountID] {
 			continue
 		}
-		mat, ok := material[a.AccountID]
-		if !ok {
-			continue // candidate has no delivered material yet
+		if res, ok := resolveCandidate(a.AccountID, refByID, material, derivedKey, nowUnix); ok {
+			res.Primary = primary
+			return res, nil
 		}
-		if !materialUsable(mat, nowUnix) {
-			continue // expired / quota-exhausted
-		}
-		secret, err := decryptGroupSecret(derivedKey, mat)
-		if err != nil {
-			continue // corrupt material — try the next candidate, don't fail the request
-		}
-		ref := refByID[a.AccountID]
-		res := buildGroupResolution(a.AccountID, ref, mat, secret)
-		res.Primary = primary
-		return res, nil
 	}
 
 	return nil, &groupResolveError{Code: groupErrAllUnusable, Reason: "all group candidates expired, exhausted, or undecryptable"}
+}
+
+// resolveCandidate resolves ONE account to its injectable credential, applying
+// the single validity gate shared by the ranked loop and the §6.5 engine-override
+// path: the account must be a candidate ref in THIS group, have delivered material,
+// be usable (not expired/exhausted), and decrypt cleanly. ok=false on any miss so
+// the caller skips it (loop) or falls back to the local pick (override). Sharing
+// one gate is the whole point — the override's "is this still a valid candidate"
+// re-check can never drift from what the loop considers usable.
+func resolveCandidate(accountID string, refByID map[string]vkeys.GroupAccountRef, material map[string]vkeys.GroupRuntimeAccount, derivedKey []byte, nowUnix int64) (*groupResolution, bool) {
+	ref, ok := refByID[accountID]
+	if !ok {
+		return nil, false // not a candidate in this group's set (stale/unknown override)
+	}
+	mat, ok := material[accountID]
+	if !ok {
+		return nil, false // candidate has no delivered material yet
+	}
+	if !materialUsable(mat, nowUnix) {
+		return nil, false // expired / quota-exhausted
+	}
+	secret, err := decryptGroupSecret(derivedKey, mat)
+	if err != nil {
+		return nil, false // corrupt material — try the next candidate, don't fail the request
+	}
+	return buildGroupResolution(accountID, ref, mat, secret), true
 }
 
 // materialUsable reports whether an account's material can serve a request now.
