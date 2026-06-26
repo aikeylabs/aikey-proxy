@@ -27,11 +27,28 @@ const signalFlushInterval = 30 * time.Second
 // harmless); the upload runs in a background goroutine whose failures are only
 // logged, never surfaced to the request. A nil reporter = feature off.
 
-// signalSample is one parsed util reading queued for delivery.
+// signalSample is one parsed util reading queued for delivery. Util7d is the
+// 7-day-window sibling of Util5h (master reads it into engine_meta.util_7d for
+// the weekly-squeeze target). It's `omitempty` so a 5h-only reading stays
+// byte-identical to the pre-7d wire — ponytail: a genuine util_7d==0.0 is
+// indistinguishable from "no 7d header" on the wire, which is fine for a trend
+// signal (other samples in the window carry the non-zero reading); switch to
+// *float64 only if master ever needs to tell zero-util from no-data.
 type signalSample struct {
 	CredentialID string  `json:"credential_id"`
 	TS           int64   `json:"ts"`
 	Util5h       float64 `json:"util_5h"`
+	Util7d       float64 `json:"util_7d,omitempty"`
+}
+
+// concurrencySample reports the PEAK number of concurrent in-flight forwarded
+// requests a credential drew within one flush window. The allocation engine's
+// DeriveFanout (§8.1) treats a high-concurrency account as several humans, so a
+// raw peak (not an average) is what it wants. Like rateLimitSample this is a
+// per-credential aggregate reset every flush, not a per-event channel.
+type concurrencySample struct {
+	CredentialID string `json:"credential_id"`
+	Peak         int    `json:"peak"`
 }
 
 // revokedSample flags a credential whose OAuth token the upstream hard-revoked
@@ -66,7 +83,16 @@ type signalReporter struct {
 	revokedIn chan revokedSample
 	rlMu      sync.Mutex     // guards rlCounts
 	rlCounts  map[string]int // per-credential 429/403 tally, reset each flush
-	logger    *slog.Logger
+	// in-flight concurrency tracking. inflCur is the LIVE count (inc on forward
+	// start, dec on completion — persists across windows so a request spanning a
+	// flush keeps being counted); inflPeak is the max inflCur seen this window,
+	// reset each flush. Both guarded by inflMu.
+	// ponytail: one global mutex for both maps — the critical section is two map
+	// ops; split to per-credential locks only if this lock ever shows up hot.
+	inflMu   sync.Mutex
+	inflCur  map[string]int
+	inflPeak map[string]int
+	logger   *slog.Logger
 }
 
 // newSignalReporter returns nil (feature off) unless both a control URL and an
@@ -82,19 +108,24 @@ func newSignalReporter(controlURL string, bearer func(context.Context) (string, 
 		in:        make(chan signalSample, 256),
 		revokedIn: make(chan revokedSample, 64),
 		rlCounts:  make(map[string]int),
+		inflCur:   make(map[string]int),
+		inflPeak:  make(map[string]int),
 		logger:    logger,
 	}
 	go r.loop()
 	return r
 }
 
-// enqueue is a non-blocking best-effort hand-off from the forward path.
-func (r *signalReporter) enqueue(credentialID string, ts int64, util float64) {
+// enqueue is a non-blocking best-effort hand-off from the forward path. util7d
+// is the optional 7-day reading (pass 0 when the upstream sent no 7d header —
+// signalSample.Util7d is omitempty so a 0 drops off the wire and util_5h stays
+// byte-identical to the pre-7d format).
+func (r *signalReporter) enqueue(credentialID string, ts int64, util5h, util7d float64) {
 	if r == nil || credentialID == "" {
 		return
 	}
 	select {
-	case r.in <- signalSample{CredentialID: credentialID, TS: ts, Util5h: util}:
+	case r.in <- signalSample{CredentialID: credentialID, TS: ts, Util5h: util5h, Util7d: util7d}:
 	default: // buffer full → drop (trend signal; never block forwarding)
 	}
 }
@@ -158,21 +189,83 @@ func (r *signalReporter) snapshotRateLimits() []rateLimitSample {
 	return out
 }
 
+// trackInflight marks one in-flight forwarded request for credentialID and
+// returns a release func to call (via `defer …()`) on completion. It bumps the
+// live count and updates this window's peak under a short map lock. Same
+// MAIN-LINK safety contract as the other hooks: a nil receiver / empty id yield
+// a no-op closure so the caller can `defer trackInflight(id)()` unconditionally
+// without a nil check, and the lock is held only for two map ops.
+//
+// The returned func MUST run (use defer) — it decrements the live count, so a
+// missed call would leak a credential as permanently "in flight" and pin its
+// peak high forever. defer at the forward call site guarantees it fires even on
+// panic. Lazy-inits both maps so a directly-constructed reporter (tests) can't
+// nil-panic.
+func (r *signalReporter) trackInflight(credentialID string) func() {
+	if r == nil || credentialID == "" {
+		return func() {} // no-op: safe to `defer …()`
+	}
+	r.inflMu.Lock()
+	if r.inflCur == nil {
+		r.inflCur = make(map[string]int)
+		r.inflPeak = make(map[string]int)
+	}
+	r.inflCur[credentialID]++
+	if r.inflCur[credentialID] > r.inflPeak[credentialID] {
+		r.inflPeak[credentialID] = r.inflCur[credentialID]
+	}
+	r.inflMu.Unlock()
+	return func() {
+		r.inflMu.Lock()
+		if r.inflCur[credentialID] > 0 {
+			r.inflCur[credentialID]--
+		}
+		r.inflMu.Unlock()
+	}
+}
+
+// snapshotConcurrency atomically reads + clears this window's per-credential
+// peak into wire samples. Reset-on-read bounds the map to credentials seen this
+// window — exactly like snapshotRateLimits. inflCur is deliberately NOT reset:
+// requests still forwarding at the window boundary stay counted, so the next
+// inc keeps computing a truthful peak (a cross-window burst still registers
+// because inflPeak starts from 0 but inflCur already carries the live count).
+// Returns nil for an idle window so post() omits the concurrency array.
+//
+// ponytail: a single long-lived stream sitting in a window with no NEW arrivals
+// won't re-bump its peak, so a quiet steady-state-1 window can report nothing
+// for that credential — harmless for a "several humans?" signal where the peak
+// is what matters; revisit only if steady-state concurrency becomes a target.
+func (r *signalReporter) snapshotConcurrency() []concurrencySample {
+	r.inflMu.Lock()
+	defer r.inflMu.Unlock()
+	if len(r.inflPeak) == 0 {
+		return nil
+	}
+	out := make([]concurrencySample, 0, len(r.inflPeak))
+	for id, peak := range r.inflPeak {
+		out = append(out, concurrencySample{CredentialID: id, Peak: peak})
+	}
+	r.inflPeak = make(map[string]int) // reset the window (inflCur persists)
+	return out
+}
+
 func (r *signalReporter) loop() {
 	ticker := time.NewTicker(signalFlushInterval)
 	defer ticker.Stop()
 	var batch []signalSample
 	var revoked []revokedSample
-	// flush takes the rate-limit snapshot as an arg rather than reading the
-	// counter itself: the size-triggered early flushes below pass nil so they
-	// DON'T disturb the 429/403 window, keeping its span exactly one ticker
-	// period — only the ticker case snapshots, so the reported window_secs stays
-	// accurate even when a util/revoked burst forces an early flush.
-	flush := func(rl []rateLimitSample) {
-		if len(batch) == 0 && len(revoked) == 0 && len(rl) == 0 {
+	// flush takes the rate-limit + concurrency snapshots as args rather than
+	// reading the per-window aggregates itself: the size-triggered early flushes
+	// below pass nil so they DON'T disturb those windows, keeping each span
+	// exactly one ticker period — only the ticker case snapshots, so the reported
+	// window_secs / peak stay accurate even when a util/revoked burst forces an
+	// early flush.
+	flush := func(rl []rateLimitSample, conc []concurrencySample) {
+		if len(batch) == 0 && len(revoked) == 0 && len(rl) == 0 && len(conc) == 0 {
 			return
 		}
-		r.post(batch, revoked, rl)
+		r.post(batch, revoked, rl, conc)
 		batch = batch[:0]
 		revoked = revoked[:0]
 	}
@@ -180,7 +273,7 @@ func (r *signalReporter) loop() {
 		select {
 		case s := <-r.in:
 			if batch = append(batch, s); len(batch) >= 64 {
-				flush(nil)
+				flush(nil, nil)
 			}
 		case rv := <-r.revokedIn:
 			// Revoked rides the SAME 30s batch flush rather than an immediate
@@ -190,19 +283,19 @@ func (r *signalReporter) loop() {
 			// tolerating ≤30s quarantine latency is an acceptable best-effort
 			// trade. The >=64 cap bounds a burst so it doesn't wait the full tick.
 			if revoked = append(revoked, rv); len(revoked) >= 64 {
-				flush(nil)
+				flush(nil, nil)
 			}
 		case <-ticker.C:
-			flush(r.snapshotRateLimits())
+			flush(r.snapshotRateLimits(), r.snapshotConcurrency())
 		}
 	}
 }
 
-func (r *signalReporter) post(samples []signalSample, revoked []revokedSample, rateLimits []rateLimitSample) {
+func (r *signalReporter) post(samples []signalSample, revoked []revokedSample, rateLimits []rateLimitSample, concurrency []concurrencySample) {
 	// All arrays are optional: marshal only the non-empty ones so an all-samples,
-	// all-revoked, or all-rate_limits flush still posts a valid body the master
-	// can decode.
-	payload := make(map[string]any, 3)
+	// all-revoked, all-rate_limits, or all-concurrency flush still posts a valid
+	// body the master can decode.
+	payload := make(map[string]any, 4)
 	if len(samples) > 0 {
 		payload["samples"] = samples
 	}
@@ -211,6 +304,9 @@ func (r *signalReporter) post(samples []signalSample, revoked []revokedSample, r
 	}
 	if len(rateLimits) > 0 {
 		payload["rate_limits"] = rateLimits
+	}
+	if len(concurrency) > 0 {
+		payload["concurrency"] = concurrency
 	}
 	if len(payload) == 0 {
 		return
@@ -251,6 +347,24 @@ func (r *signalReporter) post(samples []signalSample, revoked []revokedSample, r
 // a missing / malformed header yields (0, false) so the caller simply skips it.
 func parseUnifiedUtil5h(h http.Header) (float64, bool) {
 	raw := h.Get("anthropic-ratelimit-unified-5h-utilization")
+	if raw == "" {
+		return 0, false
+	}
+	v, err := strconv.ParseFloat(strings.TrimSpace(raw), 64)
+	if err != nil || v < 0 || v > 1 {
+		return 0, false
+	}
+	return v, true
+}
+
+// parseUnifiedUtil7d is the 7-day-window sibling of parseUnifiedUtil5h: it reads
+// the anthropic-ratelimit-unified-7d-utilization header (a float 0..1) the
+// upstream sends alongside the 5h one, with identical (value, true)-only-on-
+// clean-parse semantics. ponytail: a near-mirror of the 5h reader (3 lines of
+// shared parse logic, below the extract-a-helper threshold) — kept separate so
+// the master-facing names map 1:1 to the two header names.
+func parseUnifiedUtil7d(h http.Header) (float64, bool) {
+	raw := h.Get("anthropic-ratelimit-unified-7d-utilization")
 	if raw == "" {
 		return 0, false
 	}

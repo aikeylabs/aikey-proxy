@@ -112,12 +112,17 @@ func (p *Proxy) buildBaseEvent(req *http.Request, resp *http.Response, startTime
 		// Trust note: spoofable signal, display-only.
 		ev.AppSlug = route.AppSlug
 	}
-	// I5 (best-effort, OFF the hot path): ship the upstream's parsed 5h utilization
-	// to master so the allocation engine can read it. enqueue is nil-safe (reporter
-	// off → no-op) and non-blocking (full buffer drops the sample, never stalls).
+	// I5 (best-effort, OFF the hot path): ship the upstream's parsed 5h + 7d
+	// utilization to master so the allocation engine can read both (util_7d feeds
+	// the weekly-squeeze target). The sample still exists only when the 5h header
+	// is present — the two unified headers arrive together upstream — and util_7d
+	// just enriches it (0 + omitempty when the 7d header is absent, so util_5h
+	// reporting stays byte-identical). enqueue is nil-safe (reporter off → no-op)
+	// and non-blocking (full buffer drops the sample, never stalls).
 	if resp != nil {
-		if util, ok := parseUnifiedUtil5h(resp.Header); ok {
-			p.signalReporter.enqueue(route.CredentialID, time.Now().Unix(), util)
+		if util5h, ok := parseUnifiedUtil5h(resp.Header); ok {
+			util7d, _ := parseUnifiedUtil7d(resp.Header)
+			p.signalReporter.enqueue(route.CredentialID, time.Now().Unix(), util5h, util7d)
 		}
 	}
 	return ev

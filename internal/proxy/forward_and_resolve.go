@@ -805,6 +805,18 @@ func (p *Proxy) serveRoute(w http.ResponseWriter, r *http.Request, route *vkeys.
 		FlushInterval: -1, // Flush immediately for SSE streaming.
 	}
 
+	// ConcurrencyPeak signal (best-effort, main-link-safe): count this credential
+	// as in-flight for the upstream forward, release on completion. defer
+	// guarantees the decrement even if ServeHTTP panics, so the live counter can't
+	// leak. trackInflight returns a no-op closure for a nil reporter / empty
+	// CredentialID, so this stays a single cheap map-lock with no extra branching.
+	// Placed AFTER the quota gate + inbound-filter early-returns above, so only
+	// requests that actually reach the upstream are counted (blocked ones never
+	// inc). ponytail: scoped to the synchronous ServeHTTP window — for streaming
+	// that blocks until the SSE copy to the client finishes, a good-enough
+	// concurrency proxy; chasing the detached non-streaming token-drain goroutine
+	// would need cross-goroutine lifetime tracking for marginal accuracy.
+	defer p.signalReporter.trackInflight(route.CredentialID)()
 	rp.ServeHTTP(w, r)
 
 	// 10. Slow request detection (after the full response is sent).

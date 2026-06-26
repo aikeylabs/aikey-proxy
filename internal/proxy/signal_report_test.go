@@ -53,15 +53,15 @@ func TestParseUnifiedUtil5h(t *testing.T) {
 func TestEnqueueNilAndEmptyAreSafe(t *testing.T) {
 	// nil receiver guard: feature-off reporter must not panic.
 	var nilR *signalReporter
-	nilR.enqueue("c1", 100, 0.5) // must not panic
+	nilR.enqueue("c1", 100, 0.5, 0) // must not panic
 
 	// empty credentialID is dropped — observable via the buffered channel.
 	r := &signalReporter{in: make(chan signalSample, 4)}
-	r.enqueue("", 100, 0.5)
+	r.enqueue("", 100, 0.5, 0)
 	if len(r.in) != 0 {
 		t.Fatalf("empty credentialID should be dropped, buffered = %d", len(r.in))
 	}
-	r.enqueue("c1", 100, 0.5)
+	r.enqueue("c1", 100, 0.5, 0)
 	if len(r.in) != 1 {
 		t.Fatalf("valid sample should be queued, buffered = %d", len(r.in))
 	}
@@ -85,7 +85,7 @@ func TestSignalPostSendsBatch(t *testing.T) {
 	if r == nil {
 		t.Fatal("newSignalReporter returned nil")
 	}
-	r.post([]signalSample{{CredentialID: "c1", TS: 100, Util5h: 0.6}}, nil, nil)
+	r.post([]signalSample{{CredentialID: "c1", TS: 100, Util5h: 0.6}}, nil, nil, nil)
 
 	c := <-got
 	if c.method != http.MethodPost {
@@ -121,7 +121,7 @@ func TestSignalPostBearerErrorDoesNotPost(t *testing.T) {
 	if r == nil {
 		t.Fatal("newSignalReporter returned nil")
 	}
-	r.post([]signalSample{{CredentialID: "c1", TS: 100, Util5h: 0.6}}, nil, nil) // must not panic
+	r.post([]signalSample{{CredentialID: "c1", TS: 100, Util5h: 0.6}}, nil, nil, nil) // must not panic
 
 	if n := atomic.LoadInt32(&hits); n != 0 {
 		t.Fatalf("server hit %d times, want 0 (bearer error short-circuits)", n)
@@ -175,7 +175,7 @@ func TestSignalPostSendsRevoked(t *testing.T) {
 	}
 
 	// all-revoked batch: body omits "samples" and carries only "revoked".
-	r.post(nil, []revokedSample{{CredentialID: "c1", Reason: "revoked"}}, nil)
+	r.post(nil, []revokedSample{{CredentialID: "c1", Reason: "revoked"}}, nil, nil)
 	c := <-got
 	if c.method != http.MethodPost {
 		t.Errorf("method = %q, want POST", c.method)
@@ -189,7 +189,7 @@ func TestSignalPostSendsRevoked(t *testing.T) {
 
 	// mixed batch: both arrays serialize.
 	r.post([]signalSample{{CredentialID: "c1", TS: 100, Util5h: 0.6}},
-		[]revokedSample{{CredentialID: "c2", Reason: "revoked"}}, nil)
+		[]revokedSample{{CredentialID: "c2", Reason: "revoked"}}, nil, nil)
 	c = <-got
 	var decoded struct {
 		Samples []signalSample  `json:"samples"`
@@ -292,7 +292,7 @@ func TestSignalPostSendsRateLimits(t *testing.T) {
 	}
 
 	// rate-limits-only batch: body omits samples + revoked, exact wire contract.
-	r.post(nil, nil, []rateLimitSample{{CredentialID: "c1", Count: 3, WindowSecs: 30}})
+	r.post(nil, nil, []rateLimitSample{{CredentialID: "c1", Count: 3, WindowSecs: 30}}, nil)
 	if want := `{"rate_limits":[{"credential_id":"c1","count":3,"window_secs":30}]}`; string(<-got) != want {
 		t.Fatalf("rate-limits-only body mismatch, want %s", want)
 	}
@@ -300,7 +300,7 @@ func TestSignalPostSendsRateLimits(t *testing.T) {
 	// mixed batch: samples + revoked + rate_limits all serialize.
 	r.post([]signalSample{{CredentialID: "c1", TS: 100, Util5h: 0.6}},
 		[]revokedSample{{CredentialID: "c2", Reason: "revoked"}},
-		[]rateLimitSample{{CredentialID: "c3", Count: 5, WindowSecs: 30}})
+		[]rateLimitSample{{CredentialID: "c3", Count: 5, WindowSecs: 30}}, nil)
 	var decoded struct {
 		Samples    []signalSample    `json:"samples"`
 		Revoked    []revokedSample   `json:"revoked"`
@@ -341,5 +341,172 @@ func TestIsHardRevoked(t *testing.T) {
 				t.Fatalf("isHardRevoked(%d,%q,%q) = %v, want %v", tt.status, tt.errType, tt.errMsg, got, tt.want)
 			}
 		})
+	}
+}
+
+func TestParseUnifiedUtil7d(t *testing.T) {
+	const hdr = "anthropic-ratelimit-unified-7d-utilization"
+	tests := []struct {
+		name   string
+		set    bool
+		val    string
+		wantV  float64
+		wantOK bool
+	}{
+		{"valid", true, "0.42", 0.42, true},
+		{"missing", false, "", 0, false},
+		{"malformed", true, "xyz", 0, false},
+		{"above_one", true, "1.5", 0, false},
+		{"negative", true, "-0.1", 0, false},
+		{"zero_ok", true, "0", 0, true},
+		{"one_ok", true, "1", 1, true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			h := http.Header{}
+			if tt.set {
+				h.Set(hdr, tt.val)
+			}
+			v, ok := parseUnifiedUtil7d(h)
+			if ok != tt.wantOK {
+				t.Fatalf("ok = %v, want %v", ok, tt.wantOK)
+			}
+			if ok && v != tt.wantV {
+				t.Fatalf("v = %v, want %v", v, tt.wantV)
+			}
+		})
+	}
+}
+
+func TestSignalSampleUtil7dSerialization(t *testing.T) {
+	// both readings present → both serialize, util_7d after util_5h.
+	both, _ := json.Marshal(signalSample{CredentialID: "c1", TS: 100, Util5h: 0.6, Util7d: 0.4})
+	if want := `{"credential_id":"c1","ts":100,"util_5h":0.6,"util_7d":0.4}`; string(both) != want {
+		t.Fatalf("both = %s, want %s", both, want)
+	}
+	// 5h-only (no 7d header) → util_7d omitempty drops it, byte-identical to the
+	// pre-7d wire format so existing master ingest is unaffected.
+	only, _ := json.Marshal(signalSample{CredentialID: "c1", TS: 100, Util5h: 0.6})
+	if want := `{"credential_id":"c1","ts":100,"util_5h":0.6}`; string(only) != want {
+		t.Fatalf("5h-only = %s, want %s", only, want)
+	}
+}
+
+func TestConcurrencyPeak(t *testing.T) {
+	r := &signalReporter{} // lazy-init path (no maps preallocated)
+	// start, start → peak 2; one ends → cur 1; start → cur 2 (peak stays 2).
+	d1 := r.trackInflight("c1")
+	d2 := r.trackInflight("c1")
+	d1()                        // one completes → cur 1
+	d3 := r.trackInflight("c1") // back to cur 2
+	snap := r.snapshotConcurrency()
+	if len(snap) != 1 || snap[0] != (concurrencySample{CredentialID: "c1", Peak: 2}) {
+		t.Fatalf("snapshot = %+v, want one {c1, peak 2}", snap)
+	}
+	// next window: peak map reset. d2/d3 are still in flight (cur 2) but with no
+	// NEW arrival the idle window reports nothing — peak only bumps on inc (the
+	// documented ponytail steady-state-trough ceiling). Pins that behavior.
+	if snap2 := r.snapshotConcurrency(); snap2 != nil {
+		t.Fatalf("idle next window = %+v, want nil (peak reset)", snap2)
+	}
+	d2()
+	d3() // cur back to 0
+	// a fresh request in the new window peaks at 1 (cur started from 0).
+	d4 := r.trackInflight("c1")
+	if snap3 := r.snapshotConcurrency(); len(snap3) != 1 || snap3[0].Peak != 1 {
+		t.Fatalf("new window = %+v, want c1 peak 1", snap3)
+	}
+	d4()
+}
+
+func TestConcurrencyPeakNilAndEmpty(t *testing.T) {
+	// nil receiver guard: feature-off reporter must not panic, returns a usable
+	// no-op so callers can `defer trackInflight(id)()` unconditionally.
+	var nilR *signalReporter
+	nilR.trackInflight("c1")() // must not panic
+
+	// empty credentialID → no-op, nothing tracked.
+	r := &signalReporter{}
+	r.trackInflight("")() // must not panic, no map entry
+	if r.snapshotConcurrency() != nil {
+		t.Fatal("empty credentialID should track nothing")
+	}
+}
+
+func TestConcurrencyPeakConcurrent(t *testing.T) {
+	// Deterministic peak under real concurrency: all goroutines hold their
+	// in-flight slot simultaneously, so the peak is exactly `goroutines`. Run
+	// under -race to catch a data race on the inflCur/inflPeak maps.
+	r := &signalReporter{}
+	const goroutines = 8
+	release := make(chan struct{})
+	var held, wg sync.WaitGroup
+	held.Add(goroutines)
+	wg.Add(goroutines)
+	for i := 0; i < goroutines; i++ {
+		go func() {
+			defer wg.Done()
+			done := r.trackInflight("c1")
+			held.Done() // signal "I'm in flight"
+			<-release   // hold until every goroutine is concurrently in flight
+			done()
+		}()
+	}
+	held.Wait() // all goroutines have incremented → cur == peak == goroutines
+	snap := r.snapshotConcurrency()
+	close(release)
+	wg.Wait()
+	if len(snap) != 1 || snap[0] != (concurrencySample{CredentialID: "c1", Peak: goroutines}) {
+		t.Fatalf("concurrent peak = %+v, want one {c1, %d}", snap, goroutines)
+	}
+}
+
+func TestSignalPostSendsConcurrency(t *testing.T) {
+	got := make(chan []byte, 2)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+		b, _ := io.ReadAll(req.Body)
+		got <- b
+	}))
+	defer srv.Close()
+
+	r := newSignalReporter(srv.URL, func(context.Context) (string, error) { return "tok-123", nil }, slog.Default())
+	if r == nil {
+		t.Fatal("newSignalReporter returned nil")
+	}
+
+	// concurrency-only batch: body omits the other three, exact wire contract.
+	r.post(nil, nil, nil, []concurrencySample{{CredentialID: "c1", Peak: 2}})
+	if want := `{"concurrency":[{"credential_id":"c1","peak":2}]}`; string(<-got) != want {
+		t.Fatalf("concurrency-only body mismatch, want %s", want)
+	}
+
+	// mixed all-four batch: samples (with util_7d) + revoked + rate_limits +
+	// concurrency all serialize.
+	r.post(
+		[]signalSample{{CredentialID: "c1", TS: 100, Util5h: 0.6, Util7d: 0.4}},
+		[]revokedSample{{CredentialID: "c2", Reason: "revoked"}},
+		[]rateLimitSample{{CredentialID: "c3", Count: 5, WindowSecs: 30}},
+		[]concurrencySample{{CredentialID: "c4", Peak: 2}})
+	var decoded struct {
+		Samples     []signalSample      `json:"samples"`
+		Revoked     []revokedSample     `json:"revoked"`
+		RateLimits  []rateLimitSample   `json:"rate_limits"`
+		Concurrency []concurrencySample `json:"concurrency"`
+	}
+	body := <-got
+	if err := json.Unmarshal(body, &decoded); err != nil {
+		t.Fatalf("body not valid JSON: %v (raw %s)", err, body)
+	}
+	if len(decoded.Samples) != 1 || decoded.Samples[0] != (signalSample{CredentialID: "c1", TS: 100, Util5h: 0.6, Util7d: 0.4}) {
+		t.Fatalf("decoded samples = %+v, want one {c1,100,0.6,0.4}", decoded.Samples)
+	}
+	if len(decoded.Revoked) != 1 || decoded.Revoked[0] != (revokedSample{CredentialID: "c2", Reason: "revoked"}) {
+		t.Fatalf("decoded revoked = %+v, want one {c2,revoked}", decoded.Revoked)
+	}
+	if len(decoded.RateLimits) != 1 || decoded.RateLimits[0] != (rateLimitSample{CredentialID: "c3", Count: 5, WindowSecs: 30}) {
+		t.Fatalf("decoded rate_limits = %+v, want one {c3,5,30}", decoded.RateLimits)
+	}
+	if len(decoded.Concurrency) != 1 || decoded.Concurrency[0] != (concurrencySample{CredentialID: "c4", Peak: 2}) {
+		t.Fatalf("decoded concurrency = %+v, want one {c4,2}", decoded.Concurrency)
 	}
 }
