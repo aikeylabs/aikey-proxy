@@ -73,8 +73,7 @@ func TestApplyPoolPersona_OverridesClientIdentity(t *testing.T) {
 	req.Header.Set("User-Agent", "opencode/1.0 (third-party)")
 	req.Header.Set("X-Claude-Code-Session-Id", "client-session-xyz")
 
-	cred := &OAuthCredential{Provider: "anthropic", AccountID: "acct_pool_1", ExternalID: "ext-uuid-1", Pooled: true}
-	applyPoolPersona(req, cred)
+	applyPoolPersona(req, "acct_pool_1", "ext-uuid-1")
 
 	// OS/arch/UA overridden to THIS account's pinned persona (per-account, not the
 	// client's Windows/x64/third-party UA). Compare against the deterministic pick.
@@ -139,45 +138,39 @@ func TestPoolPersona_CollapsesAndDiffersByAccount(t *testing.T) {
 	}
 }
 
-// Pooled=true overrides a REAL Claude Code client's identity; Pooled=false leaves
-// it untouched (the byte-identical fence for direct-bind / personal OAuth).
-func TestInjectClaudeOAuth_PooledGate(t *testing.T) {
-	build := func(pooled bool) *http.Request {
+// NP-4: the disguise is gated by the context stash (the Director's gate), NOT
+// applied in-place. No stash → no-op (real identity preserved, the non-pool
+// fence); stashed → disguised. This is what keeps r real for internal logic.
+func TestApplyPoolPersonaFromContext_GatedByStash(t *testing.T) {
+	mk := func() *http.Request {
 		body := `{"model":"claude-3","metadata":{"user_id":"user_REALDEV_account_x_session_REALSESS"},"messages":[]}`
 		req := httptest.NewRequest("POST", "/v1/messages", strings.NewReader(body))
 		req.Header.Set("Content-Type", "application/json")
-		req.Header.Set("User-Agent", "claude-cli/2.0.0 (external, cli)") // a real CLI
-		req.Header.Set("X-Claude-Code-Session-Id", "REALSESS")
 		req.Header.Set("X-Stainless-OS", "Windows")
-		injectClaudeOAuth(req, &OAuthCredential{
-			Provider: "anthropic", AccountID: "acct_z", ExternalID: "ext-z", Pooled: pooled,
-		})
+		req.Header.Set("X-Claude-Code-Session-Id", "REALSESS")
 		return req
 	}
 
-	// Pooled → normalized to acct_z's pinned persona (overriding client Windows;
-	// the equality vs the deterministic pick proves the override regardless of
-	// whatever OS the persona happens to be).
-	p := build(true)
-	if got, want := p.Header.Get("X-Stainless-OS"), personaForAccount("acct_z").os; got != want {
-		t.Fatalf("pooled: X-Stainless-OS=%q must be overridden to per-account %q", got, want)
+	// No stash → identity untouched (non-pool / direct-bind path is unaffected).
+	plain := mk()
+	applyPoolPersonaFromContext(plain)
+	if plain.Header.Get("X-Stainless-OS") != "Windows" || plain.Header.Get("X-Claude-Code-Session-Id") != "REALSESS" {
+		t.Fatal("no stash → identity must be untouched")
 	}
-	if s := p.Header.Get("X-Claude-Code-Session-Id"); s == "" || s == "REALSESS" {
-		t.Fatalf("pooled: session must be normalized (not client REALSESS), got %q", s)
-	}
-	if uid, _ := readBodyJSON(t, p)["metadata"].(map[string]any)["user_id"].(string); strings.Contains(uid, "REAL") {
-		t.Fatalf("pooled: real client identity must be overridden, got %q", uid)
+	if uid, _ := readBodyJSON(t, plain)["metadata"].(map[string]any)["user_id"].(string); uid != "user_REALDEV_account_x_session_REALSESS" {
+		t.Fatalf("no stash → metadata untouched, got %q", uid)
 	}
 
-	// Non-pool → client identity preserved (fence: behavior unchanged from before).
-	n := build(false)
-	if n.Header.Get("X-Claude-Code-Session-Id") != "REALSESS" {
-		t.Fatalf("non-pool must preserve client session, got %q", n.Header.Get("X-Claude-Code-Session-Id"))
+	// Stashed → disguised to the account's persona, real client identity gone.
+	pooled := stashPoolPersona(mk(), "acct_z", "ext-z")
+	applyPoolPersonaFromContext(pooled)
+	if got, want := pooled.Header.Get("X-Stainless-OS"), personaForAccount("acct_z").os; got != want {
+		t.Fatalf("stashed → X-Stainless-OS=%q want %q", got, want)
 	}
-	if n.Header.Get("X-Stainless-OS") != "Windows" {
-		t.Fatalf("non-pool must preserve client OS, got %q", n.Header.Get("X-Stainless-OS"))
+	if s := pooled.Header.Get("X-Claude-Code-Session-Id"); s == "" || s == "REALSESS" {
+		t.Fatalf("stashed → session must be normalized, got %q", s)
 	}
-	if uid, _ := readBodyJSON(t, n)["metadata"].(map[string]any)["user_id"].(string); uid != "user_REALDEV_account_x_session_REALSESS" {
-		t.Fatalf("non-pool must preserve client metadata.user_id, got %q", uid)
+	if uid, _ := readBodyJSON(t, pooled)["metadata"].(map[string]any)["user_id"].(string); strings.Contains(uid, "REAL") {
+		t.Fatalf("stashed → real identity must be overridden, got %q", uid)
 	}
 }

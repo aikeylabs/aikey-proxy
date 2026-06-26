@@ -44,6 +44,20 @@ const (
 	// stashExtractedFields), so the security-critical first read is never
 	// skipped; only repeat calls hit this cache.
 	ctxKeyExtractedModel
+	// ctxKeyPoolPersona carries a *poolPersonaCtx for a seat_group POOL request,
+	// stashed by the pool-routing site (handleSeatGroupRoute). It is consumed
+	// ONLY in serveRoute's Director, which applies the AccountPersona identity
+	// disguise to the OUTBOUND clone — so the original request `r` keeps the real
+	// employee identity (session / metadata) for our usage + conversation-audit +
+	// filter-cache, while Anthropic sees the per-account normalized identity.
+	// This decoupling is the fix for the "collapsed session bleeds into our own
+	// session-keyed logic" issue (NP-4). Absent on non-pool requests → zero cost.
+	ctxKeyPoolPersona
+	// ctxKeyPoolWindowCap carries the chosen pool account's window_max_util_pct
+	// (int, N11's randomized pre-cut cap), stashed at resolution and read in
+	// serveRoute's ModifyResponse to pre-cut the account when the upstream's
+	// unified-utilization header crosses the cap (N10 防封). Absent → no pre-cut.
+	ctxKeyPoolWindowCap
 )
 
 // traceFromContext retrieves the request's TraceContext. Returns the zero value

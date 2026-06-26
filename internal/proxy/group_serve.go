@@ -45,7 +45,9 @@ func (p *Proxy) handleSeatGroupRoute(
 		return
 	}
 
-	res, err := resolveGroupCredential(route, p.groupKey.DerivedKey(), time.Now().Unix(), nil)
+	// Skip accounts cooling down from a recent upstream failure (N8c reactive
+	// fallback) so this request routes around them.
+	res, err := resolveGroupCredential(route, p.groupKey.DerivedKey(), time.Now().Unix(), p.poolCooldown.skipSet())
 	if err != nil {
 		code := observability.ErrCodeGroupKeyUnavailable
 		if ge, ok := err.(*groupResolveError); ok {
@@ -61,7 +63,18 @@ func (p *Proxy) handleSeatGroupRoute(
 	rc := *route
 	rc.AccountID = res.AccountID // usage attribution → the account actually used
 
-	canonicalCode := providerCanonicalCode(rc.ProviderCode)
+	// A group VK is bound to a seat_group, NOT a single provider, so the VK-level
+	// ProviderCode is EMPTY — the provider lives per-account in group_accounts.
+	// Use the RESOLVED account's provider_code (the candidate ref the resolver
+	// picked); fall back to the route's only for safety. Using rc.ProviderCode
+	// here yielded canonicalCode="" → empty upstream base URL → 502 (found by the
+	// live full-pipeline E2E 2026-06-25; hermetic tests set route.ProviderCode so
+	// never hit the empty case).
+	provCode := res.ProviderCode
+	if provCode == "" {
+		provCode = rc.ProviderCode
+	}
+	canonicalCode := providerCanonicalCode(provCode)
 	var realKey string
 	switch res.CredentialType {
 	case credTypeKey:
@@ -81,6 +94,17 @@ func (p *Proxy) handleSeatGroupRoute(
 			rc.BaseURL = providerDefaultBaseURL(canonicalCode)
 		}
 		oauthInject(r, res.OAuth, canonicalCode)
+		// Pool identity disguise (anthropic only — Codex/Kimi never pool). Stash
+		// it so serveRoute's Director applies it to the OUTBOUND clone; r keeps
+		// the real employee session/device for our usage + audit (NP-4).
+		if canonicalCode == "anthropic" {
+			r = stashPoolPersona(r, res.AccountID, res.OAuth.ExternalID)
+		}
+		// Stash the window cap so ModifyResponse can pre-cut this account when the
+		// upstream's unified-utilization crosses it (N10 防封).
+		if res.WindowMaxUtilPct != nil {
+			r = stashWindowCap(r, *res.WindowMaxUtilPct)
+		}
 		realKey = oauthSentinelKey
 	}
 
@@ -101,6 +125,17 @@ func (p *Proxy) handleSeatGroupRoute(
 		return
 	}
 
+	// N9 #8: audit a fallback — the seat's primary account was unusable (cooled /
+	// exhausted / expired / no material) so we routed to a different candidate.
+	if res.Primary != "" && res.Primary != res.AccountID {
+		logger.Info("seat-group account switched (primary unusable)",
+			"event.name", observability.EventProxyGroupAccountSwitched,
+			"seat_group_id", rc.SeatGroupID,
+			"from_account_id", res.Primary,
+			"to_account_id", res.AccountID,
+		)
+	}
+
 	logger.Info("group route resolved",
 		"event.name", observability.EventProxyGroupRouteResolved,
 		"seat_group_id", rc.SeatGroupID,
@@ -111,6 +146,19 @@ func (p *Proxy) handleSeatGroupRoute(
 
 	p.serveRouteWithObserver(w, r, &rc, prov, realKey, inboundBearer, startTime, logger,
 		observer.StreamUserChat, traceID)
+}
+
+// poolOAuthLacksDisguise reports a SAFETY VIOLATION (NP-3 fence): an OAuth pool
+// route is about to be forwarded to Anthropic WITHOUT the AccountPersona stash,
+// so the outbound request would carry the employee's REAL identity under the
+// shared account — the exact "一号多设备" ban condition the identity floor
+// prevents. Today the single pool-serving path (handleSeatGroupRoute) always
+// stashes, so this never fires; it is the backstop that makes a FUTURE
+// pool-routing path that forgets to stash observable instead of silently leaking.
+func poolOAuthLacksDisguise(route *vkeys.ResolvedRoute, realKey string, req *http.Request) bool {
+	return route.SeatGroupID != "" &&
+		realKey == oauthSentinelKey &&
+		req.Context().Value(ctxKeyPoolPersona) == nil
 }
 
 // degradeGroup fails a group request loudly (never silently routes it to a wrong

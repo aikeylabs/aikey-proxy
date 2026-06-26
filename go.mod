@@ -12,8 +12,6 @@ require (
 	github.com/AiKeyLabs/pkg/seatassign v0.0.0
 	github.com/AiKeyLabs/pkg/usagehash v0.0.0
 	github.com/aikeylabs/ai-degrade-detector/proxy-plugin/rhythm v0.0.0
-	github.com/cespare/xxhash/v2 v2.3.0
-	github.com/imroc/req/v3 v3.57.0
 	github.com/tidwall/gjson v1.19.0
 	github.com/tidwall/sjson v1.2.5
 	golang.org/x/crypto v0.49.0
@@ -50,6 +48,7 @@ require (
 	github.com/google/go-querystring v1.1.0 // indirect
 	github.com/google/uuid v1.6.0 // indirect
 	github.com/icholy/digest v1.1.0 // indirect
+	github.com/imroc/req/v3 v3.57.0 // indirect
 	github.com/klauspost/compress v1.18.2 // indirect
 	github.com/kr/text v0.2.0 // indirect
 	github.com/mattn/go-isatty v0.0.20 // indirect

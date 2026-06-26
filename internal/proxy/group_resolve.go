@@ -59,6 +59,10 @@ type groupResolution struct {
 	CredentialType string // "oauth_account" | "api_key"
 	ProviderCode   string // candidate's resolved provider code (oauthInject dispatch)
 	Identity       string // display / audit only — never sent upstream
+	// Primary is the seat's rank-0 account (seatassign top pick). When it differs
+	// from AccountID, a fallback happened (the primary was cooled / exhausted /
+	// expired / has no material) — the caller audits the switch (N9 #8).
+	Primary string
 
 	// oauth_account: header injection via oauthInject(req, OAuth, ProviderCode).
 	OAuth *OAuthCredential
@@ -66,6 +70,11 @@ type groupResolution struct {
 	PlaintextKey string
 	BaseURL      string
 	Revision     string
+	// WindowMaxUtilPct is master's randomized pre-cut cap (95-99) for this
+	// account's quota window (N11). When the upstream response says utilization
+	// ≥ this/100, N10 pre-cuts the account before it hits 100% (which looks like
+	// abuse). nil → no cap delivered → proxy uses 100% (natural exhaustion only).
+	WindowMaxUtilPct *int
 }
 
 // resolveGroupCredential ranks the route's group candidates for route.SeatID and
@@ -98,6 +107,7 @@ func resolveGroupCredential(route *vkeys.ResolvedRoute, derivedKey []byte, nowUn
 		refByID[r.AccountID] = r
 	}
 	ordered := seatassign.Rank(route.SeatID, accounts)
+	primary := ordered[0].AccountID // rank-0; audited when the actual pick differs
 
 	for _, a := range ordered {
 		if skip[a.AccountID] {
@@ -115,7 +125,9 @@ func resolveGroupCredential(route *vkeys.ResolvedRoute, derivedKey []byte, nowUn
 			continue // corrupt material — try the next candidate, don't fail the request
 		}
 		ref := refByID[a.AccountID]
-		return buildGroupResolution(a.AccountID, ref, mat, secret), nil
+		res := buildGroupResolution(a.AccountID, ref, mat, secret)
+		res.Primary = primary
+		return res, nil
 	}
 
 	return nil, &groupResolveError{Code: groupErrAllUnusable, Reason: "all group candidates expired, exhausted, or undecryptable"}
@@ -158,10 +170,11 @@ func decryptGroupSecret(derivedKey []byte, mat vkeys.GroupRuntimeAccount) (strin
 // buildGroupResolution assembles the injectable credential for the chosen account.
 func buildGroupResolution(accountID string, ref vkeys.GroupAccountRef, mat vkeys.GroupRuntimeAccount, secret string) *groupResolution {
 	res := &groupResolution{
-		AccountID:      accountID,
-		CredentialType: mat.CredentialType,
-		ProviderCode:   ref.ProviderCode,
-		Identity:       ref.Identity,
+		AccountID:        accountID,
+		CredentialType:   mat.CredentialType,
+		ProviderCode:     ref.ProviderCode,
+		Identity:         ref.Identity,
+		WindowMaxUtilPct: mat.WindowMaxUtilPct, // master's pre-cut cap (N10)
 	}
 	if mat.CredentialType == credTypeKey {
 		res.PlaintextKey = secret
@@ -169,10 +182,10 @@ func buildGroupResolution(accountID string, ref vkeys.GroupAccountRef, mat vkeys
 		res.Revision = mat.Revision
 		return res
 	}
-	// oauth_account → build the credential oauthInject consumes. Pooled=true: a
-	// group account is by definition shared by many seats, so injectClaudeOAuth
-	// must apply AccountPersona identity normalization (NP-1) to collapse every
-	// employee onto one device/session per account (§3.1 防封 floor).
+	// oauth_account → build the credential oauthInject consumes. The pool identity
+	// disguise is NOT set here; the serve site stashes it (stashPoolPersona) so
+	// the Director applies it to the outbound clone only (NP-4) — keeping the real
+	// identity on r for internal attribution.
 	res.OAuth = &OAuthCredential{
 		AccessToken: secret,
 		Provider:    ref.ProviderCode,
@@ -180,7 +193,6 @@ func buildGroupResolution(accountID string, ref vkeys.GroupAccountRef, mat vkeys
 		ExternalID:  mat.ExternalID, // Claude metadata.user_id (empty until master N7a fills it)
 		Identity:    ref.Identity,
 		ExpiresAt:   mat.ExpiresAt,
-		Pooled:      true,
 	}
 	return res
 }

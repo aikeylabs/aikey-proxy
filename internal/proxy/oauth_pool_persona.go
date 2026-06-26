@@ -25,12 +25,43 @@
 package proxy
 
 import (
+	"context"
 	"crypto/sha256"
 	"encoding/binary"
 	"encoding/hex"
 	"fmt"
 	"net/http"
 )
+
+// poolPersonaCtx is the minimal pool-account identity the Director needs to
+// disguise the OUTBOUND request. Stashed on the request context by a pool-
+// routing site (e.g. handleSeatGroupRoute); consumed once in serveRoute's
+// Director. Kept tiny so it carries no secret material.
+type poolPersonaCtx struct {
+	accountID  string
+	externalID string
+}
+
+// stashPoolPersona marks a request as a pooled anthropic account so the Director
+// applies the AccountPersona disguise to the OUTBOUND clone — NOT the original
+// r. The original keeps the real employee identity (session / X-Stainless /
+// metadata) so our usage events, conversation audit, and filter cache attribute
+// the real conversation, while Anthropic sees the per-account normalized
+// identity. Returns the request carrying the stash. (NP-4: the fix for the
+// in-place collapse bleeding into our own session-keyed logic.)
+func stashPoolPersona(r *http.Request, accountID, externalID string) *http.Request {
+	return r.WithContext(context.WithValue(r.Context(), ctxKeyPoolPersona,
+		&poolPersonaCtx{accountID: accountID, externalID: externalID}))
+}
+
+// applyPoolPersonaFromContext applies the pool disguise to the outbound clone
+// when the request was stashed as pooled. Called from the Director; a plain
+// no-op (one type-assert) for every non-pool request.
+func applyPoolPersonaFromContext(req *http.Request) {
+	if pp, ok := req.Context().Value(ctxKeyPoolPersona).(*poolPersonaCtx); ok && pp != nil {
+		applyPoolPersona(req, pp.accountID, pp.externalID)
+	}
+}
 
 // poolPersona is one COHERENT, real-world Claude Code platform fingerprint. A
 // pool account is pinned to exactly one of these (chosen by hash of accountID),
@@ -74,16 +105,17 @@ func personaForAccount(accountID string) poolPersona {
 	return poolPersonas[idx]
 }
 
-// applyPoolPersona enforces per-account identity normalization on a pooled
-// Claude request. Called from injectClaudeOAuth ONLY when cred.Pooled — runs
-// LAST so it overrides the persona headers/body the earlier steps set. Anthropic
-// path only (it lives in the Claude injector); Codex/Kimi never pool (封板 P10).
-func applyPoolPersona(req *http.Request, cred *OAuthCredential) {
+// applyPoolPersona disguises ONE request as the pool account's normalized
+// identity. It mutates the request it is given — in the NP-4 design that is the
+// OUTBOUND clone inside serveRoute's Director, so the original r keeps the real
+// employee identity. anthropic-only (it injects the Claude persona); Codex/Kimi
+// never pool (封板 P10).
+func applyPoolPersona(req *http.Request, accountID, externalID string) {
 	// 1. Lock the FULL machine + CLI + SDK fingerprint to this account's pinned
 	//    persona — UNCONDITIONAL (a real Claude Code client sets its own; leaving
 	//    them would let each employee's real OS/arch/version leak as device
 	//    variety). Per-account-derived so accounts differ (anti-千人一面).
-	p := personaForAccount(cred.AccountID)
+	p := personaForAccount(accountID)
 	req.Header.Set("User-Agent", "claude-cli/"+p.cliVersion+" (external, cli)")
 	req.Header.Set("X-Stainless-OS", p.os)
 	req.Header.Set("X-Stainless-Arch", p.arch)
@@ -95,16 +127,15 @@ func applyPoolPersona(req *http.Request, cred *OAuthCredential) {
 	//    existing per-account primitive (SHA256(accountID), stable across users +
 	//    proxies); session is the rolling masked session (NP-2) so N employees'
 	//    N sessions → 1 while still rotating like a real session.
-	deviceHash := sha256.Sum256([]byte(cred.AccountID))
+	deviceHash := sha256.Sum256([]byte(accountID))
 	deviceID := hex.EncodeToString(deviceHash[:])
-	sessionID := defaultPoolSessions.sessionID(cred.AccountID)
+	sessionID := defaultPoolSessions.sessionID(accountID)
 	req.Header.Set("X-Claude-Code-Session-Id", sessionID)
 
 	// 3. Override metadata.user_id UNCONDITIONALLY — it is the device_id +
 	//    session carrier the upstream actually clusters on. A real Claude Code
-	//    client sets its own, so injectClaudeOAuth's if-absent path skips it,
-	//    leaking the employee's real device. Pool must overwrite.
-	userID := fmt.Sprintf("user_%s_account_%s_session_%s", deviceID, cred.ExternalID, sessionID)
+	//    client sets its own, so leaving it would leak the employee's real device.
+	userID := fmt.Sprintf("user_%s_account_%s_session_%s", deviceID, externalID, sessionID)
 	setMetadataUserID(req, userID)
 }
 

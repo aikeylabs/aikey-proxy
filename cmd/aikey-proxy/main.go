@@ -24,6 +24,7 @@ import (
 	"github.com/AiKeyLabs/aikey-proxy/internal/server"
 	"github.com/AiKeyLabs/aikey-proxy/internal/supervisor"
 	"github.com/AiKeyLabs/aikey-proxy/internal/vault"
+	"github.com/AiKeyLabs/aikey-proxy/internal/vkeys"
 
 	broker "github.com/AiKeyLabs/aikey-auth-broker"
 	"github.com/AiKeyLabs/pkg/aikeycompat"
@@ -251,7 +252,9 @@ func main() {
 		accountStore := vault.NewAccountStore(brokerVault.DB())
 
 		// Inject ImpersonateChrome HTTP client for Claude token endpoint (Cloudflare bypass).
-		broker.SetHTTPClient(vault.NewImpersonateChromeHTTPClient())
+		// Impl lives in the shared broker module (moved 2026-06-26) so aikey-control-master
+		// can inject the same client for its server-side OAuth flow — single source of truth.
+		broker.SetHTTPClient(broker.NewImpersonateChromeHTTPClient())
 
 		brk := broker.NewEmbedded(tokenStore, accountStore)
 		oauthHandler = broker.NewHandler(brk)
@@ -275,6 +278,19 @@ func main() {
 	adminHandler.DebugUpstreamHeadersStateFn = proxy.UpstreamHeadersDebugState
 	adminHandler.DebugUpstreamHeadersSetFn = proxy.SetUpstreamHeadersDebugAPIOverride
 	adminHandler.AppHealthFn = sup.AppHealthSnapshot
+	// Seat-group routing health (N9): omitted from /status unless the feature is
+	// on, so non-pool deployments are unchanged. Surfaces which pool accounts are
+	// currently cooled, for the operator monitoring the first pool batch.
+	adminHandler.PoolHealthFn = func() *admin.PoolRoutingHealth {
+		if !vkeys.SeatGroupRoutingEnabled() {
+			return nil
+		}
+		h := &admin.PoolRoutingHealth{Enabled: true}
+		for id, secs := range sup.PoolCooldownSnapshot() {
+			h.CooledAccounts = append(h.CooledAccounts, admin.CooledAccount{AccountID: id, CooldownSeconds: secs})
+		}
+		return h
+	}
 	adminHandler.EffectivePacksFn = sup.EffectivePacks
 	adminHandler.AuditStatusFn = sup.AuditStatus
 	adminHandler.ReconcileGapsFn = sup.ReconcileGaps

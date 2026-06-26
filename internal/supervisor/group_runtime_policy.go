@@ -97,7 +97,13 @@ func (s *Supervisor) syncGroupRuntime(ctx context.Context, cred events.Credentia
 	if err != nil {
 		return // can't auth → keep last-known
 	}
-	groups, sig, ok := fetchGroupRuntime(ctx, masterURL, bearer)
+	// Path Z (通道3 §14): piggyback the proxy's observed window-reset epochs so
+	// master re-rolls each account's window_max_util_pct per window.
+	var observedResets map[string]int64
+	if gen.proxy != nil {
+		observedResets = gen.proxy.ObservedResetsSnapshot()
+	}
+	groups, sig, ok := fetchGroupRuntime(ctx, masterURL, bearer, observedResets)
 	if !ok {
 		return // unreachable / bad response → keep last-known (don't flap)
 	}
@@ -167,12 +173,23 @@ var groupRuntimeHTTPClient = defaultGroupRuntimeClient()
 // caller keeps the last-known group_runtime (don't flap). rawBody is the change
 // signature — same plaintext response = no token change = skip the vault rewrite
 // (the encrypted form can't be compared: a fresh nonce each encrypt).
-func fetchGroupRuntime(ctx context.Context, masterURL, bearer string) ([]grGroup, string, bool) {
+// observedResetsHeader piggybacks the proxy's observed per-account window-reset
+// epochs on the pull (Path Z, 通道3 §14): base64(JSON {account_id: epoch}).
+// master re-rolls window_max_util_pct when an epoch is newer than its stored
+// window_reset_at. Optional — master ignores it when absent (backward compatible).
+const observedResetsHeader = "X-Aikey-Observed-Resets"
+
+func fetchGroupRuntime(ctx context.Context, masterURL, bearer string, observedResets map[string]int64) ([]grGroup, string, bool) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, masterURL+"/accounts/me/group-runtime", http.NoBody)
 	if err != nil {
 		return nil, "", false
 	}
 	req.Header.Set("Authorization", "Bearer "+bearer)
+	if len(observedResets) > 0 {
+		if b, mErr := json.Marshal(observedResets); mErr == nil {
+			req.Header.Set(observedResetsHeader, base64.StdEncoding.EncodeToString(b))
+		}
+	}
 	resp, err := groupRuntimeHTTPClient.Do(req)
 	if err != nil {
 		return nil, "", false

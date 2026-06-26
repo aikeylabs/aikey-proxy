@@ -415,6 +415,22 @@ func (p *Proxy) serveRoute(w http.ResponseWriter, r *http.Request, route *vkeys.
 					logger.Error("rewrite request failed", "error", err)
 				}
 			}
+			// Seat-group POOL identity disguise (NP-4): applied to the OUTBOUND
+			// clone ONLY, so the original r kept the real employee identity for
+			// our usage + conversation-audit + filter-cache. A one-type-assert
+			// no-op for every non-pool request. After the URL rewrite so it sees
+			// the final outbound req.
+			applyPoolPersonaFromContext(req)
+			// NP-3 backstop: an OAuth pool route that reached here WITHOUT the
+			// disguise stash is about to leak the employee's real identity under
+			// the shared account. The single pool-serving path always stashes, so
+			// this is silent today — it makes a future path that forgets loud.
+			if poolOAuthLacksDisguise(route, realKey, req) {
+				logger.Warn("seat-group OAuth forwarded without identity disguise — pool account leak risk",
+					"event.name", observability.EventProxyGroupPersonaMissing,
+					"seat_group_id", route.SeatGroupID,
+					"virtual_key_id", route.VirtualKeyID)
+			}
 			// Remove hop-by-hop headers the proxy shouldn't forward.
 			req.Header.Del("X-Forwarded-For")
 
@@ -470,6 +486,43 @@ func (p *Proxy) serveRoute(w http.ResponseWriter, r *http.Request, route *vkeys.
 			// ctxKeyCodexCandidateModel is only stashed inside the
 			// canonicalCode == "openai" OAuth branch above.
 			persistCodexLastModelIfSuccessful(resp.Request, resp.StatusCode)
+
+			// N8c reactive fallback: if a pool account's upstream says it is
+			// broken (401) or its window is exhausted (rate-limit-signal 429),
+			// cool it down so the resolver routes subsequent requests around it.
+			// This request still returns its status to the client; in-request
+			// retry (no client-visible failure) is N9. Non-group routes
+			// (route.SeatGroupID == "") skip this entirely.
+			if route.SeatGroupID != "" && route.AccountID != "" {
+				// Path Z (通道3 §14): record the observed window-reset epoch so the
+				// next N7c pull piggybacks it to master, which re-rolls this
+				// account's window_max_util_pct when a new window starts. Present on
+				// 200s too. Observability-only side effect; never blocks the request.
+				if epoch, ok := observedResetEpoch(resp.Header); ok {
+					p.poolObservedResets.record(route.AccountID, epoch)
+				}
+				if until, ok := cooldownDecision(resp, time.Now()); ok {
+					p.poolCooldown.mark(route.AccountID, until)
+					logger.Warn("pool account cooled down after upstream failure",
+						"event.name", observability.EventProxyGroupAccountCooldown,
+						"seat_group_id", route.SeatGroupID,
+						"account_id", route.AccountID,
+						"status", resp.StatusCode)
+				}
+				// N10 防封 pre-cut: even on a 200, if the account's utilization
+				// crossed its randomized cap, cool it down for this window so it
+				// never hits 100% (which looks like abuse upstream).
+				if capPct, ok := windowCapFromContext(resp.Request); ok {
+					if until, hit := windowPreCutDecision(resp.Header, capPct, time.Now()); hit {
+						p.poolCooldown.mark(route.AccountID, until)
+						logger.Warn("pool account pre-cut at window cap",
+							"event.name", observability.EventProxyGroupWindowPrecut,
+							"seat_group_id", route.SeatGroupID,
+							"account_id", route.AccountID,
+							"cap_pct", capPct)
+					}
+				}
+			}
 
 			// Upstream-headers debug toggle: log a "response snapshot" with
 			// status + body + selected response headers (rate-limit + retry

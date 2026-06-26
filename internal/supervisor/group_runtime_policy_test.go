@@ -89,9 +89,10 @@ func decryptSecret(t *testing.T, key []byte, a vkeys.GroupRuntimeAccount) string
 }
 
 func TestFetchGroupRuntime_ParsesAndSendsBearer(t *testing.T) {
-	var gotAuth string
+	var gotAuth, gotObsReset string
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		gotAuth = r.Header.Get("Authorization")
+		gotObsReset = r.Header.Get(observedResetsHeader)
 		if r.URL.Path != "/accounts/me/group-runtime" {
 			w.WriteHeader(404)
 			return
@@ -100,7 +101,7 @@ func TestFetchGroupRuntime_ParsesAndSendsBearer(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	groups, body, ok := fetchGroupRuntime(context.Background(), srv.URL, "JWT123")
+	groups, body, ok := fetchGroupRuntime(context.Background(), srv.URL, "JWT123", map[string]int64{"acc-1": 1750000000})
 	if !ok || len(groups) != 1 || groups[0].SeatGroupID != "grp-1" || len(groups[0].Accounts) != 1 {
 		t.Fatalf("fetch: ok=%v groups=%+v", ok, groups)
 	}
@@ -113,12 +114,31 @@ func TestFetchGroupRuntime_ParsesAndSendsBearer(t *testing.T) {
 	if gotAuth != "Bearer JWT123" {
 		t.Fatalf("bearer not sent: %q", gotAuth)
 	}
+	// Path Z: observed resets piggybacked as base64(JSON) on the pull.
+	if gotObsReset == "" {
+		t.Fatal("observed-resets header not sent")
+	}
+	raw, decErr := base64.StdEncoding.DecodeString(gotObsReset)
+	if decErr != nil {
+		t.Fatalf("observed-resets header not base64: %v", decErr)
+	}
+	var m map[string]int64
+	if json.Unmarshal(raw, &m) != nil || m["acc-1"] != 1750000000 {
+		t.Fatalf("observed-resets header payload wrong: %q → %+v", string(raw), m)
+	}
 
-	// Non-200 → ok=false (keep last-known).
-	bad := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(401) }))
+	// Non-200 → ok=false (keep last-known). Nil resets → header omitted.
+	var gotObs2 string
+	bad := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotObs2 = r.Header.Get(observedResetsHeader)
+		w.WriteHeader(401)
+	}))
 	defer bad.Close()
-	if _, _, ok := fetchGroupRuntime(context.Background(), bad.URL, "x"); ok {
+	if _, _, ok := fetchGroupRuntime(context.Background(), bad.URL, "x", nil); ok {
 		t.Fatal("401 must yield ok=false")
+	}
+	if gotObs2 != "" {
+		t.Fatalf("nil observed-resets must omit the header, got %q", gotObs2)
 	}
 }
 

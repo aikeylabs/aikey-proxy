@@ -60,6 +60,12 @@ func (p *Proxy) buildBaseEvent(req *http.Request, resp *http.Response, startTime
 	ev := events.UsageEvent{
 		Timestamp:    startTime,
 		VirtualKeyID: route.VirtualKeyID,
+		// AccountID = the REAL account that served this request. For seat_group
+		// routing group_serve sets route.AccountID to the CHOSEN account (and
+		// re-points it on fallback A→B), so local audit attributes to the
+		// account that actually sent upstream. VirtualKeyID stays the request's
+		// VK regardless of switch (stable user attribution).
+		AccountID:    route.AccountID,
 		Provider:     provider,
 		DurationMs:   time.Since(startTime).Milliseconds(),
 		StatusCode:   resp.StatusCode,

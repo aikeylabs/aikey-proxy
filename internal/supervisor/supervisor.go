@@ -960,6 +960,13 @@ func (s *Supervisor) AppHealthSnapshot() []apppipe.AppHealth {
 	return s.active.Load().proxy.AppHealthSnapshot()
 }
 
+// PoolCooldownSnapshot returns seat-group accounts currently cooling down
+// (account_id → seconds remaining) from the active generation's proxy, for the
+// admin /status pool-routing health surface (N9).
+func (s *Supervisor) PoolCooldownSnapshot() map[string]int {
+	return s.active.Load().proxy.PoolCooldownSnapshot()
+}
+
 // ReporterMetrics returns usage reporter counters from the active generation.
 // Returns nil if reporter is not configured (no collector_url).
 func (s *Supervisor) ReporterMetrics() *events.ReporterMetrics {

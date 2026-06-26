@@ -77,6 +77,9 @@ func TestResolveGroup_OAuthPrimaryDecrypts(t *testing.T) {
 	if res.AccountID != primary {
 		t.Fatalf("expected primary %q (seatassign order), got %q", primary, res.AccountID)
 	}
+	if res.Primary != res.AccountID {
+		t.Fatalf("primary usable → no switch: Primary(%q) must equal pick(%q)", res.Primary, res.AccountID)
+	}
 	if res.CredentialType != "oauth_account" || res.OAuth == nil {
 		t.Fatalf("want oauth cred, got %+v", res)
 	}
@@ -185,6 +188,14 @@ func TestResolveGroup_SkipSetAdvances(t *testing.T) {
 	}
 	if res.AccountID != secondary {
 		t.Fatalf("skip set should advance to %q, got %q", secondary, res.AccountID)
+	}
+	// N9 #8: the rank-0 primary is reported even when skipped, so the caller can
+	// audit the switch (primary != actual pick).
+	if res.Primary != primary {
+		t.Fatalf("Primary must be the rank-0 account %q (for switch audit), got %q", primary, res.Primary)
+	}
+	if res.Primary == res.AccountID {
+		t.Fatal("a skipped primary must differ from the actual pick (switch case)")
 	}
 }
 

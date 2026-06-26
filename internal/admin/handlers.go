@@ -74,6 +74,10 @@ type Handler struct {
 	// from "feature disabled" (503).
 	AppHealthFn func() []apppipe.AppHealth
 
+	// PoolHealthFn returns seat-group routing health for /status (N9). nil → the
+	// pool_routing field is omitted (non-pool deployments unchanged).
+	PoolHealthFn func() *PoolRoutingHealth
+
 	// EffectivePacksFn returns the raw JSON report of compliance packs currently
 	// effective in the live filter child (built-in + pulled). Returns an error
 	// (apphook.ErrPacksUnavailable) when no filter child is active / can't report;
@@ -230,6 +234,23 @@ type statusResponse struct {
 	VirtualKeys int    `json:"virtual_keys_loaded"`
 	TotalReqs   int64  `json:"total_requests"`
 	TotalErrs   int64  `json:"total_errors"`
+	// PoolRouting is the seat-group routing health (N9). Omitted unless the
+	// feature is on, so non-pool deployments' /status is unchanged. Lets the
+	// operator monitoring the first pool batch see which accounts are cooled.
+	PoolRouting *PoolRoutingHealth `json:"pool_routing,omitempty"`
+}
+
+// PoolRoutingHealth is the seat-group account-routing health surface (N9). Built
+// by the cmd layer from the proxy's reactive cooldown state.
+type PoolRoutingHealth struct {
+	Enabled        bool            `json:"enabled"`
+	CooledAccounts []CooledAccount `json:"cooled_accounts,omitempty"`
+}
+
+// CooledAccount is one pool account currently routed around (401 / exhaustion).
+type CooledAccount struct {
+	AccountID       string `json:"account_id"`
+	CooldownSeconds int    `json:"cooldown_seconds"`
 }
 
 // Status returns detailed proxy status.
@@ -248,6 +269,11 @@ func (h *Handler) Status(w http.ResponseWriter, r *http.Request) {
 		totalErrs = h.TotalErrorsFn()
 	}
 
+	var poolRouting *PoolRoutingHealth
+	if h.PoolHealthFn != nil {
+		poolRouting = h.PoolHealthFn()
+	}
+
 	writeJSON(w, http.StatusOK, statusResponse{
 		Status:      "ok",
 		Version:     Version,
@@ -258,12 +284,18 @@ func (h *Handler) Status(w http.ResponseWriter, r *http.Request) {
 		StartedAt:   h.startedAt.Format(time.RFC3339),
 		TotalReqs:   totalReqs,
 		TotalErrs:   totalErrs,
+		PoolRouting: poolRouting,
 	})
 }
 
 type metricsResponse struct {
 	RequestsByVKey     map[string]int64         `json:"requests_by_vkey"`
 	RequestsByProvider map[string]int64         `json:"requests_by_provider"`
+	// RequestsByAccount: per real serving account (seat_group attribution).
+	// Counts follow pool fallback (A→B counts toward B). Empty when no group
+	// routing has happened. Lets local audit see "which account served" without
+	// the collector/ODS.
+	RequestsByAccount map[string]int64 `json:"requests_by_account"`
 	Reporter           *events.ReporterMetrics  `json:"reporter,omitempty"`
 	Collector          *events.CollectorMetrics `json:"collector,omitempty"`
 	Canary             *events.CanaryResult     `json:"canary,omitempty"`
@@ -286,6 +318,10 @@ func (h *Handler) Metrics(w http.ResponseWriter, r *http.Request) {
 		byVKey = make(map[string]int64)
 		byProvider = make(map[string]int64)
 	}
+	byAccount, err := h.store.QueryByAccount()
+	if err != nil {
+		byAccount = make(map[string]int64)
+	}
 
 	var reporterMetrics *events.ReporterMetrics
 	if h.ReporterMetricsFn != nil {
@@ -305,6 +341,7 @@ func (h *Handler) Metrics(w http.ResponseWriter, r *http.Request) {
 		TotalErrors:        totalErrs,
 		RequestsByVKey:     byVKey,
 		RequestsByProvider: byProvider,
+		RequestsByAccount:  byAccount,
 		Reporter:           reporterMetrics,
 		Collector:          collectorMetrics,
 		Canary:             canaryResult,

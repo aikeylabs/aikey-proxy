@@ -66,15 +66,6 @@ type OAuthCredential struct {
 	ExternalID  string // Account UUID from OAuth provider (e.g. Claude account.uuid)
 	Identity    string // Email or display name (for logging only, never sent upstream)
 	ExpiresAt   int64
-	// Pooled marks this credential as a seat_group POOL account shared by many
-	// seats. When true, injectClaudeOAuth applies AccountPersona identity
-	// normalization (device_id / session collapse / OS-arch-UA lock) so the
-	// upstream sees ONE consistent device per account_uuid instead of N
-	// employees' real fingerprints — the §3.1 防封 floor for safe pooling.
-	// false (direct-bind / personal OAuth) → existing fill-if-absent behavior,
-	// byte-identical. Only load-bearing on the anthropic path. Design:
-	// 20260624-动态决策账号分配引擎-技术方案.md §3.1/§3.3.
-	Pooled bool
 }
 
 // Proxy is the core reverse proxy that handles virtual key resolution
@@ -90,6 +81,16 @@ type Proxy struct {
 	// (N8). nil when the injected vault doesn't implement DerivedKey() (tests) →
 	// group routing degrades to GROUP_KEY_UNAVAILABLE rather than panicking.
 	groupKey groupKeyProvider
+	// poolCooldown holds per-account reactive fallback state (N8c): an account
+	// whose upstream failed (401 / exhaustion-429) is skipped by the resolver
+	// until its cooldown lapses. Always non-nil (set in New); the request path
+	// only consults it for group routes.
+	poolCooldown *poolCooldownStore
+	// poolObservedResets holds the latest upstream window-reset epoch observed per
+	// pool account (Path Z, 通道3 §14). The N7c pull piggybacks it to master so it
+	// re-rolls window_max_util_pct per window. Always non-nil; only written on
+	// group-route responses.
+	poolObservedResets *poolResetStore
 	// filterHook is the P4 filter dispatcher — a generic apphook.Hook
 	// (ai-compliance-detector / DLP / etc.) that inspects the inbound
 	// request body before forwarding. Nil = no filter (the common default
@@ -227,6 +228,8 @@ func New(v VaultGetter, reg *vkeys.Registry, prov *provider.Registry, coll *even
 		VerySlowRequestMs:  10000,
 		UpstreamTimeout:    defaultUpstreamTimeout,
 		appHealthCache:     apppipe.NewHealthCache(),
+		poolCooldown:       newPoolCooldownStore(),
+		poolObservedResets: newPoolResetStore(),
 	}
 	if ar, ok := v.(ActiveKeyReader); ok {
 		p.activeReader = ar
@@ -309,6 +312,23 @@ func (p *Proxy) AppHealthSnapshot() []apppipe.AppHealth {
 		return []apppipe.AppHealth{}
 	}
 	return p.appHealthCache.Snapshot()
+}
+
+// PoolCooldownSnapshot returns the seat-group accounts currently in reactive
+// cooldown (account_id → seconds remaining) for the admin /status health surface
+// (N9 组路由健康). nil when nothing is cooling. The cmd layer wraps this into the
+// admin DTO so the operator monitoring the first pool batch can see which
+// accounts are being routed around.
+func (p *Proxy) PoolCooldownSnapshot() map[string]int {
+	return p.poolCooldown.snapshot()
+}
+
+// ObservedResetsSnapshot returns the latest upstream window-reset epoch observed
+// per pool account (account_id → epoch). The supervisor's N7c pull piggybacks
+// it to master (Path Z) so master re-rolls window_max_util_pct per window. nil
+// when nothing observed yet.
+func (p *Proxy) ObservedResetsSnapshot() map[string]int64 {
+	return p.poolObservedResets.snapshot()
 }
 
 // recordAppHealth is the proxy-internal hook called from handleAppPipeline

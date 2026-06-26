@@ -178,14 +178,13 @@ func injectClaudeOAuth(req *http.Request, cred *OAuthCredential) {
 		rewriteToolNamesForward(req)
 	}
 
-	// 8. Pool identity normalization (NP-1). For a seat_group POOL account,
-	// collapse every employee onto ONE device / session / OS-arch / UA per
-	// account (§3.1 防封 floor). Runs LAST so it overrides the per-client persona
-	// set above. Non-pool (cred.Pooled == false: direct-bind, personal OAuth)
-	// skips this entirely → byte-identical to before this field existed.
-	if cred.Pooled {
-		applyPoolPersona(req, cred)
-	}
+	// NOTE: seat_group POOL identity normalization (AccountPersona) is NOT applied
+	// here on `req`. It would collapse the session/device on the same request our
+	// own usage + conversation-audit + filter-cache read, tangling pooled
+	// conversations in OUR records. Instead the pool-routing site stashes the
+	// persona (stashPoolPersona) and serveRoute's Director applies it to the
+	// OUTBOUND clone only — real identity stays on `r` for internal attribution,
+	// normalized identity goes upstream. See oauth_pool_persona.go (NP-4).
 }
 
 // claudeCodeSystemPrompt is the byte-exact 57-char marker that Anthropic's
