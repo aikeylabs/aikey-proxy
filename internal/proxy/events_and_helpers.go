@@ -112,6 +112,14 @@ func (p *Proxy) buildBaseEvent(req *http.Request, resp *http.Response, startTime
 		// Trust note: spoofable signal, display-only.
 		ev.AppSlug = route.AppSlug
 	}
+	// I5 (best-effort, OFF the hot path): ship the upstream's parsed 5h utilization
+	// to master so the allocation engine can read it. enqueue is nil-safe (reporter
+	// off → no-op) and non-blocking (full buffer drops the sample, never stalls).
+	if resp != nil {
+		if util, ok := parseUnifiedUtil5h(resp.Header); ok {
+			p.signalReporter.enqueue(route.CredentialID, time.Now().Unix(), util)
+		}
+	}
 	return ev
 }
 

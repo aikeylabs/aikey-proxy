@@ -1558,6 +1558,12 @@ func (s *Supervisor) buildGeneration() (*generation, error) {
 				loadedSeq = int64(seq)
 			}
 			p.SetReporter(reporter, fmt.Sprintf("proxy-%d", id), s.version, fmt.Sprintf("gen-%d", id), loadedSeq, vaultReader.GetLoggedInAccountID())
+			// I5: wire the allocation-engine util signal reporter with the team
+			// account-JWT (same credential the group-runtime poll uses) → master
+			// /accounts/me/signals. Off unless a team credential + control URL exist.
+			if teamCred := buildCollectorCredentials(s.cfg.Events.CollectorCredentials, vaultReader)["team"]; teamCred != nil {
+				p.EnableSignalReporting(readControlPanelURL(), teamCred.Bearer)
+			}
 			slog.Info("usage reporter enabled", "collector_url", s.cfg.Events.CollectorURL)
 
 			// Start canary probe. As of 2026-04-17 diagnostics live on the
