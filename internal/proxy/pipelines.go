@@ -987,6 +987,19 @@ func (p *Proxy) handlePathPrefixRoute(w http.ResponseWriter, r *http.Request, pr
 		// only registered when the seat-group flag is on, so SeatGroupID is empty
 		// in flag-off builds and the direct-bind path stays byte-identical.
 		if route.SeatGroupID != "" {
+			// Strip the provider prefix BEFORE handing off to the group handler.
+			// The path-prefix entry normally defers the strip to below (after the
+			// provider-compat check: `r.URL.Path = strippedPath`), but
+			// handleSeatGroupRoute forwards r.URL.Path VERBATIM to the upstream —
+			// so an unstripped `/anthropic/v1/models` would hit
+			// `api.anthropic.com/anthropic/v1/models` → 404 (verified: Cf-Ray 404
+			// from api.anthropic.com). The legacy /v1 entry (handle_dispatch.go) is
+			// unaffected: its path is already `/v1/...` with no provider prefix.
+			// Bugfix: 2026-06-26-group-vk-pathprefix-unstripped-404.
+			r.URL.Path = strippedPath
+			if r.URL.RawPath != "" {
+				r.URL.RawPath = strippedPath
+			}
 			p.handleSeatGroupRoute(w, r, route, rawAuthValue, startTime, logger, traceID)
 			return
 		}
