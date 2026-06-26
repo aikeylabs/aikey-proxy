@@ -24,7 +24,7 @@ type VaultGetter interface {
 	GetSecret(alias string) (string, error)
 }
 
-// groupKeyProvider exposes the vault's derived key so the seat-group resolver
+// groupKeyProvider exposes the vault's derived key so the oauth-group resolver
 // (N8) can decrypt per-account group material at request time. *vault.Reader
 // implements it; an injected mock that doesn't disables group routing (safe).
 type groupKeyProvider interface {
@@ -77,7 +77,7 @@ type Proxy struct {
 	probeVault   probepipe.VaultReader // non-nil when vault implements the Probe pipeline read surface (mode C, SPEC 2026-05-23)
 	broker       OAuthBroker           // OAuth credential provider (nil = OAuth not available)
 	vault        VaultGetter
-	// groupKey exposes the vault derived key for seat-group material decryption
+	// groupKey exposes the vault derived key for oauth-group material decryption
 	// (N8). nil when the injected vault doesn't implement DerivedKey() (tests) →
 	// group routing degrades to GROUP_KEY_UNAVAILABLE rather than panicking.
 	groupKey groupKeyProvider
@@ -257,7 +257,7 @@ func New(v VaultGetter, reg *vkeys.Registry, prov *provider.Registry, coll *even
 	if pv, ok := v.(probepipe.VaultReader); ok {
 		p.probeVault = pv
 	}
-	// Seat-group routing (N8) decrypts per-account group material at request
+	// Oauth-group routing (N8) decrypts per-account group material at request
 	// time with the vault derived key. *vault.Reader exposes DerivedKey(); a
 	// mock that doesn't simply leaves p.groupKey nil → group routing degrades
 	// (GROUP_KEY_UNAVAILABLE) instead of panicking. Tests can swap via
@@ -291,7 +291,7 @@ func (p *Proxy) SetProbeVault(pv probepipe.VaultReader) {
 	p.probeVault = pv
 }
 
-// SetGroupKeyProvider injects the vault derived-key accessor for seat-group
+// SetGroupKeyProvider injects the vault derived-key accessor for oauth-group
 // material decryption (N8). Mirrors SetProbeVault — auto-wired by New(...) when
 // the VaultGetter argument implements DerivedKey(); tests that exercise group
 // routing inject it explicitly.
@@ -323,7 +323,7 @@ func (p *Proxy) AppHealthSnapshot() []apppipe.AppHealth {
 	return p.appHealthCache.Snapshot()
 }
 
-// PoolCooldownSnapshot returns the seat-group accounts currently in reactive
+// PoolCooldownSnapshot returns the oauth-group accounts currently in reactive
 // cooldown (account_id → seconds remaining) for the admin /status health surface
 // (N9 组路由健康). nil when nothing is cooling. The cmd layer wraps this into the
 // admin DTO so the operator monitoring the first pool batch can see which

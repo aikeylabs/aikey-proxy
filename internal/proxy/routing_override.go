@@ -4,7 +4,7 @@
 //
 // This is a THIN redirect layer over the local seatassign pick. The supervisor's
 // pollRoutingOverrides (mirror of pollGroupRuntime) GETs the sparse assignments
-// map every ~60s and Store()s it here; handleSeatGroupRoute looks up the seat and
+// map every ~60s and Store()s it here; handleOauthGroupRoute looks up the seat and
 // hands the override account to resolveGroupCredential, which applies it ONLY when
 // it is still a valid candidate (§6.5 member-validity re-check). On any doubt the
 // resolver falls back to the local pick — the engine can redirect serving, never

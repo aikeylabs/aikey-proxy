@@ -3,7 +3,7 @@ package proxy
 // persona_chokepoint_test.go — §3.3 "归一真空" source-level fence (design
 // 20260624-动态决策账号分配引擎-技术方案.md §3.3 / 不变量 7).
 //
-// THE RISK: a pooled (seat_group) account shares ONE account_uuid across N
+// THE RISK: a pooled (oauth_group) account shares ONE account_uuid across N
 // employees. Every OAuth-injection site that can serve a pooled account MUST
 // route the OUTBOUND request through the AccountPersona normalization
 // (stashPoolPersona → the Director's applyPoolPersonaFromContext). Miss one
@@ -13,15 +13,15 @@ package proxy
 // "漏接任一字段或任一代码路径即该路径未归一".
 //
 // THE INVARIANT THIS LOCKS: today every pooled OAuth request funnels through the
-// SINGLE pool-serving chokepoint handleSeatGroupRoute (group_serve.go), which
+// SINGLE pool-serving chokepoint handleOauthGroupRoute (group_serve.go), which
 // calls oauthInject AND immediately stashPoolPersona. The other oauthInject
 // sites are single-account (non-pool) paths a pooled route can NEVER reach,
 // because handle_dispatch.go:235 and pipelines.go:989 early-return pooled traffic
-// (route.SeatGroupID != "") to handleSeatGroupRoute before those sites run.
+// (route.OauthGroupID != "") to handleOauthGroupRoute before those sites run.
 //
 // WHY A SOURCE-LEVEL FENCE (and what it adds over what exists):
 //   - TestGroupServe_PoolPersonaUpstreamOnly proves the EXISTING funnel disguises
-//     the outbound request — but it only exercises handleSeatGroupRoute, so a
+//     the outbound request — but it only exercises handleOauthGroupRoute, so a
 //     brand-new pool-serving path that forgets the stash would not be exercised.
 //   - poolOAuthLacksDisguise (the Director backstop) only emits a runtime WARN,
 //     not a failing test.
@@ -43,19 +43,19 @@ import (
 )
 
 // knownOAuthInjectSites enumerates every function that calls oauthInject and
-// whether it can serve a seat_group POOL account. A pool-serving site (true)
+// whether it can serve a oauth_group POOL account. A pool-serving site (true)
 // MUST also call stashPoolPersona. Adding a new oauthInject site forces an update
 // here — that is the review gate the fence creates.
 var knownOAuthInjectSites = map[string]bool{ // enclosing func name -> servesPool
 	// forward_and_resolve.go:224 — single personal_oauth_account binding. Non-pool:
-	// ResolveBindingCredential resolves a 1:1 binding, not a seat_group.
+	// ResolveBindingCredential resolves a 1:1 binding, not a oauth_group.
 	"ResolveBindingCredential": false,
 	// pipelines.go:1132 (Tier1 OAuth token-route) + :1220 (Tier2 OAuth probe).
-	// Non-pool: the SeatGroupID early-return (pipelines.go:989) dispatches pooled
-	// traffic to handleSeatGroupRoute before either branch runs.
+	// Non-pool: the OauthGroupID early-return (pipelines.go:989) dispatches pooled
+	// traffic to handleOauthGroupRoute before either branch runs.
 	"handlePathPrefixRoute": false,
-	// group_serve.go:96 — the ONLY seat_group POOL funnel. Must also stash persona.
-	"handleSeatGroupRoute": true,
+	// group_serve.go:96 — the ONLY oauth_group POOL funnel. Must also stash persona.
+	"handleOauthGroupRoute": true,
 }
 
 func TestPersonaChokepoints_AllPoolInjectionRoutesThroughPersona(t *testing.T) {
@@ -73,7 +73,7 @@ func TestPersonaChokepoints_AllPoolInjectionRoutesThroughPersona(t *testing.T) {
 	for fn := range injecting {
 		if _, ok := knownOAuthInjectSites[fn]; !ok {
 			t.Errorf("NEW oauthInject chokepoint %q is not registered in knownOAuthInjectSites.\n"+
-				"  If this path can serve a seat_group POOL account it MUST also call stashPoolPersona,\n"+
+				"  If this path can serve a oauth_group POOL account it MUST also call stashPoolPersona,\n"+
 				"  or pooled traffic reaches Anthropic with the employee's real identity under the\n"+
 				"  shared account (归一真空 / §3.3 / 不变量 7). Register it here with the right servesPool flag.", fn)
 		}

@@ -7,7 +7,7 @@ import (
 )
 
 // freshOAuth is a fully-usable OAuth material entry (far-future expiry, active
-// window) for the seat-group resolver tests below.
+// window) for the oauth-group resolver tests below.
 func freshOAuth(t *testing.T, key []byte, token string) vkeys.GroupRuntimeAccount {
 	return encMat(t, key, vkeys.GroupRuntimeAccount{
 		CredentialType: "oauth_account", ExpiresAt: 9_000_000_000, WindowStatus: "active",
@@ -29,7 +29,7 @@ func threeAccountRoute(t *testing.T, key []byte, seat string) (*vkeys.ResolvedRo
 		"acc-b": freshOAuth(t, key, "tok-acc-b"),
 		"acc-c": freshOAuth(t, key, "tok-acc-c"),
 	}
-	route := &vkeys.ResolvedRoute{SeatID: seat, SeatGroupID: "grp", GroupAccounts: mustJSON(t, refs), GroupRuntime: mustJSON(t, mat)}
+	route := &vkeys.ResolvedRoute{SeatID: seat, OauthGroupID: "grp", GroupAccounts: mustJSON(t, refs), GroupRuntime: mustJSON(t, mat)}
 	return route, rankOrder(seat, "acc-a", "acc-b", "acc-c")
 }
 

@@ -178,7 +178,7 @@ func injectClaudeOAuth(req *http.Request, cred *OAuthCredential) {
 		rewriteToolNamesForward(req)
 	}
 
-	// NOTE: seat_group POOL identity normalization (AccountPersona) is NOT applied
+	// NOTE: oauth_group POOL identity normalization (AccountPersona) is NOT applied
 	// here on `req`. It would collapse the session/device on the same request our
 	// own usage + conversation-audit + filter-cache read, tangling pooled
 	// conversations in OUR records. Instead the pool-routing site stashes the

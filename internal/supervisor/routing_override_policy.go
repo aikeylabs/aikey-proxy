@@ -32,13 +32,13 @@ var routingOverrideHTTPClient = &http.Client{Timeout: 10 * time.Second}
 
 // pollRoutingOverrides runs until ctx is canceled, pulling the account's routing
 // overrides every routingOverridePollInterval (plus once at start). No-op unless
-// the seat-group feature is enabled (without group VKs there is no seat to
+// the oauth-group feature is enabled (without group VKs there is no seat to
 // redirect). The account-JWT credential is built ONCE and reused across cycles —
 // same scoping as pollGroupRuntime (one Bearer refresh window). The endpoint is
 // single-account ("me") scoped, matching the local proxy which serves exactly the
 // one logged-in account's seats — the same scoping group-runtime already relies on.
 func (s *Supervisor) pollRoutingOverrides(ctx context.Context) {
-	if !seatGroupRoutingEnabled() {
+	if !oauthGroupRoutingEnabled() {
 		return // feature off → no group VKs → nothing to redirect
 	}
 	gen := s.active.Load()

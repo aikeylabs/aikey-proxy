@@ -97,12 +97,12 @@ func TestFetchGroupRuntime_ParsesAndSendsBearer(t *testing.T) {
 			w.WriteHeader(404)
 			return
 		}
-		_, _ = w.Write([]byte(`{"groups":[{"seat_group_id":"grp-1","routing_config":"{}","accounts":[{"account_id":"a1","credential_type":"oauth_account","access_token":"tok","expires_at":9}]}]}`))
+		_, _ = w.Write([]byte(`{"groups":[{"oauth_group_id":"grp-1","routing_config":"{}","accounts":[{"account_id":"a1","credential_type":"oauth_account","access_token":"tok","expires_at":9}]}]}`))
 	}))
 	defer srv.Close()
 
 	groups, body, ok := fetchGroupRuntime(context.Background(), srv.URL, "JWT123", map[string]int64{"acc-1": 1750000000})
-	if !ok || len(groups) != 1 || groups[0].SeatGroupID != "grp-1" || len(groups[0].Accounts) != 1 {
+	if !ok || len(groups) != 1 || groups[0].OauthGroupID != "grp-1" || len(groups[0].Accounts) != 1 {
 		t.Fatalf("fetch: ok=%v groups=%+v", ok, groups)
 	}
 	if body == "" || !strings.Contains(body, "grp-1") {
@@ -149,20 +149,20 @@ func TestWriteGroupRuntimeForGroups_PerVKEncrypted(t *testing.T) {
 		t.Fatalf("open: %v", err)
 	}
 	if _, err := db.Exec(`CREATE TABLE managed_virtual_keys_cache (
-		virtual_key_id TEXT PRIMARY KEY, seat_group_id TEXT, group_runtime TEXT)`); err != nil {
+		virtual_key_id TEXT PRIMARY KEY, oauth_group_id TEXT, group_runtime TEXT)`); err != nil {
 		t.Fatalf("create: %v", err)
 	}
 	// vk-g1 → grp-1, vk-direct → no group.
-	db.Exec(`INSERT INTO managed_virtual_keys_cache (virtual_key_id, seat_group_id) VALUES ('vk-g1','grp-1')`)
-	db.Exec(`INSERT INTO managed_virtual_keys_cache (virtual_key_id, seat_group_id) VALUES ('vk-direct','')`)
+	db.Exec(`INSERT INTO managed_virtual_keys_cache (virtual_key_id, oauth_group_id) VALUES ('vk-g1','grp-1')`)
+	db.Exec(`INSERT INTO managed_virtual_keys_cache (virtual_key_id, oauth_group_id) VALUES ('vk-direct','')`)
 	db.Close()
 
 	key := testKey()
 	mks := []vault.ManagedKey{
-		{VirtualKeyID: "vk-g1", SeatGroupID: "grp-1"},
+		{VirtualKeyID: "vk-g1", OauthGroupID: "grp-1"},
 		{VirtualKeyID: "vk-direct"},
 	}
-	groups := []grGroup{{SeatGroupID: "grp-1", Accounts: []grAccount{
+	groups := []grGroup{{OauthGroupID: "grp-1", Accounts: []grAccount{
 		{AccountID: "a1", CredentialType: "oauth_account", AccessToken: "tok-1", ExpiresAt: 5},
 	}}}
 

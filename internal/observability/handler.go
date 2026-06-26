@@ -48,7 +48,7 @@ const (
 	// token quota floor backstops it and the server baseline catches up on
 	// re-sync. Recurring hits signal a stale summary needing a price re-sync.
 	EventProxyQuotaModelUnpriced = "proxy.quota.model_unpriced"
-	// Seat-group routing (N8). EventProxyGroupRouteResolved: a group VK request
+	// Oauth-group routing (N8). EventProxyGroupRouteResolved: a group VK request
 	// picked + injected a candidate account. EventProxyGroupRouteDegraded: no
 	// usable candidate (no material / all expired-exhausted / key unavailable) →
 	// the request is failed rather than silently routed wrong.
@@ -105,7 +105,7 @@ const (
 	ErrCodeQuotaExceededToken = "QUOTA_EXCEEDED_TOKEN"
 	ErrCodeQuotaExceededUSD   = "QUOTA_EXCEEDED_USD"
 	ErrCodeQuotaDegradedBlock = "QUOTA_DEGRADED_BLOCK"
-	// Seat-group routing degrade codes (N8). The resolver's typed reasons
+	// Oauth-group routing degrade codes (N8). The resolver's typed reasons
 	// (GROUP_NO_CANDIDATES / GROUP_NO_MATERIAL / GROUP_ALL_UNUSABLE) are surfaced
 	// verbatim; GROUP_KEY_UNAVAILABLE is the proxy-local "can't decrypt" case.
 	ErrCodeGroupKeyUnavailable = "GROUP_KEY_UNAVAILABLE"

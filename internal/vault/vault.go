@@ -258,14 +258,14 @@ type ManagedKey struct {
 	VirtualKeyRevision string
 	OwnerAccountID     string
 
-	// ── Seat-group (channel ③) fields (N7c) ───────────────────────────────
-	// Populated only for group VKs (binding.target = seat_group). For these,
+	// ── Oauth-group (channel ③) fields (N7c) ───────────────────────────────
+	// Populated only for group VKs (binding.target = oauth_group). For these,
 	// PlaintextKey is EMPTY — the real per-account material lives in GroupRuntime
 	// and the route resolver (N8) picks a candidate account + injects its token.
 	//
-	// SeatGroupID != "" is the discriminator: empty = direct-bind VK (existing
+	// OauthGroupID != "" is the discriminator: empty = direct-bind VK (existing
 	// path, byte-unchanged); non-empty = group VK.
-	SeatGroupID string
+	OauthGroupID string
 	// GroupAccounts: the candidate account list JSON (structural, CLI-synced) —
 	// [{account_id, identity, provider_code, priority, assigned}].
 	GroupAccounts string
@@ -299,7 +299,7 @@ type ManagedKey struct {
 // different master password or corrupted data) so a single bad entry does not
 // block the proxy from starting.
 func (r *Reader) GetActiveManagedKeys() ([]ManagedKey, error) {
-	// Try the group-aware query first (reads the seat_group columns added by
+	// Try the group-aware query first (reads the oauth_group columns added by
 	// N0/N6). Fall back to the legacy query on error — an older vault that lacks
 	// those columns must still load its direct-bind keys, never lose all keys
 	// over a missing column. Mirrors the CLI's column-cascade (storage_platform.rs).
@@ -315,7 +315,7 @@ func (r *Reader) GetActiveManagedKeys() ([]ManagedKey, error) {
 }
 
 // queryManagedKeys reads active managed keys. withGroup=true also selects the
-// seat-group columns (group VKs); false is the legacy shape for older vaults.
+// oauth-group columns (group VKs); false is the legacy shape for older vaults.
 //
 // 2026-05-09 alias surfacing: COALESCE(local_alias, alias) — the cache has two
 // alias-like columns (`alias` server-canonical NOT NULL, `local_alias` nullable
@@ -324,11 +324,11 @@ func (r *Reader) queryManagedKeys(withGroup bool) ([]ManagedKey, error) {
 	groupCols := ""
 	// Direct-bind keys require provider_key_ciphertext; group VKs have NONE
 	// (material rides group_runtime), so when reading group columns we also admit
-	// rows whose only target is a seat_group.
+	// rows whose only target is a oauth_group.
 	targetFilter := "provider_key_ciphertext IS NOT NULL"
 	if withGroup {
-		groupCols = ", seat_group_id, group_accounts, group_runtime, routing_config"
-		targetFilter = "(provider_key_ciphertext IS NOT NULL OR seat_group_id IS NOT NULL)"
+		groupCols = ", oauth_group_id, group_accounts, group_runtime, routing_config"
+		targetFilter = "(provider_key_ciphertext IS NOT NULL OR oauth_group_id IS NOT NULL)"
 	}
 	rows, err := r.db.Query(`
 		SELECT virtual_key_id, COALESCE(NULLIF(local_alias, ''), alias) AS effective_alias,
@@ -355,19 +355,19 @@ func (r *Reader) queryManagedKeys(withGroup bool) ([]ManagedKey, error) {
 		var providerBaseURLsJSON *string
 		var orgID, seatID, credID, credRev, vkRev string
 		var ownerAccountID *string
-		var seatGroupID, groupAccounts, groupRuntime, routingConfig *string // group cols (nullable)
+		var oauthGroupID, groupAccounts, groupRuntime, routingConfig *string // group cols (nullable)
 
 		dest := []any{&vkID, &localAlias, &provCode, &protType, &baseURL, &nonce, &ciphertext, &providerBaseURLsJSON,
 			&orgID, &seatID, &credID, &credRev, &vkRev, &ownerAccountID}
 		if withGroup {
-			dest = append(dest, &seatGroupID, &groupAccounts, &groupRuntime, &routingConfig)
+			dest = append(dest, &oauthGroupID, &groupAccounts, &groupRuntime, &routingConfig)
 		}
 		if err := rows.Scan(dest...); err != nil {
 			slog.Warn("managed key: scan error, skipping", "error", err)
 			continue
 		}
 
-		sgID := derefStr(seatGroupID)
+		sgID := derefStr(oauthGroupID)
 		// Direct-bind keys decrypt their provider_key_ciphertext. Group VKs have
 		// NO ciphertext (material rides group_runtime, per-account) → skip decrypt,
 		// leave PlaintextKey empty; the route resolver (N8) picks an account.
@@ -414,7 +414,7 @@ func (r *Reader) queryManagedKeys(withGroup bool) ([]ManagedKey, error) {
 			CredentialRevision: credRev,
 			VirtualKeyRevision: vkRev,
 			OwnerAccountID:     derefStr(ownerAccountID),
-			SeatGroupID:        sgID,
+			OauthGroupID:        sgID,
 			GroupAccounts:      derefStr(groupAccounts),
 			GroupRuntime:       derefStr(groupRuntime),
 			RoutingConfig:      derefStr(routingConfig),

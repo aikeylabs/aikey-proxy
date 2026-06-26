@@ -1,6 +1,6 @@
-// group_resolve.go — N8a: seat-group credential resolver (pure, no I/O).
+// group_resolve.go — N8a: oauth-group credential resolver (pure, no I/O).
 //
-// Given a resolved group VK route (route.SeatGroupID != ""), this picks one
+// Given a resolved group VK route (route.OauthGroupID != ""), this picks one
 // candidate account for the request and produces the credential to inject:
 //
 //	route.GroupAccounts  (candidate set, ranking inputs + identity, NO secrets)
@@ -14,7 +14,7 @@
 // This function is deliberately side-effect free (no vault read, no HTTP, no
 // header mutation) so it is fully unit-testable. The hot-path wiring that calls
 // it + mutates the request lives in N8b (handle_dispatch), behind the
-// seat-group feature flag. Direct-bind / personal routes never reach here.
+// oauth-group feature flag. Direct-bind / personal routes never reach here.
 //
 // SECURITY: the decrypted secret exists only in the returned struct's memory;
 // it is never logged. Ranking MUST match master's snapshot.GroupAccountRef
@@ -179,7 +179,7 @@ func materialUsable(mat vkeys.GroupRuntimeAccount, nowUnix int64) bool {
 		return false // access_token expired (refresh is master's job — N7b)
 	}
 	if mat.WindowStatus == "exhausted" {
-		return false // seat-group quota window used up — fall back to next account
+		return false // oauth-group quota window used up — fall back to next account
 	}
 	return true
 }

@@ -37,12 +37,12 @@ const groupRuntimePollInterval = 60 * time.Second
 
 // pollGroupRuntime runs until ctx is canceled, pulling the account's group
 // runtime every groupRuntimePollInterval (plus once at start). No-op unless the
-// seat-group feature is enabled. The account-JWT credential is built ONCE and
+// oauth-group feature is enabled. The account-JWT credential is built ONCE and
 // reused across cycles (one Bearer refresh window, not one per cycle); the
 // control-plane refresh_token is reusable (same as the collector credential's
 // re-refresh-on-restart design), so reuse is safe.
 func (s *Supervisor) pollGroupRuntime(ctx context.Context) {
-	if !seatGroupRoutingEnabled() {
+	if !oauthGroupRoutingEnabled() {
 		return // feature off → the whole rail is bypassed (direct-bind unchanged)
 	}
 	gen := s.active.Load()
@@ -85,7 +85,7 @@ func (s *Supervisor) syncGroupRuntime(ctx context.Context, cred events.Credentia
 	mks, _ := gen.vault.GetActiveManagedKeys()
 	hasGroup := false
 	for i := range mks {
-		if mks[i].SeatGroupID != "" {
+		if mks[i].OauthGroupID != "" {
 			hasGroup = true
 			break
 		}
@@ -132,7 +132,7 @@ type grDeliveryResp struct {
 }
 
 type grGroup struct {
-	SeatGroupID   string      `json:"seat_group_id"`
+	OauthGroupID   string      `json:"oauth_group_id"`
 	RoutingConfig string      `json:"routing_config"`
 	Accounts      []grAccount `json:"accounts"`
 }
@@ -249,18 +249,18 @@ func buildGroupRuntimeJSON(derivedKey []byte, accounts []grAccount) (string, err
 }
 
 // writeGroupRuntimeForGroups writes the encrypted material into every group VK's
-// group_runtime column. A VK belongs to a group when its SeatGroupID matches; a
+// group_runtime column. A VK belongs to a group when its OauthGroupID matches; a
 // group with no local VK is simply skipped (the proxy only stores what it routes).
 func writeGroupRuntimeForGroups(dbPath string, derivedKey []byte, mks []vault.ManagedKey, groups []grGroup) error {
 	// group_id → its VK ids (from the locally-known managed keys).
 	vksByGroup := make(map[string][]string)
 	for i := range mks {
-		if mks[i].SeatGroupID != "" {
-			vksByGroup[mks[i].SeatGroupID] = append(vksByGroup[mks[i].SeatGroupID], mks[i].VirtualKeyID)
+		if mks[i].OauthGroupID != "" {
+			vksByGroup[mks[i].OauthGroupID] = append(vksByGroup[mks[i].OauthGroupID], mks[i].VirtualKeyID)
 		}
 	}
 	for _, g := range groups {
-		vkIDs := vksByGroup[g.SeatGroupID]
+		vkIDs := vksByGroup[g.OauthGroupID]
 		if len(vkIDs) == 0 {
 			continue
 		}

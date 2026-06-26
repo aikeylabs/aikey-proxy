@@ -43,7 +43,7 @@ type UsageEvent struct {
 	ErrorType    string `json:"error_type,omitempty"`
 	VirtualKeyID string `json:"virtual_key_id"`
 	// AccountID — the REAL upstream account that actually served this request.
-	// For seat_group (pool) routing this follows fallback: if the proxy
+	// For oauth_group (pool) routing this follows fallback: if the proxy
 	// switched A→B (quota/401), this is B (the account that sent upstream),
 	// NOT the VK's nominal binding — so LOCAL audit can answer "which account
 	// served this request" without querying the collector/ODS. The user

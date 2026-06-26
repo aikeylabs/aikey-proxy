@@ -427,14 +427,14 @@ func New(cfg *config.Config, configPath, password, version string) (*Supervisor,
 
 	// N7c-2: pull the account's group runtime (channel ③ token/key material) on
 	// the same master-poll rail, so a group OAuth token refreshed on master reaches
-	// this node without any CLI command. No-op unless AIKEY_PROXY_SEAT_GROUP_ENABLED
+	// this node without any CLI command. No-op unless AIKEY_PROXY_OAUTH_GROUP_ENABLED
 	// (and there is a local group VK). Isolated: a poller panic must not kill the
 	// data path.
 	observability.GoSafe("supervisor.group_runtime_poll", observability.Isolated, func() { s.pollGroupRuntime(s.ctx) })
 
 	// I-side §6.5: pull the allocation engine's seat→account routing overrides on
 	// the same master-poll rail, so the engine's redirect of a seat off an unhealthy
-	// account reaches this node without any CLI command. No-op unless seat-group
+	// account reaches this node without any CLI command. No-op unless oauth-group
 	// routing is enabled (and there is a team credential). Isolated: a poller panic
 	// must never kill the data path — and the override is a pure redirect the
 	// resolver always falls back from.
@@ -706,13 +706,13 @@ func (s *Supervisor) syncManagedKeys() {
 	}
 	for i := range managedKeys {
 		mk := &managedKeys[i]
-		// N7c safety gate: a group VK (SeatGroupID != "") carries NO PlaintextKey —
+		// N7c safety gate: a group VK (OauthGroupID != "") carries NO PlaintextKey —
 		// its per-account material lives in GroupRuntime and routing requires the
 		// group resolver (N8). Until that's enabled, do NOT register group VKs;
 		// otherwise the hot path's `PlaintextKey != ""` check fails and the request
 		// falls to the personal-key path and 401s. Gated by
-		// AIKEY_PROXY_SEAT_GROUP_ENABLED (default off) → direct-bind path unchanged.
-		if mk.SeatGroupID != "" && !seatGroupRoutingEnabled() {
+		// AIKEY_PROXY_OAUTH_GROUP_ENABLED (default off) → direct-bind path unchanged.
+		if mk.OauthGroupID != "" && !oauthGroupRoutingEnabled() {
 			continue
 		}
 		// 2026-04-29 prefix rename: team token = aikey_team_<vk_id>.
@@ -975,7 +975,7 @@ func (s *Supervisor) AppHealthSnapshot() []apppipe.AppHealth {
 	return s.active.Load().proxy.AppHealthSnapshot()
 }
 
-// PoolCooldownSnapshot returns seat-group accounts currently cooling down
+// PoolCooldownSnapshot returns oauth-group accounts currently cooling down
 // (account_id → seconds remaining) from the active generation's proxy, for the
 // admin /status pool-routing health surface (N9).
 func (s *Supervisor) PoolCooldownSnapshot() map[string]int {

@@ -94,7 +94,7 @@ func TestGroupServe_OAuthAccountInjectsBearer(t *testing.T) {
 	route := &vkeys.ResolvedRoute{
 		VirtualKeyID: "vk-grp", Provider: "anthropic", ProtocolType: "anthropic",
 		ProviderCode: "anthropic", RouteSource: "team",
-		SeatID: "seat-1", SeatGroupID: "grp-1",
+		SeatID: "seat-1", OauthGroupID: "grp-1",
 		GroupAccounts: mustJSON(t, refs), GroupRuntime: mustJSON(t, mat),
 	}
 	p, tr := setupGroupProxy(t, key, route)
@@ -118,10 +118,10 @@ func TestGroupServe_OAuthAccountInjectsBearer(t *testing.T) {
 }
 
 // Regression (live full-pipeline E2E 2026-06-25): a REAL group VK has an EMPTY
-// VK-level ProviderCode/Provider — it's bound to a seat_group, not a provider,
+// VK-level ProviderCode/Provider — it's bound to a oauth_group, not a provider,
 // so the provider lives per-account in group_accounts. The serve path must take
 // the provider from the RESOLVED account, not the route, or canonicalCode=""
-// yields an empty upstream base URL → 502. (handleSeatGroupRoute originally used
+// yields an empty upstream base URL → 502. (handleOauthGroupRoute originally used
 // rc.ProviderCode; hermetic tests set route.ProviderCode so never hit the empty
 // case — only the live pipeline did.)
 func TestGroupServe_EmptyRouteProviderUsesAccountProvider(t *testing.T) {
@@ -135,7 +135,7 @@ func TestGroupServe_EmptyRouteProviderUsesAccountProvider(t *testing.T) {
 	route := &vkeys.ResolvedRoute{
 		VirtualKeyID: "vk-grp", ProtocolType: "anthropic", RouteSource: "team",
 		// Provider + ProviderCode intentionally EMPTY — the real group-VK shape.
-		SeatID: "seat-1", SeatGroupID: "grp-1",
+		SeatID: "seat-1", OauthGroupID: "grp-1",
 		GroupAccounts: mustJSON(t, refs), GroupRuntime: mustJSON(t, mat),
 	}
 	p, tr := setupGroupProxy(t, key, route)
@@ -166,7 +166,7 @@ func TestGroupServe_APIKeyAccountInjectsKey(t *testing.T) {
 	route := &vkeys.ResolvedRoute{
 		VirtualKeyID: "vk-grp", Provider: "anthropic", ProtocolType: "anthropic",
 		ProviderCode: "anthropic", RouteSource: "team",
-		SeatID: "seat-1", SeatGroupID: "grp-1",
+		SeatID: "seat-1", OauthGroupID: "grp-1",
 		GroupAccounts: mustJSON(t, refs), GroupRuntime: mustJSON(t, mat),
 	}
 	p, tr := setupGroupProxy(t, key, route)
@@ -192,7 +192,7 @@ func TestGroupServe_NoMaterialDegrades503(t *testing.T) {
 	route := &vkeys.ResolvedRoute{
 		VirtualKeyID: "vk-grp", Provider: "anthropic", ProtocolType: "anthropic",
 		ProviderCode: "anthropic", RouteSource: "team",
-		SeatID: "seat-1", SeatGroupID: "grp-1",
+		SeatID: "seat-1", OauthGroupID: "grp-1",
 		GroupAccounts: mustJSON(t, refs), GroupRuntime: "", // not pulled yet
 	}
 	p, tr := setupGroupProxy(t, key, route)
@@ -226,7 +226,7 @@ func TestGroupServe_PoolPersonaUpstreamOnly(t *testing.T) {
 	route := &vkeys.ResolvedRoute{
 		VirtualKeyID: "vk-grp", Provider: "anthropic", ProtocolType: "anthropic",
 		ProviderCode: "anthropic", RouteSource: "team",
-		SeatID: "seat-1", SeatGroupID: "grp-1",
+		SeatID: "seat-1", OauthGroupID: "grp-1",
 		GroupAccounts: mustJSON(t, refs), GroupRuntime: mustJSON(t, mat),
 	}
 	p, tr := setupGroupProxy(t, key, route)
@@ -268,7 +268,7 @@ func TestGroupServe_CooldownOn401(t *testing.T) {
 	route := &vkeys.ResolvedRoute{
 		VirtualKeyID: "vk-grp", Provider: "anthropic", ProtocolType: "anthropic",
 		ProviderCode: "anthropic", RouteSource: "team",
-		SeatID: "seat-1", SeatGroupID: "grp-1",
+		SeatID: "seat-1", OauthGroupID: "grp-1",
 		GroupAccounts: mustJSON(t, refs), GroupRuntime: mustJSON(t, mat),
 	}
 	p, tr := setupGroupProxy(t, key, route)
@@ -305,7 +305,7 @@ func TestGroupServe_NoCooldownOnWAF429(t *testing.T) {
 	route := &vkeys.ResolvedRoute{
 		VirtualKeyID: "vk-grp", Provider: "anthropic", ProtocolType: "anthropic",
 		ProviderCode: "anthropic", RouteSource: "team",
-		SeatID: "seat-1", SeatGroupID: "grp-1",
+		SeatID: "seat-1", OauthGroupID: "grp-1",
 		GroupAccounts: mustJSON(t, refs), GroupRuntime: mustJSON(t, mat),
 	}
 	p, tr := setupGroupProxy(t, key, route)
@@ -324,7 +324,7 @@ func TestGroupServe_NoCooldownOnWAF429(t *testing.T) {
 // NP-3 fence: the backstop predicate flags exactly the leak case — an OAuth pool
 // route forwarded without the disguise stash — and nothing else.
 func TestPoolOAuthLacksDisguise_Fence(t *testing.T) {
-	grp := &vkeys.ResolvedRoute{SeatGroupID: "grp-1"}
+	grp := &vkeys.ResolvedRoute{OauthGroupID: "grp-1"}
 	direct := &vkeys.ResolvedRoute{} // no group
 	plainReq := httptest.NewRequest(http.MethodPost, "/v1/messages", nil)
 	stashedReq := stashPoolPersona(httptest.NewRequest(http.MethodPost, "/v1/messages", nil), "acc", "ext")
@@ -355,7 +355,7 @@ func TestGroupServe_DirectBindUnaffected(t *testing.T) {
 		VirtualKeyID: "vk-direct", Provider: "anthropic", ProtocolType: "anthropic",
 		ProviderCode: "anthropic", RouteSource: "team",
 		BaseURL: "https://direct.example", PlaintextKey: "sk-direct-key",
-		// SeatGroupID empty → group branch skipped.
+		// OauthGroupID empty → group branch skipped.
 	}
 	p, tr := setupGroupProxy(t, key, route)
 
@@ -396,7 +396,7 @@ func TestGroupServe_FallbackAttributesToServedAccount(t *testing.T) {
 	route := &vkeys.ResolvedRoute{
 		VirtualKeyID: "vk-grp", Provider: "anthropic", ProtocolType: "anthropic",
 		ProviderCode: "anthropic", RouteSource: "team",
-		SeatID: "seat-1", SeatGroupID: "grp-1",
+		SeatID: "seat-1", OauthGroupID: "grp-1",
 		GroupAccounts: mustJSON(t, refs), GroupRuntime: mustJSON(t, mat),
 	}
 	// Map each account's at-rest token back to its account id so we can read the

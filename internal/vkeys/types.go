@@ -171,12 +171,12 @@ type ResolvedRoute struct {
 	// defense-in-depth check.
 	FollowUserActive bool
 
-	// ── Seat-group (channel ③) route fields (N7c) ─────────────────────────
-	// SeatGroupID != "" marks a GROUP virtual key: PlaintextKey is empty and the
+	// ── Oauth-group (channel ③) route fields (N7c) ─────────────────────────
+	// OauthGroupID != "" marks a GROUP virtual key: PlaintextKey is empty and the
 	// dispatch resolver (N8) picks a candidate account from GroupAccounts (ranked
 	// via pkg/seatassign for SeatID), reads its token from GroupRuntime, and
 	// injects it. Empty for direct-bind VKs → existing path, byte-unchanged.
-	SeatGroupID string
+	OauthGroupID string
 	// GroupAccounts: candidate account list JSON (structural). GroupRuntime:
 	// per-account token/key material JSON (channel ③, encrypted, proxy-pulled;
 	// NEVER refresh_token). RoutingConfig: the group's routing knobs JSON.
