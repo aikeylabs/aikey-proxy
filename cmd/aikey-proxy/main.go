@@ -254,7 +254,7 @@ func main() {
 		// Inject ImpersonateChrome HTTP client for Claude token endpoint (Cloudflare bypass).
 		// Impl lives in the shared broker module (moved 2026-06-26) so aikey-control-master
 		// can inject the same client for its server-side OAuth flow — single source of truth.
-		broker.SetHTTPClient(broker.NewImpersonateChromeHTTPClient())
+		broker.SetHTTPClient(broker.NewImpersonateChromeHTTPClient(""))
 
 		brk := broker.NewEmbedded(tokenStore, accountStore)
 		oauthHandler = broker.NewHandler(brk)
