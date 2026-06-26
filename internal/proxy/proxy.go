@@ -89,6 +89,12 @@ type Proxy struct {
 	// signalReporter ships parsed unified-* utilization to master (I5, best-effort,
 	// off the forward hot path). nil = feature off. Set via EnableSignalReporting.
 	signalReporter *signalReporter
+	// routingOverrides is the allocation engine's seat→account routing-override
+	// cache (I-side §6.5). Shared across generations, polled by the supervisor; the
+	// group-route hot path reads it to redirect a seat off an unhealthy default.
+	// nil-safe → empty/unset means every request uses the local seatassign pick.
+	// Set via SetRoutingOverrides. See routing_override.go.
+	routingOverrides *RoutingOverrideCache
 	// poolObservedResets holds the latest upstream window-reset epoch observed per
 	// pool account (Path Z, 通道3 §14). The N7c pull piggybacks it to master so it
 	// re-rolls window_max_util_pct per window. Always non-nil; only written on

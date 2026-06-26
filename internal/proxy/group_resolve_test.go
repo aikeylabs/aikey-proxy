@@ -70,7 +70,7 @@ func TestResolveGroup_OAuthPrimaryDecrypts(t *testing.T) {
 	}
 	route := &vkeys.ResolvedRoute{SeatID: seat, SeatGroupID: "grp", GroupAccounts: mustJSON(t, refs), GroupRuntime: mustJSON(t, mat)}
 
-	res, err := resolveGroupCredential(route, key, 1_000_000, nil)
+	res, err := resolveGroupCredential(route, key, 1_000_000, nil, "")
 	if err != nil {
 		t.Fatalf("resolve: %v", err)
 	}
@@ -102,7 +102,7 @@ func TestResolveGroup_APIKeyCarriesBaseURL(t *testing.T) {
 	}
 	route := &vkeys.ResolvedRoute{SeatID: "s1", GroupAccounts: mustJSON(t, refs), GroupRuntime: mustJSON(t, mat)}
 
-	res, err := resolveGroupCredential(route, key, 1_000_000, nil)
+	res, err := resolveGroupCredential(route, key, 1_000_000, nil, "")
 	if err != nil {
 		t.Fatalf("resolve: %v", err)
 	}
@@ -129,12 +129,12 @@ func TestResolveGroup_ExpiredPrimaryFallsToNext(t *testing.T) {
 	}
 	now := int64(1_000_000)
 	mat := map[string]vkeys.GroupRuntimeAccount{
-		primary:   encMat(t, key, vkeys.GroupRuntimeAccount{CredentialType: "oauth_account", ExpiresAt: now - 1}, "tok-primary"),   // expired
+		primary:   encMat(t, key, vkeys.GroupRuntimeAccount{CredentialType: "oauth_account", ExpiresAt: now - 1}, "tok-primary"),        // expired
 		secondary: encMat(t, key, vkeys.GroupRuntimeAccount{CredentialType: "oauth_account", ExpiresAt: now + 10_000}, "tok-secondary"), // fresh
 	}
 	route := &vkeys.ResolvedRoute{SeatID: seat, GroupAccounts: mustJSON(t, refs), GroupRuntime: mustJSON(t, mat)}
 
-	res, err := resolveGroupCredential(route, key, now, nil)
+	res, err := resolveGroupCredential(route, key, now, nil, "")
 	if err != nil {
 		t.Fatalf("resolve: %v", err)
 	}
@@ -159,7 +159,7 @@ func TestResolveGroup_ExhaustedWindowSkipped(t *testing.T) {
 	}
 	route := &vkeys.ResolvedRoute{SeatID: seat, GroupAccounts: mustJSON(t, refs), GroupRuntime: mustJSON(t, mat)}
 
-	res, err := resolveGroupCredential(route, key, 1_000_000, nil)
+	res, err := resolveGroupCredential(route, key, 1_000_000, nil, "")
 	if err != nil {
 		t.Fatalf("resolve: %v", err)
 	}
@@ -182,7 +182,7 @@ func TestResolveGroup_SkipSetAdvances(t *testing.T) {
 	route := &vkeys.ResolvedRoute{SeatID: seat, GroupAccounts: mustJSON(t, refs), GroupRuntime: mustJSON(t, mat)}
 
 	// Caller already tried the primary (e.g. upstream 401) → must advance.
-	res, err := resolveGroupCredential(route, key, 1_000_000, map[string]bool{primary: true})
+	res, err := resolveGroupCredential(route, key, 1_000_000, map[string]bool{primary: true}, "")
 	if err != nil {
 		t.Fatalf("resolve: %v", err)
 	}
@@ -204,11 +204,11 @@ func TestResolveGroup_ErrorCodes(t *testing.T) {
 	refs := []vkeys.GroupAccountRef{{AccountID: "acc-a", ProviderCode: "anthropic"}}
 
 	// No candidates.
-	if _, err := resolveGroupCredential(&vkeys.ResolvedRoute{SeatID: "s", GroupAccounts: "", GroupRuntime: "{}"}, key, 1, nil); !isGroupErr(err, groupErrNoCandidates) {
+	if _, err := resolveGroupCredential(&vkeys.ResolvedRoute{SeatID: "s", GroupAccounts: "", GroupRuntime: "{}"}, key, 1, nil, ""); !isGroupErr(err, groupErrNoCandidates) {
 		t.Fatalf("want NO_CANDIDATES, got %v", err)
 	}
 	// Candidates present but no material delivered.
-	if _, err := resolveGroupCredential(&vkeys.ResolvedRoute{SeatID: "s", GroupAccounts: mustJSON(t, refs), GroupRuntime: ""}, key, 1, nil); !isGroupErr(err, groupErrNoMaterial) {
+	if _, err := resolveGroupCredential(&vkeys.ResolvedRoute{SeatID: "s", GroupAccounts: mustJSON(t, refs), GroupRuntime: ""}, key, 1, nil, ""); !isGroupErr(err, groupErrNoMaterial) {
 		t.Fatalf("want NO_MATERIAL, got %v", err)
 	}
 	// Material present but the only candidate is expired → all unusable.
@@ -216,7 +216,7 @@ func TestResolveGroup_ErrorCodes(t *testing.T) {
 		"acc-a": encMat(t, key, vkeys.GroupRuntimeAccount{CredentialType: "oauth_account", ExpiresAt: 5}, "tok"),
 	}
 	route := &vkeys.ResolvedRoute{SeatID: "s", GroupAccounts: mustJSON(t, refs), GroupRuntime: mustJSON(t, mat)}
-	if _, err := resolveGroupCredential(route, key, 1_000_000, nil); !isGroupErr(err, groupErrAllUnusable) {
+	if _, err := resolveGroupCredential(route, key, 1_000_000, nil, ""); !isGroupErr(err, groupErrAllUnusable) {
 		t.Fatalf("want ALL_UNUSABLE, got %v", err)
 	}
 }

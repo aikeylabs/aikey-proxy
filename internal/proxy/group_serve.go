@@ -46,8 +46,12 @@ func (p *Proxy) handleSeatGroupRoute(
 	}
 
 	// Skip accounts cooling down from a recent upstream failure (N8c reactive
-	// fallback) so this request routes around them.
-	res, err := resolveGroupCredential(route, p.groupKey.DerivedKey(), time.Now().Unix(), p.poolCooldown.skipSet())
+	// fallback) so this request routes around them. The allocation engine's
+	// routing override for this seat (§6.5; "" when off / no redirect) is applied
+	// inside the resolver ONLY if it's still a valid candidate — fault-isolated,
+	// falls back to the local pick on any miss.
+	override := p.routingOverrides.lookup(route.SeatID)
+	res, err := resolveGroupCredential(route, p.groupKey.DerivedKey(), time.Now().Unix(), p.poolCooldown.skipSet(), override)
 	if err != nil {
 		code := observability.ErrCodeGroupKeyUnavailable
 		if ge, ok := err.(*groupResolveError); ok {
