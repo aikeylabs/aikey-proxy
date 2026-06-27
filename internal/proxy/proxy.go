@@ -86,6 +86,15 @@ type Proxy struct {
 	// until its cooldown lapses. Always non-nil (set in New); the request path
 	// only consults it for group routes.
 	poolCooldown *poolCooldownStore
+	// signalReporter ships parsed unified-* utilization to master (I5, best-effort,
+	// off the forward hot path). nil = feature off. Set via EnableSignalReporting.
+	signalReporter *signalReporter
+	// routingOverrides is the allocation engine's seat→account routing-override
+	// cache (I-side §6.5). Shared across generations, polled by the supervisor; the
+	// group-route hot path reads it to redirect a seat off an unhealthy default.
+	// nil-safe → empty/unset means every request uses the local seatassign pick.
+	// Set via SetRoutingOverrides. See routing_override.go.
+	routingOverrides *RoutingOverrideCache
 	// poolObservedResets holds the latest upstream window-reset epoch observed per
 	// pool account (Path Z, 通道3 §14). The N7c pull piggybacks it to master so it
 	// re-rolls window_max_util_pct per window. Always non-nil; only written on
@@ -433,6 +442,23 @@ func (p *Proxy) SetReporter(r *events.Reporter, instanceID, clientVersion, confi
 	p.proxyConfigVersion = configVersion
 	p.loadedControlSeq = loadedControlSeq
 	p.loggedInAccountID = loggedInAccountID
+}
+
+// EnableSignalReporting wires the allocation-engine util signal reporter (I5): the
+// proxy parses upstream unified-* utilization and best-effort POSTs it to master's
+// /accounts/me/signals, authed with the same team account-JWT the group-runtime
+// poll uses. nil controlURL/bearer → feature stays off (newSignalReporter returns nil).
+func (p *Proxy) EnableSignalReporting(controlURL string, bearer func(ctx context.Context) (string, error)) {
+	p.signalReporter = newSignalReporter(controlURL, bearer, slog.Default())
+}
+
+// StopSignalReporting stops the signal reporter's upload loop (idempotent,
+// nil-safe). Called from generation.close() so the per-generation reporter's
+// goroutine + ticker don't leak across reloads.
+func (p *Proxy) StopSignalReporting() {
+	if p.signalReporter != nil {
+		_ = p.signalReporter.Close()
+	}
 }
 
 // SetWAL attaches a local WAL writer for offline-mode usage events.
