@@ -93,6 +93,15 @@ type signalReporter struct {
 	inflCur  map[string]int
 	inflPeak map[string]int
 	logger   *slog.Logger
+
+	// stop terminates loop() on Close so the goroutine + ticker don't leak. A
+	// fresh signalReporter is built per generation (buildGeneration); without
+	// this, every reload (aikey use, filter/quota/audit toggle, /admin/reload)
+	// leaked one loop() + 30s ticker holding a live bearer closure over the old
+	// vault reader. Close is idempotent (stopOnce) — generation.close() may run
+	// once but defensive against double-close.
+	stop     chan struct{}
+	stopOnce sync.Once
 }
 
 // newSignalReporter returns nil (feature off) unless both a control URL and an
@@ -111,9 +120,22 @@ func newSignalReporter(controlURL string, bearer func(context.Context) (string, 
 		inflCur:   make(map[string]int),
 		inflPeak:  make(map[string]int),
 		logger:    logger,
+		stop:      make(chan struct{}),
 	}
 	go r.loop()
 	return r
+}
+
+// Close stops the upload loop (idempotent, nil-safe). Called from
+// generation.close() on every reload so the loop() goroutine + ticker don't
+// leak. It does NOT close r.in / r.revokedIn — the forward path may still send
+// there (non-blocking, default-drop), and closing them would panic that send.
+func (r *signalReporter) Close() error {
+	if r == nil {
+		return nil
+	}
+	r.stopOnce.Do(func() { close(r.stop) })
+	return nil
 }
 
 // enqueue is a non-blocking best-effort hand-off from the forward path. util7d
@@ -287,6 +309,11 @@ func (r *signalReporter) loop() {
 			}
 		case <-ticker.C:
 			flush(r.snapshotRateLimits(), r.snapshotConcurrency())
+		case <-r.stop:
+			// Final flush on shutdown so a reload doesn't drop the in-flight
+			// batch, then return — ends the goroutine + ticker (no leak).
+			flush(r.snapshotRateLimits(), r.snapshotConcurrency())
+			return
 		}
 	}
 }

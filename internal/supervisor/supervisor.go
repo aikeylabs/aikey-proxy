@@ -189,6 +189,13 @@ func (g *generation) close() {
 	if g.reporter != nil {
 		_ = g.reporter.Close()
 	}
+	// Stop the allocation-engine signal reporter (lives on this generation's
+	// proxy, started per generation in buildGeneration via EnableSignalReporting).
+	// Without this its loop() goroutine + 30s ticker leak on every reload, each
+	// holding a live bearer closure over the old vault reader.
+	if g.proxy != nil {
+		g.proxy.StopSignalReporting()
+	}
 	// Standalone WAL (collector_url empty): generation owns the writer and
 	// must close it explicitly, otherwise every reload leaks a file handle
 	// on offline-mode deployments. Only non-nil when reporter is nil.

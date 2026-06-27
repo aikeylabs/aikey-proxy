@@ -85,7 +85,13 @@ func (s *Supervisor) syncRoutingOverrides(ctx context.Context, cred events.Crede
 	if !ok {
 		return // unreachable / bad response → keep last-known (don't clear)
 	}
-	if s.routingOverrides.Version() == version {
+	// Skip only once we've ALREADY stored at this version. The Stored() guard
+	// closes the first-pull-at-version-0 hole: the cache's version atomic starts
+	// at 0, so without it master's first non-empty assignments carrying
+	// routing_version:0 would match Version()==0 and be skipped forever (the
+	// override never applied, no signal). After the first Store, steady-state
+	// re-pulls of the same version skip as before (no churn, no log spam).
+	if s.routingOverrides.Stored() && s.routingOverrides.Version() == version {
 		return // unchanged → no churn (empty map skip is harmless: lookups miss either way)
 	}
 	s.routingOverrides.Store(version, assignments)

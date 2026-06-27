@@ -29,6 +29,7 @@ import "sync/atomic"
 type RoutingOverrideCache struct {
 	m       atomic.Value // map[string]string; immutable once Stored (poll builds a fresh map each pull)
 	version atomic.Int64
+	stored  atomic.Bool // false until the first Store — distinguishes "never pulled" from "pulled at version 0"
 }
 
 // NewRoutingOverrideCache returns an empty cache (every lookup misses → local pick).
@@ -46,6 +47,15 @@ func (c *RoutingOverrideCache) Store(version int64, assignments map[string]strin
 	}
 	c.m.Store(assignments)
 	c.version.Store(version)
+	c.stored.Store(true)
+}
+
+// Stored reports whether anything has ever been Stored. The poll uses it to
+// distinguish "never pulled" (version 0 because the atomic is zero-valued) from
+// "pulled at routing_version 0" — without it, master's first non-empty payload
+// carrying routing_version:0 would match Version()==0 and be skipped forever.
+func (c *RoutingOverrideCache) Stored() bool {
+	return c != nil && c.stored.Load()
 }
 
 // Version returns the last Stored routing_version (0 when nothing stored yet) so
