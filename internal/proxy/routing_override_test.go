@@ -202,3 +202,26 @@ func TestRoutingOverrideCache_NilSafeAndStore(t *testing.T) {
 		t.Fatalf("nil-map store must clear, got %q", got)
 	}
 }
+
+// TestRoutingOverrideCache_StoredDistinguishesVersionZero is the regression for the
+// first-pull-at-version-0 skip hole (review HIGH): the cache's version atomic is
+// zero-valued, so the poll cannot treat Version()==0 alone as "unchanged" — master's
+// first non-empty payload at routing_version 0 must still be applied. Stored() makes
+// the "never pulled" vs "pulled at 0" distinction the poll's skip guard now relies on.
+func TestRoutingOverrideCache_StoredDistinguishesVersionZero(t *testing.T) {
+	c := NewRoutingOverrideCache()
+	if c.Stored() {
+		t.Fatal("fresh cache must report Stored()==false (never pulled)")
+	}
+	if c.Version() != 0 {
+		t.Fatalf("fresh cache Version() must be 0, got %d", c.Version())
+	}
+	// First pull: a non-empty assignment map carrying routing_version 0.
+	c.Store(0, map[string]string{"seat-1": "acct-1"})
+	if !c.Stored() {
+		t.Fatal("after Store(0,...) Stored() must be true — else the poll skips it forever")
+	}
+	if got := c.lookup("seat-1"); got != "acct-1" {
+		t.Fatalf("version-0 non-empty payload must be applied, lookup got %q want acct-1", got)
+	}
+}

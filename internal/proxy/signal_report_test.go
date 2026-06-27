@@ -510,3 +510,27 @@ func TestSignalPostSendsConcurrency(t *testing.T) {
 		t.Fatalf("decoded concurrency = %+v, want one {c4,2}", decoded.Concurrency)
 	}
 }
+
+// TestSignalReporterCloseIdempotentAndNilSafe covers the leak-fix Close contract:
+// loop() now returns on <-r.stop (so the per-generation goroutine + ticker don't
+// leak across reloads), and Close must be safe to call more than once
+// (generation.close paths) and on a nil receiver (feature-off). The concrete risk
+// is a double close(r.stop) panic — guarded by stopOnce; this test fails if that
+// guard is removed. (loop()'s timing isn't deterministically testable — see the
+// file header — so the stop case itself is verified by inspection.)
+func TestSignalReporterCloseIdempotentAndNilSafe(t *testing.T) {
+	r := newSignalReporter("http://example.invalid", func(context.Context) (string, error) { return "tok", nil }, slog.Default())
+	if r == nil {
+		t.Fatal("newSignalReporter returned nil")
+	}
+	if err := r.Close(); err != nil {
+		t.Fatalf("first Close: %v", err)
+	}
+	if err := r.Close(); err != nil { // idempotent — must not panic on double close
+		t.Fatalf("second Close: %v", err)
+	}
+	var nilR *signalReporter
+	if err := nilR.Close(); err != nil { // nil-safe — feature-off passes a nil reporter
+		t.Fatalf("nil Close: %v", err)
+	}
+}

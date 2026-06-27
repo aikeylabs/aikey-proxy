@@ -452,6 +452,15 @@ func (p *Proxy) EnableSignalReporting(controlURL string, bearer func(ctx context
 	p.signalReporter = newSignalReporter(controlURL, bearer, slog.Default())
 }
 
+// StopSignalReporting stops the signal reporter's upload loop (idempotent,
+// nil-safe). Called from generation.close() so the per-generation reporter's
+// goroutine + ticker don't leak across reloads.
+func (p *Proxy) StopSignalReporting() {
+	if p.signalReporter != nil {
+		_ = p.signalReporter.Close()
+	}
+}
+
 // SetWAL attaches a local WAL writer for offline-mode usage events.
 // When a reporter is configured the WAL is shared with it (set once at
 // supervisor level) and the reporter performs the append.  When the reporter
