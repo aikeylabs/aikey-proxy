@@ -146,6 +146,17 @@ func (p *Proxy) handleOauthGroupRoute(
 		"provider", canonicalCode,
 	)
 
+	// Group VKs leave rc.ProviderCode empty by design (the provider is per-account
+	// in group_accounts; the base URL above already used the resolved canonicalCode,
+	// NOT rc.ProviderCode — see the 502 note earlier). But the conversation-audit
+	// observer's protocol-specific extractor needs the provider to parse the turn:
+	// without it serveRouteWithObserver leaves ProtocolFamily="" → the extractor
+	// can't decode the messages/SSE → CONTENT_EMPTY_EXTRACT drops the turn while
+	// usage (protocol-agnostic) still reports. Found by the OAuth-pool E2E
+	// (2026-06-26). Set it to the resolved canonical provider now that the base URL
+	// is fixed, so the observer's ProtocolFamily fallback fires.
+	rc.ProviderCode = canonicalCode
+
 	p.serveRouteWithObserver(w, r, &rc, prov, realKey, inboundBearer, startTime, logger,
 		observer.StreamUserChat, traceID)
 }

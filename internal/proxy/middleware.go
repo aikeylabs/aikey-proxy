@@ -3,6 +3,7 @@ package proxy
 import (
 	"context"
 	"net/http"
+	"os"
 	"strings"
 
 	"github.com/AiKeyLabs/aikey-proxy/internal/observability"
@@ -202,6 +203,16 @@ func providerToProtocol(providerCode string) string {
 func providerDefaultBaseURL(providerCode string) string {
 	switch strings.ToLower(providerCode) {
 	case "anthropic", "claude":
+		// Test-only hook (gated to loopback): the cross-component OAuth-account
+		// routing E2E points the otherwise-hardcoded Anthropic upstream at a local
+		// mock. OAuth accounts carry no configurable base_url (unlike api_key
+		// material), so without this the OAuth inject path can't be exercised
+		// against a mock. The loopback guard means a prod misconfig can never
+		// reroute real traffic. See aikey-test/oauthgroup/oauth_account_routing_test.go.
+		if o := os.Getenv("AIKEY_PROXY_TEST_ANTHROPIC_BASE_URL"); o != "" &&
+			(strings.HasPrefix(o, "http://127.0.0.1:") || strings.HasPrefix(o, "http://localhost:")) {
+			return o
+		}
 		return "https://api.anthropic.com"
 	case "openai", "gpt", "chatgpt", "codex":
 		// Why: OpenAI SDK clients (including Codex) treat base_url as already
