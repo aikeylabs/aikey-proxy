@@ -315,6 +315,43 @@ func TestGroupServe_NoCooldownOnWAF429(t *testing.T) {
 	}
 }
 
+// §5.5 hard cap: a seat the engine marked Blocked (every pool account at the
+// ≤3-人/号 cap) gets 429 — the proxy must NOT fall back to its cap-blind local pick.
+func TestGroupServe_BlockedSeatReturns429(t *testing.T) {
+	key := grKey()
+	refs := []vkeys.GroupAccountRef{{AccountID: "acc-1", ProviderCode: "anthropic"}}
+	mat := map[string]vkeys.GroupRuntimeAccount{
+		"acc-1": encMat(t, key, vkeys.GroupRuntimeAccount{
+			CredentialType: "oauth_account", ExpiresAt: 9_000_000_000, ExternalID: "uuid-1",
+		}, "tok-1"),
+	}
+	route := &vkeys.ResolvedRoute{
+		VirtualKeyID: "vk-grp", Provider: "anthropic", ProtocolType: "anthropic",
+		ProviderCode: "anthropic", RouteSource: "team",
+		SeatID: "seat-1", OauthGroupID: "grp-1",
+		GroupAccounts: mustJSON(t, refs), GroupRuntime: mustJSON(t, mat),
+	}
+	p, tr := setupGroupProxy(t, key, route)
+
+	// Engine left seat-1 unbound (pool full) → proxy must 429, never route to acc-1.
+	cache := NewRoutingOverrideCache()
+	cache.StoreAll(1, nil, map[string]bool{"seat-1": true})
+	p.SetRoutingOverrides(cache)
+
+	req, w := groupReq(groupBody)
+	p.Handle(w, req)
+
+	if w.Code != http.StatusTooManyRequests {
+		t.Fatalf("blocked seat must 429, got %d body=%s", w.Code, w.Body.String())
+	}
+	if !strings.Contains(w.Body.String(), "GROUP_POOL_FULL") {
+		t.Fatalf("429 body must carry GROUP_POOL_FULL code: %s", w.Body.String())
+	}
+	if tr.host != "" {
+		t.Fatalf("blocked request must NOT reach upstream, dialed %q", tr.host)
+	}
+}
+
 // Byte-unchanged guard: a non-group (direct-bind) team route must NOT enter the
 // group path — it forwards via the static-key path exactly as before.
 func TestGroupServe_DirectBindUnaffected(t *testing.T) {

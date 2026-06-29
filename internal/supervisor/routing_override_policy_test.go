@@ -20,16 +20,19 @@ func TestFetchRoutingOverrides_ParsesAndSendsBearer(t *testing.T) {
 			w.WriteHeader(404)
 			return
 		}
-		_, _ = w.Write([]byte(`{"routing_version":42,"assignments":{"seat-1":"acc-9","seat-2":"acc-3"}}`))
+		_, _ = w.Write([]byte(`{"routing_version":42,"assignments":{"seat-1":"acc-9","seat-2":"acc-3"},"blocked":["seat-9"]}`))
 	}))
 	defer srv.Close()
 
-	version, assignments, ok := fetchRoutingOverrides(context.Background(), srv.URL, "JWT123")
+	version, assignments, blocked, ok := fetchRoutingOverrides(context.Background(), srv.URL, "JWT123")
 	if !ok || version != 42 {
 		t.Fatalf("fetch: ok=%v version=%d", ok, version)
 	}
 	if assignments["seat-1"] != "acc-9" || assignments["seat-2"] != "acc-3" {
 		t.Fatalf("assignments not parsed: %+v", assignments)
+	}
+	if !blocked["seat-9"] || len(blocked) != 1 {
+		t.Fatalf("blocked seats not parsed: %+v", blocked)
 	}
 	if gotAuth != "Bearer JWT123" {
 		t.Fatalf("bearer not sent: %q", gotAuth)
@@ -40,7 +43,7 @@ func TestFetchRoutingOverrides_ParsesAndSendsBearer(t *testing.T) {
 		_, _ = w.Write([]byte(`{"routing_version":7}`))
 	}))
 	defer empty.Close()
-	v, a, ok := fetchRoutingOverrides(context.Background(), empty.URL, "x")
+	v, a, _, ok := fetchRoutingOverrides(context.Background(), empty.URL, "x")
 	if !ok || v != 7 || a == nil || len(a) != 0 {
 		t.Fatalf("empty-assignments pull: ok=%v v=%d a=%+v", ok, v, a)
 	}
@@ -50,7 +53,7 @@ func TestFetchRoutingOverrides_ParsesAndSendsBearer(t *testing.T) {
 		w.WriteHeader(401)
 	}))
 	defer bad.Close()
-	if _, _, ok := fetchRoutingOverrides(context.Background(), bad.URL, "x"); ok {
+	if _, _, _, ok := fetchRoutingOverrides(context.Background(), bad.URL, "x"); ok {
 		t.Fatal("401 must yield ok=false")
 	}
 }
@@ -65,7 +68,7 @@ func TestRoutingOverride_KeepLastKnownOnFailure(t *testing.T) {
 
 	// fetch against a dead endpoint → ok=false → syncRoutingOverrides would return
 	// WITHOUT touching the cache. Assert by simulating that control flow.
-	_, _, ok := fetchRoutingOverrides(context.Background(), "http://127.0.0.1:0", "x")
+	_, _, _, ok := fetchRoutingOverrides(context.Background(), "http://127.0.0.1:0", "x")
 	if ok {
 		t.Fatal("unreachable endpoint must yield ok=false")
 	}

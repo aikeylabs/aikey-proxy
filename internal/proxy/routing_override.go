@@ -28,6 +28,7 @@ import "sync/atomic"
 // plus the routing_version they came from.
 type RoutingOverrideCache struct {
 	m       atomic.Value // map[string]string; immutable once Stored (poll builds a fresh map each pull)
+	blocked atomic.Value // map[string]bool; seats the engine left UNBOUND (pool at the ≤3-人/号 cap)
 	version atomic.Int64
 	stored  atomic.Bool // false until the first Store — distinguishes "never pulled" from "pulled at version 0"
 }
@@ -35,17 +36,27 @@ type RoutingOverrideCache struct {
 // NewRoutingOverrideCache returns an empty cache (every lookup misses → local pick).
 func NewRoutingOverrideCache() *RoutingOverrideCache { return &RoutingOverrideCache{} }
 
-// Store atomically replaces the whole assignments map and records the version.
-// A nil map is normalized to empty so readers can always type-assert. The map is
-// treated as read-only after Store, so lookup needs no lock.
+// Store replaces assignments at a version with NO blocked seats — kept for callers
+// that don't carry the blocked set; delegates to StoreAll.
 func (c *RoutingOverrideCache) Store(version int64, assignments map[string]string) {
+	c.StoreAll(version, assignments, nil)
+}
+
+// StoreAll atomically replaces the assignments map AND the blocked set and records
+// the version. nil maps are normalized to empty so readers can always type-assert;
+// the maps are read-only after StoreAll, so lookup/Blocked need no lock.
+func (c *RoutingOverrideCache) StoreAll(version int64, assignments map[string]string, blocked map[string]bool) {
 	if c == nil {
 		return
 	}
 	if assignments == nil {
 		assignments = map[string]string{} // empty = engine redirects nothing
 	}
+	if blocked == nil {
+		blocked = map[string]bool{} // empty = no seat is pool-full-blocked
+	}
 	c.m.Store(assignments)
+	c.blocked.Store(blocked)
 	c.version.Store(version)
 	c.stored.Store(true)
 }
@@ -79,6 +90,21 @@ func (c *RoutingOverrideCache) lookup(seatID string) string {
 		return ""
 	}
 	return v.(map[string]string)[seatID]
+}
+
+// Blocked reports whether the engine left seatID UNBOUND because every account in
+// its pool/segment is at the ≤3-人/号 cap. The proxy 429s a blocked seat instead of
+// falling back to the cap-blind local pick (which would route a 4th user onto a
+// full account). nil-safe; false when the feature is off / nothing stored.
+func (c *RoutingOverrideCache) Blocked(seatID string) bool {
+	if c == nil || seatID == "" {
+		return false
+	}
+	v := c.blocked.Load()
+	if v == nil {
+		return false
+	}
+	return v.(map[string]bool)[seatID]
 }
 
 // SetRoutingOverrides injects the shared, supervisor-owned routing-override cache

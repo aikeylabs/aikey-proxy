@@ -81,7 +81,7 @@ func (s *Supervisor) syncRoutingOverrides(ctx context.Context, cred events.Crede
 	if err != nil {
 		return // can't auth → keep last-known
 	}
-	version, assignments, ok := fetchRoutingOverrides(ctx, masterURL, bearer)
+	version, assignments, blocked, ok := fetchRoutingOverrides(ctx, masterURL, bearer)
 	if !ok {
 		return // unreachable / bad response → keep last-known (don't clear)
 	}
@@ -94,48 +94,54 @@ func (s *Supervisor) syncRoutingOverrides(ctx context.Context, cred events.Crede
 	if s.routingOverrides.Stored() && s.routingOverrides.Version() == version {
 		return // unchanged → no churn (empty map skip is harmless: lookups miss either way)
 	}
-	s.routingOverrides.Store(version, assignments)
+	s.routingOverrides.StoreAll(version, assignments, blocked)
 	slog.Info("routing overrides updated",
 		"event.name", "proxy.routing_override.changed",
-		"routing_version", version, "seats", len(assignments))
+		"routing_version", version, "seats", len(assignments), "blocked", len(blocked))
 }
 
-// routingOverrideResp mirrors master's GET /accounts/me/routing body. Assignments
-// is SPARSE: only seats the engine redirects away from an unhealthy default appear;
-// an empty/absent map = nothing to redirect.
+// routingOverrideResp mirrors master's GET /accounts/me/routing body. Assignments =
+// the engine's authoritative per-seat binding (the RefreshSeatBindings ledger);
+// Blocked = seats the engine left unbound (pool at the ≤3-人/号 cap) → the proxy
+// 429s them instead of WRH-falling-back.
 type routingOverrideResp struct {
 	RoutingVersion int64             `json:"routing_version"`
 	Assignments    map[string]string `json:"assignments"`
+	Blocked        []string          `json:"blocked"`
 }
 
 // fetchRoutingOverrides GETs the routing endpoint with an account-JWT Bearer.
 // Returns (version, assignments, ok); ok=false on ANY error so the caller keeps
 // the last-known cache (don't flap). A nil assignments is normalized to an empty
 // map so an ok=true pull always carries a concrete (possibly empty) map.
-func fetchRoutingOverrides(ctx context.Context, masterURL, bearer string) (int64, map[string]string, bool) {
+func fetchRoutingOverrides(ctx context.Context, masterURL, bearer string) (int64, map[string]string, map[string]bool, bool) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, masterURL+"/accounts/me/routing", http.NoBody)
 	if err != nil {
-		return 0, nil, false
+		return 0, nil, nil, false
 	}
 	req.Header.Set("Authorization", "Bearer "+bearer)
 	resp, err := routingOverrideHTTPClient.Do(req)
 	if err != nil {
-		return 0, nil, false
+		return 0, nil, nil, false
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
-		return 0, nil, false
+		return 0, nil, nil, false
 	}
 	body, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
 	if err != nil {
-		return 0, nil, false
+		return 0, nil, nil, false
 	}
 	var out routingOverrideResp
 	if err := json.Unmarshal(body, &out); err != nil {
-		return 0, nil, false
+		return 0, nil, nil, false
 	}
 	if out.Assignments == nil {
 		out.Assignments = map[string]string{}
 	}
-	return out.RoutingVersion, out.Assignments, true
+	blocked := make(map[string]bool, len(out.Blocked))
+	for _, seat := range out.Blocked {
+		blocked[seat] = true
+	}
+	return out.RoutingVersion, out.Assignments, blocked, true
 }

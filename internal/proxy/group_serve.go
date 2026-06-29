@@ -45,6 +45,20 @@ func (p *Proxy) handleOauthGroupRoute(
 		return
 	}
 
+	// §5.5 hard cap: the engine left this seat UNBOUND — every account in its
+	// pool/segment is at the ≤3-人/号 cap. 429 here; do NOT fall through to the
+	// local pick, which is cap-blind and would route a 4th user onto a full account.
+	// (Distinct from the 503 degrade: an actionable "pool full" state, not a
+	// transient failure.)
+	if p.routingOverrides.Blocked(route.SeatID) {
+		logger.Warn("oauth-group seat blocked: pool at per-account user cap",
+			"event.name", observability.EventProxyGroupSeatBlocked,
+			"oauth_group_id", route.OauthGroupID,
+			"seat_id", route.SeatID)
+		writeJSONError(w, http.StatusTooManyRequests, "rate_limit_error", observability.ErrCodeGroupPoolFull,
+			"No available account: every account in your pool is at the per-account user limit. Ask your admin to add accounts.")
+		return
+	}
 	// Skip accounts cooling down from a recent upstream failure (N8c reactive
 	// fallback) so this request routes around them. The allocation engine's
 	// routing override for this seat (§6.5; "" when off / no redirect) is applied
