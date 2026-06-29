@@ -178,13 +178,12 @@ func injectClaudeOAuth(req *http.Request, cred *OAuthCredential) {
 		rewriteToolNamesForward(req)
 	}
 
-	// NOTE: oauth_group POOL identity normalization (AccountPersona) is NOT applied
-	// here on `req`. It would collapse the session/device on the same request our
-	// own usage + conversation-audit + filter-cache read, tangling pooled
-	// conversations in OUR records. Instead the pool-routing site stashes the
-	// persona (stashPoolPersona) and serveRoute's Director applies it to the
-	// OUTBOUND clone only — real identity stays on `r` for internal attribution,
-	// normalized identity goes upstream. See oauth_pool_persona.go (NP-4).
+	// NOTE: oauth_group POOL requests pass the REAL client identity upstream
+	// unchanged. The former AccountPersona normalization (N users → one frozen
+	// SHA256(accountID) identity) was removed 2026-06-29: a frozen synthetic
+	// fingerprint can't track Claude Code version bumps, so it drifts stale and
+	// becomes its OWN detection signal — worse than transparent pass-through.
+	// Risk is now bounded by a ≤3-users-per-account cap, not by disguise.
 }
 
 // claudeCodeSystemPrompt is the byte-exact 57-char marker that Anthropic's

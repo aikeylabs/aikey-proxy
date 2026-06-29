@@ -54,13 +54,6 @@ const (
 	// the request is failed rather than silently routed wrong.
 	EventProxyGroupRouteResolved = "proxy.group.route_resolved"
 	EventProxyGroupRouteDegraded = "proxy.group.route_degraded"
-	// EventProxyGroupPersonaMissing is a SAFETY backstop (NP-3): an OAuth pool
-	// request reached the upstream forward without the AccountPersona disguise
-	// stashed, so it would carry the employee's REAL identity under the shared
-	// account — the "一号多设备" ban condition the identity floor prevents. The
-	// single pool-serving path always stashes, so this never fires today; it makes
-	// a FUTURE pool-routing path that forgets to stash loud instead of silent.
-	EventProxyGroupPersonaMissing = "proxy.group.persona_missing"
 	// EventProxyGroupAccountCooldown (N8c): a pool account's upstream returned a
 	// fallback-worthy failure (401 broken / exhaustion-429), so it was cooled down
 	// and subsequent requests route around it.
