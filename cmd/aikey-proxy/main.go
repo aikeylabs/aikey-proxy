@@ -255,7 +255,16 @@ func main() {
 		// Inject ImpersonateChrome HTTP client for Claude token endpoint (Cloudflare bypass).
 		// Impl lives in the shared broker module (moved 2026-06-26) so aikey-control-master
 		// can inject the same client for its server-side OAuth flow — single source of truth.
-		broker.SetHTTPClient(broker.NewImpersonateChromeHTTPClient(""))
+		//
+		// 2026-06-30 (egress fix): pass the SAME configured egress as AI forwarding
+		// (cfg.UpstreamProxy.URL) instead of "". Why: launchd-spawned proxies don't
+		// inherit the login shell's HTTP_PROXY, so a "" client went DIRECT and got
+		// 403 "Request not allowed" from Anthropic's edge (only Chrome-TLS THROUGH the
+		// egress reaches the OAuth logic). Mirrors the old master pattern (egress URL →
+		// impersonate proxyURL). Empty url ⇒ "" ⇒ falls back to env (no regression).
+		// Forwarding uses the same cfg.UpstreamProxy.URL via buildTransport below;
+		// control-plane clients deliberately bypass it (internal/httpx.NewDirectClient).
+		broker.SetHTTPClient(broker.NewImpersonateChromeHTTPClient(cfg.UpstreamProxy.URL))
 
 		brk := broker.NewEmbedded(tokenStore, accountStore)
 		oauthHandler = broker.NewHandler(brk)
