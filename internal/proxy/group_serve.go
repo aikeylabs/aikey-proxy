@@ -55,6 +55,13 @@ func (p *Proxy) handleOauthGroupRoute(
 	if err != nil {
 		code := observability.ErrCodeGroupKeyUnavailable
 		if ge, ok := err.(*groupResolveError); ok {
+			// RW2/D2: the routed account has no token for this member — return a
+			// structured login prompt (not a 503 degrade) so the client triggers the
+			// local OAuth login for THAT account.
+			if ge.Code == groupErrLoginRequired {
+				p.respondLoginRequired(w, logger, route, ge.Account)
+				return
+			}
 			code = ge.Code
 		}
 		p.degradeGroup(w, logger, route, code, groupDegradeMessage(code))
@@ -196,6 +203,29 @@ func groupDegradeMessage(code string) string {
 	default:
 		return "Group routing is temporarily unavailable. Please retry shortly."
 	}
+}
+
+// respondLoginRequired returns the RW2/D2 structured login prompt: the member has
+// no token for the HRW-routed account, so the client must run the local OAuth
+// login for THAT account (proxy did NOT skip to a later logged-in candidate). The
+// body carries the account id so the client opens the right login; login_url is
+// assembled client-side from its local contribute page (the proxy is not wired to
+// the local web base — tracked as carry-over). Status 401: the member must
+// authenticate to the account before the request can proceed.
+func (p *Proxy) respondLoginRequired(w http.ResponseWriter, logger *slog.Logger, route *vkeys.ResolvedRoute, accountID string) {
+	logger.Info("group route requires member login",
+		"event.name", observability.EventProxyGroupLoginRequired,
+		"oauth_group_id", route.OauthGroupID,
+		"virtual_key_id", route.VirtualKeyID,
+		"account_id", accountID,
+	)
+	w.Header().Set("Content-Type", "application/json")
+	w.Header().Set(HeaderAikeyErrorSource, groupErrLoginRequired)
+	w.WriteHeader(http.StatusUnauthorized)
+	msg := "Log in to this account to use it: open your local AiKey console and complete sign-in."
+	_, _ = w.Write([]byte(`{"error":{"message":"` + escapeJSON(msg) +
+		`","type":"login_required","code":"` + groupErrLoginRequired +
+		`"},"account":"` + escapeJSON(accountID) + `","login_url":""}`))
 }
 
 // degradeGroup fails a group request loudly (never silently routes it to a wrong

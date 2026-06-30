@@ -69,6 +69,11 @@ const (
 	// was unusable (cooled / exhausted / expired / no material) so the request
 	// fell back to a different candidate — an auditable account switch.
 	EventProxyGroupAccountSwitched = "proxy.group.account_switched"
+	// EventProxyGroupLoginRequired (RW2/D2): the HRW-routed account has no token
+	// for this member (they haven't logged into it). The proxy returns a structured
+	// login prompt naming the account (strict HRW — it does NOT skip to a later
+	// logged-in account) so the member logs into THAT account on their local node.
+	EventProxyGroupLoginRequired = "proxy.group.login_required"
 	// EventProxyGroupWindowPrecut (N10): an account's upstream utilization crossed
 	// its randomized window cap (window_max_util_pct), so it was pre-cut for that
 	// window (cooled until reset) — staying under 100% which looks like abuse.

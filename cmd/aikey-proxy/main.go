@@ -247,6 +247,7 @@ func main() {
 	//     Reuse the supervisor's vault connection to avoid double-open conflicts.
 	brokerVault := sup.VaultReader()
 	var oauthHandler server.RouteRegistrar
+	var poolHandler server.RouteRegistrar // C10: pool login (memory-store broker → writeback master)
 	if brokerVault != nil {
 		tokenStore := vault.NewTokenStore(brokerVault.DB(), brokerVault.DerivedKey())
 		accountStore := vault.NewAccountStore(brokerVault.DB())
@@ -260,6 +261,10 @@ func main() {
 		oauthHandler = broker.NewHandler(brk)
 		// Wire broker into supervisor so all proxy generations can resolve OAuth credentials
 		sup.SetBroker(&brokerAdapter{inner: brk, accounts: accountStore})
+		// C10/RW8: pool login handler — its own MEMORY-store broker (per-member
+		// tokens never touch the vault) reusing the global impersonate client set
+		// above; exchanges then write back to master RW10 over the team JWT.
+		poolHandler = sup.NewPoolLoginHandler()
 		slog.Info("OAuth broker initialized")
 	} else {
 		slog.Warn("OAuth broker disabled: vault not available")
@@ -300,8 +305,17 @@ func main() {
 	dataHandler := sup.Handler()
 	sup.SetTransport(buildTransport(cfg.UpstreamProxy.URL))
 
-	// 7. Build and start the HTTP server.
-	srv := server.New(ln, dataHandler, adminHandler, oauthHandler)
+	// 7. Build and start the HTTP server. Only non-nil registrars are passed
+	// (server.New does not nil-guard; oauthHandler/poolHandler are nil when the
+	// vault/broker is unavailable).
+	extraRegistrars := make([]server.RouteRegistrar, 0, 2)
+	if oauthHandler != nil {
+		extraRegistrars = append(extraRegistrars, oauthHandler)
+	}
+	if poolHandler != nil {
+		extraRegistrars = append(extraRegistrars, poolHandler)
+	}
+	srv := server.New(ln, dataHandler, adminHandler, extraRegistrars...)
 
 	// Handle graceful shutdown — see pkg/aikeycompat for the per-OS
 	// signal set (Windows: SIGINT only; Unix: SIGINT + SIGTERM).
