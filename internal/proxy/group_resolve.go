@@ -189,10 +189,16 @@ func resolveCandidate(accountID string, refByID map[string]vkeys.GroupAccountRef
 	}
 	mat, ok := material[accountID]
 	if !ok {
-		// No delivered material = this member has no token for the account (master
-		// skips accounts a member hasn't logged into, RW1). Per-member: needs login,
-		// NOT a quota fallback. (Pre-pull races also land here; the client retries
-		// the same login flow — idempotent.)
+		// No delivered material at all = the proxy hasn't PULLED this account's
+		// material yet (channel-③ race / cold start), NOT "member needs login"
+		// (master delivers an explicit needs_login marker for that). Treat as a
+		// retryable skip → quota fallback to the next candidate, NOT a hard
+		// LOGIN_REQUIRED (P1).
+		return nil, candSkip
+	}
+	if mat.NeedsLogin {
+		// Master explicitly says the member has no token for this account → prompt
+		// login for THIS account (RW2/D2, strict HRW — don't skip past it).
 		return nil, candNeedsLogin
 	}
 	if !materialUsable(mat, nowUnix) {

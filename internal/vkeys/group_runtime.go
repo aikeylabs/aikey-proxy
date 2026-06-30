@@ -47,6 +47,9 @@ type GroupRuntimeAccount struct {
 	CredentialType   string `json:"credential_type"` // oauth_account | api_key
 	SecretNonce      string `json:"secret_nonce"`    // base64(nonce)
 	SecretCiphertext string `json:"secret_ciphertext"` // base64(enc(access_token|key))
+	// NeedsLogin: the member has no token for this OAuth account (master said so) →
+	// the resolver returns LOGIN_REQUIRED for it. No secret when true. P1.
+	NeedsLogin bool `json:"needs_login,omitempty"`
 	// OAuth meta:
 	ExpiresAt        int64  `json:"expires_at,omitempty"`
 	WindowMaxUtilPct *int   `json:"window_max_util_pct,omitempty"`

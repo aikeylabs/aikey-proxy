@@ -105,9 +105,10 @@ func TestResolveGroup_LoginRequiredNoSkip(t *testing.T) {
 	primary, other := order[0], order[1]
 
 	refs := []vkeys.GroupAccountRef{{AccountID: "acc-a", ProviderCode: "anthropic"}, {AccountID: "acc-b", ProviderCode: "anthropic"}}
-	// Only the NON-primary has a token; the primary is not logged in.
+	// Primary carries master's explicit needs_login marker; the NON-primary has a token.
 	mat := map[string]vkeys.GroupRuntimeAccount{
-		other: encMat(t, key, vkeys.GroupRuntimeAccount{CredentialType: "oauth_account", ExpiresAt: 9_000_000_000}, "tok"),
+		primary: {CredentialType: "oauth_account", NeedsLogin: true}, // master: member not logged into the primary
+		other:   encMat(t, key, vkeys.GroupRuntimeAccount{CredentialType: "oauth_account", ExpiresAt: 9_000_000_000}, "tok"),
 	}
 	route := &vkeys.ResolvedRoute{SeatID: seat, OauthGroupID: "grp", GroupAccounts: mustJSON(t, refs), GroupRuntime: mustJSON(t, mat)}
 
@@ -118,6 +119,33 @@ func TestResolveGroup_LoginRequiredNoSkip(t *testing.T) {
 	}
 	if ge.Account != primary {
 		t.Fatalf("D2: must prompt login for the HRW primary %q (not skip to %q); got %q", primary, other, ge.Account)
+	}
+}
+
+// TestResolveGroup_AbsentMaterialSkips (P1): an account with NO material entry at
+// all (channel-③ hasn't pulled it yet — NOT a master needs_login marker) is SKIPPED
+// to the next usable candidate, NOT turned into a hard LOGIN_REQUIRED. This is the
+// fix that stops a pre-pull race from telling a member to re-login an account that
+// is actually fine.
+func TestResolveGroup_AbsentMaterialSkips(t *testing.T) {
+	key := grKey()
+	seat := "seat-77"
+	order := rankOrder(seat, "acc-a", "acc-b")
+	other := order[1]
+
+	refs := []vkeys.GroupAccountRef{{AccountID: "acc-a", ProviderCode: "anthropic"}, {AccountID: "acc-b", ProviderCode: "anthropic"}}
+	// Primary is simply ABSENT from material (not pulled yet); the other is usable.
+	mat := map[string]vkeys.GroupRuntimeAccount{
+		other: encMat(t, key, vkeys.GroupRuntimeAccount{CredentialType: "oauth_account", ExpiresAt: 9_000_000_000}, "tok"),
+	}
+	route := &vkeys.ResolvedRoute{SeatID: seat, OauthGroupID: "grp", GroupAccounts: mustJSON(t, refs), GroupRuntime: mustJSON(t, mat)}
+
+	res, err := resolveGroupCredential(route, key, 1_000_000, nil, "")
+	if err != nil {
+		t.Fatalf("absent-material primary must SKIP to the usable candidate, not error: %v", err)
+	}
+	if res.AccountID != other {
+		t.Fatalf("expected fallback to the usable account %q, got %q", other, res.AccountID)
 	}
 }
 
@@ -136,7 +164,8 @@ func TestResolveGroup_LoginRequiredAfterExhausted(t *testing.T) {
 		first: encMat(t, key, vkeys.GroupRuntimeAccount{CredentialType: "oauth_account", ExpiresAt: 9_000_000_000, WindowStatus: "exhausted"}, "tok"),
 		// rank-2 has a usable token, but we must NOT reach it.
 		order[2]: encMat(t, key, vkeys.GroupRuntimeAccount{CredentialType: "oauth_account", ExpiresAt: 9_000_000_000}, "tok-z"),
-		// rank-1 (second) has NO material → login required, stops here.
+		// rank-1 (second) carries master's needs_login marker → login required, stops here.
+		second: {CredentialType: "oauth_account", NeedsLogin: true},
 	}
 	route := &vkeys.ResolvedRoute{SeatID: seat, OauthGroupID: "grp", GroupAccounts: mustJSON(t, refs), GroupRuntime: mustJSON(t, mat)}
 

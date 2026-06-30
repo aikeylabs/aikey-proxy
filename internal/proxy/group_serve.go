@@ -19,6 +19,7 @@
 package proxy
 
 import (
+	"encoding/json"
 	"log/slog"
 	"net/http"
 	"time"
@@ -217,10 +218,19 @@ func (p *Proxy) respondLoginRequired(w http.ResponseWriter, logger *slog.Logger,
 	w.Header().Set("Content-Type", "application/json")
 	w.Header().Set(HeaderAikeyErrorSource, groupErrLoginRequired)
 	w.WriteHeader(http.StatusUnauthorized)
-	msg := "Log in to this account to use it: open your local AiKey console and complete sign-in."
-	_, _ = w.Write([]byte(`{"error":{"message":"` + escapeJSON(msg) +
-		`","type":"login_required","code":"` + groupErrLoginRequired +
-		`"},"account":"` + escapeJSON(accountID) + `","login_url":""}`))
+	// json.Marshal (not string concat) so account ids / future fields can't break
+	// the JSON or inject — correct escaping for free. login_url is assembled
+	// client-side from the local console base (carry-over).
+	body, _ := json.Marshal(map[string]any{
+		"error": map[string]string{
+			"message": "Log in to this account to use it: open your local AiKey console and complete sign-in.",
+			"type":    "login_required",
+			"code":    groupErrLoginRequired,
+		},
+		"account":   accountID,
+		"login_url": "",
+	})
+	_, _ = w.Write(body)
 }
 
 // degradeGroup fails a group request loudly (never silently routes it to a wrong

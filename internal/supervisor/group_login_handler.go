@@ -21,9 +21,23 @@ import (
 	"errors"
 	"net/http"
 	"sync"
+	"time"
 
 	broker "github.com/AiKeyLabs/aikey-auth-broker"
 )
+
+// poolSessionTTL bounds how long a started-but-uncompleted pool login session is
+// kept. It matches the broker's own login-session TTL (15 min); an authorize-url
+// that's never followed by a successful submit-code is reaped on the next
+// authorize-url so the session map can't grow unbounded (P2).
+const poolSessionTTL = 15 * time.Minute
+
+// poolSession is the value stored per started login: which account it binds to +
+// when it started (for TTL reaping).
+type poolSession struct {
+	credentialID string
+	createdAt    time.Time
+}
 
 // errNoTeamCredential — no team account-JWT available (not logged in to a team).
 var errNoTeamCredential = errors.New("supervisor: no team credential (run aikey login)")
@@ -102,9 +116,11 @@ func (h *poolLoginHandler) authorizeURL(w http.ResponseWriter, r *http.Request) 
 		poolErr(w, http.StatusBadGateway, "LOGIN_START_FAILED", err.Error())
 		return
 	}
-	// Bind the session to the account so submit-code writes the token to the right
+	// Reap expired sessions (P2: bound the map; no background goroutine needed) then
+	// bind this session to the account so submit-code writes the token to the right
 	// credential (the account the proxy told the member to log into).
-	h.sessions.Store(sid, req.CredentialID)
+	h.sweepExpiredSessions()
+	h.sessions.Store(sid, poolSession{credentialID: req.CredentialID, createdAt: time.Now()})
 	poolJSON(w, map[string]any{"session_id": sid, "authorize_url": authURL})
 }
 
@@ -122,7 +138,13 @@ func (h *poolLoginHandler) submitCode(w http.ResponseWriter, r *http.Request) {
 		poolErr(w, http.StatusBadRequest, "UNKNOWN_SESSION", "no pool login session for that id")
 		return
 	}
-	credentialID := credAny.(string)
+	sess, ok := credAny.(poolSession)
+	if !ok || time.Since(sess.createdAt) > poolSessionTTL {
+		h.sessions.Delete(req.SessionID)
+		poolErr(w, http.StatusBadRequest, "SESSION_EXPIRED", "pool login session expired; restart the login")
+		return
+	}
+	credentialID := sess.credentialID
 
 	_, access, refresh, exp, externalID, err := h.ex.SubmitCode(r.Context(), req.SessionID, req.Code)
 	if err != nil {
@@ -188,6 +210,19 @@ func (s *Supervisor) NewPoolLoginHandler() *poolLoginHandler {
 	}
 }
 
+// sweepExpiredSessions deletes login sessions older than poolSessionTTL. Called
+// opportunistically on authorize-url so abandoned/failed logins can't accumulate
+// (P2) without a dedicated reaper goroutine.
+func (h *poolLoginHandler) sweepExpiredSessions() {
+	cutoff := time.Now().Add(-poolSessionTTL)
+	h.sessions.Range(func(k, v any) bool {
+		if s, ok := v.(poolSession); ok && s.createdAt.Before(cutoff) {
+			h.sessions.Delete(k)
+		}
+		return true
+	})
+}
+
 func poolJSON(w http.ResponseWriter, v any) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusOK)
@@ -196,6 +231,10 @@ func poolJSON(w http.ResponseWriter, v any) {
 
 func poolErr(w http.ResponseWriter, status int, code, msg string) {
 	w.Header().Set("Content-Type", "application/json")
+	// Mark as an aikey-generated error (mirrors proxy.HeaderAikeyErrorSource /
+	// writeJSONError); literal to avoid a supervisor→proxy import. The local web
+	// relay keys on this to distinguish aikey errors from upstream pass-throughs.
+	w.Header().Set("X-Aikey-Error-Source", code)
 	w.WriteHeader(status)
 	_ = json.NewEncoder(w).Encode(map[string]any{"error": map[string]string{"code": code, "message": msg}})
 }

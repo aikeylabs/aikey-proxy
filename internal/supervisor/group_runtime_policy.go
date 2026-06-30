@@ -143,6 +143,10 @@ type grAccount struct {
 	AccountID      string `json:"account_id"`
 	CredentialID   string `json:"credential_id"`
 	CredentialType string `json:"credential_type"` // oauth_account | api_key
+	// NeedsLogin: master delivered this OAuth account as "member not logged in"
+	// (no token) — the proxy returns LOGIN_REQUIRED for it (vs an absent account =
+	// material not pulled yet → retryable skip). P1.
+	NeedsLogin bool `json:"needs_login"`
 	// OAuth-only:
 	AccessToken      string `json:"access_token"`
 	ExpiresAt        int64  `json:"expires_at"`
@@ -216,6 +220,12 @@ func fetchGroupRuntime(ctx context.Context, masterURL, bearer string, observedRe
 func buildGroupRuntimeJSON(derivedKey []byte, accounts []grAccount) (string, error) {
 	out := make(map[string]vkeys.GroupRuntimeAccount, len(accounts))
 	for _, a := range accounts {
+		// needs_login marker carries NO secret — store it as-is so the resolver can
+		// return LOGIN_REQUIRED for it (P1), distinct from an absent account.
+		if a.NeedsLogin {
+			out[a.AccountID] = vkeys.GroupRuntimeAccount{CredentialType: a.CredentialType, NeedsLogin: true}
+			continue
+		}
 		secret := a.AccessToken
 		if a.CredentialType == "api_key" {
 			secret = a.Key
