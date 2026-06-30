@@ -76,6 +76,7 @@ func (e *groupResolveError) Error() string { return e.Code + ": " + e.Reason }
 // request. Exactly one of OAuth / PlaintextKey is meaningful, per CredentialType.
 type groupResolution struct {
 	AccountID      string
+	CredentialID   string // real credential_id of the chosen account → route.CredentialID for I5 signal reporting (T2 uplink)
 	CredentialType string // "oauth_account" | "api_key"
 	ProviderCode   string // candidate's resolved provider code (oauthInject dispatch)
 	Identity       string // display / audit only — never sent upstream
@@ -249,6 +250,7 @@ func decryptGroupSecret(derivedKey []byte, mat vkeys.GroupRuntimeAccount) (strin
 func buildGroupResolution(accountID string, ref vkeys.GroupAccountRef, mat vkeys.GroupRuntimeAccount, secret string) *groupResolution {
 	res := &groupResolution{
 		AccountID:        accountID,
+		CredentialID:     ref.CredentialID,
 		CredentialType:   mat.CredentialType,
 		ProviderCode:     ref.ProviderCode,
 		Identity:         ref.Identity,

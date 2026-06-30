@@ -1341,6 +1341,39 @@ func (p *Proxy) handlePathPrefixRoute(w http.ResponseWriter, r *http.Request, pr
 	// credential records — see helper docstring for per-KeySourceType semantics.
 	binding, _ := p.activeReader.GetProviderBinding(canonicalCode)
 	if binding != nil {
+		// ── Group VK on the follow-active path (N8 / bugfix 2026-06-30) ────────
+		// A group VK (OAuth account pool) carries NO static PlaintextKey — its
+		// per-account material lives in GroupRuntime and must be served via
+		// handleOauthGroupRoute (the same path the Tier1 `aikey_team_<vk>` token
+		// reaches at line ~989). The follow-active path (Claude Code via
+		// `aikey run` injects the `aikey_active_<provider>` sentinel) lands here
+		// instead, where ResolveBindingCredential's switch has no oauth_group
+		// case → it soft-fails with RealKey="" → the legacy fallback also can't
+		// serve a keyless VK → "no active key".
+		//
+		// The active team binding stores the vk_id (KeySourceRef). The supervisor
+		// registers every group VK in the registry under the Tier1 team token
+		// `aikey_team_<vk_id>` (supervisor.go:725) WITH the group fields fully
+		// populated — so re-resolving that token here yields the same complete
+		// group route the Tier1 path serves, without touching GetTeamKeyByID
+		// (whose query filters on `provider_key_ciphertext IS NOT NULL` and never
+		// reads group columns, so it can't see a keyless group VK at all).
+		if binding.KeySourceType == "team" {
+			if groute := p.registry.Resolve("aikey_team_" + binding.KeySourceRef); groute != nil &&
+				groute.OauthGroupID != "" {
+				// Strip the provider prefix BEFORE handing off: handleOauthGroupRoute
+				// forwards r.URL.Path VERBATIM upstream, so an unstripped
+				// `/anthropic/v1/messages` would 404 (same rationale as the Tier1
+				// branch at line ~999; bugfix 2026-06-26-group-vk-pathprefix-unstripped-404).
+				r.URL.Path = strippedPath
+				if r.URL.RawPath != "" {
+					r.URL.RawPath = strippedPath
+				}
+				p.handleOauthGroupRoute(w, r, groute, rawAuthValue, startTime, logger, traceID)
+				return
+			}
+		}
+
 		cred, bindErr := p.ResolveBindingCredential(r, binding, providerCode, canonicalCode, logger)
 		if bindErr != nil {
 			// OAuth path: writeJSONError + return (helper does NOT increment

@@ -29,6 +29,13 @@ type GroupAccountRef struct {
 	ProviderCode string `json:"provider_code"` // resolved provider code (injection dispatch)
 	Priority     int    `json:"priority"`      // deterministic tie-break (lower wins)
 	Assigned     bool   `json:"assigned"`      // master's rank-0 pick (advisory; proxy re-ranks)
+	// CredentialID is the account's real credential_id (same id the engine,
+	// auth-gate, and static-key track use). The proxy stamps it onto the resolved
+	// route so I5 usage signals enqueue keyed by credential_id instead of being
+	// dropped at the empty-id guard. json tag MUST stay byte-identical to master's
+	// snapshot.GroupAccountRef. Empty when talking to an old master (back-compat).
+	// Bugfix 2026-06-30: T2 uplink credential_id identity split.
+	CredentialID string `json:"credential_id,omitempty"`
 }
 
 // GroupRuntimeAccount is one account's AT-REST material inside a group VK's
