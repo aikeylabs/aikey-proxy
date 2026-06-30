@@ -24,11 +24,12 @@ import (
 	"time"
 
 	"github.com/AiKeyLabs/aikey-proxy/internal/events"
+	"github.com/AiKeyLabs/aikey-proxy/internal/httpx"
 )
 
 const routingOverridePollInterval = 60 * time.Second
 
-var routingOverrideHTTPClient = &http.Client{Timeout: 10 * time.Second}
+var routingOverrideHTTPClient = httpx.NewDirectClient(10 * time.Second)
 
 // pollRoutingOverrides runs until ctx is canceled, pulling the account's routing
 // overrides every routingOverridePollInterval (plus once at start). No-op unless

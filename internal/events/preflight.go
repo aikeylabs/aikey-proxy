@@ -9,6 +9,8 @@ import (
 	"net/http"
 	"os"
 	"time"
+
+	"github.com/AiKeyLabs/aikey-proxy/internal/httpx"
 )
 
 // PreflightResult holds the outcome of usage pipeline readiness checks.
@@ -78,7 +80,7 @@ func RunPreflight(collectorURL, collectorToken, walDir, eventsDBPath string) Pre
 
 // checkCollector tests collector reachability and token auth by sending an empty batch.
 func checkCollector(collectorURL, token string) (reachable, authOK bool, errMsg string) {
-	client := &http.Client{Timeout: 5 * time.Second}
+	client := httpx.NewDirectClient(5 * time.Second)
 	url := collectorURL + "/v1/usage-events:batch"
 	body := []byte(`{"source":"preflight","events":[]}`)
 

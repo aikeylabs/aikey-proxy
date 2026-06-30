@@ -27,11 +27,12 @@ import (
 	"time"
 
 	"github.com/AiKeyLabs/aikey-proxy/internal/events"
+	"github.com/AiKeyLabs/aikey-proxy/internal/httpx"
 	"github.com/AiKeyLabs/aikey-proxy/internal/vault"
 	"github.com/AiKeyLabs/aikey-proxy/internal/vkeys"
 )
 
-func defaultGroupRuntimeClient() *http.Client { return &http.Client{Timeout: 10 * time.Second} }
+func defaultGroupRuntimeClient() *http.Client { return httpx.NewDirectClient(10 * time.Second) }
 
 const groupRuntimePollInterval = 60 * time.Second
 
@@ -132,7 +133,7 @@ type grDeliveryResp struct {
 }
 
 type grGroup struct {
-	OauthGroupID   string      `json:"oauth_group_id"`
+	OauthGroupID  string      `json:"oauth_group_id"`
 	RoutingConfig string      `json:"routing_config"`
 	Accounts      []grAccount `json:"accounts"`
 }

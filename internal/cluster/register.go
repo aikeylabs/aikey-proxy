@@ -15,6 +15,8 @@ import (
 	"net/http"
 	"strings"
 	"time"
+
+	"github.com/AiKeyLabs/aikey-proxy/internal/httpx"
 )
 
 const defaultHeartbeatInterval = 5 * time.Second
@@ -51,7 +53,7 @@ func NewRegistrar(hubURL, nodeID, nodeAddr string, weight int, serviceToken stri
 		nodeAddr:     nodeAddr,
 		weight:       weight,
 		serviceToken: serviceToken,
-		client:       &http.Client{Timeout: 5 * time.Second},
+		client:       httpx.NewDirectClient(5 * time.Second),
 		interval:     defaultHeartbeatInterval,
 	}
 }

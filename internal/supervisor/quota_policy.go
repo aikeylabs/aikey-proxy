@@ -29,13 +29,14 @@ import (
 	"strings"
 	"time"
 
+	"github.com/AiKeyLabs/aikey-proxy/internal/httpx"
 	"github.com/AiKeyLabs/aikey-proxy/internal/quota"
 	"github.com/AiKeyLabs/aikey-proxy/internal/vault"
 )
 
 const quotaPollInterval = 60 * time.Second
 
-var quotaHTTPClient = &http.Client{Timeout: 10 * time.Second}
+var quotaHTTPClient = httpx.NewDirectClient(10 * time.Second)
 
 // pollQuotaPolicy runs until ctx is canceled, refreshing the org quota policy
 // every quotaPollInterval (plus once immediately).

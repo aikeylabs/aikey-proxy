@@ -19,6 +19,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"log/slog"
 	"net/http"
 	"sync"
 	"time"
@@ -148,6 +149,11 @@ func (h *poolLoginHandler) submitCode(w http.ResponseWriter, r *http.Request) {
 
 	_, access, refresh, exp, externalID, err := h.ex.SubmitCode(r.Context(), req.SessionID, req.Code)
 	if err != nil {
+		// Surface the provider exchange failure (CLAUDE.md 失败要显眼). err carries
+		// the wrapped upstream response (e.g. `[http_403] {provider body}`), which is
+		// the only place to see WHY the OAuth provider rejected the code.
+		slog.Warn("broker.pool.exchange_failed",
+			"error", err.Error(), "session_id", req.SessionID, "credential_id", credentialID)
 		poolErr(w, http.StatusBadGateway, "EXCHANGE_FAILED", err.Error())
 		return
 	}
@@ -164,6 +170,8 @@ func (h *poolLoginHandler) submitCode(w http.ResponseWriter, r *http.Request) {
 	if err := postMemberToken(r.Context(), h.client, masterURL, bearer, memberTokenWriteback{
 		CredentialID: credentialID, AccessToken: access, RefreshToken: refresh, ExpiresAt: exp, ExternalID: externalID,
 	}); err != nil {
+		slog.Warn("broker.pool.writeback_failed",
+			"error", err.Error(), "credential_id", credentialID)
 		poolErr(w, http.StatusBadGateway, "WRITEBACK_FAILED", err.Error())
 		return
 	}

@@ -43,6 +43,7 @@ import (
 	"github.com/AiKeyLabs/aikey-proxy/internal/cluster"
 	"github.com/AiKeyLabs/aikey-proxy/internal/config"
 	"github.com/AiKeyLabs/aikey-proxy/internal/events"
+	"github.com/AiKeyLabs/aikey-proxy/internal/httpx"
 	"github.com/AiKeyLabs/aikey-proxy/internal/observability"
 	"github.com/AiKeyLabs/aikey-proxy/internal/observer/conversation_audit"
 	"github.com/AiKeyLabs/aikey-proxy/internal/provider"
@@ -545,7 +546,7 @@ func (s *Supervisor) startQuotaHeartbeat() {
 	if interval > 120*time.Second {
 		interval = 120 * time.Second
 	}
-	client := &http.Client{Timeout: 5 * time.Second}
+	client := httpx.NewDirectClient(5 * time.Second)
 	s.quotaHeartbeat = heartbeat.New(interval, func(ctx context.Context) error {
 		req, err := http.NewRequestWithContext(ctx, http.MethodGet, healthURL, http.NoBody)
 		if err != nil {

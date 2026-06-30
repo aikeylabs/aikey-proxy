@@ -10,6 +10,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/AiKeyLabs/aikey-proxy/internal/httpx"
 )
 
 // ponytail: flush cadence doubles as the rate-limit count window — one constant
@@ -113,7 +115,7 @@ func newSignalReporter(controlURL string, bearer func(context.Context) (string, 
 	r := &signalReporter{
 		url:       strings.TrimRight(controlURL, "/") + "/accounts/me/signals",
 		bearer:    bearer,
-		client:    &http.Client{Timeout: 10 * time.Second},
+		client:    httpx.NewDirectClient(10 * time.Second),
 		in:        make(chan signalSample, 256),
 		revokedIn: make(chan revokedSample, 64),
 		rlCounts:  make(map[string]int),

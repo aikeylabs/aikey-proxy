@@ -13,6 +13,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/AiKeyLabs/aikey-proxy/internal/httpx"
 	"github.com/AiKeyLabs/aikey-proxy/internal/observability"
 	"github.com/AiKeyLabs/pkg/aikeycompat"
 	"github.com/AiKeyLabs/pkg/aikeytime"
@@ -211,7 +212,7 @@ func NewReporter(in *ReporterConfig) (*Reporter, error) {
 		dlw:          dlw,
 		signal:       make(chan struct{}, 1),
 		done:         make(chan struct{}),
-		client:       &http.Client{Timeout: 30 * time.Second},
+		client:       httpx.NewDirectClient(30 * time.Second),
 		sentSeq:      make(map[string]int64),
 		confirmedSeq: make(map[string]int64),
 		seenV1:       make(map[string]bool),

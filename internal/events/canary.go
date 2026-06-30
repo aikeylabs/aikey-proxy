@@ -9,6 +9,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/AiKeyLabs/aikey-proxy/internal/httpx"
 	"github.com/AiKeyLabs/aikey-proxy/internal/observability"
 	"github.com/AiKeyLabs/pkg/aikeytime"
 )
@@ -98,7 +99,7 @@ func NewCanaryProbe(reporter *Reporter, cfg CanaryConfig) *CanaryProbe {
 	p := &CanaryProbe{
 		reporter: reporter,
 		cfg:      cfg,
-		client:   &http.Client{Timeout: 10 * time.Second},
+		client:   httpx.NewDirectClient(10 * time.Second),
 		done:     make(chan struct{}),
 	}
 

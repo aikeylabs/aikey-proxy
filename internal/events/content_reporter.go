@@ -11,6 +11,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/AiKeyLabs/aikey-proxy/internal/httpx"
 	"github.com/AiKeyLabs/aikey-proxy/internal/observability"
 )
 
@@ -89,7 +90,7 @@ func NewContentReporter(in *ContentReporterConfig, wal *ContentWAL) *ContentRepo
 		cfg.BatchSize = 100
 	}
 	if cfg.HTTPClient == nil {
-		cfg.HTTPClient = &http.Client{Timeout: 30 * time.Second}
+		cfg.HTTPClient = httpx.NewDirectClient(30 * time.Second)
 	}
 	return &ContentReporter{
 		cfg:          cfg,
