@@ -94,6 +94,62 @@ func TestResolveGroup_OAuthPrimaryDecrypts(t *testing.T) {
 	}
 }
 
+// TestResolveGroup_LoginRequiredNoSkip (RW2/D2): the HRW-primary account has no
+// material (member hasn't logged into it) while a LATER candidate does — the
+// resolver returns LOGIN_REQUIRED for the PRIMARY and does NOT skip to the
+// logged-in one (preserving HRW allocation).
+func TestResolveGroup_LoginRequiredNoSkip(t *testing.T) {
+	key := grKey()
+	seat := "seat-77"
+	order := rankOrder(seat, "acc-a", "acc-b")
+	primary, other := order[0], order[1]
+
+	refs := []vkeys.GroupAccountRef{{AccountID: "acc-a", ProviderCode: "anthropic"}, {AccountID: "acc-b", ProviderCode: "anthropic"}}
+	// Only the NON-primary has a token; the primary is not logged in.
+	mat := map[string]vkeys.GroupRuntimeAccount{
+		other: encMat(t, key, vkeys.GroupRuntimeAccount{CredentialType: "oauth_account", ExpiresAt: 9_000_000_000}, "tok"),
+	}
+	route := &vkeys.ResolvedRoute{SeatID: seat, OauthGroupID: "grp", GroupAccounts: mustJSON(t, refs), GroupRuntime: mustJSON(t, mat)}
+
+	_, err := resolveGroupCredential(route, key, 1_000_000, nil, "")
+	ge, ok := err.(*groupResolveError)
+	if !ok || ge.Code != groupErrLoginRequired {
+		t.Fatalf("want LOGIN_REQUIRED, got %v", err)
+	}
+	if ge.Account != primary {
+		t.Fatalf("D2: must prompt login for the HRW primary %q (not skip to %q); got %q", primary, other, ge.Account)
+	}
+}
+
+// TestResolveGroup_LoginRequiredAfterExhausted (RW2): quota fallback still skips
+// an exhausted account, but stops at the next account the member hasn't logged
+// into (login required), rather than skipping further to a usable one.
+func TestResolveGroup_LoginRequiredAfterExhausted(t *testing.T) {
+	key := grKey()
+	seat := "seat-9"
+	order := rankOrder(seat, "x", "y", "z")
+	first, second := order[0], order[1]
+
+	refs := []vkeys.GroupAccountRef{{AccountID: "x", ProviderCode: "anthropic"}, {AccountID: "y", ProviderCode: "anthropic"}, {AccountID: "z", ProviderCode: "anthropic"}}
+	mat := map[string]vkeys.GroupRuntimeAccount{
+		// rank-0 exhausted → skipped (quota fallback continues).
+		first: encMat(t, key, vkeys.GroupRuntimeAccount{CredentialType: "oauth_account", ExpiresAt: 9_000_000_000, WindowStatus: "exhausted"}, "tok"),
+		// rank-2 has a usable token, but we must NOT reach it.
+		order[2]: encMat(t, key, vkeys.GroupRuntimeAccount{CredentialType: "oauth_account", ExpiresAt: 9_000_000_000}, "tok-z"),
+		// rank-1 (second) has NO material → login required, stops here.
+	}
+	route := &vkeys.ResolvedRoute{SeatID: seat, OauthGroupID: "grp", GroupAccounts: mustJSON(t, refs), GroupRuntime: mustJSON(t, mat)}
+
+	_, err := resolveGroupCredential(route, key, 1_000_000, nil, "")
+	ge, ok := err.(*groupResolveError)
+	if !ok || ge.Code != groupErrLoginRequired {
+		t.Fatalf("want LOGIN_REQUIRED after skipping exhausted, got %v", err)
+	}
+	if ge.Account != second {
+		t.Fatalf("should stop at rank-1 %q (skip exhausted rank-0, not jump to usable rank-2); got %q", second, ge.Account)
+	}
+}
+
 func TestResolveGroup_APIKeyCarriesBaseURL(t *testing.T) {
 	key := grKey()
 	refs := []vkeys.GroupAccountRef{{AccountID: "acc-k", ProviderCode: "openai"}}
