@@ -54,13 +54,6 @@ const (
 	// the request is failed rather than silently routed wrong.
 	EventProxyGroupRouteResolved = "proxy.group.route_resolved"
 	EventProxyGroupRouteDegraded = "proxy.group.route_degraded"
-	// EventProxyGroupPersonaMissing is a SAFETY backstop (NP-3): an OAuth pool
-	// request reached the upstream forward without the AccountPersona disguise
-	// stashed, so it would carry the employee's REAL identity under the shared
-	// account — the "一号多设备" ban condition the identity floor prevents. The
-	// single pool-serving path always stashes, so this never fires today; it makes
-	// a FUTURE pool-routing path that forgets to stash loud instead of silent.
-	EventProxyGroupPersonaMissing = "proxy.group.persona_missing"
 	// EventProxyGroupAccountCooldown (N8c): a pool account's upstream returned a
 	// fallback-worthy failure (401 broken / exhaustion-429), so it was cooled down
 	// and subsequent requests route around it.
@@ -78,6 +71,10 @@ const (
 	// its randomized window cap (window_max_util_pct), so it was pre-cut for that
 	// window (cooled until reset) — staying under 100% which looks like abuse.
 	EventProxyGroupWindowPrecut = "proxy.group.window_precut"
+	// EventProxyGroupSeatBlocked (§5.5): the engine left this seat UNBOUND because
+	// every account in its pool/segment is at the ≤3-人/号 cap, so the proxy 429s it
+	// (never WRH-falls-back, which would route a 4th user onto a full account).
+	EventProxyGroupSeatBlocked = "proxy.group.seat_blocked"
 )
 
 // Usage extraction events.
@@ -114,6 +111,9 @@ const (
 	// (GROUP_NO_CANDIDATES / GROUP_NO_MATERIAL / GROUP_ALL_UNUSABLE) are surfaced
 	// verbatim; GROUP_KEY_UNAVAILABLE is the proxy-local "can't decrypt" case.
 	ErrCodeGroupKeyUnavailable = "GROUP_KEY_UNAVAILABLE"
+	// ErrCodeGroupPoolFull (§5.5): 429 when the seat is blocked — every pool account
+	// is at the per-account user cap; the user waits or the admin adds accounts.
+	ErrCodeGroupPoolFull = "GROUP_POOL_FULL"
 )
 
 // ---- HealthSnapshot ----

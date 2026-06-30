@@ -254,10 +254,9 @@ func buildGroupResolution(accountID string, ref vkeys.GroupAccountRef, mat vkeys
 		res.Revision = mat.Revision
 		return res
 	}
-	// oauth_account → build the credential oauthInject consumes. The pool identity
-	// disguise is NOT set here; the serve site stashes it (stashPoolPersona) so
-	// the Director applies it to the outbound clone only (NP-4) — keeping the real
-	// identity on r for internal attribution.
+	// oauth_account → build the credential oauthInject consumes. The real client
+	// identity flows upstream unchanged (transparent proxy); the former per-account
+	// AccountPersona normalization was removed 2026-06-29 (see oauth_inject.go).
 	res.OAuth = &OAuthCredential{
 		AccessToken: secret,
 		Provider:    ref.ProviderCode,

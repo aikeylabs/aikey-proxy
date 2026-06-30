@@ -211,11 +211,11 @@ func TestGroupServe_NoMaterialDegrades503(t *testing.T) {
 	}
 }
 
-// NP-4: pool identity disguise is applied to the OUTBOUND request only. The
-// inbound r keeps the real employee session/OS so our usage + conversation-audit
-// + filter-cache attribute the real conversation (no cross-employee tangling in
-// OUR records); Anthropic sees the per-account normalized identity.
-func TestGroupServe_PoolPersonaUpstreamOnly(t *testing.T) {
+// Transparent proxy (2026-06-29): after AccountPersona removal, an oauth_group
+// pool request forwards the REAL client identity (session/OS) upstream UNCHANGED
+// — no per-account synthetic device/session. Guards against re-introducing the
+// forgery this code path used to apply (see oauth_inject.go NOTE for the WHY).
+func TestGroupServe_PoolPassesRealIdentity(t *testing.T) {
 	key := grKey()
 	refs := []vkeys.GroupAccountRef{{AccountID: "acc-pool", ProviderCode: "anthropic"}}
 	mat := map[string]vkeys.GroupRuntimeAccount{
@@ -239,19 +239,13 @@ func TestGroupServe_PoolPersonaUpstreamOnly(t *testing.T) {
 	if w.Code != http.StatusOK {
 		t.Fatalf("status=%d body=%s", w.Code, w.Body.String())
 	}
-	// Upstream (outbound clone) → disguised to the account's persona.
-	if tr.session == "" || tr.session == "REAL-SESSION" {
-		t.Fatalf("upstream session must be normalized, got %q", tr.session)
+	// Upstream (outbound) must carry the REAL client identity, NOT a synthetic
+	// per-account one — the whole point of dropping the disguise.
+	if tr.session != "REAL-SESSION" {
+		t.Fatalf("upstream session must pass through real value unchanged, got %q", tr.session)
 	}
-	if want := personaForAccount("acc-pool").os; tr.stainlessOS != want {
-		t.Fatalf("upstream OS=%q want persona %q", tr.stainlessOS, want)
-	}
-	// Inbound r → real identity preserved (the whole point of NP-4).
-	if got := req.Header.Get("X-Claude-Code-Session-Id"); got != "REAL-SESSION" {
-		t.Fatalf("inbound r session must stay real for internal attribution, got %q", got)
-	}
-	if got := req.Header.Get("X-Stainless-OS"); got != "Windows" {
-		t.Fatalf("inbound r OS must stay real, got %q", got)
+	if tr.stainlessOS != "Windows" {
+		t.Fatalf("upstream OS must pass through real value unchanged, got %q", tr.stainlessOS)
 	}
 }
 
@@ -321,29 +315,40 @@ func TestGroupServe_NoCooldownOnWAF429(t *testing.T) {
 	}
 }
 
-// NP-3 fence: the backstop predicate flags exactly the leak case — an OAuth pool
-// route forwarded without the disguise stash — and nothing else.
-func TestPoolOAuthLacksDisguise_Fence(t *testing.T) {
-	grp := &vkeys.ResolvedRoute{OauthGroupID: "grp-1"}
-	direct := &vkeys.ResolvedRoute{} // no group
-	plainReq := httptest.NewRequest(http.MethodPost, "/v1/messages", nil)
-	stashedReq := stashPoolPersona(httptest.NewRequest(http.MethodPost, "/v1/messages", nil), "acc", "ext")
+// §5.5 hard cap: a seat the engine marked Blocked (every pool account at the
+// ≤3-人/号 cap) gets 429 — the proxy must NOT fall back to its cap-blind local pick.
+func TestGroupServe_BlockedSeatReturns429(t *testing.T) {
+	key := grKey()
+	refs := []vkeys.GroupAccountRef{{AccountID: "acc-1", ProviderCode: "anthropic"}}
+	mat := map[string]vkeys.GroupRuntimeAccount{
+		"acc-1": encMat(t, key, vkeys.GroupRuntimeAccount{
+			CredentialType: "oauth_account", ExpiresAt: 9_000_000_000, ExternalID: "uuid-1",
+		}, "tok-1"),
+	}
+	route := &vkeys.ResolvedRoute{
+		VirtualKeyID: "vk-grp", Provider: "anthropic", ProtocolType: "anthropic",
+		ProviderCode: "anthropic", RouteSource: "team",
+		SeatID: "seat-1", OauthGroupID: "grp-1",
+		GroupAccounts: mustJSON(t, refs), GroupRuntime: mustJSON(t, mat),
+	}
+	p, tr := setupGroupProxy(t, key, route)
 
-	// OAuth pool, NOT stashed → the violation the fence exists to catch.
-	if !poolOAuthLacksDisguise(grp, oauthSentinelKey, plainReq) {
-		t.Fatal("OAuth pool route without stash must be flagged")
+	// Engine left seat-1 unbound (pool full) → proxy must 429, never route to acc-1.
+	cache := NewRoutingOverrideCache()
+	cache.StoreAll(1, nil, map[string]bool{"seat-1": true})
+	p.SetRoutingOverrides(cache)
+
+	req, w := groupReq(groupBody)
+	p.Handle(w, req)
+
+	if w.Code != http.StatusTooManyRequests {
+		t.Fatalf("blocked seat must 429, got %d body=%s", w.Code, w.Body.String())
 	}
-	// OAuth pool, stashed → fine (disguise will be applied).
-	if poolOAuthLacksDisguise(grp, oauthSentinelKey, stashedReq) {
-		t.Fatal("stashed OAuth pool route must not be flagged")
+	if !strings.Contains(w.Body.String(), "GROUP_POOL_FULL") {
+		t.Fatalf("429 body must carry GROUP_POOL_FULL code: %s", w.Body.String())
 	}
-	// api_key pool (realKey is a real key, not the OAuth sentinel) → no persona.
-	if poolOAuthLacksDisguise(grp, "sk-real-key", plainReq) {
-		t.Fatal("api_key pool route needs no disguise")
-	}
-	// Non-group route → never flagged.
-	if poolOAuthLacksDisguise(direct, oauthSentinelKey, plainReq) {
-		t.Fatal("non-group route must not be flagged")
+	if tr.host != "" {
+		t.Fatalf("blocked request must NOT reach upstream, dialed %q", tr.host)
 	}
 }
 
