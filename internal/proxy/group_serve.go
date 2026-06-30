@@ -85,7 +85,8 @@ func (p *Proxy) handleOauthGroupRoute(
 
 	// Per-request copy — DO NOT mutate the shared registry route (see file doc).
 	rc := *route
-	rc.AccountID = res.AccountID // usage attribution → the account actually used
+	rc.AccountID = res.AccountID       // usage attribution → the account actually used
+	rc.CredentialID = res.CredentialID // I5 signal reporting keyed by credential_id (T2 uplink; empty group route.CredentialID was dropping all signals)
 
 	// A group VK is bound to a oauth_group, NOT a single provider, so the VK-level
 	// ProviderCode is EMPTY — the provider lives per-account in group_accounts.
