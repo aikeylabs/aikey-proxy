@@ -92,6 +92,12 @@ func (c *RoutingOverrideCache) lookup(seatID string) string {
 	return v.(map[string]string)[seatID]
 }
 
+// Assignment returns the engine's override account_id for seatID (exported wrapper
+// over lookup), or "" when nothing is overridden. Used by the supervisor's
+// group_runtime writer to stamp IsCurrentRouted (C2 display) with the SAME override
+// the hot-path resolver applies — one definition of "which account is routed".
+func (c *RoutingOverrideCache) Assignment(seatID string) string { return c.lookup(seatID) }
+
 // Blocked reports whether the engine left seatID UNBOUND because every account in
 // its pool/segment is at the ≤3-人/号 cap. The proxy 429s a blocked seat instead of
 // falling back to the cap-blind local pick (which would route a 4th user onto a

@@ -99,6 +99,12 @@ func (s *Supervisor) syncRoutingOverrides(ctx context.Context, cred events.Crede
 	slog.Info("routing overrides updated",
 		"event.name", "proxy.routing_override.changed",
 		"routing_version", version, "seats", len(assignments), "blocked", len(blocked))
+	// C2 display coupling (owner-approved 2026-06-30): the engine just redirected one
+	// or more seats. Re-stamp IsCurrentRouted on the affected group VKs' group_runtime
+	// so /user/vault shows the new routed account within this override poll, not only on
+	// the next material refresh. Display-only + network-free (RMW on the cached column);
+	// the routing redirect itself already took effect via the override cache above.
+	s.restampCurrentRouted()
 }
 
 // routingOverrideResp mirrors master's GET /accounts/me/routing body. Assignments =

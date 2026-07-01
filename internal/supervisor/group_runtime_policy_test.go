@@ -166,7 +166,7 @@ func TestWriteGroupRuntimeForGroups_PerVKEncrypted(t *testing.T) {
 		{AccountID: "a1", CredentialType: "oauth_account", AccessToken: "tok-1", ExpiresAt: 5},
 	}}}
 
-	if err := writeGroupRuntimeForGroups(dbPath, key, mks, groups); err != nil {
+	if err := writeGroupRuntimeForGroups(dbPath, key, mks, groups, nil); err != nil {
 		t.Fatalf("write: %v", err)
 	}
 
@@ -224,7 +224,7 @@ func TestWriteGroupRuntimeForGroups_ClearsUndeliveredGroupVK(t *testing.T) {
 		{AccountID: "a1", CredentialType: "oauth_account", AccessToken: "tok-1", ExpiresAt: 5},
 	}}}
 
-	if err := writeGroupRuntimeForGroups(dbPath, key, mks, groups); err != nil {
+	if err := writeGroupRuntimeForGroups(dbPath, key, mks, groups, nil); err != nil {
 		t.Fatalf("write: %v", err)
 	}
 
@@ -242,5 +242,133 @@ func TestWriteGroupRuntimeForGroups_ClearsUndeliveredGroupVK(t *testing.T) {
 	var m map[string]vkeys.GroupRuntimeAccount
 	if err := json.Unmarshal([]byte(grStay.String), &m); err != nil || decryptSecret(t, key, m["a1"]) != "tok-1" {
 		t.Fatalf("still-member group VK must keep fresh material, got %q", grStay.String)
+	}
+}
+
+// twoCandGroupAccounts is a seat's candidate list JSON (mirrors the CLI-synced
+// group_accounts column) with two equal-priority accounts, so seatassign.Rank
+// decides the rank-0 default deterministically.
+const twoCandGroupAccounts = `[{"account_id":"a1","priority":1},{"account_id":"a2","priority":1}]`
+
+// TestComputeRoutedAccountID_OverrideBeatsRankZero (C2): the routed account = the
+// engine override when it still names a candidate, else the seatassign rank-0 pick.
+// Asserted RELATIVE to the deterministic default (HRW output isn't hand-predicted):
+// picking the OTHER candidate as override MUST flip the result; a non-candidate
+// override MUST be ignored (fall back to rank-0). 能红: if computeRoutedAccountID
+// ignored the override, the "override flips it" assertion fails.
+func TestComputeRoutedAccountID_OverrideBeatsRankZero(t *testing.T) {
+	mk := vault.ManagedKey{SeatID: "seat-x", GroupAccounts: twoCandGroupAccounts}
+
+	def := computeRoutedAccountID(mk, nil) // rank-0, no override
+	if def != "a1" && def != "a2" {
+		t.Fatalf("rank-0 default must be a candidate, got %q", def)
+	}
+	other := "a1"
+	if def == "a1" {
+		other = "a2"
+	}
+	// Override naming the OTHER candidate must win.
+	if got := computeRoutedAccountID(mk, func(string) string { return other }); got != other {
+		t.Fatalf("override should route to %q, got %q", other, got)
+	}
+	// Override naming a NON-candidate must be ignored → rank-0 default.
+	if got := computeRoutedAccountID(mk, func(string) string { return "ghost" }); got != def {
+		t.Fatalf("non-candidate override must fall back to rank-0 %q, got %q", def, got)
+	}
+	// No parseable candidates → "".
+	if got := computeRoutedAccountID(vault.ManagedKey{SeatID: "s"}, nil); got != "" {
+		t.Fatalf("no candidates → \"\", got %q", got)
+	}
+}
+
+// TestWriteGroupRuntimeForGroups_StampsCurrentRouted (C2): the writer flags exactly
+// ONE account per VK as IsCurrentRouted, honoring the override, and the same group's
+// two seats get DIFFERENT routed accounts (per-VK, not per-group-shared).
+func TestWriteGroupRuntimeForGroups_StampsCurrentRouted(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "vault.db")
+	db, err := sql.Open("sqlite", dbPath)
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	if _, err := db.Exec(`CREATE TABLE managed_virtual_keys_cache (
+		virtual_key_id TEXT PRIMARY KEY, oauth_group_id TEXT, group_runtime TEXT)`); err != nil {
+		t.Fatalf("create: %v", err)
+	}
+	db.Exec(`INSERT INTO managed_virtual_keys_cache (virtual_key_id, oauth_group_id) VALUES ('vk-s1','grp-1')`)
+	db.Exec(`INSERT INTO managed_virtual_keys_cache (virtual_key_id, oauth_group_id) VALUES ('vk-s2','grp-1')`)
+	db.Close()
+
+	key := testKey()
+	// Two seats on the SAME group → must get independently-stamped routed accounts.
+	mks := []vault.ManagedKey{
+		{VirtualKeyID: "vk-s1", OauthGroupID: "grp-1", SeatID: "seat-1", GroupAccounts: twoCandGroupAccounts},
+		{VirtualKeyID: "vk-s2", OauthGroupID: "grp-1", SeatID: "seat-2", GroupAccounts: twoCandGroupAccounts},
+	}
+	groups := []grGroup{{OauthGroupID: "grp-1", Accounts: []grAccount{
+		{AccountID: "a1", CredentialType: "oauth_account", AccessToken: "t1", ExpiresAt: 9},
+		{AccountID: "a2", CredentialType: "oauth_account", AccessToken: "t2", ExpiresAt: 9},
+	}}}
+	// Force seat-1 → a1 via override; seat-2 gets no override (rank-0).
+	overrideFor := func(seat string) string {
+		if seat == "seat-1" {
+			return "a1"
+		}
+		return ""
+	}
+	if err := writeGroupRuntimeForGroups(dbPath, key, mks, groups, overrideFor); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+
+	routedOf := func(vk string) string {
+		db, _ := sql.Open("sqlite", dbPath)
+		defer db.Close()
+		var gr string
+		db.QueryRow(`SELECT group_runtime FROM managed_virtual_keys_cache WHERE virtual_key_id=?`, vk).Scan(&gr)
+		var m map[string]vkeys.GroupRuntimeAccount
+		if err := json.Unmarshal([]byte(gr), &m); err != nil {
+			t.Fatalf("parse %s: %v", vk, err)
+		}
+		routed := ""
+		for id, a := range m {
+			if a.IsCurrentRouted {
+				if routed != "" {
+					t.Fatalf("%s: more than one account flagged current-routed", vk)
+				}
+				routed = id
+			}
+		}
+		return routed
+	}
+	if got := routedOf("vk-s1"); got != "a1" {
+		t.Fatalf("seat-1 override → a1 current-routed, got %q", got)
+	}
+	// seat-2 has no override → rank-0; just assert exactly one is flagged and it's a candidate.
+	if got := routedOf("vk-s2"); got != "a1" && got != "a2" {
+		t.Fatalf("seat-2 current-routed must be a candidate, got %q", got)
+	}
+}
+
+// TestStampCurrentRoutedJSON_FlipsFlagInPlace (C2 coupling): the override-change
+// re-stamp path moves IsCurrentRouted to the new account WITHOUT touching secrets,
+// and reports changed=false when nothing moves.
+func TestStampCurrentRoutedJSON_FlipsFlagInPlace(t *testing.T) {
+	orig := `{"a1":{"credential_type":"oauth_account","secret_ciphertext":"ZZ","is_current_routed":true},"a2":{"credential_type":"oauth_account","secret_ciphertext":"YY"}}`
+	// Re-route to a2.
+	out, changed, err := stampCurrentRoutedJSON(orig, "a2")
+	if err != nil || !changed {
+		t.Fatalf("expected change, got changed=%v err=%v", changed, err)
+	}
+	var m map[string]vkeys.GroupRuntimeAccount
+	json.Unmarshal([]byte(out), &m)
+	if m["a1"].IsCurrentRouted || !m["a2"].IsCurrentRouted {
+		t.Fatalf("flag should move a1→a2, got a1=%v a2=%v", m["a1"].IsCurrentRouted, m["a2"].IsCurrentRouted)
+	}
+	// Secret untouched (never decrypted / re-encrypted).
+	if m["a1"].SecretCiphertext != "ZZ" || m["a2"].SecretCiphertext != "YY" {
+		t.Fatalf("secrets must be untouched, got %q / %q", m["a1"].SecretCiphertext, m["a2"].SecretCiphertext)
+	}
+	// Idempotent: re-stamping the same routed account reports no change.
+	if _, changed2, _ := stampCurrentRoutedJSON(out, "a2"); changed2 {
+		t.Fatalf("re-stamp of unchanged routed must report changed=false")
 	}
 }

@@ -57,6 +57,16 @@ type GroupRuntimeAccount struct {
 	// NeedsLogin: the member has no token for this OAuth account (master said so) →
 	// the resolver returns LOGIN_REQUIRED for it. No secret when true. P1.
 	NeedsLogin bool `json:"needs_login,omitempty"`
+	// IsCurrentRouted: DISPLAY-ONLY (C2, 2026-06-30) — true on the ONE account this
+	// seat's traffic is currently routed to in steady state = routing-override ??
+	// seatassign rank-0. NOT read by the resolver (which re-decides per request incl.
+	// cooldown failover); it exists only so /user/vault can show "current routed"
+	// distinct from the static "assigned" default. Recomputed on every material
+	// refresh AND on every routing-override change (couples the two 60s rails, owner-
+	// approved 2026-06-30). Per-VK (per-seat): the same group's VKs carry different
+	// flags. Deliberately excludes transient per-request cooldown failover (would
+	// flap; owner chose the stable pick).
+	IsCurrentRouted bool `json:"is_current_routed,omitempty"`
 	// OAuth meta:
 	ExpiresAt        int64  `json:"expires_at,omitempty"`
 	WindowMaxUtilPct *int   `json:"window_max_util_pct,omitempty"`

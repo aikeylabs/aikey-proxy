@@ -185,9 +185,12 @@ func (p *Proxy) handleOauthGroupRoute(
 func groupDegradeMessage(code string) string {
 	switch code {
 	case groupErrNoCandidates:
-		// Permanent until an admin acts: the seat isn't (or is no longer) a member
-		// of the group, so it has no candidate accounts. Retrying will not help.
-		return "Your seat is not a member of this credential-sharing group (it may have been removed). " +
+		// Permanent until an admin acts: the seat has NO account available in the
+		// group — either it was removed from the seat group, or the group has no
+		// active accounts. Covers both the empty candidate snapshot AND an empty
+		// channel-③ delivery ("{}", 2026-06-30). Retrying will NOT help.
+		return "Your seat has no available account in this credential-sharing group " +
+			"(it may have been removed from the group, or the group has no active accounts). " +
 			"Contact your administrator — this will not resolve on its own."
 	case groupErrNoMaterial:
 		// Transient: candidates exist but the proxy hasn't pulled their material

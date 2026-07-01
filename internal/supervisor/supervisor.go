@@ -273,7 +273,10 @@ func (g *generation) drain(timeout time.Duration, reloadID string) {
 // Supervisor manages the proxy lifecycle and exposes the data-plane handler.
 type Supervisor struct {
 	startedAt time.Time
-	transport http.RoundTripper // optional upstream proxy transport; nil = default
+	// transport is the optional upstream-proxy RoundTripper applied to every
+	// generation's proxy (nil = default). atomic.Pointer so an egress hot-swap
+	// (SetTransport, 2026-06-30) can't race the gen-build read in applyToProxy.
+	transport atomic.Pointer[transportBox]
 	// ctx / cancel bound the lifetime of all detached upstream calls.
 	// Canceled in Shutdown() to stop any in-flight upstream requests.
 	ctx    context.Context
@@ -579,12 +582,17 @@ func (s *Supervisor) SetBroker(b proxy.OAuthBroker) {
 }
 
 func (s *Supervisor) SetTransport(t http.RoundTripper) {
-	s.transport = t
-	// Also apply to the already-running initial generation.
+	s.transport.Store(&transportBox{rt: t})
+	// Also apply to the already-running initial generation. proxy.SetTransport is
+	// itself atomic, so this hot-swap is safe while the generation serves requests.
 	if gen := s.active.Load(); gen != nil {
 		gen.proxy.SetTransport(t)
 	}
 }
+
+// transportBox boxes the RoundTripper so it can live in an atomic.Pointer (atomics
+// can't hold an interface value directly). nil rt = use the default transport.
+type transportBox struct{ rt http.RoundTripper }
 
 // managedKeySyncLoop runs in a background goroutine and periodically merges
 // newly-active managed keys into the live registry without a full reload.
@@ -1399,8 +1407,8 @@ func (s *Supervisor) buildGeneration() (*generation, error) {
 	p.SetRoutingOverrides(s.routingOverrides)
 	p.SlowRequestMs = int64(s.cfg.Log.SlowRequestMs)
 	p.VerySlowRequestMs = int64(s.cfg.Log.VerySlowRequestMs)
-	if s.transport != nil {
-		p.SetTransport(s.transport)
+	if b := s.transport.Load(); b != nil && b.rt != nil {
+		p.SetTransport(b.rt)
 	}
 	if s.broker != nil {
 		p.SetBroker(s.broker)

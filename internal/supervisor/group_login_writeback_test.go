@@ -6,8 +6,18 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"sync/atomic"
 	"testing"
+	"time"
 )
+
+// fastBackoff shrinks the retry backoff for tests + restores it after.
+func fastBackoff(t *testing.T) {
+	t.Helper()
+	prev := writebackBaseBackoff
+	writebackBaseBackoff = time.Millisecond
+	t.Cleanup(func() { writebackBaseBackoff = prev })
+}
 
 // TestPostMemberToken_PostsToMasterWithBearer: the writeback POSTs the per-member
 // token to master's RW10 endpoint with the account-JWT Bearer + JSON body, and the
@@ -56,5 +66,67 @@ func TestPostMemberToken_Non2xxSurfaces(t *testing.T) {
 	err := postMemberToken(context.Background(), srv.Client(), srv.URL, "JWT", memberTokenWriteback{CredentialID: "c1", AccessToken: "t"})
 	if err == nil {
 		t.Fatal("non-2xx master response must surface as an error")
+	}
+}
+
+// TestPostMemberToken_RetriesTransient5xxThenSucceeds: a TRANSIENT master failure
+// (5xx while the VM restarts / nginx backend flaps) is retried; once the master
+// recovers the writeback lands. The OAuth code was already consumed, so this is the
+// whole point — a blip must not waste it. 防退化 for the 2026-06-30 retry.
+func TestPostMemberToken_RetriesTransient5xxThenSucceeds(t *testing.T) {
+	fastBackoff(t)
+	var hits int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if atomic.AddInt32(&hits, 1) < 3 {
+			w.WriteHeader(http.StatusServiceUnavailable) // 503 → transient → retry
+			return
+		}
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer srv.Close()
+
+	if err := postMemberToken(context.Background(), srv.Client(), srv.URL, "JWT", memberTokenWriteback{CredentialID: "c1", AccessToken: "t"}); err != nil {
+		t.Fatalf("expected success after transient 5xx, got: %v", err)
+	}
+	if got := atomic.LoadInt32(&hits); got != 3 {
+		t.Errorf("server hit %d times, want 3 (2 transient + 1 success)", got)
+	}
+}
+
+// TestPostMemberToken_4xxFailsFastNoRetry: a 4xx is PERMANENT — retrying can't help,
+// so we must fail on the FIRST attempt (no wasted retries / latency).
+func TestPostMemberToken_4xxFailsFastNoRetry(t *testing.T) {
+	fastBackoff(t)
+	var hits int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt32(&hits, 1)
+		w.WriteHeader(http.StatusBadRequest) // 400 → permanent
+	}))
+	defer srv.Close()
+
+	if err := postMemberToken(context.Background(), srv.Client(), srv.URL, "JWT", memberTokenWriteback{CredentialID: "c1", AccessToken: "t"}); err == nil {
+		t.Fatal("4xx must surface as an error")
+	}
+	if got := atomic.LoadInt32(&hits); got != 1 {
+		t.Errorf("server hit %d times, want 1 (4xx must NOT retry)", got)
+	}
+}
+
+// TestPostMemberToken_ExhaustsRetriesOnPersistent5xx: a master that stays down
+// exhausts all attempts and returns an error (bounded, doesn't hang forever).
+func TestPostMemberToken_ExhaustsRetriesOnPersistent5xx(t *testing.T) {
+	fastBackoff(t)
+	var hits int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt32(&hits, 1)
+		w.WriteHeader(http.StatusBadGateway) // 502 → transient, but never recovers
+	}))
+	defer srv.Close()
+
+	if err := postMemberToken(context.Background(), srv.Client(), srv.URL, "JWT", memberTokenWriteback{CredentialID: "c1", AccessToken: "t"}); err == nil {
+		t.Fatal("persistent 5xx must surface as an error after exhausting retries")
+	}
+	if got := atomic.LoadInt32(&hits); got != writebackMaxAttempts {
+		t.Errorf("server hit %d times, want %d (all attempts)", got, writebackMaxAttempts)
 	}
 }

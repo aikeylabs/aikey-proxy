@@ -117,10 +117,27 @@ func resolveGroupCredential(route *vkeys.ResolvedRoute, derivedKey []byte, nowUn
 		return nil, &groupResolveError{Code: groupErrNoCandidates, Reason: "no parseable group candidates on route"}
 	}
 
+	// Distinguish "not pulled yet" from "pulled → nothing for this seat" (2026-06-30):
+	//   ""       → the channel-③ poll hasn't landed → NO_MATERIAL (retry DOES help).
+	//   bad JSON → treat as not-ready → NO_MATERIAL (retry).
+	//   "{}"     → the proxy DID pull and this seat's group delivered NO accounts:
+	//              the member was unbound/removed (access gate wiped it to "{}"), or
+	//              the group has no enabled accounts → NO_CANDIDATES: retrying will
+	//              NOT help, the member must contact an admin. The candidate snapshot
+	//              (group_accounts) may still be STALE with entries — the material rail
+	//              (proxy 60s) is fresher than on-demand key sync, so trust "{}" over
+	//              stale candidates here. WHY: a removed member was shown "credentials
+	//              still syncing, retry shortly" forever — the message told them to
+	//              retry when only an admin re-adding the seat can fix it.
+	if route.GroupRuntime == "" {
+		return nil, &groupResolveError{Code: groupErrNoMaterial, Reason: "group_runtime not pulled yet"}
+	}
 	var material map[string]vkeys.GroupRuntimeAccount
-	if route.GroupRuntime == "" || json.Unmarshal([]byte(route.GroupRuntime), &material) != nil || len(material) == 0 {
-		// Material not pulled yet (N7c-2 poll hasn't landed) or unparseable.
-		return nil, &groupResolveError{Code: groupErrNoMaterial, Reason: "group_runtime is empty — material not delivered yet"}
+	if err := json.Unmarshal([]byte(route.GroupRuntime), &material); err != nil {
+		return nil, &groupResolveError{Code: groupErrNoMaterial, Reason: "group_runtime unparseable — treat as not-ready"}
+	}
+	if len(material) == 0 {
+		return nil, &groupResolveError{Code: groupErrNoCandidates, Reason: "group_runtime delivered no accounts for this seat (unbound/removed member or empty group)"}
 	}
 
 	// Rank exactly as master does: Account{AccountID, Priority}, Weight unset.

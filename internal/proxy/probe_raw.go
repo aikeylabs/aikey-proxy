@@ -238,7 +238,7 @@ func (p *Proxy) handleProbeRaw(w http.ResponseWriter, r *http.Request, canonical
 
 	// 5. Send + time. Use p.transport so HTTP_PROXY env etc are honored
 	// the same way as the regular upstream path.
-	transport := p.transport
+	transport := p.currentTransport()
 	if transport == nil {
 		transport = http.DefaultTransport
 	}

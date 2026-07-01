@@ -11,6 +11,7 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"sync"
 	"time"
 
 	"golang.org/x/term"
@@ -309,6 +310,51 @@ func main() {
 	adminHandler.AuditStatusFn = sup.AuditStatus
 	adminHandler.ReconcileGapsFn = sup.ReconcileGaps
 
+	// Egress (upstream) proxy config endpoints (GET/PUT /admin/upstream-proxy), the
+	// runtime home of the egress proxy after R25 出口收敛. Get returns the live URL;
+	// Set persists it to aikey-user.yaml (survives re-render) and HOT-SWAPS the
+	// forwarding transport + OAuth impersonate client in place — no restart. egressMu
+	// guards the cached URL Get reads (the transport/broker swaps are themselves
+	// atomic). Decision: user chose hot-swap (B) + plaintext storage (i).
+	var egressMu sync.Mutex
+	egressURL := cfg.UpstreamProxy.URL
+	adminHandler.GetUpstreamProxyFn = func() string {
+		egressMu.Lock()
+		defer egressMu.Unlock()
+		return egressURL
+	}
+	adminHandler.SetUpstreamProxyFn = func(rawURL string) error {
+		if err := config.PersistUpstreamProxyURL(resolvedPath, rawURL); err != nil {
+			return err
+		}
+		sup.SetTransport(buildTransport(rawURL))
+		broker.SetHTTPClient(broker.NewImpersonateChromeHTTPClient(rawURL))
+		egressMu.Lock()
+		egressURL = rawURL
+		egressMu.Unlock()
+		return nil
+	}
+	// ProbeUpstreamProxyFn tests a CANDIDATE egress URL end-to-end (through the same
+	// buildTransport the live path uses) to a provider host, WITHOUT persisting it, so
+	// the web "Test connectivity" button can verify before Save. Any HTTP response
+	// (even 401/404) proves the tunnel carries traffic; a transport error means the
+	// proxy couldn't reach out.
+	adminHandler.ProbeUpstreamProxyFn = func(rawURL string) (int, int64, error) {
+		client := &http.Client{Transport: buildTransport(rawURL), Timeout: 10 * time.Second}
+		req, err := http.NewRequest(http.MethodGet, upstreamProbeTarget, nil)
+		if err != nil {
+			return 0, 0, err
+		}
+		start := time.Now()
+		resp, err := client.Do(req)
+		elapsed := time.Since(start).Milliseconds()
+		if err != nil {
+			return 0, elapsed, err
+		}
+		_ = resp.Body.Close()
+		return resp.StatusCode, elapsed, nil
+	}
+
 	// Build the outbound transport for upstream providers. Always non-nil now:
 	// even the direct path needs MaxIdleConnsPerHost tuning (see buildTransport).
 	dataHandler := sup.Handler()
@@ -409,6 +455,12 @@ func cloneDefaultTransport() *http.Transport {
 	}
 	return &http.Transport{}
 }
+
+// upstreamProbeTarget is the provider host the "Test connectivity" probe reaches for
+// through a candidate egress proxy. api.anthropic.com is the Claude-centric primary
+// forwarding target; any HTTP response (even 401/404, no key sent) proves the tunnel
+// carries traffic to the AI world.
+const upstreamProbeTarget = "https://api.anthropic.com/"
 
 func buildTransport(proxyURL string) *http.Transport {
 	// All providers resolve to a handful of hosts (api.anthropic.com etc.),

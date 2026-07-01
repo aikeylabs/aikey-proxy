@@ -71,7 +71,12 @@ type OAuthCredential struct {
 // Proxy is the core reverse proxy that handles virtual key resolution
 // and request forwarding.
 type Proxy struct {
-	transport    http.RoundTripper     // nil → http.DefaultTransport (reads env vars)
+	// transport is the outbound RoundTripper for AI provider forwarding, held in an
+	// atomic.Pointer so the egress upstream-proxy URL can be HOT-SWAPPED at runtime
+	// (Settings → Upstream proxy, 2026-06-30) without racing the per-request read in
+	// forward_and_resolve. Nil box / nil rt → http.DefaultTransport (honors
+	// HTTP_PROXY env). Read via currentTransport, written via SetTransport.
+	transport    atomic.Pointer[transportBox]
 	activeReader ActiveKeyReader       // non-nil when vault implements ActiveKeyReader
 	appVault     apppipe.VaultReader   // non-nil when vault implements the App pipeline read surface (Phase 4)
 	probeVault   probepipe.VaultReader // non-nil when vault implements the Probe pipeline read surface (mode C, SPEC 2026-05-23)
@@ -216,10 +221,24 @@ type Proxy struct {
 // Must be called before serving requests. A nil value restores the default
 // behavior (http.DefaultTransport, which honors HTTP_PROXY / HTTPS_PROXY env vars).
 func (p *Proxy) SetTransport(t http.RoundTripper) {
-	p.transport = t
+	p.transport.Store(&transportBox{rt: t})
 	if t != nil {
 		slog.Info("proxy: custom transport set")
 	}
+}
+
+// transportBox boxes the RoundTripper so it can live in an atomic.Pointer (atomics
+// can't hold an interface value directly). A nil rt means "use the default".
+type transportBox struct{ rt http.RoundTripper }
+
+// currentTransport returns the live RoundTripper (nil → caller falls back to the
+// default). Lock-free atomic read: safe on the hot path concurrently with a
+// SetTransport hot-swap.
+func (p *Proxy) currentTransport() http.RoundTripper {
+	if b := p.transport.Load(); b != nil {
+		return b.rt
+	}
+	return nil
 }
 
 // New creates a new Proxy. ctx is the proxy lifecycle context; canceling it

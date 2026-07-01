@@ -91,6 +91,12 @@ func New(ln net.Listener, dataHandler http.Handler, adminHandler *admin.Handler,
 	mux.HandleFunc("GET /admin/audit/status", adminHandler.AuditStatus)
 	mux.HandleFunc("POST /admin/audit/reconcile", adminHandler.AuditReconcile)
 
+	// Egress (upstream) proxy config — read + hot-swap. Relayed by the local web
+	// "Settings → Upstream proxy" card (R25 出口收敛: egress lives on the proxy node).
+	mux.HandleFunc("GET /admin/upstream-proxy", adminHandler.UpstreamProxyGet)
+	mux.HandleFunc("PUT /admin/upstream-proxy", adminHandler.UpstreamProxySet)
+	mux.HandleFunc("POST /admin/upstream-proxy/probe", adminHandler.UpstreamProxyProbe)
+
 	// Extra route registrars (e.g., OAuth broker handler)
 	for _, h := range extraHandlers {
 		h.RegisterRoutes(mux)

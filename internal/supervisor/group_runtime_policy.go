@@ -30,6 +30,7 @@ import (
 	"github.com/AiKeyLabs/aikey-proxy/internal/httpx"
 	"github.com/AiKeyLabs/aikey-proxy/internal/vault"
 	"github.com/AiKeyLabs/aikey-proxy/internal/vkeys"
+	"github.com/AiKeyLabs/pkg/seatassign"
 )
 
 func defaultGroupRuntimeClient() *http.Client { return httpx.NewDirectClient(10 * time.Second) }
@@ -112,7 +113,9 @@ func (s *Supervisor) syncGroupRuntime(ctx context.Context, cred events.Credentia
 	if prev := s.lastGroupRuntimeSig.Load(); prev != nil && *prev == sig {
 		return
 	}
-	if err := writeGroupRuntimeForGroups(s.cfg.Vault.Path, gen.vault.DerivedKey(), mks, groups); err != nil {
+	// s.routingOverrides.Assignment is nil-safe (guards nil receiver → "" = rank-0),
+	// so the routed-account stamp degrades to the local pick when overrides are unset.
+	if err := writeGroupRuntimeForGroups(s.cfg.Vault.Path, gen.vault.DerivedKey(), mks, groups, s.routingOverrides.Assignment); err != nil {
 		slog.Warn("group_runtime write failed",
 			"event.name", "proxy.group_runtime.write_failed", "error", err.Error())
 		return // leave lastGroupRuntimeSig unchanged → retry next tick
@@ -214,11 +217,56 @@ func fetchGroupRuntime(ctx context.Context, masterURL, bearer string, observedRe
 	return out.Groups, string(body), true
 }
 
-// buildGroupRuntimeJSON encrypts each account's secret (access_token | key) with
-// the vault key and renders the group_runtime JSON for one group. An account
-// whose encryption fails is skipped (best-effort — one bad account must not blank
-// the whole group). Returns "{}" for an empty/all-skipped group.
-func buildGroupRuntimeJSON(derivedKey []byte, accounts []grAccount) (string, error) {
+// restampCurrentRouted recomputes IsCurrentRouted on every local group VK's EXISTING
+// group_runtime after a routing-override change — WITHOUT refetching material from
+// master or re-encrypting secrets (it reads the already-loaded mk.GroupRuntime and
+// flips only the plaintext display flag). This couples the routing-override rail to
+// the group_runtime display column (owner-approved 2026-06-30) so /user/vault reflects
+// an engine redirect within one override poll, not only on the next material refresh.
+//
+// NO Reload: IsCurrentRouted is display-only (the hot-path resolver never reads it),
+// and the CLI/web read the vault column directly — so writing the column suffices.
+// The actual routing redirect already took effect via the RoutingOverrideCache the
+// resolver reads at request time; this only keeps the DISPLAY in step.
+func (s *Supervisor) restampCurrentRouted() {
+	gen := s.active.Load()
+	if gen == nil || gen.vault == nil {
+		return
+	}
+	mks, err := gen.vault.GetActiveManagedKeys()
+	if err != nil {
+		return
+	}
+	for i := range mks {
+		mk := mks[i]
+		if mk.OauthGroupID == "" || mk.GroupRuntime == "" {
+			continue
+		}
+		newJSON, changed, err := stampCurrentRoutedJSON(mk.GroupRuntime, computeRoutedAccountID(mk, s.routingOverrides.Assignment))
+		if err != nil {
+			slog.Warn("group_runtime restamp parse failed",
+				"event.name", "proxy.group_runtime.restamp_failed",
+				"virtual_key_id", mk.VirtualKeyID, "error", err.Error())
+			continue
+		}
+		if !changed {
+			continue
+		}
+		if err := vault.WriteGroupRuntime(s.cfg.Vault.Path, mk.VirtualKeyID, newJSON); err != nil {
+			slog.Warn("group_runtime restamp write failed",
+				"event.name", "proxy.group_runtime.restamp_failed",
+				"virtual_key_id", mk.VirtualKeyID, "error", err.Error())
+		}
+	}
+}
+
+// buildGroupRuntimeMap encrypts each account's secret (access_token | key) with the
+// vault key and returns the per-account material map for one group. It is
+// ROUTED-AGNOSTIC — IsCurrentRouted (C2 display) is stamped per-VK later by
+// marshalGroupRuntime, because "which account is routed" is per-seat and the same
+// group's VKs belong to different seats. An account whose encryption fails is skipped
+// (best-effort — one bad account must not blank the whole group).
+func buildGroupRuntimeMap(derivedKey []byte, accounts []grAccount) map[string]vkeys.GroupRuntimeAccount {
 	out := make(map[string]vkeys.GroupRuntimeAccount, len(accounts))
 	for _, a := range accounts {
 		// needs_login marker carries NO secret — store it as-is so the resolver can
@@ -252,6 +300,18 @@ func buildGroupRuntimeJSON(derivedKey []byte, accounts []grAccount) (string, err
 		}
 		out[a.AccountID] = gra
 	}
+	return out
+}
+
+// marshalGroupRuntime renders the material map, stamping IsCurrentRouted=true on the
+// single routedAccountID (C2 display). routedAccountID "" (or absent from the map) →
+// no account is flagged. The input map is NOT mutated (entries are copied by value).
+func marshalGroupRuntime(base map[string]vkeys.GroupRuntimeAccount, routedAccountID string) (string, error) {
+	out := make(map[string]vkeys.GroupRuntimeAccount, len(base))
+	for id, acc := range base {
+		acc.IsCurrentRouted = id == routedAccountID
+		out[id] = acc
+	}
 	b, err := json.Marshal(out)
 	if err != nil {
 		return "", fmt.Errorf("marshal group_runtime: %w", err)
@@ -259,30 +319,108 @@ func buildGroupRuntimeJSON(derivedKey []byte, accounts []grAccount) (string, err
 	return string(b), nil
 }
 
+// buildGroupRuntimeJSON renders the routed-agnostic group_runtime JSON for one group
+// (no IsCurrentRouted flag). Retained for callers/tests that don't need per-seat
+// routing display.
+func buildGroupRuntimeJSON(derivedKey []byte, accounts []grAccount) (string, error) {
+	return marshalGroupRuntime(buildGroupRuntimeMap(derivedKey, accounts), "")
+}
+
+// computeRoutedAccountID returns the account this seat's traffic is routed to in
+// STEADY STATE (C2 display) = routing-override (when it still names a candidate in the
+// group) ?? seatassign rank-0. It reuses seatassign.Rank — the SAME primitive the
+// hot-path resolver (group_resolve.go) uses — so the displayed account matches what
+// routing picks when nothing is cooled down. It DELIBERATELY omits the resolver's
+// per-request cooldown / material / needs-login skips: owner chose the stable,
+// non-flapping pick (2026-06-30), so transient failover is intentionally not surfaced.
+// "" when the candidate list is absent/unparseable. overrideFor may be nil (→ rank-0).
+func computeRoutedAccountID(mk vault.ManagedKey, overrideFor func(string) string) string {
+	var refs []vkeys.GroupAccountRef
+	if mk.GroupAccounts == "" || json.Unmarshal([]byte(mk.GroupAccounts), &refs) != nil || len(refs) == 0 {
+		return ""
+	}
+	accounts := make([]seatassign.Account, 0, len(refs))
+	inSet := make(map[string]bool, len(refs))
+	for _, r := range refs {
+		accounts = append(accounts, seatassign.Account{AccountID: r.AccountID, Priority: r.Priority})
+		inSet[r.AccountID] = true
+	}
+	ordered := seatassign.Rank(mk.SeatID, accounts)
+	if len(ordered) == 0 {
+		return ""
+	}
+	routed := ordered[0].AccountID // rank-0 default
+	if overrideFor != nil {
+		if ov := overrideFor(mk.SeatID); ov != "" && inSet[ov] {
+			routed = ov // engine redirect — apply only when it still names a candidate
+		}
+	}
+	return routed
+}
+
+// stampCurrentRoutedJSON rewrites an EXISTING group_runtime JSON so ONLY
+// routedAccountID carries IsCurrentRouted (C2 re-stamp on a routing-override change —
+// no master fetch, no re-encryption, secrets untouched). Returns (json, changed, err);
+// changed=false when nothing moved (caller skips the write). Unparseable input is
+// returned unchanged with the error so a corrupt column can't crash the poll.
+func stampCurrentRoutedJSON(runtimeJSON, routedAccountID string) (string, bool, error) {
+	if runtimeJSON == "" || runtimeJSON == "{}" {
+		return runtimeJSON, false, nil
+	}
+	var m map[string]vkeys.GroupRuntimeAccount
+	if err := json.Unmarshal([]byte(runtimeJSON), &m); err != nil {
+		return runtimeJSON, false, err
+	}
+	changed := false
+	for id, acc := range m {
+		want := id == routedAccountID
+		if acc.IsCurrentRouted != want {
+			acc.IsCurrentRouted = want
+			m[id] = acc
+			changed = true
+		}
+	}
+	if !changed {
+		return runtimeJSON, false, nil
+	}
+	b, err := json.Marshal(m)
+	if err != nil {
+		return runtimeJSON, false, fmt.Errorf("marshal group_runtime: %w", err)
+	}
+	return string(b), true, nil
+}
+
 // writeGroupRuntimeForGroups writes the encrypted material into every group VK's
-// group_runtime column. A VK belongs to a group when its OauthGroupID matches; a
-// group with no local VK is simply skipped (the proxy only stores what it routes).
-func writeGroupRuntimeForGroups(dbPath string, derivedKey []byte, mks []vault.ManagedKey, groups []grGroup) error {
-	// group_id → its VK ids (from the locally-known managed keys).
-	vksByGroup := make(map[string][]string)
+// group_runtime column, stamping IsCurrentRouted PER-VK (per-seat) via
+// computeRoutedAccountID — the same group's VKs belong to different seats and can
+// route to different accounts. A VK belongs to a group when its OauthGroupID matches;
+// a group with no local VK is simply skipped (the proxy only stores what it routes).
+// overrideFor supplies the engine's seat→account routing override (nil → rank-0 only).
+func writeGroupRuntimeForGroups(dbPath string, derivedKey []byte, mks []vault.ManagedKey, groups []grGroup, overrideFor func(string) string) error {
+	// group_id → its locally-known managed keys (need the whole mk for SeatID +
+	// GroupAccounts to compute the per-seat routed account, not just the VK id).
+	mksByGroup := make(map[string][]vault.ManagedKey)
 	for i := range mks {
 		if mks[i].OauthGroupID != "" {
-			vksByGroup[mks[i].OauthGroupID] = append(vksByGroup[mks[i].OauthGroupID], mks[i].VirtualKeyID)
+			mksByGroup[mks[i].OauthGroupID] = append(mksByGroup[mks[i].OauthGroupID], mks[i])
 		}
 	}
 	delivered := make(map[string]bool, len(groups))
 	for _, g := range groups {
 		delivered[g.OauthGroupID] = true
-		vkIDs := vksByGroup[g.OauthGroupID]
-		if len(vkIDs) == 0 {
+		groupMks := mksByGroup[g.OauthGroupID]
+		if len(groupMks) == 0 {
 			continue
 		}
-		jsonVal, err := buildGroupRuntimeJSON(derivedKey, g.Accounts)
-		if err != nil {
-			return err
-		}
-		for _, vkID := range vkIDs {
-			if err := vault.WriteGroupRuntime(dbPath, vkID, jsonVal); err != nil {
+		// Encrypt the material ONCE per group (routed-agnostic), then stamp the
+		// per-seat routed flag per VK — avoids re-encrypting for each seat.
+		base := buildGroupRuntimeMap(derivedKey, g.Accounts)
+		for _, mk := range groupMks {
+			jsonVal, err := marshalGroupRuntime(base, computeRoutedAccountID(mk, overrideFor))
+			if err != nil {
+				return err
+			}
+			if err := vault.WriteGroupRuntime(dbPath, mk.VirtualKeyID, jsonVal); err != nil {
 				return err
 			}
 		}
@@ -296,12 +434,12 @@ func writeGroupRuntimeForGroups(dbPath string, derivedKey []byte, mks []vault.Ma
 	// group_runtime is a JSON object {account_id:{...}}, so empty = "{}".
 	// Only reached after a SUCCESSFUL delivery fetch (caller gates on ok), so this
 	// never wipes on a transient master error.
-	for gid, vkIDs := range vksByGroup {
+	for gid, groupMks := range mksByGroup {
 		if delivered[gid] {
 			continue
 		}
-		for _, vkID := range vkIDs {
-			if err := vault.WriteGroupRuntime(dbPath, vkID, "{}"); err != nil {
+		for _, mk := range groupMks {
+			if err := vault.WriteGroupRuntime(dbPath, mk.VirtualKeyID, "{}"); err != nil {
 				return err
 			}
 		}

@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync/atomic"
 	"testing"
 )
 
@@ -19,17 +20,28 @@ type fakePoolExchanger struct {
 	refresh    string
 	expiresAt  int64
 	externalID string
+	identity   string
 	submitErr  error
+	submitN    int    // # of SubmitCode calls (idempotent-retry assertions)
+	forgotN    int    // # of Forget calls (cache-clear-on-success assertions)
+	forgotSess string // last Forget sessionID
+	forgotAcct string // last Forget accountID
 }
 
 func (f *fakePoolExchanger) StartLogin(_ context.Context, _ string) (string, string, error) {
 	return "sess-1", f.authURL, nil
 }
-func (f *fakePoolExchanger) SubmitCode(_ context.Context, _, _ string) (string, string, string, int64, string, error) {
+func (f *fakePoolExchanger) SubmitCode(_ context.Context, _, _ string) (string, string, string, int64, string, string, error) {
+	f.submitN++
 	if f.submitErr != nil {
-		return "", "", "", 0, "", f.submitErr
+		return "", "", "", 0, "", "", f.submitErr
 	}
-	return f.accountID, f.access, f.refresh, f.expiresAt, f.externalID, nil
+	return f.accountID, f.access, f.refresh, f.expiresAt, f.externalID, f.identity, nil
+}
+func (f *fakePoolExchanger) Forget(_ context.Context, sessionID, accountID string) {
+	f.forgotN++
+	f.forgotSess = sessionID
+	f.forgotAcct = accountID
 }
 
 func newPoolHandler(t *testing.T, ex poolExchanger, masterURL string) *poolLoginHandler {
@@ -65,7 +77,7 @@ func TestPoolLogin_EndToEnd(t *testing.T) {
 	}))
 	defer master.Close()
 
-	ex := &fakePoolExchanger{authURL: "https://login", accountID: "acc-x", access: "TOK", refresh: "RT", expiresAt: 42, externalID: "uuid-x"}
+	ex := &fakePoolExchanger{authURL: "https://login", accountID: "acc-x", access: "TOK", refresh: "RT", expiresAt: 42, externalID: "uuid-x", identity: "member@team.com"}
 	h := newPoolHandler(t, ex, master.URL)
 	h.client = master.Client()
 
@@ -83,8 +95,8 @@ func TestPoolLogin_EndToEnd(t *testing.T) {
 		t.Fatalf("authorize-url resp: %+v", sresp)
 	}
 
-	// 2) submit-code → exchange + writeback.
-	w2 := doJSON(h.submitCode, `{"session_id":"sess-1","code":"abc#state"}`)
+	// 2) submit-code with confirm → exchange + writeback.
+	w2 := doJSON(h.submitCode, `{"session_id":"sess-1","code":"abc#state","confirm":true}`)
 	if w2.Code != http.StatusOK {
 		t.Fatalf("submit-code: %d %s", w2.Code, w2.Body.String())
 	}
@@ -95,6 +107,67 @@ func TestPoolLogin_EndToEnd(t *testing.T) {
 	// token must NOT be echoed to the caller.
 	if strings.Contains(w2.Body.String(), "TOK") || strings.Contains(w2.Body.String(), "RT") {
 		t.Fatalf("token leaked into submit-code response: %s", w2.Body.String())
+	}
+	// the exchanged account's identity (email) IS returned, for display + the
+	// team-account mismatch warning (email is not a secret).
+	var okResp struct {
+		Status   string `json:"status"`
+		Identity string `json:"identity"`
+	}
+	_ = json.Unmarshal(w2.Body.Bytes(), &okResp)
+	if okResp.Identity != "member@team.com" {
+		t.Fatalf("submit-code response should carry identity email, got %q", okResp.Identity)
+	}
+}
+
+// TestPoolLogin_PendingThenConfirm: step 1 (confirm=false) exchanges and returns the
+// resolved account for review WITHOUT writing to master; step 2 (confirm=true) writes
+// the reviewed token back. Guards the two-step confirm gate (2026-06-30).
+func TestPoolLogin_PendingThenConfirm(t *testing.T) {
+	var writebacks int32
+	master := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		atomic.AddInt32(&writebacks, 1)
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{"status":"ok"}`))
+	}))
+	defer master.Close()
+
+	ex := &fakePoolExchanger{authURL: "u", accountID: "acc-x", access: "T", identity: "member@team.com"}
+	h := newPoolHandler(t, ex, master.URL)
+	h.client = master.Client()
+
+	_ = doJSON(h.authorizeURL, `{"provider":"claude","credential_id":"c1"}`)
+
+	// Step 1: no confirm → pending + identity, NO writeback, session kept.
+	w1 := doJSON(h.submitCode, `{"session_id":"sess-1","code":"abc#st"}`)
+	if w1.Code != http.StatusOK {
+		t.Fatalf("step 1 (no confirm) → 200 pending, got %d %s", w1.Code, w1.Body.String())
+	}
+	var pending struct {
+		Status   string `json:"status"`
+		Identity string `json:"identity"`
+	}
+	_ = json.Unmarshal(w1.Body.Bytes(), &pending)
+	if pending.Status != "pending" || pending.Identity != "member@team.com" {
+		t.Fatalf("step 1 should return pending + identity, got %+v", pending)
+	}
+	if n := atomic.LoadInt32(&writebacks); n != 0 {
+		t.Fatalf("step 1 must NOT write to master, got %d writebacks", n)
+	}
+	if ex.forgotN != 0 {
+		t.Fatalf("step 1 must NOT Forget the session (needed for confirm), got %d", ex.forgotN)
+	}
+
+	// Step 2: confirm → writeback lands, session consumed.
+	w2 := doJSON(h.submitCode, `{"session_id":"sess-1","code":"abc#st","confirm":true}`)
+	if w2.Code != http.StatusOK {
+		t.Fatalf("step 2 (confirm) → 200 ok, got %d %s", w2.Code, w2.Body.String())
+	}
+	if n := atomic.LoadInt32(&writebacks); n != 1 {
+		t.Fatalf("step 2 should write exactly once, got %d", n)
+	}
+	if ex.forgotN != 1 {
+		t.Fatalf("step 2 should Forget on success, got %d", ex.forgotN)
 	}
 }
 
@@ -158,11 +231,66 @@ func TestPoolLogin_SessionConsumedOnce(t *testing.T) {
 	h.client = master.Client()
 
 	_ = doJSON(h.authorizeURL, `{"provider":"claude","credential_id":"c1"}`)
-	if w := doJSON(h.submitCode, `{"session_id":"sess-1","code":"x"}`); w.Code != http.StatusOK {
+	if w := doJSON(h.submitCode, `{"session_id":"sess-1","code":"x","confirm":true}`); w.Code != http.StatusOK {
 		t.Fatalf("first submit: %d", w.Code)
 	}
 	// replay → session gone → 400.
-	if w := doJSON(h.submitCode, `{"session_id":"sess-1","code":"x"}`); w.Code != http.StatusBadRequest {
+	if w := doJSON(h.submitCode, `{"session_id":"sess-1","code":"x","confirm":true}`); w.Code != http.StatusBadRequest {
 		t.Fatalf("replay should be rejected, got %d", w.Code)
+	}
+	// success cleared the cached token via Forget (so it doesn't linger in memory).
+	if ex.forgotN != 1 || ex.forgotSess != "sess-1" || ex.forgotAcct != "a" {
+		t.Fatalf("Forget(sess-1,a) expected once on success, got n=%d sess=%q acct=%q", ex.forgotN, ex.forgotSess, ex.forgotAcct)
+	}
+}
+
+// TestPoolLogin_WritebackFailureKeepsSessionForRetry: the OAuth code is spent at
+// exchange, so a transient master outage during writeback must NOT waste it. The
+// handler keeps the session on WRITEBACK_FAILED; the page can re-POST the same
+// code#state and — because SubmitCode is idempotent per session — the cached token
+// is replayed and lands once master recovers. Forget runs only on the successful
+// writeback. 防退化 for the 2026-06-30 idempotent-retry design.
+func TestPoolLogin_WritebackFailureKeepsSessionForRetry(t *testing.T) {
+	fastBackoff(t) // shrink the writeback retry backoff for the test
+	var hits int32
+	master := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		// 503 for the whole first submit (all writebackMaxAttempts), then recover.
+		if atomic.AddInt32(&hits, 1) <= int32(writebackMaxAttempts) {
+			w.WriteHeader(http.StatusServiceUnavailable)
+			return
+		}
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{"status":"ok"}`))
+	}))
+	defer master.Close()
+
+	ex := &fakePoolExchanger{authURL: "u", accountID: "acc-x", access: "TOK"}
+	h := newPoolHandler(t, ex, master.URL)
+	h.client = master.Client()
+
+	_ = doJSON(h.authorizeURL, `{"provider":"claude","credential_id":"c1"}`)
+
+	// 1) master down for every attempt → WRITEBACK_FAILED, session KEPT, no Forget.
+	if w := doJSON(h.submitCode, `{"session_id":"sess-1","code":"abc#st","confirm":true}`); w.Code != http.StatusBadGateway {
+		t.Fatalf("first submit (master down) → 502, got %d %s", w.Code, w.Body.String())
+	}
+	if ex.forgotN != 0 {
+		t.Fatalf("Forget must NOT run on writeback failure (got %d)", ex.forgotN)
+	}
+
+	// 2) retry same session+code → master recovered → writeback lands, then Forget.
+	if w := doJSON(h.submitCode, `{"session_id":"sess-1","code":"abc#st","confirm":true}`); w.Code != http.StatusOK {
+		t.Fatalf("retry (master back) → 200, got %d %s", w.Code, w.Body.String())
+	}
+	if ex.submitN != 2 {
+		t.Fatalf("SubmitCode called once per submit; want 2, got %d", ex.submitN)
+	}
+	if ex.forgotN != 1 || ex.forgotSess != "sess-1" || ex.forgotAcct != "acc-x" {
+		t.Fatalf("Forget(sess-1,acc-x) expected once on success, got n=%d sess=%q acct=%q", ex.forgotN, ex.forgotSess, ex.forgotAcct)
+	}
+
+	// 3) session consumed on success → a later replay is rejected.
+	if w := doJSON(h.submitCode, `{"session_id":"sess-1","code":"abc#st","confirm":true}`); w.Code != http.StatusBadRequest {
+		t.Fatalf("post-success replay → 400, got %d", w.Code)
 	}
 }

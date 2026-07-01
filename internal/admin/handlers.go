@@ -90,6 +90,23 @@ type Handler struct {
 	// (re-send WAL-present gaps, confirm WAL-absent gaps lost now). nil → 503.
 	AuditStatusFn   func() *events.AuditStatus
 	ReconcileGapsFn func(ctx context.Context) (events.ReconcileResult, error)
+
+	// GetUpstreamProxyFn / SetUpstreamProxyFn back the GET/PUT /admin/upstream-proxy
+	// endpoints that the local web "Settings → Upstream proxy" card relays to. Get
+	// returns the live egress proxy URL ("" = direct); Set persists it to
+	// aikey-user.yaml and HOT-SWAPS the running transport + impersonate client (no
+	// restart). nil → 503 (endpoint disabled — e.g. cluster node). See
+	// config.PersistUpstreamProxyURL + the main.go wiring.
+	GetUpstreamProxyFn func() string
+	SetUpstreamProxyFn func(url string) error
+
+	// ProbeUpstreamProxyFn tests whether a CANDIDATE egress URL can actually carry
+	// traffic to an AI provider (built with the same buildTransport the live path
+	// uses), WITHOUT persisting it — so the web "Test connectivity" button can verify
+	// before Save. Returns (httpStatus, elapsedMs, err); err = the request never got
+	// a response (proxy unreachable / DNS / timeout). Any HTTP status = reachable.
+	// nil → 503.
+	ProbeUpstreamProxyFn func(url string) (status int, elapsedMs int64, err error)
 }
 
 // KeyCheckTarget holds decrypted credentials for one provider, used by GET /health/keys.

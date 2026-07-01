@@ -292,9 +292,18 @@ func TestResolveGroup_ErrorCodes(t *testing.T) {
 	if _, err := resolveGroupCredential(&vkeys.ResolvedRoute{SeatID: "s", GroupAccounts: "", GroupRuntime: "{}"}, key, 1, nil, ""); !isGroupErr(err, groupErrNoCandidates) {
 		t.Fatalf("want NO_CANDIDATES, got %v", err)
 	}
-	// Candidates present but no material delivered.
+	// Candidates present but no material pulled yet ("" = poll not landed) → NO_MATERIAL
+	// (transient, retry helps).
 	if _, err := resolveGroupCredential(&vkeys.ResolvedRoute{SeatID: "s", GroupAccounts: mustJSON(t, refs), GroupRuntime: ""}, key, 1, nil, ""); !isGroupErr(err, groupErrNoMaterial) {
-		t.Fatalf("want NO_MATERIAL, got %v", err)
+		t.Fatalf("want NO_MATERIAL for unpulled material, got %v", err)
+	}
+	// 2026-06-30: candidates present (STALE snapshot) but material explicitly "{}" —
+	// the proxy polled and this seat's group delivered NO accounts (member removed /
+	// unbound, or empty group). Must be NO_CANDIDATES ("contact admin, won't self-
+	// resolve"), NOT NO_MATERIAL ("still syncing, retry") — retrying never helps a
+	// removed member. This is the fix for the "still syncing forever" report.
+	if _, err := resolveGroupCredential(&vkeys.ResolvedRoute{SeatID: "s", GroupAccounts: mustJSON(t, refs), GroupRuntime: "{}"}, key, 1, nil, ""); !isGroupErr(err, groupErrNoCandidates) {
+		t.Fatalf("want NO_CANDIDATES for pulled-but-empty material, got %v", err)
 	}
 	// Material present but the only candidate is expired → all unusable.
 	mat := map[string]vkeys.GroupRuntimeAccount{

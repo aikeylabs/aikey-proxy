@@ -211,6 +211,60 @@ func TestGroupServe_NoMaterialDegrades503(t *testing.T) {
 	}
 }
 
+// ① login-prompt producer verification (2026-06-30): a member who has NOT logged
+// into the routed pool account (master delivered the account with needs_login=true,
+// so group_runtime carries the marker — NON-empty) must get a structured 401
+// OAUTH_GROUP_MEMBER_LOGIN_REQUIRED, NOT the 503 "still syncing" degrade. This is the
+// user-facing side of the login flow: claude surfaces the proxy's error message, so
+// this 401 body IS the "please sign in" prompt. Pairs with the resolver-level
+// TestResolveGroup_LoginRequiredNoSkip. Distinguishes login-needed (marker present)
+// from not-synced (empty material → TestGroupServe_NoMaterialDegrades503).
+func TestGroupServe_LoginRequiredReturns401(t *testing.T) {
+	key := grKey()
+	refs := []vkeys.GroupAccountRef{{AccountID: "acc-1", ProviderCode: "anthropic"}}
+	mat := map[string]vkeys.GroupRuntimeAccount{
+		// needs_login marker carries NO secret — master delivered the account as
+		// "member not logged in" (this is what makes material non-empty, so the
+		// resolver reaches candNeedsLogin instead of bailing on NO_MATERIAL).
+		"acc-1": {CredentialType: "oauth_account", NeedsLogin: true},
+	}
+	route := &vkeys.ResolvedRoute{
+		VirtualKeyID: "vk-grp", Provider: "anthropic", ProtocolType: "anthropic",
+		ProviderCode: "anthropic", RouteSource: "team",
+		SeatID: "seat-1", OauthGroupID: "grp-1",
+		GroupAccounts: mustJSON(t, refs), GroupRuntime: mustJSON(t, mat),
+	}
+	p, tr := setupGroupProxy(t, key, route)
+
+	req, w := groupReq(groupBody)
+	p.Handle(w, req)
+
+	if w.Code != http.StatusUnauthorized {
+		t.Fatalf("not-logged-in routed account must return 401 login prompt, got %d body=%s", w.Code, w.Body.String())
+	}
+	if got := w.Header().Get(HeaderAikeyErrorSource); got != groupErrLoginRequired {
+		t.Fatalf("X-Aikey-Error-Source=%q want %q", got, groupErrLoginRequired)
+	}
+	body := w.Body.String()
+	if !strings.Contains(body, groupErrLoginRequired) {
+		t.Fatalf("body must carry the login-required code so the client can act: %s", body)
+	}
+	if !strings.Contains(body, "acc-1") {
+		t.Fatalf("body must name the account to log into: %s", body)
+	}
+	if !strings.Contains(body, "sign-in") {
+		t.Fatalf("body must carry the human sign-in prompt claude will display: %s", body)
+	}
+	// Must NOT be mistaken for the transient "still syncing" degrade, and must not
+	// reach upstream (the request is halted pending login).
+	if strings.Contains(body, "GROUP_NO_MATERIAL") {
+		t.Fatalf("login-required must NOT be a NO_MATERIAL degrade: %s", body)
+	}
+	if tr.host != "" {
+		t.Fatalf("login-required must not reach upstream, dialed %q", tr.host)
+	}
+}
+
 // Transparent proxy (2026-06-29): after AccountPersona removal, an oauth_group
 // pool request forwards the REAL client identity (session/OS) upstream UNCHANGED
 // — no per-account synthetic device/session. Guards against re-introducing the

@@ -376,7 +376,7 @@ func (p *Proxy) serveRoute(w http.ResponseWriter, r *http.Request, route *vkeys.
 	// Streaming: keep the client context. When the client disconnects the
 	// upstream TCP connection is released so the provider stops generation
 	// and stops billing. Partial token usage is still recorded by the drainer.
-	inner := p.transport
+	inner := p.currentTransport()
 	if inner == nil {
 		inner = http.DefaultTransport
 		logger.Debug("using default transport (no custom transport set)")
