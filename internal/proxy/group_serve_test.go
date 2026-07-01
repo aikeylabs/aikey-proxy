@@ -211,6 +211,74 @@ func TestGroupServe_NoMaterialDegrades503(t *testing.T) {
 	}
 }
 
+// ③ status-code mapping (2026-07-01): the Anthropic SDK retries 5xx/429 with backoff,
+// so a PERMANENT failure sent as 503 makes claude hang for minutes. Permanent codes
+// must be non-retryable 4xx (fail fast); only genuinely transient ones stay 503.
+func TestGroupDegradeStatus(t *testing.T) {
+	cases := []struct {
+		code       string
+		wantStatus int
+	}{
+		{groupErrNoCandidates, http.StatusForbidden},        // permanent (removed / empty) → fail fast
+		{groupErrAllUnusable, http.StatusTooManyRequests},   // rate-limited → 429 (honest)
+		{groupErrNoMaterial, http.StatusServiceUnavailable}, // transient sync → retry
+		{"SOME_OTHER_CODE", http.StatusServiceUnavailable},  // default transient
+	}
+	for _, c := range cases {
+		got, _ := groupDegradeStatus(c.code)
+		if got != c.wantStatus {
+			t.Errorf("groupDegradeStatus(%s)=%d want %d", c.code, got, c.wantStatus)
+		}
+	}
+	// The permanent code must NOT be a retryable 5xx (that's the whole bug).
+	if s, _ := groupDegradeStatus(groupErrNoCandidates); s >= 500 {
+		t.Errorf("NO_CANDIDATES must be a non-retryable 4xx, got %d (5xx → claude backoff-hang)", s)
+	}
+}
+
+// ② removed-member message fix (2026-06-30): a seat REMOVED from the group gets an
+// empty channel-③ delivery — the proxy wipes group_runtime to "{}". The candidate
+// snapshot (group_accounts) may still be STALE with entries. This must surface the
+// "no available account — contact admin, won't self-resolve" message (NO_CANDIDATES),
+// NOT the misleading "credentials still syncing, retry shortly" (NO_MATERIAL) that
+// told a removed member to retry forever.
+func TestGroupServe_RemovedMemberEmptyMaterialNotSyncing(t *testing.T) {
+	key := grKey()
+	// Stale snapshot still lists a candidate; material was wiped to "{}".
+	refs := []vkeys.GroupAccountRef{{AccountID: "acc-1", ProviderCode: "anthropic"}}
+	route := &vkeys.ResolvedRoute{
+		VirtualKeyID: "vk-grp", Provider: "anthropic", ProtocolType: "anthropic",
+		ProviderCode: "anthropic", RouteSource: "team",
+		SeatID: "seat-1", OauthGroupID: "grp-1",
+		GroupAccounts: mustJSON(t, refs), GroupRuntime: "{}", // pulled → delivered nothing
+	}
+	p, tr := setupGroupProxy(t, key, route)
+
+	req, w := groupReq(groupBody)
+	p.Handle(w, req)
+
+	body := w.Body.String()
+	// ③ (2026-07-01): a PERMANENT failure must be a NON-retryable 4xx (403), NOT 503.
+	// A 503 makes the Anthropic SDK retry with exponential backoff → claude hangs for
+	// minutes on a condition that can never succeed (the reported bug), and renders a
+	// contradictory "server-side issue, try again" suffix. 403 = fail fast.
+	if w.Code != http.StatusForbidden {
+		t.Fatalf("removed member (permanent NO_CANDIDATES) must be 403 fail-fast, not %d (503 → claude retry-hang)", w.Code)
+	}
+	if strings.Contains(body, "GROUP_NO_MATERIAL") || strings.Contains(strings.ToLower(body), "still syncing") {
+		t.Fatalf("removed member must NOT get the transient 'still syncing' message: %s", body)
+	}
+	if !strings.Contains(body, "GROUP_NO_CANDIDATES") {
+		t.Fatalf("removed member (empty material) must degrade as NO_CANDIDATES: %s", body)
+	}
+	if strings.Contains(strings.ToLower(body), "retry") {
+		t.Fatalf("removed member must not be told to retry (won't self-resolve): %s", body)
+	}
+	if tr.host != "" {
+		t.Fatalf("degraded request must NOT reach upstream, dialed %q", tr.host)
+	}
+}
+
 // ① login-prompt producer verification (2026-06-30): a member who has NOT logged
 // into the routed pool account (master delivered the account with needs_login=true,
 // so group_runtime carries the marker — NON-empty) must get a structured 401
@@ -304,7 +372,7 @@ func TestGroupServe_PoolPassesRealIdentity(t *testing.T) {
 }
 
 // N8c: a pool account whose upstream returns 401 is cooled down, and a later
-// request routes around it (here the only candidate → GROUP_ALL_UNUSABLE 503).
+// request routes around it (here the only candidate → GROUP_ALL_UNUSABLE 429).
 func TestGroupServe_CooldownOn401(t *testing.T) {
 	key := grKey()
 	refs := []vkeys.GroupAccountRef{{AccountID: "acc-1", ProviderCode: "anthropic"}}
@@ -335,8 +403,10 @@ func TestGroupServe_CooldownOn401(t *testing.T) {
 	tr.status = 0
 	req2, w2 := groupReq(groupBody)
 	p.Handle(w2, req2)
-	if w2.Code != http.StatusServiceUnavailable || !strings.Contains(w2.Body.String(), "GROUP_ALL_UNUSABLE") {
-		t.Fatalf("cooled-down sole account must yield GROUP_ALL_UNUSABLE 503, got %d: %s", w2.Code, w2.Body.String())
+	// ALL_UNUSABLE = a genuine rate-limit (recovers when the window resets) → 429,
+	// not 503: honest code, and it's the client's call whether to back off + retry.
+	if w2.Code != http.StatusTooManyRequests || !strings.Contains(w2.Body.String(), "GROUP_ALL_UNUSABLE") {
+		t.Fatalf("cooled-down sole account must yield GROUP_ALL_UNUSABLE 429, got %d: %s", w2.Code, w2.Body.String())
 	}
 }
 

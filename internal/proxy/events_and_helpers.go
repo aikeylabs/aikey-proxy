@@ -57,6 +57,16 @@ func (p *Proxy) buildBaseEvent(req *http.Request, resp *http.Response, startTime
 		// 极端兜底:ResolvedRoute 没填 ProviderCode 时退回 URL-form,避免空字符串
 		provider = route.Provider
 	}
+	// resp may be nil on an upstream-no-response path (transport error → no
+	// response object). Every caller today is inside ModifyResponse (resp non-nil),
+	// but the `if resp != nil` guard below (util reporting) proves resp is treated
+	// as nilable — so read StatusCode nil-safely too, keeping the two consistent and
+	// making buildBaseEvent safe if a future error-path caller passes nil (was a
+	// latent panic; staticcheck SA5011). 0 = "no upstream status".
+	statusCode := 0
+	if resp != nil {
+		statusCode = resp.StatusCode
+	}
 	ev := events.UsageEvent{
 		Timestamp:    startTime,
 		VirtualKeyID: route.VirtualKeyID,
@@ -68,7 +78,7 @@ func (p *Proxy) buildBaseEvent(req *http.Request, resp *http.Response, startTime
 		AccountID:   route.AccountID,
 		Provider:    provider,
 		DurationMs:  time.Since(startTime).Milliseconds(),
-		StatusCode:  resp.StatusCode,
+		StatusCode:  statusCode,
 		IsStreaming: streaming,
 		RequestPath: req.URL.Path,
 	}

@@ -237,17 +237,47 @@ func (p *Proxy) respondLoginRequired(w http.ResponseWriter, logger *slog.Logger,
 	_, _ = w.Write(body)
 }
 
+// groupDegradeStatus maps a resolver failure code to the HTTP status that gives the
+// client the RIGHT retry behavior (2026-07-01). The Anthropic SDK retries 5xx (and
+// 429) with exponential backoff — so a PERMANENT failure returned as 503 makes
+// `claude` HANG for minutes retrying something that can never succeed, and renders a
+// misleading "server-side issue, usually temporary — try again" suffix that
+// contradicts our own "will not resolve on its own" message. Rule: permanent → 4xx
+// (fail fast); genuinely transient → 503.
+func groupDegradeStatus(code string) (status int, errType string) {
+	switch code {
+	case groupErrNoCandidates:
+		// Permanent until an admin acts: the seat has no account in the group
+		// (removed / empty group). Retrying never helps → 403 so the client fails
+		// FAST — no backoff hang, no "try again" framing. THIS fixes the reported
+		// "no available oauth → claude hangs for minutes" bug.
+		return http.StatusForbidden, "permission_error"
+	case groupErrAllUnusable:
+		// Every candidate is rate-limited / expired — a genuine rate-limit that
+		// recovers when the upstream window resets. 429 is the honest code (the
+		// client MAY back off and retry, which is legitimate here).
+		return http.StatusTooManyRequests, "rate_limit_error"
+	default:
+		// NO_MATERIAL (channel-③ poll in flight) / group key unavailable (vault
+		// reload) → genuinely transient; retrying shortly IS the right action → 503.
+		return http.StatusServiceUnavailable, "server_error"
+	}
+}
+
 // degradeGroup fails a group request loudly (never silently routes it to a wrong
-// key). Emits a WARN with trace context + the degrade reason code, then a 503 so
-// the client retries. N8c extends this with per-candidate fallback before giving
-// up; today a resolver failure means every candidate was already unusable.
+// key). Emits a WARN with trace context + the degrade reason code, then the status
+// groupDegradeStatus picks for that code (permanent → 4xx fail-fast, transient →
+// 503). N8c extends this with per-candidate fallback before giving up; today a
+// resolver failure means every candidate was already unusable.
 func (p *Proxy) degradeGroup(w http.ResponseWriter, logger *slog.Logger, route *vkeys.ResolvedRoute, code, clientMsg string) {
 	p.errors.Add(1)
+	status, errType := groupDegradeStatus(code)
 	logger.Warn("group route degraded",
 		"event.name", observability.EventProxyGroupRouteDegraded,
 		"error.code", code,
+		"http.status", status,
 		"oauth_group_id", route.OauthGroupID,
 		"virtual_key_id", route.VirtualKeyID,
 	)
-	writeJSONError(w, http.StatusServiceUnavailable, "server_error", code, clientMsg)
+	writeJSONError(w, status, errType, code, clientMsg)
 }
