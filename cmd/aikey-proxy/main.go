@@ -388,9 +388,20 @@ func main() {
 		}
 	})
 
-	// Wait for shutdown signal.
-	sig := <-sigCh
-	slog.Info("received signal, shutting down", "signal", sig)
+	// Wait for either an OS shutdown signal OR a graceful self-restart request
+	// from the control-plane healer (selfheal.go): the proxy went stale after a
+	// host network change and confirmed master is reachable, so it wants a clean
+	// relaunch. BOTH paths run the identical drain below (code reuse); the restart
+	// path just exits non-zero afterwards so launchd/systemd relaunch it.
+	restartRequested := false
+	select {
+	case sig := <-sigCh:
+		slog.Info("received signal, shutting down", "signal", sig)
+	case <-sup.RestartRequested():
+		restartRequested = true
+		slog.Warn("control-plane self-heal: graceful restart requested — draining then relaunching",
+			"event.name", observability.EventProxyControlPlaneSelfRestart)
+	}
 
 	// Graceful shutdown: stop accepting new connections, drain active generation.
 	if err := srv.Shutdown(30 * time.Second); err != nil {
@@ -406,6 +417,13 @@ func main() {
 	if logWriter != nil {
 		logWriter.Flush(3 * time.Second)
 		_ = logWriter.Close()
+	}
+
+	// Self-restart requests exit non-zero (EX_TEMPFAIL) AFTER the graceful drain
+	// above, so the OS service manager relaunches a clean process. A plain signal
+	// shutdown returns normally (exit 0) and is NOT relaunched.
+	if restartRequested {
+		os.Exit(75)
 	}
 }
 

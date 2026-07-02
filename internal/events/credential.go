@@ -202,7 +202,7 @@ func (j *RefreshableJWT) refresh(ctx context.Context) (string, time.Time, error)
 
 	client := j.HTTPClient
 	if client == nil {
-		client = defaultRefreshClient
+		client = defaultRefreshClient.Get()
 	}
 	resp, err := client.Do(req)
 	if err != nil {
@@ -239,4 +239,4 @@ func (j *RefreshableJWT) refresh(ctx context.Context) (string, time.Time, error)
 // hot path of every upload right at the edge of the access token's
 // validity window — a stuck refresh would block uploads. 10s is the
 // same shape as the reporter's batch-upload client.
-var defaultRefreshClient = httpx.NewDirectClient(10 * time.Second)
+var defaultRefreshClient = httpx.NewSwappableDirect(10 * time.Second)

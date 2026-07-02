@@ -28,6 +28,7 @@ import (
 
 	"github.com/AiKeyLabs/aikey-proxy/internal/events"
 	"github.com/AiKeyLabs/aikey-proxy/internal/httpx"
+	"github.com/AiKeyLabs/aikey-proxy/internal/observability"
 	"github.com/AiKeyLabs/aikey-proxy/internal/vault"
 	"github.com/AiKeyLabs/aikey-proxy/internal/vkeys"
 	"github.com/AiKeyLabs/pkg/seatassign"
@@ -174,7 +175,19 @@ type grAccount struct {
 // AES-GCM encrypted with the vault key; nonce + ciphertext are base64 in the
 // JSON. N8 base64-decodes + vault.Decrypt.
 
-var groupRuntimeHTTPClient = defaultGroupRuntimeClient()
+// groupRuntimeSwap is the group-runtime + member-token-writeback control-plane
+// client, registered in the CENTRAL self-heal registry (internal/httpx). A host
+// network change stalls long-lived direct clients with no-route errors (see
+// selfheal.go); httpx.RebuildAllControlPlane() then installs a FRESH client (new
+// dialer + empty pool) for THIS rail and every other control-plane rail at once.
+// Both the poll (fetchGroupRuntime) and the writeback read the LIVE client via
+// groupRuntimeClient(). WHY a whole new client rather than CloseIdleConnections():
+// closing idle conns alone does NOT reliably clear the stale post-network-change
+// state (golang/go#23427); a fresh Transport is the reliable reset.
+var groupRuntimeSwap = httpx.NewSwappable(defaultGroupRuntimeClient)
+
+// groupRuntimeClient returns the live (swappable) control-plane HTTP client.
+func groupRuntimeClient() *http.Client { return groupRuntimeSwap.Get() }
 
 // fetchGroupRuntime GETs the account-level group-runtime endpoint with an
 // account-JWT Bearer. Returns (groups, rawBody, ok); ok=false on any error so the
@@ -198,10 +211,30 @@ func fetchGroupRuntime(ctx context.Context, masterURL, bearer string, observedRe
 			req.Header.Set(observedResetsHeader, base64.StdEncoding.EncodeToString(b))
 		}
 	}
-	resp, err := groupRuntimeHTTPClient.Do(req)
+	resp, err := groupRuntimeClient().Do(req)
 	if err != nil {
+		// Self-heal (2026-07-01): a host network change can stall the long-lived
+		// client with a routing-layer error while master is perfectly reachable
+		// from a fresh process. The poll is the steady 60s heartbeat that drives
+		// recovery: Tier1 rebuilds the client, and after `threshold` consecutive
+		// stuck cycles (with master confirmed reachable) escalates to a guarded
+		// self-restart. Non-net-change errors (master 5xx, timeout) don't touch
+		// the healer — they aren't a routing-stale symptom.
+		if isNetChangeDialErr(err) {
+			if d := controlPlaneHeal.onPollNetChange(masterURL); d == restartSkipBreaker {
+				slog.Error("control-plane stuck reaching master after network change; restart budget exhausted — manual `aikey proxy restart` may be needed",
+					"event.name", observability.EventProxyControlPlaneRestartExhausted, "error", err.Error())
+			} else {
+				slog.Warn("control-plane client rebuilt after network-change dial error",
+					"event.name", observability.EventProxyControlPlaneClientRebuilt, "caller", "group_runtime_poll",
+					"error", err.Error())
+			}
+		}
 		return nil, "", false
 	}
+	// Reached master (any HTTP response proves the routing path is alive) → clear
+	// the net-change stuck counter so a later transient can't ride an old tally.
+	controlPlaneHeal.onPollOK()
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
 		return nil, "", false

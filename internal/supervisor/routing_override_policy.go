@@ -29,7 +29,7 @@ import (
 
 const routingOverridePollInterval = 60 * time.Second
 
-var routingOverrideHTTPClient = httpx.NewDirectClient(10 * time.Second)
+var routingOverrideHTTPClient = httpx.NewSwappableDirect(10 * time.Second)
 
 // pollRoutingOverrides runs until ctx is canceled, pulling the account's routing
 // overrides every routingOverridePollInterval (plus once at start). No-op unless
@@ -127,7 +127,7 @@ func fetchRoutingOverrides(ctx context.Context, masterURL, bearer string) (int64
 		return 0, nil, nil, false
 	}
 	req.Header.Set("Authorization", "Bearer "+bearer)
-	resp, err := routingOverrideHTTPClient.Do(req)
+	resp, err := routingOverrideHTTPClient.Get().Do(req)
 	if err != nil {
 		return 0, nil, nil, false
 	}

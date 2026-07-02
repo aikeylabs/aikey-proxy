@@ -66,14 +66,18 @@ type contentBatchResponse struct {
 // (org,event_id) dedup absorbs the overlap). Terminal (4xx) drops the batch
 // (advances sentSeq, no retry) — the gap is server-detectable via source_seq.
 type ContentReporter struct {
-	nextUploadAttempt   time.Time
-	lastOKUploadAt      time.Time
-	wal                 *ContentWAL
-	sentSeq             map[string]int64
-	confirmedSeq        map[string]int64
-	signal              chan struct{}
-	done                chan struct{}
-	cfg                 ContentReporterConfig
+	nextUploadAttempt time.Time
+	lastOKUploadAt    time.Time
+	wal               *ContentWAL
+	sentSeq           map[string]int64
+	confirmedSeq      map[string]int64
+	signal            chan struct{}
+	done              chan struct{}
+	cfg               ContentReporterConfig
+	// client is the swappable control-plane→collector client. An injected
+	// cfg.HTTPClient is wrapped fixed (not globally rebuilt); the default is
+	// registered so a host network change rebuilds it (self-heal registry).
+	client              *httpx.SwappableClient
 	wg                  sync.WaitGroup
 	consecutiveFailures int
 	mu                  sync.Mutex
@@ -89,11 +93,17 @@ func NewContentReporter(in *ContentReporterConfig, wal *ContentWAL) *ContentRepo
 	if cfg.BatchSize <= 0 {
 		cfg.BatchSize = 100
 	}
-	if cfg.HTTPClient == nil {
-		cfg.HTTPClient = httpx.NewDirectClient(30 * time.Second)
+	// Registered swappable for the default client (rebuilt on network change);
+	// an injected client is honored as-is (fixed, not registered).
+	var client *httpx.SwappableClient
+	if cfg.HTTPClient != nil {
+		client = httpx.NewSwappableFixed(cfg.HTTPClient)
+	} else {
+		client = httpx.NewSwappableDirect(30 * time.Second)
 	}
 	return &ContentReporter{
 		cfg:          cfg,
+		client:       client,
 		wal:          wal,
 		sentSeq:      make(map[string]int64),
 		confirmedSeq: make(map[string]int64),
@@ -333,7 +343,7 @@ func (r *ContentReporter) doUpload(body []byte) (*contentBatchResponse, int, err
 	} else if r.cfg.CollectorToken != "" {
 		httpReq.Header.Set("Authorization", "Bearer "+r.cfg.CollectorToken)
 	}
-	httpResp, err := r.cfg.HTTPClient.Do(httpReq)
+	httpResp, err := r.client.Get().Do(httpReq)
 	if err != nil {
 		return nil, 0, err // transport → retryable
 	}

@@ -37,7 +37,7 @@ func TestPostMemberToken_PostsToMasterWithBearer(t *testing.T) {
 	defer srv.Close()
 
 	wb := memberTokenWriteback{CredentialID: "c1", AccessToken: "tok", RefreshToken: "rt", ExpiresAt: 100, ExternalID: "uuid-1"}
-	if err := postMemberToken(context.Background(), srv.Client(), srv.URL, "JWT123", wb); err != nil {
+	if err := postMemberToken(context.Background(), func() *http.Client { return srv.Client() }, srv.URL, "JWT123", wb); err != nil {
 		t.Fatalf("postMemberToken: %v", err)
 	}
 	if gotPath != "/accounts/me/oauth-member-token" {
@@ -63,7 +63,7 @@ func TestPostMemberToken_Non2xxSurfaces(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	err := postMemberToken(context.Background(), srv.Client(), srv.URL, "JWT", memberTokenWriteback{CredentialID: "c1", AccessToken: "t"})
+	err := postMemberToken(context.Background(), func() *http.Client { return srv.Client() }, srv.URL, "JWT", memberTokenWriteback{CredentialID: "c1", AccessToken: "t"})
 	if err == nil {
 		t.Fatal("non-2xx master response must surface as an error")
 	}
@@ -85,7 +85,7 @@ func TestPostMemberToken_RetriesTransient5xxThenSucceeds(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	if err := postMemberToken(context.Background(), srv.Client(), srv.URL, "JWT", memberTokenWriteback{CredentialID: "c1", AccessToken: "t"}); err != nil {
+	if err := postMemberToken(context.Background(), func() *http.Client { return srv.Client() }, srv.URL, "JWT", memberTokenWriteback{CredentialID: "c1", AccessToken: "t"}); err != nil {
 		t.Fatalf("expected success after transient 5xx, got: %v", err)
 	}
 	if got := atomic.LoadInt32(&hits); got != 3 {
@@ -104,7 +104,7 @@ func TestPostMemberToken_4xxFailsFastNoRetry(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	if err := postMemberToken(context.Background(), srv.Client(), srv.URL, "JWT", memberTokenWriteback{CredentialID: "c1", AccessToken: "t"}); err == nil {
+	if err := postMemberToken(context.Background(), func() *http.Client { return srv.Client() }, srv.URL, "JWT", memberTokenWriteback{CredentialID: "c1", AccessToken: "t"}); err == nil {
 		t.Fatal("4xx must surface as an error")
 	}
 	if got := atomic.LoadInt32(&hits); got != 1 {
@@ -123,7 +123,7 @@ func TestPostMemberToken_ExhaustsRetriesOnPersistent5xx(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	if err := postMemberToken(context.Background(), srv.Client(), srv.URL, "JWT", memberTokenWriteback{CredentialID: "c1", AccessToken: "t"}); err == nil {
+	if err := postMemberToken(context.Background(), func() *http.Client { return srv.Client() }, srv.URL, "JWT", memberTokenWriteback{CredentialID: "c1", AccessToken: "t"}); err == nil {
 		t.Fatal("persistent 5xx must surface as an error after exhausting retries")
 	}
 	if got := atomic.LoadInt32(&hits); got != writebackMaxAttempts {

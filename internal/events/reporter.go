@@ -132,13 +132,13 @@ type Reporter struct {
 	wal                 *WALWriter
 	done                chan struct{}
 	// delivery-integrity cursors (memory only; see type doc). Guarded by mu.
-	sentSeq             map[string]int64  // source_id → highest seq handed to upload
-	confirmedSeq        map[string]int64  // source_id → server contiguous high-water
-	seenV1              map[string]bool   // event_id → uploaded; A1 one-shot for v1 entries
-	signal              chan struct{}     // cap-1 wakeup poke from Report → uploadLoop
-	dlw                 *deadLetterWriter // dead letter writer for terminal failures
-	client              *http.Client
-	lastUploadStatus    string // "ok" | "retryable_failed" | "terminal_failed"
+	sentSeq             map[string]int64       // source_id → highest seq handed to upload
+	confirmedSeq        map[string]int64       // source_id → server contiguous high-water
+	seenV1              map[string]bool        // event_id → uploaded; A1 one-shot for v1 entries
+	signal              chan struct{}          // cap-1 wakeup poke from Report → uploadLoop
+	dlw                 *deadLetterWriter      // dead letter writer for terminal failures
+	client              *httpx.SwappableClient // control-plane→collector: rebuilt on host network change (self-heal registry)
+	lastUploadStatus    string                 // "ok" | "retryable_failed" | "terminal_failed"
 	cfg                 ReporterConfig
 	wg                  sync.WaitGroup
 	consecutiveFailures int
@@ -212,7 +212,7 @@ func NewReporter(in *ReporterConfig) (*Reporter, error) {
 		dlw:          dlw,
 		signal:       make(chan struct{}, 1),
 		done:         make(chan struct{}),
-		client:       httpx.NewDirectClient(30 * time.Second),
+		client:       httpx.NewSwappableDirect(30 * time.Second),
 		sentSeq:      make(map[string]int64),
 		confirmedSeq: make(map[string]int64),
 		seenV1:       make(map[string]bool),
@@ -876,7 +876,7 @@ func (r *Reporter) doUpload(url string, body []byte, cred Credential) (*batchRes
 		}
 	}
 
-	resp, err := r.client.Do(httpReq)
+	resp, err := r.client.Get().Do(httpReq)
 	if err != nil {
 		return nil, &uploadError{Err: fmt.Errorf("http: %w", err)}
 	}

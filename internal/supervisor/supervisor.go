@@ -443,6 +443,14 @@ func New(cfg *config.Config, configPath, password, version string) (*Supervisor,
 	// data path.
 	observability.GoSafe("supervisor.group_runtime_poll", observability.Isolated, func() { s.pollGroupRuntime(s.ctx) })
 
+	// Control-plane self-heal, Stage 2 (2026-07-01): proactively rebuild the
+	// control-plane client the moment the host's network changes (WiFi switch /
+	// tether / interface up-down), so control-plane calls to master dial clean
+	// without waiting for a failure. Dependency-free (net.Interfaces fingerprint).
+	// Isolated + cheap: a 20s poll; a panic here must never touch the data path.
+	// See netmon.go / selfheal.go.
+	observability.GoSafe("supervisor.net_change_monitor", observability.Isolated, func() { runNetChangeMonitor(s.ctx) })
+
 	// I-side §6.5: pull the allocation engine's seat→account routing overrides on
 	// the same master-poll rail, so the engine's redirect of a seat off an unhealthy
 	// account reaches this node without any CLI command. No-op unless oauth-group

@@ -26,6 +26,16 @@ const (
 	EventProxyGenerationDrainTimeout = "proxy.generation.drain_timeout"
 )
 
+// Control-plane self-heal events (2026-07-01): recovery from a host network
+// change that leaves the long-lived control-plane client stalled with no-route
+// errors to master. See supervisor/selfheal.go + netmon.go.
+const (
+	EventProxyControlPlaneClientRebuilt    = "proxy.control_plane.client_rebuilt"
+	EventProxyControlPlaneNetChange        = "proxy.control_plane.net_change_detected"
+	EventProxyControlPlaneSelfRestart      = "proxy.control_plane.self_restart"
+	EventProxyControlPlaneRestartExhausted = "proxy.control_plane.restart_budget_exhausted"
+)
+
 // Health events.
 const (
 	EventProxyHealthOk        = "proxy.health.ok"

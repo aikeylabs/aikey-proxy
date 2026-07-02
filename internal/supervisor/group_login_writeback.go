@@ -21,6 +21,9 @@ import (
 	"log/slog"
 	"net/http"
 	"time"
+
+	"github.com/AiKeyLabs/aikey-proxy/internal/httpx"
+	"github.com/AiKeyLabs/aikey-proxy/internal/observability"
 )
 
 // memberTokenWriteback is the RW10 request body (mirrors api.MemberTokenHandler).
@@ -55,8 +58,10 @@ const (
 var writebackBaseBackoff = 500 * time.Millisecond
 
 // postMemberToken POSTs the freshly-exchanged per-member token to master's RW10
-// endpoint with the team account-JWT Bearer. client is injected for testability
-// (production passes groupRuntimeHTTPClient).
+// endpoint with the team account-JWT Bearer. clientFn is injected for testability
+// and is RE-RESOLVED every attempt (production passes groupRuntimeClient, the
+// live swappable accessor) so a client rebuilt mid-retry takes effect on the
+// next try.
 //
 // RETRY (2026-06-30): the OAuth exchange already CONSUMED the one-shot auth code,
 // so a TRANSIENT master blip (the VM restarting → "no route to host", or a 5xx
@@ -64,7 +69,14 @@ var writebackBaseBackoff = 500 * time.Millisecond
 // exponential backoff. A 4xx is PERMANENT (bad request / auth / validation):
 // retrying can't help, so we fail fast. The write is idempotent on master via the
 // (credential_id, seat) PK, so re-POSTing the same token is safe.
-func postMemberToken(ctx context.Context, client *http.Client, masterURL, bearer string, wb memberTokenWriteback) error {
+//
+// SELF-HEAL (2026-07-01): a routing-layer dial error (no-route/EHOSTUNREACH) can
+// mean the long-lived client went stale after a host network change while master
+// is actually reachable. We rebuild the shared client mid-retry so subsequent
+// attempts (and later polls) dial clean instead of burning all 6 tries on a dead
+// transport. The guarded self-restart backstop (selfheal.go) covers the case
+// where even a rebuilt in-process client stays stuck.
+func postMemberToken(ctx context.Context, clientFn func() *http.Client, masterURL, bearer string, wb memberTokenWriteback) error {
 	body, err := json.Marshal(wb)
 	if err != nil {
 		return err
@@ -72,7 +84,7 @@ func postMemberToken(ctx context.Context, client *http.Client, masterURL, bearer
 	backoff := writebackBaseBackoff
 	var lastErr error
 	for attempt := 1; attempt <= writebackMaxAttempts; attempt++ {
-		status, err := writeMemberTokenOnce(ctx, client, masterURL, bearer, body)
+		status, err := writeMemberTokenOnce(ctx, clientFn(), masterURL, bearer, body)
 		if err == nil {
 			return nil
 		}
@@ -80,6 +92,14 @@ func postMemberToken(ctx context.Context, client *http.Client, masterURL, bearer
 		// Permanent client error (4xx) — retrying won't help; surface immediately.
 		if status >= 400 && status < 500 {
 			return err
+		}
+		// Network-change dial error → swap in a fresh control-plane client so the
+		// NEXT clientFn() call dials clean (WARN, not silent — logging-conventions).
+		if isNetChangeDialErr(err) {
+			slog.Warn("control-plane client rebuilt after network-change dial error",
+				"event.name", observability.EventProxyControlPlaneClientRebuilt, "caller", "member_token_writeback",
+				"credential_id", wb.CredentialID, "error", err.Error())
+			httpx.RebuildAllControlPlane()
 		}
 		if attempt == writebackMaxAttempts {
 			break

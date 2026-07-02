@@ -80,7 +80,7 @@ type rateLimitSample struct {
 type signalReporter struct {
 	url       string
 	bearer    func(ctx context.Context) (string, error) // account-JWT (reuses the group-runtime poll credential)
-	client    *http.Client
+	client    *httpx.SwappableClient                    // control-plane: rebuilt on host network change (self-heal registry)
 	in        chan signalSample
 	revokedIn chan revokedSample
 	rlMu      sync.Mutex     // guards rlCounts
@@ -115,7 +115,7 @@ func newSignalReporter(controlURL string, bearer func(context.Context) (string, 
 	r := &signalReporter{
 		url:       strings.TrimRight(controlURL, "/") + "/accounts/me/signals",
 		bearer:    bearer,
-		client:    httpx.NewDirectClient(10 * time.Second),
+		client:    httpx.NewSwappableDirect(10 * time.Second),
 		in:        make(chan signalSample, 256),
 		revokedIn: make(chan revokedSample, 64),
 		rlCounts:  make(map[string]int),
@@ -358,7 +358,7 @@ func (r *signalReporter) post(samples []signalSample, revoked []revokedSample, r
 	}
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Authorization", "Bearer "+tok)
-	resp, err := r.client.Do(req)
+	resp, err := r.client.Get().Do(req)
 	if err != nil {
 		r.logger.Warn("signal report upload failed",
 			"event.name", "proxy.signal.upload_failed", "error", err)

@@ -36,7 +36,7 @@ import (
 
 const quotaPollInterval = 60 * time.Second
 
-var quotaHTTPClient = httpx.NewDirectClient(10 * time.Second)
+var quotaHTTPClient = httpx.NewSwappableDirect(10 * time.Second)
 
 // pollQuotaPolicy runs until ctx is canceled, refreshing the org quota policy
 // every quotaPollInterval (plus once immediately).
@@ -115,7 +115,7 @@ func fetchQuotaPolicy(ctx context.Context, masterURL, orgID string, seats []stri
 	if err != nil {
 		return nil, "", false
 	}
-	resp, err := quotaHTTPClient.Do(req)
+	resp, err := quotaHTTPClient.Get().Do(req)
 	if err != nil {
 		return nil, "", false
 	}

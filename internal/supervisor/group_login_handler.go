@@ -200,7 +200,7 @@ func (h *poolLoginHandler) submitCode(w http.ResponseWriter, r *http.Request) {
 		poolErr(w, http.StatusServiceUnavailable, "NO_MASTER_URL", "control-panel URL not configured")
 		return
 	}
-	if err := postMemberToken(r.Context(), h.client, masterURL, bearer, memberTokenWriteback{
+	if err := postMemberToken(r.Context(), h.writebackClientFn(), masterURL, bearer, memberTokenWriteback{
 		CredentialID: credentialID, AccessToken: access, RefreshToken: refresh, ExpiresAt: exp, ExternalID: externalID,
 	}); err != nil {
 		// DELIBERATELY keep the session (do NOT delete here): the code was already
@@ -260,8 +260,22 @@ func (s *Supervisor) NewPoolLoginHandler() *poolLoginHandler {
 		ex:        &brokerPoolExchanger{brk: brk, memTok: memTok, memAcc: memAcc},
 		masterURL: readControlPanelURL,
 		bearer:    s.teamBearer,
-		client:    groupRuntimeHTTPClient,
+		// client left nil in production ⇒ writebackClientFn() resolves the LIVE
+		// swappable groupRuntimeClient each retry, so a network-change rebuild
+		// heals the writeback. Tests inject a fixed h.client (see writebackClientFn).
 	}
+}
+
+// writebackClientFn returns the *http.Client provider postMemberToken re-resolves
+// every retry. When h.client is set (tests inject a fixed httptest client) it
+// wins; otherwise production uses the live swappable control-plane client so a
+// mid-flight rebuild (selfheal) takes effect on the next attempt.
+func (h *poolLoginHandler) writebackClientFn() func() *http.Client {
+	if h.client != nil {
+		c := h.client
+		return func() *http.Client { return c }
+	}
+	return groupRuntimeClient
 }
 
 // sweepExpiredSessions deletes login sessions older than poolSessionTTL. Called

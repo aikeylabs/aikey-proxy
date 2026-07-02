@@ -27,7 +27,7 @@ var errUnknownNode = fmt.Errorf("hub does not know this node")
 
 // Registrar keeps this proxy node registered + alive in the hub name service.
 type Registrar struct {
-	client *http.Client
+	client *httpx.SwappableClient // control-plane→hub: rebuilt on host network change (self-heal registry)
 	// healthFn, when set, supplies the optional `health` heartbeat field
 	// (P0-B): node-local health (daemon sync status + proxy metrics) rides
 	// the existing heartbeat so it becomes externally visible with zero new
@@ -53,7 +53,7 @@ func NewRegistrar(hubURL, nodeID, nodeAddr string, weight int, serviceToken stri
 		nodeAddr:     nodeAddr,
 		weight:       weight,
 		serviceToken: serviceToken,
-		client:       httpx.NewDirectClient(5 * time.Second),
+		client:       httpx.NewSwappableDirect(5 * time.Second),
 		interval:     defaultHeartbeatInterval,
 	}
 }
@@ -125,7 +125,7 @@ func (r *Registrar) post(ctx context.Context, path string, body []byte) (*http.R
 	if r.serviceToken != "" {
 		req.Header.Set("Authorization", "Bearer "+r.serviceToken)
 	}
-	return r.client.Do(req)
+	return r.client.Get().Do(req)
 }
 
 // Run registers, then heartbeats on the hub-provided interval until ctx is done.

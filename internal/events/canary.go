@@ -60,7 +60,7 @@ type CanaryResult struct {
 // CanaryProbe sends periodic synthetic events through the pipeline and verifies arrival.
 type CanaryProbe struct {
 	reporter            *Reporter
-	client              *http.Client
+	client              *httpx.SwappableClient // control-plane→diagnostics: rebuilt on host network change (self-heal registry)
 	done                chan struct{}
 	cfg                 CanaryConfig
 	lastResult          CanaryResult
@@ -99,7 +99,7 @@ func NewCanaryProbe(reporter *Reporter, cfg CanaryConfig) *CanaryProbe {
 	p := &CanaryProbe{
 		reporter: reporter,
 		cfg:      cfg,
-		client:   httpx.NewDirectClient(10 * time.Second),
+		client:   httpx.NewSwappableDirect(10 * time.Second),
 		done:     make(chan struct{}),
 	}
 
@@ -285,7 +285,7 @@ func (p *CanaryProbe) checkArrival(eventID string, sentAt time.Time, diagnostics
 		slog.Debug("canary check: request build failed", "url", url, "error", reqErr)
 		return result
 	}
-	resp, err := p.client.Do(req)
+	resp, err := p.client.Get().Do(req)
 	if err != nil {
 		// Diagnostics endpoint unreachable — deployment/network issue rather
 		// than a pipeline fault. Mark as "unavailable" (not "failed") so the
@@ -353,7 +353,7 @@ func (p *CanaryProbe) checkArrival(eventID string, sentAt time.Time, diagnostics
 			slog.Debug("canary check: query request build failed", "url", queryURL, "error", qReqErr)
 			return result
 		}
-		qResp, qErr := p.client.Do(qReq)
+		qResp, qErr := p.client.Get().Do(qReq)
 		if qErr != nil || qResp.StatusCode != http.StatusOK {
 			// Query-service unreachable or error. Don't demote the overall
 			// status to "failed" — collector side is fine. Report "partial"
