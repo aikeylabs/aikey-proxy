@@ -515,9 +515,10 @@ func TestGroupServe_DirectBindUnaffected(t *testing.T) {
 func TestGroupServe_FallbackAttributesToServedAccount(t *testing.T) {
 	key := grKey()
 	refs := []vkeys.GroupAccountRef{
-		{AccountID: "acc-1", ProviderCode: "anthropic"},
-		{AccountID: "acc-2", ProviderCode: "anthropic"},
+		{AccountID: "acc-1", ProviderCode: "anthropic", Identity: "a1@pool.test"},
+		{AccountID: "acc-2", ProviderCode: "anthropic", Identity: "a2@pool.test"},
 	}
+	identityOf := map[string]string{"acc-1": "a1@pool.test", "acc-2": "a2@pool.test"}
 	mat := map[string]vkeys.GroupRuntimeAccount{
 		"acc-1": encMat(t, key, vkeys.GroupRuntimeAccount{CredentialType: "oauth_account", ExpiresAt: 9_000_000_000, ExternalID: "uuid-1"}, "tok-1"),
 		"acc-2": encMat(t, key, vkeys.GroupRuntimeAccount{CredentialType: "oauth_account", ExpiresAt: 9_000_000_000, ExternalID: "uuid-2"}, "tok-2"),
@@ -539,6 +540,16 @@ func TestGroupServe_FallbackAttributesToServedAccount(t *testing.T) {
 	p.SetGroupKeyProvider(fakeGroupKey{k: key})
 	tr := &outboundCapture{}
 	p.SetTransport(tr)
+	// WAL capture of the REPORTED wire event (ReportableEvent) — the shape the
+	// collector → DWD → usage-audit page actually consumes.
+	walDir := t.TempDir()
+	wal, err := events.NewWALWriter(walDir)
+	if err != nil {
+		t.Fatalf("NewWALWriter: %v", err)
+	}
+	t.Cleanup(func() { _ = wal.Close() })
+	p.SetWAL(wal)
+	p.SetReporter(nil, "proxy-grp", "test", "gen-grp", 0, "acc-grp")
 
 	// Request 1: the primary account serves; upstream 401 cools it down.
 	tr.status = http.StatusUnauthorized
@@ -592,6 +603,21 @@ func TestGroupServe_FallbackAttributesToServedAccount(t *testing.T) {
 	// 用户归属 stable across the switch.
 	if got.VirtualKeyID != "vk-grp" {
 		t.Fatalf("user归属 must stay stable across switch: VirtualKeyID=%q want vk-grp", got.VirtualKeyID)
+	}
+	// Point-in-time audit identity (2026-07-01, usage-audit "selected account"): the
+	// REPORTED wire event (ReportableEvent → collector → DWD → usage-audit page) must
+	// carry the SERVING account's email as oauth_identity — denormalized at event time
+	// so the audit page shows who served even after rename/removal, and it must follow
+	// the switch (B's identity, not the cooled A's). 能红: drop the group_serve
+	// `rc.OAuthIdentity = res.Identity` stamp → this is "" → fails.
+	_ = wal.Close()
+	entry := readLastWALEntry(t, walDir)
+	if entry.EventJSON.OAuthIdentity != identityOf[served2] {
+		t.Fatalf("wire oauth_identity=%q want the SERVING account's identity %q (selected-account audit display)",
+			entry.EventJSON.OAuthIdentity, identityOf[served2])
+	}
+	if entry.EventJSON.AccountID != served2 {
+		t.Fatalf("wire account_id=%q want served account %q", entry.EventJSON.AccountID, served2)
 	}
 }
 

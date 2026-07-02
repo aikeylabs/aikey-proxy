@@ -87,6 +87,12 @@ func (p *Proxy) handleOauthGroupRoute(
 	rc := *route
 	rc.AccountID = res.AccountID       // usage attribution → the account actually used
 	rc.CredentialID = res.CredentialID // I5 signal reporting keyed by credential_id (T2 uplink; empty group route.CredentialID was dropping all signals)
+	// Point-in-time audit identity (2026-07-01, usage-audit "selected account" display):
+	// the SELECTED pool account's email rides the usage event as oauth_identity
+	// (reportable.go reads route.OAuthIdentity → ODS → DWD → the master usage-audit
+	// page). Denormalized ON PURPOSE: routing changes over time, so joining live
+	// tables later would misattribute history — the event must carry who served it.
+	rc.OAuthIdentity = res.Identity
 
 	// A group VK is bound to a oauth_group, NOT a single provider, so the VK-level
 	// ProviderCode is EMPTY — the provider lives per-account in group_accounts.
