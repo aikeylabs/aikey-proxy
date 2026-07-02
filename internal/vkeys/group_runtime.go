@@ -54,6 +54,14 @@ type GroupRuntimeAccount struct {
 	CredentialType   string `json:"credential_type"` // oauth_account | api_key
 	SecretNonce      string `json:"secret_nonce"`    // base64(nonce)
 	SecretCiphertext string `json:"secret_ciphertext"` // base64(enc(access_token|key))
+	// Display meta (non-secret, 2026-07-01): identity/provider_code/priority carried on
+	// the fast rail so the client's candidate LIST membership refreshes here (a fast-rail-
+	// only account renders with its email/provider, not a bare UUID) — the CLI's
+	// merge_group_accounts_live treats this map as authoritative for membership. Priority
+	// is NOT omitempty (0 is a valid priority).
+	Identity     string `json:"identity,omitempty"`
+	ProviderCode string `json:"provider_code,omitempty"`
+	Priority     int    `json:"priority"`
 	// NeedsLogin: the member has no token for this OAuth account (master said so) →
 	// the resolver returns LOGIN_REQUIRED for it. No secret when true. P1.
 	NeedsLogin bool `json:"needs_login,omitempty"`

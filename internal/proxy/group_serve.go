@@ -51,7 +51,7 @@ func (p *Proxy) handleOauthGroupRoute(
 	// local pick, which is cap-blind and would route a 4th user onto a full account.
 	// (Distinct from the 503 degrade: an actionable "pool full" state, not a
 	// transient failure.)
-	if p.routingOverrides.Blocked(route.SeatID) {
+	if p.routingOverrides.Blocked(route.SeatID, route.OauthGroupID) {
 		logger.Warn("oauth-group seat blocked: pool at per-account user cap",
 			"event.name", observability.EventProxyGroupSeatBlocked,
 			"oauth_group_id", route.OauthGroupID,
@@ -65,7 +65,7 @@ func (p *Proxy) handleOauthGroupRoute(
 	// routing override for this seat (§6.5; "" when off / no redirect) is applied
 	// inside the resolver ONLY if it's still a valid candidate — fault-isolated,
 	// falls back to the local pick on any miss.
-	override := p.routingOverrides.lookup(route.SeatID)
+	override := p.routingOverrides.lookup(route.SeatID, route.OauthGroupID)
 	res, err := resolveGroupCredential(route, p.groupKey.DerivedKey(), time.Now().Unix(), p.poolCooldown.skipSet(), override)
 	if err != nil {
 		code := observability.ErrCodeGroupKeyUnavailable

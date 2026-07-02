@@ -49,16 +49,6 @@ const (
 	groupErrLoginRequired = "OAUTH_GROUP_MEMBER_LOGIN_REQUIRED"
 )
 
-// candOutcome is the 3-way result of evaluating one candidate: usable now, skip
-// (expired/exhausted/corrupt → continue fallback), or needs-login (no member
-// token → stop + prompt, RW2/D2).
-type candOutcome int
-
-const (
-	candOK candOutcome = iota
-	candSkip
-	candNeedsLogin
-)
 
 // groupResolveError is a typed resolver failure so the caller can map a precise
 // HTTP status + error code without string matching.
@@ -150,100 +140,53 @@ func resolveGroupCredential(route *vkeys.ResolvedRoute, derivedKey []byte, nowUn
 	ordered := seatassign.Rank(route.SeatID, accounts)
 	primary := ordered[0].AccountID // rank-0; audited when the actual pick differs
 
-	// §6.5 allocation-engine routing override (I-side keystone). The engine
-	// re-ran seatassign over only the HEALTHY accounts and named the override as
-	// this seat's healthy pick. Apply it ONLY when it is STILL a valid, serving
-	// candidate in THIS group right now — member-validity re-check: the account
-	// may have been removed/disabled since the engine computed it. resolveCandidate
-	// runs the SAME validity gate the ranked loop below uses (candidate ref present
-	// + material delivered + usable + decryptable), so the override can never route
-	// to an account the proxy has no material for. Any miss (stale / no material /
-	// expired / exhausted / undecryptable / in skip) falls through to the local
-	// ranked pick — the existing path stays the default.
-	if overrideAccountID != "" && !skip[overrideAccountID] {
-		// Override only takes effect when its account is usable RIGHT NOW. A
-		// needs-login/expired/exhausted override falls through to the local ranked
-		// pick (don't force a login on a stale engine redirect).
-		if res, oc := resolveCandidate(overrideAccountID, refByID, material, derivedKey, nowUnix); oc == candOK {
-			res.Primary = primary // engine redirect audited as a switch (primary != pick)
-			return res, nil
-		}
-	}
-
-	for _, a := range ordered {
-		if skip[a.AccountID] {
-			continue
-		}
-		res, oc := resolveCandidate(a.AccountID, refByID, material, derivedKey, nowUnix)
+	// SINGLE SOURCE OF TRUTH (2026-07-01): the pick — engine override first (§6.5,
+	// member-validity re-checked; needs_login overrides are HONORED per the owner rule
+	// "the engine may route a member to an account they haven't logged into"), else the
+	// local ranked pick — is vkeys.PickRoutedAccount, the SAME function the display
+	// stamp (supervisor.computeRoutedAccountID → /user/vault current_routed) uses. Do
+	// NOT re-derive routing here; forwarding and display must agree by construction.
+	//
+	// The only hot-path-extra gate is DECRYPT (needs the vault key, so it can't be in
+	// the pure picker): a corrupt secret adds the account to the skip set and re-picks,
+	// preserving the old "corrupt material never fails the request" resilience.
+	localSkip, cloned := skip, false
+	for {
+		acc, oc := vkeys.PickRoutedAccount(route.SeatID, refs, material, overrideAccountID, localSkip, nowUnix)
 		switch oc {
-		case candOK:
+		case vkeys.PickNeedsLogin:
+			// RW2/D2: prompt login for THE routed account (engine pick or strict-HRW
+			// rank stop) — never silently hop past it to a later logged-in account.
+			return nil, &groupResolveError{Code: groupErrLoginRequired,
+				Reason: "member has no token for the routed account — login required", Account: acc}
+		case vkeys.PickOK:
+			mat := material[acc]
+			secret, err := decryptGroupSecret(derivedKey, mat)
+			if err != nil {
+				// corrupt material — route around it, don't fail the request. Clone the
+				// caller's skip set once (never mutate the shared cooldown view).
+				if !cloned {
+					clone := make(map[string]bool, len(skip)+1)
+					for k, v := range skip {
+						clone[k] = v
+					}
+					localSkip, cloned = clone, true
+				}
+				localSkip[acc] = true
+				continue
+			}
+			res := buildGroupResolution(acc, refByID[acc], mat, secret)
 			res.Primary = primary
 			return res, nil
-		case candNeedsLogin:
-			// RW2/D2: stop at the first account this member hasn't logged into and
-			// prompt — do NOT skip to a later logged-in account (preserves HRW
-			// allocation). Quota fallback (candSkip) still advances past it.
-			return nil, &groupResolveError{Code: groupErrLoginRequired,
-				Reason: "member has no token for the routed account — login required", Account: a.AccountID}
-		case candSkip:
-			continue
+		default: // PickNone
+			return nil, &groupResolveError{Code: groupErrAllUnusable, Reason: "all group candidates expired, exhausted, or undecryptable"}
 		}
 	}
-
-	return nil, &groupResolveError{Code: groupErrAllUnusable, Reason: "all group candidates expired, exhausted, or undecryptable"}
 }
 
-// resolveCandidate resolves ONE account to its injectable credential, applying
-// the single validity gate shared by the ranked loop and the §6.5 engine-override
-// path: the account must be a candidate ref in THIS group, have delivered material,
-// be usable (not expired/exhausted), and decrypt cleanly. ok=false on any miss so
-// the caller skips it (loop) or falls back to the local pick (override). Sharing
-// one gate is the whole point — the override's "is this still a valid candidate"
-// re-check can never drift from what the loop considers usable.
-func resolveCandidate(accountID string, refByID map[string]vkeys.GroupAccountRef, material map[string]vkeys.GroupRuntimeAccount, derivedKey []byte, nowUnix int64) (*groupResolution, candOutcome) {
-	ref, ok := refByID[accountID]
-	if !ok {
-		return nil, candSkip // not a candidate in this group's set (stale/unknown override)
-	}
-	mat, ok := material[accountID]
-	if !ok {
-		// No delivered material at all = the proxy hasn't PULLED this account's
-		// material yet (channel-③ race / cold start), NOT "member needs login"
-		// (master delivers an explicit needs_login marker for that). Treat as a
-		// retryable skip → quota fallback to the next candidate, NOT a hard
-		// LOGIN_REQUIRED (P1).
-		return nil, candSkip
-	}
-	if mat.NeedsLogin {
-		// Master explicitly says the member has no token for this account → prompt
-		// login for THIS account (RW2/D2, strict HRW — don't skip past it).
-		return nil, candNeedsLogin
-	}
-	if !materialUsable(mat, nowUnix) {
-		return nil, candSkip // expired / quota-exhausted → fall back to next account
-	}
-	secret, err := decryptGroupSecret(derivedKey, mat)
-	if err != nil {
-		return nil, candSkip // corrupt material — try the next candidate, don't fail the request
-	}
-	return buildGroupResolution(accountID, ref, mat, secret), candOK
-}
-
-// materialUsable reports whether an account's material can serve a request now.
-// OAuth: not past expiry and quota window not exhausted. API key: always usable
-// if present (no expiry/window in the contract).
-func materialUsable(mat vkeys.GroupRuntimeAccount, nowUnix int64) bool {
-	if mat.CredentialType == credTypeKey {
-		return true
-	}
-	if mat.ExpiresAt > 0 && mat.ExpiresAt <= nowUnix {
-		return false // access_token expired (refresh is master's job — N7b)
-	}
-	if mat.WindowStatus == "exhausted" {
-		return false // oauth-group quota window used up — fall back to next account
-	}
-	return true
-}
+// (resolveCandidate / materialUsable were absorbed into vkeys.PickRoutedAccount /
+// vkeys.MaterialUsable — the shared pure pick used by BOTH this hot path and the
+// supervisor's display stamp. 2026-07-01 single-source-of-truth unification.)
 
 // decryptGroupSecret base64-decodes the nonce + ciphertext and AES-GCM decrypts
 // the secret with the vault key.

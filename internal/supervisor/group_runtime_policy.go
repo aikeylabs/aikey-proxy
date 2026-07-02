@@ -116,7 +116,12 @@ func (s *Supervisor) syncGroupRuntime(ctx context.Context, cred events.Credentia
 	}
 	// s.routingOverrides.Assignment is nil-safe (guards nil receiver → "" = rank-0),
 	// so the routed-account stamp degrades to the local pick when overrides are unset.
-	if err := writeGroupRuntimeForGroups(s.cfg.Vault.Path, gen.vault.DerivedKey(), mks, groups, s.routingOverrides.Assignment); err != nil {
+	// Same cooldown view the hot path uses, so is_current_routed reflects cooling failover.
+	var grSkip map[string]bool
+	if gen.proxy != nil {
+		grSkip = gen.proxy.CooldownSkipSet()
+	}
+	if err := writeGroupRuntimeForGroups(s.cfg.Vault.Path, gen.vault.DerivedKey(), mks, groups, s.routingOverrides.Assignment, grSkip); err != nil {
 		slog.Warn("group_runtime write failed",
 			"event.name", "proxy.group_runtime.write_failed", "error", err.Error())
 		return // leave lastGroupRuntimeSig unchanged → retry next tick
@@ -148,6 +153,12 @@ type grAccount struct {
 	AccountID      string `json:"account_id"`
 	CredentialID   string `json:"credential_id"`
 	CredentialType string `json:"credential_type"` // oauth_account | api_key
+	// Display meta (non-secret, 2026-07-01) so the client's candidate LIST membership
+	// refreshes off this fast rail (a fast-rail-only account renders with its
+	// email/provider, not a bare UUID). Threaded straight through to group_runtime.
+	Identity     string `json:"identity"`
+	ProviderCode string `json:"provider_code"`
+	Priority     int    `json:"priority"`
 	// NeedsLogin: master delivered this OAuth account as "member not logged in"
 	// (no token) — the proxy returns LOGIN_REQUIRED for it (vs an absent account =
 	// material not pulled yet → retryable skip). P1.
@@ -270,12 +281,23 @@ func (s *Supervisor) restampCurrentRouted() {
 	if err != nil {
 		return
 	}
+	// Same cooldown view the hot-path resolver uses, so the stamp names the account the
+	// proxy actually forwards to (cooling-driven failover included).
+	var skip map[string]bool
+	if gen.proxy != nil {
+		skip = gen.proxy.CooldownSkipSet()
+	}
+	nowUnix := time.Now().Unix()
 	for i := range mks {
 		mk := mks[i]
 		if mk.OauthGroupID == "" || mk.GroupRuntime == "" {
 			continue
 		}
-		newJSON, changed, err := stampCurrentRoutedJSON(mk.GroupRuntime, computeRoutedAccountID(mk, s.routingOverrides.Assignment))
+		// Feed the STORED material to the shared pick so the re-stamp applies the same
+		// usability gates as the hot path (unparseable → nil = blind mode, nominal pick).
+		var material map[string]vkeys.GroupRuntimeAccount
+		_ = json.Unmarshal([]byte(mk.GroupRuntime), &material)
+		newJSON, changed, err := stampCurrentRoutedJSON(mk.GroupRuntime, computeRoutedAccountID(mk, material, s.routingOverrides.Assignment, skip, nowUnix))
 		if err != nil {
 			slog.Warn("group_runtime restamp parse failed",
 				"event.name", "proxy.group_runtime.restamp_failed",
@@ -305,7 +327,10 @@ func buildGroupRuntimeMap(derivedKey []byte, accounts []grAccount) map[string]vk
 		// needs_login marker carries NO secret — store it as-is so the resolver can
 		// return LOGIN_REQUIRED for it (P1), distinct from an absent account.
 		if a.NeedsLogin {
-			out[a.AccountID] = vkeys.GroupRuntimeAccount{CredentialType: a.CredentialType, NeedsLogin: true}
+			out[a.AccountID] = vkeys.GroupRuntimeAccount{
+				CredentialType: a.CredentialType, NeedsLogin: true,
+				Identity: a.Identity, ProviderCode: a.ProviderCode, Priority: a.Priority,
+			}
 			continue
 		}
 		secret := a.AccessToken
@@ -320,6 +345,9 @@ func buildGroupRuntimeMap(derivedKey []byte, accounts []grAccount) map[string]vk
 			CredentialType:   a.CredentialType,
 			SecretNonce:      base64.StdEncoding.EncodeToString(nonce),
 			SecretCiphertext: base64.StdEncoding.EncodeToString(ct),
+			Identity:         a.Identity,     // non-secret display meta → client list refresh
+			ProviderCode:     a.ProviderCode, //
+			Priority:         a.Priority,     //
 		}
 		if a.CredentialType == "api_key" {
 			gra.BaseURL = a.BaseURL
@@ -359,36 +387,47 @@ func buildGroupRuntimeJSON(derivedKey []byte, accounts []grAccount) (string, err
 	return marshalGroupRuntime(buildGroupRuntimeMap(derivedKey, accounts), "")
 }
 
-// computeRoutedAccountID returns the account this seat's traffic is routed to in
-// STEADY STATE (C2 display) = routing-override (when it still names a candidate in the
-// group) ?? seatassign rank-0. It reuses seatassign.Rank — the SAME primitive the
-// hot-path resolver (group_resolve.go) uses — so the displayed account matches what
-// routing picks when nothing is cooled down. It DELIBERATELY omits the resolver's
-// per-request cooldown / material / needs-login skips: owner chose the stable,
-// non-flapping pick (2026-06-30), so transient failover is intentionally not surfaced.
+// computeRoutedAccountID returns the account this seat's traffic is routed to (C2
+// display, the is_current_routed / current_routed stamp).
+//
+// SINGLE SOURCE OF TRUTH (2026-07-01 unification): the pick itself is
+// vkeys.PickRoutedAccount — the EXACT function the hot-path resolver
+// (proxy.resolveGroupCredential) forwards with, fed the same override view (the shared
+// RoutingOverrideCache via overrideFor), the same cooldown skip view
+// (proxy.CooldownSkipSet), and the same material usability gates. Display == forwarding
+// by construction; do NOT re-derive routing here. A needs_login pick IS the routed
+// account (owner rule: the engine may route a member to an account they haven't logged
+// into — the stamp shows it so the member logs into THAT one).
+//
+// material is the group's CURRENT runtime material map (pass the freshly built map when
+// writing, or the parsed stored column when re-stamping); empty/nil → the picker's blind
+// mode (rank/override-only — pre-poll display still shows a nominal pick). Residual
+// (accepted): the hot path also skips undecryptable secrets per request (decrypt needs
+// the vault key, can't be in the pure pick), and the stamp persists at the 60s poll +
+// override-change cadence, so mid-cycle changes converge within ≤60s. skip may be nil.
 // "" when the candidate list is absent/unparseable. overrideFor may be nil (→ rank-0).
-func computeRoutedAccountID(mk vault.ManagedKey, overrideFor func(string) string) string {
+func computeRoutedAccountID(mk vault.ManagedKey, material map[string]vkeys.GroupRuntimeAccount, overrideFor func(seatID, groupID string) string, skip map[string]bool, nowUnix int64) string {
 	var refs []vkeys.GroupAccountRef
 	if mk.GroupAccounts == "" || json.Unmarshal([]byte(mk.GroupAccounts), &refs) != nil || len(refs) == 0 {
 		return ""
 	}
+	override := ""
+	if overrideFor != nil {
+		override = overrideFor(mk.SeatID, mk.OauthGroupID)
+	}
+	if acc, oc := vkeys.PickRoutedAccount(mk.SeatID, refs, material, override, skip, nowUnix); oc != vkeys.PickNone {
+		return acc
+	}
+	// Nothing pickable (hot path would 429/ALL_UNUSABLE) → show the nominal seatassign
+	// rank-0 rather than blank (display-only fallback; no traffic is served here anyway).
 	accounts := make([]seatassign.Account, 0, len(refs))
-	inSet := make(map[string]bool, len(refs))
 	for _, r := range refs {
 		accounts = append(accounts, seatassign.Account{AccountID: r.AccountID, Priority: r.Priority})
-		inSet[r.AccountID] = true
 	}
-	ordered := seatassign.Rank(mk.SeatID, accounts)
-	if len(ordered) == 0 {
-		return ""
+	if ordered := seatassign.Rank(mk.SeatID, accounts); len(ordered) > 0 {
+		return ordered[0].AccountID
 	}
-	routed := ordered[0].AccountID // rank-0 default
-	if overrideFor != nil {
-		if ov := overrideFor(mk.SeatID); ov != "" && inSet[ov] {
-			routed = ov // engine redirect — apply only when it still names a candidate
-		}
-	}
-	return routed
+	return ""
 }
 
 // stampCurrentRoutedJSON rewrites an EXISTING group_runtime JSON so ONLY
@@ -429,7 +468,9 @@ func stampCurrentRoutedJSON(runtimeJSON, routedAccountID string) (string, bool, 
 // route to different accounts. A VK belongs to a group when its OauthGroupID matches;
 // a group with no local VK is simply skipped (the proxy only stores what it routes).
 // overrideFor supplies the engine's seat→account routing override (nil → rank-0 only).
-func writeGroupRuntimeForGroups(dbPath string, derivedKey []byte, mks []vault.ManagedKey, groups []grGroup, overrideFor func(string) string) error {
+// skip is the current cooldown view (proxy.CooldownSkipSet) so the routed stamp reflects
+// cooling-driven failover, matching the hot path (nil → no cooldown view).
+func writeGroupRuntimeForGroups(dbPath string, derivedKey []byte, mks []vault.ManagedKey, groups []grGroup, overrideFor func(seatID, groupID string) string, skip map[string]bool) error {
 	// group_id → its locally-known managed keys (need the whole mk for SeatID +
 	// GroupAccounts to compute the per-seat routed account, not just the VK id).
 	mksByGroup := make(map[string][]vault.ManagedKey)
@@ -446,10 +487,13 @@ func writeGroupRuntimeForGroups(dbPath string, derivedKey []byte, mks []vault.Ma
 			continue
 		}
 		// Encrypt the material ONCE per group (routed-agnostic), then stamp the
-		// per-seat routed flag per VK — avoids re-encrypting for each seat.
+		// per-seat routed flag per VK — avoids re-encrypting for each seat. The pick is
+		// fed the FRESH material map being written (not the stale stored column) so the
+		// stamp's usability gates see exactly what the hot path will read next.
 		base := buildGroupRuntimeMap(derivedKey, g.Accounts)
+		nowUnix := time.Now().Unix()
 		for _, mk := range groupMks {
-			jsonVal, err := marshalGroupRuntime(base, computeRoutedAccountID(mk, overrideFor))
+			jsonVal, err := marshalGroupRuntime(base, computeRoutedAccountID(mk, base, overrideFor, skip, nowUnix))
 			if err != nil {
 				return err
 			}

@@ -351,6 +351,15 @@ func (p *Proxy) PoolCooldownSnapshot() map[string]int {
 	return p.poolCooldown.snapshot()
 }
 
+// CooldownSkipSet returns the EXACT set of accounts the hot-path group resolver skips
+// right now (poolCooldown.skipSet) so the supervisor's is_current_routed stamp can be
+// computed with the SAME cooldown view the forward path uses — closing the display↔actual
+// gap for cooling-driven switches (2026-07-01). Same function as group_serve.go's resolver
+// call, so the two can't diverge in which accounts are considered cooled.
+func (p *Proxy) CooldownSkipSet() map[string]bool {
+	return p.poolCooldown.skipSet()
+}
+
 // ObservedResetsSnapshot returns the latest upstream window-reset epoch observed
 // per pool account (account_id → epoch). The supervisor's N7c pull piggybacks
 // it to master (Path Z) so master re-rolls window_max_util_pct per window. nil

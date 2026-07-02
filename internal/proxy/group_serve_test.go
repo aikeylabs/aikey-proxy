@@ -459,7 +459,7 @@ func TestGroupServe_BlockedSeatReturns429(t *testing.T) {
 
 	// Engine left seat-1 unbound (pool full) → proxy must 429, never route to acc-1.
 	cache := NewRoutingOverrideCache()
-	cache.StoreAll(1, nil, map[string]bool{"seat-1": true})
+	cache.StoreAll(1, nil, map[string]bool{routeKey("seat-1", "grp-1"): true}) // composite (seat,group) key
 	p.SetRoutingOverrides(cache)
 
 	req, w := groupReq(groupBody)

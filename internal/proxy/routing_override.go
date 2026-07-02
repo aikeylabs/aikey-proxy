@@ -24,6 +24,13 @@ package proxy
 
 import "sync/atomic"
 
+// routeKey is the composite (seat, group) key of the routing-override maps. LOCKSTEP
+// with master's adapter/routing.go routeKey — the two MUST format keys identically or
+// every override lookup misses. A multi-pool seat (member of >1 group) has a distinct
+// binding per group, so keying by seat alone dropped all but the first group's route
+// (2026-07-01). "|" is safe: seat/group ids are UUIDs.
+func routeKey(seatID, groupID string) string { return seatID + "|" + groupID }
+
 // RoutingOverrideCache holds the engine's sparse seat_id→account_id assignments
 // plus the routing_version they came from.
 type RoutingOverrideCache struct {
@@ -78,39 +85,42 @@ func (c *RoutingOverrideCache) Version() int64 {
 	return c.version.Load()
 }
 
-// lookup returns the engine's override account_id for seatID, or "" when the
-// feature is off / nothing stored / no override for this seat. nil-safe so the
-// hot path can call it unconditionally.
-func (c *RoutingOverrideCache) lookup(seatID string) string {
-	if c == nil || seatID == "" {
+// lookup returns the engine's override account_id for (seatID, groupID), or "" when
+// the feature is off / nothing stored / no override for this (seat,group). Keyed by
+// the composite routeKey so a multi-pool seat gets the RIGHT group's override (not just
+// its first group's). nil-safe so the hot path can call it unconditionally.
+func (c *RoutingOverrideCache) lookup(seatID, groupID string) string {
+	if c == nil || seatID == "" || groupID == "" {
 		return ""
 	}
 	v := c.m.Load()
 	if v == nil {
 		return ""
 	}
-	return v.(map[string]string)[seatID]
+	return v.(map[string]string)[routeKey(seatID, groupID)]
 }
 
-// Assignment returns the engine's override account_id for seatID (exported wrapper
-// over lookup), or "" when nothing is overridden. Used by the supervisor's
+// Assignment returns the engine's override account_id for (seatID, groupID) (exported
+// wrapper over lookup), or "" when nothing is overridden. Used by the supervisor's
 // group_runtime writer to stamp IsCurrentRouted (C2 display) with the SAME override
 // the hot-path resolver applies — one definition of "which account is routed".
-func (c *RoutingOverrideCache) Assignment(seatID string) string { return c.lookup(seatID) }
+func (c *RoutingOverrideCache) Assignment(seatID, groupID string) string {
+	return c.lookup(seatID, groupID)
+}
 
-// Blocked reports whether the engine left seatID UNBOUND because every account in
-// its pool/segment is at the ≤3-人/号 cap. The proxy 429s a blocked seat instead of
-// falling back to the cap-blind local pick (which would route a 4th user onto a
-// full account). nil-safe; false when the feature is off / nothing stored.
-func (c *RoutingOverrideCache) Blocked(seatID string) bool {
-	if c == nil || seatID == "" {
+// Blocked reports whether the engine left (seatID, groupID) UNBOUND because every
+// account in its pool/segment is at the ≤3-人/号 cap. The proxy 429s a blocked seat
+// instead of falling back to the cap-blind local pick (which would route a 4th user
+// onto a full account). nil-safe; false when the feature is off / nothing stored.
+func (c *RoutingOverrideCache) Blocked(seatID, groupID string) bool {
+	if c == nil || seatID == "" || groupID == "" {
 		return false
 	}
 	v := c.blocked.Load()
 	if v == nil {
 		return false
 	}
-	return v.(map[string]bool)[seatID]
+	return v.(map[string]bool)[routeKey(seatID, groupID)]
 }
 
 // SetRoutingOverrides injects the shared, supervisor-owned routing-override cache

@@ -166,7 +166,7 @@ func TestWriteGroupRuntimeForGroups_PerVKEncrypted(t *testing.T) {
 		{AccountID: "a1", CredentialType: "oauth_account", AccessToken: "tok-1", ExpiresAt: 5},
 	}}}
 
-	if err := writeGroupRuntimeForGroups(dbPath, key, mks, groups, nil); err != nil {
+	if err := writeGroupRuntimeForGroups(dbPath, key, mks, groups, nil, nil); err != nil {
 		t.Fatalf("write: %v", err)
 	}
 
@@ -224,7 +224,7 @@ func TestWriteGroupRuntimeForGroups_ClearsUndeliveredGroupVK(t *testing.T) {
 		{AccountID: "a1", CredentialType: "oauth_account", AccessToken: "tok-1", ExpiresAt: 5},
 	}}}
 
-	if err := writeGroupRuntimeForGroups(dbPath, key, mks, groups, nil); err != nil {
+	if err := writeGroupRuntimeForGroups(dbPath, key, mks, groups, nil, nil); err != nil {
 		t.Fatalf("write: %v", err)
 	}
 
@@ -259,7 +259,7 @@ const twoCandGroupAccounts = `[{"account_id":"a1","priority":1},{"account_id":"a
 func TestComputeRoutedAccountID_OverrideBeatsRankZero(t *testing.T) {
 	mk := vault.ManagedKey{SeatID: "seat-x", GroupAccounts: twoCandGroupAccounts}
 
-	def := computeRoutedAccountID(mk, nil) // rank-0, no override
+	def := computeRoutedAccountID(mk, nil, nil, nil, 1_000_000) // rank-0, no override, no cooldown
 	if def != "a1" && def != "a2" {
 		t.Fatalf("rank-0 default must be a candidate, got %q", def)
 	}
@@ -268,16 +268,47 @@ func TestComputeRoutedAccountID_OverrideBeatsRankZero(t *testing.T) {
 		other = "a2"
 	}
 	// Override naming the OTHER candidate must win.
-	if got := computeRoutedAccountID(mk, func(string) string { return other }); got != other {
+	if got := computeRoutedAccountID(mk, nil, func(string, string) string { return other }, nil, 1_000_000); got != other {
 		t.Fatalf("override should route to %q, got %q", other, got)
 	}
 	// Override naming a NON-candidate must be ignored → rank-0 default.
-	if got := computeRoutedAccountID(mk, func(string) string { return "ghost" }); got != def {
+	if got := computeRoutedAccountID(mk, nil, func(string, string) string { return "ghost" }, nil, 1_000_000); got != def {
 		t.Fatalf("non-candidate override must fall back to rank-0 %q, got %q", def, got)
 	}
 	// No parseable candidates → "".
-	if got := computeRoutedAccountID(vault.ManagedKey{SeatID: "s"}, nil); got != "" {
+	if got := computeRoutedAccountID(vault.ManagedKey{SeatID: "s"}, nil, nil, nil, 1_000_000); got != "" {
 		t.Fatalf("no candidates → \"\", got %q", got)
+	}
+}
+
+// CONVERGENCE (2026-07-01): computeRoutedAccountID (the is_current_routed / current_routed
+// DISPLAY stamp read by /user/vault + /user/virtual-keys after A2) is now cooldown-aware —
+// it takes the SAME skip view the hot-path resolver uses (proxy.CooldownSkipSet), so the
+// displayed account MATCHES what the proxy actually forwards to under cooling-driven
+// failover. Mirrors proxy.TestResolveGroup_RoutedFollowsOverride_AndCoolingFallsThrough
+// (the actual forward side). 能红: drop the `!skip` guards in computeRoutedAccountID → the
+// cooled-rank-0 case below reverts to rank-0 and diverges from the hot path → fails.
+func TestComputeRoutedAccountID_CoolingAware_MatchesHotPath(t *testing.T) {
+	mk := vault.ManagedKey{SeatID: "seat-cool", GroupAccounts: twoCandGroupAccounts}
+	def := computeRoutedAccountID(mk, nil, nil, nil, 1_000_000) // rank-0, nothing cooled
+	other := "a1"
+	if def == "a1" {
+		other = "a2"
+	}
+
+	// rank-0 (def) COOLED, no override → the stamp moves to the next non-cooled account,
+	// exactly like the hot path's ranked-loop fall-through.
+	if got := computeRoutedAccountID(mk, nil, nil, map[string]bool{def: true}, 1_000_000); got != other {
+		t.Fatalf("cooled rank-0 → stamp must move to next non-cooled %q, got %q", other, got)
+	}
+	// Override account COOLED → the override is NOT honored; fall through to non-cooled
+	// (same gate as the hot path: `override != "" && !skip[override]`).
+	if got := computeRoutedAccountID(mk, nil, func(string, string) string { return def }, map[string]bool{def: true}, 1_000_000); got != other {
+		t.Fatalf("cooled override must fall through to %q, got %q", other, got)
+	}
+	// ALL cooled → nominal rank-0 (hot path would 429; display shows the engine pick).
+	if got := computeRoutedAccountID(mk, nil, nil, map[string]bool{"a1": true, "a2": true}, 1_000_000); got != def {
+		t.Fatalf("all cooled → nominal rank-0 %q, got %q", def, got)
 	}
 }
 
@@ -309,13 +340,13 @@ func TestWriteGroupRuntimeForGroups_StampsCurrentRouted(t *testing.T) {
 		{AccountID: "a2", CredentialType: "oauth_account", AccessToken: "t2", ExpiresAt: 9},
 	}}}
 	// Force seat-1 → a1 via override; seat-2 gets no override (rank-0).
-	overrideFor := func(seat string) string {
+	overrideFor := func(seat, _ string) string {
 		if seat == "seat-1" {
 			return "a1"
 		}
 		return ""
 	}
-	if err := writeGroupRuntimeForGroups(dbPath, key, mks, groups, overrideFor); err != nil {
+	if err := writeGroupRuntimeForGroups(dbPath, key, mks, groups, overrideFor, nil); err != nil {
 		t.Fatalf("write: %v", err)
 	}
 

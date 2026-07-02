@@ -48,9 +48,9 @@ func TestResolveGroup_OverrideValidCandidateRedirects(t *testing.T) {
 
 	// Feed the override through the cache exactly like the hot path does.
 	cache := NewRoutingOverrideCache()
-	cache.Store(7, map[string]string{seat: override})
+	cache.Store(7, map[string]string{routeKey(seat, route.OauthGroupID): override})
 
-	res, err := resolveGroupCredential(route, key, 1_000_000, nil, cache.lookup(seat))
+	res, err := resolveGroupCredential(route, key, 1_000_000, nil, cache.lookup(seat, route.OauthGroupID))
 	if err != nil {
 		t.Fatalf("resolve: %v", err)
 	}
@@ -79,9 +79,9 @@ func TestResolveGroup_StaleOverrideFallsBackToLocal(t *testing.T) {
 	primary := order[0]
 
 	cache := NewRoutingOverrideCache()
-	cache.Store(3, map[string]string{seat: "ghost-account"}) // not in the candidate set
+	cache.Store(3, map[string]string{routeKey(seat, route.OauthGroupID): "ghost-account"}) // not in the candidate set
 
-	res, err := resolveGroupCredential(route, key, 1_000_000, nil, cache.lookup(seat))
+	res, err := resolveGroupCredential(route, key, 1_000_000, nil, cache.lookup(seat, route.OauthGroupID))
 	if err != nil {
 		t.Fatalf("resolve: %v", err)
 	}
@@ -90,6 +90,43 @@ func TestResolveGroup_StaleOverrideFallsBackToLocal(t *testing.T) {
 	}
 	if res.Primary != res.AccountID {
 		t.Fatalf("local pick → no switch: Primary(%q) must equal pick(%q)", res.Primary, res.AccountID)
+	}
+}
+
+// OWNER RULE (2026-07-01): the engine MAY route a member to an account they have NOT
+// logged into — an override naming a needs_login account is HONORED: the hot path stops
+// there with LOGIN_REQUIRED for THAT account (matching what vault/virtual-keys/team-oauth
+// display as the routed account), it does NOT silently fall through to a logged-in local
+// pick. 能红: make the picker treat a needs_login override as unusable (fall through) →
+// this resolves the local pick instead of erroring → fails.
+func TestResolveGroup_NeedsLoginOverridePromptsLoginForThatAccount(t *testing.T) {
+	key := grKey()
+	seat := "seat-ovr-nl"
+	now := int64(1_000_000)
+
+	refs := []vkeys.GroupAccountRef{
+		{AccountID: "acc-a", ProviderCode: "anthropic"},
+		{AccountID: "acc-b", ProviderCode: "anthropic"},
+	}
+	order := rankOrder(seat, "acc-a", "acc-b")
+	primary := order[0]  // logged in + usable — the fall-through would serve this
+	override := order[1] // the ENGINE's pick — member not logged in
+	mat := map[string]vkeys.GroupRuntimeAccount{
+		primary:  freshOAuth(t, key, "tok-primary"),
+		override: {CredentialType: "oauth_account", NeedsLogin: true},
+	}
+	route := &vkeys.ResolvedRoute{SeatID: seat, OauthGroupID: "grp", GroupAccounts: mustJSON(t, refs), GroupRuntime: mustJSON(t, mat)}
+
+	_, err := resolveGroupCredential(route, key, now, nil, override)
+	if err == nil {
+		t.Fatal("needs_login override must NOT silently serve the local pick — want LOGIN_REQUIRED")
+	}
+	ge, ok := err.(*groupResolveError)
+	if !ok || ge.Code != groupErrLoginRequired {
+		t.Fatalf("want LOGIN_REQUIRED, got %v", err)
+	}
+	if ge.Account != override {
+		t.Fatalf("login prompt must name the ENGINE-routed account %q (the one all pages display), got %q", override, ge.Account)
 	}
 }
 
@@ -150,10 +187,10 @@ func TestResolveGroup_EngineDownEmptyCacheLocalPick(t *testing.T) {
 	primary := order[0]
 
 	cache := NewRoutingOverrideCache() // never Stored — engine down
-	if got := cache.lookup(seat); got != "" {
+	if got := cache.lookup(seat, route.OauthGroupID); got != "" {
 		t.Fatalf("empty cache must miss, got %q", got)
 	}
-	res, err := resolveGroupCredential(route, key, 1_000_000, nil, cache.lookup(seat))
+	res, err := resolveGroupCredential(route, key, 1_000_000, nil, cache.lookup(seat, route.OauthGroupID))
 	if err != nil {
 		t.Fatalf("resolve: %v", err)
 	}
@@ -166,39 +203,48 @@ func TestResolveGroup_EngineDownEmptyCacheLocalPick(t *testing.T) {
 // Store replaces the whole map; Version gates re-apply.
 func TestRoutingOverrideCache_NilSafeAndStore(t *testing.T) {
 	var nilCache *RoutingOverrideCache
-	if got := nilCache.lookup("seat"); got != "" {
+	if got := nilCache.lookup("seat", "g"); got != "" {
 		t.Fatalf("nil cache lookup must be empty, got %q", got)
 	}
 	if v := nilCache.Version(); v != 0 {
 		t.Fatalf("nil cache version must be 0, got %d", v)
 	}
-	nilCache.Store(1, map[string]string{"seat": "x"}) // must not panic
+	nilCache.Store(1, map[string]string{routeKey("seat", "g"): "x"}) // must not panic
 
 	c := NewRoutingOverrideCache()
-	if got := c.lookup("seat"); got != "" {
+	if got := c.lookup("seat", "g"); got != "" {
 		t.Fatalf("fresh cache must miss, got %q", got)
 	}
-	c.Store(5, map[string]string{"seat-1": "acc-1"})
-	if got := c.lookup("seat-1"); got != "acc-1" {
+	c.Store(5, map[string]string{routeKey("seat-1", "g"): "acc-1"})
+	if got := c.lookup("seat-1", "g"); got != "acc-1" {
 		t.Fatalf("lookup after store: got %q", got)
 	}
-	if got := c.lookup("seat-unknown"); got != "" {
+	if got := c.lookup("seat-unknown", "g"); got != "" {
 		t.Fatalf("unknown seat must miss, got %q", got)
+	}
+	// Multi-pool (2026-07-01): the SAME seat in TWO groups keeps DISTINCT overrides —
+	// keying by seat alone (the old bug) would collapse them to one.
+	c.Store(5, map[string]string{routeKey("seat-1", "g1"): "acc-g1", routeKey("seat-1", "g2"): "acc-g2"})
+	if got := c.lookup("seat-1", "g1"); got != "acc-g1" {
+		t.Fatalf("seat-1/g1 override: got %q", got)
+	}
+	if got := c.lookup("seat-1", "g2"); got != "acc-g2" {
+		t.Fatalf("seat-1/g2 override (multi-pool, distinct per group): got %q", got)
 	}
 	if v := c.Version(); v != 5 {
 		t.Fatalf("version: got %d", v)
 	}
-	// A later store replaces the whole map (old seat gone, new seat present).
-	c.Store(6, map[string]string{"seat-2": "acc-2"})
-	if got := c.lookup("seat-1"); got != "" {
-		t.Fatalf("replaced map must drop seat-1, got %q", got)
+	// A later store replaces the whole map (old key gone, new key present).
+	c.Store(6, map[string]string{routeKey("seat-2", "g"): "acc-2"})
+	if got := c.lookup("seat-1", "g1"); got != "" {
+		t.Fatalf("replaced map must drop seat-1/g1, got %q", got)
 	}
-	if got := c.lookup("seat-2"); got != "acc-2" {
+	if got := c.lookup("seat-2", "g"); got != "acc-2" {
 		t.Fatalf("replaced map must carry seat-2, got %q", got)
 	}
 	// A nil map normalizes to empty (no panic, all lookups miss).
 	c.Store(7, nil)
-	if got := c.lookup("seat-2"); got != "" {
+	if got := c.lookup("seat-2", "g"); got != "" {
 		t.Fatalf("nil-map store must clear, got %q", got)
 	}
 }
@@ -217,11 +263,11 @@ func TestRoutingOverrideCache_StoredDistinguishesVersionZero(t *testing.T) {
 		t.Fatalf("fresh cache Version() must be 0, got %d", c.Version())
 	}
 	// First pull: a non-empty assignment map carrying routing_version 0.
-	c.Store(0, map[string]string{"seat-1": "acct-1"})
+	c.Store(0, map[string]string{routeKey("seat-1", "g"): "acct-1"})
 	if !c.Stored() {
 		t.Fatal("after Store(0,...) Stored() must be true — else the poll skips it forever")
 	}
-	if got := c.lookup("seat-1"); got != "acct-1" {
+	if got := c.lookup("seat-1", "g"); got != "acct-1" {
 		t.Fatalf("version-0 non-empty payload must be applied, lookup got %q want acct-1", got)
 	}
 }
