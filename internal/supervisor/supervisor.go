@@ -312,6 +312,10 @@ type Supervisor struct {
 	// pollRoutingOverrides; read on the group-route hot path to redirect a seat off
 	// an unhealthy account. nil-safe everywhere → empty means "use the local pick".
 	routingOverrides *proxy.RoutingOverrideCache
+	// lastRoutingMismatchVersion throttles the proxy.routing_override.format_mismatch
+	// WARN (non-empty routes, zero matching a local (seat,group)) to once per
+	// routing_version — the 60s ticker would otherwise repeat it every cycle.
+	lastRoutingMismatchVersion atomic.Int64
 	// quotaHeartbeat is the traffic-independent server-reachability probe behind
 	// budget-mode staleness (D-U7/P9). nil unless enforce_mode=budget AND a
 	// collector URL is configured — so the default availability path (and Personal)
@@ -1413,6 +1417,10 @@ func (s *Supervisor) buildGeneration() (*generation, error) {
 	// Unconditional + nil-safe: an empty cache (no team cred / control URL / poll
 	// not landed) just means every request uses the local seatassign pick.
 	p.SetRoutingOverrides(s.routingOverrides)
+	// Local console base for member-login URLs in group login-required 401s
+	// (20260703 update). Explicitly-empty (cluster/server configs) → URL-less
+	// fallback; absent key (pre-20260703 preserved configs) → default 8090.
+	p.SetConsoleURL(s.cfg.ResolvedConsoleURL())
 	p.SlowRequestMs = int64(s.cfg.Log.SlowRequestMs)
 	p.VerySlowRequestMs = int64(s.cfg.Log.VerySlowRequestMs)
 	if b := s.transport.Load(); b != nil && b.rt != nil {

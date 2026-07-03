@@ -85,6 +85,13 @@ const (
 	// every account in its pool/segment is at the ≤3-人/号 cap, so the proxy 429s it
 	// (never WRH-falls-back, which would route a 4th user onto a full account).
 	EventProxyGroupSeatBlocked = "proxy.group.seat_blocked"
+	// EventProxyGroupLoginStateWriteFailed / ClearFailed: the bypass
+	// ~/.aikey/run/group-login-required.json state file (statusline login hint,
+	// 20260703 update) could not be written / removed. Best-effort by design —
+	// the 401 response itself is unaffected — but WARN because the statusline
+	// hint silently disappearing (or nagging stale) is a debugging trap.
+	EventProxyGroupLoginStateWriteFailed = "proxy.group.login_state_write_failed"
+	EventProxyGroupLoginStateClearFailed = "proxy.group.login_state_clear_failed"
 )
 
 // Usage extraction events.

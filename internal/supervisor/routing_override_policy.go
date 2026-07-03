@@ -25,6 +25,7 @@ import (
 
 	"github.com/AiKeyLabs/aikey-proxy/internal/events"
 	"github.com/AiKeyLabs/aikey-proxy/internal/httpx"
+	"github.com/AiKeyLabs/pkg/routingwire"
 )
 
 const routingOverridePollInterval = 60 * time.Second
@@ -82,7 +83,7 @@ func (s *Supervisor) syncRoutingOverrides(ctx context.Context, cred events.Crede
 	if err != nil {
 		return // can't auth → keep last-known
 	}
-	version, assignments, blocked, ok := fetchRoutingOverrides(ctx, masterURL, bearer)
+	version, routes, ok := fetchRoutingOverrides(ctx, masterURL, bearer)
 	if !ok {
 		return // unreachable / bad response → keep last-known (don't clear)
 	}
@@ -93,12 +94,25 @@ func (s *Supervisor) syncRoutingOverrides(ctx context.Context, cred events.Crede
 	// override never applied, no signal). After the first Store, steady-state
 	// re-pulls of the same version skip as before (no churn, no log spam).
 	if s.routingOverrides.Stored() && s.routingOverrides.Version() == version {
-		return // unchanged → no churn (empty map skip is harmless: lookups miss either way)
+		return // unchanged → no churn (empty route set skip is harmless: lookups miss either way)
 	}
-	s.routingOverrides.StoreAll(version, assignments, blocked)
+	bound, blocked := s.routingOverrides.StoreRoutes(version, routes)
 	slog.Info("routing overrides updated",
 		"event.name", "proxy.routing_override.changed",
-		"routing_version", version, "seats", len(assignments), "blocked", len(blocked))
+		"routing_version", version, "route_entries", bound, "blocked_entries", blocked)
+	// Format-mismatch fingerprint (2026-07-02, review F1): a NON-EMPTY route set in
+	// which not a single entry matches any of this vault's local (seat,group) pairs
+	// means the two sides disagree about the wire (or the payload is for the wrong
+	// account) — a failure that is otherwise indistinguishable from "no overrides".
+	// WARN once per routing_version (the ticker would repeat it every 60s otherwise).
+	// Mandatory-WARN rule: fallback-to-default paths must log.
+	if len(routes) > 0 && !routesMatchAnyLocal(routes, s.localSeatGroups()) {
+		if s.lastRoutingMismatchVersion.Swap(version) != version {
+			slog.Warn("routing overrides matched no local group VK — wire format / account mismatch?",
+				"event.name", "proxy.routing_override.format_mismatch",
+				"routing_version", version, "route_entries", len(routes))
+		}
+	}
 	// C2 display coupling (owner-approved 2026-06-30): the engine just redirected one
 	// or more seats. Re-stamp IsCurrentRouted on the affected group VKs' group_runtime
 	// so /user/vault shows the new routed account within this override poll, not only on
@@ -107,48 +121,68 @@ func (s *Supervisor) syncRoutingOverrides(ctx context.Context, cred events.Crede
 	s.restampCurrentRouted()
 }
 
-// routingOverrideResp mirrors master's GET /accounts/me/routing body. Assignments =
-// the engine's authoritative per-seat binding (the RefreshSeatBindings ledger);
-// Blocked = seats the engine left unbound (pool at the ≤3-人/号 cap) → the proxy
-// 429s them instead of WRH-falling-back.
-type routingOverrideResp struct {
-	RoutingVersion int64             `json:"routing_version"`
-	Assignments    map[string]string `json:"assignments"`
-	Blocked        []string          `json:"blocked"`
-}
-
-// fetchRoutingOverrides GETs the routing endpoint with an account-JWT Bearer.
-// Returns (version, assignments, ok); ok=false on ANY error so the caller keeps
-// the last-known cache (don't flap). A nil assignments is normalized to an empty
-// map so an ok=true pull always carries a concrete (possibly empty) map.
-func fetchRoutingOverrides(ctx context.Context, masterURL, bearer string) (int64, map[string]string, map[string]bool, bool) {
+// fetchRoutingOverrides GETs the routing endpoint with an account-JWT Bearer and
+// decodes the SHARED wire DTO (pkg/routingwire — the same structs master emits, so
+// the two repos cannot drift). Returns (version, routes, ok); ok=false on ANY error
+// so the caller keeps the last-known cache (don't flap). nil routes normalize to an
+// empty slice so an ok=true pull always carries a concrete (possibly empty) set.
+func fetchRoutingOverrides(ctx context.Context, masterURL, bearer string) (int64, []routingwire.RouteEntry, bool) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, masterURL+"/accounts/me/routing", http.NoBody)
 	if err != nil {
-		return 0, nil, nil, false
+		return 0, nil, false
 	}
 	req.Header.Set("Authorization", "Bearer "+bearer)
 	resp, err := routingOverrideHTTPClient.Get().Do(req)
 	if err != nil {
-		return 0, nil, nil, false
+		return 0, nil, false
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
-		return 0, nil, nil, false
+		return 0, nil, false
 	}
 	body, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
 	if err != nil {
-		return 0, nil, nil, false
+		return 0, nil, false
 	}
-	var out routingOverrideResp
+	var out routingwire.RoutingResponse
 	if err := json.Unmarshal(body, &out); err != nil {
-		return 0, nil, nil, false
+		return 0, nil, false
 	}
-	if out.Assignments == nil {
-		out.Assignments = map[string]string{}
+	if out.Routes == nil {
+		out.Routes = []routingwire.RouteEntry{}
 	}
-	blocked := make(map[string]bool, len(out.Blocked))
-	for _, seat := range out.Blocked {
-		blocked[seat] = true
+	return out.RoutingVersion, out.Routes, true
+}
+
+// routesMatchAnyLocal reports whether at least one wire entry targets one of this
+// vault's local (seat, group) pairs. Pure — unit-tested as the format-mismatch
+// fingerprint's decision core.
+func routesMatchAnyLocal(routes []routingwire.RouteEntry, local map[[2]string]bool) bool {
+	for _, r := range routes {
+		if local[[2]string{r.SeatID, r.GroupID}] {
+			return true
+		}
 	}
-	return out.RoutingVersion, out.Assignments, blocked, true
+	return false
+}
+
+// localSeatGroups collects the (seat, group) pairs of this vault's group VKs — the
+// set a healthy routing payload should intersect. Empty on any read problem (the
+// mismatch WARN then stays silent: no local expectation, nothing to mismatch).
+func (s *Supervisor) localSeatGroups() map[[2]string]bool {
+	gen := s.active.Load()
+	if gen == nil || gen.vault == nil {
+		return nil
+	}
+	mks, err := gen.vault.GetActiveManagedKeys()
+	if err != nil {
+		return nil
+	}
+	out := map[[2]string]bool{}
+	for i := range mks {
+		if mks[i].OauthGroupID != "" && mks[i].SeatID != "" {
+			out[[2]string{mks[i].SeatID, mks[i].OauthGroupID}] = true
+		}
+	}
+	return out
 }

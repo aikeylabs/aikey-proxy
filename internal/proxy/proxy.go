@@ -105,6 +105,15 @@ type Proxy struct {
 	// re-rolls window_max_util_pct per window. Always non-nil; only written on
 	// group-route responses.
 	poolObservedResets *poolResetStore
+	// consoleURL is Config.ConsoleURL — the co-installed local console base used
+	// to assemble the member-login URL in OAUTH_GROUP_MEMBER_LOGIN_REQUIRED
+	// responses (20260703 update). "" ⇒ URL-less fallback wording. Set once via
+	// SetConsoleURL before serving; not hot-swapped.
+	consoleURL string
+	// groupLoginState is the bypass ~/.aikey/run/group-login-required.json store
+	// consumed by `aikey statusline`. Always non-nil (set in New); written on
+	// login-required 401s, cleared on the next successful group resolve.
+	groupLoginState *groupLoginStateStore
 	// filterHook is the P4 filter dispatcher — a generic apphook.Hook
 	// (ai-compliance-detector / DLP / etc.) that inspects the inbound
 	// request body before forwarding. Nil = no filter (the common default
@@ -258,6 +267,7 @@ func New(v VaultGetter, reg *vkeys.Registry, prov *provider.Registry, coll *even
 		appHealthCache:     apppipe.NewHealthCache(),
 		poolCooldown:       newPoolCooldownStore(),
 		poolObservedResets: newPoolResetStore(),
+		groupLoginState:    newGroupLoginStateStore(),
 	}
 	if ar, ok := v.(ActiveKeyReader); ok {
 		p.activeReader = ar
@@ -324,6 +334,14 @@ func (p *Proxy) SetGroupKeyProvider(kp groupKeyProvider) {
 // editions/tests that don't run quota.
 func (p *Proxy) SetQuotaEnforcer(e *quota.Enforcer) {
 	p.quota = e
+}
+
+// SetConsoleURL injects Config.ConsoleURL (20260703 update) — the co-installed
+// local console base used to assemble the member-login URL in group
+// login-required responses. Safe to leave unset: "" degrades to URL-less
+// wording (cluster nodes / server-side proxies have no local console).
+func (p *Proxy) SetConsoleURL(u string) {
+	p.consoleURL = u
 }
 
 // AppHealthSnapshot returns the in-process record of the most recent

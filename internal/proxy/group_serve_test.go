@@ -7,9 +7,12 @@ package proxy
 // encrypted at-rest material.
 
 import (
+	"encoding/json"
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -330,6 +333,143 @@ func TestGroupServe_LoginRequiredReturns401(t *testing.T) {
 	}
 	if tr.host != "" {
 		t.Fatalf("login-required must not reach upstream, dialed %q", tr.host)
+	}
+}
+
+// Display contract (20260703 update, spike-verified in dev2): claude only renders
+// error.message verbatim for Anthropic-STANDARD error types — the previous custom
+// "login_required" type fell into the generic "API error · Retrying" path (11
+// blind retries) and the member never saw the sign-in prompt. With console_url
+// configured, login_url must be assembled by the PROXY (决策2: single assembly
+// point) and appear both as a field and inside the human message.
+func TestGroupServe_LoginRequiredDisplayContract(t *testing.T) {
+	key := grKey()
+	refs := []vkeys.GroupAccountRef{{AccountID: "acc-1", ProviderCode: "anthropic"}}
+	mat := map[string]vkeys.GroupRuntimeAccount{
+		"acc-1": {CredentialType: "oauth_account", NeedsLogin: true},
+	}
+	route := &vkeys.ResolvedRoute{
+		VirtualKeyID: "vk-grp", Provider: "anthropic", ProtocolType: "anthropic",
+		ProviderCode: "anthropic", RouteSource: "team",
+		SeatID: "seat-1", OauthGroupID: "grp-1",
+		GroupAccounts: mustJSON(t, refs), GroupRuntime: mustJSON(t, mat),
+	}
+	p, _ := setupGroupProxy(t, key, route)
+	p.SetConsoleURL("http://127.0.0.1:8090/") // trailing slash must not double up
+
+	req, w := groupReq(groupBody)
+	p.Handle(w, req)
+
+	if w.Code != http.StatusUnauthorized {
+		t.Fatalf("status=%d body=%s", w.Code, w.Body.String())
+	}
+	var resp struct {
+		Error struct {
+			Type    string `json:"type"`
+			Code    string `json:"code"`
+			Message string `json:"message"`
+		} `json:"error"`
+		Account  string `json:"account"`
+		LoginURL string `json:"login_url"`
+	}
+	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("401 body must stay valid JSON: %v — %s", err, w.Body.String())
+	}
+	if resp.Error.Type != "authentication_error" {
+		t.Fatalf("error.type=%q want authentication_error (custom types are NOT rendered by claude)", resp.Error.Type)
+	}
+	if resp.Error.Code != groupErrLoginRequired {
+		t.Fatalf("error.code=%q must keep the precise machine signal %q", resp.Error.Code, groupErrLoginRequired)
+	}
+	wantURL := "http://127.0.0.1:8090/user/team-oauth"
+	if resp.LoginURL != wantURL {
+		t.Fatalf("login_url=%q want %q", resp.LoginURL, wantURL)
+	}
+	if !strings.Contains(resp.Error.Message, wantURL) {
+		t.Fatalf("human message must carry the clickable URL (claude shows message only): %s", resp.Error.Message)
+	}
+
+	// Bypass statusline hint: the state file must exist with the SAME url
+	// (single assembly point) while login is pending...
+	statePath := filepath.Join(os.Getenv("AIKEY_RUN_DIR"), "group-login-required.json")
+	raw, err := os.ReadFile(statePath)
+	if err != nil {
+		t.Fatalf("state file must be written on login-required 401: %v", err)
+	}
+	var st struct {
+		AccountID string `json:"account_id"`
+		LoginURL  string `json:"login_url"`
+		WrittenAt int64  `json:"written_at"`
+	}
+	if err := json.Unmarshal(raw, &st); err != nil {
+		t.Fatalf("state file must be valid JSON: %v — %s", err, raw)
+	}
+	if st.AccountID != "acc-1" || st.LoginURL != wantURL || st.WrittenAt == 0 {
+		t.Fatalf("state file content mismatch: %+v", st)
+	}
+
+	// ...and be CLEARED by the next successful group resolve (member logged in),
+	// so statusline recovery is automatic — a stale hint would nag forever.
+	mat["acc-1"] = encMat(t, key, vkeys.GroupRuntimeAccount{
+		CredentialType: "oauth_account", ExpiresAt: 9_000_000_000, ExternalID: "uuid-1",
+	}, "oauth-tok-live")
+	route.GroupRuntime = mustJSON(t, mat)
+	req2, w2 := groupReq(groupBody)
+	p.Handle(w2, req2)
+	if w2.Code != http.StatusOK {
+		t.Fatalf("post-login request must succeed, got %d body=%s", w2.Code, w2.Body.String())
+	}
+	if _, err := os.Stat(statePath); !os.IsNotExist(err) {
+		t.Fatalf("state file must be cleared after a successful group resolve, stat err=%v", err)
+	}
+}
+
+// Empty console_url (cluster node / server-side proxy — no co-installed local
+// console) must degrade to URL-less wording, never a broken half-URL, and the
+// response must stay a well-formed 401 (main-path robustness).
+func TestGroupServe_LoginRequiredNoConsoleURLFallback(t *testing.T) {
+	key := grKey()
+	refs := []vkeys.GroupAccountRef{{AccountID: "acc-1", ProviderCode: "anthropic"}}
+	mat := map[string]vkeys.GroupRuntimeAccount{
+		"acc-1": {CredentialType: "oauth_account", NeedsLogin: true},
+	}
+	route := &vkeys.ResolvedRoute{
+		VirtualKeyID: "vk-grp", Provider: "anthropic", ProtocolType: "anthropic",
+		ProviderCode: "anthropic", RouteSource: "team",
+		SeatID: "seat-1", OauthGroupID: "grp-1",
+		GroupAccounts: mustJSON(t, refs), GroupRuntime: mustJSON(t, mat),
+	}
+	p, _ := setupGroupProxy(t, key, route) // console URL deliberately unset
+
+	req, w := groupReq(groupBody)
+	p.Handle(w, req)
+
+	if w.Code != http.StatusUnauthorized {
+		t.Fatalf("status=%d body=%s", w.Code, w.Body.String())
+	}
+	var resp struct {
+		Error struct {
+			Type    string `json:"type"`
+			Message string `json:"message"`
+		} `json:"error"`
+		LoginURL string `json:"login_url"`
+	}
+	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("401 body must stay valid JSON: %v — %s", err, w.Body.String())
+	}
+	if resp.LoginURL != "" {
+		t.Fatalf("login_url must be empty without console_url, got %q", resp.LoginURL)
+	}
+	if resp.Error.Type != "authentication_error" {
+		t.Fatalf("fallback must keep the displayable type, got %q", resp.Error.Type)
+	}
+	if strings.Contains(resp.Error.Message, "http://") || strings.Contains(resp.Error.Message, "https://") {
+		t.Fatalf("URL-less fallback must not leak a half-assembled URL: %s", resp.Error.Message)
+	}
+	// Even URL-less, the message must still point at the console page path so
+	// the member can find it manually.
+	if !strings.Contains(resp.Error.Message, "/user/team-oauth") {
+		t.Fatalf("fallback message must name the console page: %s", resp.Error.Message)
 	}
 }
 

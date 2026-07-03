@@ -22,6 +22,7 @@ import (
 	"encoding/json"
 	"log/slog"
 	"net/http"
+	"strings"
 	"time"
 
 	"github.com/AiKeyLabs/aikey-proxy/internal/observability"
@@ -82,6 +83,11 @@ func (p *Proxy) handleOauthGroupRoute(
 		p.degradeGroup(w, logger, route, code, groupDegradeMessage(code))
 		return
 	}
+
+	// Member has a token for the routed account ⇒ any earlier "login required"
+	// statusline hint is now stale — clear it (no-op unless one was written;
+	// see groupLoginStateStore.dirty).
+	p.groupLoginState.Clear(logger)
 
 	// Per-request copy — DO NOT mutate the shared registry route (see file doc).
 	rc := *route
@@ -211,36 +217,73 @@ func groupDegradeMessage(code string) string {
 	}
 }
 
+// groupLoginConsolePath is the local-console page where a member completes the
+// pool-account sign-in (C19 rename: /user/oauth-contribute → /user/team-oauth).
+// Appended to the configured console base to form login_url. The page route is
+// owned by aikey-control's local web router — a rename there must update this
+// constant (cross-repo contract, same as the JSON body shape below).
+const groupLoginConsolePath = "/user/team-oauth"
+
 // respondLoginRequired returns the RW2/D2 structured login prompt: the member has
 // no token for the HRW-routed account, so the client must run the local OAuth
-// login for THAT account (proxy did NOT skip to a later logged-in candidate). The
-// body carries the account id so the client opens the right login; login_url is
-// assembled client-side from its local contribute page (the proxy is not wired to
-// the local web base — tracked as carry-over). Status 401: the member must
-// authenticate to the account before the request can proceed.
+// login for THAT account (proxy did NOT skip to a later logged-in candidate).
+// Status 401: the member must authenticate to the account before the request can
+// proceed.
+//
+// Display contract (20260703 update, spike-verified in dev2):
+//   - error.type is "authentication_error" — the Anthropic-standard type — NOT a
+//     custom string. claude/codex only render error.message verbatim for types
+//     they recognize; the previous custom "login_required" type fell into the
+//     generic "API error · Retrying" path and the user never saw the prompt.
+//     Machine consumers keep the precise signal via error.code and the
+//     X-Aikey-Error-Source header (both stay OAUTH_GROUP_MEMBER_LOGIN_REQUIRED).
+//   - login_url is assembled HERE from Config.ConsoleURL (决策2: single assembly
+//     point — the statusline state file below reuses the same URL). Empty
+//     ConsoleURL (cluster node / server-side proxy) degrades to URL-less wording.
 func (p *Proxy) respondLoginRequired(w http.ResponseWriter, logger *slog.Logger, route *vkeys.ResolvedRoute, accountID string) {
+	loginURL := p.groupLoginURL()
 	logger.Info("group route requires member login",
 		"event.name", observability.EventProxyGroupLoginRequired,
 		"oauth_group_id", route.OauthGroupID,
 		"virtual_key_id", route.VirtualKeyID,
 		"account_id", accountID,
+		"login_url", loginURL,
 	)
+	// Bypass statusline hint (决策3): best-effort, never blocks the response.
+	p.groupLoginState.Write(logger, route.ProviderCode, accountID, loginURL)
+
+	message := "AiKey: log in to this shared account before use. " +
+		"Open your local AiKey console (" + groupLoginConsolePath + " page), complete sign-in, then retry."
+	if loginURL != "" {
+		message = "AiKey: log in to this shared account before use. " +
+			"Open " + loginURL + " and complete sign-in, then retry."
+	}
+
 	w.Header().Set("Content-Type", "application/json")
 	w.Header().Set(HeaderAikeyErrorSource, groupErrLoginRequired)
 	w.WriteHeader(http.StatusUnauthorized)
 	// json.Marshal (not string concat) so account ids / future fields can't break
-	// the JSON or inject — correct escaping for free. login_url is assembled
-	// client-side from the local console base (carry-over).
+	// the JSON or inject — correct escaping for free.
 	body, _ := json.Marshal(map[string]any{
 		"error": map[string]string{
-			"message": "Log in to this account to use it: open your local AiKey console and complete sign-in.",
-			"type":    "login_required",
+			"message": message,
+			"type":    "authentication_error",
 			"code":    groupErrLoginRequired,
 		},
 		"account":   accountID,
-		"login_url": "",
+		"login_url": loginURL,
 	})
 	_, _ = w.Write(body)
+}
+
+// groupLoginURL assembles the member-login page URL from the configured local
+// console base. "" when no console is co-installed (empty console_url).
+func (p *Proxy) groupLoginURL() string {
+	base := strings.TrimRight(p.consoleURL, "/")
+	if base == "" {
+		return ""
+	}
+	return base + groupLoginConsolePath
 }
 
 // groupDegradeStatus maps a resolver failure code to the HTTP status that gives the
