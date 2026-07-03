@@ -948,7 +948,7 @@ func readU32LEOrDefault(db *sql.DB, key string, defaultVal uint32) uint32 {
 // not yet exist.  Opens a fresh read-write connection so callers do not need
 // an existing Reader (e.g. the Supervisor calling this before vault.Open).
 func ReadConfigU64LE(dbPath, key string) (uint64, error) {
-	db, err := sql.Open("sqlite", dbPath)
+	db, err := sql.Open("sqlite", withBusyTimeoutDSN(dbPath))
 	if err != nil {
 		return 0, fmt.Errorf("open vault db for config read: %w", err)
 	}
@@ -977,7 +977,7 @@ func ReadConfigU64LE(dbPath, key string) (uint64, error) {
 // runtime.source_identity for delivery-integrity event stamping — written by
 // the CLI side (storage.rs SOURCE_IDENTITY_KEY).
 func ReadConfigString(dbPath, key string) (string, error) {
-	db, err := sql.Open("sqlite", dbPath)
+	db, err := sql.Open("sqlite", withBusyTimeoutDSN(dbPath))
 	if err != nil {
 		return "", fmt.Errorf("open vault db for config read: %w", err)
 	}
@@ -1640,7 +1640,7 @@ func (r *Reader) GetActiveAppKeysForSlug(slug string) (int, error) {
 // vault config table (INSERT OR REPLACE).  Opens its own connection so it can
 // be called independently of an existing Reader.
 func WriteConfigU64LE(dbPath, key string, value uint64) error {
-	db, err := sql.Open("sqlite", dbPath)
+	db, err := sql.Open("sqlite", withBusyTimeoutDSN(dbPath))
 	if err != nil {
 		return fmt.Errorf("open vault db for config write: %w", err)
 	}
@@ -1661,7 +1661,7 @@ func WriteConfigU64LE(dbPath, key string, value uint64) error {
 // table (INSERT OR REPLACE). Mirror of WriteConfigU64LE for non-numeric config
 // such as compliance.master_policy JSON. Opens its own connection.
 func WriteConfigString(dbPath, key, value string) error {
-	db, err := sql.Open("sqlite", dbPath)
+	db, err := sql.Open("sqlite", withBusyTimeoutDSN(dbPath))
 	if err != nil {
 		return fmt.Errorf("open vault db for config write: %w", err)
 	}
@@ -1679,8 +1679,16 @@ func WriteConfigString(dbPath, key, value string) error {
 // window/meta). Only managed_virtual_keys_cache.group_runtime is touched — never
 // the CLI-owned structural columns (which the CLI's sync fences this out of). A
 // separate write connection mirrors WriteConfigString's pattern.
+//
+// busy_timeout is MANDATORY here (2026-07-03, Ubuntu client-leg regression):
+// modernc's default busy_timeout is 0 — the UPDATE fails instantly with
+// SQLITE_BUSY whenever any reader (CLI vault poll, second proxy connection)
+// briefly holds the lock. The supervisor's 60s pull cycle then aborts and
+// group VKs 503 "credentials are still syncing" for minutes on Linux, where
+// the lock timing loses far more often than on macOS. Same guard applied to
+// the config read/write helpers above — do not reintroduce raw dbPath opens.
 func WriteGroupRuntime(dbPath, virtualKeyID, jsonValue string) error {
-	db, err := sql.Open("sqlite", dbPath)
+	db, err := sql.Open("sqlite", withBusyTimeoutDSN(dbPath))
 	if err != nil {
 		return fmt.Errorf("open vault db for group_runtime write: %w", err)
 	}
