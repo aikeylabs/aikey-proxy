@@ -36,6 +36,22 @@ const (
 	EventProxyControlPlaneRestartExhausted = "proxy.control_plane.restart_budget_exhausted"
 )
 
+// SyncRail events (2026-07-03): control-plane sync rail state transitions.
+// A rail keeps serving last-known data and retrying forever in every state —
+// these events are the VISIBILITY the old silent keep-last-known loops lacked
+// (bugfix 2026-07-03-routing-override-rail-silent-stall.md). See
+// supervisor/railset.go.
+const (
+	EventProxySyncRailStale         = "proxy.sync.rail_stale"
+	EventProxySyncRailOffline       = "proxy.sync.rail_offline"
+	EventProxySyncRailRecovered     = "proxy.sync.rail_recovered"
+	EventProxySyncCredentialRebuilt = "proxy.sync.credential_rebuilt"
+	// EventProxySyncHealthFileFailed: the statusline sync-health bypass file
+	// (~/.aikey/run/sync-health.json) could not be written/removed — the claude
+	// status bar may show a stale (or miss a fresh) sync warning.
+	EventProxySyncHealthFileFailed = "proxy.sync.health_file_failed"
+)
+
 // Health events.
 const (
 	EventProxyHealthOk        = "proxy.health.ok"

@@ -1,30 +1,36 @@
-// routing_override_policy.go — I-side §6.5 keystone (supervisor poll). Mirror of
-// group_runtime_policy.go: the always-on proxy pulls the account-level routing
-// override endpoint from master (GET /accounts/me/routing, account-JWT) every
-// ~60s and stores the sparse seat→account assignments in the shared in-memory
-// RoutingOverrideCache. The group-route resolver (group_serve.go → group_resolve.go
-// §6.5) reads it at request time to redirect a seat off an unhealthy default.
+// routing_override_policy.go — I-side §6.5: the allocation engine's seat→account
+// routing-override rail. Pulls GET /accounts/me/routing (account-JWT) and stores
+// the sparse assignments in the shared in-memory RoutingOverrideCache the
+// group-route resolver reads at request time.
+//
+// Since 2026-07-03 this rail is DRIVEN BY THE SYNCRAIL FRAMEWORK (railset.go):
+// gate, generation, control URL and team credential are re-evaluated every
+// cycle, failures are counted into the OK→STALE→OFFLINE visibility state
+// machine, and Reload kicks an immediate cycle. The old hand-written loop built
+// its credential once at start and early-returned forever on any precondition
+// miss — silently (bugfix 2026-07-03-routing-override-rail-silent-stall.md).
 //
 // WHY proxy (not CLI): the engine recomputes overrides as account health drifts;
 // the CLI isn't always running. Same master-poll rail compliance/quota/group-runtime
 // already use.
 //
-// MAIN-LINK SAFETY: on master error / non-200 / timeout / no-auth this returns
-// without touching the cache (keep-last-known, never flap), and the cache is a
-// pure redirect layer the resolver always falls back from. A poll panic is
-// isolated by GoSafe in supervisor.New — it can never affect the data path.
+// MAIN-LINK SAFETY: on master error / non-200 / timeout / no-auth the cycle
+// returns an error WITHOUT touching the cache (keep-last-known, never flap) —
+// the framework makes the failure visible, the cache is a pure redirect layer
+// the resolver always falls back from.
 package supervisor
 
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"io"
 	"log/slog"
 	"net/http"
 	"time"
 
-	"github.com/AiKeyLabs/aikey-proxy/internal/events"
 	"github.com/AiKeyLabs/aikey-proxy/internal/httpx"
+	"github.com/AiKeyLabs/aikey-proxy/internal/vault"
 	"github.com/AiKeyLabs/pkg/routingwire"
 )
 
@@ -32,60 +38,155 @@ const routingOverridePollInterval = 60 * time.Second
 
 var routingOverrideHTTPClient = httpx.NewSwappableDirect(10 * time.Second)
 
-// pollRoutingOverrides runs until ctx is canceled, pulling the account's routing
-// overrides every routingOverridePollInterval (plus once at start). No-op unless
-// the oauth-group feature is enabled (without group VKs there is no seat to
-// redirect). The account-JWT credential is built ONCE and reused across cycles —
-// same scoping as pollGroupRuntime (one Bearer refresh window). The endpoint is
-// single-account ("me") scoped, matching the local proxy which serves exactly the
-// one logged-in account's seats — the same scoping group-runtime already relies on.
-func (s *Supervisor) pollRoutingOverrides(ctx context.Context) {
-	if !oauthGroupRoutingEnabled() {
-		return // feature off → no group VKs → nothing to redirect
+// routingOverrideRail declares this rail for the SyncRail framework. Gate: the
+// oauth-group feature is on AND this vault actually has group VKs — a personal
+// install without them is idle by design (no failure noise), and the old
+// always-pull behavior fetched overrides no resolver would ever read.
+func (s *Supervisor) routingOverrideRail() railSpec {
+	return railSpec{
+		name:         "routing_override",
+		interval:     routingOverridePollInterval,
+		needsTeamJWT: true,
+		gate: func(gen *generation) bool {
+			return oauthGroupRoutingEnabled() && len(s.localSeatGroupsFor(gen)) > 0
+		},
+		hydrate: s.hydrateRoutingOverrides,
+		sync:    s.syncRoutingOverrides,
 	}
-	gen := s.active.Load()
-	if gen == nil || gen.vault == nil {
-		return
-	}
-	cred := buildCollectorCredentials(s.cfg.Events.CollectorCredentials, gen.vault)["team"]
-	if cred == nil {
-		// Pre-login / no team credential → nothing to pull with. A reload after
-		// `aikey account login` re-runs startup and picks it up.
-		return
-	}
+}
 
-	s.syncRoutingOverrides(ctx, cred)
-	ticker := time.NewTicker(routingOverridePollInterval)
-	defer ticker.Stop()
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		case <-ticker.C:
-			s.syncRoutingOverrides(ctx, cred)
+// persistedAssignment is the my_assignment_override column payload — the
+// engine's last-known assignment for one VK's (seat, group), written on each
+// applied routing_version so a proxy restart resumes with the SAME pick the
+// engine last issued (N12's persistence leg; without it the restart window fell
+// back to the local ranked pick, the 2026-07-03 incident amplifier).
+type persistedAssignment struct {
+	AccountID string `json:"account_id,omitempty"`
+	Blocked   bool   `json:"blocked,omitempty"`
+	// RoutingVersion audits which engine version issued this assignment and
+	// lets hydrate pick the newest across rows written at different times.
+	RoutingVersion int64 `json:"routing_version"`
+	// SyncedAt (unix) makes staleness inspectable (SELECT-level debugging).
+	SyncedAt int64 `json:"synced_at"`
+}
+
+// hydrateRoutingOverrides preloads the in-memory override cache from the
+// persisted my_assignment_override columns — runs once before the rail's first
+// pull so the restart window serves the engine's last-known assignments instead
+// of falling back to the local ranked pick (§5.3). A later successful pull is
+// authoritative and overwrites both the cache and the columns.
+func (s *Supervisor) hydrateRoutingOverrides(gen *generation) {
+	if !oauthGroupRoutingEnabled() || s.routingOverrides == nil || s.routingOverrides.Stored() {
+		return
+	}
+	mks, err := gen.vault.GetActiveManagedKeys()
+	if err != nil {
+		return // best-effort: the first pull populates the cache anyway
+	}
+	// Rebuild wire entries and ingest through StoreRoutes — the ONLY public key
+	// builder — so the (seat,group) cache-key encoding stays private to the
+	// proxy package (its file-doc contract).
+	var entries []routingwire.RouteEntry
+	var version int64
+	for i := range mks {
+		mk := mks[i]
+		if mk.OauthGroupID == "" || mk.SeatID == "" || mk.MyAssignmentOverride == "" {
+			continue
+		}
+		var pa persistedAssignment
+		if json.Unmarshal([]byte(mk.MyAssignmentOverride), &pa) != nil {
+			continue // corrupt row: skip it, never fail the hydrate
+		}
+		if !pa.Blocked && pa.AccountID == "" {
+			continue
+		}
+		entries = append(entries, routingwire.RouteEntry{
+			SeatID: mk.SeatID, GroupID: mk.OauthGroupID,
+			AccountID: pa.AccountID, Blocked: pa.Blocked,
+		})
+		if pa.RoutingVersion > version {
+			version = pa.RoutingVersion
+		}
+	}
+	if len(entries) == 0 {
+		return
+	}
+	s.routingOverrides.StoreRoutes(version, entries)
+	slog.Info("routing overrides hydrated from vault (last-known, pre-pull)",
+		"event.name", "proxy.routing_override.hydrated",
+		"routing_version", version, "entries", len(entries))
+}
+
+// persistAssignmentOverrides mirrors the freshly-stored cache into each group
+// VK's my_assignment_override column. Write-on-change only (steady state is
+// zero writes); a VK the engine no longer overrides gets its column cleared so
+// hydrate can't resurrect a withdrawn assignment. The live pull is
+// authoritative — it overwrites regardless of version direction (a reinstalled
+// master may legitimately restart its version counter); RoutingVersion in the
+// payload exists for hydrate ordering and auditability, not as a write gate.
+func (s *Supervisor) persistAssignmentOverrides(gen *generation, version int64) {
+	mks, err := gen.vault.GetActiveManagedKeys()
+	if err != nil {
+		return
+	}
+	now := time.Now().Unix()
+	for i := range mks {
+		mk := mks[i]
+		if mk.OauthGroupID == "" || mk.SeatID == "" {
+			continue
+		}
+		acct := s.routingOverrides.Assignment(mk.SeatID, mk.OauthGroupID)
+		blk := s.routingOverrides.Blocked(mk.SeatID, mk.OauthGroupID)
+		desired := ""
+		if acct != "" || blk {
+			b, mErr := json.Marshal(persistedAssignment{
+				AccountID: acct, Blocked: blk, RoutingVersion: version, SyncedAt: now,
+			})
+			if mErr != nil {
+				continue
+			}
+			desired = string(b)
+		}
+		if sameAssignmentPayload(mk.MyAssignmentOverride, desired) {
+			continue // steady state: same assignment at same version → no write
+		}
+		if err := vault.WriteAssignmentOverride(s.cfg.Vault.Path, mk.VirtualKeyID, desired); err != nil {
+			// Persistence is an enhancement, not a dependency: the in-memory cache
+			// already serves this cycle; WARN (mandatory-visibility) and move on.
+			slog.Warn("my_assignment_override write failed — restart hydrate will miss this assignment",
+				"event.name", "proxy.routing_override.persist_failed",
+				"virtual_key_id", mk.VirtualKeyID, "error", err.Error())
 		}
 	}
 }
 
-// syncRoutingOverrides pulls the account's routing overrides and, only when the
-// routing_version actually advanced, replaces the shared cache. On any error it
-// returns leaving the last-known assignments in place (don't flap). Mirrors
-// syncGroupRuntime's version-skip + keep-last-known shape.
-func (s *Supervisor) syncRoutingOverrides(ctx context.Context, cred events.Credential) {
+// sameAssignmentPayload compares two persisted payloads ignoring synced_at (a
+// re-write that only bumps the timestamp is churn, not information).
+func sameAssignmentPayload(existing, desired string) bool {
+	if existing == desired {
+		return true
+	}
+	if existing == "" || desired == "" {
+		return false
+	}
+	var a, b persistedAssignment
+	if json.Unmarshal([]byte(existing), &a) != nil || json.Unmarshal([]byte(desired), &b) != nil {
+		return false
+	}
+	return a.AccountID == b.AccountID && a.Blocked == b.Blocked && a.RoutingVersion == b.RoutingVersion
+}
+
+// syncRoutingOverrides runs one pull. Only when the routing_version actually
+// advanced does it replace the shared cache; a fetch error keeps the last-known
+// assignments in place (don't flap) and is COUNTED by the framework (no more
+// silent returns). Mirrors syncGroupRuntime's version-skip + keep-last-known.
+func (s *Supervisor) syncRoutingOverrides(ctx context.Context, gen *generation, masterURL, bearer string) error {
 	if s.routingOverrides == nil {
-		return
+		return nil
 	}
-	masterURL := readControlPanelURL()
-	if masterURL == "" {
-		return
-	}
-	bearer, err := cred.Bearer(ctx)
+	version, routes, err := fetchRoutingOverrides(ctx, masterURL, bearer)
 	if err != nil {
-		return // can't auth → keep last-known
-	}
-	version, routes, ok := fetchRoutingOverrides(ctx, masterURL, bearer)
-	if !ok {
-		return // unreachable / bad response → keep last-known (don't clear)
+		return err // keep last-known; framework counts + surfaces
 	}
 	// Skip only once we've ALREADY stored at this version. The Stored() guard
 	// closes the first-pull-at-version-0 hole: the cache's version atomic starts
@@ -94,7 +195,7 @@ func (s *Supervisor) syncRoutingOverrides(ctx context.Context, cred events.Crede
 	// override never applied, no signal). After the first Store, steady-state
 	// re-pulls of the same version skip as before (no churn, no log spam).
 	if s.routingOverrides.Stored() && s.routingOverrides.Version() == version {
-		return // unchanged → no churn (empty route set skip is harmless: lookups miss either way)
+		return nil // unchanged → no churn (a successful no-op cycle IS a success)
 	}
 	bound, blocked := s.routingOverrides.StoreRoutes(version, routes)
 	slog.Info("routing overrides updated",
@@ -106,7 +207,7 @@ func (s *Supervisor) syncRoutingOverrides(ctx context.Context, cred events.Crede
 	// account) — a failure that is otherwise indistinguishable from "no overrides".
 	// WARN once per routing_version (the ticker would repeat it every 60s otherwise).
 	// Mandatory-WARN rule: fallback-to-default paths must log.
-	if len(routes) > 0 && !routesMatchAnyLocal(routes, s.localSeatGroups()) {
+	if len(routes) > 0 && !routesMatchAnyLocal(routes, s.localSeatGroupsFor(gen)) {
 		if s.lastRoutingMismatchVersion.Swap(version) != version {
 			slog.Warn("routing overrides matched no local group VK — wire format / account mismatch?",
 				"event.name", "proxy.routing_override.format_mismatch",
@@ -119,39 +220,45 @@ func (s *Supervisor) syncRoutingOverrides(ctx context.Context, cred events.Crede
 	// the next material refresh. Display-only + network-free (RMW on the cached column);
 	// the routing redirect itself already took effect via the override cache above.
 	s.restampCurrentRouted()
+	// N12 persistence leg (2026-07-03): mirror the applied assignments to the
+	// my_assignment_override columns so a restart hydrates the same picks (§5.3).
+	s.persistAssignmentOverrides(gen, version)
+	return nil
 }
 
 // fetchRoutingOverrides GETs the routing endpoint with an account-JWT Bearer and
 // decodes the SHARED wire DTO (pkg/routingwire — the same structs master emits, so
-// the two repos cannot drift). Returns (version, routes, ok); ok=false on ANY error
-// so the caller keeps the last-known cache (don't flap). nil routes normalize to an
-// empty slice so an ok=true pull always carries a concrete (possibly empty) set.
-func fetchRoutingOverrides(ctx context.Context, masterURL, bearer string) (int64, []routingwire.RouteEntry, bool) {
+// the two repos cannot drift). Returns a non-nil error on ANY failure so the
+// caller keeps the last-known cache AND the framework can surface the underlying
+// cause (a bare ok=false hid the connection-refused detail that mattered most in
+// the 2026-07-03 incident). nil routes normalize to an empty slice so a
+// successful pull always carries a concrete (possibly empty) set.
+func fetchRoutingOverrides(ctx context.Context, masterURL, bearer string) (int64, []routingwire.RouteEntry, error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, masterURL+"/accounts/me/routing", http.NoBody)
 	if err != nil {
-		return 0, nil, false
+		return 0, nil, err
 	}
 	req.Header.Set("Authorization", "Bearer "+bearer)
 	resp, err := routingOverrideHTTPClient.Get().Do(req)
 	if err != nil {
-		return 0, nil, false
+		return 0, nil, err
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
-		return 0, nil, false
+		return 0, nil, fmt.Errorf("GET /accounts/me/routing: HTTP %d", resp.StatusCode)
 	}
 	body, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
 	if err != nil {
-		return 0, nil, false
+		return 0, nil, err
 	}
 	var out routingwire.RoutingResponse
 	if err := json.Unmarshal(body, &out); err != nil {
-		return 0, nil, false
+		return 0, nil, fmt.Errorf("decode routing response: %w", err)
 	}
 	if out.Routes == nil {
 		out.Routes = []routingwire.RouteEntry{}
 	}
-	return out.RoutingVersion, out.Routes, true
+	return out.RoutingVersion, out.Routes, nil
 }
 
 // routesMatchAnyLocal reports whether at least one wire entry targets one of this
@@ -166,11 +273,10 @@ func routesMatchAnyLocal(routes []routingwire.RouteEntry, local map[[2]string]bo
 	return false
 }
 
-// localSeatGroups collects the (seat, group) pairs of this vault's group VKs — the
-// set a healthy routing payload should intersect. Empty on any read problem (the
-// mismatch WARN then stays silent: no local expectation, nothing to mismatch).
-func (s *Supervisor) localSeatGroups() map[[2]string]bool {
-	gen := s.active.Load()
+// localSeatGroupsFor collects the (seat, group) pairs of a generation's group VKs
+// — the set a healthy routing payload should intersect, and this rail's gate
+// ("is there anything to route locally?"). Empty on any read problem.
+func (s *Supervisor) localSeatGroupsFor(gen *generation) map[[2]string]bool {
 	if gen == nil || gen.vault == nil {
 		return nil
 	}
@@ -185,4 +291,9 @@ func (s *Supervisor) localSeatGroups() map[[2]string]bool {
 		}
 	}
 	return out
+}
+
+// localSeatGroups keeps the historical accessor shape (current generation).
+func (s *Supervisor) localSeatGroups() map[[2]string]bool {
+	return s.localSeatGroupsFor(s.active.Load())
 }

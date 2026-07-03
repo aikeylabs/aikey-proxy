@@ -101,9 +101,9 @@ func TestFetchGroupRuntime_ParsesAndSendsBearer(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	groups, body, ok := fetchGroupRuntime(context.Background(), srv.URL, "JWT123", map[string]int64{"acc-1": 1750000000})
-	if !ok || len(groups) != 1 || groups[0].OauthGroupID != "grp-1" || len(groups[0].Accounts) != 1 {
-		t.Fatalf("fetch: ok=%v groups=%+v", ok, groups)
+	groups, body, err := fetchGroupRuntime(context.Background(), srv.URL, "JWT123", map[string]int64{"acc-1": 1750000000})
+	if err != nil || len(groups) != 1 || groups[0].OauthGroupID != "grp-1" || len(groups[0].Accounts) != 1 {
+		t.Fatalf("fetch: err=%v groups=%+v", err, groups)
 	}
 	if body == "" || !strings.Contains(body, "grp-1") {
 		t.Fatalf("raw body (change signature) missing: %q", body)
@@ -134,8 +134,8 @@ func TestFetchGroupRuntime_ParsesAndSendsBearer(t *testing.T) {
 		w.WriteHeader(401)
 	}))
 	defer bad.Close()
-	if _, _, ok := fetchGroupRuntime(context.Background(), bad.URL, "x", nil); ok {
-		t.Fatal("401 must yield ok=false")
+	if _, _, err := fetchGroupRuntime(context.Background(), bad.URL, "x", nil); err == nil {
+		t.Fatal("401 must yield a non-nil error (keep-last-known + rail failure count)")
 	}
 	if gotObs2 != "" {
 		t.Fatalf("nil observed-resets must omit the header, got %q", gotObs2)

@@ -29,9 +29,9 @@ func TestFetchRoutingOverrides_ParsesAndSendsBearer(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	version, routes, ok := fetchRoutingOverrides(context.Background(), srv.URL, "JWT123")
-	if !ok || version != 42 || len(routes) != 3 {
-		t.Fatalf("fetch: ok=%v version=%d routes=%d", ok, version, len(routes))
+	version, routes, err := fetchRoutingOverrides(context.Background(), srv.URL, "JWT123")
+	if err != nil || version != 42 || len(routes) != 3 {
+		t.Fatalf("fetch: err=%v version=%d routes=%d", err, version, len(routes))
 	}
 	if routes[0].AccountID != "acc-9" || routes[1].GroupID != "g2" || !routes[2].Blocked {
 		t.Fatalf("routes not parsed: %+v", routes)
@@ -61,18 +61,18 @@ func TestFetchRoutingOverrides_ParsesAndSendsBearer(t *testing.T) {
 		_, _ = w.Write([]byte(`{"routing_version":7}`))
 	}))
 	defer empty.Close()
-	v, rts, ok := fetchRoutingOverrides(context.Background(), empty.URL, "x")
-	if !ok || v != 7 || rts == nil || len(rts) != 0 {
-		t.Fatalf("empty-routes pull: ok=%v v=%d routes=%+v", ok, v, rts)
+	v, rts, err := fetchRoutingOverrides(context.Background(), empty.URL, "x")
+	if err != nil || v != 7 || rts == nil || len(rts) != 0 {
+		t.Fatalf("empty-routes pull: err=%v v=%d routes=%+v", err, v, rts)
 	}
 
-	// Non-200 → ok=false (caller keeps last-known).
+	// Non-200 → error (caller keeps last-known; framework surfaces the cause).
 	bad := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(401)
 	}))
 	defer bad.Close()
-	if _, _, ok := fetchRoutingOverrides(context.Background(), bad.URL, "x"); ok {
-		t.Fatal("401 must yield ok=false")
+	if _, _, err := fetchRoutingOverrides(context.Background(), bad.URL, "x"); err == nil {
+		t.Fatal("401 must yield a non-nil error")
 	}
 }
 
@@ -84,11 +84,11 @@ func TestRoutingOverride_KeepLastKnownOnFailure(t *testing.T) {
 	cache := proxy.NewRoutingOverrideCache()
 	cache.StoreRoutes(1, []routingwire.RouteEntry{{SeatID: "seat-1", GroupID: "g1", AccountID: "acc-1"}})
 
-	// fetch against a dead endpoint → ok=false → syncRoutingOverrides would return
+	// fetch against a dead endpoint → error → syncRoutingOverrides returns it
 	// WITHOUT touching the cache. Assert by simulating that control flow.
-	_, _, ok := fetchRoutingOverrides(context.Background(), "http://127.0.0.1:0", "x")
-	if ok {
-		t.Fatal("unreachable endpoint must yield ok=false")
+	_, _, err := fetchRoutingOverrides(context.Background(), "http://127.0.0.1:0", "x")
+	if err == nil {
+		t.Fatal("unreachable endpoint must yield a non-nil error")
 	}
 	// Cache untouched.
 	if v := cache.Version(); v != 1 {

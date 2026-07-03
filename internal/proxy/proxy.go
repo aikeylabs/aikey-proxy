@@ -114,6 +114,11 @@ type Proxy struct {
 	// consumed by `aikey statusline`. Always non-nil (set in New); written on
 	// login-required 401s, cleared on the next successful group resolve.
 	groupLoginState *groupLoginStateStore
+	// routingRailHealth probes the routing_override SyncRail state (SyncRail
+	// §5.4, 2026-07-03): stale/offline → the login-required 401 wording says
+	// "routing sync unreachable" instead of a possibly-misdirected sign-in
+	// prompt (the incident shape: local pick ≠ engine assignment). nil = ok.
+	routingRailHealth func() (state string, failingSeconds int64)
 	// filterHook is the P4 filter dispatcher — a generic apphook.Hook
 	// (ai-compliance-detector / DLP / etc.) that inspects the inbound
 	// request body before forwarding. Nil = no filter (the common default
@@ -342,6 +347,16 @@ func (p *Proxy) SetQuotaEnforcer(e *quota.Enforcer) {
 // wording (cluster nodes / server-side proxies have no local console).
 func (p *Proxy) SetConsoleURL(u string) {
 	p.consoleURL = u
+}
+
+// SetRoutingRailHealth injects the supervisor's routing_override SyncRail
+// health probe (SyncRail §5.4, 2026-07-03). respondLoginRequired consults it:
+// when the assignment rail is stale/offline the local ranked pick may
+// contradict the engine (the 2026-07-03 incident shape), so the 401 must say
+// "routing sync unreachable" instead of directing the member to sign into a
+// possibly-wrong account. nil (tests / framework off) → treated as healthy.
+func (p *Proxy) SetRoutingRailHealth(fn func() (state string, failingSeconds int64)) {
+	p.routingRailHealth = fn
 }
 
 // AppHealthSnapshot returns the in-process record of the most recent

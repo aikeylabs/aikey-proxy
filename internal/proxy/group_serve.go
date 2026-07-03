@@ -20,6 +20,7 @@ package proxy
 
 import (
 	"encoding/json"
+	"fmt"
 	"log/slog"
 	"net/http"
 	"strings"
@@ -259,21 +260,56 @@ func (p *Proxy) respondLoginRequired(w http.ResponseWriter, logger *slog.Logger,
 			"Open " + loginURL + " and complete sign-in, then retry."
 	}
 
+	// SyncRail truthful wording (§5.4, 2026-07-03 incident): when the engine's
+	// assignment rail is stale/offline, THIS pick came from the local ranked
+	// fallback and may contradict what the team-oauth page shows (the engine may
+	// have routed the seat to an account the member already signed into). Saying
+	// "go log in" then sends the member on a wild-goose chase — say what is
+	// actually wrong instead. reason stays machine-readable; error.code and the
+	// header keep the precise signal unchanged (additive contract only).
+	reason := ""
+	if p.routingRailHealth != nil {
+		if st, downSecs := p.routingRailHealth(); st == "stale" || st == "offline" {
+			reason = "routing_sync_unavailable"
+			message = "AiKey: account routing sync with your team server has been unreachable for " +
+				humanDuration(downSecs) + ", so this sign-in request may be misdirected. " +
+				"Check the connection to your team server (aikey status), or contact your admin. " +
+				"If the account shown on your console is already signed in, this error should clear once sync recovers."
+		}
+	}
+
 	w.Header().Set("Content-Type", "application/json")
 	w.Header().Set(HeaderAikeyErrorSource, groupErrLoginRequired)
 	w.WriteHeader(http.StatusUnauthorized)
+	errObj := map[string]string{
+		"message": message,
+		"type":    "authentication_error",
+		"code":    groupErrLoginRequired,
+	}
+	if reason != "" {
+		errObj["reason"] = reason
+	}
 	// json.Marshal (not string concat) so account ids / future fields can't break
 	// the JSON or inject — correct escaping for free.
 	body, _ := json.Marshal(map[string]any{
-		"error": map[string]string{
-			"message": message,
-			"type":    "authentication_error",
-			"code":    groupErrLoginRequired,
-		},
+		"error":     errObj,
 		"account":   accountID,
 		"login_url": loginURL,
 	})
 	_, _ = w.Write(body)
+}
+
+// humanDuration renders seconds as a coarse "N min" / "N h" for user-facing
+// error text (en-US wording per the code-and-ui-language rule).
+func humanDuration(secs int64) string {
+	switch {
+	case secs >= 3600:
+		return fmt.Sprintf("%d h", secs/3600)
+	case secs >= 60:
+		return fmt.Sprintf("%d min", secs/60)
+	default:
+		return fmt.Sprintf("%d s", secs)
+	}
 }
 
 // groupLoginURL assembles the member-login page URL from the configured local

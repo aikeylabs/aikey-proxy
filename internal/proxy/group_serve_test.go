@@ -783,3 +783,85 @@ func TestGroupDegradeMessage(t *testing.T) {
 		t.Errorf("group degrade messages must differ per code:\n  noCand=%q\n  noMat=%q\n  allUnusable=%q", noCand, noMat, allUnusable)
 	}
 }
+
+// SyncRail truthful wording (§5.4, 2026-07-03 incident): when the engine's
+// assignment rail is STALE/OFFLINE, the pick behind this 401 came from the
+// LOCAL ranked fallback and may contradict the engine (the member may already
+// be signed into the account the engine actually routed them to). The 401 must
+// then say "routing sync unreachable" — not direct the member to sign into a
+// possibly-wrong account — and carry the machine-readable reason. A healthy
+// rail keeps the normal sign-in prompt with NO reason field (additive contract).
+func TestGroupServe_LoginRequiredRailStateWording(t *testing.T) {
+	key := grKey()
+	refs := []vkeys.GroupAccountRef{{AccountID: "acc-1", ProviderCode: "anthropic"}}
+	mat := map[string]vkeys.GroupRuntimeAccount{
+		"acc-1": {CredentialType: "oauth_account", NeedsLogin: true},
+	}
+	route := &vkeys.ResolvedRoute{
+		VirtualKeyID: "vk-grp", Provider: "anthropic", ProtocolType: "anthropic",
+		ProviderCode: "anthropic", RouteSource: "team",
+		SeatID: "seat-1", OauthGroupID: "grp-1",
+		GroupAccounts: mustJSON(t, refs), GroupRuntime: mustJSON(t, mat),
+	}
+
+	decode := func(w *httptest.ResponseRecorder) (string, string) {
+		var resp struct {
+			Error struct {
+				Message string `json:"message"`
+				Reason  string `json:"reason"`
+			} `json:"error"`
+		}
+		if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+			t.Fatalf("401 body must stay valid JSON: %v — %s", err, w.Body.String())
+		}
+		return resp.Error.Message, resp.Error.Reason
+	}
+
+	// Healthy rail (probe says ok): normal sign-in prompt, no reason field.
+	p, _ := setupGroupProxy(t, key, route)
+	p.SetConsoleURL("http://127.0.0.1:8090")
+	p.SetRoutingRailHealth(func() (string, int64) { return "ok", 0 })
+	req, w := groupReq(groupBody)
+	p.Handle(w, req)
+	if w.Code != http.StatusUnauthorized {
+		t.Fatalf("status=%d body=%s", w.Code, w.Body.String())
+	}
+	msg, reason := decode(w)
+	if !strings.Contains(msg, "sign-in") || reason != "" {
+		t.Fatalf("healthy rail must keep the sign-in prompt with no reason: msg=%q reason=%q", msg, reason)
+	}
+
+	// Degraded rail: truthful wording + machine-readable reason; code and header
+	// unchanged (additive-only contract).
+	p2, _ := setupGroupProxy(t, key, route)
+	p2.SetConsoleURL("http://127.0.0.1:8090")
+	p2.SetRoutingRailHealth(func() (string, int64) { return "offline", 23 * 60 })
+	req2, w2 := groupReq(groupBody)
+	p2.Handle(w2, req2)
+	if w2.Code != http.StatusUnauthorized {
+		t.Fatalf("degraded-rail status=%d body=%s", w2.Code, w2.Body.String())
+	}
+	msg2, reason2 := decode(w2)
+	if reason2 != "routing_sync_unavailable" {
+		t.Fatalf("degraded rail must set reason=routing_sync_unavailable, got %q", reason2)
+	}
+	if !strings.Contains(msg2, "unreachable for 23 min") {
+		t.Fatalf("degraded wording must state the outage duration: %q", msg2)
+	}
+	if strings.Contains(msg2, "complete sign-in, then retry") {
+		t.Fatalf("degraded wording must NOT blindly direct a sign-in: %q", msg2)
+	}
+	if got := w2.Header().Get(HeaderAikeyErrorSource); got != groupErrLoginRequired {
+		t.Fatalf("header signal must stay %q, got %q", groupErrLoginRequired, got)
+	}
+
+	// nil probe (framework off / older wiring): behaves as healthy.
+	p3, _ := setupGroupProxy(t, key, route)
+	p3.SetConsoleURL("http://127.0.0.1:8090")
+	req3, w3 := groupReq(groupBody)
+	p3.Handle(w3, req3)
+	msg3, reason3 := decode(w3)
+	if !strings.Contains(msg3, "sign-in") || reason3 != "" {
+		t.Fatalf("nil probe must behave as healthy: msg=%q reason=%q", msg3, reason3)
+	}
+}

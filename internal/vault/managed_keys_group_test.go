@@ -19,7 +19,10 @@ func newManagedKeysReader(t *testing.T, withGroup bool) *Reader {
 	t.Cleanup(func() { db.Close() })
 	groupCols := ""
 	if withGroup {
-		groupCols = ", oauth_group_id TEXT, group_accounts TEXT, group_runtime TEXT, routing_config TEXT"
+		// Mirrors the CLI migration (migrations.rs), which adds all five group
+		// columns in ONE batch — a vault with oauth_group_id always has
+		// my_assignment_override too, so the group-aware query may select both.
+		groupCols = ", oauth_group_id TEXT, group_accounts TEXT, group_runtime TEXT, routing_config TEXT, my_assignment_override TEXT"
 	}
 	if _, err := db.Exec(`CREATE TABLE managed_virtual_keys_cache (
 		virtual_key_id TEXT PRIMARY KEY, alias TEXT NOT NULL, local_alias TEXT,
