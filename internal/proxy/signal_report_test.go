@@ -334,6 +334,16 @@ func TestIsHardRevoked(t *testing.T) {
 		{"401_plain_expiry", 401, "authentication_error", "token expired", false},
 		{"429_revoked", 429, "", "revoked", false},
 		{"200_ok", 200, "", "", false},
+		// codex/openai hard-revocation shapes (sub2api-derived, R37 2026-07-04):
+		// errMsg is the raw body. token_invalidated has NO "revoked" substring, so
+		// the old matcher missed it; the {"detail":"Unauthorized"} form is
+		// non-standard (no error envelope at all).
+		{"401_codex_token_invalidated", 401, "", `{"error":{"code":"token_invalidated"}}`, true},
+		{"401_codex_token_revoked_code", 401, "", `{"error":{"code":"token_revoked"}}`, true},
+		{"401_codex_detail_unauthorized", 401, "", `{"detail":"Unauthorized"}`, true},
+		// a plain codex 401 (transient / refresh-recoverable) must NOT quarantine.
+		{"401_codex_plain", 401, "", `{"error":{"message":"invalid token"}}`, false},
+		{"401_generic_unauthorized_word", 401, "", "request was unauthorized, please retry", false},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {

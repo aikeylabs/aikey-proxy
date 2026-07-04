@@ -406,17 +406,22 @@ func parseUnifiedUtil7d(h http.Header) (float64, bool) {
 
 // isHardRevoked reports whether a 401 upstream response means the credential's
 // OAuth token was HARD-revoked (gone for good) vs a routine expiry the refresh
-// path recovers from. Anthropic returns 401 with an "OAuth token has been
-// revoked" message in the hard case. We gate on status==401 AND the "revoked"
-// keyword in the parsed error type/message so a plain token-expiry 401 does NOT
-// quarantine an otherwise-healthy account.
+// path recovers from. We gate on status==401 AND a documented hard-revocation
+// marker in the parsed error type/message (errMsg is the raw body), so a plain
+// token-expiry 401 does NOT quarantine an otherwise-healthy account:
+//   - anthropic: "OAuth token has been revoked" (contains "revoked").
+//   - codex/openai (sub2api-derived, see research/oauth-codex-ratelimit): the
+//     error code "token_revoked" (contains "revoked") or "token_invalidated",
+//     or the non-standard body {"detail":"Unauthorized"} = permanently invalid.
 //
-// ponytail: keyword match on the documented "revoked" string only — narrow on
-// purpose to avoid false-positive quarantines; widen the term list here if other
-// hard-ban phrasings show up.
+// ponytail: narrow keyword/shape match on purpose to avoid false-positive
+// quarantines; widen the term list here if other hard-ban phrasings show up.
 func isHardRevoked(statusCode int, errType, errMsg string) bool {
 	if statusCode != http.StatusUnauthorized {
 		return false
 	}
-	return strings.Contains(strings.ToLower(errType+" "+errMsg), "revoked")
+	blob := strings.ToLower(errType + " " + errMsg)
+	return strings.Contains(blob, "revoked") ||
+		strings.Contains(blob, "token_invalidated") ||
+		strings.Contains(blob, `"detail":"unauthorized"`)
 }

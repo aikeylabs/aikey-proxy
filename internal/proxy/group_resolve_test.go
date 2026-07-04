@@ -305,13 +305,28 @@ func TestResolveGroup_ErrorCodes(t *testing.T) {
 	if _, err := resolveGroupCredential(&vkeys.ResolvedRoute{SeatID: "s", GroupAccounts: mustJSON(t, refs), GroupRuntime: "{}"}, key, 1, nil, ""); !isGroupErr(err, groupErrNoCandidates) {
 		t.Fatalf("want NO_CANDIDATES for pulled-but-empty material, got %v", err)
 	}
-	// Material present but the only candidate is expired → all unusable.
-	mat := map[string]vkeys.GroupRuntimeAccount{
+	// R36 (2026-07-04, codex pools): the only candidate is EXPIRED → LOGIN_REQUIRED,
+	// NOT ALL_UNUSABLE. An expired member token is member-fixable (re-login mints a
+	// new one; codex tokens live ~10 days so this is their steady-state path), so the
+	// resolver prompts a self-serve 401 login for that account instead of dead-ending
+	// in the admin-facing 503.
+	expMat := map[string]vkeys.GroupRuntimeAccount{
 		"acc-a": encMat(t, key, vkeys.GroupRuntimeAccount{CredentialType: "oauth_account", ExpiresAt: 5}, "tok"),
 	}
-	route := &vkeys.ResolvedRoute{SeatID: "s", GroupAccounts: mustJSON(t, refs), GroupRuntime: mustJSON(t, mat)}
-	if _, err := resolveGroupCredential(route, key, 1_000_000, nil, ""); !isGroupErr(err, groupErrAllUnusable) {
-		t.Fatalf("want ALL_UNUSABLE, got %v", err)
+	expRoute := &vkeys.ResolvedRoute{SeatID: "s", GroupAccounts: mustJSON(t, refs), GroupRuntime: mustJSON(t, expMat)}
+	if _, err := resolveGroupCredential(expRoute, key, 1_000_000, nil, ""); !isGroupErr(err, groupErrLoginRequired) {
+		t.Fatalf("want LOGIN_REQUIRED for the expired-only case (R36), got %v", err)
+	}
+
+	// Window-exhausted (NOT expired) is genuinely not member-fixable → ALL_UNUSABLE.
+	// Only routing around it (or waiting for the window to reset) helps, so it stays
+	// the admin-facing dead-end and does NOT downgrade to a login prompt.
+	exhMat := map[string]vkeys.GroupRuntimeAccount{
+		"acc-a": encMat(t, key, vkeys.GroupRuntimeAccount{CredentialType: "oauth_account", ExpiresAt: 9_000_000_000, WindowStatus: "exhausted"}, "tok"),
+	}
+	exhRoute := &vkeys.ResolvedRoute{SeatID: "s", GroupAccounts: mustJSON(t, refs), GroupRuntime: mustJSON(t, exhMat)}
+	if _, err := resolveGroupCredential(exhRoute, key, 1_000_000, nil, ""); !isGroupErr(err, groupErrAllUnusable) {
+		t.Fatalf("want ALL_UNUSABLE for the window-exhausted-only case, got %v", err)
 	}
 }
 

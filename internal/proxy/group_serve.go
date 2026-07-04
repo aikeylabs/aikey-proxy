@@ -121,16 +121,11 @@ func (p *Proxy) handleOauthGroupRoute(
 			rc.BaseURL = res.BaseURL
 		}
 	default: // oauth_account
-		// Mirror ResolveBindingCredential's OAuth branch: Codex uses the
-		// chatgpt.com Responses API base (+ deferred model capture); other
-		// providers use their default base. Headers injected here; the Director
-		// sees the sentinel and only rewrites the upstream URL.
-		if canonicalCode == "openai" {
-			rc.BaseURL = "https://chatgpt.com/backend-api/codex"
-			r = captureCodexModel(r)
-		} else {
-			rc.BaseURL = providerDefaultBaseURL(canonicalCode)
-		}
+		// Per-provider OAuth upstream (base URL + any provider setup like codex's
+		// deferred model capture) via the shared resolver — same source as the
+		// legacy /v1 path. Headers injected here; the Director sees the sentinel
+		// and only rewrites the upstream URL.
+		rc.BaseURL, r = resolveOAuthUpstream(canonicalCode, r)
 		oauthInject(r, res.OAuth, canonicalCode)
 		// Stash the window cap so ModifyResponse can pre-cut this account when the
 		// upstream's unified-utilization crosses it (N10 防封).

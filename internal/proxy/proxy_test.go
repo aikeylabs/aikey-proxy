@@ -50,6 +50,21 @@ func setupTestProxy(t *testing.T, upstreamURL string) *Proxy {
 func setupTestProxyWithStore(t *testing.T, upstreamURL string, store events.EventInserter) *Proxy {
 	t.Helper()
 
+	// Per-test run-dir isolation (2026-07-04). TestMain sandboxes AIKEY_RUN_DIR to
+	// ONE package-wide temp dir; the pool cooldown store persists to + hydrates from
+	// pool-cooldown.json under it (survive-restart, oauth_pool_cooldown.go). Sharing
+	// that one file across tests means a test that cools an account (acc-1, …) leaks
+	// it to every later test whose proxy hydrates the same file — so group_serve
+	// tests passed in isolation but failed together (cooled accounts → NO_CANDIDATES /
+	// ALL_UNUSABLE instead of the expected outcome). Giving each constructed proxy its
+	// OWN run dir makes every test hydrate an EMPTY cooldown file. This is the SINGLE
+	// construction point for all proxy tests (setupTestProxy delegates here), so one
+	// t.Setenv covers group + window + fallback tests. Single-proxy tests that read
+	// AIKEY_RUN_DIR later (group-login-required.json) stay consistent — t.Setenv holds
+	// for the whole test. Restart-survival is covered separately by the persist tests,
+	// which build the store directly (not via this helper).
+	t.Setenv("AIKEY_RUN_DIR", t.TempDir())
+
 	v := &mockVault{
 		secrets: map[string]string{
 			"openai:test":    "sk-real-openai-key-123",

@@ -226,7 +226,12 @@ func cooldownDecision(resp *http.Response, now time.Time) (time.Time, bool) {
 			return time.Time{}, false // WAF business rejection — not the account's fault
 		}
 		d := poolCooldownDefault
-		if ra := retryAfterDuration(resp.Header); ra > 0 {
+		// Codex (ChatGPT) carries its own reset headers (x-codex-*-reset-after-
+		// seconds) instead of Retry-After — prefer them; else Retry-After; else
+		// default. See research/oauth-codex-ratelimit + R37 (2026-07-04).
+		if cx := codexRateLimitReset(resp.Header); cx > 0 {
+			d = cx
+		} else if ra := retryAfterDuration(resp.Header); ra > 0 {
 			d = ra
 		}
 		if d > poolCooldownMax {
@@ -239,17 +244,70 @@ func cooldownDecision(resp *http.Response, now time.Time) (time.Time, bool) {
 }
 
 // hasRateLimitSignal reports whether the response carries a real rate-limit /
-// exhaustion marker (vs a WAF business rejection that omits them).
+// exhaustion marker (vs a WAF business rejection that omits them). Covers the
+// anthropic form (Retry-After / *ratelimit* headers) AND the codex form
+// (x-codex-* usage headers) — a codex 429 that omitted both would otherwise be
+// mis-read as a WAF rejection and the exhausted account never cooled (打死号).
 func hasRateLimitSignal(h http.Header) bool {
 	if h.Get("Retry-After") != "" {
 		return true
 	}
 	for k := range h {
-		if strings.Contains(strings.ToLower(k), "ratelimit") {
+		lk := strings.ToLower(k)
+		if strings.Contains(lk, "ratelimit") || strings.HasPrefix(lk, "x-codex-") {
 			return true
 		}
 	}
 	return false
+}
+
+// codexRateLimitReset extracts the cooldown duration from codex's own rate-limit
+// headers (ChatGPT backend; sub2api-derived wire format, see research doc). Mirrors
+// sub2api's calculateOpenAI429ResetTime header path: prefer the EXHAUSTED window's
+// reset (used_percent ≥ 100; primary=weekly/7d wins over secondary=5h), else the
+// larger of the two window resets. Returns 0 when no codex reset header is present
+// (caller then falls back to Retry-After / default). Anthropic responses carry no
+// x-codex-* headers, so this is a no-op on the claude path (zero regression).
+func codexRateLimitReset(h http.Header) time.Duration {
+	primaryReset := codexHeaderInt(h, "x-codex-primary-reset-after-seconds")
+	secondaryReset := codexHeaderInt(h, "x-codex-secondary-reset-after-seconds")
+	primaryUsed := codexHeaderFloat(h, "x-codex-primary-used-percent")
+	secondaryUsed := codexHeaderFloat(h, "x-codex-secondary-used-percent")
+
+	// Exhausted window's reset first (7d before 5h — the longer wall).
+	if primaryUsed >= 100 && primaryReset > 0 {
+		return time.Duration(primaryReset) * time.Second
+	}
+	if secondaryUsed >= 100 && secondaryReset > 0 {
+		return time.Duration(secondaryReset) * time.Second
+	}
+	// 429 without either window at 100% → cool for the longer reset we can see.
+	maxReset := primaryReset
+	if secondaryReset > maxReset {
+		maxReset = secondaryReset
+	}
+	if maxReset > 0 {
+		return time.Duration(maxReset) * time.Second
+	}
+	return 0
+}
+
+func codexHeaderInt(h http.Header, key string) int {
+	if v := strings.TrimSpace(h.Get(key)); v != "" {
+		if i, err := strconv.Atoi(v); err == nil {
+			return i
+		}
+	}
+	return 0
+}
+
+func codexHeaderFloat(h http.Header, key string) float64 {
+	if v := strings.TrimSpace(h.Get(key)); v != "" {
+		if f, err := strconv.ParseFloat(v, 64); err == nil {
+			return f
+		}
+	}
+	return 0
 }
 
 // retryAfterDuration parses the Retry-After header's delta-seconds form. The

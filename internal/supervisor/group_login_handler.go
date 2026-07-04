@@ -59,6 +59,12 @@ type poolExchanger interface {
 	// Forget clears the cached exchange result (token + broker session) once the
 	// token has been durably written back to master, so it doesn't linger in memory.
 	Forget(ctx context.Context, sessionID, accountID string)
+	// LoginStatus reports a login session's progress (pending/success/failed/
+	// expired + provider error text). Codex's auth_code flow completes via the
+	// broker's localhost:1455 callback — the page can't paste a code, it POLLS
+	// this until the callback fires, then submit-code replays the cached exchange
+	// (empty code, idempotent). NO token material in the result.
+	LoginStatus(ctx context.Context, sessionID string) (status, errText string, err error)
 }
 
 // brokerPoolExchanger wraps a memory-store EmbeddedBroker: SubmitCode reads the
@@ -104,6 +110,14 @@ func (e *brokerPoolExchanger) SubmitCode(ctx context.Context, sessionID, code st
 func (e *brokerPoolExchanger) Forget(ctx context.Context, sessionID, accountID string) {
 	_ = e.memTok.DeleteTokens(ctx, accountID)
 	e.brk.ForgetSession(sessionID)
+}
+
+func (e *brokerPoolExchanger) LoginStatus(ctx context.Context, sessionID string) (string, string, error) {
+	s, err := e.brk.GetLoginStatus(ctx, sessionID)
+	if err != nil {
+		return "", "", err
+	}
+	return s.Status, s.Error, nil
 }
 
 // poolLoginHandler serves the pool login endpoints. bearer/masterURL are injected
@@ -225,11 +239,48 @@ func (h *poolLoginHandler) submitCode(w http.ResponseWriter, r *http.Request) {
 	poolJSON(w, map[string]any{"status": "ok", "identity": identity})
 }
 
+// status serves GET /oauth/pool/status?session_id=<id> — the codex (auth_code)
+// pool login's polling leg. The browser can't paste a code for codex (OpenAI
+// redirects to the broker's own localhost:1455 callback, which exchanges
+// in-place), so the page polls here until the session flips to success, then
+// calls submit-code with an EMPTY code — the broker's idempotent replay returns
+// the cached exchange without re-spending anything. Only sessions this handler
+// started are visible (fail-closed vs probing the personal broker's sessions);
+// the response carries status + provider error text, never token material.
+func (h *poolLoginHandler) status(w http.ResponseWriter, r *http.Request) {
+	sid := r.URL.Query().Get("session_id")
+	if sid == "" {
+		poolErr(w, http.StatusBadRequest, "MISSING_SESSION_ID", "session_id query param is required")
+		return
+	}
+	sessAny, ok := h.sessions.Load(sid)
+	if !ok {
+		poolErr(w, http.StatusBadRequest, "UNKNOWN_SESSION", "no pool login session for that id")
+		return
+	}
+	if sess, ok := sessAny.(poolSession); !ok || time.Since(sess.createdAt) > poolSessionTTL {
+		h.sessions.Delete(sid)
+		poolErr(w, http.StatusBadRequest, "SESSION_EXPIRED", "pool login session expired; restart the login")
+		return
+	}
+	status, errText, err := h.ex.LoginStatus(r.Context(), sid)
+	if err != nil {
+		poolErr(w, http.StatusBadGateway, "STATUS_FAILED", err.Error())
+		return
+	}
+	resp := map[string]any{"status": status}
+	if errText != "" {
+		resp["error_detail"] = errText
+	}
+	poolJSON(w, resp)
+}
+
 // RegisterRoutes mounts the pool login endpoints (server.RouteRegistrar). They
 // live alongside the personal broker's /oauth/* routes on the proxy's local mux.
 func (h *poolLoginHandler) RegisterRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("POST /oauth/pool/authorize-url", h.authorizeURL)
 	mux.HandleFunc("POST /oauth/pool/submit-code", h.submitCode)
+	mux.HandleFunc("GET /oauth/pool/status", h.status)
 }
 
 // teamBearer returns a fresh team account-JWT Bearer (same credential channel ③
