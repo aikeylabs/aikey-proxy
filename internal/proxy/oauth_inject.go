@@ -269,10 +269,21 @@ func hasFingerprint(block map[string]any) bool {
 //
 // Why inject-if-absent: Codex CLI may set its own originator or account ID
 // in future versions. Overwriting would break forward compatibility.
+//
+// ChatGPT-Account-Id source (fixed 2026-07-04, R34 codex pools): the real
+// chatgpt_account_id lives in ExternalID (the broker extracts it from the token
+// JWT's auth.chatgpt_account_id claim). AccountID is OUR identifier — the
+// broker's random account row id on the personal path, the pool's internal
+// account id on the group path — sending it upstream was a wrong value that only
+// went unnoticed because Codex CLI usually sets its own header (setIfAbsent).
+// ExternalID first; AccountID kept as a legacy fallback for old vault rows that
+// predate ExternalID.
 func injectCodexOAuth(req *http.Request, cred *OAuthCredential) {
 	req.Header.Set("Authorization", "Bearer "+cred.AccessToken)
 	setIfAbsent(req, "originator", "opencode")
-	if cred.AccountID != "" {
+	if id := cred.ExternalID; id != "" {
+		setIfAbsent(req, "ChatGPT-Account-Id", id)
+	} else if cred.AccountID != "" {
 		setIfAbsent(req, "ChatGPT-Account-Id", cred.AccountID)
 	}
 }

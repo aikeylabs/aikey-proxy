@@ -830,3 +830,90 @@ func TestReporter_ReplayDeadLetter_MalformedLineSkipped(t *testing.T) {
 		t.Errorf("re-delivered entry should be removed; file:\n%s", string(data))
 	}
 }
+
+// ── automatic dead-letter replay (2026-07-04 self-heal) ─────────────────────
+//
+// A successful upload proves the pipe recovered, so maybeAutoReplayLocked must
+// fire the replay (once per cooldown window) with NO manual step. 能红: drop
+// the maybeAutoReplayLocked call from onUploadSuccess and the "auto" test
+// fails; drop the cooldown gate and the "cooldown" test fails.
+func TestReporter_AutoReplay_FiresAfterUploadSuccess(t *testing.T) {
+	var accepted atomic.Int64
+	var auth atomic.Value
+	auth.Store("")
+	srv := recordingServer(t, &accepted, &auth)
+
+	dir := t.TempDir()
+	reporter, err := NewReporter(&ReporterConfig{
+		CollectorURL: srv.URL, CollectorToken: "tok",
+		QueueCapacity: 10, BatchSize: 5, UploadInterval: 50 * time.Millisecond,
+		WALDir: dir, DBPath: filepath.Join(dir, "events.db"),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer reporter.Close()
+
+	seedDeadLetter(t, dir, deadLetterEntry{
+		DeadAt: aikeytime.Now(), Reason: "terminal", ErrorCode: 401, ErrorMsg: "outage",
+		Events:   []ReportableEvent{{EventID: "ev-dl", OrgID: "o", RouteSource: "team", EventTime: aikeytime.Now(), OccurredAt: aikeytime.Now(), RequestStatus: "success", RequestCount: 1}},
+		EventIDs: []string{"ev-dl"},
+	})
+
+	// A successful upload lands → the auto-replay trigger runs asynchronously.
+	reporter.onUploadSuccess(1)
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		if len(readDeadLetterEntries(t, dir)) == 0 {
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	if left := readDeadLetterEntries(t, dir); len(left) != 0 {
+		t.Fatalf("auto replay must drain the dead-letter file, %d entries left", len(left))
+	}
+	if accepted.Load() == 0 {
+		t.Fatal("replayed events must reach the collector")
+	}
+}
+
+// Within the cooldown window a second success must NOT re-stat/re-fire; after
+// the window it must fire again. Pinned via the lastAutoReplayAt gate.
+func TestReporter_AutoReplay_CooldownGate(t *testing.T) {
+	dir := t.TempDir()
+	reporter, err := NewReporter(&ReporterConfig{
+		CollectorURL: "http://127.0.0.1:0", CollectorToken: "tok",
+		QueueCapacity: 10, BatchSize: 5, UploadInterval: time.Hour,
+		WALDir: dir, DBPath: filepath.Join(dir, "events.db"),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer reporter.Close()
+
+	// First trigger stamps the gate even when the file is empty (stat gate).
+	reporter.mu.Lock()
+	reporter.maybeAutoReplayLocked()
+	first := reporter.lastAutoReplayAt
+	reporter.mu.Unlock()
+	if first.IsZero() {
+		t.Fatal("first trigger must stamp the cooldown gate")
+	}
+	// Second trigger inside the window: stamp unchanged (no re-fire).
+	reporter.mu.Lock()
+	reporter.maybeAutoReplayLocked()
+	second := reporter.lastAutoReplayAt
+	reporter.mu.Unlock()
+	if !second.Equal(first) {
+		t.Fatal("cooldown window must suppress a second trigger")
+	}
+	// Simulate window expiry → trigger re-arms.
+	reporter.mu.Lock()
+	reporter.lastAutoReplayAt = time.Now().Add(-autoReplayCooldown - time.Second)
+	reporter.maybeAutoReplayLocked()
+	third := reporter.lastAutoReplayAt
+	reporter.mu.Unlock()
+	if third.Equal(first) || time.Since(third) > time.Minute {
+		t.Fatal("expired cooldown must re-arm the trigger")
+	}
+}

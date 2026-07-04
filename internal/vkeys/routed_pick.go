@@ -114,3 +114,13 @@ func MaterialUsable(mat GroupRuntimeAccount, nowUnix int64) bool {
 	}
 	return true
 }
+
+// MaterialExpired reports whether an OAuth account's material is stale
+// SPECIFICALLY because the member's access token passed its expiry. R36
+// (2026-07-04): expiry is MEMBER-fixable — re-logging in mints a new token — so
+// the resolver's dead-end classification uses this to prompt a 401 re-login
+// instead of the admin-facing ALL_UNUSABLE 503. Window-exhausted is deliberately
+// NOT this: only routing around (or waiting) fixes it. API keys never expire.
+func MaterialExpired(mat GroupRuntimeAccount, nowUnix int64) bool {
+	return mat.CredentialType != "api_key" && mat.ExpiresAt > 0 && mat.ExpiresAt <= nowUnix
+}

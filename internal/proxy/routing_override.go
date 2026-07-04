@@ -22,14 +22,39 @@
 // supervisor-scoped, not per-generation).
 package proxy
 
-import "sync/atomic"
+import (
+	"sync/atomic"
 
-// routeKey is the composite (seat, group) key of the routing-override maps. LOCKSTEP
-// with master's adapter/routing.go routeKey — the two MUST format keys identically or
-// every override lookup misses. A multi-pool seat (member of >1 group) has a distinct
-// binding per group, so keying by seat alone dropped all but the first group's route
-// (2026-07-01). "|" is safe: seat/group ids are UUIDs.
+	"github.com/AiKeyLabs/pkg/routingwire"
+)
+
+// routeKey is the composite (seat, group) key of the in-memory override maps — a
+// PACKAGE-PRIVATE cache implementation detail. The wire itself carries structured
+// routingwire.RouteEntry objects (shared DTO module, 2026-07-02), so there is no
+// cross-repo key-format contract anymore; only StoreRoutes below builds these keys.
+// A multi-pool seat (member of >1 group) has a distinct binding per group. "|" is
+// safe: seat/group ids are UUIDs.
 func routeKey(seatID, groupID string) string { return seatID + "|" + groupID }
+
+// StoreRoutes ingests the wire's structured route entries (pkg/routingwire) and
+// atomically replaces the cache — the ONLY place wire entries become cache keys, so
+// the composite-key encoding never leaks past this package. Returns the bound/blocked
+// counts for the caller's log line.
+func (c *RoutingOverrideCache) StoreRoutes(version int64, routes []routingwire.RouteEntry) (bound, blocked int) {
+	assignments := make(map[string]string, len(routes))
+	blockedSet := map[string]bool{}
+	for _, r := range routes {
+		if r.Blocked {
+			blockedSet[routeKey(r.SeatID, r.GroupID)] = true
+			continue
+		}
+		if r.AccountID != "" {
+			assignments[routeKey(r.SeatID, r.GroupID)] = r.AccountID
+		}
+	}
+	c.StoreAll(version, assignments, blockedSet)
+	return len(assignments), len(blockedSet)
+}
 
 // RoutingOverrideCache holds the engine's sparse seat_id→account_id assignments
 // plus the routing_version they came from.

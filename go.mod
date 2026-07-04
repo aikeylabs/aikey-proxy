@@ -43,6 +43,7 @@ replace github.com/AiKeyLabs/aikey-config-tool => ../aikey-config-tool
 replace github.com/aikeylabs/ai-degrade-detector/proxy-plugin/rhythm => ../ai-degrade-detector/proxy-plugin/rhythm
 
 require (
+	github.com/AiKeyLabs/pkg/routingwire v0.0.0
 	github.com/andybalholm/brotli v1.2.0 // indirect
 	github.com/dustin/go-humanize v1.0.1 // indirect
 	github.com/google/go-querystring v1.1.0 // indirect
@@ -66,3 +67,5 @@ require (
 	modernc.org/mathutil v1.7.1 // indirect
 	modernc.org/memory v1.11.0 // indirect
 )
+
+replace github.com/AiKeyLabs/pkg/routingwire => ../pkg/routingwire

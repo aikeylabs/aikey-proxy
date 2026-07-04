@@ -15,11 +15,17 @@
 package proxy
 
 import (
+	"encoding/json"
+	"log/slog"
 	"net/http"
+	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/AiKeyLabs/aikey-proxy/internal/observability"
 )
 
 const (
@@ -42,7 +48,113 @@ type poolCooldownStore struct {
 }
 
 func newPoolCooldownStore() *poolCooldownStore {
-	return &poolCooldownStore{m: make(map[string]time.Time), now: time.Now}
+	s := &poolCooldownStore{m: make(map[string]time.Time), now: time.Now}
+	// Cross-restart persistence (2026-07-04 self-heal, §S4): without it a proxy
+	// restart forgot every cooldown and could immediately route traffic back
+	// onto an account that just 401'd / rate-limited. STRICTLY an enhancement,
+	// never a dependency (owner constraint): a missing/corrupt/unreadable file
+	// falls back to an empty store and the main link proceeds untouched.
+	s.hydrateFromFile()
+	return s
+}
+
+// ── cross-restart persistence (bypass state file, §S4 2026-07-04) ───────────
+// Same ownership pattern as sync-health.json / group-login-required.json:
+// one concern, one file, one writer (this store). Writes happen on mark()
+// (rare — an upstream 401/exhaustion) and are atomic (temp+rename). Reads
+// happen ONCE at construction. Every failure path is best-effort:
+// write → WARN and keep serving; read → empty store (fallback, never blocks).
+
+const poolCooldownFilename = "pool-cooldown.json"
+
+type poolCooldownFileBody struct {
+	// Accounts maps accountID → avoid-until unix seconds (only unexpired ones).
+	Accounts  map[string]int64 `json:"accounts"`
+	WrittenAt int64            `json:"written_at"` // unix millis
+}
+
+func poolCooldownPath() (string, error) {
+	if dir := os.Getenv("AIKEY_RUN_DIR"); dir != "" {
+		return filepath.Join(dir, poolCooldownFilename), nil
+	}
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return "", err
+	}
+	return filepath.Join(home, ".aikey", "run", poolCooldownFilename), nil
+}
+
+// hydrateFromFile preloads unexpired cooldowns from the state file. Fallback
+// by design: any error (missing file, bad JSON, unreadable) leaves the store
+// empty — the data path never depends on this file.
+func (s *poolCooldownStore) hydrateFromFile() {
+	path, err := poolCooldownPath()
+	if err != nil {
+		return
+	}
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		return // missing or unreadable → empty store (fallback)
+	}
+	var body poolCooldownFileBody
+	if json.Unmarshal(raw, &body) != nil {
+		return // corrupt → empty store (fallback); next mark() overwrites it
+	}
+	now := s.now()
+	loaded := 0
+	for id, untilUnix := range body.Accounts {
+		until := time.Unix(untilUnix, 0)
+		if id != "" && now.Before(until) {
+			s.m[id] = until
+			loaded++
+		}
+	}
+	if loaded > 0 {
+		slog.Info("pool cooldowns hydrated from state file (survive restart)",
+			"event.name", observability.EventProxyGroupAccountCooldown, "accounts", loaded)
+	}
+}
+
+// persistLocked mirrors the current unexpired cooldowns to the state file
+// (s.mu held by the caller). Empty set removes the file. Best-effort: a
+// failure is WARN-logged and never surfaces to the request path.
+func (s *poolCooldownStore) persistLocked() {
+	path, err := poolCooldownPath()
+	if err != nil {
+		return
+	}
+	now := s.now()
+	accounts := make(map[string]int64, len(s.m))
+	for id, until := range s.m {
+		if now.Before(until) {
+			accounts[id] = until.Unix()
+		}
+	}
+	if len(accounts) == 0 {
+		if rmErr := os.Remove(path); rmErr != nil && !os.IsNotExist(rmErr) {
+			slog.Warn("pool cooldown state file remove failed",
+				"event.name", observability.EventProxyGroupAccountCooldown, "error", rmErr.Error())
+		}
+		return
+	}
+	err = func() error {
+		if mkErr := os.MkdirAll(filepath.Dir(path), 0o700); mkErr != nil {
+			return mkErr
+		}
+		data, mErr := json.Marshal(poolCooldownFileBody{Accounts: accounts, WrittenAt: time.Now().UnixMilli()})
+		if mErr != nil {
+			return mErr
+		}
+		tmp := path + ".tmp"
+		if wErr := os.WriteFile(tmp, data, 0o600); wErr != nil {
+			return wErr
+		}
+		return os.Rename(tmp, path)
+	}()
+	if err != nil {
+		slog.Warn("pool cooldown state file write failed — cooldowns won't survive a restart",
+			"event.name", observability.EventProxyGroupAccountCooldown, "error", err.Error())
+	}
 }
 
 // mark cools an account down until `until`. A no-op for an empty id or a time
@@ -54,6 +166,7 @@ func (s *poolCooldownStore) mark(accountID string, until time.Time) {
 	s.mu.Lock()
 	if cur, ok := s.m[accountID]; !ok || until.After(cur) {
 		s.m[accountID] = until
+		s.persistLocked()
 	}
 	s.mu.Unlock()
 }
@@ -113,7 +226,12 @@ func cooldownDecision(resp *http.Response, now time.Time) (time.Time, bool) {
 			return time.Time{}, false // WAF business rejection — not the account's fault
 		}
 		d := poolCooldownDefault
-		if ra := retryAfterDuration(resp.Header); ra > 0 {
+		// Codex (ChatGPT) carries its own reset headers (x-codex-*-reset-after-
+		// seconds) instead of Retry-After — prefer them; else Retry-After; else
+		// default. See research/oauth-codex-ratelimit + R37 (2026-07-04).
+		if cx := codexRateLimitReset(resp.Header); cx > 0 {
+			d = cx
+		} else if ra := retryAfterDuration(resp.Header); ra > 0 {
 			d = ra
 		}
 		if d > poolCooldownMax {
@@ -126,17 +244,70 @@ func cooldownDecision(resp *http.Response, now time.Time) (time.Time, bool) {
 }
 
 // hasRateLimitSignal reports whether the response carries a real rate-limit /
-// exhaustion marker (vs a WAF business rejection that omits them).
+// exhaustion marker (vs a WAF business rejection that omits them). Covers the
+// anthropic form (Retry-After / *ratelimit* headers) AND the codex form
+// (x-codex-* usage headers) — a codex 429 that omitted both would otherwise be
+// mis-read as a WAF rejection and the exhausted account never cooled (打死号).
 func hasRateLimitSignal(h http.Header) bool {
 	if h.Get("Retry-After") != "" {
 		return true
 	}
 	for k := range h {
-		if strings.Contains(strings.ToLower(k), "ratelimit") {
+		lk := strings.ToLower(k)
+		if strings.Contains(lk, "ratelimit") || strings.HasPrefix(lk, "x-codex-") {
 			return true
 		}
 	}
 	return false
+}
+
+// codexRateLimitReset extracts the cooldown duration from codex's own rate-limit
+// headers (ChatGPT backend; sub2api-derived wire format, see research doc). Mirrors
+// sub2api's calculateOpenAI429ResetTime header path: prefer the EXHAUSTED window's
+// reset (used_percent ≥ 100; primary=weekly/7d wins over secondary=5h), else the
+// larger of the two window resets. Returns 0 when no codex reset header is present
+// (caller then falls back to Retry-After / default). Anthropic responses carry no
+// x-codex-* headers, so this is a no-op on the claude path (zero regression).
+func codexRateLimitReset(h http.Header) time.Duration {
+	primaryReset := codexHeaderInt(h, "x-codex-primary-reset-after-seconds")
+	secondaryReset := codexHeaderInt(h, "x-codex-secondary-reset-after-seconds")
+	primaryUsed := codexHeaderFloat(h, "x-codex-primary-used-percent")
+	secondaryUsed := codexHeaderFloat(h, "x-codex-secondary-used-percent")
+
+	// Exhausted window's reset first (7d before 5h — the longer wall).
+	if primaryUsed >= 100 && primaryReset > 0 {
+		return time.Duration(primaryReset) * time.Second
+	}
+	if secondaryUsed >= 100 && secondaryReset > 0 {
+		return time.Duration(secondaryReset) * time.Second
+	}
+	// 429 without either window at 100% → cool for the longer reset we can see.
+	maxReset := primaryReset
+	if secondaryReset > maxReset {
+		maxReset = secondaryReset
+	}
+	if maxReset > 0 {
+		return time.Duration(maxReset) * time.Second
+	}
+	return 0
+}
+
+func codexHeaderInt(h http.Header, key string) int {
+	if v := strings.TrimSpace(h.Get(key)); v != "" {
+		if i, err := strconv.Atoi(v); err == nil {
+			return i
+		}
+	}
+	return 0
+}
+
+func codexHeaderFloat(h http.Header, key string) float64 {
+	if v := strings.TrimSpace(h.Get(key)); v != "" {
+		if f, err := strconv.ParseFloat(v, 64); err == nil {
+			return f
+		}
+	}
+	return 0
 }
 
 // retryAfterDuration parses the Retry-After header's delta-seconds form. The

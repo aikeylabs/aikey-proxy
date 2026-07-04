@@ -36,6 +36,26 @@ const (
 	EventProxyControlPlaneRestartExhausted = "proxy.control_plane.restart_budget_exhausted"
 )
 
+// SyncRail events (2026-07-03): control-plane sync rail state transitions.
+// A rail keeps serving last-known data and retrying forever in every state —
+// these events are the VISIBILITY the old silent keep-last-known loops lacked
+// (bugfix 2026-07-03-routing-override-rail-silent-stall.md). See
+// supervisor/railset.go.
+const (
+	EventProxySyncRailStale         = "proxy.sync.rail_stale"
+	EventProxySyncRailOffline       = "proxy.sync.rail_offline"
+	EventProxySyncRailRecovered     = "proxy.sync.rail_recovered"
+	EventProxySyncCredentialRebuilt = "proxy.sync.credential_rebuilt"
+	// EventProxySyncHealthFileFailed: the statusline sync-health bypass file
+	// (~/.aikey/run/sync-health.json) could not be written/removed — the claude
+	// status bar may show a stale (or miss a fresh) sync warning.
+	EventProxySyncHealthFileFailed = "proxy.sync.health_file_failed"
+	// EventReporterDeadLetterReplayed: the automatic dead-letter replay ran
+	// after the upload pipe recovered (2026-07-04 self-heal) — carries
+	// scanned/replayed/still-failing counts, or the error when the pass failed.
+	EventReporterDeadLetterReplayed = "proxy.events.dead_letter_replayed"
+)
+
 // Health events.
 const (
 	EventProxyHealthOk        = "proxy.health.ok"
@@ -85,6 +105,13 @@ const (
 	// every account in its pool/segment is at the ≤3-人/号 cap, so the proxy 429s it
 	// (never WRH-falls-back, which would route a 4th user onto a full account).
 	EventProxyGroupSeatBlocked = "proxy.group.seat_blocked"
+	// EventProxyGroupLoginStateWriteFailed / ClearFailed: the bypass
+	// ~/.aikey/run/group-login-required.json state file (statusline login hint,
+	// 20260703 update) could not be written / removed. Best-effort by design —
+	// the 401 response itself is unaffected — but WARN because the statusline
+	// hint silently disappearing (or nagging stale) is a debugging trap.
+	EventProxyGroupLoginStateWriteFailed = "proxy.group.login_state_write_failed"
+	EventProxyGroupLoginStateClearFailed = "proxy.group.login_state_clear_failed"
 )
 
 // Usage extraction events.

@@ -204,23 +204,11 @@ func (p *Proxy) ResolveBindingCredential(
 			}
 		}
 
-		// Codex BaseURL override pinned by TestFence_OAuthBinding_OpenAICodexBaseURLOverride.
-		// Why: Codex OAuth uses chatgpt.com/backend-api/codex (Responses API),
-		// NOT api.openai.com/v1 (Chat Completions API). API key users hit
-		// api.openai.com; OAuth users hit chatgpt.com.
-		// Ref: workflow/CI/research/oauth-codex-test/main.go
-		if canonicalCode == "openai" {
-			out.BaseURL = "https://chatgpt.com/backend-api/codex"
-			// Stage the `model` field into request context. Actual
-			// persistence is deferred to ModifyResponse, which only
-			// writes the file when upstream returned 2xx — see
-			// codex_model_capture.go for the bug-2026-06-09 rationale.
-			// `captureCodexModel` returns a NEW request with the value
-			// in context; reassign to propagate downstream.
-			r = captureCodexModel(r)
-		} else {
-			out.BaseURL = providerDefaultBaseURL(canonicalCode)
-		}
+		// Per-provider OAuth upstream (base URL + any provider setup) via the shared
+		// resolver — same source as the group route. Codex's chatgpt.com override +
+		// deferred model capture live in resolveOAuthUpstream; pinned by
+		// TestFence_OAuthBinding_OpenAICodexBaseURLOverride.
+		out.BaseURL, r = resolveOAuthUpstream(canonicalCode, r)
 		oauthInject(r, cred, canonicalCode)
 
 		identityTag := cred.Identity

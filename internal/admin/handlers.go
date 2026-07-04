@@ -77,6 +77,9 @@ type Handler struct {
 	// PoolHealthFn returns oauth-group routing health for /status (N9). nil → the
 	// pool_routing field is omitted (non-pool deployments unchanged).
 	PoolHealthFn func() *PoolRoutingHealth
+	// SyncHealthFn supplies the SyncRail per-rail health map for /status. Nil or
+	// an empty map → the control_plane_sync field is omitted.
+	SyncHealthFn func() map[string]SyncRailStatus
 
 	// EffectivePacksFn returns the raw JSON report of compliance packs currently
 	// effective in the live filter child (built-in + pulled). Returns an error
@@ -255,6 +258,21 @@ type statusResponse struct {
 	// feature is on, so non-pool deployments' /status is unchanged. Lets the
 	// operator monitoring the first pool batch see which accounts are cooled.
 	PoolRouting *PoolRoutingHealth `json:"pool_routing,omitempty"`
+	// ControlPlaneSync is the SyncRail health surface (2026-07-03): per-rail
+	// ok/stale/offline state with failure counts and last error. Omitted when no
+	// rail has ever attempted a cycle (personal installs — /status unchanged).
+	// Release-checklist E2E and `aikey statusline` read this to assert the
+	// master-sync pipeline is alive (health-signal-surface rule).
+	ControlPlaneSync map[string]SyncRailStatus `json:"control_plane_sync,omitempty"`
+}
+
+// SyncRailStatus mirrors supervisor.RailSyncStatus for the /status wire (built
+// by the cmd layer — admin does not import supervisor).
+type SyncRailStatus struct {
+	State               string `json:"state"`
+	ConsecutiveFailures int    `json:"consecutive_failures"`
+	LastSuccessAt       int64  `json:"last_success_at,omitempty"`
+	LastError           string `json:"last_error,omitempty"`
 }
 
 // PoolRoutingHealth is the oauth-group account-routing health surface (N9). Built
@@ -290,6 +308,10 @@ func (h *Handler) Status(w http.ResponseWriter, r *http.Request) {
 	if h.PoolHealthFn != nil {
 		poolRouting = h.PoolHealthFn()
 	}
+	var syncHealth map[string]SyncRailStatus
+	if h.SyncHealthFn != nil {
+		syncHealth = h.SyncHealthFn()
+	}
 
 	writeJSON(w, http.StatusOK, statusResponse{
 		Status:      "ok",
@@ -299,9 +321,10 @@ func (h *Handler) Status(w http.ResponseWriter, r *http.Request) {
 		VirtualKeys: h.registry.Count(),
 		VaultPath:   h.cfg.Vault.Path,
 		StartedAt:   h.startedAt.Format(time.RFC3339),
-		TotalReqs:   totalReqs,
-		TotalErrs:   totalErrs,
-		PoolRouting: poolRouting,
+		TotalReqs:        totalReqs,
+		TotalErrs:        totalErrs,
+		PoolRouting:      poolRouting,
+		ControlPlaneSync: syncHealth,
 	})
 }
 

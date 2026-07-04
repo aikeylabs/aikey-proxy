@@ -306,6 +306,25 @@ func main() {
 		}
 		return h
 	}
+	// SyncRail health (2026-07-03): per-rail control-plane sync state for /status
+	// (health-signal-surface rule — the release E2E asserts this, not the UI).
+	// Empty map (no rail ever attempted — personal installs) → field omitted.
+	adminHandler.SyncHealthFn = func() map[string]admin.SyncRailStatus {
+		snap := sup.ControlPlaneSyncSnapshot()
+		if len(snap) == 0 {
+			return nil
+		}
+		out := make(map[string]admin.SyncRailStatus, len(snap))
+		for name, st := range snap {
+			out[name] = admin.SyncRailStatus{
+				State:               st.State,
+				ConsecutiveFailures: st.ConsecutiveFailures,
+				LastSuccessAt:       st.LastSuccessAt,
+				LastError:           st.LastError,
+			}
+		}
+		return out
+	}
 	adminHandler.EffectivePacksFn = sup.EffectivePacks
 	adminHandler.AuditStatusFn = sup.AuditStatus
 	adminHandler.ReconcileGapsFn = sup.ReconcileGaps

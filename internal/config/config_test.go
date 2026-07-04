@@ -174,6 +174,41 @@ func writeTestPair(t *testing.T, system, user string) string {
 
 // Without aikey-user.yaml the system value passes through unchanged —
 // pre-login state for fresh Personal installs must keep working.
+// console_url absent-vs-empty contract (20260703 OAuth组成员登录提示):
+// ABSENT key = pre-20260703 config preserved across an upgrade → must default
+// (the whole existing personal/trial install base gets the login URL without a
+// config migration). EXPLICIT "" = server/cluster opt-out → must stay empty.
+// A plain-string "simplification" would silently break the upgrade default.
+func TestLoad_ConsoleURLAbsentDefaultsExplicitEmptyHonored(t *testing.T) {
+	// systemProxyYaml predates console_url — the upgrade-preserved shape.
+	sysPath := writeTestPair(t, systemProxyYaml, "")
+	cfg, err := Load(sysPath)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if got := cfg.ResolvedConsoleURL(); got != DefaultConsoleURL {
+		t.Fatalf("absent console_url must default to %q, got %q", DefaultConsoleURL, got)
+	}
+
+	sysPath2 := writeTestPair(t, systemProxyYaml+"\nconsole_url: \"\"\n", "")
+	cfg2, err := Load(sysPath2)
+	if err != nil {
+		t.Fatalf("Load explicit-empty: %v", err)
+	}
+	if got := cfg2.ResolvedConsoleURL(); got != "" {
+		t.Fatalf("explicit-empty console_url must stay empty (opt-out), got %q", got)
+	}
+
+	sysPath3 := writeTestPair(t, systemProxyYaml+"\nconsole_url: \"http://127.0.0.1:9191\"\n", "")
+	cfg3, err := Load(sysPath3)
+	if err != nil {
+		t.Fatalf("Load explicit-value: %v", err)
+	}
+	if got := cfg3.ResolvedConsoleURL(); got != "http://127.0.0.1:9191" {
+		t.Fatalf("explicit console_url must be honored, got %q", got)
+	}
+}
+
 func TestLoad_NoUserYamlPreservesSystemValues(t *testing.T) {
 	sysPath := writeTestPair(t, systemProxyYaml, "")
 	cfg, err := Load(sysPath)

@@ -52,6 +52,58 @@ func TestCooldownDecision_Classification(t *testing.T) {
 	}
 }
 
+// TestCooldownDecision_CodexRateLimit covers the codex (ChatGPT) 429 wire format
+// (sub2api-derived, R37 2026-07-04): codex carries x-codex-* usage headers instead
+// of Retry-After/*ratelimit*. A codex 429 with ONLY these headers must still be
+// recognized as a rate-limit (not mis-read as a WAF rejection → 打死号), and its
+// reset-after-seconds drives the cooldown.
+func TestCooldownDecision_CodexRateLimit(t *testing.T) {
+	now := time.Unix(1_750_000_000, 0)
+
+	// 5h (secondary) window exhausted → cool for its reset (300s), even though there
+	// is NO Retry-After and NO *ratelimit* header (only x-codex-*).
+	sec := http.Header{
+		"X-Codex-Secondary-Used-Percent":       {"100"},
+		"X-Codex-Secondary-Reset-After-Seconds": {"300"},
+		"X-Codex-Primary-Used-Percent":         {"40"},
+		"X-Codex-Primary-Reset-After-Seconds":  {"600000"},
+	}
+	if until, ok := cooldownDecision(resp(429, sec), now); !ok || until != now.Add(300*time.Second) {
+		t.Fatalf("codex 5h-exhausted 429 must cool for the 5h reset (300s), got until=%v ok=%v", until, ok)
+	}
+
+	// 7d (primary) exhausted wins over 5h — the longer wall.
+	wk := http.Header{
+		"X-Codex-Primary-Used-Percent":         {"100"},
+		"X-Codex-Primary-Reset-After-Seconds":  {"3600"},
+		"X-Codex-Secondary-Used-Percent":       {"100"},
+		"X-Codex-Secondary-Reset-After-Seconds": {"120"},
+	}
+	if until, ok := cooldownDecision(resp(429, wk), now); !ok || until != now.Add(3600*time.Second) {
+		t.Fatalf("codex 7d-exhausted 429 must prefer the 7d reset (3600s), got until=%v ok=%v", until, ok)
+	}
+
+	// 429 but neither window at 100% → cool for the larger visible reset.
+	partial := http.Header{
+		"X-Codex-Primary-Used-Percent":         {"80"},
+		"X-Codex-Primary-Reset-After-Seconds":  {"200"},
+		"X-Codex-Secondary-Used-Percent":       {"90"},
+		"X-Codex-Secondary-Reset-After-Seconds": {"50"},
+	}
+	if until, ok := cooldownDecision(resp(429, partial), now); !ok || until != now.Add(200*time.Second) {
+		t.Fatalf("codex sub-100%% 429 must cool for the larger reset (200s), got until=%v ok=%v", until, ok)
+	}
+
+	// A codex 429 whose reset exceeds the cap is clamped.
+	huge := http.Header{
+		"X-Codex-Primary-Used-Percent":        {"100"},
+		"X-Codex-Primary-Reset-After-Seconds": {"999999"},
+	}
+	if until, _ := cooldownDecision(resp(429, huge), now); until != now.Add(poolCooldownMax) {
+		t.Fatalf("oversized codex reset must be capped at max, got %v", until)
+	}
+}
+
 func TestPoolCooldownStore_Snapshot(t *testing.T) {
 	now := time.Unix(1_750_000_000, 0)
 	s := &poolCooldownStore{m: map[string]time.Time{}, now: func() time.Time { return now }}

@@ -281,6 +281,16 @@ type ManagedKey struct {
 	// RoutingConfig: the group's routing knobs JSON (exhaustion_signals/util_cap/
 	// ratios), structural-synced; the resolver reads it for classification.
 	RoutingConfig string
+	// MyAssignmentOverride: the engine's persisted seat→account routing assignment
+	// for THIS VK's (seat, group) — {"account_id","blocked","routing_version",
+	// "synced_at"} JSON, written by the routing_override SyncRail after each
+	// successful pull and hydrated into the in-memory override cache at startup
+	// (N12's persistence leg, completed 2026-07-03: without it a proxy restart
+	// forgot the engine assignment and the local ranked pick could demand login
+	// for an account the engine had routed the seat away from). Empty = no
+	// persisted assignment (local ranked pick). CLI never touches this column
+	// (fenced in its structural sync).
+	MyAssignmentOverride string
 }
 
 // GetActiveManagedKeys reads all team keys from managed_virtual_keys_cache that
@@ -332,7 +342,7 @@ func (r *Reader) queryManagedKeys(withGroup bool) ([]ManagedKey, error) {
 	// rows whose only target is a oauth_group.
 	targetFilter := "provider_key_ciphertext IS NOT NULL"
 	if withGroup {
-		groupCols = ", oauth_group_id, group_accounts, group_runtime, routing_config"
+		groupCols = ", oauth_group_id, group_accounts, group_runtime, routing_config, my_assignment_override"
 		targetFilter = "(provider_key_ciphertext IS NOT NULL OR oauth_group_id IS NOT NULL)"
 	}
 	rows, err := r.db.Query(`
@@ -360,12 +370,12 @@ func (r *Reader) queryManagedKeys(withGroup bool) ([]ManagedKey, error) {
 		var providerBaseURLsJSON *string
 		var orgID, seatID, credID, credRev, vkRev string
 		var ownerAccountID *string
-		var oauthGroupID, groupAccounts, groupRuntime, routingConfig *string // group cols (nullable)
+		var oauthGroupID, groupAccounts, groupRuntime, routingConfig, myAssignmentOverride *string // group cols (nullable)
 
 		dest := []any{&vkID, &localAlias, &provCode, &protType, &baseURL, &nonce, &ciphertext, &providerBaseURLsJSON,
 			&orgID, &seatID, &credID, &credRev, &vkRev, &ownerAccountID}
 		if withGroup {
-			dest = append(dest, &oauthGroupID, &groupAccounts, &groupRuntime, &routingConfig)
+			dest = append(dest, &oauthGroupID, &groupAccounts, &groupRuntime, &routingConfig, &myAssignmentOverride)
 		}
 		if err := rows.Scan(dest...); err != nil {
 			slog.Warn("managed key: scan error, skipping", "error", err)
@@ -421,8 +431,9 @@ func (r *Reader) queryManagedKeys(withGroup bool) ([]ManagedKey, error) {
 			OwnerAccountID:     derefStr(ownerAccountID),
 			OauthGroupID:        sgID,
 			GroupAccounts:      derefStr(groupAccounts),
-			GroupRuntime:       derefStr(groupRuntime),
-			RoutingConfig:      derefStr(routingConfig),
+			GroupRuntime:         derefStr(groupRuntime),
+			RoutingConfig:        derefStr(routingConfig),
+			MyAssignmentOverride: derefStr(myAssignmentOverride),
 		})
 	}
 	if err := rows.Err(); err != nil {
@@ -1704,6 +1715,27 @@ func WriteGroupRuntime(dbPath, virtualKeyID, jsonValue string) error {
 		jsonValue, virtualKeyID)
 	if err != nil {
 		return fmt.Errorf("write group_runtime for vk %q: %w", virtualKeyID, err)
+	}
+	return nil
+}
+
+// WriteAssignmentOverride updates the my_assignment_override column for one
+// group VK (the routing_override SyncRail's persistence leg, N12 completed
+// 2026-07-03). jsonValue "" clears it (engine no longer overrides this seat).
+// Only this proxy-owned column is touched — the CLI's structural sync fences it
+// out, mirroring WriteGroupRuntime's ownership split.
+func WriteAssignmentOverride(dbPath, virtualKeyID, jsonValue string) error {
+	db, err := sql.Open("sqlite", dbPath)
+	if err != nil {
+		return fmt.Errorf("open vault db for my_assignment_override write: %w", err)
+	}
+	defer db.Close()
+
+	_, err = db.Exec(
+		"UPDATE managed_virtual_keys_cache SET my_assignment_override = ? WHERE virtual_key_id = ?",
+		jsonValue, virtualKeyID)
+	if err != nil {
+		return fmt.Errorf("write my_assignment_override for vk %q: %w", virtualKeyID, err)
 	}
 	return nil
 }

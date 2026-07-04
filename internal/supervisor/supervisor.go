@@ -312,6 +312,18 @@ type Supervisor struct {
 	// pollRoutingOverrides; read on the group-route hot path to redirect a seat off
 	// an unhealthy account. nil-safe everywhere → empty means "use the local pick".
 	routingOverrides *proxy.RoutingOverrideCache
+	// lastRoutingMismatchVersion throttles the proxy.routing_override.format_mismatch
+	// WARN (non-empty routes, zero matching a local (seat,group)) to once per
+	// routing_version — the 60s ticker would otherwise repeat it every cycle.
+	lastRoutingMismatchVersion atomic.Int64
+	// railset drives the SyncRail control-plane sync rails (railset.go,
+	// 2026-07-03): routing_override + group_runtime in Phase 1. Supervisor-scoped
+	// so Reload can kick an immediate re-sync and /status can snapshot rail health.
+	railset *railSet
+	// teamCred is the shared on-demand team account-JWT source for the rails —
+	// rebuilt whenever the control URL changes or a refresh fails (the fix for the
+	// 2026-07-03 "credential baked at start with a stale URL" incident).
+	teamCred *teamCredentialSource
 	// quotaHeartbeat is the traffic-independent server-reachability probe behind
 	// budget-mode staleness (D-U7/P9). nil unless enforce_mode=budget AND a
 	// collector URL is configured — so the default availability path (and Personal)
@@ -382,7 +394,9 @@ func New(cfg *config.Config, configPath, password, version string) (*Supervisor,
 		quotaSnapshot:    quota.NewSnapshot(),
 		quotaCounter:     quota.NewCounter(),
 		routingOverrides: proxy.NewRoutingOverrideCache(),
+		teamCred:         &teamCredentialSource{},
 	}
+	s.railset = newRailSet(s.groupRuntimeRail(), s.routingOverrideRail())
 	gen, err := s.buildGeneration()
 	if err != nil {
 		return nil, fmt.Errorf("initial generation failed: %w", err)
@@ -436,12 +450,14 @@ func New(cfg *config.Config, configPath, password, version string) (*Supervisor,
 	// or no active seats (Personal), or when quota is disabled.
 	observability.GoSafe("supervisor.quota_policy_poll", observability.Isolated, func() { s.pollQuotaPolicy(s.ctx) })
 
-	// N7c-2: pull the account's group runtime (channel ③ token/key material) on
-	// the same master-poll rail, so a group OAuth token refreshed on master reaches
-	// this node without any CLI command. No-op unless AIKEY_PROXY_OAUTH_GROUP_ENABLED
-	// (and there is a local group VK). Isolated: a poller panic must not kill the
-	// data path.
-	observability.GoSafe("supervisor.group_runtime_poll", observability.Isolated, func() { s.pollGroupRuntime(s.ctx) })
+	// SyncRail (2026-07-03): the group_runtime (N7c-2 channel ③ material) and
+	// routing_override (I-side §6.5 engine assignments) rails, driven by the
+	// declarative framework in railset.go — gate/URL/credential re-evaluated every
+	// cycle, failures counted into the OK→STALE→OFFLINE visibility state machine,
+	// Reload kicks an immediate re-sync. One GoSafe/Isolated goroutine per rail
+	// (names kept from the old hand-written polls so log filters carry over).
+	// quota/compliance/audit stay on their legacy loops until Phase 2.
+	s.railset.start(s)
 
 	// Control-plane self-heal, Stage 2 (2026-07-01): proactively rebuild the
 	// control-plane client the moment the host's network changes (WiFi switch /
@@ -450,14 +466,6 @@ func New(cfg *config.Config, configPath, password, version string) (*Supervisor,
 	// Isolated + cheap: a 20s poll; a panic here must never touch the data path.
 	// See netmon.go / selfheal.go.
 	observability.GoSafe("supervisor.net_change_monitor", observability.Isolated, func() { runNetChangeMonitor(s.ctx) })
-
-	// I-side §6.5: pull the allocation engine's seat→account routing overrides on
-	// the same master-poll rail, so the engine's redirect of a seat off an unhealthy
-	// account reaches this node without any CLI command. No-op unless oauth-group
-	// routing is enabled (and there is a team credential). Isolated: a poller panic
-	// must never kill the data path — and the override is a pure redirect the
-	// resolver always falls back from.
-	observability.GoSafe("supervisor.routing_override_poll", observability.Isolated, func() { s.pollRoutingOverrides(s.ctx) })
 
 	// Cluster mode (V3c): register this node with the hub name service + heartbeat
 	// so clients discover it via /cluster/resolve. Inert for non-cluster proxies —
@@ -1312,6 +1320,20 @@ func (s *Supervisor) Reload(ctx context.Context) error {
 		)
 	})
 
+	// SyncRail convergence (§5.2, 2026-07-03): a reload usually follows a config /
+	// vault change (`aikey account set-url`, login, settings save). Drop the
+	// cached team credential so the next cycle rebuilds against the CURRENT
+	// control URL, and nudge every rail to run that cycle NOW — the settings
+	// change converges in seconds instead of one poll interval. Both calls are
+	// non-blocking (kick channels are buffered); the 60s per-cycle URL re-check
+	// remains the bottom-line self-heal when no reload ever fires.
+	if s.teamCred != nil {
+		s.teamCred.invalidate()
+	}
+	if s.railset != nil {
+		s.railset.kickAll()
+	}
+
 	return nil
 }
 
@@ -1413,6 +1435,13 @@ func (s *Supervisor) buildGeneration() (*generation, error) {
 	// Unconditional + nil-safe: an empty cache (no team cred / control URL / poll
 	// not landed) just means every request uses the local seatassign pick.
 	p.SetRoutingOverrides(s.routingOverrides)
+	// Local console base for member-login URLs in group login-required 401s
+	// (20260703 update). Explicitly-empty (cluster/server configs) → URL-less
+	// fallback; absent key (pre-20260703 preserved configs) → default 8090.
+	p.SetConsoleURL(s.cfg.ResolvedConsoleURL())
+	// SyncRail §5.4: let the 401 wording distinguish "you need to sign in" from
+	// "the assignment rail is unreachable so this pick may be misdirected".
+	p.SetRoutingRailHealth(func() (string, int64) { return s.railHealthFor("routing_override") })
 	p.SlowRequestMs = int64(s.cfg.Log.SlowRequestMs)
 	p.VerySlowRequestMs = int64(s.cfg.Log.VerySlowRequestMs)
 	if b := s.transport.Load(); b != nil && b.rt != nil {

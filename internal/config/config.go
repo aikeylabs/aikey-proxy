@@ -41,6 +41,24 @@ type Config struct {
 	Observers     map[string]map[string]any `yaml:"observers,omitempty"`
 	Vault         VaultConfig               `yaml:"vault"`
 	UpstreamProxy UpstreamProxyConfig       `yaml:"upstream_proxy"`
+	// ConsoleURL is the base URL of THIS machine's local AiKey console
+	// (aikey-local-server web, e.g. "http://127.0.0.1:8090"). Used to assemble
+	// user-facing login links in structured errors (OAUTH_GROUP_MEMBER_LOGIN_
+	// REQUIRED → <console>/user/team-oauth) so the message shown inside claude /
+	// codex names a clickable next step. Single assembly point for login_url —
+	// do NOT re-derive this URL in CLI/wrapper code (see
+	// update/20260703-OAuth组成员登录提示-CLI显示与login_url.md 决策2).
+	//
+	// *string ON PURPOSE (absent ≠ explicit-empty):
+	//   - key ABSENT (nil): pre-20260703 personal/trial configs are PRESERVED
+	//     on upgrade (never re-rendered), so the whole existing install base
+	//     would silently lose the login URL. Absent ⇒ DefaultConsoleURL, which
+	//     is correct on every personal/trial box (console port 8090).
+	//   - key EXPLICITLY "" : deployments with no co-installed console
+	//     (server profile render, cluster-node heredoc) opt out ⇒ URL-less
+	//     fallback wording. Do not "simplify" this to a plain string — that
+	//     erases the upgrade-path default.
+	ConsoleURL *string `yaml:"console_url,omitempty"`
 	// Cluster is the V3c cluster-node config block. Absent / Enabled=false ⇒
 	// standard local proxy (Personal/Trial) — zero behavior change. When
 	// Enabled, this proxy is a cluster node: it registers + heartbeats to the
@@ -332,6 +350,22 @@ func (c *Config) applyDefaults() {
 			c.Providers[name] = p
 		}
 	}
+	// nil (key absent — pre-20260703 preserved configs) → default console.
+	// Explicit "" (server / cluster) is honored as opt-out. See the
+	// ConsoleURL field doc for why this must stay absent-vs-empty aware.
+	if c.ConsoleURL == nil {
+		v := DefaultConsoleURL
+		c.ConsoleURL = &v
+	}
+}
+
+// ResolvedConsoleURL returns the effective console base ("" = no co-installed
+// console → URL-less error wording). Safe before applyDefaults (nil → default).
+func (c *Config) ResolvedConsoleURL() string {
+	if c.ConsoleURL == nil {
+		return DefaultConsoleURL
+	}
+	return *c.ConsoleURL
 }
 
 func (c *Config) validate() error {

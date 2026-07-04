@@ -26,6 +26,8 @@ type fakePoolExchanger struct {
 	forgotN    int    // # of Forget calls (cache-clear-on-success assertions)
 	forgotSess string // last Forget sessionID
 	forgotAcct string // last Forget accountID
+	status     string // LoginStatus result (codex polling leg); "" ⇒ pending
+	statusErr  string // LoginStatus provider error text
 }
 
 func (f *fakePoolExchanger) StartLogin(_ context.Context, _ string) (string, string, error) {
@@ -42,6 +44,12 @@ func (f *fakePoolExchanger) Forget(_ context.Context, sessionID, accountID strin
 	f.forgotN++
 	f.forgotSess = sessionID
 	f.forgotAcct = accountID
+}
+func (f *fakePoolExchanger) LoginStatus(_ context.Context, _ string) (string, string, error) {
+	if f.status == "" {
+		return "pending", "", nil
+	}
+	return f.status, f.statusErr, nil
 }
 
 func newPoolHandler(t *testing.T, ex poolExchanger, masterURL string) *poolLoginHandler {
@@ -292,5 +300,52 @@ func TestPoolLogin_WritebackFailureKeepsSessionForRetry(t *testing.T) {
 	// 3) session consumed on success → a later replay is rejected.
 	if w := doJSON(h.submitCode, `{"session_id":"sess-1","code":"abc#st","confirm":true}`); w.Code != http.StatusBadRequest {
 		t.Fatalf("post-success replay → 400, got %d", w.Code)
+	}
+}
+
+// TestPoolLogin_Status: the codex polling leg. Only sessions the pool handler
+// started are visible (fail-closed: probing an unknown/personal-broker session id
+// → 400), and the response carries status/error text but never token material.
+func TestPoolLogin_Status(t *testing.T) {
+	ex := &fakePoolExchanger{authURL: "u", accountID: "acc-x", access: "SECRET-TOK"}
+	h := newPoolHandler(t, ex, "http://unused")
+
+	_ = doJSON(h.authorizeURL, `{"provider":"codex","credential_id":"c1"}`)
+
+	get := func(sid string) *httptest.ResponseRecorder {
+		r := httptest.NewRequest(http.MethodGet, "/oauth/pool/status?session_id="+sid, nil)
+		w := httptest.NewRecorder()
+		h.status(w, r)
+		return w
+	}
+
+	// Unknown session → 400 (no probing the broker through this handler).
+	if w := get("not-ours"); w.Code != http.StatusBadRequest {
+		t.Fatalf("unknown session → 400, got %d %s", w.Code, w.Body.String())
+	}
+	// Missing session_id → 400.
+	{
+		r := httptest.NewRequest(http.MethodGet, "/oauth/pool/status", nil)
+		w := httptest.NewRecorder()
+		h.status(w, r)
+		if w.Code != http.StatusBadRequest {
+			t.Fatalf("missing session_id → 400, got %d", w.Code)
+		}
+	}
+	// Pending → {"status":"pending"}.
+	if w := get("sess-1"); w.Code != http.StatusOK || !strings.Contains(w.Body.String(), `"pending"`) {
+		t.Fatalf("pending status expected, got %d %s", w.Code, w.Body.String())
+	}
+	// Callback fired → success surfaces, provider error text passes through on
+	// failure, and NO token material ever appears in the body.
+	ex.status = "success"
+	if w := get("sess-1"); w.Code != http.StatusOK || !strings.Contains(w.Body.String(), `"success"`) {
+		t.Fatalf("success status expected, got %d %s", w.Code, w.Body.String())
+	} else if strings.Contains(w.Body.String(), "SECRET-TOK") {
+		t.Fatalf("status body must never contain token material: %s", w.Body.String())
+	}
+	ex.status, ex.statusErr = "failed", "provider said no"
+	if w := get("sess-1"); !strings.Contains(w.Body.String(), "provider said no") {
+		t.Fatalf("provider error text should pass through: %s", w.Body.String())
 	}
 }

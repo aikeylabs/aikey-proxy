@@ -26,7 +26,6 @@ import (
 	"net/http"
 	"time"
 
-	"github.com/AiKeyLabs/aikey-proxy/internal/events"
 	"github.com/AiKeyLabs/aikey-proxy/internal/httpx"
 	"github.com/AiKeyLabs/aikey-proxy/internal/observability"
 	"github.com/AiKeyLabs/aikey-proxy/internal/vault"
@@ -38,67 +37,41 @@ func defaultGroupRuntimeClient() *http.Client { return httpx.NewDirectClient(10 
 
 const groupRuntimePollInterval = 60 * time.Second
 
-// pollGroupRuntime runs until ctx is canceled, pulling the account's group
-// runtime every groupRuntimePollInterval (plus once at start). No-op unless the
-// oauth-group feature is enabled. The account-JWT credential is built ONCE and
-// reused across cycles (one Bearer refresh window, not one per cycle); the
-// control-plane refresh_token is reusable (same as the collector credential's
-// re-refresh-on-restart design), so reuse is safe.
-func (s *Supervisor) pollGroupRuntime(ctx context.Context) {
-	if !oauthGroupRoutingEnabled() {
-		return // feature off → the whole rail is bypassed (direct-bind unchanged)
-	}
-	gen := s.active.Load()
-	if gen == nil || gen.vault == nil {
-		return
-	}
-	creds := buildCollectorCredentials(s.cfg.Events.CollectorCredentials, gen.vault)
-	cred := creds["team"] // the account-JWT used for team-scoped master calls
-	if cred == nil {
-		// Pre-login / no team credential → nothing to pull with. A reload after
-		// `aikey account login` re-runs startup and picks it up.
-		return
-	}
-
-	s.syncGroupRuntime(ctx, cred)
-	ticker := time.NewTicker(groupRuntimePollInterval)
-	defer ticker.Stop()
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		case <-ticker.C:
-			s.syncGroupRuntime(ctx, cred)
-		}
+// groupRuntimeRail declares this rail for the SyncRail framework (railset.go,
+// 2026-07-03): gate/generation/URL/credential re-evaluated every cycle, failures
+// counted into the visibility state machine. The old hand-written loop built its
+// team credential once at start and early-returned forever on any startup
+// precondition miss — silently (bugfix
+// 2026-07-03-routing-override-rail-silent-stall.md).
+func (s *Supervisor) groupRuntimeRail() railSpec {
+	return railSpec{
+		name:         "group_runtime",
+		interval:     groupRuntimePollInterval,
+		needsTeamJWT: true,
+		gate: func(gen *generation) bool {
+			if !oauthGroupRoutingEnabled() {
+				return false // feature off → the whole rail is bypassed (direct-bind unchanged)
+			}
+			mks, _ := gen.vault.GetActiveManagedKeys()
+			for i := range mks {
+				if mks[i].OauthGroupID != "" {
+					return true
+				}
+			}
+			return false // no local group VK → nothing to pull/store (idle, not broken)
+		},
+		sync: s.syncGroupRuntime,
 	}
 }
 
-// syncGroupRuntime pulls the account-level group runtime and, only when the
-// material actually changed, rewrites each group VK's group_runtime column and
-// reloads so the resolver (N8) picks up the fresh tokens. Mirrors syncQuotaPolicy.
-func (s *Supervisor) syncGroupRuntime(ctx context.Context, cred events.Credential) {
-	gen := s.active.Load()
-	if gen == nil || gen.vault == nil {
-		return
-	}
-	masterURL := readControlPanelURL()
-	if masterURL == "" {
-		return
-	}
-	mks, _ := gen.vault.GetActiveManagedKeys()
-	hasGroup := false
-	for i := range mks {
-		if mks[i].OauthGroupID != "" {
-			hasGroup = true
-			break
-		}
-	}
-	if !hasGroup {
-		return // no local group VK → nothing to pull/store
-	}
-	bearer, err := cred.Bearer(ctx)
+// syncGroupRuntime runs one pull of the account-level group runtime and, only
+// when the material actually changed, rewrites each group VK's group_runtime
+// column and reloads so the resolver (N8) picks up the fresh tokens. Any error
+// keeps the last-known material (don't flap) and is COUNTED by the framework.
+func (s *Supervisor) syncGroupRuntime(ctx context.Context, gen *generation, masterURL, bearer string) error {
+	mks, err := gen.vault.GetActiveManagedKeys()
 	if err != nil {
-		return // can't auth → keep last-known
+		return err
 	}
 	// Path Z (通道3 §14): piggyback the proxy's observed window-reset epochs so
 	// master re-rolls each account's window_max_util_pct per window.
@@ -106,13 +79,13 @@ func (s *Supervisor) syncGroupRuntime(ctx context.Context, cred events.Credentia
 	if gen.proxy != nil {
 		observedResets = gen.proxy.ObservedResetsSnapshot()
 	}
-	groups, sig, ok := fetchGroupRuntime(ctx, masterURL, bearer, observedResets)
-	if !ok {
-		return // unreachable / bad response → keep last-known (don't flap)
+	groups, sig, err := fetchGroupRuntime(ctx, masterURL, bearer, observedResets)
+	if err != nil {
+		return err // unreachable / bad response → keep last-known (don't flap)
 	}
 	// Steady state: same material (no token refresh) → no rewrite/reload.
 	if prev := s.lastGroupRuntimeSig.Load(); prev != nil && *prev == sig {
-		return
+		return nil
 	}
 	// s.routingOverrides.Assignment is nil-safe (guards nil receiver → "" = rank-0),
 	// so the routed-account stamp degrades to the local pick when overrides are unset.
@@ -124,15 +97,18 @@ func (s *Supervisor) syncGroupRuntime(ctx context.Context, cred events.Credentia
 	if err := writeGroupRuntimeForGroups(s.cfg.Vault.Path, gen.vault.DerivedKey(), mks, groups, s.routingOverrides.Assignment, grSkip); err != nil {
 		slog.Warn("group_runtime write failed",
 			"event.name", "proxy.group_runtime.write_failed", "error", err.Error())
-		return // leave lastGroupRuntimeSig unchanged → retry next tick
+		return err // leave lastGroupRuntimeSig unchanged → retry next tick
 	}
 	s.lastGroupRuntimeSig.Store(&sig)
 	slog.Info("group runtime material changed",
 		"event.name", "proxy.group_runtime.changed", "groups", len(groups))
 	if err := s.Reload(ctx); err != nil {
+		// Local reload hiccup, not a master-sync failure: the material IS stored
+		// (next reload picks it up), so the cycle still counts as a success.
 		slog.Warn("group_runtime reload failed",
 			"event.name", "proxy.group_runtime.reload_failed", "error", err.Error())
 	}
+	return nil
 }
 
 // ── master response (mirrors groupruntime.GroupDelivery / AccountMaterial) ──
@@ -201,20 +177,22 @@ var groupRuntimeSwap = httpx.NewSwappable(defaultGroupRuntimeClient)
 func groupRuntimeClient() *http.Client { return groupRuntimeSwap.Get() }
 
 // fetchGroupRuntime GETs the account-level group-runtime endpoint with an
-// account-JWT Bearer. Returns (groups, rawBody, ok); ok=false on any error so the
-// caller keeps the last-known group_runtime (don't flap). rawBody is the change
-// signature — same plaintext response = no token change = skip the vault rewrite
-// (the encrypted form can't be compared: a fresh nonce each encrypt).
+// account-JWT Bearer. Returns (groups, rawBody, err); a non-nil error means the
+// caller keeps the last-known group_runtime (don't flap) and the SyncRail
+// framework surfaces the cause (2026-07-03: a bare ok=false hid the
+// connection-refused detail that mattered most in the incident). rawBody is the
+// change signature — same plaintext response = no token change = skip the vault
+// rewrite (the encrypted form can't be compared: a fresh nonce each encrypt).
 // observedResetsHeader piggybacks the proxy's observed per-account window-reset
 // epochs on the pull (Path Z, 通道3 §14): base64(JSON {account_id: epoch}).
 // master re-rolls window_max_util_pct when an epoch is newer than its stored
 // window_reset_at. Optional — master ignores it when absent (backward compatible).
 const observedResetsHeader = "X-Aikey-Observed-Resets"
 
-func fetchGroupRuntime(ctx context.Context, masterURL, bearer string, observedResets map[string]int64) ([]grGroup, string, bool) {
+func fetchGroupRuntime(ctx context.Context, masterURL, bearer string, observedResets map[string]int64) ([]grGroup, string, error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, masterURL+"/accounts/me/group-runtime", http.NoBody)
 	if err != nil {
-		return nil, "", false
+		return nil, "", err
 	}
 	req.Header.Set("Authorization", "Bearer "+bearer)
 	if len(observedResets) > 0 {
@@ -241,24 +219,24 @@ func fetchGroupRuntime(ctx context.Context, masterURL, bearer string, observedRe
 					"error", err.Error())
 			}
 		}
-		return nil, "", false
+		return nil, "", err
 	}
 	// Reached master (any HTTP response proves the routing path is alive) → clear
 	// the net-change stuck counter so a later transient can't ride an old tally.
 	controlPlaneHeal.onPollOK()
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
-		return nil, "", false
+		return nil, "", fmt.Errorf("GET /accounts/me/group-runtime: HTTP %d", resp.StatusCode)
 	}
 	body, err := io.ReadAll(io.LimitReader(resp.Body, 8<<20))
 	if err != nil {
-		return nil, "", false
+		return nil, "", err
 	}
 	var out grDeliveryResp
 	if err := json.Unmarshal(body, &out); err != nil {
-		return nil, "", false
+		return nil, "", fmt.Errorf("decode group-runtime response: %w", err)
 	}
-	return out.Groups, string(body), true
+	return out.Groups, string(body), nil
 }
 
 // restampCurrentRouted recomputes IsCurrentRouted on every local group VK's EXISTING
