@@ -121,6 +121,15 @@ type batchResponse struct {
 type Reporter struct {
 	lastCanaryEventAt time.Time
 	lastErrorAt       time.Time
+	// lastAutoReplayAt gates the dead-letter AUTO-replay (2026-07-04 self-heal):
+	// a successful upload proves the pipe recovered, so entries dead-lettered
+	// during the outage are replayed automatically — at most once per
+	// autoReplayCooldown, guarded by autoReplayInFlight. Manual replay
+	// (POST /admin/replay-dead-letter) stays as the emergency channel.
+	// Idempotency: collector ingest dedups by event_id (INSERT OR IGNORE /
+	// ON CONFLICT DO NOTHING), so re-uploading already-accepted entries is safe.
+	lastAutoReplayAt   time.Time
+	autoReplayInFlight atomic.Bool
 	// nextUploadAttempt is the non-blocking backoff gate (B', 2026-06-09 缺口2):
 	// after a drain pass hits retryable upload failures, drainOnce sets this
 	// ahead and skips upload attempts until it passes — replacing the old in-line
@@ -822,6 +831,47 @@ func (r *Reporter) onUploadSuccess(count int) {
 			"total", total,
 			"recovered", wasRecovery)
 	}
+	r.maybeAutoReplayLocked()
+}
+
+// autoReplayCooldown spaces automatic dead-letter replays so a flapping
+// upstream can't turn the replay pass into a hot loop. 10 min ≈ one recovery
+// window; entries left behind are retried on the next trigger.
+const autoReplayCooldown = 10 * time.Minute
+
+// maybeAutoReplayLocked (r.mu held) fires the self-healing dead-letter replay
+// when a successful upload shows the pipe is healthy again. Non-blocking: the
+// replay itself runs on an isolated goroutine — a panic or slow pass never
+// touches the upload hot path.
+func (r *Reporter) maybeAutoReplayLocked() {
+	if r.dlw == nil || time.Since(r.lastAutoReplayAt) < autoReplayCooldown {
+		return
+	}
+	// Cheap gate: only bother when the dead-letter file has content. Stat runs
+	// at most once per cooldown window.
+	r.lastAutoReplayAt = time.Now()
+	if fi, err := os.Stat(r.dlw.path); err != nil || fi.Size() == 0 {
+		return
+	}
+	if !r.autoReplayInFlight.CompareAndSwap(false, true) {
+		return
+	}
+	observability.GoSafe("events.reporter.auto_replay", observability.Isolated, func() {
+		defer r.autoReplayInFlight.Store(false)
+		res, err := r.ReplayDeadLetter(context.Background())
+		if err != nil {
+			slog.Warn("reporter: automatic dead-letter replay failed — entries kept for the next window",
+				"event.name", observability.EventReporterDeadLetterReplayed,
+				"error", err.Error())
+			return
+		}
+		if res.EntriesScanned == 0 {
+			return
+		}
+		slog.Info("reporter: automatic dead-letter replay finished",
+			"event.name", observability.EventReporterDeadLetterReplayed,
+			"scanned", res.EntriesScanned, "events_replayed", res.EventsReplayedOK, "still_failing", res.EntriesStillFailing)
+	})
 }
 
 // onUploadFail updates delivery state after a failed upload.

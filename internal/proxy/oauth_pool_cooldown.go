@@ -15,11 +15,17 @@
 package proxy
 
 import (
+	"encoding/json"
+	"log/slog"
 	"net/http"
+	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/AiKeyLabs/aikey-proxy/internal/observability"
 )
 
 const (
@@ -42,7 +48,113 @@ type poolCooldownStore struct {
 }
 
 func newPoolCooldownStore() *poolCooldownStore {
-	return &poolCooldownStore{m: make(map[string]time.Time), now: time.Now}
+	s := &poolCooldownStore{m: make(map[string]time.Time), now: time.Now}
+	// Cross-restart persistence (2026-07-04 self-heal, §S4): without it a proxy
+	// restart forgot every cooldown and could immediately route traffic back
+	// onto an account that just 401'd / rate-limited. STRICTLY an enhancement,
+	// never a dependency (owner constraint): a missing/corrupt/unreadable file
+	// falls back to an empty store and the main link proceeds untouched.
+	s.hydrateFromFile()
+	return s
+}
+
+// ── cross-restart persistence (bypass state file, §S4 2026-07-04) ───────────
+// Same ownership pattern as sync-health.json / group-login-required.json:
+// one concern, one file, one writer (this store). Writes happen on mark()
+// (rare — an upstream 401/exhaustion) and are atomic (temp+rename). Reads
+// happen ONCE at construction. Every failure path is best-effort:
+// write → WARN and keep serving; read → empty store (fallback, never blocks).
+
+const poolCooldownFilename = "pool-cooldown.json"
+
+type poolCooldownFileBody struct {
+	// Accounts maps accountID → avoid-until unix seconds (only unexpired ones).
+	Accounts  map[string]int64 `json:"accounts"`
+	WrittenAt int64            `json:"written_at"` // unix millis
+}
+
+func poolCooldownPath() (string, error) {
+	if dir := os.Getenv("AIKEY_RUN_DIR"); dir != "" {
+		return filepath.Join(dir, poolCooldownFilename), nil
+	}
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return "", err
+	}
+	return filepath.Join(home, ".aikey", "run", poolCooldownFilename), nil
+}
+
+// hydrateFromFile preloads unexpired cooldowns from the state file. Fallback
+// by design: any error (missing file, bad JSON, unreadable) leaves the store
+// empty — the data path never depends on this file.
+func (s *poolCooldownStore) hydrateFromFile() {
+	path, err := poolCooldownPath()
+	if err != nil {
+		return
+	}
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		return // missing or unreadable → empty store (fallback)
+	}
+	var body poolCooldownFileBody
+	if json.Unmarshal(raw, &body) != nil {
+		return // corrupt → empty store (fallback); next mark() overwrites it
+	}
+	now := s.now()
+	loaded := 0
+	for id, untilUnix := range body.Accounts {
+		until := time.Unix(untilUnix, 0)
+		if id != "" && now.Before(until) {
+			s.m[id] = until
+			loaded++
+		}
+	}
+	if loaded > 0 {
+		slog.Info("pool cooldowns hydrated from state file (survive restart)",
+			"event.name", observability.EventProxyGroupAccountCooldown, "accounts", loaded)
+	}
+}
+
+// persistLocked mirrors the current unexpired cooldowns to the state file
+// (s.mu held by the caller). Empty set removes the file. Best-effort: a
+// failure is WARN-logged and never surfaces to the request path.
+func (s *poolCooldownStore) persistLocked() {
+	path, err := poolCooldownPath()
+	if err != nil {
+		return
+	}
+	now := s.now()
+	accounts := make(map[string]int64, len(s.m))
+	for id, until := range s.m {
+		if now.Before(until) {
+			accounts[id] = until.Unix()
+		}
+	}
+	if len(accounts) == 0 {
+		if rmErr := os.Remove(path); rmErr != nil && !os.IsNotExist(rmErr) {
+			slog.Warn("pool cooldown state file remove failed",
+				"event.name", observability.EventProxyGroupAccountCooldown, "error", rmErr.Error())
+		}
+		return
+	}
+	err = func() error {
+		if mkErr := os.MkdirAll(filepath.Dir(path), 0o700); mkErr != nil {
+			return mkErr
+		}
+		data, mErr := json.Marshal(poolCooldownFileBody{Accounts: accounts, WrittenAt: time.Now().UnixMilli()})
+		if mErr != nil {
+			return mErr
+		}
+		tmp := path + ".tmp"
+		if wErr := os.WriteFile(tmp, data, 0o600); wErr != nil {
+			return wErr
+		}
+		return os.Rename(tmp, path)
+	}()
+	if err != nil {
+		slog.Warn("pool cooldown state file write failed — cooldowns won't survive a restart",
+			"event.name", observability.EventProxyGroupAccountCooldown, "error", err.Error())
+	}
 }
 
 // mark cools an account down until `until`. A no-op for an empty id or a time
@@ -54,6 +166,7 @@ func (s *poolCooldownStore) mark(accountID string, until time.Time) {
 	s.mu.Lock()
 	if cur, ok := s.m[accountID]; !ok || until.After(cur) {
 		s.m[accountID] = until
+		s.persistLocked()
 	}
 	s.mu.Unlock()
 }

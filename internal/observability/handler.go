@@ -50,6 +50,10 @@ const (
 	// (~/.aikey/run/sync-health.json) could not be written/removed — the claude
 	// status bar may show a stale (or miss a fresh) sync warning.
 	EventProxySyncHealthFileFailed = "proxy.sync.health_file_failed"
+	// EventReporterDeadLetterReplayed: the automatic dead-letter replay ran
+	// after the upload pipe recovered (2026-07-04 self-heal) — carries
+	// scanned/replayed/still-failing counts, or the error when the pass failed.
+	EventReporterDeadLetterReplayed = "proxy.events.dead_letter_replayed"
 )
 
 // Health events.
