@@ -15,6 +15,8 @@ import (
 	"database/sql"
 	"encoding/json"
 	"fmt"
+
+	"github.com/AiKeyLabs/aikey-proxy/internal/vault"
 )
 
 // PolicySubject is one subject as delivered by GET /v1/quota/policy. It mirrors
@@ -37,7 +39,10 @@ type PolicySubject struct {
 // A missing table (a vault that predates the Phase 2 schema) is tolerated (no-op)
 // so the poll never errors a pre-migration vault.
 func WriteSubjects(dbPath string, subjects []PolicySubject) error {
-	db, err := sql.Open("sqlite", dbPath)
+	// Same vault DB file — reuse the busy_timeout guard (single source of truth,
+	// vault.WithBusyTimeoutDSN) so this poll's full-replace write retries on lock
+	// contention instead of failing an admin's quota-limit edit with SQLITE_BUSY.
+	db, err := sql.Open("sqlite", vault.WithBusyTimeoutDSN(dbPath))
 	if err != nil {
 		return fmt.Errorf("open vault db for quota policy write: %w", err)
 	}
