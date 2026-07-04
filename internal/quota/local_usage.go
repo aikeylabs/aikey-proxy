@@ -15,6 +15,8 @@ package quota
 import (
 	"database/sql"
 	"fmt"
+
+	"github.com/AiKeyLabs/aikey-proxy/internal/vault"
 )
 
 // LocalUsageRow is one persisted (subject, metric, period) increment. Mirrors the
@@ -75,7 +77,11 @@ func WriteLocalUsage(dbPath string, rows []LocalUsageRow) error {
 	if len(rows) == 0 {
 		return nil
 	}
-	db, err := sql.Open("sqlite", dbPath)
+	// Same vault DB file as vault.WriteConfig*/WriteGroupRuntime — must carry the
+	// busy_timeout guard (this is the busiest vault writer, 5s ticks), else it
+	// fails instantly on SQLITE_BUSY under lock contention on Linux. Single source
+	// of truth: vault.WithBusyTimeoutDSN (do not open the vault file raw).
+	db, err := sql.Open("sqlite", vault.WithBusyTimeoutDSN(dbPath))
 	if err != nil {
 		return fmt.Errorf("open vault db for local-usage flush: %w", err)
 	}

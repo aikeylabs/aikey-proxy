@@ -6,6 +6,7 @@ import (
 	"log/slog"
 	"time"
 
+	"github.com/AiKeyLabs/aikey-proxy/internal/vault"
 	_ "modernc.org/sqlite"
 )
 
@@ -16,7 +17,14 @@ type Store struct {
 
 // OpenStore opens (or creates) the events database with WAL mode.
 func OpenStore(dbPath string) (*Store, error) {
-	db, err := sql.Open("sqlite", dbPath)
+	// busy_timeout via DSN (per-connection, not persisted like journal_mode=WAL,
+	// so it must be on the DSN not an Exec'd PRAGMA). The events DB is multi-writer
+	// — collector Insert vs RetentionLoop PruneOlderThan on separate pool conns,
+	// reload building a new generation while the old one still flushes, and the
+	// cross-process `aikey-proxy wal vacuum` — so a second writer would otherwise
+	// hit SQLITE_BUSY instantly (WAL serializes writers but doesn't wait). Reuse
+	// vault.WithBusyTimeoutDSN as the single sqlite busy_timeout convention.
+	db, err := sql.Open("sqlite", vault.WithBusyTimeoutDSN(dbPath))
 	if err != nil {
 		return nil, fmt.Errorf("open events db: %w", err)
 	}
