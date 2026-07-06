@@ -404,6 +404,86 @@ func parseUnifiedUtil7d(h http.Header) (float64, bool) {
 	return v, true
 }
 
+// codex5hThresholdMinutes: a window shorter than this is the "5h" (short/head)
+// window, longer is the "7d" (weekly) window. 360 = 6h, mirroring sub2api's
+// single-window disambiguation. Live Plus windows are 300 (5h) and 10080 (7d).
+const codex5hThresholdMinutes = 360
+
+// parseCodexUtil reads Codex's per-window utilization off an upstream response
+// (the X-Codex-* headers ride on every chatgpt.com /responses 200 — verified
+// live 2026-07-06, see research/oauth-codex-ratelimit/2026-07-06-codex-ratelimit-
+// taxonomy.md) and NORMALIZES it to the SAME (util_5h, util_7d) fraction shape
+// the allocation engine consumes for Anthropic, so master stays provider-neutral
+// (design §4B/§5.1). Two gotchas baked in:
+//   - percent is 0..100 → ÷100 (Anthropic util is already 0..1).
+//   - Codex ships TWO windows named primary/secondary whose durations are NOT
+//     fixed to 5h/7d (a Plus account's primary is 5h, but sub2api's own comment
+//     had it backwards). We classify by X-Codex-*-Window-Minutes — smaller = 5h,
+//     larger = 7d — NEVER by the primary/secondary name.
+// Returns (0,0,false) when no X-Codex-*-used-percent header is present (i.e. the
+// response is not Codex traffic), so the caller simply skips the sample — the
+// same "clean-parse-only" contract as parseUnifiedUtil5h. util_7d is 0 when its
+// window is absent (matches the Anthropic path's omitempty-0 behavior).
+func parseCodexUtil(h http.Header) (util5h, util7d float64, ok bool) {
+	pUsed, pOK := parseCodexPercent(h.Get("X-Codex-Primary-Used-Percent"))
+	sUsed, sOK := parseCodexPercent(h.Get("X-Codex-Secondary-Used-Percent"))
+	if !pOK && !sOK {
+		return 0, 0, false // not Codex traffic (or no util headers) → skip
+	}
+	pMin := parseCodexInt(h.Get("X-Codex-Primary-Window-Minutes"))
+	sMin := parseCodexInt(h.Get("X-Codex-Secondary-Window-Minutes"))
+
+	// primaryIs5h: is the primary window the SHORT (5h) one? Classify by duration.
+	primaryIs5h := true // default when minutes are absent: primary = 5h (head signal)
+	switch {
+	case pMin > 0 && sMin > 0:
+		primaryIs5h = pMin <= sMin
+	case pMin > 0:
+		primaryIs5h = pMin <= codex5hThresholdMinutes
+	case sMin > 0:
+		primaryIs5h = sMin > codex5hThresholdMinutes
+	}
+
+	if primaryIs5h {
+		util5h, util7d = pUsed/100, sUsed/100
+	} else {
+		util5h, util7d = sUsed/100, pUsed/100
+	}
+	return util5h, util7d, true
+}
+
+// parseCodexPercent parses an X-Codex-*-used-percent header (float 0..100+). Codex
+// can report >100 briefly; we clamp the upper bound to 100 so the normalized
+// fraction stays in [0,1] for the engine, but treat a missing/negative/garbage
+// value as "absent" (ok=false).
+func parseCodexPercent(raw string) (float64, bool) {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return 0, false
+	}
+	v, err := strconv.ParseFloat(raw, 64)
+	if err != nil || v < 0 {
+		return 0, false
+	}
+	if v > 100 {
+		v = 100
+	}
+	return v, true
+}
+
+// parseCodexInt parses an X-Codex-*-window-minutes / -reset-after-seconds header;
+// 0 on missing/garbage (treated as "unknown" by callers).
+func parseCodexInt(raw string) int {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return 0
+	}
+	if i, err := strconv.Atoi(raw); err == nil && i > 0 {
+		return i
+	}
+	return 0
+}
+
 // isHardRevoked reports whether a 401 upstream response means the credential's
 // OAuth token was HARD-revoked (gone for good) vs a routine expiry the refresh
 // path recovers from. We gate on status==401 AND a documented hard-revocation

@@ -263,7 +263,16 @@ func hasFingerprint(block map[string]any) bool {
 // injectCodexOAuth injects Codex (ChatGPT Plus/Pro) headers.
 //
 // Verified 2026-04-15:
-//   - originator: opencode (required by Codex API)
+//   - originator: codex_cli_rs (the OFFICIAL codex CLI value; was "opencode",
+//     inherited from opencode's codex.ts). Source of truth: openai/codex
+//     codex-rs/login/src/auth/default_client.rs DEFAULT_ORIGINATOR="codex_cli_rs"
+//     (sent on every /responses request via add_originator_header). This is only
+//     a FALLBACK: setIfAbsent preserves the value a real codex CLI already sends,
+//     so we merely stop mislabelling originator-less traffic as the third-party
+//     "opencode" tool. NOTE: this is a required API header, NOT a persona/UA
+//     fingerprint — we deliberately do NOT inject a synthetic User-Agent/session
+//     here (that identity-forgery layer was removed 2026-06-29 for transparent
+//     proxy + ≤3-users/account; see CC账号池 requirement).
 //   - ChatGPT-Account-Id: from JWT claims (for org subscriptions)
 //   - API URL: chatgpt.com/backend-api/codex/responses (Responses API format)
 //
@@ -280,7 +289,7 @@ func hasFingerprint(block map[string]any) bool {
 // predate ExternalID.
 func injectCodexOAuth(req *http.Request, cred *OAuthCredential) {
 	req.Header.Set("Authorization", "Bearer "+cred.AccessToken)
-	setIfAbsent(req, "originator", "opencode")
+	setIfAbsent(req, "originator", "codex_cli_rs")
 	if id := cred.ExternalID; id != "" {
 		setIfAbsent(req, "ChatGPT-Account-Id", id)
 	} else if cred.AccountID != "" {

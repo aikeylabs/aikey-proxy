@@ -691,6 +691,11 @@ func (p *Proxy) serveRoute(w http.ResponseWriter, r *http.Request, route *vkeys.
 					upstreamReqID := extractUpstreamRequestID(resp)
 					p.reportUsage(route, bearerToken, ev.Model, startTime, resp.StatusCode, breakdown, "", "", realKey, sessionID, "complete", upstreamReqID)
 					// Phase 2: accrue token + local usd quota for this completed request.
+					// Backfill the model for local usd pricing when the adapter left it
+					// empty (mirrors the streaming path) so codex/others aren't unpriced.
+					if breakdown.Model == "" {
+						breakdown.Model = ev.Model
+					}
 					p.accrueQuotaUsage(route, breakdown, logger)
 				}
 			} else {
@@ -731,6 +736,14 @@ func (p *Proxy) serveRoute(w http.ResponseWriter, r *http.Request, route *vkeys.
 						}
 						// Phase 2: accrue token + local usd quota on stream completion,
 						// independent of the reporter.
+						// Local usd pricing keys on br.Model, but some providers' usage
+						// frame omits it (Codex /responses SSE) → the request would be
+						// left unpriced (usd=0) even though reportUsage recorded the
+						// correct `model`. Backfill so the edge price lookup matches the
+						// model this request actually ran (2026-07-06 codex-into-pool).
+						if br.Model == "" {
+							br.Model = model
+						}
 						p.accrueQuotaUsage(route, br, logger)
 					}
 				}

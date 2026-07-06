@@ -60,8 +60,9 @@ func TestCooldownDecision_Classification(t *testing.T) {
 func TestCooldownDecision_CodexRateLimit(t *testing.T) {
 	now := time.Unix(1_750_000_000, 0)
 
-	// 5h (secondary) window exhausted → cool for its reset (300s), even though there
-	// is NO Retry-After and NO *ratelimit* header (only x-codex-*).
+	// Only ONE window exhausted (used≥100) → cool for THAT window's reset (300s),
+	// even though there is NO Retry-After and NO *ratelimit* header (only x-codex-*).
+	// The other window is below 100% so it does not gate.
 	sec := http.Header{
 		"X-Codex-Secondary-Used-Percent":       {"100"},
 		"X-Codex-Secondary-Reset-After-Seconds": {"300"},
@@ -69,10 +70,10 @@ func TestCooldownDecision_CodexRateLimit(t *testing.T) {
 		"X-Codex-Primary-Reset-After-Seconds":  {"600000"},
 	}
 	if until, ok := cooldownDecision(resp(429, sec), now); !ok || until != now.Add(300*time.Second) {
-		t.Fatalf("codex 5h-exhausted 429 must cool for the 5h reset (300s), got until=%v ok=%v", until, ok)
+		t.Fatalf("codex one-window-exhausted 429 must cool for that window's reset (300s), got until=%v ok=%v", until, ok)
 	}
 
-	// 7d (primary) exhausted wins over 5h — the longer wall.
+	// Both windows exhausted, LONGER reset is on PRIMARY → cool for the longer wall.
 	wk := http.Header{
 		"X-Codex-Primary-Used-Percent":         {"100"},
 		"X-Codex-Primary-Reset-After-Seconds":  {"3600"},
@@ -80,7 +81,22 @@ func TestCooldownDecision_CodexRateLimit(t *testing.T) {
 		"X-Codex-Secondary-Reset-After-Seconds": {"120"},
 	}
 	if until, ok := cooldownDecision(resp(429, wk), now); !ok || until != now.Add(3600*time.Second) {
-		t.Fatalf("codex 7d-exhausted 429 must prefer the 7d reset (3600s), got until=%v ok=%v", until, ok)
+		t.Fatalf("codex both-exhausted 429 must cool for the longer reset (3600s), got until=%v ok=%v", until, ok)
+	}
+
+	// D9 REGRESSION (bugfix 2026-07-06-codex-ratelimit-reset-window-by-name): both
+	// windows exhausted, but the LONGER wall is the SECONDARY window. The old code
+	// returned the PRIMARY reset first (assuming primary=7d) and under-cooled to
+	// the shorter wall → re-429. Must cool for the longer reset (1800s) regardless
+	// of which window is named primary/secondary.
+	bugBothExhaustedLongerSecondary := http.Header{
+		"X-Codex-Primary-Used-Percent":         {"100"},
+		"X-Codex-Primary-Reset-After-Seconds":  {"120"}, // 5h — shorter
+		"X-Codex-Secondary-Used-Percent":       {"100"},
+		"X-Codex-Secondary-Reset-After-Seconds": {"1800"}, // 7d — longer, MUST win
+	}
+	if until, ok := cooldownDecision(resp(429, bugBothExhaustedLongerSecondary), now); !ok || until != now.Add(1800*time.Second) {
+		t.Fatalf("D9: both-exhausted must cool for the LONGER reset (1800s) regardless of primary/secondary name, got until=%v ok=%v", until, ok)
 	}
 
 	// 429 but neither window at 100% → cool for the larger visible reset.

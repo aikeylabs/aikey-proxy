@@ -71,7 +71,7 @@ func TestOAuthInject_DispatchesByProvider(t *testing.T) {
 		wantValue   string
 	}{
 		{"anthropic", "Bearer oauth-tok", "anthropic-version", "2023-06-01"},
-		{"openai", "Bearer oauth-tok", "originator", "opencode"},
+		{"openai", "Bearer oauth-tok", "originator", "codex_cli_rs"},
 		{"kimi", "Bearer oauth-tok", "X-Msh-Platform", "kimi_cli"},
 		{"moonshot", "Bearer oauth-tok", "X-Msh-Platform", "kimi_cli"},
 		{"unknown", "Bearer oauth-tok", "", ""},
@@ -286,8 +286,8 @@ func TestInjectCodexOAuth(t *testing.T) {
 		if got := req.Header.Get("Authorization"); got != "Bearer codex-tok" {
 			t.Errorf("Authorization = %q", got)
 		}
-		if got := req.Header.Get("originator"); got != "opencode" {
-			t.Errorf("originator = %q, want %q", got, "opencode")
+		if got := req.Header.Get("originator"); got != "codex_cli_rs" {
+			t.Errorf("originator = %q, want %q", got, "codex_cli_rs")
 		}
 		if got := req.Header.Get("ChatGPT-Account-Id"); got != "chatgpt-uuid-789" {
 			t.Errorf("ChatGPT-Account-Id = %q, want ExternalID %q (not internal AccountID)", got, "chatgpt-uuid-789")

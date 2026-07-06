@@ -129,9 +129,19 @@ func (p *Proxy) buildBaseEvent(req *http.Request, resp *http.Response, startTime
 	// just enriches it (0 + omitempty when the 7d header is absent, so util_5h
 	// reporting stays byte-identical). enqueue is nil-safe (reporter off → no-op)
 	// and non-blocking (full buffer drops the sample, never stalls).
+	// Provider dispatch is by header-sniff, NOT a provider_code switch: the two
+	// utilization header families are mutually exclusive (an account is either
+	// Anthropic → anthropic-ratelimit-unified-*, or Codex → X-Codex-*, never both),
+	// so we try Anthropic first, then Codex. This mirrors R34's reactive layer
+	// (hasRateLimitSignal / cooldownDecision sniff both without branching) and
+	// keeps the enqueue provider-neutral (design §4B: normalize at the edge, feed
+	// one wire). parseCodexUtil already ÷100s and maps primary/secondary→5h/7d by
+	// window duration, so master/engine see the identical (util_5h, util_7d) shape.
 	if resp != nil {
 		if util5h, ok := parseUnifiedUtil5h(resp.Header); ok {
 			util7d, _ := parseUnifiedUtil7d(resp.Header)
+			p.signalReporter.enqueue(route.CredentialID, time.Now().Unix(), util5h, util7d)
+		} else if util5h, util7d, ok := parseCodexUtil(resp.Header); ok {
 			p.signalReporter.enqueue(route.CredentialID, time.Now().Unix(), util5h, util7d)
 		}
 	}
