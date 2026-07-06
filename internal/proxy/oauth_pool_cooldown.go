@@ -262,32 +262,45 @@ func hasRateLimitSignal(h http.Header) bool {
 }
 
 // codexRateLimitReset extracts the cooldown duration from codex's own rate-limit
-// headers (ChatGPT backend; sub2api-derived wire format, see research doc). Mirrors
-// sub2api's calculateOpenAI429ResetTime header path: prefer the EXHAUSTED window's
-// reset (used_percent ≥ 100; primary=weekly/7d wins over secondary=5h), else the
-// larger of the two window resets. Returns 0 when no codex reset header is present
-// (caller then falls back to Retry-After / default). Anthropic responses carry no
-// x-codex-* headers, so this is a no-op on the claude path (zero regression).
+// headers (ChatGPT backend; wire format verified live 2026-07-06, see
+// research/oauth-codex-ratelimit/). We cool for the LONGEST reset among the
+// EXHAUSTED (used_percent ≥ 100) windows, so we never un-cool the account into a
+// window that is still full and immediately re-429. Returns 0 when no codex reset
+// header is present (caller falls back to Retry-After / default). Anthropic
+// responses carry no x-codex-* headers, so this is a no-op on the claude path.
+//
+// Why compare reset DURATIONS, not the primary/secondary NAME: the primary/
+// secondary label is NOT tied to a fixed 5h/7d window — a Plus account's primary
+// IS the 5h window (verified live 2026-07-06; sub2api's "primary=weekly" comment
+// is backwards). The previous code returned the primary reset first assuming
+// primary=7d ("the longer wall"), so when BOTH windows were exhausted it
+// under-cooled to whichever window happened to be primary and re-429'd. Comparing
+// resets directly sidesteps the naming trap entirely.
+// Ref: bugfix 2026-07-06-codex-ratelimit-reset-window-by-name.md.
 func codexRateLimitReset(h http.Header) time.Duration {
 	primaryReset := codexHeaderInt(h, "x-codex-primary-reset-after-seconds")
 	secondaryReset := codexHeaderInt(h, "x-codex-secondary-reset-after-seconds")
 	primaryUsed := codexHeaderFloat(h, "x-codex-primary-used-percent")
 	secondaryUsed := codexHeaderFloat(h, "x-codex-secondary-used-percent")
 
-	// Exhausted window's reset first (7d before 5h — the longer wall).
-	if primaryUsed >= 100 && primaryReset > 0 {
-		return time.Duration(primaryReset) * time.Second
+	// Longest reset among EXHAUSTED windows wins (the bigger wall).
+	best := 0
+	if primaryUsed >= 100 && primaryReset > best {
+		best = primaryReset
 	}
-	if secondaryUsed >= 100 && secondaryReset > 0 {
-		return time.Duration(secondaryReset) * time.Second
+	if secondaryUsed >= 100 && secondaryReset > best {
+		best = secondaryReset
 	}
-	// 429 without either window at 100% → cool for the longer reset we can see.
-	maxReset := primaryReset
-	if secondaryReset > maxReset {
-		maxReset = secondaryReset
+	if best == 0 {
+		// 429 with neither window flagged exhausted → cool for the longer reset we
+		// can see (both windows' resets ride on the response regardless).
+		best = primaryReset
+		if secondaryReset > best {
+			best = secondaryReset
+		}
 	}
-	if maxReset > 0 {
-		return time.Duration(maxReset) * time.Second
+	if best > 0 {
+		return time.Duration(best) * time.Second
 	}
 	return 0
 }
