@@ -1724,8 +1724,12 @@ func WriteGroupRuntime(dbPath, virtualKeyID, jsonValue string) error {
 // 2026-07-03). jsonValue "" clears it (engine no longer overrides this seat).
 // Only this proxy-owned column is touched — the CLI's structural sync fences it
 // out, mirroring WriteGroupRuntime's ownership split.
+// busy_timeout is MANDATORY (same 2026-07-03 regression class as WriteGroupRuntime
+// above): a raw open here made this UPDATE fail instantly with SQLITE_BUSY under
+// any concurrent reader, silently dropping the routing override (2026-07-07 parity
+// audit P1-4). Do not reintroduce raw dbPath opens.
 func WriteAssignmentOverride(dbPath, virtualKeyID, jsonValue string) error {
-	db, err := sql.Open("sqlite", dbPath)
+	db, err := sql.Open("sqlite", WithBusyTimeoutDSN(dbPath))
 	if err != nil {
 		return fmt.Errorf("open vault db for my_assignment_override write: %w", err)
 	}
