@@ -56,9 +56,14 @@ type ConversationRecord struct {
 	UserText                 string           `json:"user_text,omitempty"`
 	ProviderCode             string           `json:"provider_code,omitempty"`
 	Model                    string           `json:"model,omitempty"`
-	EventID                  string           `json:"event_id"`
-	VirtualKeyID             string           `json:"virtual_key_id,omitempty"`
-	OwnerAccountID           string           `json:"owner_account_id"`
+	EventID      string `json:"event_id"`
+	VirtualKeyID string `json:"virtual_key_id,omitempty"`
+	// SeatID: seat-dimension attribution (2026-07-07) — the org seat of the
+	// human at the terminal, from the same route field usage events carry.
+	// OwnerAccountID alone misattributed shared-pool-VK turns to the VK
+	// owner; audit views key on seat with owner fallback for legacy rows.
+	SeatID         string `json:"seat_id,omitempty"`
+	OwnerAccountID string `json:"owner_account_id"`
 	SessionID                string           `json:"session_id"`
 	RequestStatus            string           `json:"request_status"`
 	OrgID                    string           `json:"org_id"`
@@ -230,6 +235,7 @@ func (o *Observer) OnRequestEnd(_ context.Context, req *observer.RequestContext,
 		EventID:        req.TraceID, // stable per-turn idempotency key
 		OrgID:          orgOrPersonal(req.OrgID),
 		SessionID:      req.SessionID,
+		SeatID:         req.SeatID,
 		OwnerAccountID: req.OwnerAccountID,
 		Model:          model,
 		ProviderCode:   req.ProviderID,

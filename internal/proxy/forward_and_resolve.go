@@ -107,6 +107,10 @@ func (p *Proxy) serveRouteWithObserver(
 				}
 				return p.loggedInAccountID // personal-key fallback, as in usage
 			}(),
+			// Same field usage events stamp (reportable.go SeatID) — the seat
+			// dimension is what keeps shared-pool-VK turns attributed to the
+			// employee, not the VK owner (2026-07-07 audit misattribution).
+			SeatID: route.SeatID,
 		}
 		// payload_level=full (enterprise conversation audit): when some active
 		// observer wants the raw request body, buffer+restore it here so the

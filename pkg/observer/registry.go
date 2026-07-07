@@ -158,6 +158,15 @@ type RequestContext struct {
 	// Empty OrgID means a personal (non-org) request.
 	OrgID          string
 	OwnerAccountID string
+	// SeatID is the org seat this request's HUMAN belongs to, from
+	// route.SeatID — the same field usage events carry (reportable.go). Why
+	// it exists SEPARATELY from OwnerAccountID (2026-07-07, org 624a2488
+	// live incident): for a shared OAuth-pool VK the route's AccountID is
+	// the VK OWNER (pool creator), not the employee at the terminal —
+	// audit records keyed only on owner filed under a stranger seat while
+	// usage (seat-keyed UI) attributed correctly. Empty for personal keys
+	// and legacy vault rows that pre-date seat stamping.
+	SeatID string
 	// Stream is the SPEC §1.4.1 stream name this request emits under
 	// (StreamUserChat / StreamAppPipeline / StreamProbe). Set by the
 	// Registry on the way into NotifyStart so observers can read it
