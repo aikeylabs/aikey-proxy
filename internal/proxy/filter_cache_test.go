@@ -20,7 +20,7 @@ func TestFilterCache_HistoryReuse(t *testing.T) {
 
 	// 第1轮:messages=[A] → 扫 A
 	r1 := newReq(`{"messages":[{"role":"user","content":"A"}]}`)
-	p.applyInboundFilter(httptest.NewRecorder(), r1, "m", "personal", "", "", discardLogger())
+	p.applyInboundFilter(httptest.NewRecorder(), r1, "m", "personal", "", "", "", discardLogger())
 	if hook.called != 1 {
 		t.Fatalf("turn1: Detect called %d, want 1", hook.called)
 	}
@@ -28,7 +28,7 @@ func TestFilterCache_HistoryReuse(t *testing.T) {
 	// 第2轮:messages=[A(历史 user), x(assistant), B(user)] → A 命中缓存不重扫;
 	// assistant x 不扫(返回内容);只扫新 user B。
 	r2 := newReq(`{"messages":[{"role":"user","content":"A"},{"role":"assistant","content":"x"},{"role":"user","content":"B"}]}`)
-	p.applyInboundFilter(httptest.NewRecorder(), r2, "m", "personal", "", "", discardLogger())
+	p.applyInboundFilter(httptest.NewRecorder(), r2, "m", "personal", "", "", "", discardLogger())
 	if hook.called != 2 { // 1(A) + 1(B);assistant x 跳过;A 命中缓存
 		t.Errorf("turn2: Detect 累计 %d, want 2(A 命中缓存、assistant x 不扫、只扫 B)", hook.called)
 	}
@@ -40,7 +40,7 @@ func TestFilterCache_Disabled_AlwaysScans(t *testing.T) {
 	p := &Proxy{filterHook: hook} // 不调 SetFilterCacheEnabled → 缓存关闭
 	for i := 0; i < 2; i++ {
 		r := newReq(`{"messages":[{"role":"user","content":"A"}]}`)
-		p.applyInboundFilter(httptest.NewRecorder(), r, "m", "personal", "", "", discardLogger())
+		p.applyInboundFilter(httptest.NewRecorder(), r, "m", "personal", "", "", "", discardLogger())
 	}
 	if hook.called != 2 {
 		t.Errorf("缓存关闭:Detect called %d, want 2(不应缓存)", hook.called)
@@ -54,9 +54,9 @@ func TestFilterCache_MaskVerdictReused(t *testing.T) {
 	p.SetFilterCacheEnabled(true, 5)
 
 	r1 := newReq(`{"messages":[{"role":"user","content":"secret"}]}`)
-	p.applyInboundFilter(httptest.NewRecorder(), r1, "m", "personal", "", "", discardLogger())
+	p.applyInboundFilter(httptest.NewRecorder(), r1, "m", "personal", "", "", "", discardLogger())
 	r2 := newReq(`{"messages":[{"role":"user","content":"secret"}]}`)
-	p.applyInboundFilter(httptest.NewRecorder(), r2, "m", "personal", "", "", discardLogger())
+	p.applyInboundFilter(httptest.NewRecorder(), r2, "m", "personal", "", "", "", discardLogger())
 
 	if hook.called != 1 {
 		t.Errorf("Detect called %d, want 1(第2次应命中缓存)", hook.called)
@@ -73,7 +73,7 @@ func TestFilterCache_DegradedNotCached(t *testing.T) {
 	p.SetFilterCacheEnabled(true, 5)
 	for i := 0; i < 2; i++ {
 		r := newReq(`{"messages":[{"role":"user","content":"A"}]}`)
-		p.applyInboundFilter(httptest.NewRecorder(), r, "m", "personal", "", "", discardLogger())
+		p.applyInboundFilter(httptest.NewRecorder(), r, "m", "personal", "", "", "", discardLogger())
 	}
 	if hook.called != 2 {
 		t.Errorf("degraded 被缓存了?Detect called %d, want 2(degraded 不可缓存)", hook.called)
@@ -97,7 +97,7 @@ func TestFilterCache_DegradedForwardsOriginalUnmasked(t *testing.T) {
 	p.SetFilterCacheEnabled(true, 5)
 
 	r := newReq(`{"messages":[{"role":"user","content":"` + sensitive + `"}]}`)
-	proceed := p.applyInboundFilter(httptest.NewRecorder(), r, "m", "personal", "", "", discardLogger())
+	proceed := p.applyInboundFilter(httptest.NewRecorder(), r, "m", "personal", "", "", "", discardLogger())
 
 	if !proceed {
 		t.Fatal("degraded 必须放行(fail-open):不拦截用户请求")
@@ -210,7 +210,7 @@ func TestFilterCache_DuplicateMessagesInOneRequest(t *testing.T) {
 
 	// 两条逐字相同的敏感消息一起发
 	r := newReq(`{"messages":[{"role":"user","content":"secret"},{"role":"user","content":"secret"}]}`)
-	p.applyInboundFilter(httptest.NewRecorder(), r, "m", "personal", "", "", discardLogger())
+	p.applyInboundFilter(httptest.NewRecorder(), r, "m", "personal", "", "", "", discardLogger())
 
 	body := readReqBody(t, r)
 	if strings.Contains(body, "secret") {

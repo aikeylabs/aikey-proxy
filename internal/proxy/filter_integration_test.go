@@ -85,7 +85,7 @@ func TestFilterIntegration_HistoryLeakFixThroughRealDetector(t *testing.T) {
 	apply := func(body string) string {
 		r := newReq(body)
 		r.Header.Set("X-Claude-Code-Session-Id", "integ-sess")
-		if !p.applyInboundFilter(httptest.NewRecorder(), r, "claude-3", "personal", "", "", discardLogger()) {
+		if !p.applyInboundFilter(httptest.NewRecorder(), r, "claude-3", "personal", "", "", "", discardLogger()) {
 			t.Fatalf("request unexpectedly blocked: %s", body)
 		}
 		return readReqBody(t, r)
@@ -155,7 +155,7 @@ func TestFilterIntegration_PerfBaseline(t *testing.T) {
 		r := newReq(body)
 		r.Header.Set("X-Claude-Code-Session-Id", sess)
 		t0 := time.Now()
-		p.applyInboundFilter(httptest.NewRecorder(), r, "claude-3", "personal", "", "", discardLogger())
+		p.applyInboundFilter(httptest.NewRecorder(), r, "claude-3", "personal", "", "", "", discardLogger())
 		return time.Since(t0)
 	}
 
@@ -201,7 +201,7 @@ func TestFilterIntegration_DetectorMaskIsDeterministic(t *testing.T) {
 		// Mix a credential (regex rule) + a phone (NER/CRF path) to exercise both maskers.
 		r := newReq(`{"messages":[{"role":"user","content":"please store my key ` + integSecret + ` and phone 13812345678 safely for later"}]}`)
 		r.Header.Set("X-Claude-Code-Session-Id", "determinism")
-		p.applyInboundFilter(httptest.NewRecorder(), r, "claude-3", "personal", "", "", discardLogger())
+		p.applyInboundFilter(httptest.NewRecorder(), r, "claude-3", "personal", "", "", "", discardLogger())
 		return readReqBody(t, r)
 	}
 
