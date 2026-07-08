@@ -82,6 +82,7 @@ func (p *Proxy) applyInboundFilter(
 	orgID string,
 	virtualKeyID string,
 	seatID string,
+	sessionID string,
 	logger *slog.Logger,
 ) (proceed bool) {
 	hook := p.filterHook
@@ -283,7 +284,12 @@ func (p *Proxy) applyInboundFilter(
 			// to the raw detector user_id (metadata.user_id, a Claude/session id),
 			// so pool-VK events showed a stranger id instead of the employee's
 			// alias (2026-07-08, mirrors the conversation-audit seat fix).
-			teamEvents = append(teamEvents, injectSeat(injectVirtualKey(injectTenant(resp.Event, orgID), virtualKeyID), seatID))
+			// session_id: the conversation session (resolveSessionID, the SAME
+			// source the conversation-audit observer uses), so the compliance
+			// audit drawer can deep-link to the exact conversation turn for this
+			// flagged prompt — event_id joins the turn, session_id opens its
+			// thread (2026-07-08 cross-audit link, decision 2a).
+			teamEvents = append(teamEvents, injectSession(injectSeat(injectVirtualKey(injectTenant(resp.Event, orgID), virtualKeyID), seatID), sessionID))
 		}
 
 		switch resp.Action {
@@ -469,6 +475,32 @@ func injectSeat(eventJSON []byte, seatID string) []byte {
 		return eventJSON
 	}
 	m["seat_id"] = q
+	out, err := json.Marshal(m)
+	if err != nil {
+		return eventJSON
+	}
+	return out
+}
+
+// injectSession stamps the conversation session_id onto the team event JSON —
+// resolved by resolveSessionID, the SAME source the conversation-audit observer
+// uses, so the compliance audit drawer can deep-link to the exact conversation
+// thread (event_id joins the turn; session_id opens its thread). Empty session
+// (no session header — e.g. codex, which the conversation-audit UI keys by
+// event_id instead) → unchanged, same fail-safe as injectSeat. (2026-07-08.)
+func injectSession(eventJSON []byte, sessionID string) []byte {
+	if sessionID == "" {
+		return eventJSON
+	}
+	var m map[string]json.RawMessage
+	if err := json.Unmarshal(eventJSON, &m); err != nil {
+		return eventJSON
+	}
+	q, err := json.Marshal(sessionID)
+	if err != nil {
+		return eventJSON
+	}
+	m["session_id"] = q
 	out, err := json.Marshal(m)
 	if err != nil {
 		return eventJSON

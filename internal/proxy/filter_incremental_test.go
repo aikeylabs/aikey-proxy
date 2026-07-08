@@ -69,7 +69,7 @@ func TestApplyInboundFilter_DeprecatedIncrementalNowFullScans(t *testing.T) {
 	hook := &stubHook{resp: &apphook.Response{Action: apphook.ActionAllow}}
 	// filterIncremental=true:旧 env 仍开,但已被忽略 → 仍走全量扫。
 	p := &Proxy{filterHook: hook, filterIncremental: true}
-	if proceed := p.applyInboundFilter(nil, newReq(body), "m", "personal", "", "", "", discardLogger()); !proceed {
+	if proceed := p.applyInboundFilter(nil, newReq(body), "m", "personal", "", "", "", "", discardLogger()); !proceed {
 		t.Fatal("expected proceed")
 	}
 	// 全量扫:system + 3 条消息都扫 → >1 次。增量(旧漏因)只会 1 次(只扫最新 turn)。
@@ -85,7 +85,7 @@ func TestApplyInboundFilter_IncrementalFallsBackOnAgentLoop(t *testing.T) {
 	body := `{"messages":[{"role":"user","content":"前文"},{"role":"assistant","content":"工具调用"}]}`
 	hook := &stubHook{resp: &apphook.Response{Action: apphook.ActionAllow}}
 	p := &Proxy{filterHook: hook, filterIncremental: true}
-	if proceed := p.applyInboundFilter(nil, newReq(body), "m", "personal", "", "", "", discardLogger()); !proceed {
+	if proceed := p.applyInboundFilter(nil, newReq(body), "m", "personal", "", "", "", "", discardLogger()); !proceed {
 		t.Fatal("expected proceed")
 	}
 	// Full-scan fallback ran (the user piece got scanned), not a silent skip.
