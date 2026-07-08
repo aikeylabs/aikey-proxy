@@ -92,7 +92,7 @@ func fetchConversationAuditPolicy(ctx context.Context, masterURL, orgID string) 
 	if err != nil {
 		return false, 0, false
 	}
-	resp, err := complianceHTTPClient.Do(req) // reuse the package HTTP client (10s timeout)
+	resp, err := complianceHTTPClient.Get().Do(req) // reuse the package HTTP client (10s timeout)
 	if err != nil {
 		return false, 0, false
 	}

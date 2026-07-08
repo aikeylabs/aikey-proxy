@@ -90,8 +90,8 @@ func TestWithBusyTimeoutDSN(t *testing.T) {
 		{"/path/vault.db?cache=shared", "/path/vault.db?cache=shared&_pragma=busy_timeout(5000)"},
 	}
 	for _, c := range cases {
-		if got := withBusyTimeoutDSN(c.in); got != c.want {
-			t.Errorf("withBusyTimeoutDSN(%q) = %q, want %q", c.in, got, c.want)
+		if got := WithBusyTimeoutDSN(c.in); got != c.want {
+			t.Errorf("WithBusyTimeoutDSN(%q) = %q, want %q", c.in, got, c.want)
 		}
 	}
 }

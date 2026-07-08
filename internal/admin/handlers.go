@@ -74,6 +74,13 @@ type Handler struct {
 	// from "feature disabled" (503).
 	AppHealthFn func() []apppipe.AppHealth
 
+	// PoolHealthFn returns oauth-group routing health for /status (N9). nil → the
+	// pool_routing field is omitted (non-pool deployments unchanged).
+	PoolHealthFn func() *PoolRoutingHealth
+	// SyncHealthFn supplies the SyncRail per-rail health map for /status. Nil or
+	// an empty map → the control_plane_sync field is omitted.
+	SyncHealthFn func() map[string]SyncRailStatus
+
 	// EffectivePacksFn returns the raw JSON report of compliance packs currently
 	// effective in the live filter child (built-in + pulled). Returns an error
 	// (apphook.ErrPacksUnavailable) when no filter child is active / can't report;
@@ -86,6 +93,31 @@ type Handler struct {
 	// (re-send WAL-present gaps, confirm WAL-absent gaps lost now). nil → 503.
 	AuditStatusFn   func() *events.AuditStatus
 	ReconcileGapsFn func(ctx context.Context) (events.ReconcileResult, error)
+
+	// GetUpstreamProxyFn / SetUpstreamProxyFn back the GET/PUT /admin/upstream-proxy
+	// endpoints that the local web "Settings → Upstream proxy" card relays to. Get
+	// returns the live egress proxy URL ("" = direct); Set persists it to
+	// aikey-user.yaml and HOT-SWAPS the running transport + impersonate client (no
+	// restart). nil → 503 (endpoint disabled — e.g. cluster node). See
+	// config.PersistUpstreamProxyURL + the main.go wiring.
+	GetUpstreamProxyFn func() string
+	SetUpstreamProxyFn func(url string) error
+
+	// EgressStateFn backs the layered "egress" block in GET /admin/upstream-proxy
+	// (2026-07-08, `aikey env` 逐级显示需求): the daemon-truth view of the egress
+	// decision — explicit URL > daemon process env > OS system proxy — plus the
+	// effective result computed through the SAME resolution path the forwarding
+	// transport uses (display must never diverge from behavior). nil → the GET
+	// response stays the legacy {"url"} shape (older wiring / cluster nodes).
+	EgressStateFn func() EgressState
+
+	// ProbeUpstreamProxyFn tests whether a CANDIDATE egress URL can actually carry
+	// traffic to an AI provider (built with the same buildTransport the live path
+	// uses), WITHOUT persisting it — so the web "Test connectivity" button can verify
+	// before Save. Returns (httpStatus, elapsedMs, err); err = the request never got
+	// a response (proxy unreachable / DNS / timeout). Any HTTP status = reachable.
+	// nil → 503.
+	ProbeUpstreamProxyFn func(url string) (status int, elapsedMs int64, err error)
 }
 
 // KeyCheckTarget holds decrypted credentials for one provider, used by GET /health/keys.
@@ -230,6 +262,38 @@ type statusResponse struct {
 	VirtualKeys int    `json:"virtual_keys_loaded"`
 	TotalReqs   int64  `json:"total_requests"`
 	TotalErrs   int64  `json:"total_errors"`
+	// PoolRouting is the oauth-group routing health (N9). Omitted unless the
+	// feature is on, so non-pool deployments' /status is unchanged. Lets the
+	// operator monitoring the first pool batch see which accounts are cooled.
+	PoolRouting *PoolRoutingHealth `json:"pool_routing,omitempty"`
+	// ControlPlaneSync is the SyncRail health surface (2026-07-03): per-rail
+	// ok/stale/offline state with failure counts and last error. Omitted when no
+	// rail has ever attempted a cycle (personal installs — /status unchanged).
+	// Release-checklist E2E and `aikey statusline` read this to assert the
+	// master-sync pipeline is alive (health-signal-surface rule).
+	ControlPlaneSync map[string]SyncRailStatus `json:"control_plane_sync,omitempty"`
+}
+
+// SyncRailStatus mirrors supervisor.RailSyncStatus for the /status wire (built
+// by the cmd layer — admin does not import supervisor).
+type SyncRailStatus struct {
+	State               string `json:"state"`
+	ConsecutiveFailures int    `json:"consecutive_failures"`
+	LastSuccessAt       int64  `json:"last_success_at,omitempty"`
+	LastError           string `json:"last_error,omitempty"`
+}
+
+// PoolRoutingHealth is the oauth-group account-routing health surface (N9). Built
+// by the cmd layer from the proxy's reactive cooldown state.
+type PoolRoutingHealth struct {
+	Enabled        bool            `json:"enabled"`
+	CooledAccounts []CooledAccount `json:"cooled_accounts,omitempty"`
+}
+
+// CooledAccount is one pool account currently routed around (401 / exhaustion).
+type CooledAccount struct {
+	AccountID       string `json:"account_id"`
+	CooldownSeconds int    `json:"cooldown_seconds"`
 }
 
 // Status returns detailed proxy status.
@@ -248,27 +312,43 @@ func (h *Handler) Status(w http.ResponseWriter, r *http.Request) {
 		totalErrs = h.TotalErrorsFn()
 	}
 
+	var poolRouting *PoolRoutingHealth
+	if h.PoolHealthFn != nil {
+		poolRouting = h.PoolHealthFn()
+	}
+	var syncHealth map[string]SyncRailStatus
+	if h.SyncHealthFn != nil {
+		syncHealth = h.SyncHealthFn()
+	}
+
 	writeJSON(w, http.StatusOK, statusResponse{
-		Status:      "ok",
-		Version:     Version,
-		Uptime:      time.Since(h.startedAt).Round(time.Second).String(),
-		ListenAddr:  h.cfg.Listen.Addr(),
-		VirtualKeys: h.registry.Count(),
-		VaultPath:   h.cfg.Vault.Path,
-		StartedAt:   h.startedAt.Format(time.RFC3339),
-		TotalReqs:   totalReqs,
-		TotalErrs:   totalErrs,
+		Status:           "ok",
+		Version:          Version,
+		Uptime:           time.Since(h.startedAt).Round(time.Second).String(),
+		ListenAddr:       h.cfg.Listen.Addr(),
+		VirtualKeys:      h.registry.Count(),
+		VaultPath:        h.cfg.Vault.Path,
+		StartedAt:        h.startedAt.Format(time.RFC3339),
+		TotalReqs:        totalReqs,
+		TotalErrs:        totalErrs,
+		PoolRouting:      poolRouting,
+		ControlPlaneSync: syncHealth,
 	})
 }
 
 type metricsResponse struct {
-	RequestsByVKey     map[string]int64         `json:"requests_by_vkey"`
-	RequestsByProvider map[string]int64         `json:"requests_by_provider"`
-	Reporter           *events.ReporterMetrics  `json:"reporter,omitempty"`
-	Collector          *events.CollectorMetrics `json:"collector,omitempty"`
-	Canary             *events.CanaryResult     `json:"canary,omitempty"`
-	TotalRequests      int64                    `json:"total_requests"`
-	TotalErrors        int64                    `json:"total_errors"`
+	RequestsByVKey     map[string]int64 `json:"requests_by_vkey"`
+	RequestsByProvider map[string]int64 `json:"requests_by_provider"`
+	// RequestsByAccount: per real serving account (oauth_group attribution).
+	// Counts follow pool fallback (A→B counts toward B). Empty when no group
+	// routing has happened. Lets local audit see "which account served" without
+	// the collector/ODS.
+	RequestsByAccount map[string]int64         `json:"requests_by_account"`
+	Reporter          *events.ReporterMetrics  `json:"reporter,omitempty"`
+	Collector         *events.CollectorMetrics `json:"collector,omitempty"`
+	Canary            *events.CanaryResult     `json:"canary,omitempty"`
+	TotalRequests     int64                    `json:"total_requests"`
+	TotalErrors       int64                    `json:"total_errors"`
 }
 
 // Metrics returns aggregated usage metrics.
@@ -285,6 +365,10 @@ func (h *Handler) Metrics(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		byVKey = make(map[string]int64)
 		byProvider = make(map[string]int64)
+	}
+	byAccount, err := h.store.QueryByAccount()
+	if err != nil {
+		byAccount = make(map[string]int64)
 	}
 
 	var reporterMetrics *events.ReporterMetrics
@@ -305,6 +389,7 @@ func (h *Handler) Metrics(w http.ResponseWriter, r *http.Request) {
 		TotalErrors:        totalErrs,
 		RequestsByVKey:     byVKey,
 		RequestsByProvider: byProvider,
+		RequestsByAccount:  byAccount,
 		Reporter:           reporterMetrics,
 		Collector:          collectorMetrics,
 		Canary:             canaryResult,

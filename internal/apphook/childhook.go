@@ -33,6 +33,8 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+
+	"github.com/AiKeyLabs/pkg/aikeycompat"
 )
 
 // ChildHookConfig configures a ChildHook.
@@ -144,6 +146,11 @@ func (h *ChildHook) spawnLocked(ctx context.Context) error {
 	}
 
 	cmd := exec.Command(h.cfg.BinaryPath, h.cfg.BinaryArgs...) //nolint:gosec // operator-configured app-hook binary, path stat-verified above; args from trusted vault/config, never request input
+	// Never flash a console window on Windows: the proxy runs console-less,
+	// so a console-subsystem hook child would otherwise pop a visible
+	// terminal window for its whole lifetime (same class as the 2026-07-07
+	// web-bridge window-flash bug). No-op on Unix; stdio pipes unaffected.
+	aikeycompat.HideSpawnConsole(cmd)
 	// Inherit the proxy's env (the child relies on it for AIKEY_* config) and
 	// append any per-app ExtraEnv the supervisor derived from vault.
 	if len(h.cfg.ExtraEnv) > 0 {

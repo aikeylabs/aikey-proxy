@@ -6,6 +6,8 @@ import (
 	"sync"
 	"testing"
 	"time"
+
+	"github.com/AiKeyLabs/aikey-proxy/internal/httpx"
 )
 
 // newTestReporter builds a real Reporter backed by a temp WAL dir. The canary
@@ -35,7 +37,7 @@ func newProbeNoLoop(reporter *Reporter, diagnosticsURL string) *CanaryProbe {
 			Interval:       time.Hour,
 			CheckDelay:     time.Millisecond, // don't wait 15s in tests
 		},
-		client: &http.Client{Timeout: 2 * time.Second},
+		client: httpx.NewSwappableFixed(&http.Client{Timeout: 2 * time.Second}),
 		done:   make(chan struct{}),
 	}
 }

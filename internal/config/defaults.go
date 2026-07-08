@@ -21,4 +21,12 @@ const (
 	// DefaultPortDriftMax bounds runtime port drift when the configured
 	// listen port is occupied. See 20260430-端口偏移能力修复.md.
 	DefaultPortDriftMax = 10
+	// DefaultConsoleURL applies when console_url is ABSENT from yaml (pre-
+	// 20260703 personal/trial configs preserved across upgrades). 8090 is the
+	// local-server user-console port on every default personal/trial install
+	// (allocator "trial" key at offset 0). Explicit "" opts out — see
+	// Config.ConsoleURL. Known edge: a drifted console port with a preserved
+	// old config yields a 404-ing default URL; the message still names the
+	// /user/team-oauth page so the member can find it manually.
+	DefaultConsoleURL = "http://127.0.0.1:8090"
 )

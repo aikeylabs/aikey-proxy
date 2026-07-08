@@ -11,6 +11,8 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"sync"
+	"sync/atomic"
 	"time"
 
 	"golang.org/x/term"
@@ -23,7 +25,9 @@ import (
 	proxyruntime "github.com/AiKeyLabs/aikey-proxy/internal/runtime"
 	"github.com/AiKeyLabs/aikey-proxy/internal/server"
 	"github.com/AiKeyLabs/aikey-proxy/internal/supervisor"
+	"github.com/AiKeyLabs/aikey-proxy/internal/sysproxy"
 	"github.com/AiKeyLabs/aikey-proxy/internal/vault"
+	"github.com/AiKeyLabs/aikey-proxy/internal/vkeys"
 
 	broker "github.com/AiKeyLabs/aikey-auth-broker"
 	"github.com/AiKeyLabs/pkg/aikeycompat"
@@ -126,6 +130,21 @@ func main() {
 	slog.SetDefault(slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{
 		Level: slog.LevelInfo,
 	})))
+
+	// Handle graceful shutdown — see pkg/aikeycompat for the per-OS signal set
+	// (Windows: SIGINT only; Unix: SIGINT + SIGTERM).
+	//
+	// WHY Notify is installed FIRST, before any init (2026-07-08 bugfix, e2e
+	// i3): a service manager may forward SIGTERM at any moment after exec
+	// (systemd stop right after start, restart storms), and the CLI writes the
+	// ownership meta while we are still initializing (vault/broker/observers —
+	// hundreds of ms). Before this move an early SIGTERM hit Go's default
+	// disposition and killed the process ("signal: 15", non-zero exit) instead
+	// of draining gracefully. The buffered channel captures the early signal;
+	// the select at the bottom of main consumes it right after init completes →
+	// same graceful drain path, exit 0.
+	sigCh := make(chan os.Signal, 1)
+	signal.Notify(sigCh, aikeycompat.ShutdownSignals()...)
 
 	// 1. Resolve and load config.
 	resolvedPath, err := resolveConfigPath(*configPath)
@@ -242,21 +261,58 @@ func main() {
 		"listen", ln.Addr(),
 	)
 
+	// 5a. OS system-proxy watcher (2026-07-08 需求: 代理更新时自动刷新).
+	// Primes synchronously so both the broker client below and the forwarding
+	// transport see the CURRENT system proxy from request #1. Precedence
+	// (user-approved): explicit upstream_proxy.url > process env > OS system
+	// proxy (live). The poll loop is started after egress wiring (below) so
+	// its change callback can reach the live transport + broker swap.
+	sysWatcher := sysproxy.NewWatcher()
+	// effectiveBrokerEgress: static egress URL for the OAuth impersonate
+	// client — explicit config wins; else the system-derived URL ("" = client
+	// falls back to its own env handling, the pre-2026-07-08 behavior).
+	effectiveBrokerEgress := func(cfgURL string) string {
+		if cfgURL != "" {
+			return cfgURL
+		}
+		return sysWatcher.BrokerEgressURL()
+	}
+
 	// 5b. Build OAuth broker (embedded, uses vault stores).
 	//     Reuse the supervisor's vault connection to avoid double-open conflicts.
 	brokerVault := sup.VaultReader()
 	var oauthHandler server.RouteRegistrar
+	var poolHandler server.RouteRegistrar // C10: pool login (memory-store broker → writeback master)
 	if brokerVault != nil {
 		tokenStore := vault.NewTokenStore(brokerVault.DB(), brokerVault.DerivedKey())
 		accountStore := vault.NewAccountStore(brokerVault.DB())
 
 		// Inject ImpersonateChrome HTTP client for Claude token endpoint (Cloudflare bypass).
-		broker.SetHTTPClient(vault.NewImpersonateChromeHTTPClient())
+		// Impl lives in the shared broker module (moved 2026-06-26) so aikey-control-master
+		// can inject the same client for its server-side OAuth flow — single source of truth.
+		//
+		// 2026-06-30 (egress fix): pass the SAME configured egress as AI forwarding
+		// (cfg.UpstreamProxy.URL) instead of "". Why: launchd-spawned proxies don't
+		// inherit the login shell's HTTP_PROXY, so a "" client went DIRECT and got
+		// 403 "Request not allowed" from Anthropic's edge (only Chrome-TLS THROUGH the
+		// egress reaches the OAuth logic). Mirrors the old master pattern (egress URL →
+		// impersonate proxyURL). Empty url ⇒ "" ⇒ falls back to env (no regression).
+		// Forwarding uses the same cfg.UpstreamProxy.URL via buildTransport below;
+		// control-plane clients deliberately bypass it (internal/httpx.NewDirectClient).
+		// 2026-07-08: "" no longer means "hope the env has it" — the system
+		// proxy watcher supplies the live OS value (launchd-spawned proxies
+		// have no login-shell env), keeping OAuth on the same egress as AI
+		// forwarding.
+		broker.SetHTTPClient(broker.NewImpersonateChromeHTTPClient(effectiveBrokerEgress(cfg.UpstreamProxy.URL)))
 
 		brk := broker.NewEmbedded(tokenStore, accountStore)
 		oauthHandler = broker.NewHandler(brk)
 		// Wire broker into supervisor so all proxy generations can resolve OAuth credentials
 		sup.SetBroker(&brokerAdapter{inner: brk, accounts: accountStore})
+		// C10/RW8: pool login handler — its own MEMORY-store broker (per-member
+		// tokens never touch the vault) reusing the global impersonate client set
+		// above; exchanges then write back to master RW10 over the team JWT.
+		poolHandler = sup.NewPoolLoginHandler()
 		slog.Info("OAuth broker initialized")
 	} else {
 		slog.Warn("OAuth broker disabled: vault not available")
@@ -275,22 +331,139 @@ func main() {
 	adminHandler.DebugUpstreamHeadersStateFn = proxy.UpstreamHeadersDebugState
 	adminHandler.DebugUpstreamHeadersSetFn = proxy.SetUpstreamHeadersDebugAPIOverride
 	adminHandler.AppHealthFn = sup.AppHealthSnapshot
+	// Oauth-group routing health (N9): omitted from /status unless the feature is
+	// on, so non-pool deployments are unchanged. Surfaces which pool accounts are
+	// currently cooled, for the operator monitoring the first pool batch.
+	adminHandler.PoolHealthFn = func() *admin.PoolRoutingHealth {
+		if !vkeys.OauthGroupRoutingEnabled() {
+			return nil
+		}
+		h := &admin.PoolRoutingHealth{Enabled: true}
+		for id, secs := range sup.PoolCooldownSnapshot() {
+			h.CooledAccounts = append(h.CooledAccounts, admin.CooledAccount{AccountID: id, CooldownSeconds: secs})
+		}
+		return h
+	}
+	// SyncRail health (2026-07-03): per-rail control-plane sync state for /status
+	// (health-signal-surface rule — the release E2E asserts this, not the UI).
+	// Empty map (no rail ever attempted — personal installs) → field omitted.
+	adminHandler.SyncHealthFn = func() map[string]admin.SyncRailStatus {
+		snap := sup.ControlPlaneSyncSnapshot()
+		if len(snap) == 0 {
+			return nil
+		}
+		out := make(map[string]admin.SyncRailStatus, len(snap))
+		for name, st := range snap {
+			out[name] = admin.SyncRailStatus{
+				State:               st.State,
+				ConsecutiveFailures: st.ConsecutiveFailures,
+				LastSuccessAt:       st.LastSuccessAt,
+				LastError:           st.LastError,
+			}
+		}
+		return out
+	}
 	adminHandler.EffectivePacksFn = sup.EffectivePacks
 	adminHandler.AuditStatusFn = sup.AuditStatus
 	adminHandler.ReconcileGapsFn = sup.ReconcileGaps
 
+	// Egress (upstream) proxy config endpoints (GET/PUT /admin/upstream-proxy), the
+	// runtime home of the egress proxy after R25 出口收敛. Get returns the live URL;
+	// Set persists it to aikey-user.yaml (survives re-render) and HOT-SWAPS the
+	// forwarding transport + OAuth impersonate client in place — no restart. egressMu
+	// guards the cached URL Get reads (the transport/broker swaps are themselves
+	// atomic). Decision: user chose hot-swap (B) + plaintext storage (i).
+	var egressMu sync.Mutex
+	egressURL := cfg.UpstreamProxy.URL
+	adminHandler.GetUpstreamProxyFn = func() string {
+		egressMu.Lock()
+		defer egressMu.Unlock()
+		return egressURL
+	}
+	// liveTransport tracks the transport currently serving forwarding, so the
+	// system-proxy change callback can flush its idle pool (pooled connections
+	// to a dead Clash port would otherwise be reused until IdleConnTimeout).
+	var liveTransport atomic.Pointer[http.Transport]
+	installTransport := func(t *http.Transport) {
+		liveTransport.Store(t)
+		sup.SetTransport(t)
+	}
+	adminHandler.SetUpstreamProxyFn = func(rawURL string) error {
+		if err := config.PersistUpstreamProxyURL(resolvedPath, rawURL); err != nil {
+			return err
+		}
+		installTransport(buildTransport(rawURL, sysWatcher.ProxyFunc()))
+		broker.SetHTTPClient(broker.NewImpersonateChromeHTTPClient(effectiveBrokerEgress(rawURL)))
+		egressMu.Lock()
+		egressURL = rawURL
+		egressMu.Unlock()
+		return nil
+	}
+	// EgressStateFn (2026-07-08): layered egress decision for `aikey env`.
+	adminHandler.EgressStateFn = func() admin.EgressState {
+		egressMu.Lock()
+		explicit := egressURL
+		egressMu.Unlock()
+		return egressState(explicit, sysWatcher)
+	}
+
+	// ProbeUpstreamProxyFn tests a CANDIDATE egress URL end-to-end (through the same
+	// buildTransport the live path uses) to a provider host, WITHOUT persisting it, so
+	// the web "Test connectivity" button can verify before Save. Any HTTP response
+	// (even 401/404) proves the tunnel carries traffic; a transport error means the
+	// proxy couldn't reach out.
+	adminHandler.ProbeUpstreamProxyFn = func(rawURL string) (int, int64, error) {
+		client := &http.Client{Transport: buildTransport(rawURL, sysWatcher.ProxyFunc()), Timeout: 10 * time.Second}
+		req, err := http.NewRequest(http.MethodGet, upstreamProbeTarget, nil)
+		if err != nil {
+			return 0, 0, err
+		}
+		start := time.Now()
+		resp, err := client.Do(req)
+		elapsed := time.Since(start).Milliseconds()
+		if err != nil {
+			return 0, elapsed, err
+		}
+		_ = resp.Body.Close()
+		return resp.StatusCode, elapsed, nil
+	}
+
 	// Build the outbound transport for upstream providers. Always non-nil now:
 	// even the direct path needs MaxIdleConnsPerHost tuning (see buildTransport).
 	dataHandler := sup.Handler()
-	sup.SetTransport(buildTransport(cfg.UpstreamProxy.URL))
+	installTransport(buildTransport(cfg.UpstreamProxy.URL, sysWatcher.ProxyFunc()))
 
-	// 7. Build and start the HTTP server.
-	srv := server.New(ln, dataHandler, adminHandler, oauthHandler)
+	// Start the system-proxy poll loop (inert when env config is authoritative,
+	// on unsupported platforms, and — via the explicit-egress guard below —
+	// effectively when upstream_proxy.url is set). On change: flush the idle
+	// pool so no request reuses a connection through the OLD proxy, and rebuild
+	// the OAuth client (it takes a static URL, not a per-request func).
+	observability.GoSafe("sysproxy.watch", observability.Isolated, func() {
+		sysWatcher.Run(context.Background(), func(_, _ sysproxy.Snapshot) {
+			egressMu.Lock()
+			explicit := egressURL != ""
+			egressMu.Unlock()
+			if explicit {
+				return // user-configured egress outranks the system proxy
+			}
+			if t := liveTransport.Load(); t != nil {
+				t.CloseIdleConnections()
+			}
+			broker.SetHTTPClient(broker.NewImpersonateChromeHTTPClient(effectiveBrokerEgress("")))
+		})
+	})
 
-	// Handle graceful shutdown — see pkg/aikeycompat for the per-OS
-	// signal set (Windows: SIGINT only; Unix: SIGINT + SIGTERM).
-	sigCh := make(chan os.Signal, 1)
-	signal.Notify(sigCh, aikeycompat.ShutdownSignals()...)
+	// 7. Build and start the HTTP server. Only non-nil registrars are passed
+	// (server.New does not nil-guard; oauthHandler/poolHandler are nil when the
+	// vault/broker is unavailable).
+	extraRegistrars := make([]server.RouteRegistrar, 0, 2)
+	if oauthHandler != nil {
+		extraRegistrars = append(extraRegistrars, oauthHandler)
+	}
+	if poolHandler != nil {
+		extraRegistrars = append(extraRegistrars, poolHandler)
+	}
+	srv := server.New(ln, dataHandler, adminHandler, extraRegistrars...)
 
 	// Fatal: server.Serve is the process's reason for being. If it dies the
 	// proxy cannot serve requests, so exit(2) and let the OS supervisor
@@ -303,9 +476,20 @@ func main() {
 		}
 	})
 
-	// Wait for shutdown signal.
-	sig := <-sigCh
-	slog.Info("received signal, shutting down", "signal", sig)
+	// Wait for either an OS shutdown signal OR a graceful self-restart request
+	// from the control-plane healer (selfheal.go): the proxy went stale after a
+	// host network change and confirmed master is reachable, so it wants a clean
+	// relaunch. BOTH paths run the identical drain below (code reuse); the restart
+	// path just exits non-zero afterwards so launchd/systemd relaunch it.
+	restartRequested := false
+	select {
+	case sig := <-sigCh:
+		slog.Info("received signal, shutting down", "signal", sig)
+	case <-sup.RestartRequested():
+		restartRequested = true
+		slog.Warn("control-plane self-heal: graceful restart requested — draining then relaunching",
+			"event.name", observability.EventProxyControlPlaneSelfRestart)
+	}
 
 	// Graceful shutdown: stop accepting new connections, drain active generation.
 	if err := srv.Shutdown(30 * time.Second); err != nil {
@@ -321,6 +505,13 @@ func main() {
 	if logWriter != nil {
 		logWriter.Flush(3 * time.Second)
 		_ = logWriter.Close()
+	}
+
+	// Self-restart requests exit non-zero (EX_TEMPFAIL) AFTER the graceful drain
+	// above, so the OS service manager relaunches a clean process. A plain signal
+	// shutdown returns normally (exit 0) and is NOT relaunched.
+	if restartRequested {
+		os.Exit(75)
 	}
 }
 
@@ -347,9 +538,13 @@ func getVaultPassword() (string, error) {
 
 // buildTransport returns the outbound http.Transport for upstream providers.
 //
-// Direct (no upstream_proxy): a Clone of http.DefaultTransport — preserving
-// ProxyFromEnvironment (HTTP_PROXY / HTTPS_PROXY / NO_PROXY) and HTTP/2 — with
-// MaxIdleConnsPerHost raised. Go's default of 2 idle conns per host means that
+// Direct (no upstream_proxy): a Clone of http.DefaultTransport — with Proxy
+// swapped to sysProxy (2026-07-08): the sysproxy.Watcher's per-request
+// resolver, which preserves env-var behavior (HTTP_PROXY / HTTPS_PROXY /
+// NO_PROXY) when the env is set and otherwise follows the LIVE OS system
+// proxy, so a Clash port change / toggle applies without a daemon restart.
+// HTTP/2 is preserved, with MaxIdleConnsPerHost raised. Go's default of 2
+// idle conns per host means that
 // under >2 concurrent requests to one provider, finished connections are
 // dropped and the next request pays a fresh TCP+TLS handshake. HTTP/2
 // multiplexing masks this against h2 upstreams, but HTTP/1.1 fallbacks and
@@ -371,22 +566,78 @@ func cloneDefaultTransport() *http.Transport {
 	return &http.Transport{}
 }
 
-func buildTransport(proxyURL string) *http.Transport {
+// upstreamProbeTarget is the provider host the "Test connectivity" probe reaches for
+// through a candidate egress proxy. api.anthropic.com is the Claude-centric primary
+// forwarding target; any HTTP response (even 401/404, no key sent) proves the tunnel
+// carries traffic to the AI world.
+const upstreamProbeTarget = "https://api.anthropic.com/"
+
+// egressState assembles the layered egress decision for GET /admin/upstream-proxy
+// (`aikey env`, 2026-07-08 逐级显示需求). The effective value is computed through
+// watcher.ProxyFunc() — the SAME resolver the forwarding transport runs per
+// request — so what the CLI displays can never diverge from what traffic does.
+// Pulled out of main() so the decision logic sits behind a fence test
+// (egress_integration_test.go).
+func egressState(explicit string, watcher *sysproxy.Watcher) admin.EgressState {
+	snap := watcher.Current()
+	envExplicit, envInherited := sysproxy.EnvProxyVarsSplit()
+	st := admin.EgressState{
+		ExplicitURL:      explicit,
+		EnvAuthoritative: watcher.EnvExplicit(),
+		EnvVars:          envExplicit,
+		EnvInheritedVars: envInherited,
+		SystemSupported:  watcher.Supported(),
+		SystemHTTP:       snap.HTTP,
+		SystemHTTPS:      snap.HTTPS,
+		SystemSOCKS:      snap.SOCKS,
+	}
+	if explicit != "" {
+		st.EffectiveSource, st.EffectiveURL = "explicit", explicit
+		return st
+	}
+	// Resolve exactly like the transport would for a provider target.
+	// Request object only — nothing is dialed.
+	req, err := http.NewRequest(http.MethodGet, upstreamProbeTarget, nil)
+	if err != nil {
+		st.EffectiveSource = "direct"
+		return st
+	}
+	u, perr := watcher.ProxyFunc()(req)
+	switch {
+	case perr != nil || u == nil:
+		st.EffectiveSource = "direct"
+	case st.EnvAuthoritative:
+		st.EffectiveSource, st.EffectiveURL = "env", u.Redacted()
+	case snap.ProxyFor("https") != "":
+		st.EffectiveSource, st.EffectiveURL = "system", u.Redacted()
+	default:
+		// Layers 1-3 empty, ProxyFunc fell through to inherited shell env.
+		st.EffectiveSource, st.EffectiveURL = "env_inherited", u.Redacted()
+	}
+	return st
+}
+
+func buildTransport(proxyURL string, sysProxy func(*http.Request) (*url.URL, error)) *http.Transport {
 	// All providers resolve to a handful of hosts (api.anthropic.com etc.),
 	// so a generous per-host idle pool is bounded in practice by MaxIdleConns.
 	const perHost = 100
 
-	if proxyURL == "" {
+	direct := func() *http.Transport {
 		t := cloneDefaultTransport()
+		if sysProxy != nil {
+			t.Proxy = sysProxy
+		}
 		t.MaxIdleConnsPerHost = perHost
 		return t
 	}
+
+	if proxyURL == "" {
+		return direct()
+	}
 	parsed, err := url.Parse(proxyURL)
 	if err != nil {
-		slog.Warn("upstream_proxy.url is invalid, falling back to env vars", "url", proxyURL, "error", err)
-		t := cloneDefaultTransport()
-		t.MaxIdleConnsPerHost = perHost
-		return t
+		slog.Warn("upstream_proxy.url is invalid, falling back to env/system proxy", "url", proxyURL, "error", err)
+		return direct()
 	}
 	t := &http.Transport{
 		Proxy:               http.ProxyURL(parsed),

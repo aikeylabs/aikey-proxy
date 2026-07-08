@@ -46,6 +46,21 @@ func TestBuildBaseEvent_PrefersCanonicalProviderCode(t *testing.T) {
 	}
 }
 
+// Regression (2026-07-01): buildBaseEvent must NOT panic when resp is nil — the
+// upstream-no-response / transport-error path. The `if resp != nil` util-report guard
+// inside the function proves resp is nilable, but StatusCode used to be dereferenced
+// unguarded → latent nil panic (staticcheck SA5011). nil resp → StatusCode 0, no panic.
+func TestBuildBaseEvent_NilRespNoPanic(t *testing.T) {
+	p := &Proxy{}
+	req := httptest.NewRequest(http.MethodPost, "/v1/messages", nil)
+	route := &vkeys.ResolvedRoute{VirtualKeyID: "vk", ProviderCode: "anthropic", ProtocolType: "anthropic"}
+
+	ev := p.buildBaseEvent(req, nil, time.Now(), route, false) // must not panic
+	if ev.StatusCode != 0 {
+		t.Fatalf("nil resp must yield StatusCode 0 (no upstream status), got %d", ev.StatusCode)
+	}
+}
+
 func TestBuildBaseEvent_FallbackToProviderWhenProviderCodeEmpty(t *testing.T) {
 	// 防御:pre-2026-05-08 fixture 或 route_builders bug 可能让 ProviderCode
 	// 为空字符串。此时退回 Provider,避免写空 provider 字段污染聚合查询。

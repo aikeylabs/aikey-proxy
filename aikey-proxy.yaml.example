@@ -31,6 +31,13 @@ listen:
 vault:
   path: "~/.aikey/data/vault.db"
 
+# Local AiKey console base (aikey-local-server web, 8090 on a default personal
+# install). Used to assemble the member-login URL shown inside claude/codex
+# when a shared pool account requires sign-in
+# (OAUTH_GROUP_MEMBER_LOGIN_REQUIRED → <console>/user/team-oauth).
+# Empty ⇒ the error message falls back to URL-less wording.
+console_url: "http://127.0.0.1:8090"
+
 # Virtual keys are delivered via vault (managed_virtual_keys_cache or
 # personal_route_token columns). Add keys with `aikey add <alias>
 # --provider <name>`, then `aikey list` / `aikey route` for the bearer

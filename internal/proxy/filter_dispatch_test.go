@@ -61,7 +61,7 @@ func TestApplyInboundFilter_PipeCapAndSplice(t *testing.T) {
 	r := newReq(`{"model":"m","messages":[{"role":"user","content":"` + full + `"}]}`)
 	w := httptest.NewRecorder()
 
-	if proceed := p.applyInboundFilter(w, r, "m", "personal", "", "", discardLogger()); !proceed {
+	if proceed := p.applyInboundFilter(w, r, "m", "personal", "", "", "", "", discardLogger()); !proceed {
 		t.Fatal("expected proceed")
 	}
 	// 1. payload over the pipe is capped — the detector never sees the huge tail.
@@ -84,7 +84,7 @@ func TestApplyInboundFilter_NoHook_PassThrough(t *testing.T) {
 	r := newReq(`{"model":"claude","messages":[{"role":"user","content":"hi"}]}`)
 	w := httptest.NewRecorder()
 
-	proceed := p.applyInboundFilter(w, r, "claude", "personal", "", "", discardLogger())
+	proceed := p.applyInboundFilter(w, r, "claude", "personal", "", "", "", "", discardLogger())
 	if !proceed {
 		t.Fatal("expected proceed=true with no hook")
 	}
@@ -101,7 +101,7 @@ func TestApplyInboundFilter_Allow(t *testing.T) {
 	r := newReq(body)
 	w := httptest.NewRecorder()
 
-	proceed := p.applyInboundFilter(w, r, "m", "personal", "", "", discardLogger())
+	proceed := p.applyInboundFilter(w, r, "m", "personal", "", "", "", "", discardLogger())
 	if !proceed {
 		t.Fatal("Allow should proceed")
 	}
@@ -131,7 +131,7 @@ func TestApplyInboundFilter_Mask(t *testing.T) {
 	r := newReq(`{"messages":[{"content":"my id is 110101199001011234"}]}`)
 	w := httptest.NewRecorder()
 
-	proceed := p.applyInboundFilter(w, r, "m", "personal", "", "", discardLogger())
+	proceed := p.applyInboundFilter(w, r, "m", "personal", "", "", "", "", discardLogger())
 	if !proceed {
 		t.Fatal("Mask should proceed (forward masked)")
 	}
@@ -167,7 +167,7 @@ func TestApplyInboundFilter_MaskEmptyPayload_LeavesUnchanged(t *testing.T) {
 	r := newReq(orig)
 	w := httptest.NewRecorder()
 
-	proceed := p.applyInboundFilter(w, r, "m", "personal", "", "", discardLogger())
+	proceed := p.applyInboundFilter(w, r, "m", "personal", "", "", "", "", discardLogger())
 	if !proceed {
 		t.Fatal("should proceed")
 	}
@@ -186,7 +186,7 @@ func TestApplyInboundFilter_Block(t *testing.T) {
 	r := newReq(`{"messages":[{"content":"key=sk-ant-secret"}]}`)
 	w := httptest.NewRecorder()
 
-	proceed := p.applyInboundFilter(w, r, "m", "personal", "", "", discardLogger())
+	proceed := p.applyInboundFilter(w, r, "m", "personal", "", "", "", "", discardLogger())
 	if proceed {
 		t.Fatal("Block should NOT proceed")
 	}
@@ -215,7 +215,7 @@ func TestApplyInboundFilter_BlockDefaultMessage(t *testing.T) {
 	r := newReq(`{"messages":[{"content":"x"}]}`) // needs a content piece to inspect
 	w := httptest.NewRecorder()
 
-	p.applyInboundFilter(w, r, "m", "personal", "", "", discardLogger())
+	p.applyInboundFilter(w, r, "m", "personal", "", "", "", "", discardLogger())
 	var body map[string]any
 	_ = json.Unmarshal(w.Body.Bytes(), &body)
 	errObj := body["error"].(map[string]any)
@@ -232,7 +232,7 @@ func TestApplyInboundFilter_Warn(t *testing.T) {
 	r := newReq(body)
 	w := httptest.NewRecorder()
 
-	proceed := p.applyInboundFilter(w, r, "m", "personal", "", "", discardLogger())
+	proceed := p.applyInboundFilter(w, r, "m", "personal", "", "", "", "", discardLogger())
 	if !proceed {
 		t.Fatal("Warn should proceed")
 	}
@@ -253,7 +253,7 @@ func TestApplyInboundFilter_DegradedFailsOpen(t *testing.T) {
 	r := newReq(body)
 	w := httptest.NewRecorder()
 
-	proceed := p.applyInboundFilter(w, r, "m", "personal", "", "", discardLogger())
+	proceed := p.applyInboundFilter(w, r, "m", "personal", "", "", "", "", discardLogger())
 	if !proceed {
 		t.Fatal("degraded must fail-open (proceed), NOT fail the request (§6 #11)")
 	}
@@ -273,7 +273,7 @@ func TestApplyInboundFilter_NilBody(t *testing.T) {
 	r.Body = nil
 	w := httptest.NewRecorder()
 
-	proceed := p.applyInboundFilter(w, r, "m", "personal", "", "", discardLogger())
+	proceed := p.applyInboundFilter(w, r, "m", "personal", "", "", "", "", discardLogger())
 	if !proceed {
 		t.Fatal("nil body should proceed without calling hook")
 	}
@@ -309,7 +309,7 @@ func TestApplyInboundFilter_UnknownAction_FailsLoudDegraded(t *testing.T) {
 	var logBuf bytes.Buffer
 	logger := slog.New(slog.NewTextHandler(&logBuf, &slog.HandlerOptions{Level: slog.LevelWarn}))
 
-	proceed := p.applyInboundFilter(w, r, "m", "personal", "", "", logger)
+	proceed := p.applyInboundFilter(w, r, "m", "personal", "", "", "", "", logger)
 
 	// 1. fail-OPEN: the request proceeds and content is forwarded unchanged.
 	if !proceed {
@@ -321,5 +321,54 @@ func TestApplyInboundFilter_UnknownAction_FailsLoudDegraded(t *testing.T) {
 	// 2. fail-LOUD: a WARN names the unknown action (not a silent clean Allow).
 	if logs := logBuf.String(); !strings.Contains(logs, "proxy.filter.unknown_action") {
 		t.Errorf("expected a WARN (proxy.filter.unknown_action) for the unknown action, got logs:\n%s", logs)
+	}
+}
+
+// TestInjectSeat pins the 2026-07-08 seat-attribution stamp: the compliance
+// event must carry seat_id so the master audit page resolves the employee's
+// alias instead of the raw detector user_id. Mirrors injectVirtualKey's
+// fail-safe contract (empty seat / bad JSON → unchanged).
+func TestInjectSeat(t *testing.T) {
+	// stamps seat_id, preserves existing fields (incl. detector's user_id)
+	out := injectSeat([]byte(`{"user_id":"claude-session-x","action":"block"}`), "seat-aa4c7f87")
+	var m map[string]any
+	if err := json.Unmarshal(out, &m); err != nil {
+		t.Fatalf("bad json: %v", err)
+	}
+	if m["seat_id"] != "seat-aa4c7f87" {
+		t.Fatalf("seat_id = %v, want seat-aa4c7f87", m["seat_id"])
+	}
+	if m["user_id"] != "claude-session-x" {
+		t.Fatalf("user_id clobbered = %v (must be preserved — decision A)", m["user_id"])
+	}
+	// empty seat → unchanged (personal key / legacy)
+	if got := string(injectSeat([]byte(`{"action":"mask"}`), "")); got != `{"action":"mask"}` {
+		t.Fatalf("empty seat mutated event: %s", got)
+	}
+	// non-JSON → unchanged (fail-safe)
+	if got := string(injectSeat([]byte(`not json`), "s1")); got != `not json` {
+		t.Fatalf("bad json mutated: %s", got)
+	}
+}
+
+// TestInjectSession pins the 2026-07-08 cross-audit deep-link key: the
+// compliance event carries session_id (same resolveSessionID source as the
+// conversation-audit observer) so the drawer can open the exact conversation
+// thread. Fail-safe contract mirrors injectSeat.
+func TestInjectSession(t *testing.T) {
+	out := injectSession([]byte(`{"event_id":"trace-1","seat_id":"s1"}`), "sess-9")
+	var m map[string]any
+	if err := json.Unmarshal(out, &m); err != nil {
+		t.Fatalf("bad json: %v", err)
+	}
+	if m["session_id"] != "sess-9" {
+		t.Fatalf("session_id = %v, want sess-9", m["session_id"])
+	}
+	if m["event_id"] != "trace-1" || m["seat_id"] != "s1" {
+		t.Fatalf("existing fields clobbered: %v", m)
+	}
+	// empty session (codex / no session header) → unchanged
+	if got := string(injectSession([]byte(`{"event_id":"x"}`), "")); got != `{"event_id":"x"}` {
+		t.Fatalf("empty session mutated: %s", got)
 	}
 }

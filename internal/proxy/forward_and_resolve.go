@@ -107,6 +107,10 @@ func (p *Proxy) serveRouteWithObserver(
 				}
 				return p.loggedInAccountID // personal-key fallback, as in usage
 			}(),
+			// Same field usage events stamp (reportable.go SeatID) — the seat
+			// dimension is what keeps shared-pool-VK turns attributed to the
+			// employee, not the VK owner (2026-07-07 audit misattribution).
+			SeatID: route.SeatID,
 		}
 		// payload_level=full (enterprise conversation audit): when some active
 		// observer wants the raw request body, buffer+restore it here so the
@@ -204,23 +208,11 @@ func (p *Proxy) ResolveBindingCredential(
 			}
 		}
 
-		// Codex BaseURL override pinned by TestFence_OAuthBinding_OpenAICodexBaseURLOverride.
-		// Why: Codex OAuth uses chatgpt.com/backend-api/codex (Responses API),
-		// NOT api.openai.com/v1 (Chat Completions API). API key users hit
-		// api.openai.com; OAuth users hit chatgpt.com.
-		// Ref: workflow/CI/research/oauth-codex-test/main.go
-		if canonicalCode == "openai" {
-			out.BaseURL = "https://chatgpt.com/backend-api/codex"
-			// Stage the `model` field into request context. Actual
-			// persistence is deferred to ModifyResponse, which only
-			// writes the file when upstream returned 2xx — see
-			// codex_model_capture.go for the bug-2026-06-09 rationale.
-			// `captureCodexModel` returns a NEW request with the value
-			// in context; reassign to propagate downstream.
-			r = captureCodexModel(r)
-		} else {
-			out.BaseURL = providerDefaultBaseURL(canonicalCode)
-		}
+		// Per-provider OAuth upstream (base URL + any provider setup) via the shared
+		// resolver — same source as the group route. Codex's chatgpt.com override +
+		// deferred model capture live in resolveOAuthUpstream; pinned by
+		// TestFence_OAuthBinding_OpenAICodexBaseURLOverride.
+		out.BaseURL, r = resolveOAuthUpstream(canonicalCode, r)
 		oauthInject(r, cred, canonicalCode)
 
 		identityTag := cred.Identity
@@ -337,7 +329,7 @@ func (p *Proxy) serveRoute(w http.ResponseWriter, r *http.Request, route *vkeys.
 	// On Block, applyInboundFilter writes the 403 and we return without
 	// forwarding. On Mask, r.Body is rewritten to the redacted version so the
 	// upstream LLM never sees the raw sensitive prompt. Fail-open on degraded.
-	if !p.applyInboundFilter(w, r, extractModel(r), route.RouteSource, route.OrgID, route.VirtualKeyID, logger) {
+	if !p.applyInboundFilter(w, r, extractModel(r), route.RouteSource, route.OrgID, route.VirtualKeyID, route.SeatID, resolveSessionID(r, route.ProtocolType, route.ProviderCode), logger) {
 		return
 	}
 
@@ -376,7 +368,7 @@ func (p *Proxy) serveRoute(w http.ResponseWriter, r *http.Request, route *vkeys.
 	// Streaming: keep the client context. When the client disconnects the
 	// upstream TCP connection is released so the provider stops generation
 	// and stops billing. Partial token usage is still recorded by the drainer.
-	inner := p.transport
+	inner := p.currentTransport()
 	if inner == nil {
 		inner = http.DefaultTransport
 		logger.Debug("using default transport (no custom transport set)")
@@ -470,6 +462,43 @@ func (p *Proxy) serveRoute(w http.ResponseWriter, r *http.Request, route *vkeys.
 			// ctxKeyCodexCandidateModel is only stashed inside the
 			// canonicalCode == "openai" OAuth branch above.
 			persistCodexLastModelIfSuccessful(resp.Request, resp.StatusCode)
+
+			// N8c reactive fallback: if a pool account's upstream says it is
+			// broken (401) or its window is exhausted (rate-limit-signal 429),
+			// cool it down so the resolver routes subsequent requests around it.
+			// This request still returns its status to the client; in-request
+			// retry (no client-visible failure) is N9. Non-group routes
+			// (route.OauthGroupID == "") skip this entirely.
+			if route.OauthGroupID != "" && route.AccountID != "" {
+				// Path Z (通道3 §14): record the observed window-reset epoch so the
+				// next N7c pull piggybacks it to master, which re-rolls this
+				// account's window_max_util_pct when a new window starts. Present on
+				// 200s too. Observability-only side effect; never blocks the request.
+				if epoch, ok := observedResetEpoch(resp.Header); ok {
+					p.poolObservedResets.record(route.AccountID, epoch)
+				}
+				if until, ok := cooldownDecision(resp, time.Now()); ok {
+					p.poolCooldown.mark(route.AccountID, until)
+					logger.Warn("pool account cooled down after upstream failure",
+						"event.name", observability.EventProxyGroupAccountCooldown,
+						"oauth_group_id", route.OauthGroupID,
+						"account_id", route.AccountID,
+						"status", resp.StatusCode)
+				}
+				// N10 防封 pre-cut: even on a 200, if the account's utilization
+				// crossed its randomized cap, cool it down for this window so it
+				// never hits 100% (which looks like abuse upstream).
+				if capPct, ok := windowCapFromContext(resp.Request); ok {
+					if until, hit := windowPreCutDecision(resp.Header, capPct, time.Now()); hit {
+						p.poolCooldown.mark(route.AccountID, until)
+						logger.Warn("pool account pre-cut at window cap",
+							"event.name", observability.EventProxyGroupWindowPrecut,
+							"oauth_group_id", route.OauthGroupID,
+							"account_id", route.AccountID,
+							"cap_pct", capPct)
+					}
+				}
+			}
 
 			// Upstream-headers debug toggle: log a "response snapshot" with
 			// status + body + selected response headers (rate-limit + retry
@@ -666,6 +695,11 @@ func (p *Proxy) serveRoute(w http.ResponseWriter, r *http.Request, route *vkeys.
 					upstreamReqID := extractUpstreamRequestID(resp)
 					p.reportUsage(route, bearerToken, ev.Model, startTime, resp.StatusCode, breakdown, "", "", realKey, sessionID, "complete", upstreamReqID)
 					// Phase 2: accrue token + local usd quota for this completed request.
+					// Backfill the model for local usd pricing when the adapter left it
+					// empty (mirrors the streaming path) so codex/others aren't unpriced.
+					if breakdown.Model == "" {
+						breakdown.Model = ev.Model
+					}
 					p.accrueQuotaUsage(route, breakdown, logger)
 				}
 			} else {
@@ -706,6 +740,14 @@ func (p *Proxy) serveRoute(w http.ResponseWriter, r *http.Request, route *vkeys.
 						}
 						// Phase 2: accrue token + local usd quota on stream completion,
 						// independent of the reporter.
+						// Local usd pricing keys on br.Model, but some providers' usage
+						// frame omits it (Codex /responses SSE) → the request would be
+						// left unpriced (usd=0) even though reportUsage recorded the
+						// correct `model`. Backfill so the edge price lookup matches the
+						// model this request actually ran (2026-07-06 codex-into-pool).
+						if br.Model == "" {
+							br.Model = model
+						}
 						p.accrueQuotaUsage(route, br, logger)
 					}
 				}
@@ -752,6 +794,18 @@ func (p *Proxy) serveRoute(w http.ResponseWriter, r *http.Request, route *vkeys.
 		FlushInterval: -1, // Flush immediately for SSE streaming.
 	}
 
+	// ConcurrencyPeak signal (best-effort, main-link-safe): count this credential
+	// as in-flight for the upstream forward, release on completion. defer
+	// guarantees the decrement even if ServeHTTP panics, so the live counter can't
+	// leak. trackInflight returns a no-op closure for a nil reporter / empty
+	// CredentialID, so this stays a single cheap map-lock with no extra branching.
+	// Placed AFTER the quota gate + inbound-filter early-returns above, so only
+	// requests that actually reach the upstream are counted (blocked ones never
+	// inc). ponytail: scoped to the synchronous ServeHTTP window — for streaming
+	// that blocks until the SSE copy to the client finishes, a good-enough
+	// concurrency proxy; chasing the detached non-streaming token-drain goroutine
+	// would need cross-goroutine lifetime tracking for marginal accuracy.
+	defer p.signalReporter.trackInflight(route.CredentialID)()
 	rp.ServeHTTP(w, r)
 
 	// 10. Slow request detection (after the full response is sent).

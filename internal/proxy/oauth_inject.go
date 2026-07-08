@@ -177,6 +177,13 @@ func injectClaudeOAuth(req *http.Request, cred *OAuthCredential) {
 		// stored on req.Context().
 		rewriteToolNamesForward(req)
 	}
+
+	// NOTE: oauth_group POOL requests pass the REAL client identity upstream
+	// unchanged. The former AccountPersona normalization (N users → one frozen
+	// SHA256(accountID) identity) was removed 2026-06-29: a frozen synthetic
+	// fingerprint can't track Claude Code version bumps, so it drifts stale and
+	// becomes its OWN detection signal — worse than transparent pass-through.
+	// Risk is now bounded by a ≤3-users-per-account cap, not by disguise.
 }
 
 // claudeCodeSystemPrompt is the byte-exact 57-char marker that Anthropic's
@@ -256,16 +263,36 @@ func hasFingerprint(block map[string]any) bool {
 // injectCodexOAuth injects Codex (ChatGPT Plus/Pro) headers.
 //
 // Verified 2026-04-15:
-//   - originator: opencode (required by Codex API)
+//   - originator: codex_cli_rs (the OFFICIAL codex CLI value; was "opencode",
+//     inherited from opencode's codex.ts). Source of truth: openai/codex
+//     codex-rs/login/src/auth/default_client.rs DEFAULT_ORIGINATOR="codex_cli_rs"
+//     (sent on every /responses request via add_originator_header). This is only
+//     a FALLBACK: setIfAbsent preserves the value a real codex CLI already sends,
+//     so we merely stop mislabelling originator-less traffic as the third-party
+//     "opencode" tool. NOTE: this is a required API header, NOT a persona/UA
+//     fingerprint — we deliberately do NOT inject a synthetic User-Agent/session
+//     here (that identity-forgery layer was removed 2026-06-29 for transparent
+//     proxy + ≤3-users/account; see CC账号池 requirement).
 //   - ChatGPT-Account-Id: from JWT claims (for org subscriptions)
 //   - API URL: chatgpt.com/backend-api/codex/responses (Responses API format)
 //
 // Why inject-if-absent: Codex CLI may set its own originator or account ID
 // in future versions. Overwriting would break forward compatibility.
+//
+// ChatGPT-Account-Id source (fixed 2026-07-04, R34 codex pools): the real
+// chatgpt_account_id lives in ExternalID (the broker extracts it from the token
+// JWT's auth.chatgpt_account_id claim). AccountID is OUR identifier — the
+// broker's random account row id on the personal path, the pool's internal
+// account id on the group path — sending it upstream was a wrong value that only
+// went unnoticed because Codex CLI usually sets its own header (setIfAbsent).
+// ExternalID first; AccountID kept as a legacy fallback for old vault rows that
+// predate ExternalID.
 func injectCodexOAuth(req *http.Request, cred *OAuthCredential) {
 	req.Header.Set("Authorization", "Bearer "+cred.AccessToken)
-	setIfAbsent(req, "originator", "opencode")
-	if cred.AccountID != "" {
+	setIfAbsent(req, "originator", "codex_cli_rs")
+	if id := cred.ExternalID; id != "" {
+		setIfAbsent(req, "ChatGPT-Account-Id", id)
+	} else if cred.AccountID != "" {
 		setIfAbsent(req, "ChatGPT-Account-Id", cred.AccountID)
 	}
 }

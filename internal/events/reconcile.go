@@ -241,7 +241,7 @@ func (r *Reporter) httpGetJSON(ctx context.Context, u string, out any) error {
 	if err != nil {
 		return err
 	}
-	resp, err := r.client.Do(req)
+	resp, err := r.client.Get().Do(req)
 	if err != nil {
 		return err
 	}
@@ -262,7 +262,7 @@ func (r *Reporter) httpPostJSON(ctx context.Context, u string, body, out any) er
 		return err
 	}
 	req.Header.Set("Content-Type", "application/json")
-	resp, err := r.client.Do(req)
+	resp, err := r.client.Get().Do(req)
 	if err != nil {
 		return err
 	}
