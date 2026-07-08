@@ -131,6 +131,21 @@ func main() {
 		Level: slog.LevelInfo,
 	})))
 
+	// Handle graceful shutdown — see pkg/aikeycompat for the per-OS signal set
+	// (Windows: SIGINT only; Unix: SIGINT + SIGTERM).
+	//
+	// WHY Notify is installed FIRST, before any init (2026-07-08 bugfix, e2e
+	// i3): a service manager may forward SIGTERM at any moment after exec
+	// (systemd stop right after start, restart storms), and the CLI writes the
+	// ownership meta while we are still initializing (vault/broker/observers —
+	// hundreds of ms). Before this move an early SIGTERM hit Go's default
+	// disposition and killed the process ("signal: 15", non-zero exit) instead
+	// of draining gracefully. The buffered channel captures the early signal;
+	// the select at the bottom of main consumes it right after init completes →
+	// same graceful drain path, exit 0.
+	sigCh := make(chan os.Signal, 1)
+	signal.Notify(sigCh, aikeycompat.ShutdownSignals()...)
+
 	// 1. Resolve and load config.
 	resolvedPath, err := resolveConfigPath(*configPath)
 	if err != nil {
@@ -450,11 +465,6 @@ func main() {
 	}
 	srv := server.New(ln, dataHandler, adminHandler, extraRegistrars...)
 
-	// Handle graceful shutdown — see pkg/aikeycompat for the per-OS
-	// signal set (Windows: SIGINT only; Unix: SIGINT + SIGTERM).
-	sigCh := make(chan os.Signal, 1)
-	signal.Notify(sigCh, aikeycompat.ShutdownSignals()...)
-
 	// Fatal: server.Serve is the process's reason for being. If it dies the
 	// proxy cannot serve requests, so exit(2) and let the OS supervisor
 	// restart us rather than lingering as a zombie that accepts nothing.
@@ -570,10 +580,12 @@ const upstreamProbeTarget = "https://api.anthropic.com/"
 // (egress_integration_test.go).
 func egressState(explicit string, watcher *sysproxy.Watcher) admin.EgressState {
 	snap := watcher.Current()
+	envExplicit, envInherited := sysproxy.EnvProxyVarsSplit()
 	st := admin.EgressState{
 		ExplicitURL:      explicit,
-		EnvAuthoritative: watcher.EnvAuthoritative(),
-		EnvVars:          sysproxy.EnvProxyVars(),
+		EnvAuthoritative: watcher.EnvExplicit(),
+		EnvVars:          envExplicit,
+		EnvInheritedVars: envInherited,
 		SystemSupported:  watcher.Supported(),
 		SystemHTTP:       snap.HTTP,
 		SystemHTTPS:      snap.HTTPS,
@@ -596,8 +608,11 @@ func egressState(explicit string, watcher *sysproxy.Watcher) admin.EgressState {
 		st.EffectiveSource = "direct"
 	case st.EnvAuthoritative:
 		st.EffectiveSource, st.EffectiveURL = "env", u.Redacted()
-	default:
+	case snap.ProxyFor("https") != "":
 		st.EffectiveSource, st.EffectiveURL = "system", u.Redacted()
+	default:
+		// Layers 1-3 empty, ProxyFunc fell through to inherited shell env.
+		st.EffectiveSource, st.EffectiveURL = "env_inherited", u.Redacted()
 	}
 	return st
 }

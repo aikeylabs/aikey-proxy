@@ -60,7 +60,7 @@ require (
 	github.com/remyoudompheng/bigfft v0.0.0-20230129092748-24d4a6f8daec // indirect
 	github.com/tidwall/match v1.1.1 // indirect
 	github.com/tidwall/pretty v1.2.0 // indirect
-	golang.org/x/net v0.51.0 // indirect
+	golang.org/x/net v0.51.0
 	golang.org/x/sys v0.42.0
 	golang.org/x/text v0.35.0 // indirect
 	modernc.org/libc v1.70.0 // indirect

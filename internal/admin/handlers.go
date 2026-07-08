@@ -322,13 +322,13 @@ func (h *Handler) Status(w http.ResponseWriter, r *http.Request) {
 	}
 
 	writeJSON(w, http.StatusOK, statusResponse{
-		Status:      "ok",
-		Version:     Version,
-		Uptime:      time.Since(h.startedAt).Round(time.Second).String(),
-		ListenAddr:  h.cfg.Listen.Addr(),
-		VirtualKeys: h.registry.Count(),
-		VaultPath:   h.cfg.Vault.Path,
-		StartedAt:   h.startedAt.Format(time.RFC3339),
+		Status:           "ok",
+		Version:          Version,
+		Uptime:           time.Since(h.startedAt).Round(time.Second).String(),
+		ListenAddr:       h.cfg.Listen.Addr(),
+		VirtualKeys:      h.registry.Count(),
+		VaultPath:        h.cfg.Vault.Path,
+		StartedAt:        h.startedAt.Format(time.RFC3339),
 		TotalReqs:        totalReqs,
 		TotalErrs:        totalErrs,
 		PoolRouting:      poolRouting,
@@ -337,18 +337,18 @@ func (h *Handler) Status(w http.ResponseWriter, r *http.Request) {
 }
 
 type metricsResponse struct {
-	RequestsByVKey     map[string]int64         `json:"requests_by_vkey"`
-	RequestsByProvider map[string]int64         `json:"requests_by_provider"`
+	RequestsByVKey     map[string]int64 `json:"requests_by_vkey"`
+	RequestsByProvider map[string]int64 `json:"requests_by_provider"`
 	// RequestsByAccount: per real serving account (oauth_group attribution).
 	// Counts follow pool fallback (A→B counts toward B). Empty when no group
 	// routing has happened. Lets local audit see "which account served" without
 	// the collector/ODS.
-	RequestsByAccount map[string]int64 `json:"requests_by_account"`
-	Reporter           *events.ReporterMetrics  `json:"reporter,omitempty"`
-	Collector          *events.CollectorMetrics `json:"collector,omitempty"`
-	Canary             *events.CanaryResult     `json:"canary,omitempty"`
-	TotalRequests      int64                    `json:"total_requests"`
-	TotalErrors        int64                    `json:"total_errors"`
+	RequestsByAccount map[string]int64         `json:"requests_by_account"`
+	Reporter          *events.ReporterMetrics  `json:"reporter,omitempty"`
+	Collector         *events.CollectorMetrics `json:"collector,omitempty"`
+	Canary            *events.CanaryResult     `json:"canary,omitempty"`
+	TotalRequests     int64                    `json:"total_requests"`
+	TotalErrors       int64                    `json:"total_errors"`
 }
 
 // Metrics returns aggregated usage metrics.

@@ -26,11 +26,17 @@ type upstreamProxyBody struct {
 type EgressState struct {
 	// ExplicitURL: layer 1 — the user-set upstream_proxy.url ("" = not set).
 	ExplicitURL string `json:"explicit_url"`
-	// EnvAuthoritative: layer 2 — true when the DAEMON process env carries
-	// proxy vars (then OS detection is bypassed entirely, incl. NO_PROXY).
+	// EnvAuthoritative: layer 2 — true when the daemon env carries proxy vars
+	// EXPLICITLY configured via ~/.aikey/proxy.env (CLI-marked at spawn).
+	// Since the 2026-07-08 precedence refinement, ONLY those bypass OS
+	// detection; inherited shell env is a below-system fallback (layer 4).
 	EnvAuthoritative bool `json:"env_authoritative"`
-	// EnvVars: the proxy-relevant vars the daemon sees (credentials redacted).
+	// EnvVars: the EXPLICIT (proxy.env) vars (credentials redacted).
 	EnvVars map[string]string `json:"env_vars,omitempty"`
+	// EnvInheritedVars: layer 4 — proxy vars inherited from the spawn shell
+	// (.zshrc exports, stale terminals); consulted only when layers 1-3 are
+	// all empty.
+	EnvInheritedVars map[string]string `json:"env_inherited_vars,omitempty"`
 	// System: layer 3 — the live OS system-proxy snapshot.
 	SystemSupported bool   `json:"system_supported"`
 	SystemHTTP      string `json:"system_http,omitempty"`
@@ -38,7 +44,8 @@ type EgressState struct {
 	SystemSOCKS     string `json:"system_socks,omitempty"`
 	// Effective: the resolved result for https provider targets, computed via
 	// the SAME ProxyFunc the forwarding transport uses. Source is one of
-	// "explicit" | "env" | "system" | "direct"; URL is "" when direct.
+	// "explicit" | "env" | "system" | "env_inherited" | "direct"; URL is ""
+	// when direct.
 	EffectiveSource string `json:"effective_source"`
 	EffectiveURL    string `json:"effective_url,omitempty"`
 }

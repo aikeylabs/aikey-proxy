@@ -13,12 +13,24 @@
 // Design (方案 A, user-approved 2026-07-08): the direct-mode Transport.Proxy is
 // a FUNCTION reading an atomic snapshot refreshed by a poll loop — never
 // http.ProxyFromEnvironment's cached global. Precedence (single source of
-// truth, user-approved):
+// truth, user-approved; refined same day after field evidence from two
+// machines — see below):
 //
-//	explicit upstream_proxy.url  >  process env (frozen, authoritative if set)  >  OS system proxy (live)
+//	explicit upstream_proxy.url  >  proxy.env EXPLICIT env  >  OS system proxy (live)  >  inherited shell env  >  direct
 //
-// The explicit layer stays OUTSIDE this package (buildTransport keeps using
-// http.ProxyURL for it); this package resolves the other two.
+// WHY the env layer is split in two (2026-07-08 refinement, user-approved):
+// "process env" conflates the user's EXPLICIT aikey config (~/.aikey/proxy.env,
+// which the CLI injects at spawn) with ACCIDENTAL shell inheritance (.zshrc
+// exports, stale terminal sessions). Clash-style users practically always have
+// shell exports, so an undivided env layer permanently masked the system-proxy
+// auto-follow this package exists for — and made behavior differ between
+// launchd auto-start (no shell env) and manual restart (shell env). The CLI
+// marks its proxy.env injections via AIKEY_PROXYENV_KEYS; only marked proxy
+// vars outrank OS detection, inherited ones fall below it as a last resort
+// (still covering headless/Linux manual starts).
+//
+// The explicit-URL layer stays OUTSIDE this package (buildTransport keeps
+// using http.ProxyURL for it); this package resolves the rest.
 //
 // WHY poll (not events): netmon's fingerprint is the set of interface IPs —
 // toggling/re-porting a system proxy does NOT change interface IPs, so the
@@ -38,8 +50,11 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"strings"
 	"sync"
 	"time"
+
+	"golang.org/x/net/http/httpproxy"
 
 	"github.com/AiKeyLabs/aikey-proxy/internal/observability"
 )
@@ -92,11 +107,19 @@ type Watcher struct {
 	// full watcher on any development/CI OS.
 	supported bool
 
-	// envAuthoritative: the process environment carries proxy intent
-	// (HTTP(S)_PROXY / ALL_PROXY / NO_PROXY via proxy.env or the spawn env).
-	// Env is EXPLICIT user config, so it outranks OS detection — including its
-	// NO_PROXY exclusions, which must not "fall through" to the system layer.
-	envAuthoritative bool
+	// envProxy resolves proxy env vars (both layers 2 and 4). Built ONCE at
+	// construction from the frozen process env via x/net/httpproxy — the same
+	// implementation net/http delegates to, but WITHOUT the process-global
+	// sync.Once cache, so tests can drive it deterministically with t.Setenv.
+	envProxy func(*url.URL) (*url.URL, error)
+
+	// envExplicit: the process env carries proxy vars that the CLI marked as
+	// coming from ~/.aikey/proxy.env (AIKEY_PROXYENV_KEYS). That is EXPLICIT
+	// user config, so it outranks OS detection — including its NO_PROXY
+	// exclusions, which must not "fall through" to the system layer.
+	// Inherited (unmarked) proxy vars do NOT set this; they participate only
+	// as the below-system fallback inside ProxyFunc.
+	envExplicit bool
 
 	// readFailing dedups WARN logs: one WARN per failure streak, one INFO on
 	// recovery, never a 20s WARN drumbeat.
@@ -107,7 +130,12 @@ type Watcher struct {
 // reader. On unsupported platforms or with authoritative env config the
 // watcher is inert (Run returns immediately, ProxyFunc delegates to env).
 func NewWatcher() *Watcher {
-	w := &Watcher{read: readSystemProxy, supported: platformSupported, envAuthoritative: envProxyConfigured()}
+	w := &Watcher{
+		read:        readSystemProxy,
+		supported:   platformSupported,
+		envExplicit: envProxyExplicit(os.Getenv),
+		envProxy:    httpproxy.FromEnvironment().ProxyFunc(),
+	}
 	w.prime()
 	return w
 }
@@ -119,7 +147,11 @@ func NewWatcher() *Watcher {
 // Always "supported" and env-independent; never use in production wiring
 // (production is NewWatcher, which honors platform + env precedence).
 func NewWatcherWithReader(read func() (Snapshot, error)) *Watcher {
-	w := &Watcher{read: read, supported: true}
+	w := &Watcher{
+		read:      read,
+		supported: true,
+		envProxy:  httpproxy.FromEnvironment().ProxyFunc(),
+	}
 	w.prime()
 	return w
 }
@@ -132,10 +164,15 @@ func (w *Watcher) PollOnce() bool {
 	return changed
 }
 
-// newWatcherForTest injects a fake reader and env-authority flag; always
+// newWatcherForTest injects a fake reader and explicit-env flag; always
 // "supported" so the full poll/observe path runs on any test OS.
-func newWatcherForTest(read func() (Snapshot, error), envAuthoritative bool) *Watcher {
-	w := &Watcher{read: read, supported: true, envAuthoritative: envAuthoritative}
+func newWatcherForTest(read func() (Snapshot, error), envExplicit bool) *Watcher {
+	w := &Watcher{
+		read:        read,
+		supported:   true,
+		envExplicit: envExplicit,
+		envProxy:    httpproxy.FromEnvironment().ProxyFunc(),
+	}
 	w.prime()
 	return w
 }
@@ -160,8 +197,10 @@ func (w *Watcher) prime() {
 	}
 }
 
-// active reports whether OS detection participates at all.
-func (w *Watcher) active() bool { return w.supported && !w.envAuthoritative }
+// active reports whether OS detection participates at all. Only EXPLICIT
+// (proxy.env-marked) env config disables it — inherited shell env does not,
+// because the system proxy now outranks inheritance.
+func (w *Watcher) active() bool { return w.supported && !w.envExplicit }
 
 // Current returns the last-known snapshot (zero value when inactive).
 func (w *Watcher) Current() Snapshot {
@@ -170,29 +209,58 @@ func (w *Watcher) Current() Snapshot {
 	return w.cur
 }
 
-// EnvAuthoritative reports whether the process env carries proxy intent and
-// therefore outranks OS detection. Read-only observability accessor (admin
-// egress state / `aikey env`).
-func (w *Watcher) EnvAuthoritative() bool { return w.envAuthoritative }
+// EnvExplicit reports whether proxy.env-marked (explicit) proxy vars are
+// present and therefore outrank OS detection. Read-only observability
+// accessor (admin egress state / `aikey env`).
+func (w *Watcher) EnvExplicit() bool { return w.envExplicit }
 
 // Supported reports whether this platform has OS system-proxy detection.
 // Read-only observability accessor.
 func (w *Watcher) Supported() bool { return w.supported }
 
-// EnvProxyVars returns the proxy-relevant environment variables THIS process
-// sees (the daemon's frozen spawn env — deliberately not the user's shell),
-// with any embedded URL credentials redacted. Observability only: the egress
-// decision itself goes through ProxyFunc, never this map.
-func EnvProxyVars() map[string]string {
+// EnvProxyVarsSplit returns the proxy-relevant environment variables THIS
+// process sees (the daemon's frozen spawn env — deliberately not the user's
+// shell), split by provenance: explicit = injected from ~/.aikey/proxy.env
+// (AIKEY_PROXYENV_KEYS-marked), inherited = everything else (shell exports,
+// stale terminals). Credentials in URLs are redacted. Observability only:
+// the egress decision itself goes through ProxyFunc, never these maps.
+func EnvProxyVarsSplit() (explicit, inherited map[string]string) {
+	return envProxyVarsSplitFrom(os.Getenv)
+}
+
+func envProxyVarsSplitFrom(get func(string) string) (explicit, inherited map[string]string) {
+	marked := explicitEnvKeySet(get)
+	explicit, inherited = map[string]string{}, map[string]string{}
+	for k, v := range envProxyVarsFrom(get) {
+		if marked[strings.ToUpper(k)] {
+			explicit[k] = v
+		} else {
+			inherited[k] = v
+		}
+	}
+	return explicit, inherited
+}
+
+// envProxyVarsFrom is the injectable core (tests fake the getter). WHY the
+// twin-dedupe (2026-07-08 Windows field report): Windows env keys are
+// case-INsensitive — Getenv("http_proxy") returns the SAME variable as
+// Getenv("HTTP_PROXY"), so the naive 8-key loop displayed every variable
+// twice in `aikey env`. The lowercase twin is listed only when it's a
+// genuinely distinct value (possible on Unix, where env is case-sensitive).
+func envProxyVarsFrom(get func(string) string) map[string]string {
 	out := map[string]string{}
-	for _, k := range []string{
-		"HTTP_PROXY", "http_proxy",
-		"HTTPS_PROXY", "https_proxy",
-		"ALL_PROXY", "all_proxy",
-		"NO_PROXY", "no_proxy",
+	for _, pair := range [][2]string{
+		{"HTTP_PROXY", "http_proxy"},
+		{"HTTPS_PROXY", "https_proxy"},
+		{"ALL_PROXY", "all_proxy"},
+		{"NO_PROXY", "no_proxy"},
 	} {
-		if v := os.Getenv(k); v != "" {
-			out[k] = redactURLCredentials(v)
+		upper, lower := get(pair[0]), get(pair[1])
+		if upper != "" {
+			out[pair[0]] = redactURLCredentials(upper)
+		}
+		if lower != "" && lower != upper {
+			out[pair[1]] = redactURLCredentials(lower)
 		}
 	}
 	return out
@@ -266,15 +334,18 @@ func (w *Watcher) observe() (old, cur Snapshot, changed bool) {
 
 // ProxyFunc returns the Transport.Proxy for the DIRECT egress mode
 // (upstream_proxy.url empty). Layering per the approved precedence:
-//   - env authoritative → exactly the pre-existing behavior
-//     (http.ProxyFromEnvironment; its sync.Once cache is harmless because the
-//     process env is immutable anyway), including NO_PROXY handling;
+//   - explicit proxy.env env (marked) → env resolution with full NO_PROXY
+//     handling (x/net httpproxy — identical semantics to
+//     http.ProxyFromEnvironment, minus its process-global cache);
 //   - otherwise → the live system-proxy snapshot, re-read on every request so
 //     a mid-flight Clash change applies to the very next request;
-//   - no system proxy → direct.
+//   - no system proxy → INHERITED shell env as last-resort fallback (covers
+//     headless/Linux manual starts and unsupported platforms, where this
+//     equals the pre-detection behavior);
+//   - nothing anywhere → direct.
 func (w *Watcher) ProxyFunc() func(*http.Request) (*url.URL, error) {
 	if !w.active() {
-		return http.ProxyFromEnvironment
+		return func(req *http.Request) (*url.URL, error) { return w.envProxy(req.URL) }
 	}
 	return func(req *http.Request) (*url.URL, error) {
 		// Never proxy loopback destinations (local relays, self-probes) —
@@ -282,19 +353,20 @@ func (w *Watcher) ProxyFunc() func(*http.Request) (*url.URL, error) {
 		if isLoopbackHost(req.URL.Hostname()) {
 			return nil, nil
 		}
-		raw := w.Current().ProxyFor(req.URL.Scheme)
-		if raw == "" {
-			return nil, nil
+		if raw := w.Current().ProxyFor(req.URL.Scheme); raw != "" {
+			return url.Parse(raw)
 		}
-		return url.Parse(raw)
+		// Layer 4: inherited shell env (unmarked vars) as fallback.
+		return w.envProxy(req.URL)
 	}
 }
 
-// BrokerEgressURL is the system-derived egress for clients that take a static
-// proxy URL string (the OAuth ImpersonateChrome client). "" when env config is
-// authoritative (the client's own env fallback applies) or no system proxy is
-// set. Callers must re-invoke this on change (main's onChange rebuilds the
-// broker client) — the returned string is a point-in-time value by design.
+// BrokerEgressURL is the layered egress for clients that take a static proxy
+// URL string (the OAuth ImpersonateChrome client). "" when explicit env
+// config applies or nothing is detected — in both cases the client's own env
+// fallback yields the same result (explicit or inherited env respectively).
+// Callers must re-invoke this on change (main's onChange rebuilds the broker
+// client) — the returned string is a point-in-time value by design.
 func (w *Watcher) BrokerEgressURL() string {
 	if !w.active() {
 		return ""
@@ -302,17 +374,41 @@ func (w *Watcher) BrokerEgressURL() string {
 	return w.Current().ProxyFor("https")
 }
 
-// envProxyConfigured reports whether the process env carries any proxy intent.
-// Mirrors the variable set golang.org/x/net/http/httpproxy consults. NO_PROXY
-// alone counts too: it expresses "I curated env-level proxy rules".
-func envProxyConfigured() bool {
-	for _, k := range []string{
-		"HTTP_PROXY", "http_proxy",
-		"HTTPS_PROXY", "https_proxy",
-		"ALL_PROXY", "all_proxy",
-		"NO_PROXY", "no_proxy",
-	} {
-		if os.Getenv(k) != "" {
+// proxyEnvNames is the variable set golang.org/x/net/http/httpproxy consults.
+// NO_PROXY counts too: it expresses "I curated env-level proxy rules".
+var proxyEnvNames = []string{
+	"HTTP_PROXY", "http_proxy",
+	"HTTPS_PROXY", "https_proxy",
+	"ALL_PROXY", "all_proxy",
+	"NO_PROXY", "no_proxy",
+}
+
+// explicitEnvKeyMarker is set by aikey-cli at spawn: comma-separated env keys
+// it injected from ~/.aikey/proxy.env (the user's EXPLICIT aikey config).
+const explicitEnvKeyMarker = "AIKEY_PROXYENV_KEYS"
+
+// explicitEnvKeySet parses the marker into an upper-cased key set. Upper-cased
+// on both sides because Windows env keys are case-insensitive and proxy.env
+// keys are user-typed in either case.
+func explicitEnvKeySet(get func(string) string) map[string]bool {
+	out := map[string]bool{}
+	for _, k := range strings.Split(get(explicitEnvKeyMarker), ",") {
+		if k = strings.TrimSpace(k); k != "" {
+			out[strings.ToUpper(k)] = true
+		}
+	}
+	return out
+}
+
+// envProxyExplicit reports whether any proxy var is BOTH set and marked as
+// coming from proxy.env — the only condition that outranks OS detection.
+func envProxyExplicit(get func(string) string) bool {
+	marked := explicitEnvKeySet(get)
+	if len(marked) == 0 {
+		return false
+	}
+	for _, k := range proxyEnvNames {
+		if get(k) != "" && marked[strings.ToUpper(k)] {
 			return true
 		}
 	}

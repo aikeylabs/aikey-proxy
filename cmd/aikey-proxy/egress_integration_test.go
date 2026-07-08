@@ -44,7 +44,21 @@ func fakeForwardProxy(t *testing.T, tag string) (*httptest.Server, *atomic.Int64
 	return srv, &hits
 }
 
+// clearProxyEnvMain pins the proxy env empty so assertions are hermetic
+// against the runner's shell (dev Macs export https_proxy; since the
+// 2026-07-08 refinement an empty snapshot falls through to inherited env).
+func clearProxyEnvMain(t *testing.T) {
+	t.Helper()
+	for _, k := range []string{
+		"HTTP_PROXY", "http_proxy", "HTTPS_PROXY", "https_proxy",
+		"ALL_PROXY", "all_proxy", "NO_PROXY", "no_proxy", "AIKEY_PROXYENV_KEYS",
+	} {
+		t.Setenv(k, "")
+	}
+}
+
 func TestEgress_FollowsSystemProxySwitch_NoRestart(t *testing.T) {
+	clearProxyEnvMain(t)
 	proxyA, hitsA := fakeForwardProxy(t, "via-A")
 	proxyB, hitsB := fakeForwardProxy(t, "via-B")
 
@@ -134,6 +148,7 @@ func TestEgress_ExplicitURLOutranksSystemProxy(t *testing.T) {
 // `aikey env` renders): each layer must be reported, and the effective value
 // must match what the transport's resolver would do.
 func TestEgressState_LayeredReporting(t *testing.T) {
+	clearProxyEnvMain(t)
 	sys := sysproxy.Snapshot{HTTP: "http://127.0.0.1:7890", HTTPS: "http://127.0.0.1:7890", SOCKS: "socks5://127.0.0.1:7891"}
 	watcher := sysproxy.NewWatcherWithReader(func() (sysproxy.Snapshot, error) { return sys, nil })
 
@@ -163,23 +178,84 @@ func TestEgressState_LayeredReporting(t *testing.T) {
 	}
 }
 
-// Env-authoritative daemon: the env layer must be flagged and its vars listed
-// (credentials redacted server-side). The effective URL for this branch goes
-// through Go's ProxyFromEnvironment, whose process-global sync.Once cache may
-// already be primed by earlier tests — so we assert the layer reporting, not
-// the effective value (the effective path is covered by sysproxy unit tests).
-func TestEgressState_EnvAuthoritativeReported(t *testing.T) {
+// Explicit (proxy.env-marked) env: flagged authoritative, listed in the
+// explicit map with credentials redacted, and effective through the real
+// resolver. Uses the REAL NewWatcher (explicit env keeps it inert, so no OS
+// read happens even on macOS).
+func TestEgressState_ExplicitEnvReported(t *testing.T) {
+	clearProxyEnvMain(t)
 	t.Setenv("HTTPS_PROXY", "http://user:secret@127.0.0.1:7899")
-	watcher := sysproxy.NewWatcher() // real constructor: reads env authority, skips OS read
+	t.Setenv("AIKEY_PROXYENV_KEYS", "HTTPS_PROXY")
+	watcher := sysproxy.NewWatcher()
 	st := egressState("", watcher)
 	if !st.EnvAuthoritative {
-		t.Fatal("env layer must be authoritative when HTTPS_PROXY is set")
+		t.Fatal("proxy.env-marked HTTPS_PROXY must be authoritative")
 	}
 	got, ok := st.EnvVars["HTTPS_PROXY"]
 	if !ok {
-		t.Fatalf("env vars must list HTTPS_PROXY, got %v", st.EnvVars)
+		t.Fatalf("explicit vars must list HTTPS_PROXY, got %v", st.EnvVars)
 	}
 	if strings.Contains(got, "secret") {
 		t.Fatalf("credentials must be redacted, got %q", got)
+	}
+	if st.EffectiveSource != "env" {
+		t.Fatalf("effective source must be env, got %s", st.EffectiveSource)
+	}
+	if strings.Contains(st.EffectiveURL, "secret") {
+		t.Fatalf("effective URL must be redacted, got %q", st.EffectiveURL)
+	}
+}
+
+// Inherited (unmarked) env: NOT authoritative, listed as layer 4, and only
+// effective when the system snapshot is empty (2026-07-08 refinement — the
+// field case from the user's Mac .zshrc and the Windows HKCU\Environment).
+func TestEgressState_InheritedEnvDemotedBelowSystem(t *testing.T) {
+	clearProxyEnvMain(t)
+	t.Setenv("https_proxy", "http://127.0.0.1:7890") // no marker → inherited
+
+	// System proxy present → it wins; inherited env is visible but outranked.
+	withSys := sysproxy.NewWatcherWithReader(func() (sysproxy.Snapshot, error) {
+		return sysproxy.Snapshot{HTTPS: "http://127.0.0.1:9999"}, nil
+	})
+	st := egressState("", withSys)
+	if st.EnvAuthoritative {
+		t.Fatal("inherited env must not be authoritative")
+	}
+	if st.EnvInheritedVars["https_proxy"] == "" {
+		t.Fatalf("inherited vars must list https_proxy, got %v", st.EnvInheritedVars)
+	}
+	if st.EffectiveSource != "system" || st.EffectiveURL != "http://127.0.0.1:9999" {
+		t.Fatalf("system must outrank inherited env, got %s/%s", st.EffectiveSource, st.EffectiveURL)
+	}
+
+	// No system proxy → inherited env is the fallback.
+	noSys := sysproxy.NewWatcherWithReader(func() (sysproxy.Snapshot, error) {
+		return sysproxy.Snapshot{}, nil
+	})
+	st = egressState("", noSys)
+	if st.EffectiveSource != "env_inherited" || st.EffectiveURL != "http://127.0.0.1:7890" {
+		t.Fatalf("want env_inherited fallback, got %s/%s", st.EffectiveSource, st.EffectiveURL)
+	}
+}
+
+// Transport-level layer-4 proof: with no system proxy, live traffic egresses
+// through the INHERITED env proxy (old headless/manual behavior preserved).
+func TestEgress_InheritedEnvFallbackCarriesTraffic(t *testing.T) {
+	clearProxyEnvMain(t)
+	proxyC, hitsC := fakeForwardProxy(t, "via-C")
+	t.Setenv("http_proxy", proxyC.URL) // inherited: no marker
+	watcher := sysproxy.NewWatcherWithReader(func() (sysproxy.Snapshot, error) {
+		return sysproxy.Snapshot{}, nil
+	})
+	transport := buildTransport("", watcher.ProxyFunc())
+	client := &http.Client{Transport: transport, Timeout: 5 * time.Second}
+	resp, err := client.Get("http://provider.test/v1/ping")
+	if err != nil {
+		t.Fatalf("egress request failed: %v", err)
+	}
+	defer resp.Body.Close()
+	body, _ := io.ReadAll(resp.Body)
+	if string(body) != "via-C" || hitsC.Load() != 1 {
+		t.Fatalf("want inherited-env egress via-C (1 hit), got %q hits=%d", body, hitsC.Load())
 	}
 }

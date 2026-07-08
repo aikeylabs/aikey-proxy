@@ -4,6 +4,9 @@ import (
 	"context"
 	"errors"
 	"net/http"
+	"os"
+	"reflect"
+	"strings"
 	"testing"
 	"time"
 )
@@ -90,7 +93,21 @@ func reqTo(t *testing.T, rawurl string) *http.Request {
 	return req
 }
 
+// clearProxyEnv makes the test hermetic against the RUNNER's shell env (a dev
+// Mac usually exports https_proxy): since the 2026-07-08 refinement, an empty
+// snapshot falls through to inherited env — so tests asserting "direct" must
+// pin the env to empty BEFORE constructing the watcher (envProxy is built at
+// construction from the frozen env).
+func clearProxyEnv(t *testing.T) {
+	t.Helper()
+	for _, k := range proxyEnvNames {
+		t.Setenv(k, "")
+	}
+	t.Setenv(explicitEnvKeyMarker, "")
+}
+
 func TestProxyFunc_FollowsLiveSnapshot(t *testing.T) {
+	clearProxyEnv(t)
 	cur := Snapshot{HTTP: "http://127.0.0.1:7890", HTTPS: "http://127.0.0.1:7890"}
 	var readErr error
 	w := newWatcherForTest(func() (Snapshot, error) { return cur, readErr }, false)
@@ -112,13 +129,62 @@ func TestProxyFunc_FollowsLiveSnapshot(t *testing.T) {
 		t.Fatalf("want refreshed proxy :9999, got %v", u)
 	}
 
-	// System proxy toggled OFF: refresh to direct.
+	// System proxy toggled OFF: refresh to direct (env cleared above, so the
+	// layer-4 inherited fallback has nothing to offer).
 	cur = Snapshot{}
 	if _, _, changed := w.observe(); !changed {
 		t.Fatal("toggle-off must be observed")
 	}
 	if u, _ := fn(reqTo(t, "https://api.anthropic.com/v1/messages")); u != nil {
 		t.Fatalf("want direct after toggle-off, got %v", u)
+	}
+}
+
+// Layer 4 (2026-07-08 refinement): with no system proxy, INHERITED shell env
+// (unmarked) is the fallback; when a system proxy appears it takes over —
+// inherited env is outranked.
+func TestProxyFunc_InheritedEnvIsBelowSystemProxy(t *testing.T) {
+	clearProxyEnv(t)
+	t.Setenv("HTTPS_PROXY", "http://127.0.0.1:7890") // inherited: no marker
+	cur := Snapshot{}
+	w := newWatcherForTest(func() (Snapshot, error) { return cur, nil }, false)
+	fn := w.ProxyFunc()
+
+	// No system proxy → inherited env fallback engages (old Linux/manual
+	// behavior preserved).
+	if u, _ := fn(reqTo(t, "https://api.anthropic.com/v1/messages")); u == nil || u.Port() != "7890" {
+		t.Fatalf("want inherited env fallback :7890, got %v", u)
+	}
+
+	// System proxy turns on → it outranks the inherited env (the whole point
+	// of the refinement: Clash users' .zshrc exports must not pin the port).
+	cur = Snapshot{HTTPS: "http://127.0.0.1:9999"}
+	if _, _, changed := w.observe(); !changed {
+		t.Fatal("system proxy appearance must be observed")
+	}
+	if u, _ := fn(reqTo(t, "https://api.anthropic.com/v1/messages")); u == nil || u.Port() != "9999" {
+		t.Fatalf("system proxy must outrank inherited env, got %v", u)
+	}
+}
+
+// Explicit proxy.env config (marker) still outranks everything below it,
+// including the system proxy — the enterprise no-GUI contract is unchanged.
+func TestProxyFunc_ExplicitEnvOutranksSystemProxy(t *testing.T) {
+	clearProxyEnv(t)
+	t.Setenv("HTTPS_PROXY", "http://127.0.0.1:7890")
+	t.Setenv(explicitEnvKeyMarker, "HTTPS_PROXY")
+	if !envProxyExplicit(os.Getenv) {
+		t.Fatal("marked HTTPS_PROXY must be explicit")
+	}
+	w := newWatcherForTest(func() (Snapshot, error) {
+		return Snapshot{HTTPS: "http://127.0.0.1:9999"}, nil
+	}, envProxyExplicit(os.Getenv))
+	if w.active() {
+		t.Fatal("explicit env must keep the watcher inert")
+	}
+	u, err := w.ProxyFunc()(reqTo(t, "https://api.anthropic.com/v1/messages"))
+	if err != nil || u == nil || u.Port() != "7890" {
+		t.Fatalf("explicit env must win over system proxy, got %v err %v", u, err)
 	}
 }
 
@@ -190,15 +256,96 @@ func TestSnapshotProxyForFallbacks(t *testing.T) {
 	}
 }
 
-func TestEnvProxyConfigured(t *testing.T) {
-	for _, k := range []string{"HTTP_PROXY", "http_proxy", "HTTPS_PROXY", "https_proxy", "ALL_PROXY", "all_proxy", "NO_PROXY", "no_proxy"} {
-		t.Setenv(k, "")
+// 2026-07-08 precedence refinement: only proxy vars MARKED as coming from
+// proxy.env (AIKEY_PROXYENV_KEYS) count as explicit; inherited shell exports
+// must NOT disable OS detection.
+func TestEnvProxyExplicit_MarkerGated(t *testing.T) {
+	get := func(env map[string]string) func(string) string {
+		return func(k string) string { return env[k] }
 	}
-	if envProxyConfigured() {
-		t.Fatal("clean env must not be authoritative")
+	// Inherited only (the .zshrc-export field case): NOT explicit.
+	if envProxyExplicit(get(map[string]string{"https_proxy": "http://127.0.0.1:7890"})) {
+		t.Fatal("inherited shell env must not be explicit")
 	}
-	t.Setenv("https_proxy", "http://127.0.0.1:7890")
-	if !envProxyConfigured() {
-		t.Fatal("https_proxy must make env authoritative")
+	// Marked via proxy.env (case-insensitive match): explicit.
+	if !envProxyExplicit(get(map[string]string{
+		"https_proxy":         "http://127.0.0.1:7890",
+		"AIKEY_PROXYENV_KEYS": "HTTPS_PROXY,DEGRADE_DETECTOR_PROXY_TOKEN",
+	})) {
+		t.Fatal("proxy.env-marked https_proxy must be explicit")
+	}
+	// Marker lists non-proxy keys only: NOT explicit.
+	if envProxyExplicit(get(map[string]string{
+		"https_proxy":         "http://127.0.0.1:7890",
+		"AIKEY_PROXYENV_KEYS": "DEGRADE_DETECTOR_PROXY_TOKEN",
+	})) {
+		t.Fatal("marker without proxy keys must not be explicit")
+	}
+}
+
+// Split by provenance: marked vars → explicit map, unmarked → inherited map.
+func TestEnvProxyVarsSplit_ByMarker(t *testing.T) {
+	get := func(k string) string {
+		switch k {
+		case "HTTPS_PROXY":
+			return "http://127.0.0.1:7890"
+		case "all_proxy":
+			return "socks5://127.0.0.1:7890"
+		case "AIKEY_PROXYENV_KEYS":
+			return "https_proxy"
+		}
+		return ""
+	}
+	explicit, inherited := envProxyVarsSplitFrom(get)
+	if len(explicit) != 1 || explicit["HTTPS_PROXY"] == "" {
+		t.Fatalf("HTTPS_PROXY must be explicit (marker is case-insensitive), got %v", explicit)
+	}
+	if len(inherited) != 1 || inherited["all_proxy"] == "" {
+		t.Fatalf("all_proxy must be inherited, got %v", inherited)
+	}
+}
+
+// Layer-4 fallback: system snapshot empty → ProxyFunc falls through to the
+// inherited env (ProxyFromEnvironment) instead of going direct.
+// NOTE: not asserted via a live ProxyFromEnvironment call here — its
+// process-global sync.Once cache would make the assertion order-dependent
+// across the package's tests. The fall-through branch is asserted by
+// TestEgress_InheritedEnvFallback in cmd/aikey-proxy (fresh binary run).
+
+// 2026-07-08 Windows field report: env keys are case-insensitive on Windows,
+// so both Getenv("HTTP_PROXY") and Getenv("http_proxy") return the same
+// variable — the display must not list it twice.
+func TestEnvProxyVars_WindowsCaseInsensitiveDedupe(t *testing.T) {
+	winGet := func(k string) string { // case-insensitive like Windows
+		switch strings.ToUpper(k) {
+		case "HTTP_PROXY", "HTTPS_PROXY":
+			return "http://127.0.0.1:7890"
+		}
+		return ""
+	}
+	got := envProxyVarsFrom(winGet)
+	want := map[string]string{
+		"HTTP_PROXY":  "http://127.0.0.1:7890",
+		"HTTPS_PROXY": "http://127.0.0.1:7890",
+	}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("want deduped %v, got %v", want, got)
+	}
+}
+
+// Unix: case-sensitive env — genuinely distinct lowercase twins stay visible.
+func TestEnvProxyVars_UnixDistinctCasesBothShown(t *testing.T) {
+	unixGet := func(k string) string {
+		switch k {
+		case "HTTPS_PROXY":
+			return "http://127.0.0.1:7890"
+		case "https_proxy":
+			return "http://127.0.0.1:9999"
+		}
+		return ""
+	}
+	got := envProxyVarsFrom(unixGet)
+	if got["HTTPS_PROXY"] != "http://127.0.0.1:7890" || got["https_proxy"] != "http://127.0.0.1:9999" {
+		t.Fatalf("distinct twins must both be shown, got %v", got)
 	}
 }
