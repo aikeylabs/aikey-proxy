@@ -103,6 +103,14 @@ type Handler struct {
 	GetUpstreamProxyFn func() string
 	SetUpstreamProxyFn func(url string) error
 
+	// EgressStateFn backs the layered "egress" block in GET /admin/upstream-proxy
+	// (2026-07-08, `aikey env` 逐级显示需求): the daemon-truth view of the egress
+	// decision — explicit URL > daemon process env > OS system proxy — plus the
+	// effective result computed through the SAME resolution path the forwarding
+	// transport uses (display must never diverge from behavior). nil → the GET
+	// response stays the legacy {"url"} shape (older wiring / cluster nodes).
+	EgressStateFn func() EgressState
+
 	// ProbeUpstreamProxyFn tests whether a CANDIDATE egress URL can actually carry
 	// traffic to an AI provider (built with the same buildTransport the live path
 	// uses), WITHOUT persisting it — so the web "Test connectivity" button can verify

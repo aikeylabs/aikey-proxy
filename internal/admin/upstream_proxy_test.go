@@ -141,3 +141,46 @@ func TestUpstreamProxyProbe_NotWired(t *testing.T) {
 		t.Fatalf("status = %d, want 503 when not wired", w.Code)
 	}
 }
+
+// 2026-07-08 layered egress state (`aikey env`): when EgressStateFn is wired
+// the GET response carries the full decision chain; when it isn't, the body
+// must stay the legacy {"url"} shape (no "egress" key) so older consumers and
+// partially-wired hosts are unaffected.
+func TestUpstreamProxyGet_EgressStateWired(t *testing.T) {
+	h := &Handler{
+		GetUpstreamProxyFn: func() string { return "" },
+		EgressStateFn: func() EgressState {
+			return EgressState{
+				SystemSupported: true,
+				SystemHTTPS:     "http://127.0.0.1:7890",
+				EffectiveSource: "system",
+				EffectiveURL:    "http://127.0.0.1:7890",
+			}
+		},
+	}
+	w := httptest.NewRecorder()
+	h.UpstreamProxyGet(w, httptest.NewRequest(http.MethodGet, "/admin/upstream-proxy", nil))
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200", w.Code)
+	}
+	var body upstreamProxyBody
+	if err := json.Unmarshal(w.Body.Bytes(), &body); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if body.Egress == nil {
+		t.Fatal("egress block missing")
+	}
+	if body.Egress.EffectiveSource != "system" || body.Egress.EffectiveURL != "http://127.0.0.1:7890" {
+		t.Fatalf("effective = %q %q, want system http://127.0.0.1:7890",
+			body.Egress.EffectiveSource, body.Egress.EffectiveURL)
+	}
+}
+
+func TestUpstreamProxyGet_NoEgressFnKeepsLegacyShape(t *testing.T) {
+	h := &Handler{GetUpstreamProxyFn: func() string { return "http://127.0.0.1:7890" }}
+	w := httptest.NewRecorder()
+	h.UpstreamProxyGet(w, httptest.NewRequest(http.MethodGet, "/admin/upstream-proxy", nil))
+	if strings.Contains(w.Body.String(), "egress") {
+		t.Fatalf("legacy shape must not contain an egress key, got %s", w.Body.String())
+	}
+}

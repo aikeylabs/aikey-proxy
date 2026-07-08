@@ -13,16 +13,50 @@ import (
 // Empty url means "no egress proxy → direct".
 type upstreamProxyBody struct {
 	URL string `json:"url"`
+	// Egress is the layered decision state (2026-07-08, read side only —
+	// omitted when EgressStateFn isn't wired, keeping the legacy shape for
+	// existing consumers like the web Settings prefill, which reads .url).
+	Egress *EgressState `json:"egress,omitempty"`
+}
+
+// EgressState is the daemon-truth view of the egress proxy decision, layer by
+// layer, consumed by `aikey env`. WHY daemon-truth matters: the daemon's env
+// is the launchd/systemd spawn snapshot — usually NOT the user's shell env —
+// so only the daemon itself can answer "which proxy do my requests use".
+type EgressState struct {
+	// ExplicitURL: layer 1 — the user-set upstream_proxy.url ("" = not set).
+	ExplicitURL string `json:"explicit_url"`
+	// EnvAuthoritative: layer 2 — true when the DAEMON process env carries
+	// proxy vars (then OS detection is bypassed entirely, incl. NO_PROXY).
+	EnvAuthoritative bool `json:"env_authoritative"`
+	// EnvVars: the proxy-relevant vars the daemon sees (credentials redacted).
+	EnvVars map[string]string `json:"env_vars,omitempty"`
+	// System: layer 3 — the live OS system-proxy snapshot.
+	SystemSupported bool   `json:"system_supported"`
+	SystemHTTP      string `json:"system_http,omitempty"`
+	SystemHTTPS     string `json:"system_https,omitempty"`
+	SystemSOCKS     string `json:"system_socks,omitempty"`
+	// Effective: the resolved result for https provider targets, computed via
+	// the SAME ProxyFunc the forwarding transport uses. Source is one of
+	// "explicit" | "env" | "system" | "direct"; URL is "" when direct.
+	EffectiveSource string `json:"effective_source"`
+	EffectiveURL    string `json:"effective_url,omitempty"`
 }
 
 // UpstreamProxyGet serves GET /admin/upstream-proxy — the live egress proxy URL the
-// local web "Settings → Upstream proxy" card reads to prefill. 503 if not wired.
+// local web "Settings → Upstream proxy" card reads to prefill, plus (when wired)
+// the layered egress decision for `aikey env`. 503 if not wired.
 func (h *Handler) UpstreamProxyGet(w http.ResponseWriter, _ *http.Request) {
 	if h.GetUpstreamProxyFn == nil {
 		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "upstream-proxy config not supported"})
 		return
 	}
-	writeJSON(w, http.StatusOK, upstreamProxyBody{URL: h.GetUpstreamProxyFn()})
+	body := upstreamProxyBody{URL: h.GetUpstreamProxyFn()}
+	if h.EgressStateFn != nil {
+		st := h.EgressStateFn()
+		body.Egress = &st
+	}
+	writeJSON(w, http.StatusOK, body)
 }
 
 // UpstreamProxySet serves PUT /admin/upstream-proxy. Validates the URL, persists it

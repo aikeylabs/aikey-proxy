@@ -210,7 +210,10 @@ type LogConfig struct {
 
 // UpstreamProxyConfig configures the outbound proxy used when connecting to AI providers.
 // Supports HTTP, HTTPS, and SOCKS5 proxy URLs.
-// If empty, the standard HTTP_PROXY / HTTPS_PROXY / NO_PROXY environment variables are used.
+// If empty: the standard HTTP_PROXY / HTTPS_PROXY / NO_PROXY environment variables
+// apply when set; otherwise the OS system proxy (macOS/Windows) is auto-detected and
+// followed LIVE (2026-07-08, internal/sysproxy) — a Clash port change / toggle takes
+// effect without restarting the daemon.
 type UpstreamProxyConfig struct {
 	// URL is the proxy endpoint, e.g.:
 	//   http://127.0.0.1:7890   (Clash HTTP mode)

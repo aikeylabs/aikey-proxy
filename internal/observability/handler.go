@@ -36,6 +36,16 @@ const (
 	EventProxyControlPlaneRestartExhausted = "proxy.control_plane.restart_budget_exhausted"
 )
 
+// Egress (upstream proxy) events (2026-07-08): OS system-proxy auto-detection
+// for the direct egress path. A long-lived proxy daemon must FOLLOW the host's
+// system proxy (Clash port change / toggle) instead of freezing the value seen
+// at process start — see internal/sysproxy.
+const (
+	EventProxyEgressSysProxyChanged       = "proxy.egress.sysproxy_changed"
+	EventProxyEgressSysProxyReadFailed    = "proxy.egress.sysproxy_read_failed"
+	EventProxyEgressSysProxyReadRecovered = "proxy.egress.sysproxy_read_recovered"
+)
+
 // SyncRail events (2026-07-03): control-plane sync rail state transitions.
 // A rail keeps serving last-known data and retrying forever in every state —
 // these events are the VISIBILITY the old silent keep-last-known loops lacked

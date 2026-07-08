@@ -12,6 +12,7 @@ import (
 	"os/signal"
 	"path/filepath"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"golang.org/x/term"
@@ -24,6 +25,7 @@ import (
 	proxyruntime "github.com/AiKeyLabs/aikey-proxy/internal/runtime"
 	"github.com/AiKeyLabs/aikey-proxy/internal/server"
 	"github.com/AiKeyLabs/aikey-proxy/internal/supervisor"
+	"github.com/AiKeyLabs/aikey-proxy/internal/sysproxy"
 	"github.com/AiKeyLabs/aikey-proxy/internal/vault"
 	"github.com/AiKeyLabs/aikey-proxy/internal/vkeys"
 
@@ -244,6 +246,23 @@ func main() {
 		"listen", ln.Addr(),
 	)
 
+	// 5a. OS system-proxy watcher (2026-07-08 需求: 代理更新时自动刷新).
+	// Primes synchronously so both the broker client below and the forwarding
+	// transport see the CURRENT system proxy from request #1. Precedence
+	// (user-approved): explicit upstream_proxy.url > process env > OS system
+	// proxy (live). The poll loop is started after egress wiring (below) so
+	// its change callback can reach the live transport + broker swap.
+	sysWatcher := sysproxy.NewWatcher()
+	// effectiveBrokerEgress: static egress URL for the OAuth impersonate
+	// client — explicit config wins; else the system-derived URL ("" = client
+	// falls back to its own env handling, the pre-2026-07-08 behavior).
+	effectiveBrokerEgress := func(cfgURL string) string {
+		if cfgURL != "" {
+			return cfgURL
+		}
+		return sysWatcher.BrokerEgressURL()
+	}
+
 	// 5b. Build OAuth broker (embedded, uses vault stores).
 	//     Reuse the supervisor's vault connection to avoid double-open conflicts.
 	brokerVault := sup.VaultReader()
@@ -265,7 +284,11 @@ func main() {
 		// impersonate proxyURL). Empty url ⇒ "" ⇒ falls back to env (no regression).
 		// Forwarding uses the same cfg.UpstreamProxy.URL via buildTransport below;
 		// control-plane clients deliberately bypass it (internal/httpx.NewDirectClient).
-		broker.SetHTTPClient(broker.NewImpersonateChromeHTTPClient(cfg.UpstreamProxy.URL))
+		// 2026-07-08: "" no longer means "hope the env has it" — the system
+		// proxy watcher supplies the live OS value (launchd-spawned proxies
+		// have no login-shell env), keeping OAuth on the same egress as AI
+		// forwarding.
+		broker.SetHTTPClient(broker.NewImpersonateChromeHTTPClient(effectiveBrokerEgress(cfg.UpstreamProxy.URL)))
 
 		brk := broker.NewEmbedded(tokenStore, accountStore)
 		oauthHandler = broker.NewHandler(brk)
@@ -342,24 +365,40 @@ func main() {
 		defer egressMu.Unlock()
 		return egressURL
 	}
+	// liveTransport tracks the transport currently serving forwarding, so the
+	// system-proxy change callback can flush its idle pool (pooled connections
+	// to a dead Clash port would otherwise be reused until IdleConnTimeout).
+	var liveTransport atomic.Pointer[http.Transport]
+	installTransport := func(t *http.Transport) {
+		liveTransport.Store(t)
+		sup.SetTransport(t)
+	}
 	adminHandler.SetUpstreamProxyFn = func(rawURL string) error {
 		if err := config.PersistUpstreamProxyURL(resolvedPath, rawURL); err != nil {
 			return err
 		}
-		sup.SetTransport(buildTransport(rawURL))
-		broker.SetHTTPClient(broker.NewImpersonateChromeHTTPClient(rawURL))
+		installTransport(buildTransport(rawURL, sysWatcher.ProxyFunc()))
+		broker.SetHTTPClient(broker.NewImpersonateChromeHTTPClient(effectiveBrokerEgress(rawURL)))
 		egressMu.Lock()
 		egressURL = rawURL
 		egressMu.Unlock()
 		return nil
 	}
+	// EgressStateFn (2026-07-08): layered egress decision for `aikey env`.
+	adminHandler.EgressStateFn = func() admin.EgressState {
+		egressMu.Lock()
+		explicit := egressURL
+		egressMu.Unlock()
+		return egressState(explicit, sysWatcher)
+	}
+
 	// ProbeUpstreamProxyFn tests a CANDIDATE egress URL end-to-end (through the same
 	// buildTransport the live path uses) to a provider host, WITHOUT persisting it, so
 	// the web "Test connectivity" button can verify before Save. Any HTTP response
 	// (even 401/404) proves the tunnel carries traffic; a transport error means the
 	// proxy couldn't reach out.
 	adminHandler.ProbeUpstreamProxyFn = func(rawURL string) (int, int64, error) {
-		client := &http.Client{Transport: buildTransport(rawURL), Timeout: 10 * time.Second}
+		client := &http.Client{Transport: buildTransport(rawURL, sysWatcher.ProxyFunc()), Timeout: 10 * time.Second}
 		req, err := http.NewRequest(http.MethodGet, upstreamProbeTarget, nil)
 		if err != nil {
 			return 0, 0, err
@@ -377,7 +416,27 @@ func main() {
 	// Build the outbound transport for upstream providers. Always non-nil now:
 	// even the direct path needs MaxIdleConnsPerHost tuning (see buildTransport).
 	dataHandler := sup.Handler()
-	sup.SetTransport(buildTransport(cfg.UpstreamProxy.URL))
+	installTransport(buildTransport(cfg.UpstreamProxy.URL, sysWatcher.ProxyFunc()))
+
+	// Start the system-proxy poll loop (inert when env config is authoritative,
+	// on unsupported platforms, and — via the explicit-egress guard below —
+	// effectively when upstream_proxy.url is set). On change: flush the idle
+	// pool so no request reuses a connection through the OLD proxy, and rebuild
+	// the OAuth client (it takes a static URL, not a per-request func).
+	observability.GoSafe("sysproxy.watch", observability.Isolated, func() {
+		sysWatcher.Run(context.Background(), func(_, _ sysproxy.Snapshot) {
+			egressMu.Lock()
+			explicit := egressURL != ""
+			egressMu.Unlock()
+			if explicit {
+				return // user-configured egress outranks the system proxy
+			}
+			if t := liveTransport.Load(); t != nil {
+				t.CloseIdleConnections()
+			}
+			broker.SetHTTPClient(broker.NewImpersonateChromeHTTPClient(effectiveBrokerEgress("")))
+		})
+	})
 
 	// 7. Build and start the HTTP server. Only non-nil registrars are passed
 	// (server.New does not nil-guard; oauthHandler/poolHandler are nil when the
@@ -469,9 +528,13 @@ func getVaultPassword() (string, error) {
 
 // buildTransport returns the outbound http.Transport for upstream providers.
 //
-// Direct (no upstream_proxy): a Clone of http.DefaultTransport — preserving
-// ProxyFromEnvironment (HTTP_PROXY / HTTPS_PROXY / NO_PROXY) and HTTP/2 — with
-// MaxIdleConnsPerHost raised. Go's default of 2 idle conns per host means that
+// Direct (no upstream_proxy): a Clone of http.DefaultTransport — with Proxy
+// swapped to sysProxy (2026-07-08): the sysproxy.Watcher's per-request
+// resolver, which preserves env-var behavior (HTTP_PROXY / HTTPS_PROXY /
+// NO_PROXY) when the env is set and otherwise follows the LIVE OS system
+// proxy, so a Clash port change / toggle applies without a daemon restart.
+// HTTP/2 is preserved, with MaxIdleConnsPerHost raised. Go's default of 2
+// idle conns per host means that
 // under >2 concurrent requests to one provider, finished connections are
 // dropped and the next request pays a fresh TCP+TLS handshake. HTTP/2
 // multiplexing masks this against h2 upstreams, but HTTP/1.1 fallbacks and
@@ -499,22 +562,67 @@ func cloneDefaultTransport() *http.Transport {
 // carries traffic to the AI world.
 const upstreamProbeTarget = "https://api.anthropic.com/"
 
-func buildTransport(proxyURL string) *http.Transport {
+// egressState assembles the layered egress decision for GET /admin/upstream-proxy
+// (`aikey env`, 2026-07-08 逐级显示需求). The effective value is computed through
+// watcher.ProxyFunc() — the SAME resolver the forwarding transport runs per
+// request — so what the CLI displays can never diverge from what traffic does.
+// Pulled out of main() so the decision logic sits behind a fence test
+// (egress_integration_test.go).
+func egressState(explicit string, watcher *sysproxy.Watcher) admin.EgressState {
+	snap := watcher.Current()
+	st := admin.EgressState{
+		ExplicitURL:      explicit,
+		EnvAuthoritative: watcher.EnvAuthoritative(),
+		EnvVars:          sysproxy.EnvProxyVars(),
+		SystemSupported:  watcher.Supported(),
+		SystemHTTP:       snap.HTTP,
+		SystemHTTPS:      snap.HTTPS,
+		SystemSOCKS:      snap.SOCKS,
+	}
+	if explicit != "" {
+		st.EffectiveSource, st.EffectiveURL = "explicit", explicit
+		return st
+	}
+	// Resolve exactly like the transport would for a provider target.
+	// Request object only — nothing is dialed.
+	req, err := http.NewRequest(http.MethodGet, upstreamProbeTarget, nil)
+	if err != nil {
+		st.EffectiveSource = "direct"
+		return st
+	}
+	u, perr := watcher.ProxyFunc()(req)
+	switch {
+	case perr != nil || u == nil:
+		st.EffectiveSource = "direct"
+	case st.EnvAuthoritative:
+		st.EffectiveSource, st.EffectiveURL = "env", u.Redacted()
+	default:
+		st.EffectiveSource, st.EffectiveURL = "system", u.Redacted()
+	}
+	return st
+}
+
+func buildTransport(proxyURL string, sysProxy func(*http.Request) (*url.URL, error)) *http.Transport {
 	// All providers resolve to a handful of hosts (api.anthropic.com etc.),
 	// so a generous per-host idle pool is bounded in practice by MaxIdleConns.
 	const perHost = 100
 
-	if proxyURL == "" {
+	direct := func() *http.Transport {
 		t := cloneDefaultTransport()
+		if sysProxy != nil {
+			t.Proxy = sysProxy
+		}
 		t.MaxIdleConnsPerHost = perHost
 		return t
 	}
+
+	if proxyURL == "" {
+		return direct()
+	}
 	parsed, err := url.Parse(proxyURL)
 	if err != nil {
-		slog.Warn("upstream_proxy.url is invalid, falling back to env vars", "url", proxyURL, "error", err)
-		t := cloneDefaultTransport()
-		t.MaxIdleConnsPerHost = perHost
-		return t
+		slog.Warn("upstream_proxy.url is invalid, falling back to env/system proxy", "url", proxyURL, "error", err)
+		return direct()
 	}
 	t := &http.Transport{
 		Proxy:               http.ProxyURL(parsed),
