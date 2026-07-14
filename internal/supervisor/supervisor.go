@@ -1128,8 +1128,29 @@ func (s *Supervisor) GetKeyCheckTargets() ([]admin.KeyCheckTarget, error) {
 		return nil, nil
 	}
 	cfg, err := gen.vault.GetActiveKeyConfig()
-	if err != nil || cfg == nil {
-		return nil, nil
+	if err != nil {
+		// A vault READ FAILURE is not "there are no keys". Returning (nil, nil)
+		// here made /health/keys answer "no active key configured" while the
+		// vault was actually unreadable — a broken pipeline that looks healthy,
+		// which health-signal-surface exists to forbid. Worse, an operator
+		// reading that could conclude the proxy has no keys and re-import /
+		// re-provision a vault that is perfectly fine.
+		//
+		// This outer guard also silently defeated the inner loop below, which was
+		// deliberately fixed to WARN on a per-provider resolve failure: none of
+		// that care could ever run once the config read itself was swallowed.
+		//
+		// HealthKeys already distinguishes this case ("key resolution failed: …",
+		// still HTTP 200 per contract) from len==0 ("no active key configured") —
+		// it just never received the error to distinguish. (2026-07-13)
+		slog.Error("active key config read failed for health probe",
+			"event.name", "usage.health.key_config_read_failed",
+			"error.code", "KEY_CONFIG_READ_FAILED",
+			"error", err.Error())
+		return nil, fmt.Errorf("read active key config: %w", err)
+	}
+	if cfg == nil {
+		return nil, nil // genuinely no active key — the documented empty case
 	}
 
 	var targets []admin.KeyCheckTarget
