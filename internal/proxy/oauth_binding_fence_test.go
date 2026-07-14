@@ -336,8 +336,16 @@ func TestFence_OAuthBinding_OpenAICodexBaseURLOverride(t *testing.T) {
 	transport := &capturingTransport{}
 	p.SetTransport(transport)
 
-	req := httptest.NewRequest(http.MethodPost, "/openai/v1/chat/completions",
-		strings.NewReader(`{"model":"gpt-4o","messages":[{"role":"user","content":"hi"}]}`))
+	// Codex OAuth speaks the RESPONSES API — that is the whole reason its upstream
+	// is chatgpt.com/backend-api/codex rather than api.openai.com/v1. This fence
+	// originally drove the request with /chat/completions, which silently encoded
+	// the 2026-07-13 bug (a Chat-Completions client's path appended to an upstream
+	// that doesn't serve it → ChatGPT's edge replies "invalid x-api-key"). The
+	// dialect gate now rejects that shape before forwarding, so the fence drives
+	// the dialect codex actually speaks; its ASSERTION (the Codex base-URL override
+	// must beat the team key's BaseURL) is unchanged and still the point.
+	req := httptest.NewRequest(http.MethodPost, "/openai/v1/responses",
+		strings.NewReader(`{"model":"gpt-4o","input":"hi"}`))
 	req.Header.Set("Content-Type", "application/json")
 	w := httptest.NewRecorder()
 	p.Handle(w, req)

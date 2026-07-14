@@ -231,6 +231,42 @@ func resolveOAuthUpstream(canonicalCode string, r *http.Request) (baseURL string
 	}
 }
 
+// oauthUpstreamRejectsPath reports whether an OAuth-credential request can NOT
+// be served by that provider's OAuth upstream, and why (2026-07-13, user report:
+// codex works, opencode dies with a bogus "invalid x-api-key").
+//
+// Why this exists: codex is the one provider whose OAuth upstream differs from
+// its API-key upstream (see resolveOAuthUpstream) — ChatGPT accounts are served
+// by chatgpt.com/backend-api/codex, which speaks ONLY the Responses API. The
+// request path is appended verbatim to that base, so a /chat/completions client
+// (opencode, ai-sdk, LangChain, …) ended up calling a route that doesn't exist
+// there; ChatGPT's edge answered with its own 4xx whose body says "invalid
+// x-api-key". Nothing was wrong with the key — but the message sent users
+// debugging credentials for hours. The honest failure is: this credential's
+// upstream doesn't serve this dialect.
+//
+// Deliberately narrow: only the openai-OAuth lane is constrained. Every other
+// provider's OAuth upstream == its API-key upstream, so their clients are free
+// to speak whatever the provider serves. API-key credentials of ANY provider are
+// untouched (they route to api.openai.com/v1 & friends, which do serve
+// /chat/completions) — this guard is only reached from the OAuth branches.
+//
+// Empty reason = allowed.
+func oauthUpstreamRejectsPath(canonicalCode, urlPath string) string {
+	if canonicalCode != "openai" {
+		return ""
+	}
+	// The Responses API is the only dialect chatgpt.com/backend-api/codex serves.
+	// Match on suffix so both /v1/responses (legacy lane) and /responses (group
+	// lane, already stripped) pass.
+	if strings.HasSuffix(strings.TrimSuffix(urlPath, "/"), "/responses") {
+		return ""
+	}
+	return "This key is backed by a ChatGPT OAuth account, whose upstream only serves the Responses API (/responses). " +
+		"The client called " + urlPath + " (Chat Completions). Use an API-key credential for this client, " +
+		"or use a Responses-API client such as codex."
+}
+
 func providerDefaultBaseURL(providerCode string) string {
 	switch strings.ToLower(providerCode) {
 	case "anthropic", "claude":

@@ -121,6 +121,21 @@ func (p *Proxy) handleOauthGroupRoute(
 			rc.BaseURL = res.BaseURL
 		}
 	default: // oauth_account
+		// Dialect gate (2026-07-13): codex OAuth serves ONLY the Responses API.
+		// Without this, a /chat/completions client's path got appended to
+		// chatgpt.com/backend-api/codex and ChatGPT's edge answered with a
+		// misleading "invalid x-api-key". Fail fast with the real reason.
+		if reason := oauthUpstreamRejectsPath(canonicalCode, r.URL.Path); reason != "" {
+			logger.Warn("group route: OAuth upstream does not serve this endpoint",
+				"event.name", observability.EventProxyRequestDialectUnsupported,
+				"error.code", observability.ErrCodeOAuthResponsesOnly,
+				"error.message", reason,
+				"url.path", r.URL.Path,
+			)
+			writeJSONError(w, http.StatusBadRequest, "invalid_request_error",
+				observability.ErrCodeOAuthResponsesOnly, reason)
+			return
+		}
 		// Per-provider OAuth upstream (base URL + any provider setup like codex's
 		// deferred model capture) via the shared resolver — same source as the
 		// legacy /v1 path. Headers injected here; the Director sees the sentinel

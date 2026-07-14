@@ -208,6 +208,27 @@ func (p *Proxy) ResolveBindingCredential(
 			}
 		}
 
+		// Dialect gate (2026-07-13): codex OAuth serves ONLY the Responses API.
+		// Without this, a /chat/completions client's path got appended to
+		// chatgpt.com/backend-api/codex and ChatGPT's edge answered with a
+		// misleading "invalid x-api-key" — users debugged the key for hours.
+		// Same predicate the group lane uses (single source of truth).
+		if reason := oauthUpstreamRejectsPath(canonicalCode, r.URL.Path); reason != "" {
+			logger.Warn("oauth: upstream does not serve this endpoint",
+				"event.name", observability.EventProxyRequestDialectUnsupported,
+				"error.code", observability.ErrCodeOAuthResponsesOnly,
+				"error.message", reason,
+				"url.path", r.URL.Path,
+				"provider", canonicalCode,
+			)
+			return nil, &apppipe.BindingResolveError{
+				StatusCode: http.StatusBadRequest,
+				ErrorType:  "invalid_request_error",
+				ErrorCode:  observability.ErrCodeOAuthResponsesOnly,
+				Message:    reason,
+			}
+		}
+
 		// Per-provider OAuth upstream (base URL + any provider setup) via the shared
 		// resolver — same source as the group route. Codex's chatgpt.com override +
 		// deferred model capture live in resolveOAuthUpstream; pinned by

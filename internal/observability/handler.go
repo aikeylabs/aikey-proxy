@@ -83,6 +83,11 @@ const (
 	EventProxyRequestSlow          = "proxy.request.slow"
 	EventProxyRequestCompleted     = "proxy.request.completed"
 	EventProxyRequestQuotaExceeded = "proxy.request.quota_exceeded"
+	// EventProxyRequestDialectUnsupported (2026-07-13): the request's endpoint is
+	// not served by the credential's OAuth upstream (codex OAuth = Responses API
+	// only). Rejected locally with ErrCodeOAuthResponsesOnly instead of letting
+	// ChatGPT's edge answer with a misleading "invalid x-api-key".
+	EventProxyRequestDialectUnsupported = "proxy.request.dialect_unsupported"
 	// EventProxyQuotaModelUnpriced: a completed request's model has no entry in
 	// the edge price summary (D-U8/P7), so its usd was NOT counted locally — the
 	// token quota floor backstops it and the server baseline catches up on
@@ -161,6 +166,15 @@ const (
 	// ErrCodeGroupPoolFull (§5.5): 429 when the seat is blocked — every pool account
 	// is at the per-account user cap; the user waits or the admin adds accounts.
 	ErrCodeGroupPoolFull = "GROUP_POOL_FULL"
+	// ErrCodeOAuthResponsesOnly (2026-07-13): the request targets an endpoint the
+	// credential's OAuth upstream doesn't serve. Codex OAuth (ChatGPT accounts)
+	// speaks ONLY the Responses API at chatgpt.com/backend-api/codex — a
+	// /chat/completions client (opencode, ai-sdk, LangChain, …) pointed at an
+	// OAuth-backed openai key used to have its path appended to that base,
+	// producing a 4xx from ChatGPT's edge whose body ("invalid x-api-key") sent
+	// users hunting a key problem that did not exist. Fail fast with the real
+	// reason + the way out (use an API-key credential for this client). 400.
+	ErrCodeOAuthResponsesOnly = "OAUTH_RESPONSES_ONLY"
 )
 
 // ---- HealthSnapshot ----
