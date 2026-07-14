@@ -45,11 +45,28 @@ func extractFilterableContent(body []byte) (pieces []contentPiece, parsed map[st
 	// system inside messages[] instead, so this is simply absent there.
 	collectContentField(m, "system", &pieces)
 
-	// messages[].content for both Anthropic and OpenAI shapes.
+	// messages[].content for both Anthropic and OpenAI chat shapes.
 	if msgs, isArr := m["messages"].([]any); isArr {
 		for _, mi := range msgs {
 			if msg, isObj := mi.(map[string]any); isObj {
 				collectContentField(msg, "content", &pieces)
+			}
+		}
+	}
+
+	// OpenAI Responses API (codex): content lives in input[] / input string,
+	// system in `instructions` (kept in scope here as the full extractor mirrors
+	// system for masking symmetry). See extractUserContent for the live path.
+	collectContentField(m, "instructions", &pieces)
+	switch in := m["input"].(type) {
+	case string:
+		if in != "" {
+			pieces = append(pieces, contentPiece{text: in, setText: func(s string) { m["input"] = s }})
+		}
+	case []any:
+		for _, ii := range in {
+			if item, isObj := ii.(map[string]any); isObj {
+				collectContentField(item, "content", &pieces)
 			}
 		}
 	}
@@ -82,11 +99,40 @@ func extractUserContent(body []byte) (pieces []contentPiece, parsed map[string]a
 	if err := json.Unmarshal(body, &m); err != nil {
 		return nil, nil, false
 	}
-	msgs, isArr := m["messages"].([]any)
-	if !isArr {
-		return nil, m, false
+	if msgs, isArr := m["messages"].([]any); isArr {
+		collectUserTurns(msgs, &pieces)
+		return pieces, m, true
 	}
-	for _, mi := range msgs {
+	// OpenAI Responses API (codex, /v1/responses): the request carries no
+	// messages[]; user turns live in input[] and the system prompt in
+	// `instructions` (skipped like `system`). input can be a bare string
+	// (single-turn shorthand) or an item array whose message items mirror
+	// chat messages but with input_text content parts. Without this branch
+	// the whole request was "not filterable" → forwarded UNFILTERED, letting
+	// codex prompts bypass the compliance scan while conversation audit (a
+	// separate, Responses-aware path) still captured them (live incident
+	// 2026-07-08; same wire-format class as the audit R20 fix).
+	switch in := m["input"].(type) {
+	case string:
+		if in != "" {
+			pieces = append(pieces, contentPiece{
+				text:    in,
+				setText: func(s string) { m["input"] = s },
+			})
+		}
+		return pieces, m, true
+	case []any:
+		collectUserTurns(in, &pieces)
+		return pieces, m, true
+	}
+	return nil, m, false
+}
+
+// collectUserTurns scans a chat-style item array (Anthropic/OpenAI messages[]
+// or Responses API input[]) for USER-role text, applying the single skip policy
+// (model responses / admin instructions / tool output are never user input).
+func collectUserTurns(items []any, out *[]contentPiece) {
+	for _, mi := range items {
 		msg, isObj := mi.(map[string]any)
 		if !isObj {
 			continue
@@ -99,9 +145,8 @@ func extractUserContent(body []byte) (pieces []contentPiece, parsed map[string]a
 			// Anthropic + OpenAI-family (Codex/Kimi) + OpenClaw roles uniformly.
 			continue
 		}
-		collectContentField(msg, "content", &pieces)
+		collectContentField(msg, "content", out)
 	}
-	return pieces, m, true
 }
 
 // extractLatestUserContent extracts ONLY the latest user turn's text — the NEW
@@ -165,7 +210,13 @@ func collectContentField(parent map[string]any, key string, out *[]contentPiece)
 			if !isObj {
 				continue
 			}
-			if t, _ := block["type"].(string); t != "text" {
+			// "text" = Anthropic/OpenAI chat content block; "input_text" = OpenAI
+			// Responses API user content part (codex). Both carry human text in
+			// the same `text` field. Non-text blocks (image / input_image /
+			// tool_use / output_text=model reply) are skipped.
+			switch t, _ := block["type"].(string); t {
+			case "text", "input_text":
+			default:
 				continue
 			}
 			txt, isStr := block["text"].(string)

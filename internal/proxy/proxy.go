@@ -24,6 +24,13 @@ type VaultGetter interface {
 	GetSecret(alias string) (string, error)
 }
 
+// groupKeyProvider exposes the vault's derived key so the oauth-group resolver
+// (N8) can decrypt per-account group material at request time. *vault.Reader
+// implements it; an injected mock that doesn't disables group routing (safe).
+type groupKeyProvider interface {
+	DerivedKey() []byte
+}
+
 // ActiveKeyReader extends VaultGetter with active-key lookups used by
 // path-prefix routing (/anthropic/v1/..., /openai/v1/...).
 // Implemented by *vault.Reader when the vault supports managed and personal keys.
@@ -64,12 +71,54 @@ type OAuthCredential struct {
 // Proxy is the core reverse proxy that handles virtual key resolution
 // and request forwarding.
 type Proxy struct {
-	transport    http.RoundTripper     // nil → http.DefaultTransport (reads env vars)
+	// transport is the outbound RoundTripper for AI provider forwarding, held in an
+	// atomic.Pointer so the egress upstream-proxy URL can be HOT-SWAPPED at runtime
+	// (Settings → Upstream proxy, 2026-06-30) without racing the per-request read in
+	// forward_and_resolve. Nil box / nil rt → http.DefaultTransport (honors
+	// HTTP_PROXY env). Read via currentTransport, written via SetTransport.
+	transport    atomic.Pointer[transportBox]
 	activeReader ActiveKeyReader       // non-nil when vault implements ActiveKeyReader
 	appVault     apppipe.VaultReader   // non-nil when vault implements the App pipeline read surface (Phase 4)
 	probeVault   probepipe.VaultReader // non-nil when vault implements the Probe pipeline read surface (mode C, SPEC 2026-05-23)
 	broker       OAuthBroker           // OAuth credential provider (nil = OAuth not available)
 	vault        VaultGetter
+	// groupKey exposes the vault derived key for oauth-group material decryption
+	// (N8). nil when the injected vault doesn't implement DerivedKey() (tests) →
+	// group routing degrades to GROUP_KEY_UNAVAILABLE rather than panicking.
+	groupKey groupKeyProvider
+	// poolCooldown holds per-account reactive fallback state (N8c): an account
+	// whose upstream failed (401 / exhaustion-429) is skipped by the resolver
+	// until its cooldown lapses. Always non-nil (set in New); the request path
+	// only consults it for group routes.
+	poolCooldown *poolCooldownStore
+	// signalReporter ships parsed unified-* utilization to master (I5, best-effort,
+	// off the forward hot path). nil = feature off. Set via EnableSignalReporting.
+	signalReporter *signalReporter
+	// routingOverrides is the allocation engine's seat→account routing-override
+	// cache (I-side §6.5). Shared across generations, polled by the supervisor; the
+	// group-route hot path reads it to redirect a seat off an unhealthy default.
+	// nil-safe → empty/unset means every request uses the local seatassign pick.
+	// Set via SetRoutingOverrides. See routing_override.go.
+	routingOverrides *RoutingOverrideCache
+	// poolObservedResets holds the latest upstream window-reset epoch observed per
+	// pool account (Path Z, 通道3 §14). The N7c pull piggybacks it to master so it
+	// re-rolls window_max_util_pct per window. Always non-nil; only written on
+	// group-route responses.
+	poolObservedResets *poolResetStore
+	// consoleURL is Config.ConsoleURL — the co-installed local console base used
+	// to assemble the member-login URL in OAUTH_GROUP_MEMBER_LOGIN_REQUIRED
+	// responses (20260703 update). "" ⇒ URL-less fallback wording. Set once via
+	// SetConsoleURL before serving; not hot-swapped.
+	consoleURL string
+	// groupLoginState is the bypass ~/.aikey/run/group-login-required.json store
+	// consumed by `aikey statusline`. Always non-nil (set in New); written on
+	// login-required 401s, cleared on the next successful group resolve.
+	groupLoginState *groupLoginStateStore
+	// routingRailHealth probes the routing_override SyncRail state (SyncRail
+	// §5.4, 2026-07-03): stale/offline → the login-required 401 wording says
+	// "routing sync unreachable" instead of a possibly-misdirected sign-in
+	// prompt (the incident shape: local pick ≠ engine assignment). nil = ok.
+	routingRailHealth func() (state string, failingSeconds int64)
 	// filterHook is the P4 filter dispatcher — a generic apphook.Hook
 	// (ai-compliance-detector / DLP / etc.) that inspects the inbound
 	// request body before forwarding. Nil = no filter (the common default
@@ -186,10 +235,24 @@ type Proxy struct {
 // Must be called before serving requests. A nil value restores the default
 // behavior (http.DefaultTransport, which honors HTTP_PROXY / HTTPS_PROXY env vars).
 func (p *Proxy) SetTransport(t http.RoundTripper) {
-	p.transport = t
+	p.transport.Store(&transportBox{rt: t})
 	if t != nil {
 		slog.Info("proxy: custom transport set")
 	}
+}
+
+// transportBox boxes the RoundTripper so it can live in an atomic.Pointer (atomics
+// can't hold an interface value directly). A nil rt means "use the default".
+type transportBox struct{ rt http.RoundTripper }
+
+// currentTransport returns the live RoundTripper (nil → caller falls back to the
+// default). Lock-free atomic read: safe on the hot path concurrently with a
+// SetTransport hot-swap.
+func (p *Proxy) currentTransport() http.RoundTripper {
+	if b := p.transport.Load(); b != nil {
+		return b.rt
+	}
+	return nil
 }
 
 // New creates a new Proxy. ctx is the proxy lifecycle context; canceling it
@@ -207,6 +270,9 @@ func New(v VaultGetter, reg *vkeys.Registry, prov *provider.Registry, coll *even
 		VerySlowRequestMs:  10000,
 		UpstreamTimeout:    defaultUpstreamTimeout,
 		appHealthCache:     apppipe.NewHealthCache(),
+		poolCooldown:       newPoolCooldownStore(),
+		poolObservedResets: newPoolResetStore(),
+		groupLoginState:    newGroupLoginStateStore(),
 	}
 	if ar, ok := v.(ActiveKeyReader); ok {
 		p.activeReader = ar
@@ -224,6 +290,14 @@ func New(v VaultGetter, reg *vkeys.Registry, prov *provider.Registry, coll *even
 	// in production; tests can swap via SetProbeVault.
 	if pv, ok := v.(probepipe.VaultReader); ok {
 		p.probeVault = pv
+	}
+	// Oauth-group routing (N8) decrypts per-account group material at request
+	// time with the vault derived key. *vault.Reader exposes DerivedKey(); a
+	// mock that doesn't simply leaves p.groupKey nil → group routing degrades
+	// (GROUP_KEY_UNAVAILABLE) instead of panicking. Tests can swap via
+	// SetGroupKeyProvider.
+	if kp, ok := v.(groupKeyProvider); ok {
+		p.groupKey = kp
 	}
 	return p
 }
@@ -251,12 +325,38 @@ func (p *Proxy) SetProbeVault(pv probepipe.VaultReader) {
 	p.probeVault = pv
 }
 
+// SetGroupKeyProvider injects the vault derived-key accessor for oauth-group
+// material decryption (N8). Mirrors SetProbeVault — auto-wired by New(...) when
+// the VaultGetter argument implements DerivedKey(); tests that exercise group
+// routing inject it explicitly.
+func (p *Proxy) SetGroupKeyProvider(kp groupKeyProvider) {
+	p.groupKey = kp
+}
+
 // SetQuotaEnforcer injects the Phase 2 token-quota gate (Stage 3). Wired by the
 // supervisor from the per-process snapshot+counter. Safe to leave unset — a nil
 // enforcer is a no-op (no enforcement), which is the correct behavior for
 // editions/tests that don't run quota.
 func (p *Proxy) SetQuotaEnforcer(e *quota.Enforcer) {
 	p.quota = e
+}
+
+// SetConsoleURL injects Config.ConsoleURL (20260703 update) — the co-installed
+// local console base used to assemble the member-login URL in group
+// login-required responses. Safe to leave unset: "" degrades to URL-less
+// wording (cluster nodes / server-side proxies have no local console).
+func (p *Proxy) SetConsoleURL(u string) {
+	p.consoleURL = u
+}
+
+// SetRoutingRailHealth injects the supervisor's routing_override SyncRail
+// health probe (SyncRail §5.4, 2026-07-03). respondLoginRequired consults it:
+// when the assignment rail is stale/offline the local ranked pick may
+// contradict the engine (the 2026-07-03 incident shape), so the 401 must say
+// "routing sync unreachable" instead of directing the member to sign into a
+// possibly-wrong account. nil (tests / framework off) → treated as healthy.
+func (p *Proxy) SetRoutingRailHealth(fn func() (state string, failingSeconds int64)) {
+	p.routingRailHealth = fn
 }
 
 // AppHealthSnapshot returns the in-process record of the most recent
@@ -273,6 +373,32 @@ func (p *Proxy) AppHealthSnapshot() []apppipe.AppHealth {
 		return []apppipe.AppHealth{}
 	}
 	return p.appHealthCache.Snapshot()
+}
+
+// PoolCooldownSnapshot returns the oauth-group accounts currently in reactive
+// cooldown (account_id → seconds remaining) for the admin /status health surface
+// (N9 组路由健康). nil when nothing is cooling. The cmd layer wraps this into the
+// admin DTO so the operator monitoring the first pool batch can see which
+// accounts are being routed around.
+func (p *Proxy) PoolCooldownSnapshot() map[string]int {
+	return p.poolCooldown.snapshot()
+}
+
+// CooldownSkipSet returns the EXACT set of accounts the hot-path group resolver skips
+// right now (poolCooldown.skipSet) so the supervisor's is_current_routed stamp can be
+// computed with the SAME cooldown view the forward path uses — closing the display↔actual
+// gap for cooling-driven switches (2026-07-01). Same function as group_serve.go's resolver
+// call, so the two can't diverge in which accounts are considered cooled.
+func (p *Proxy) CooldownSkipSet() map[string]bool {
+	return p.poolCooldown.skipSet()
+}
+
+// ObservedResetsSnapshot returns the latest upstream window-reset epoch observed
+// per pool account (account_id → epoch). The supervisor's N7c pull piggybacks
+// it to master (Path Z) so master re-rolls window_max_util_pct per window. nil
+// when nothing observed yet.
+func (p *Proxy) ObservedResetsSnapshot() map[string]int64 {
+	return p.poolObservedResets.snapshot()
 }
 
 // recordAppHealth is the proxy-internal hook called from handleAppPipeline
@@ -377,6 +503,23 @@ func (p *Proxy) SetReporter(r *events.Reporter, instanceID, clientVersion, confi
 	p.proxyConfigVersion = configVersion
 	p.loadedControlSeq = loadedControlSeq
 	p.loggedInAccountID = loggedInAccountID
+}
+
+// EnableSignalReporting wires the allocation-engine util signal reporter (I5): the
+// proxy parses upstream unified-* utilization and best-effort POSTs it to master's
+// /accounts/me/signals, authed with the same team account-JWT the group-runtime
+// poll uses. nil controlURL/bearer → feature stays off (newSignalReporter returns nil).
+func (p *Proxy) EnableSignalReporting(controlURL string, bearer func(ctx context.Context) (string, error)) {
+	p.signalReporter = newSignalReporter(controlURL, bearer, slog.Default())
+}
+
+// StopSignalReporting stops the signal reporter's upload loop (idempotent,
+// nil-safe). Called from generation.close() so the per-generation reporter's
+// goroutine + ticker don't leak across reloads.
+func (p *Proxy) StopSignalReporting() {
+	if p.signalReporter != nil {
+		_ = p.signalReporter.Close()
+	}
 }
 
 // SetWAL attaches a local WAL writer for offline-mode usage events.

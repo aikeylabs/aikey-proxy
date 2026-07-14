@@ -42,6 +42,14 @@ type UsageEvent struct {
 	AppKeyID     string `json:"app_key_id,omitempty"`
 	ErrorType    string `json:"error_type,omitempty"`
 	VirtualKeyID string `json:"virtual_key_id"`
+	// AccountID — the REAL upstream account that actually served this request.
+	// For oauth_group (pool) routing this follows fallback: if the proxy
+	// switched A→B (quota/401), this is B (the account that sent upstream),
+	// NOT the VK's nominal binding — so LOCAL audit can answer "which account
+	// served this request" without querying the collector/ODS. The user
+	// attribution (VirtualKeyID) is stable across the switch; only this
+	// account dimension changes. Empty for legacy single-binding paths.
+	AccountID string `json:"account_id,omitempty"`
 	// App pipeline audit fields (Phase 4, 主方案 §5.3 主聚合).
 	// Empty / zero for legacy paths.
 	AppSlug        string `json:"app_slug,omitempty"`

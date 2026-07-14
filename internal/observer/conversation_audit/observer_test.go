@@ -35,6 +35,7 @@ func driveAnthropicTurn(o *Observer, traceID string, withStop bool) {
 		TraceID:        traceID,
 		OrgID:          "org-1",
 		OwnerAccountID: "acct-7",
+		SeatID:         "seat-3",
 		SessionID:      "sess-9",
 		ProviderID:     "anthropic",
 		StartedAt:      time.Unix(1_700_000_000, 0),
@@ -80,6 +81,11 @@ func TestObserver_HappyPathAssemblesRecord(t *testing.T) {
 	}
 	if r.OrgID != "org-1" || r.OwnerAccountID != "acct-7" || r.SessionID != "sess-9" {
 		t.Fatalf("attribution: org=%q owner=%q session=%q", r.OrgID, r.OwnerAccountID, r.SessionID)
+	}
+	// Seat dimension (2026-07-07): must ride along, or shared-pool-VK turns
+	// re-attribute to the VK owner and file under a stranger seat row.
+	if r.SeatID != "seat-3" {
+		t.Fatalf("seat_id=%q want seat-3", r.SeatID)
 	}
 	if r.Model != "claude-x" || r.ProviderCode != "anthropic" {
 		t.Fatalf("model=%q provider=%q", r.Model, r.ProviderCode)

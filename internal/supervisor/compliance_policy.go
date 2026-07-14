@@ -25,6 +25,7 @@ import (
 	"os"
 	"time"
 
+	"github.com/AiKeyLabs/aikey-proxy/internal/httpx"
 	"github.com/AiKeyLabs/aikey-proxy/internal/vault"
 )
 
@@ -36,7 +37,7 @@ const (
 	compliancePollInterval    = 60 * time.Second
 )
 
-var complianceHTTPClient = &http.Client{Timeout: 10 * time.Second}
+var complianceHTTPClient = httpx.NewSwappableDirect(10 * time.Second)
 
 // resolveTeamOrgID returns the org this node's team mandates follow — BOTH the
 // compliance master policy (this file) AND the conversation-audit capture switch
@@ -129,7 +130,7 @@ func fetchComplianceMasterPolicy(ctx context.Context, masterURL, orgID string) (
 	if err != nil {
 		return false, false
 	}
-	resp, err := complianceHTTPClient.Do(req)
+	resp, err := complianceHTTPClient.Get().Do(req)
 	if err != nil {
 		return false, false
 	}

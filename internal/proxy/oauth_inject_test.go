@@ -71,7 +71,7 @@ func TestOAuthInject_DispatchesByProvider(t *testing.T) {
 		wantValue   string
 	}{
 		{"anthropic", "Bearer oauth-tok", "anthropic-version", "2023-06-01"},
-		{"openai", "Bearer oauth-tok", "originator", "opencode"},
+		{"openai", "Bearer oauth-tok", "originator", "codex_cli_rs"},
 		{"kimi", "Bearer oauth-tok", "X-Msh-Platform", "kimi_cli"},
 		{"moonshot", "Bearer oauth-tok", "X-Msh-Platform", "kimi_cli"},
 		{"unknown", "Bearer oauth-tok", "", ""},
@@ -275,19 +275,32 @@ func TestInjectClaudeOAuth_MetadataUserID(t *testing.T) {
 // --- injectCodexOAuth ---
 
 func TestInjectCodexOAuth(t *testing.T) {
-	t.Run("sets required headers", func(t *testing.T) {
+	t.Run("sets required headers (ExternalID → ChatGPT-Account-Id)", func(t *testing.T) {
 		req := httptest.NewRequest("POST", "/responses", nil)
-		cred := &OAuthCredential{AccessToken: "codex-tok", AccountID: "acct-456"}
+		// R34 fix (2026-07-04): the real chatgpt_account_id is ExternalID (broker
+		// extracts it from the token JWT). AccountID is OUR internal id — on the
+		// pool path it's the pool's internal account id, WRONG to send upstream.
+		cred := &OAuthCredential{AccessToken: "codex-tok", ExternalID: "chatgpt-uuid-789", AccountID: "internal-pool-id"}
 		injectCodexOAuth(req, cred)
 
 		if got := req.Header.Get("Authorization"); got != "Bearer codex-tok" {
 			t.Errorf("Authorization = %q", got)
 		}
-		if got := req.Header.Get("originator"); got != "opencode" {
-			t.Errorf("originator = %q, want %q", got, "opencode")
+		if got := req.Header.Get("originator"); got != "codex_cli_rs" {
+			t.Errorf("originator = %q, want %q", got, "codex_cli_rs")
 		}
+		if got := req.Header.Get("ChatGPT-Account-Id"); got != "chatgpt-uuid-789" {
+			t.Errorf("ChatGPT-Account-Id = %q, want ExternalID %q (not internal AccountID)", got, "chatgpt-uuid-789")
+		}
+	})
+
+	t.Run("falls back to AccountID when ExternalID empty (legacy vault rows)", func(t *testing.T) {
+		req := httptest.NewRequest("POST", "/responses", nil)
+		cred := &OAuthCredential{AccessToken: "codex-tok", AccountID: "acct-456"}
+		injectCodexOAuth(req, cred)
+
 		if got := req.Header.Get("ChatGPT-Account-Id"); got != "acct-456" {
-			t.Errorf("ChatGPT-Account-Id = %q, want %q", got, "acct-456")
+			t.Errorf("ChatGPT-Account-Id = %q, want AccountID fallback %q", got, "acct-456")
 		}
 	})
 

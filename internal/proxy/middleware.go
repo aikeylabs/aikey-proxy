@@ -3,6 +3,7 @@ package proxy
 import (
 	"context"
 	"net/http"
+	"os"
 	"strings"
 
 	"github.com/AiKeyLabs/aikey-proxy/internal/observability"
@@ -44,6 +45,11 @@ const (
 	// stashExtractedFields), so the security-critical first read is never
 	// skipped; only repeat calls hit this cache.
 	ctxKeyExtractedModel
+	// ctxKeyPoolWindowCap carries the chosen pool account's window_max_util_pct
+	// (int, N11's randomized pre-cut cap), stashed at resolution and read in
+	// serveRoute's ModifyResponse to pre-cut the account when the upstream's
+	// unified-utilization header crosses the cap (N10 防封). Absent → no pre-cut.
+	ctxKeyPoolWindowCap
 )
 
 // traceFromContext retrieves the request's TraceContext. Returns the zero value
@@ -185,9 +191,95 @@ func providerToProtocol(providerCode string) string {
 //
 // Last synced (2026-04-24): added P0 (groq / xai / openrouter / perplexity)
 // + P1 (zhipu / qwen / doubao / siliconflow) alongside the original 6.
+// codexUpstreamBaseURL is the Codex OAuth upstream — chatgpt.com/backend-api/codex
+// (Responses API), NOT api.openai.com/v1 (that's the API-key path). Both OAuth
+// dispatch sites hardcoded this string; centralized here (single source) so they
+// can't drift AND so an E2E can redirect it to a local mock.
+//
+// Test-only hook (loopback-gated, same posture as providerDefaultBaseURL's
+// AIKEY_PROXY_TEST_ANTHROPIC_BASE_URL): Codex OAuth carries no configurable
+// base_url, so the codex-account routing E2E can't exercise the inject path
+// against a mock without this. The loopback guard means a prod misconfig can
+// never reroute real traffic. See aikey-test/oauthgroup/codex_account_routing_test.go.
+func codexUpstreamBaseURL() string {
+	if o := os.Getenv("AIKEY_PROXY_TEST_CODEX_BASE_URL"); o != "" &&
+		(strings.HasPrefix(o, "http://127.0.0.1:") || strings.HasPrefix(o, "http://localhost:")) {
+		return o
+	}
+	return "https://chatgpt.com/backend-api/codex"
+}
+
+// resolveOAuthUpstream selects the upstream base URL for an OAuth-credential
+// request AND applies any provider-specific request setup, returning the
+// (possibly re-wrapped) request. Centralizes the per-provider OAuth-upstream
+// policy so the two dispatch sites (legacy /v1 forward_and_resolve + the group
+// route in group_serve) share ONE source instead of each carrying its own
+// `if canonicalCode == "openai"` branch — a new provider whose OAuth upstream
+// differs from its API-key default (like codex) adds one case here, not two.
+//
+// codex is the one provider whose OAuth base ≠ its API-key base: OAuth hits
+// chatgpt.com/backend-api/codex (Responses API), API keys hit api.openai.com/v1.
+// It also needs deferred model capture (captureCodexModel returns a NEW request
+// carrying the model in context; the caller must use the returned request).
+// Every other provider's OAuth base == providerDefaultBaseURL and needs no setup.
+func resolveOAuthUpstream(canonicalCode string, r *http.Request) (baseURL string, req *http.Request) {
+	switch canonicalCode {
+	case "openai":
+		return codexUpstreamBaseURL(), captureCodexModel(r)
+	default:
+		return providerDefaultBaseURL(canonicalCode), r
+	}
+}
+
+// oauthUpstreamRejectsPath reports whether an OAuth-credential request can NOT
+// be served by that provider's OAuth upstream, and why (2026-07-13, user report:
+// codex works, opencode dies with a bogus "invalid x-api-key").
+//
+// Why this exists: codex is the one provider whose OAuth upstream differs from
+// its API-key upstream (see resolveOAuthUpstream) — ChatGPT accounts are served
+// by chatgpt.com/backend-api/codex, which speaks ONLY the Responses API. The
+// request path is appended verbatim to that base, so a /chat/completions client
+// (opencode, ai-sdk, LangChain, …) ended up calling a route that doesn't exist
+// there; ChatGPT's edge answered with its own 4xx whose body says "invalid
+// x-api-key". Nothing was wrong with the key — but the message sent users
+// debugging credentials for hours. The honest failure is: this credential's
+// upstream doesn't serve this dialect.
+//
+// Deliberately narrow: only the openai-OAuth lane is constrained. Every other
+// provider's OAuth upstream == its API-key upstream, so their clients are free
+// to speak whatever the provider serves. API-key credentials of ANY provider are
+// untouched (they route to api.openai.com/v1 & friends, which do serve
+// /chat/completions) — this guard is only reached from the OAuth branches.
+//
+// Empty reason = allowed.
+func oauthUpstreamRejectsPath(canonicalCode, urlPath string) string {
+	if canonicalCode != "openai" {
+		return ""
+	}
+	// The Responses API is the only dialect chatgpt.com/backend-api/codex serves.
+	// Match on suffix so both /v1/responses (legacy lane) and /responses (group
+	// lane, already stripped) pass.
+	if strings.HasSuffix(strings.TrimSuffix(urlPath, "/"), "/responses") {
+		return ""
+	}
+	return "This key is backed by a ChatGPT OAuth account, whose upstream only serves the Responses API (/responses). " +
+		"The client called " + urlPath + " (Chat Completions). Use an API-key credential for this client, " +
+		"or use a Responses-API client such as codex."
+}
+
 func providerDefaultBaseURL(providerCode string) string {
 	switch strings.ToLower(providerCode) {
 	case "anthropic", "claude":
+		// Test-only hook (gated to loopback): the cross-component OAuth-account
+		// routing E2E points the otherwise-hardcoded Anthropic upstream at a local
+		// mock. OAuth accounts carry no configurable base_url (unlike api_key
+		// material), so without this the OAuth inject path can't be exercised
+		// against a mock. The loopback guard means a prod misconfig can never
+		// reroute real traffic. See aikey-test/oauthgroup/oauth_account_routing_test.go.
+		if o := os.Getenv("AIKEY_PROXY_TEST_ANTHROPIC_BASE_URL"); o != "" &&
+			(strings.HasPrefix(o, "http://127.0.0.1:") || strings.HasPrefix(o, "http://localhost:")) {
+			return o
+		}
 		return "https://api.anthropic.com"
 	case "openai", "gpt", "chatgpt", "codex":
 		// Why: OpenAI SDK clients (including Codex) treat base_url as already

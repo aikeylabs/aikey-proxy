@@ -57,14 +57,30 @@ func (p *Proxy) buildBaseEvent(req *http.Request, resp *http.Response, startTime
 		// 极端兜底:ResolvedRoute 没填 ProviderCode 时退回 URL-form,避免空字符串
 		provider = route.Provider
 	}
+	// resp may be nil on an upstream-no-response path (transport error → no
+	// response object). Every caller today is inside ModifyResponse (resp non-nil),
+	// but the `if resp != nil` guard below (util reporting) proves resp is treated
+	// as nilable — so read StatusCode nil-safely too, keeping the two consistent and
+	// making buildBaseEvent safe if a future error-path caller passes nil (was a
+	// latent panic; staticcheck SA5011). 0 = "no upstream status".
+	statusCode := 0
+	if resp != nil {
+		statusCode = resp.StatusCode
+	}
 	ev := events.UsageEvent{
 		Timestamp:    startTime,
 		VirtualKeyID: route.VirtualKeyID,
-		Provider:     provider,
-		DurationMs:   time.Since(startTime).Milliseconds(),
-		StatusCode:   resp.StatusCode,
-		IsStreaming:  streaming,
-		RequestPath:  req.URL.Path,
+		// AccountID = the REAL account that served this request. For oauth_group
+		// routing group_serve sets route.AccountID to the CHOSEN account (and
+		// re-points it on fallback A→B), so local audit attributes to the
+		// account that actually sent upstream. VirtualKeyID stays the request's
+		// VK regardless of switch (stable user attribution).
+		AccountID:   route.AccountID,
+		Provider:    provider,
+		DurationMs:  time.Since(startTime).Milliseconds(),
+		StatusCode:  statusCode,
+		IsStreaming: streaming,
+		RequestPath: req.URL.Path,
 	}
 	// Ephemeral trace correlation (not persisted) so the async collector can
 	// cite trace/span/request ids if it has to drop this event under backpressure.
@@ -106,20 +122,42 @@ func (p *Proxy) buildBaseEvent(req *http.Request, resp *http.Response, startTime
 		// Trust note: spoofable signal, display-only.
 		ev.AppSlug = route.AppSlug
 	}
+	// I5 (best-effort, OFF the hot path): ship the upstream's parsed 5h + 7d
+	// utilization to master so the allocation engine can read both (util_7d feeds
+	// the weekly-squeeze target). The sample still exists only when the 5h header
+	// is present — the two unified headers arrive together upstream — and util_7d
+	// just enriches it (0 + omitempty when the 7d header is absent, so util_5h
+	// reporting stays byte-identical). enqueue is nil-safe (reporter off → no-op)
+	// and non-blocking (full buffer drops the sample, never stalls).
+	// Provider dispatch is by header-sniff, NOT a provider_code switch: the two
+	// utilization header families are mutually exclusive (an account is either
+	// Anthropic → anthropic-ratelimit-unified-*, or Codex → X-Codex-*, never both),
+	// so we try Anthropic first, then Codex. This mirrors R34's reactive layer
+	// (hasRateLimitSignal / cooldownDecision sniff both without branching) and
+	// keeps the enqueue provider-neutral (design §4B: normalize at the edge, feed
+	// one wire). parseCodexUtil already ÷100s and maps primary/secondary→5h/7d by
+	// window duration, so master/engine see the identical (util_5h, util_7d) shape.
+	if resp != nil {
+		if util5h, ok := parseUnifiedUtil5h(resp.Header); ok {
+			util7d, _ := parseUnifiedUtil7d(resp.Header)
+			p.signalReporter.enqueue(route.CredentialID, time.Now().Unix(), util5h, util7d)
+		} else if util5h, util7d, ok := parseCodexUtil(resp.Header); ok {
+			p.signalReporter.enqueue(route.CredentialID, time.Now().Unix(), util5h, util7d)
+		}
+	}
 	return ev
 }
 
 // recordEvent records a usage event for error responses (no token counts).
 func (p *Proxy) recordEvent(req *http.Request, resp *http.Response, startTime time.Time, route *vkeys.ResolvedRoute, bearerToken string, streaming bool) {
 	ev := p.buildBaseEvent(req, resp, startTime, route, streaming)
-	var errMsg string
+	var errMsg, errType string
 	if resp.StatusCode >= 400 {
 		p.errors.Add(1)
 		// Capture the upstream error envelope (re-buffers resp.Body so the client
 		// still receives the original payload). Returns the provider's error TYPE +
 		// human MESSAGE parsed from the body.
-		errType, msg := captureUpstreamErrorBody(resp)
-		errMsg = msg
+		errType, errMsg = captureUpstreamErrorBody(resp)
 		// error_type: prefer the provider's classification (e.g.
 		// exceeded_current_quota_error / invalid_request_error) so the usage row
 		// tells WHY it failed; fall back to the generic HTTP reason phrase
@@ -133,9 +171,32 @@ func (p *Proxy) recordEvent(req *http.Request, resp *http.Response, startTime ti
 	}
 	// Probe traffic bypasses all sinks — see isAikeyProbe rationale in
 	// middleware.go. Keep p.errors.Add(1) above so the /metrics view still
-	// shows "N requests returned 4xx/5xx" even for self-tests.
+	// shows "N requests returned 4xx/5xx" even for self-tests. Probes also skip
+	// the revoked-feed below: a probe may deliberately send no auth and earn a
+	// 401, which is NOT a real revocation.
 	if isAikeyProbe(req) {
 		return
+	}
+	// Revoked-feed emit (best-effort, OFF the hot path, mirrors the I5 util
+	// enqueue in buildBaseEvent): a hard-revoked OAuth token (401 "OAuth token
+	// has been revoked") means this credential can't serve again until re-auth,
+	// so flag master to quarantine the account in the allocation engine. We do
+	// NOT alter the 401 — it still flows to the client unchanged. enqueueRevoked
+	// is nil-safe (reporter off → no-op) and non-blocking (full buffer drops).
+	if isHardRevoked(resp.StatusCode, errType, errMsg) {
+		p.signalReporter.enqueueRevoked(route.CredentialID, "revoked")
+	}
+	// Rate-limit-feed emit (best-effort, OFF the hot path, mirrors the revoked
+	// hook above): the proxy sees every upstream 429 (rate limit) / 403 (forbidden);
+	// counting them per credential lets master normalize a near-window 429/403
+	// frequency into the allocation engine's §5.1 w5 "Recent429FreqNorm" risk
+	// signal. We do NOT alter the response — it flows to the client unchanged. The
+	// status is the one captureUpstreamErrorBody already read; we don't re-read the
+	// body. incrRateLimit is nil-safe (reporter off → no-op) and non-blocking (a
+	// short map lock, reset every flush bounds it); an empty CredentialID (no route)
+	// is dropped inside.
+	if resp.StatusCode == http.StatusTooManyRequests || resp.StatusCode == http.StatusForbidden {
+		p.signalReporter.incrRateLimit(route.CredentialID)
 	}
 	p.collector.Record(&ev)
 	// Error responses are treated as interrupted — the client never got a

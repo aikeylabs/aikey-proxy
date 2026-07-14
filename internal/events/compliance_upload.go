@@ -54,7 +54,7 @@ func (r *Reporter) UploadComplianceEvents(ctx context.Context, routeSource strin
 		}
 	}
 
-	resp, err := r.client.Do(req)
+	resp, err := r.client.Get().Do(req)
 	if err != nil {
 		return fmt.Errorf("compliance upload: POST %s: %w", url, err)
 	}

@@ -80,15 +80,13 @@ func extractAssistantDelta(protocolFamily, eventType string, payload []byte) str
 		}
 		return ""
 	case protoOpenAI:
-		var f struct {
-			Choices []struct {
-				Delta struct {
-					Content string `json:"content"`
-				} `json:"delta"`
-			} `json:"choices"`
-		}
-		if json.Unmarshal(payload, &f) == nil && len(f.Choices) > 0 {
-			return f.Choices[0].Delta.Content
+		// Probe table (see openaiWireFormats): the two formats' frame shapes
+		// are disjoint, so first non-empty wins and Chat Completions keeps
+		// first-probe priority.
+		for _, wf := range openaiWireFormats {
+			if txt := wf.delta(payload); txt != "" {
+				return txt
+			}
 		}
 		return ""
 	case protoGemini:
@@ -116,7 +114,12 @@ func isCompletionMarker(protocolFamily, eventType string, payload []byte) bool {
 	case protoAnthropic:
 		return eventType == "message_stop" || bytes.Contains(payload, []byte(`"type":"message_stop"`))
 	case protoOpenAI:
-		return bytes.Equal(bytes.TrimSpace(payload), []byte("[DONE]"))
+		for _, wf := range openaiWireFormats {
+			if wf.done(payload) {
+				return true
+			}
+		}
+		return false
 	case protoGemini:
 		return bytes.Contains(payload, []byte(`"finishReason"`))
 	default:
@@ -150,6 +153,58 @@ func extractAnthropicPrompt(body []byte) (userText, systemText, model string) {
 	return userText, systemText, req.Model
 }
 
+// --- OpenAI-family wire formats (polymorphic probe table) -------------------
+//
+// The "openai_compatible" protocol family carries MORE THAN ONE wire format:
+// classic Chat Completions (`/v1/chat/completions`, messages[]) and the
+// Responses API (`/v1/responses`, instructions + input[], what Codex sends
+// with wire_api="responses") — the same two-format split the usage extractor
+// documents in provider/openai.go. Missing the second one silently skipped
+// every Codex turn from the conversation audit (live incident 2026-07-07,
+// CONTENT_EMPTY_EXTRACT on the Windows box while usage recorded fine).
+//
+// Why a probe table instead of if/else inside each function (user 拍板
+// 2026-07-07: 多态 + 可扩展 + 不影响旧 openai KEY 的采集): each wire format
+// is ONE table entry owning its three probes (prompt / delta / done); the
+// shared extraction flow iterates the table and the first entry that claims
+// the payload wins. Adding the next OpenAI wire variant = appending one entry
+// plus its fixtures — no edits to shared flow. Chat Completions probes FIRST,
+// so existing openai-key deployments keep byte-identical extraction.
+type openaiWireFormat struct {
+	name string
+	// prompt parses a request body; ok=false when the body is not this format
+	// (the table then tries the next entry).
+	prompt func(body []byte) (user, system, model string, ok bool)
+	// delta returns the assistant text carried by one SSE frame, "" when the
+	// frame carries none in this format.
+	delta func(payload []byte) string
+	// done reports whether the frame is this format's end-of-stream marker.
+	done func(payload []byte) bool
+}
+
+var openaiWireFormats = []openaiWireFormat{
+	{name: "chat_completions", prompt: chatCompletionsPrompt, delta: chatCompletionsDelta, done: chatCompletionsDone},
+	{name: "responses_api", prompt: responsesAPIPrompt, delta: responsesAPIDelta, done: responsesAPIDone},
+}
+
+func extractOpenAIPrompt(body []byte) (userText, systemText, model string) {
+	for _, wf := range openaiWireFormats {
+		if u, s, m, ok := wf.prompt(body); ok {
+			return u, s, m
+		}
+	}
+	// No format claimed the body (e.g. a bare {"model":...} probe). Preserve
+	// the legacy behavior of still surfacing model so OnRequestEnd's model
+	// fallback chain is unchanged.
+	var bare struct {
+		Model string `json:"model"`
+	}
+	_ = json.Unmarshal(body, &bare)
+	return "", "", bare.Model
+}
+
+// --- wire format 1: Chat Completions (/v1/chat/completions) ----------------
+
 type openaiReq struct {
 	Model    string `json:"model"`
 	Messages []struct {
@@ -158,10 +213,10 @@ type openaiReq struct {
 	} `json:"messages"`
 }
 
-func extractOpenAIPrompt(body []byte) (userText, systemText, model string) {
+func chatCompletionsPrompt(body []byte) (userText, systemText, model string, ok bool) {
 	var req openaiReq
-	if json.Unmarshal(body, &req) != nil {
-		return "", "", ""
+	if json.Unmarshal(body, &req) != nil || len(req.Messages) == 0 {
+		return "", "", "", false
 	}
 	for _, m := range req.Messages {
 		if (m.Role == "system" || m.Role == "developer") && systemText == "" {
@@ -174,7 +229,81 @@ func extractOpenAIPrompt(body []byte) (userText, systemText, model string) {
 			break
 		}
 	}
-	return userText, systemText, req.Model
+	return userText, systemText, req.Model, true
+}
+
+func chatCompletionsDelta(payload []byte) string {
+	var f struct {
+		Choices []struct {
+			Delta struct {
+				Content string `json:"content"`
+			} `json:"delta"`
+		} `json:"choices"`
+	}
+	if json.Unmarshal(payload, &f) == nil && len(f.Choices) > 0 {
+		return f.Choices[0].Delta.Content
+	}
+	return ""
+}
+
+func chatCompletionsDone(payload []byte) bool {
+	return bytes.Equal(bytes.TrimSpace(payload), []byte("[DONE]"))
+}
+
+// --- wire format 2: Responses API (/v1/responses, Codex) --------------------
+
+type responsesReq struct {
+	Model string `json:"model"`
+	// Instructions is the Responses API's system prompt slot.
+	Instructions string          `json:"instructions"`
+	Input        json.RawMessage `json:"input"` // string | []item
+}
+
+func responsesAPIPrompt(body []byte) (userText, systemText, model string, ok bool) {
+	var req responsesReq
+	if json.Unmarshal(body, &req) != nil {
+		return "", "", "", false
+	}
+	if req.Instructions == "" && len(req.Input) == 0 {
+		return "", "", "", false
+	}
+	systemText = req.Instructions
+	// input is either one plain string (single-turn shorthand) or an item
+	// array whose message items mirror chat messages with content parts of
+	// type input_text ({"type":"input_text","text":...} — joinContent reads
+	// the text field regardless of the type tag).
+	var s string
+	if json.Unmarshal(req.Input, &s) == nil {
+		return s, systemText, req.Model, true
+	}
+	var items []struct {
+		Role    string          `json:"role"`
+		Content json.RawMessage `json:"content"`
+	}
+	if json.Unmarshal(req.Input, &items) == nil {
+		for i := len(items) - 1; i >= 0; i-- {
+			if items[i].Role == "user" {
+				userText = joinContent(items[i].Content)
+				break
+			}
+		}
+	}
+	return userText, systemText, req.Model, true
+}
+
+func responsesAPIDelta(payload []byte) string {
+	var f struct {
+		Type  string `json:"type"`
+		Delta string `json:"delta"`
+	}
+	if json.Unmarshal(payload, &f) == nil && f.Type == "response.output_text.delta" {
+		return f.Delta
+	}
+	return ""
+}
+
+func responsesAPIDone(payload []byte) bool {
+	return bytes.Contains(payload, []byte(`"type":"response.completed"`))
 }
 
 type geminiPart struct {

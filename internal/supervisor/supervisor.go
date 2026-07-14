@@ -43,6 +43,7 @@ import (
 	"github.com/AiKeyLabs/aikey-proxy/internal/cluster"
 	"github.com/AiKeyLabs/aikey-proxy/internal/config"
 	"github.com/AiKeyLabs/aikey-proxy/internal/events"
+	"github.com/AiKeyLabs/aikey-proxy/internal/httpx"
 	"github.com/AiKeyLabs/aikey-proxy/internal/observability"
 	"github.com/AiKeyLabs/aikey-proxy/internal/observer/conversation_audit"
 	"github.com/AiKeyLabs/aikey-proxy/internal/provider"
@@ -189,6 +190,13 @@ func (g *generation) close() {
 	if g.reporter != nil {
 		_ = g.reporter.Close()
 	}
+	// Stop the allocation-engine signal reporter (lives on this generation's
+	// proxy, started per generation in buildGeneration via EnableSignalReporting).
+	// Without this its loop() goroutine + 30s ticker leak on every reload, each
+	// holding a live bearer closure over the old vault reader.
+	if g.proxy != nil {
+		g.proxy.StopSignalReporting()
+	}
 	// Standalone WAL (collector_url empty): generation owns the writer and
 	// must close it explicitly, otherwise every reload leaks a file handle
 	// on offline-mode deployments. Only non-nil when reporter is nil.
@@ -265,7 +273,10 @@ func (g *generation) drain(timeout time.Duration, reloadID string) {
 // Supervisor manages the proxy lifecycle and exposes the data-plane handler.
 type Supervisor struct {
 	startedAt time.Time
-	transport http.RoundTripper // optional upstream proxy transport; nil = default
+	// transport is the optional upstream-proxy RoundTripper applied to every
+	// generation's proxy (nil = default). atomic.Pointer so an egress hot-swap
+	// (SetTransport, 2026-06-30) can't race the gen-build read in applyToProxy.
+	transport atomic.Pointer[transportBox]
 	// ctx / cancel bound the lifetime of all detached upstream calls.
 	// Canceled in Shutdown() to stop any in-flight upstream requests.
 	ctx    context.Context
@@ -290,6 +301,29 @@ type Supervisor struct {
 	// takes effect within the 60s poll WITHOUT the employee running any command,
 	// and steady state adds no churn. Mirrors lastFilterSig / masterCompliance.
 	lastQuotaSig atomic.Pointer[string]
+	// lastGroupRuntimeSig is the signature (raw response body) of the last group
+	// runtime this node pulled (N7c-2). pollGroupRuntime rewrites group_runtime +
+	// Reloads ONLY when the material actually changed (a token refreshed), so a
+	// 60s poll over unchanged tokens adds no churn. Mirrors lastQuotaSig.
+	lastGroupRuntimeSig atomic.Pointer[string]
+	// routingOverrides is the allocation engine's seat→account routing-override
+	// cache (I-side §6.5). Supervisor-scoped (not per-generation) so a reload never
+	// loses it — the same instance is injected into every Proxy. Populated by
+	// pollRoutingOverrides; read on the group-route hot path to redirect a seat off
+	// an unhealthy account. nil-safe everywhere → empty means "use the local pick".
+	routingOverrides *proxy.RoutingOverrideCache
+	// lastRoutingMismatchVersion throttles the proxy.routing_override.format_mismatch
+	// WARN (non-empty routes, zero matching a local (seat,group)) to once per
+	// routing_version — the 60s ticker would otherwise repeat it every cycle.
+	lastRoutingMismatchVersion atomic.Int64
+	// railset drives the SyncRail control-plane sync rails (railset.go,
+	// 2026-07-03): routing_override + group_runtime in Phase 1. Supervisor-scoped
+	// so Reload can kick an immediate re-sync and /status can snapshot rail health.
+	railset *railSet
+	// teamCred is the shared on-demand team account-JWT source for the rails —
+	// rebuilt whenever the control URL changes or a refresh fails (the fix for the
+	// 2026-07-03 "credential baked at start with a stale URL" incident).
+	teamCred *teamCredentialSource
 	// quotaHeartbeat is the traffic-independent server-reachability probe behind
 	// budget-mode staleness (D-U7/P9). nil unless enforce_mode=budget AND a
 	// collector URL is configured — so the default availability path (and Personal)
@@ -349,17 +383,20 @@ func (s *Supervisor) VaultReader() *vault.Reader {
 func New(cfg *config.Config, configPath, password, version string) (*Supervisor, error) {
 	ctx, cancel := context.WithCancel(context.Background())
 	s := &Supervisor{
-		cfg:           cfg,
-		configPath:    configPath,
-		password:      password,
-		version:       version,
-		startedAt:     time.Now(),
-		ctx:           ctx,
-		cancel:        cancel,
-		quotaEnabled:  quotaEnabledFromEnv(),
-		quotaSnapshot: quota.NewSnapshot(),
-		quotaCounter:  quota.NewCounter(),
+		cfg:              cfg,
+		configPath:       configPath,
+		password:         password,
+		version:          version,
+		startedAt:        time.Now(),
+		ctx:              ctx,
+		cancel:           cancel,
+		quotaEnabled:     quotaEnabledFromEnv(),
+		quotaSnapshot:    quota.NewSnapshot(),
+		quotaCounter:     quota.NewCounter(),
+		routingOverrides: proxy.NewRoutingOverrideCache(),
+		teamCred:         &teamCredentialSource{},
 	}
+	s.railset = newRailSet(s.groupRuntimeRail(), s.routingOverrideRail())
 	gen, err := s.buildGeneration()
 	if err != nil {
 		return nil, fmt.Errorf("initial generation failed: %w", err)
@@ -412,6 +449,23 @@ func New(cfg *config.Config, configPath, password, version string) (*Supervisor,
 	// it on the same master-poll rail as compliance/audit. No-op when no team/org
 	// or no active seats (Personal), or when quota is disabled.
 	observability.GoSafe("supervisor.quota_policy_poll", observability.Isolated, func() { s.pollQuotaPolicy(s.ctx) })
+
+	// SyncRail (2026-07-03): the group_runtime (N7c-2 channel ③ material) and
+	// routing_override (I-side §6.5 engine assignments) rails, driven by the
+	// declarative framework in railset.go — gate/URL/credential re-evaluated every
+	// cycle, failures counted into the OK→STALE→OFFLINE visibility state machine,
+	// Reload kicks an immediate re-sync. One GoSafe/Isolated goroutine per rail
+	// (names kept from the old hand-written polls so log filters carry over).
+	// quota/compliance/audit stay on their legacy loops until Phase 2.
+	s.railset.start(s)
+
+	// Control-plane self-heal, Stage 2 (2026-07-01): proactively rebuild the
+	// control-plane client the moment the host's network changes (WiFi switch /
+	// tether / interface up-down), so control-plane calls to master dial clean
+	// without waiting for a failure. Dependency-free (net.Interfaces fingerprint).
+	// Isolated + cheap: a 20s poll; a panic here must never touch the data path.
+	// See netmon.go / selfheal.go.
+	observability.GoSafe("supervisor.net_change_monitor", observability.Isolated, func() { runNetChangeMonitor(s.ctx) })
 
 	// Cluster mode (V3c): register this node with the hub name service + heartbeat
 	// so clients discover it via /cluster/resolve. Inert for non-cluster proxies —
@@ -511,7 +565,7 @@ func (s *Supervisor) startQuotaHeartbeat() {
 	if interval > 120*time.Second {
 		interval = 120 * time.Second
 	}
-	client := &http.Client{Timeout: 5 * time.Second}
+	client := httpx.NewDirectClient(5 * time.Second)
 	s.quotaHeartbeat = heartbeat.New(interval, func(ctx context.Context) error {
 		req, err := http.NewRequestWithContext(ctx, http.MethodGet, healthURL, http.NoBody)
 		if err != nil {
@@ -544,12 +598,17 @@ func (s *Supervisor) SetBroker(b proxy.OAuthBroker) {
 }
 
 func (s *Supervisor) SetTransport(t http.RoundTripper) {
-	s.transport = t
-	// Also apply to the already-running initial generation.
+	s.transport.Store(&transportBox{rt: t})
+	// Also apply to the already-running initial generation. proxy.SetTransport is
+	// itself atomic, so this hot-swap is safe while the generation serves requests.
 	if gen := s.active.Load(); gen != nil {
 		gen.proxy.SetTransport(t)
 	}
 }
+
+// transportBox boxes the RoundTripper so it can live in an atomic.Pointer (atomics
+// can't hold an interface value directly). nil rt = use the default transport.
+type transportBox struct{ rt http.RoundTripper }
 
 // managedKeySyncLoop runs in a background goroutine and periodically merges
 // newly-active managed keys into the live registry without a full reload.
@@ -679,6 +738,15 @@ func (s *Supervisor) syncManagedKeys() {
 	}
 	for i := range managedKeys {
 		mk := &managedKeys[i]
+		// N7c safety gate: a group VK (OauthGroupID != "") carries NO PlaintextKey —
+		// its per-account material lives in GroupRuntime and routing requires the
+		// group resolver (N8). Until that's enabled, do NOT register group VKs;
+		// otherwise the hot path's `PlaintextKey != ""` check fails and the request
+		// falls to the personal-key path and 401s. Gated by
+		// AIKEY_PROXY_OAUTH_GROUP_ENABLED (default off) → direct-bind path unchanged.
+		if mk.OauthGroupID != "" && !oauthGroupRoutingEnabled() {
+			continue
+		}
 		// 2026-04-29 prefix rename: team token = aikey_team_<vk_id>.
 		// Use NormalizeTeamToken so historical-prefix dirty data in
 		// mk.VirtualKeyID gets stripped+rebuilt (defense-in-depth: should
@@ -939,6 +1007,13 @@ func (s *Supervisor) AppHealthSnapshot() []apppipe.AppHealth {
 	return s.active.Load().proxy.AppHealthSnapshot()
 }
 
+// PoolCooldownSnapshot returns oauth-group accounts currently cooling down
+// (account_id → seconds remaining) from the active generation's proxy, for the
+// admin /status pool-routing health surface (N9).
+func (s *Supervisor) PoolCooldownSnapshot() map[string]int {
+	return s.active.Load().proxy.PoolCooldownSnapshot()
+}
+
 // ReporterMetrics returns usage reporter counters from the active generation.
 // Returns nil if reporter is not configured (no collector_url).
 func (s *Supervisor) ReporterMetrics() *events.ReporterMetrics {
@@ -1053,8 +1128,29 @@ func (s *Supervisor) GetKeyCheckTargets() ([]admin.KeyCheckTarget, error) {
 		return nil, nil
 	}
 	cfg, err := gen.vault.GetActiveKeyConfig()
-	if err != nil || cfg == nil {
-		return nil, nil
+	if err != nil {
+		// A vault READ FAILURE is not "there are no keys". Returning (nil, nil)
+		// here made /health/keys answer "no active key configured" while the
+		// vault was actually unreadable — a broken pipeline that looks healthy,
+		// which health-signal-surface exists to forbid. Worse, an operator
+		// reading that could conclude the proxy has no keys and re-import /
+		// re-provision a vault that is perfectly fine.
+		//
+		// This outer guard also silently defeated the inner loop below, which was
+		// deliberately fixed to WARN on a per-provider resolve failure: none of
+		// that care could ever run once the config read itself was swallowed.
+		//
+		// HealthKeys already distinguishes this case ("key resolution failed: …",
+		// still HTTP 200 per contract) from len==0 ("no active key configured") —
+		// it just never received the error to distinguish. (2026-07-13)
+		slog.Error("active key config read failed for health probe",
+			"event.name", "usage.health.key_config_read_failed",
+			"error.code", "KEY_CONFIG_READ_FAILED",
+			"error", err.Error())
+		return nil, fmt.Errorf("read active key config: %w", err)
+	}
+	if cfg == nil {
+		return nil, nil // genuinely no active key — the documented empty case
 	}
 
 	var targets []admin.KeyCheckTarget
@@ -1245,6 +1341,20 @@ func (s *Supervisor) Reload(ctx context.Context) error {
 		)
 	})
 
+	// SyncRail convergence (§5.2, 2026-07-03): a reload usually follows a config /
+	// vault change (`aikey account set-url`, login, settings save). Drop the
+	// cached team credential so the next cycle rebuilds against the CURRENT
+	// control URL, and nudge every rail to run that cycle NOW — the settings
+	// change converges in seconds instead of one poll interval. Both calls are
+	// non-blocking (kick channels are buffered); the 60s per-cycle URL re-check
+	// remains the bottom-line self-heal when no reload ever fires.
+	if s.teamCred != nil {
+		s.teamCred.invalidate()
+	}
+	if s.railset != nil {
+		s.railset.kickAll()
+	}
+
 	return nil
 }
 
@@ -1341,10 +1451,22 @@ func (s *Supervisor) buildGeneration() (*generation, error) {
 
 	// Build the proxy handler with configured thresholds.
 	p := proxy.New(vaultReader, registry, providers, collector, s.ctx)
+	// Inject the shared, supervisor-owned routing-override cache (I-side §6.5) so
+	// the group-route hot path can read the engine's seat→account redirects.
+	// Unconditional + nil-safe: an empty cache (no team cred / control URL / poll
+	// not landed) just means every request uses the local seatassign pick.
+	p.SetRoutingOverrides(s.routingOverrides)
+	// Local console base for member-login URLs in group login-required 401s
+	// (20260703 update). Explicitly-empty (cluster/server configs) → URL-less
+	// fallback; absent key (pre-20260703 preserved configs) → default 8090.
+	p.SetConsoleURL(s.cfg.ResolvedConsoleURL())
+	// SyncRail §5.4: let the 401 wording distinguish "you need to sign in" from
+	// "the assignment rail is unreachable so this pick may be misdirected".
+	p.SetRoutingRailHealth(func() (string, int64) { return s.railHealthFor("routing_override") })
 	p.SlowRequestMs = int64(s.cfg.Log.SlowRequestMs)
 	p.VerySlowRequestMs = int64(s.cfg.Log.VerySlowRequestMs)
-	if s.transport != nil {
-		p.SetTransport(s.transport)
+	if b := s.transport.Load(); b != nil && b.rt != nil {
+		p.SetTransport(b.rt)
 	}
 	if s.broker != nil {
 		p.SetBroker(s.broker)
@@ -1530,6 +1652,12 @@ func (s *Supervisor) buildGeneration() (*generation, error) {
 				loadedSeq = int64(seq)
 			}
 			p.SetReporter(reporter, fmt.Sprintf("proxy-%d", id), s.version, fmt.Sprintf("gen-%d", id), loadedSeq, vaultReader.GetLoggedInAccountID())
+			// I5: wire the allocation-engine util signal reporter with the team
+			// account-JWT (same credential the group-runtime poll uses) → master
+			// /accounts/me/signals. Off unless a team credential + control URL exist.
+			if teamCred := buildCollectorCredentials(s.cfg.Events.CollectorCredentials, vaultReader)["team"]; teamCred != nil {
+				p.EnableSignalReporting(readControlPanelURL(), teamCred.Bearer)
+			}
 			slog.Info("usage reporter enabled", "collector_url", s.cfg.Events.CollectorURL)
 
 			// Start canary probe. As of 2026-04-17 diagnostics live on the

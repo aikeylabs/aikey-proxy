@@ -42,8 +42,11 @@ build: sync-fingerprint
 	@go build $(LDFLAGS) -o bin/aikey-proxy ./cmd/aikey-proxy
 	@cp $(CONFIG) bin/$(CONFIG)
 
+# ./cmd/aikey-proxy added 2026-07-08: the egress system-proxy-switch
+# integration tests (egress_integration_test.go) live in package main because
+# they drive the REAL buildTransport — internal/... alone would skip them.
 test:
-	go test -race -v ./internal/...
+	go test -race -v ./internal/... ./cmd/aikey-proxy/
 
 # Chaos experiments (缺口7/8) — build-tagged so they stay OUT of the normal
 # `test` suite. They drive the real newStreamDrainer / http.Server code paths

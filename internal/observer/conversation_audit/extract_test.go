@@ -159,3 +159,95 @@ func TestIsCompletionMarker(t *testing.T) {
 		}
 	}
 }
+
+// --- Responses API wire format (Codex, /v1/responses) -----------------------
+//
+// Fixtures mirror what Codex actually sends with wire_api="responses" (the
+// same format provider/openai.go's usage extractor documents). Live incident
+// 2026-07-07: this format extracted to empty → every Codex turn was skipped
+// from the conversation audit (CONTENT_EMPTY_EXTRACT) while usage recorded
+// fine. Chat Completions fixtures above must stay green untouched — the probe
+// table's first entry pins the legacy behavior.
+
+func TestExtractPrompt_OpenAI_ResponsesAPI_ItemArray(t *testing.T) {
+	body := []byte(`{
+		"model": "gpt-5-codex",
+		"instructions": "You are Codex, a coding agent.",
+		"stream": true,
+		"input": [
+			{"type": "message", "role": "user", "content": [{"type": "input_text", "text": "old turn"}]},
+			{"type": "message", "role": "assistant", "content": [{"type": "output_text", "text": "old answer"}]},
+			{"type": "message", "role": "user", "content": [{"type": "input_text", "text": "写一个快排"}]}
+		]
+	}`)
+	user, system, model := extractPrompt(protoOpenAI, body)
+	if user != "写一个快排" {
+		t.Errorf("user = %q, want latest user turn", user)
+	}
+	if system != "You are Codex, a coding agent." {
+		t.Errorf("system = %q, want instructions", system)
+	}
+	if model != "gpt-5-codex" {
+		t.Errorf("model = %q", model)
+	}
+}
+
+func TestExtractPrompt_OpenAI_ResponsesAPI_StringInput(t *testing.T) {
+	body := []byte(`{"model":"gpt-5-codex","input":"hello codex"}`)
+	user, system, model := extractPrompt(protoOpenAI, body)
+	if user != "hello codex" || system != "" || model != "gpt-5-codex" {
+		t.Errorf("got (%q,%q,%q), want plain-string input as user text", user, system, model)
+	}
+}
+
+func TestExtractPrompt_OpenAI_ChatCompletionsStillWinsWhenMessagesPresent(t *testing.T) {
+	// A body carrying messages[] must keep the legacy extraction even if it
+	// also carries stray Responses-ish fields — chat/completions probes first.
+	body := []byte(`{
+		"model": "gpt-4o",
+		"instructions": "should be ignored",
+		"messages": [
+			{"role": "system", "content": "sys"},
+			{"role": "user", "content": "hi"}
+		]
+	}`)
+	user, system, model := extractPrompt(protoOpenAI, body)
+	if user != "hi" || system != "sys" || model != "gpt-4o" {
+		t.Errorf("got (%q,%q,%q), legacy chat/completions extraction regressed", user, system, model)
+	}
+}
+
+func TestExtractPrompt_OpenAI_BareModelBodyKeepsLegacyModelFallback(t *testing.T) {
+	// Neither format claims a bare probe body; legacy behavior surfaced the
+	// model anyway (OnRequestEnd's fallback chain depends on it).
+	user, system, model := extractPrompt(protoOpenAI, []byte(`{"model":"gpt-4o"}`))
+	if user != "" || system != "" || model != "gpt-4o" {
+		t.Errorf("got (%q,%q,%q), want empty text + model passthrough", user, system, model)
+	}
+}
+
+func TestExtractAssistantDelta_OpenAI_ResponsesAPI(t *testing.T) {
+	if got := extractAssistantDelta(protoOpenAI, "", []byte(`{"type":"response.output_text.delta","delta":"chunk"}`)); got != "chunk" {
+		t.Errorf("delta = %q, want chunk", got)
+	}
+	// Non-text Responses frames carry no assistant text.
+	if got := extractAssistantDelta(protoOpenAI, "", []byte(`{"type":"response.output_item.added","item":{}}`)); got != "" {
+		t.Errorf("non-text frame leaked %q", got)
+	}
+	// Chat Completions delta unchanged (probe order).
+	if got := extractAssistantDelta(protoOpenAI, "", []byte(`{"choices":[{"delta":{"content":"cc"}}]}`)); got != "cc" {
+		t.Errorf("chat delta = %q, want cc", got)
+	}
+}
+
+func TestIsCompletionMarker_OpenAI_BothFormats(t *testing.T) {
+	if !isCompletionMarker(protoOpenAI, "", []byte(`[DONE]`)) {
+		t.Error("[DONE] must stay a completion marker (chat/completions)")
+	}
+	if !isCompletionMarker(protoOpenAI, "", []byte(`{"type":"response.completed","response":{"usage":{"input_tokens":10}}}`)) {
+		t.Error("response.completed must mark completion (Responses API)")
+	}
+	if isCompletionMarker(protoOpenAI, "", []byte(`{"type":"response.output_text.delta","delta":"x"}`)) {
+		t.Error("delta frame must not mark completion")
+	}
+}
