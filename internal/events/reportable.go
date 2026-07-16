@@ -101,6 +101,15 @@ type ReportableEvent struct {
 	// ODS with the provider's audit log without us having to log full bodies.
 	// Always populated for both success + error paths when upstream sets it.
 	UpstreamRequestID string `json:"upstream_request_id,omitempty"`
+	// RequestPath is the inbound request's URL path (e.g. "/v1/messages",
+	// "/openai/v1/models"). 2026-07-15 非生成流量不进用量审计: the projector
+	// classifies generation vs non-generation traffic (GET /v1/models health
+	// polls etc.) from this FACT — the proxy deliberately reports the path,
+	// not a verdict, so classification policy lives in ONE place (the
+	// enricher's generation-endpoint table). Additive + omitempty: legacy
+	// consumers (CLI WAL serde, older collectors) ignore it; events from
+	// older proxies simply lack it and keep their current classification.
+	RequestPath string `json:"request_path,omitempty"`
 	DeviceID          string `json:"device_id,omitempty"`
 	ProxyInstanceID   string `json:"proxy_instance_id,omitempty"`
 	TraceID           string `json:"trace_id,omitempty"`
@@ -179,7 +188,9 @@ type ReportOpts struct {
 	// `openai-request-id`). Carried through so support can pivot from a local
 	// ODS row to provider-side logs.
 	UpstreamRequestID string
-	Completion        string
+	// RequestPath is the inbound r.URL.Path — see ReportableEvent.RequestPath.
+	RequestPath string
+	Completion  string
 	// UI anchor fields (see ReportableEvent docs for semantics).
 	// SessionID comes from the X-Claude-Code-Session-Id request header.
 	// Completion defaults to "complete" if left empty.
@@ -268,6 +279,7 @@ func BuildReportableEvent(opts *ReportOpts) ReportableEvent {
 	ev := ReportableEvent{
 		EventID:            opts.EventID,
 		UpstreamRequestID:  opts.UpstreamRequestID,
+		RequestPath:        opts.RequestPath,
 		ProxyInstanceID:    opts.ProxyInstanceID,
 		SourceID:           opts.SourceID,
 		SourceSeq:          opts.SourceSeq,

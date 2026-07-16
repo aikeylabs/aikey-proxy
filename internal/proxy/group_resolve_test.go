@@ -65,8 +65,8 @@ func TestResolveGroup_OAuthPrimaryDecrypts(t *testing.T) {
 		{AccountID: "acc-b", Identity: "b@x", ProviderCode: "anthropic"},
 	}
 	mat := map[string]vkeys.GroupRuntimeAccount{
-		"acc-a": encMat(t, key, vkeys.GroupRuntimeAccount{CredentialType: "oauth_account", ExpiresAt: 9_000_000_000, ExternalID: "uuid-a"}, "tok-a"),
-		"acc-b": encMat(t, key, vkeys.GroupRuntimeAccount{CredentialType: "oauth_account", ExpiresAt: 9_000_000_000, ExternalID: "uuid-b"}, "tok-b"),
+		"acc-a": encMat(t, key, vkeys.GroupRuntimeAccount{CredentialType: "oauth_account", ExpiresAt: 9_000_000_000, ExternalID: "uuid-a", EgressProxyURL: "socks5://10.0.0.a:1080"}, "tok-a"),
+		"acc-b": encMat(t, key, vkeys.GroupRuntimeAccount{CredentialType: "oauth_account", ExpiresAt: 9_000_000_000, ExternalID: "uuid-b", EgressProxyURL: "socks5://10.0.0.b:1080"}, "tok-b"),
 	}
 	route := &vkeys.ResolvedRoute{SeatID: seat, OauthGroupID: "grp", GroupAccounts: mustJSON(t, refs), GroupRuntime: mustJSON(t, mat)}
 
@@ -91,6 +91,11 @@ func TestResolveGroup_OAuthPrimaryDecrypts(t *testing.T) {
 	}
 	if res.PlaintextKey != "" {
 		t.Fatalf("oauth resolution must not set PlaintextKey")
+	}
+	// Per-account egress (§11.7, P7): the RESOLVED account's egress_proxy_url must
+	// flow onto the resolution so the caller can pin this account's exit IP.
+	if want := "socks5://10.0.0." + primary[len(primary)-1:] + ":1080"; res.EgressProxyURL != want {
+		t.Fatalf("egress_proxy_url not carried from resolved account: got %q want %q", res.EgressProxyURL, want)
 	}
 }
 

@@ -396,6 +396,30 @@ func (p *Proxy) serveRoute(w http.ResponseWriter, r *http.Request, route *vkeys.
 	} else {
 		logger.Debug("using custom transport (upstream proxy)")
 	}
+	// Per-account egress proxy (§11.7, P7): when the resolved oauth-group account
+	// pins an egress_proxy_url, THIS request leaves through it (Layer-0, highest
+	// precedence — it wins over the node-level transport), chained through the node
+	// socks5 front proxy when present (2-hop). Only group routes ever set this; the
+	// default hot path skips this block entirely (byte-unchanged). A build error
+	// (e.g. non-socks5 node front cannot chain a socks5 account) fails the request
+	// loudly rather than silently leaking traffic out the wrong (node) IP.
+	if route.EgressProxyURL != "" {
+		egT, egErr := p.accountEgressTransport(route.EgressProxyURL)
+		if egErr != nil {
+			p.errors.Add(1)
+			logger.Error("per-account egress proxy unavailable",
+				"event.name", observability.EventProxyRequestUpstreamError,
+				"error.code", observability.ErrCodeAccountEgressProxy,
+				"error.message", egErr.Error(),
+				"account_id", route.AccountID,
+			)
+			writeJSONError(w, http.StatusServiceUnavailable, "server_error", observability.ErrCodeAccountEgressProxy,
+				"This account's egress proxy is misconfigured and traffic was not sent out the wrong IP. Ask your admin to check the account's egress proxy setting.")
+			return
+		}
+		inner = egT
+		logger.Debug("using per-account egress transport", "account_id", route.AccountID)
+	}
 	var transport http.RoundTripper = inner
 	if !streaming {
 		transport = &detachedTransport{
@@ -714,7 +738,7 @@ func (p *Proxy) serveRoute(w http.ResponseWriter, r *http.Request, route *vkeys.
 					// either the full JSON or it's an error we surface elsewhere.
 					sessionID := resolveSessionID(r, route.ProtocolType, route.ProviderCode)
 					upstreamReqID := extractUpstreamRequestID(resp)
-					p.reportUsage(route, bearerToken, ev.Model, startTime, resp.StatusCode, breakdown, "", "", realKey, sessionID, "complete", upstreamReqID)
+					p.reportUsage(route, bearerToken, ev.Model, startTime, resp.StatusCode, breakdown, "", "", realKey, sessionID, "complete", upstreamReqID, r.URL.Path)
 					// Phase 2: accrue token + local usd quota for this completed request.
 					// Backfill the model for local usd pricing when the adapter left it
 					// empty (mirrors the streaming path) so codex/others aren't unpriced.
@@ -732,6 +756,8 @@ func (p *Proxy) serveRoute(w http.ResponseWriter, r *http.Request, route *vkeys.
 				// callback time the request's header map may have been recycled.
 				probe := isAikeyProbe(r)
 				sessionID := resolveSessionID(r, route.ProtocolType, route.ProviderCode)
+				// Capture the path now too — same request-recycling caveat.
+				requestPath := r.URL.Path
 				// Capture upstreamReqID NOW (response headers are stable from
 				// here onward; the streaming body keeps draining in a goroutine
 				// but headers are already finalized by upstream).
@@ -757,7 +783,7 @@ func (p *Proxy) serveRoute(w http.ResponseWriter, r *http.Request, route *vkeys.
 							model = br.Model
 						}
 						if p.reporter != nil {
-							p.reportUsage(route, bearerToken, model, startTime, resp.StatusCode, br, "", "", realKey, sessionID, completion, upstreamReqID)
+							p.reportUsage(route, bearerToken, model, startTime, resp.StatusCode, br, "", "", realKey, sessionID, completion, upstreamReqID, requestPath)
 						}
 						// Phase 2: accrue token + local usd quota on stream completion,
 						// independent of the reporter.

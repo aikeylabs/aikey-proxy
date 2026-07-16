@@ -1,6 +1,7 @@
 package events
 
 import (
+	"encoding/json"
 	"testing"
 
 	"github.com/AiKeyLabs/aikey-proxy/internal/vkeys"
@@ -369,5 +370,49 @@ func TestBuildReportableEvent_StampsContentHash(t *testing.T) {
 	opts.OutputTokens = 0
 	if BuildReportableEvent(&opts).ContentHash == ev.ContentHash {
 		t.Fatal("output_tokens 50→0 did not change ContentHash — corruption would slip through")
+	}
+}
+
+// TestBuildReportableEvent_RequestPathOnWire pins the 2026-07-15
+// 非生成流量不进用量审计 contract: the wire event must carry the inbound
+// request path (the FACT the projector's generation/non-generation
+// classifier keys on), and must omit the field entirely when the caller
+// didn't capture one (legacy shape — older consumers keep parsing).
+func TestBuildReportableEvent_RequestPathOnWire(t *testing.T) {
+	route := &vkeys.ResolvedRoute{VirtualKeyID: "vk-1", RouteSource: "team", OrgID: "org-1"}
+
+	ev := BuildReportableEvent(&ReportOpts{
+		EventID:     "evt-path",
+		Route:       route,
+		RequestPath: "/openai/v1/models",
+		StatusCode:  200,
+	})
+	if ev.RequestPath != "/openai/v1/models" {
+		t.Errorf("RequestPath = %q, want /openai/v1/models", ev.RequestPath)
+	}
+	b, err := json.Marshal(ev)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	var wire map[string]any
+	if err := json.Unmarshal(b, &wire); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if got, _ := wire["request_path"].(string); got != "/openai/v1/models" {
+		t.Errorf(`wire request_path = %q, want "/openai/v1/models"`, got)
+	}
+
+	// Legacy shape: no path captured → field absent on the wire (omitempty).
+	ev2 := BuildReportableEvent(&ReportOpts{EventID: "evt-nopath", Route: route, StatusCode: 200})
+	b2, err := json.Marshal(ev2)
+	if err != nil {
+		t.Fatalf("marshal legacy: %v", err)
+	}
+	var wire2 map[string]any
+	if err := json.Unmarshal(b2, &wire2); err != nil {
+		t.Fatalf("unmarshal legacy: %v", err)
+	}
+	if _, present := wire2["request_path"]; present {
+		t.Error("legacy event unexpectedly carries request_path on the wire")
 	}
 }

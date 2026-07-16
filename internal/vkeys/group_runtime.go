@@ -86,6 +86,13 @@ type GroupRuntimeAccount struct {
 	// instead and Kimi needs neither, so this is only load-bearing for Claude
 	// OAuth group accounts. Empty until master's N7a producer populates it.
 	ExternalID string `json:"external_id,omitempty"`
+	// EgressProxyURL is this account's optional per-account egress proxy (§11.7,
+	// P7). Non-secret operational routing config (projected PLAINTEXT by the CLI,
+	// not encrypted like the token). When set, THIS account's outbound leaves
+	// through it (Layer-0, highest precedence — see internal/admin egress
+	// selection), chaining through the node's own socks5 front proxy when present
+	// (2-hop). Empty → the node's node-level egress chain applies unchanged.
+	EgressProxyURL string `json:"egress_proxy_url,omitempty"`
 	// KEY meta:
 	BaseURL  string `json:"base_url,omitempty"`
 	Revision string `json:"revision,omitempty"`

@@ -1,4 +1,4 @@
-package main
+package app
 
 // Egress integration test for the 2026-07-08 system-proxy auto-refresh
 // requirement: a RUNNING transport must egress through the NEW system proxy

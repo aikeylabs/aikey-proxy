@@ -203,7 +203,7 @@ func (p *Proxy) recordEvent(req *http.Request, resp *http.Response, startTime ti
 	// usable result even though the request finished "fast" from our POV.
 	sessionID := resolveSessionID(req, route.ProtocolType, route.ProviderCode)
 	upstreamReqID := extractUpstreamRequestID(resp)
-	p.reportUsage(route, bearerToken, ev.Model, startTime, resp.StatusCode, provider.TokenBreakdown{}, ev.ErrorType, errMsg, "", sessionID, "interrupted", upstreamReqID)
+	p.reportUsage(route, bearerToken, ev.Model, startTime, resp.StatusCode, provider.TokenBreakdown{}, ev.ErrorType, errMsg, "", sessionID, "interrupted", upstreamReqID, req.URL.Path)
 }
 
 // errorBodyCap bounds the captured upstream error body (ODS error_message + WAL
@@ -557,7 +557,7 @@ func extractUpstreamRequestID(resp *http.Response) string {
 // surface it, e.g. OpenAI/Kimi).
 // upstreamReqID is the provider-side request id (anthropic `req_xxx` / openai
 // `req_xxx`) extracted from response headers; empty when upstream omitted it.
-func (p *Proxy) reportUsage(route *vkeys.ResolvedRoute, bearerToken, model string, startTime time.Time, statusCode int, breakdown provider.TokenBreakdown, errorType, errorMessage, realKey, sessionID, completion, upstreamReqID string) {
+func (p *Proxy) reportUsage(route *vkeys.ResolvedRoute, bearerToken, model string, startTime time.Time, statusCode int, breakdown provider.TokenBreakdown, errorType, errorMessage, realKey, sessionID, completion, upstreamReqID, requestPath string) {
 	if p.reporter == nil && p.wal == nil {
 		return
 	}
@@ -614,6 +614,7 @@ func (p *Proxy) reportUsage(route *vkeys.ResolvedRoute, bearerToken, model strin
 		SessionID:          sessionID,
 		Completion:         completion,
 		UpstreamRequestID:  upstreamReqID,
+		RequestPath:        requestPath,
 	})
 	if p.reporter != nil {
 		// Reporter writes WAL + enqueues upload; when wal is the shared

@@ -175,6 +175,12 @@ const (
 	// users hunting a key problem that did not exist. Fail fast with the real
 	// reason + the way out (use an API-key credential for this client). 400.
 	ErrCodeOAuthResponsesOnly = "OAUTH_RESPONSES_ONLY"
+	// ErrCodeAccountEgressProxy (§11.7, P7): the resolved oauth-group account pins
+	// a per-account egress proxy that could not be built into a working dialer —
+	// e.g. a non-socks5 scheme, or a socks5 account proxy that cannot be chained
+	// through a non-socks5 node front proxy. 503; the request is REFUSED rather
+	// than sent out the node's IP (which would defeat the per-account isolation).
+	ErrCodeAccountEgressProxy = "ACCOUNT_EGRESS_PROXY_UNAVAILABLE"
 )
 
 // ---- HealthSnapshot ----

@@ -183,6 +183,15 @@ type ResolvedRoute struct {
 	GroupAccounts string
 	GroupRuntime  string
 	RoutingConfig string
+	// EgressProxyURL is the RESOLVED account's optional per-account egress proxy
+	// (§11.7, P7), copied here per-request by handleOauthGroupRoute from the
+	// picked GroupRuntimeAccount. When set, serveRoute selects a per-account
+	// egress transport (single-hop, or 2-hop chained through the node's socks5
+	// front proxy) so THIS account's outbound leaves via its own IP. Empty for
+	// every non-group route → the node-level egress transport applies unchanged.
+	// Held only in this per-request struct + in-memory material — never written
+	// to the proxy's config file.
+	EgressProxyURL string
 }
 
 // IsModelAllowed checks if the given model is permitted by this route.

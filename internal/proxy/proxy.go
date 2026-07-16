@@ -4,6 +4,7 @@ import (
 	"context"
 	"log/slog"
 	"net/http"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -76,8 +77,15 @@ type Proxy struct {
 	// (Settings → Upstream proxy, 2026-06-30) without racing the per-request read in
 	// forward_and_resolve. Nil box / nil rt → http.DefaultTransport (honors
 	// HTTP_PROXY env). Read via currentTransport, written via SetTransport.
-	transport    atomic.Pointer[transportBox]
-	activeReader ActiveKeyReader       // non-nil when vault implements ActiveKeyReader
+	transport atomic.Pointer[transportBox]
+	// accountEgressTransports caches one built *http.Transport per egress chain
+	// spec (the whole egress_proxy_url string) so the socks5 dialer chain is built
+	// once, not per request. The account chain is SELF-CONTAINED (§11.7, P7) — it
+	// does not consult the node upstream_proxy — so the spec string is the whole
+	// cache key. Only populated for accounts that configure an egress proxy; the
+	// default hot path never touches it.
+	accountEgressTransports sync.Map // map[string]accountEgressEntry
+	activeReader            ActiveKeyReader       // non-nil when vault implements ActiveKeyReader
 	appVault     apppipe.VaultReader   // non-nil when vault implements the App pipeline read surface (Phase 4)
 	probeVault   probepipe.VaultReader // non-nil when vault implements the Probe pipeline read surface (mode C, SPEC 2026-05-23)
 	broker       OAuthBroker           // OAuth credential provider (nil = OAuth not available)

@@ -86,6 +86,10 @@ type groupResolution struct {
 	// ≥ this/100, N10 pre-cuts the account before it hits 100% (which looks like
 	// abuse). nil → no cap delivered → proxy uses 100% (natural exhaustion only).
 	WindowMaxUtilPct *int
+	// EgressProxyURL is the chosen account's optional per-account egress proxy
+	// (§11.7, P7). "" → node-level egress applies. Non-secret; carried so the
+	// caller can pin this account's outbound to its own exit IP.
+	EgressProxyURL string
 }
 
 // resolveGroupCredential ranks the route's group candidates for route.SeatID and
@@ -232,6 +236,7 @@ func buildGroupResolution(accountID string, ref vkeys.GroupAccountRef, mat vkeys
 		ProviderCode:     ref.ProviderCode,
 		Identity:         ref.Identity,
 		WindowMaxUtilPct: mat.WindowMaxUtilPct, // master's pre-cut cap (N10)
+		EgressProxyURL:   mat.EgressProxyURL,   // per-account egress (§11.7, P7)
 	}
 	if mat.CredentialType == credTypeKey {
 		res.PlaintextKey = secret

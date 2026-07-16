@@ -100,6 +100,10 @@ func (p *Proxy) handleOauthGroupRoute(
 	// page). Denormalized ON PURPOSE: routing changes over time, so joining live
 	// tables later would misattribute history — the event must carry who served it.
 	rc.OAuthIdentity = res.Identity
+	// Per-account egress proxy (§11.7, P7): pin this account's outbound to its own
+	// exit IP. serveRoute reads rc.EgressProxyURL to select a per-account egress
+	// transport (single-hop, or 2-hop chained through the node socks5 front proxy).
+	rc.EgressProxyURL = res.EgressProxyURL
 
 	// A group VK is bound to a oauth_group, NOT a single provider, so the VK-level
 	// ProviderCode is EMPTY — the provider lives per-account in group_accounts.
