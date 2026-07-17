@@ -599,7 +599,7 @@ func TestGroupServe_BlockedSeatReturns429(t *testing.T) {
 
 	// Engine left seat-1 unbound (pool full) → proxy must 429, never route to acc-1.
 	cache := NewRoutingOverrideCache()
-	cache.StoreAll(1, nil, map[string]bool{routeKey("seat-1", "grp-1"): true}) // composite (seat,group) key
+	cache.StoreAll(1, nil, map[string]bool{routeKey("seat-1", "grp-1"): true})
 	p.SetRoutingOverrides(cache)
 
 	req, w := groupReq(groupBody)
@@ -610,6 +610,11 @@ func TestGroupServe_BlockedSeatReturns429(t *testing.T) {
 	}
 	if !strings.Contains(w.Body.String(), "GROUP_POOL_FULL") {
 		t.Fatalf("429 body must carry GROUP_POOL_FULL code: %s", w.Body.String())
+	}
+	// Neutral wording — the 429 must NOT guess the cause (2026-07-17: the old
+	// "add accounts" phrasing misdirected admins on a transient unbind).
+	if strings.Contains(w.Body.String(), "per-account user limit") {
+		t.Fatalf("blocked 429 must use neutral wording, not the add-accounts phrasing: %s", w.Body.String())
 	}
 	if tr.host != "" {
 		t.Fatalf("blocked request must NOT reach upstream, dialed %q", tr.host)

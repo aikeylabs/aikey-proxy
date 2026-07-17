@@ -85,6 +85,14 @@ type Proxy struct {
 	// cache key. Only populated for accounts that configure an egress proxy; the
 	// default hot path never touches it.
 	accountEgressTransports sync.Map // map[string]accountEgressEntry
+	// nodeExplicitEgress is set when the user pinned an explicit node-level
+	// upstream proxy via /user/settings (SetUpstreamProxyFn). When true the
+	// per-account egress branch in serveRoute is SKIPPED so the user's own local
+	// proxy wins over admin-configured per-account egress (L1 highest, the escape
+	// hatch when the admin proxy is down — user decision "自己配置的代理优先级最高",
+	// 2026-07-16). The trade-off (all accounts then share one exit IP, temporarily
+	// breaking single-account-single-IP anti-ban) is accepted for availability.
+	nodeExplicitEgress atomic.Bool
 	activeReader            ActiveKeyReader       // non-nil when vault implements ActiveKeyReader
 	appVault     apppipe.VaultReader   // non-nil when vault implements the App pipeline read surface (Phase 4)
 	probeVault   probepipe.VaultReader // non-nil when vault implements the Probe pipeline read surface (mode C, SPEC 2026-05-23)
@@ -249,6 +257,13 @@ func (p *Proxy) SetTransport(t http.RoundTripper) {
 	}
 }
 
+// SetNodeExplicitEgress toggles the L1 override: when on, the user's node-level
+// explicit upstream proxy (/user/settings) applies to ALL traffic — api-key,
+// OAuth, AND team-oauth (per-account) routes — by making serveRoute skip the
+// per-account egress branch. Off restores per-account egress precedence. Called
+// from SetUpstreamProxyFn on every node-upstream change (set → on, clear → off).
+func (p *Proxy) SetNodeExplicitEgress(on bool) { p.nodeExplicitEgress.Store(on) }
+
 // transportBox boxes the RoundTripper so it can live in an atomic.Pointer (atomics
 // can't hold an interface value directly). A nil rt means "use the default".
 type transportBox struct{ rt http.RoundTripper }
@@ -307,6 +322,9 @@ func New(v VaultGetter, reg *vkeys.Registry, prov *provider.Registry, coll *even
 	if kp, ok := v.(groupKeyProvider); ok {
 		p.groupKey = kp
 	}
+	// Reclaim idle per-account egress transports (+ their group health-check
+	// goroutines) until shutdown. Cheap no-op for proxies without egress configured.
+	p.startEgressSweeper()
 	return p
 }
 

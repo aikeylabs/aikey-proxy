@@ -25,6 +25,7 @@ package proxy
 import (
 	"bytes"
 	"context"
+	"errors"
 	"io"
 	"log/slog"
 	"net/http"
@@ -397,13 +398,18 @@ func (p *Proxy) serveRoute(w http.ResponseWriter, r *http.Request, route *vkeys.
 		logger.Debug("using custom transport (upstream proxy)")
 	}
 	// Per-account egress proxy (§11.7, P7): when the resolved oauth-group account
-	// pins an egress_proxy_url, THIS request leaves through it (Layer-0, highest
-	// precedence — it wins over the node-level transport), chained through the node
-	// socks5 front proxy when present (2-hop). Only group routes ever set this; the
-	// default hot path skips this block entirely (byte-unchanged). A build error
+	// pins an egress_proxy_url, THIS request leaves through it, chained through the
+	// node socks5 front proxy when present (2-hop). Only group routes ever set this;
+	// the default hot path skips this block entirely (byte-unchanged). A build error
 	// (e.g. non-socks5 node front cannot chain a socks5 account) fails the request
 	// loudly rather than silently leaking traffic out the wrong (node) IP.
-	if route.EgressProxyURL != "" {
+	//
+	// L1 override (2026-07-16): when the user pinned an explicit node-level upstream
+	// via /user/settings, it wins over per-account egress — the escape hatch when
+	// the admin's per-account proxy is down (avoids total unavailability). So this
+	// block is skipped and the request rides the node-level transport (SetTransport)
+	// like api-key / OAuth traffic. Precedence: user-local explicit > per-account.
+	if route.EgressProxyURL != "" && !p.nodeExplicitEgress.Load() {
 		egT, egErr := p.accountEgressTransport(route.EgressProxyURL)
 		if egErr != nil {
 			p.errors.Add(1)
@@ -829,6 +835,23 @@ func (p *Proxy) serveRoute(w http.ResponseWriter, r *http.Request, route *vkeys.
 		ErrorHandler: func(w http.ResponseWriter, r *http.Request, err error) {
 			p.errors.Add(1)
 			latencyMs := time.Since(startTime).Milliseconds()
+			// Per-account egress dial failure (a socks5 hop refused, or a
+			// fallback/url-test group has NO reachable member): surface it plainly
+			// so the user knows it's THEIR egress, not the provider, and NEVER fall
+			// through to a direct dial (the engine already failed rather than leak).
+			var egErr *EgressDialError
+			if errors.As(err, &egErr) {
+				logger.Error("per-account egress connect failed",
+					"event.name", observability.EventProxyRequestUpstreamError,
+					"error.code", observability.ErrCodeAccountEgressProxy,
+					"error.message", err.Error(),
+					"latency_ms", latencyMs,
+					"account_id", route.AccountID,
+				)
+				writeJSONError(w, http.StatusServiceUnavailable, "server_error", observability.ErrCodeAccountEgressProxy,
+					"egress connect fail: this account's egress upstream(s) are unreachable. Run `aikey doctor` to diagnose.")
+				return
+			}
 			logger.Error("upstream error",
 				"event.name", observability.EventProxyRequestUpstreamError,
 				"error.code", observability.ErrCodeUpstreamError,

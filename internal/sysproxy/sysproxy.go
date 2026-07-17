@@ -228,6 +228,39 @@ func EnvProxyVarsSplit() (explicit, inherited map[string]string) {
 	return envProxyVarsSplitFrom(os.Getenv)
 }
 
+// NoProxyBypass returns a predicate reporting whether a destination host should
+// BYPASS an explicit egress proxy and dial DIRECT: loopback IPs / "localhost" are
+// always direct, plus any host matching NO_PROXY / no_proxy (domain suffix or
+// CIDR). Reuses Go's httpproxy canon (a sentinel proxy makes ProxyFunc return
+// non-nil for a NON-bypassed host; nil ⇒ bypass) so there's no hand-rolled
+// matching. Shared by BOTH the node-level explicit upstream (app.buildTransport)
+// and the per-account egress transport (proxy.dialerToTransport) so internal
+// destinations honor the same NO_PROXY the operator configured, regardless of
+// which egress layer is in play.
+//
+// NOTE (intentional, do NOT "unify" with Watcher.ProxyFunc): this is a distinct
+// concern from Watcher.ProxyFunc. ProxyFunc answers "with NO explicit upstream,
+// which env/system proxy applies" (returns a proxy URL); NoProxyBypass answers
+// "with an explicit upstream set, does this host SKIP it" (returns a bool). Both
+// delegate NO_PROXY matching to x/net/httpproxy, so their NO_PROXY semantics are
+// already identical — there is no duplicated matcher to converge. Merging the two
+// different-purpose functions would be over-abstraction (2026-07-16 assessment).
+func NoProxyBypass() func(host string) bool {
+	cfg := &httpproxy.Config{
+		HTTPProxy:  "http://sentinel.invalid:1",
+		HTTPSProxy: "http://sentinel.invalid:1",
+		NoProxy:    os.Getenv("NO_PROXY") + "," + os.Getenv("no_proxy"),
+	}
+	pf := cfg.ProxyFunc()
+	return func(host string) bool {
+		if host == "" {
+			return false
+		}
+		u, _ := pf(&url.URL{Scheme: "https", Host: host})
+		return u == nil
+	}
+}
+
 func envProxyVarsSplitFrom(get func(string) string) (explicit, inherited map[string]string) {
 	marked := explicitEnvKeySet(get)
 	explicit, inherited = map[string]string{}, map[string]string{}

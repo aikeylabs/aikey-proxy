@@ -1,7 +1,9 @@
 package vkeys
 
 import (
+	"encoding/json"
 	"log/slog"
+	"sort"
 	"sync"
 )
 
@@ -66,4 +68,59 @@ func (r *Registry) Count() int {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
 	return len(r.byToken)
+}
+
+// AccountEgressSpec is one pool account's configured per-account egress spec,
+// for the `aikey test` / `aikey doctor` self-check (§5.4). Label is the account's
+// own display identity (email/alias) — NEVER an internal id / group name — so the
+// self-check output stays user-facing (feedback_terse_user_messages_no_commercial_leak).
+type AccountEgressSpec struct {
+	Label string
+	Spec  string
+}
+
+// EgressSpecs returns the DISTINCT per-account egress specs across all group
+// routes, one row per account. The same group_runtime appears under every seat's
+// VK token, and pool accounts recur across seats, so results are deduped by
+// account id (identical specs collapse to one). Sorted by label for stable
+// output. Empty result = no per-account egress configured on this node (the
+// common Personal case). Read-only: parses the routes' at-rest GroupRuntime JSON,
+// no dialing here — connectivity is the caller's job (egress.TestDial).
+func (r *Registry) EgressSpecs() []AccountEgressSpec {
+	r.mu.RLock()
+	routes := make([]*ResolvedRoute, 0, len(r.byToken))
+	for _, rt := range r.byToken {
+		routes = append(routes, rt)
+	}
+	r.mu.RUnlock()
+
+	byAccount := make(map[string]AccountEgressSpec)
+	for _, rt := range routes {
+		if rt == nil || rt.GroupRuntime == "" {
+			continue
+		}
+		var mat map[string]GroupRuntimeAccount
+		if err := json.Unmarshal([]byte(rt.GroupRuntime), &mat); err != nil {
+			// Malformed material is a routing problem surfaced elsewhere; the
+			// self-check just skips it rather than failing the whole enumeration.
+			continue
+		}
+		for accountID, acc := range mat {
+			if acc.EgressProxyURL == "" {
+				continue
+			}
+			label := acc.Identity
+			if label == "" {
+				label = "account " + accountID
+			}
+			byAccount[accountID] = AccountEgressSpec{Label: label, Spec: acc.EgressProxyURL}
+		}
+	}
+
+	out := make([]AccountEgressSpec, 0, len(byAccount))
+	for _, s := range byAccount {
+		out = append(out, s)
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].Label < out[j].Label })
+	return out
 }

@@ -14,8 +14,8 @@ require (
 	github.com/aikeylabs/ai-degrade-detector/proxy-plugin/rhythm v0.0.0
 	github.com/tidwall/gjson v1.19.0
 	github.com/tidwall/sjson v1.2.5
-	golang.org/x/crypto v0.49.0
-	golang.org/x/term v0.41.0
+	golang.org/x/crypto v0.50.0
+	golang.org/x/term v0.42.0
 	gopkg.in/yaml.v3 v3.0.1
 	modernc.org/sqlite v1.48.2
 )
@@ -43,6 +43,7 @@ replace github.com/AiKeyLabs/aikey-config-tool => ../aikey-config-tool
 replace github.com/aikeylabs/ai-degrade-detector/proxy-plugin/rhythm => ../ai-degrade-detector/proxy-plugin/rhythm
 
 require (
+	github.com/AiKeyLabs/pkg/egress v0.0.0
 	github.com/AiKeyLabs/pkg/routingwire v0.0.0
 	github.com/andybalholm/brotli v1.2.0 // indirect
 	github.com/dustin/go-humanize v1.0.1 // indirect
@@ -60,12 +61,14 @@ require (
 	github.com/remyoudompheng/bigfft v0.0.0-20230129092748-24d4a6f8daec // indirect
 	github.com/tidwall/match v1.1.1 // indirect
 	github.com/tidwall/pretty v1.2.0 // indirect
-	golang.org/x/net v0.51.0
-	golang.org/x/sys v0.42.0
-	golang.org/x/text v0.35.0 // indirect
+	golang.org/x/net v0.53.0
+	golang.org/x/sys v0.43.0
+	golang.org/x/text v0.37.0 // indirect
 	modernc.org/libc v1.70.0 // indirect
 	modernc.org/mathutil v1.7.1 // indirect
 	modernc.org/memory v1.11.0 // indirect
 )
 
 replace github.com/AiKeyLabs/pkg/routingwire => ../pkg/routingwire
+
+replace github.com/AiKeyLabs/pkg/egress => ../pkg/egress

@@ -164,7 +164,8 @@ const (
 	// verbatim; GROUP_KEY_UNAVAILABLE is the proxy-local "can't decrypt" case.
 	ErrCodeGroupKeyUnavailable = "GROUP_KEY_UNAVAILABLE"
 	// ErrCodeGroupPoolFull (§5.5): 429 when the seat is blocked — every pool account
-	// is at the per-account user cap; the user waits or the admin adds accounts.
+	// is at the per-account user cap, or no usable account remains. Neutral wording
+	// (does not guess the cause); the user waits or contacts the admin.
 	ErrCodeGroupPoolFull = "GROUP_POOL_FULL"
 	// ErrCodeOAuthResponsesOnly (2026-07-13): the request targets an endpoint the
 	// credential's OAuth upstream doesn't serve. Codex OAuth (ChatGPT accounts)

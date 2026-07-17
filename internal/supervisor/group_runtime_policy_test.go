@@ -30,7 +30,8 @@ func TestBuildGroupRuntimeJSON_EncryptsBothTypesNoRefresh(t *testing.T) {
 	reset := int64(1750000000)
 	accts := []grAccount{
 		{AccountID: "a-oauth", CredentialType: "oauth_account", AccessToken: "at-live", ExpiresAt: 200,
-			WindowMaxUtilPct: &pct, WindowStatus: "active", WindowResetAt: &reset},
+			WindowMaxUtilPct: &pct, WindowStatus: "active", WindowResetAt: &reset,
+			EgressProxyURL: "socks5://10.0.0.9:1080"}, // per-account egress (§11.7, P7) — member rail
 		{AccountID: "a-key", CredentialType: "api_key", Key: "sk-real", BaseURL: "https://x", Revision: "r9"},
 	}
 	js, err := buildGroupRuntimeJSON(key, accts)
@@ -60,6 +61,12 @@ func TestBuildGroupRuntimeJSON_EncryptsBothTypesNoRefresh(t *testing.T) {
 	}
 	if oa.BaseURL != "" || oa.Revision != "" {
 		t.Fatalf("oauth must not carry KEY meta: %+v", oa)
+	}
+	// Per-account egress (§11.7, P7) must survive the member-rail projection into the
+	// vault material so the resolver hands it to accountEgressTransport — without this
+	// a per-account egress set in master silently no-ops on personal/team-member proxies.
+	if oa.EgressProxyURL != "socks5://10.0.0.9:1080" {
+		t.Fatalf("member-rail egress not carried into group_runtime: %q, want socks5://10.0.0.9:1080", oa.EgressProxyURL)
 	}
 	// KEY: decrypts back to the key + carries base_url/revision.
 	k := m["a-key"]

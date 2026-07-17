@@ -277,6 +277,10 @@ type Supervisor struct {
 	// generation's proxy (nil = default). atomic.Pointer so an egress hot-swap
 	// (SetTransport, 2026-06-30) can't race the gen-build read in applyToProxy.
 	transport atomic.Pointer[transportBox]
+	// nodeExplicitEgress carries the L1 override (user's node-level explicit
+	// upstream wins over per-account egress) across generation rebuilds, so a
+	// reload/hot-swap doesn't silently restore per-account precedence.
+	nodeExplicitEgress atomic.Bool
 	// ctx / cancel bound the lifetime of all detached upstream calls.
 	// Canceled in Shutdown() to stop any in-flight upstream requests.
 	ctx    context.Context
@@ -603,6 +607,17 @@ func (s *Supervisor) SetTransport(t http.RoundTripper) {
 	// itself atomic, so this hot-swap is safe while the generation serves requests.
 	if gen := s.active.Load(); gen != nil {
 		gen.proxy.SetTransport(t)
+	}
+}
+
+// SetNodeExplicitEgress mirrors the L1 override onto the live proxy (and stores
+// it so future generations inherit it). See proxy.SetNodeExplicitEgress: when on,
+// the user's node-level explicit upstream wins over per-account egress for ALL
+// routes (api-key / OAuth / team-oauth).
+func (s *Supervisor) SetNodeExplicitEgress(on bool) {
+	s.nodeExplicitEgress.Store(on)
+	if gen := s.active.Load(); gen != nil {
+		gen.proxy.SetNodeExplicitEgress(on)
 	}
 }
 
@@ -1468,6 +1483,9 @@ func (s *Supervisor) buildGeneration() (*generation, error) {
 	if b := s.transport.Load(); b != nil && b.rt != nil {
 		p.SetTransport(b.rt)
 	}
+	// Inherit the L1 override so a rebuilt generation keeps user-local-explicit
+	// precedence over per-account egress (see SetNodeExplicitEgress).
+	p.SetNodeExplicitEgress(s.nodeExplicitEgress.Load())
 	if s.broker != nil {
 		p.SetBroker(s.broker)
 	}

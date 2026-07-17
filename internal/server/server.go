@@ -97,6 +97,10 @@ func New(ln net.Listener, dataHandler http.Handler, adminHandler *admin.Handler,
 	mux.HandleFunc("PUT /admin/upstream-proxy", adminHandler.UpstreamProxySet)
 	mux.HandleFunc("POST /admin/upstream-proxy/probe", adminHandler.UpstreamProxyProbe)
 
+	// Per-account egress connectivity self-check (§5.4): `aikey test` (presence)
+	// / `aikey doctor` (?dial=1) read this to verify each pool account's egress.
+	mux.HandleFunc("GET /admin/egress/selfcheck", adminHandler.EgressSelfCheck)
+
 	// Extra route registrars (e.g., OAuth broker handler)
 	for _, h := range extraHandlers {
 		h.RegisterRoutes(mux)

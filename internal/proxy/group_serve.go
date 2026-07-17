@@ -48,18 +48,21 @@ func (p *Proxy) handleOauthGroupRoute(
 		return
 	}
 
-	// §5.5 hard cap: the engine left this seat UNBOUND — every account in its
-	// pool/segment is at the ≤3-人/号 cap. 429 here; do NOT fall through to the
-	// local pick, which is cap-blind and would route a 4th user onto a full account.
-	// (Distinct from the 503 degrade: an actionable "pool full" state, not a
-	// transient failure.)
+	// §5.5: the engine left this seat UNBOUND (every pool account at the ≤3-人/号
+	// cap, or no usable account at all). 429 here; do NOT fall through to the
+	// local pick, which is cap-blind and would route a 4th user onto a full
+	// account. Neutral wording that doesn't guess the cause — the original "add
+	// accounts" phrasing misdirected admins when the real cause was a transient
+	// unbind (2026-07-17 customer incident; the actual root cause was fixed in the
+	// binding pass, so this 429 is now rare — genuine cap-full or all-dead pool).
 	if p.routingOverrides.Blocked(route.SeatID, route.OauthGroupID) {
-		logger.Warn("oauth-group seat blocked: pool at per-account user cap",
+		logger.Warn("oauth-group seat blocked by the allocation engine",
 			"event.name", observability.EventProxyGroupSeatBlocked,
+			"error.code", observability.ErrCodeGroupPoolFull,
 			"oauth_group_id", route.OauthGroupID,
 			"seat_id", route.SeatID)
 		writeJSONError(w, http.StatusTooManyRequests, "rate_limit_error", observability.ErrCodeGroupPoolFull,
-			"No available account: every account in your pool is at the per-account user limit. Ask your admin to add accounts.")
+			"No available account in your pool right now. Contact your administrator if this persists.")
 		return
 	}
 	// Skip accounts cooling down from a recent upstream failure (N8c reactive
@@ -138,6 +141,23 @@ func (p *Proxy) handleOauthGroupRoute(
 			)
 			writeJSONError(w, http.StatusBadRequest, "invalid_request_error",
 				observability.ErrCodeOAuthResponsesOnly, reason)
+			return
+		}
+		// B2 guard (2026-07-17, verify-first 红灯实证 group_serve_verify_b2_test.go):
+		// an anthropic OAuth account whose material lacks ExternalID (the OAuth
+		// account UUID) must NOT be served — the injected metadata.user_id would
+		// carry an EMPTY uuid ("…_account__session_…"), which Anthropic's OAuth WAF
+		// rejects with a business 429 (no rate-limit signal → never cooled → sticky
+		// re-pick → permanent 429 dead loop; 引擎方案 §2.2 audit + research/
+		// oauth-token-exchange-test). Reachable via the RW7 admin-enroll window:
+		// external_id is backfilled on first member login, and the material rail
+		// lags ≤60s behind. Respond login-required for THIS account: the member's
+		// sign-in IS the backfill action (SetExternalIDIfEmpty), and if already
+		// backfilled the prompt self-heals on the next material pull (§6.3:
+		// incomplete material = 不可选). Codex keys off AccountID and Kimi doesn't
+		// use it — only the anthropic family needs the uuid.
+		if canonicalCode == "anthropic" && res.OAuth != nil && res.OAuth.ExternalID == "" {
+			p.respondLoginRequired(w, logger, route, res.AccountID)
 			return
 		}
 		// Per-provider OAuth upstream (base URL + any provider setup like codex's

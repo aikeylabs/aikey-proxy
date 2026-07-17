@@ -48,6 +48,12 @@ type EgressState struct {
 	// when direct.
 	EffectiveSource string `json:"effective_source"`
 	EffectiveURL    string `json:"effective_url,omitempty"`
+	// MultiProtocol: true when this build has the enterprise multi-protocol
+	// (mihomo) egress engine. The /user/settings upstream editor gates its
+	// affordances on this — a multi-line spec box (socks5 chain / ss/vmess/trojan
+	// config fragment, aligned with the master per-account editor) when true; a
+	// single-URL input when false (open-source degrades to the original mode).
+	MultiProtocol bool `json:"multi_protocol"`
 }
 
 // UpstreamProxyGet serves GET /admin/upstream-proxy — the live egress proxy URL the

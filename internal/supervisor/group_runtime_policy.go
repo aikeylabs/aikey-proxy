@@ -150,6 +150,11 @@ type grAccount struct {
 	// producer must populate it for Claude OAuth group accounts — until then it
 	// arrives empty and Claude OAuth group routing is degraded (see N8 finding).
 	ExternalID string `json:"external_id"`
+	// EgressProxyURL is this account's optional per-account egress proxy (§11.7,
+	// P7): a non-secret routing attribute master ships on the member rail so this
+	// (personal/team-member) proxy pins the account's outbound to its own exit IP,
+	// same as a cluster worker gets via the org rail. "" → node-level egress chain.
+	EgressProxyURL string `json:"egress_proxy_url"`
 	// KEY-only:
 	Key      string `json:"key"`
 	BaseURL  string `json:"base_url"`
@@ -336,6 +341,7 @@ func buildGroupRuntimeMap(derivedKey []byte, accounts []grAccount) map[string]vk
 			gra.WindowStatus = a.WindowStatus
 			gra.WindowResetAt = a.WindowResetAt
 			gra.ExternalID = a.ExternalID
+			gra.EgressProxyURL = a.EgressProxyURL // per-account egress (§11.7, P7) — member rail
 		}
 		out[a.AccountID] = gra
 	}

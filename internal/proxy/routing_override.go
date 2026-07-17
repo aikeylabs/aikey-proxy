@@ -133,10 +133,11 @@ func (c *RoutingOverrideCache) Assignment(seatID, groupID string) string {
 	return c.lookup(seatID, groupID)
 }
 
-// Blocked reports whether the engine left (seatID, groupID) UNBOUND because every
-// account in its pool/segment is at the ≤3-人/号 cap. The proxy 429s a blocked seat
-// instead of falling back to the cap-blind local pick (which would route a 4th user
-// onto a full account). nil-safe; false when the feature is off / nothing stored.
+// Blocked reports whether the engine left (seatID, groupID) UNBOUND — every pool
+// account at the ≤3-人/号 cap, or no usable account at all. The proxy 429s a
+// blocked seat instead of falling back to the cap-blind local pick (which would
+// route a 4th user onto a full account). nil-safe; false when the feature is off /
+// nothing stored.
 func (c *RoutingOverrideCache) Blocked(seatID, groupID string) bool {
 	if c == nil || seatID == "" || groupID == "" {
 		return false

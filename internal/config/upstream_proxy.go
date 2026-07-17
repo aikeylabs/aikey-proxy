@@ -22,17 +22,39 @@ import (
 	"path/filepath"
 	"strings"
 
+	"github.com/AiKeyLabs/pkg/egress"
 	"gopkg.in/yaml.v3"
 )
 
-// ValidateUpstreamProxyURL accepts "" (clear → direct egress) or an http/https/
-// socks5 URL with a host:port. Mirrors the (now-removed) master systemsettings
-// validator so the contract is identical across the egress-convergence move.
+// ValidateUpstreamProxyURL accepts "" (clear → direct egress), a single http/
+// https/socks5 URL with host:port, a socks5 CHAIN (socks5://front,socks5://exit),
+// or a multi-protocol config FRAGMENT (proxies/proxy-groups). Chains and fragments
+// are delegated to egress.ValidateSpec so /user/settings accepts exactly the same
+// forms as the master per-account editor (config alignment).
+//
+// Bugfix 2026-07-17: chains + fragments were rejected here even though the node
+// upstream RUNTIME (BuildEgressTransport → egress.BuildDialer) already supports
+// them — egress.ValidateSpec was written to be shared by this caller (see its
+// docstring) but was never wired. Fragments additionally need the multi-protocol
+// (mihomo) engine, which only the enterprise offline package links; on the
+// GPL-free OSS build we reject a fragment early with an actionable message rather
+// than accepting it and failing at dial time ("server set a fragment, local can't
+// dial it").
 func ValidateUpstreamProxyURL(raw string) error {
-	if strings.TrimSpace(raw) == "" {
+	s := strings.TrimSpace(raw)
+	if s == "" {
 		return nil // empty = clear the proxy (direct egress)
 	}
-	u, err := url.Parse(raw)
+	// Engine spec (socks5 chain or config fragment) → the egress engine handles it.
+	if strings.Contains(s, ",") || egress.IsFragment(s) {
+		if egress.IsFragment(s) && !egress.MultiProtocolAvailable() {
+			return fmt.Errorf("multi-protocol egress (ss/vmess/trojan/… or a fallback group) needs the enterprise offline package; " +
+				"this build supports a single http/socks5 URL or a socks5 chain (e.g. socks5://front:1080,socks5://exit:1080)")
+		}
+		return egress.ValidateSpec(s)
+	}
+	// Single URL (http/https/socks5).
+	u, err := url.Parse(s)
 	if err != nil {
 		return fmt.Errorf("not a valid URL: %w", err)
 	}

@@ -118,6 +118,13 @@ type Handler struct {
 	// a response (proxy unreachable / DNS / timeout). Any HTTP status = reachable.
 	// nil → 503.
 	ProbeUpstreamProxyFn func(url string) (status int, elapsedMs int64, err error)
+
+	// EgressSelfCheckFn backs GET /admin/egress/selfcheck — the per-account egress
+	// connectivity self-check for `aikey test` (presence) / `aikey doctor` (dial).
+	// Enumerates the registry's per-account egress specs and, when dial=true,
+	// probes each via the shared egress.TestDial. nil → empty list. See
+	// egress_selfcheck.go + the app.Run wiring.
+	EgressSelfCheckFn func(ctx context.Context, dial bool) []EgressCheckResult
 }
 
 // KeyCheckTarget holds decrypted credentials for one provider, used by GET /health/keys.

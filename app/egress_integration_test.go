@@ -16,6 +16,7 @@ package app
 // sends loopback destinations direct.
 
 import (
+	"context"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -72,12 +73,13 @@ func TestEgress_FollowsSystemProxySwitch_NoRestart(t *testing.T) {
 	})
 
 	// The REAL production transport for direct mode (upstream_proxy.url empty).
-	transport := buildTransport("", watcher.ProxyFunc())
+	transport, _ := buildTransport("", watcher.ProxyFunc())
 	client := &http.Client{Transport: transport, Timeout: 5 * time.Second}
 
 	egress := func() string {
 		t.Helper()
-		resp, err := client.Get("http://provider.test/v1/ping")
+		req, _ := http.NewRequestWithContext(context.Background(), http.MethodGet, "http://provider.test/v1/ping", nil)
+		resp, err := client.Do(req)
 		if err != nil {
 			t.Fatalf("egress request failed: %v", err)
 		}
@@ -111,7 +113,7 @@ func TestEgress_FollowsSystemProxySwitch_NoRestart(t *testing.T) {
 	if !watcher.PollOnce() {
 		t.Fatal("watcher must observe the toggle-off")
 	}
-	req, _ := http.NewRequest(http.MethodGet, "http://provider.test/v1/ping", nil)
+	req, _ := http.NewRequestWithContext(context.Background(), http.MethodGet, "http://provider.test/v1/ping", nil)
 	if u, err := transport.Proxy(req); err != nil || u != nil {
 		t.Fatalf("after toggle-off egress must be direct, got proxy=%v err=%v", u, err)
 	}
@@ -127,10 +129,11 @@ func TestEgress_ExplicitURLOutranksSystemProxy(t *testing.T) {
 	watcher := sysproxy.NewWatcherWithReader(func() (sysproxy.Snapshot, error) {
 		return sysproxy.Snapshot{HTTP: proxyA.URL, HTTPS: proxyA.URL}, nil
 	})
-	transport := buildTransport(proxyB.URL, watcher.ProxyFunc())
+	transport, _ := buildTransport(proxyB.URL, watcher.ProxyFunc())
 	client := &http.Client{Transport: transport, Timeout: 5 * time.Second}
 
-	resp, err := client.Get("http://provider.test/v1/ping")
+	req, _ := http.NewRequestWithContext(context.Background(), http.MethodGet, "http://provider.test/v1/ping", nil)
+	resp, err := client.Do(req)
 	if err != nil {
 		t.Fatalf("egress request failed: %v", err)
 	}
@@ -247,9 +250,10 @@ func TestEgress_InheritedEnvFallbackCarriesTraffic(t *testing.T) {
 	watcher := sysproxy.NewWatcherWithReader(func() (sysproxy.Snapshot, error) {
 		return sysproxy.Snapshot{}, nil
 	})
-	transport := buildTransport("", watcher.ProxyFunc())
+	transport, _ := buildTransport("", watcher.ProxyFunc())
 	client := &http.Client{Transport: transport, Timeout: 5 * time.Second}
-	resp, err := client.Get("http://provider.test/v1/ping")
+	req, _ := http.NewRequestWithContext(context.Background(), http.MethodGet, "http://provider.test/v1/ping", nil)
+	resp, err := client.Do(req)
 	if err != nil {
 		t.Fatalf("egress request failed: %v", err)
 	}
