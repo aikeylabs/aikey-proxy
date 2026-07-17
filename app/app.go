@@ -762,8 +762,13 @@ func buildTransport(proxyURL string, sysProxy func(*http.Request) (*url.URL, err
 	}
 
 	if egress.IsEngineSpec(spec) {
-		if !egress.MultiProtocolAvailable() {
-			slog.Warn("upstream_proxy chain/multi-protocol spec ignored: this build supports a single proxy URL only (enterprise package required); falling back to env/system proxy")
+		// Only multi-protocol FRAGMENTS (ss/vmess/trojan/… or a proxy-group) need the
+		// enterprise mihomo engine. A socks5 CHAIN is handled by the built-in,
+		// GPL-free engine on EVERY build (P8 line 106/225 "socks5 链 → 全构建行为一致";
+		// symmetric with per-account egress). So gate ONLY fragments; let chains
+		// build. requirements/2026-07-17-egress-spec-capability-by-edition.md.
+		if egress.IsFragment(spec) && !egress.MultiProtocolAvailable() {
+			slog.Warn("upstream_proxy multi-protocol fragment ignored: it needs the enterprise package (this build supports a single URL or a socks5 chain); falling back to env/system proxy")
 			return direct(), nil
 		}
 		// The engine transport (dialerToTransport) already applies the shared
@@ -772,10 +777,10 @@ func buildTransport(proxyURL string, sysProxy func(*http.Request) (*url.URL, err
 		// no extra wrapping here.
 		t, closer, err := proxy.BuildEgressTransport(spec)
 		if err != nil {
-			slog.Warn("upstream_proxy multi-protocol spec failed to build, falling back to env/system proxy", "error", err)
+			slog.Warn("upstream_proxy engine spec failed to build, falling back to env/system proxy", "error", err)
 			return direct(), nil
 		}
-		slog.Info("upstream proxy configured (multi-protocol engine)")
+		slog.Info("upstream proxy configured (egress engine)")
 		return t, closer
 	}
 
@@ -809,37 +814,17 @@ func buildTransport(proxyURL string, sysProxy func(*http.Request) (*url.URL, err
 
 // validateNodeUpstream gates a candidate /user/settings upstream spec at write
 // time (SetUpstreamProxyFn) so a bad value is rejected there rather than silently
-// going direct at request time. Mirrors buildTransport's dispatch so what
-// validates is exactly what will build. Empty = clear (always ok).
-//   - engine-spec (chain / fragment): rejected loudly in a build without the
-//     enterprise multi-protocol engine ("single URL only"); otherwise
-//     shape-checked via egress.ValidateSpec (same forms as the master
-//     per-account editor — config alignment).
-//   - single URL: must parse and be http/https/socks5 with a host.
+// going direct at request time.
+//
+// SINGLE SOURCE OF TRUTH (收敛 2026-07-17): delegates to the low-layer
+// config.ValidateUpstreamProxyURL so this runtime gate and the admin PUT handler
+// (internal/admin/upstream_proxy.go) accept EXACTLY the same forms — no drift.
+// Semantics per requirements/2026-07-17-egress-spec-capability-by-edition.md:
+// single URL + socks5 chain accepted on ALL builds (built-in engine); only a
+// multi-protocol FRAGMENT requires the enterprise mihomo engine. (Previously this
+// duplicated the dispatch and wrongly rejected socks5 chains on OSS.)
 func validateNodeUpstream(spec string) error {
-	spec = strings.TrimSpace(spec)
-	if spec == "" {
-		return nil
-	}
-	if egress.IsEngineSpec(spec) {
-		if !egress.MultiProtocolAvailable() {
-			return fmt.Errorf("this build supports a single proxy URL only (http/https/socks5); multi-hop chains and protocol configs require the enterprise package")
-		}
-		return egress.ValidateSpec(spec)
-	}
-	u, err := url.Parse(spec)
-	if err != nil {
-		return fmt.Errorf("not a valid proxy URL: %w", err)
-	}
-	switch u.Scheme {
-	case "http", "https", "socks5":
-	default:
-		return fmt.Errorf("unsupported proxy scheme %q (use http, https, or socks5)", u.Scheme)
-	}
-	if u.Host == "" {
-		return fmt.Errorf("proxy URL missing host:port")
-	}
-	return nil
+	return config.ValidateUpstreamProxyURL(spec)
 }
 
 // runWALVacuum implements `aikey-proxy wal vacuum [--config path]`: loads the
