@@ -3,6 +3,7 @@ package proxy
 import (
 	"context"
 	"net/http"
+	"net/url"
 	"os"
 	"strings"
 
@@ -267,17 +268,39 @@ func oauthUpstreamRejectsPath(canonicalCode, urlPath string) string {
 		"or use a Responses-API client such as codex."
 }
 
+// testOnlyBaseURLAllowed gates the AIKEY_PROXY_TEST_* base-url hooks. Allowed:
+// plain-http loopback, or a plain-http hostname under the RFC 6761 reserved
+// ".test" TLD — public DNS can never resolve ".test", so a prod misconfig still
+// cannot reroute real traffic anywhere routable. Why ".test" is needed at all:
+// the egress-coexistence E2E must send OAuth traffic THROUGH a per-account
+// egress, and the always-on loopback egress bypass (egress_engine.go, 2026-07-16
+// security fix) would short-circuit a 127.0.0.1 mock — so the mock is addressed
+// by a fake ".test" hostname the test's socks5 exit resolves back to loopback.
+// See aikey-test/oauthgroup/egress_coexist_e2e_test.go.
+func testOnlyBaseURLAllowed(raw string) bool {
+	if raw == "" {
+		return false
+	}
+	if strings.HasPrefix(raw, "http://127.0.0.1:") || strings.HasPrefix(raw, "http://localhost:") {
+		return true
+	}
+	u, err := url.Parse(raw)
+	if err != nil {
+		return false
+	}
+	return u.Scheme == "http" && strings.HasSuffix(u.Hostname(), ".test")
+}
+
 func providerDefaultBaseURL(providerCode string) string {
 	switch strings.ToLower(providerCode) {
 	case "anthropic", "claude":
-		// Test-only hook (gated to loopback): the cross-component OAuth-account
-		// routing E2E points the otherwise-hardcoded Anthropic upstream at a local
-		// mock. OAuth accounts carry no configurable base_url (unlike api_key
-		// material), so without this the OAuth inject path can't be exercised
-		// against a mock. The loopback guard means a prod misconfig can never
+		// Test-only hook (gated to loopback / .test): the cross-component
+		// OAuth-account routing E2E points the otherwise-hardcoded Anthropic
+		// upstream at a local mock. OAuth accounts carry no configurable base_url
+		// (unlike api_key material), so without this the OAuth inject path can't
+		// be exercised against a mock. The guard means a prod misconfig can never
 		// reroute real traffic. See aikey-test/oauthgroup/oauth_account_routing_test.go.
-		if o := os.Getenv("AIKEY_PROXY_TEST_ANTHROPIC_BASE_URL"); o != "" &&
-			(strings.HasPrefix(o, "http://127.0.0.1:") || strings.HasPrefix(o, "http://localhost:")) {
+		if o := os.Getenv("AIKEY_PROXY_TEST_ANTHROPIC_BASE_URL"); testOnlyBaseURLAllowed(o) {
 			return o
 		}
 		return "https://api.anthropic.com"

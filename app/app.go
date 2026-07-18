@@ -424,10 +424,9 @@ func Run() {
 			return err
 		}
 		installTransport(buildTransport(spec, sysWatcher.ProxyFunc()))
-		// L1 override: a set explicit node upstream wins over per-account egress for
-		// ALL routes (api-key / OAuth / team-oauth). Clearing it restores per-account
-		// precedence. (User decision 2026-07-16 — escape hatch when admin proxy down.)
-		sup.SetNodeExplicitEgress(spec != "")
+		// 2026-07-18 (reversed the L1 override): the node upstream serves only
+		// non-egress traffic; per-account egress stays independent, so setting/clearing
+		// the node upstream no longer touches per-account egress precedence.
 		broker.SetHTTPClient(broker.NewImpersonateChromeHTTPClient(effectiveBrokerEgress(spec)))
 		egressMu.Lock()
 		egressURL = spec
@@ -515,13 +514,6 @@ func Run() {
 			installTransport(buildTransport(cfg.UpstreamProxy.URL, sysWatcher.ProxyFunc()))
 		}()
 	}
-	// Seed the L1 override from the persisted config so a node that boots with an
-	// explicit upstream already overrides per-account egress (matches the runtime
-	// SetUpstreamProxyFn behavior — no first-request window where per-account wins).
-	// Set synchronously (independent of the async transport install above) so the
-	// override is in effect from the first request even while the group builds.
-	sup.SetNodeExplicitEgress(bootSpec != "")
-
 	// Start the system-proxy poll loop (inert when env config is authoritative,
 	// on unsupported platforms, and — via the explicit-egress guard below —
 	// effectively when upstream_proxy.url is set). On change: flush the idle

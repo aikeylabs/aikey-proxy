@@ -404,12 +404,17 @@ func (p *Proxy) serveRoute(w http.ResponseWriter, r *http.Request, route *vkeys.
 	// (e.g. non-socks5 node front cannot chain a socks5 account) fails the request
 	// loudly rather than silently leaking traffic out the wrong (node) IP.
 	//
-	// L1 override (2026-07-16): when the user pinned an explicit node-level upstream
-	// via /user/settings, it wins over per-account egress — the escape hatch when
-	// the admin's per-account proxy is down (avoids total unavailability). So this
-	// block is skipped and the request rides the node-level transport (SetTransport)
-	// like api-key / OAuth traffic. Precedence: user-local explicit > per-account.
-	if route.EgressProxyURL != "" && !p.nodeExplicitEgress.Load() {
+	// Coexistence (2026-07-18, reversed the 2026-07-16 L1 override): per-account
+	// egress is an ACCOUNT-level attribute — it applies whenever the resolved account
+	// has one, INDEPENDENT of any node-level upstream. A node upstream set via
+	// /user/settings only serves traffic WITHOUT a per-account egress (api_key / VK /
+	// OAuth accounts without one) — it no longer overrides an account's egress. This
+	// keeps single-IP-per-account防封 intact while letting the user proxy their
+	// non-egress traffic. Trade-off: if the admin's per-account proxy is down, the
+	// account's request fails loudly (ErrCodeAccountEgressProxy 503) rather than
+	// silently rerouting through the node upstream out a different IP.
+	// See update/20260718-per-account-egress-与节点上游共存.md.
+	if route.EgressProxyURL != "" {
 		egT, egErr := p.accountEgressTransport(route.EgressProxyURL)
 		if egErr != nil {
 			p.errors.Add(1)

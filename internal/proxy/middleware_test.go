@@ -25,3 +25,37 @@ func TestWriteJSONError_MarksAikeyOrigin(t *testing.T) {
 		t.Errorf("body must keep provider-shaped type + aikey code, got %s", b)
 	}
 }
+
+// TestTestOnlyBaseURLAllowed pins the AIKEY_PROXY_TEST_* base-url gate: loopback
+// and RFC 6761 ".test" hostnames pass (the egress-coexistence E2E needs a
+// non-loopback name so the loopback egress bypass doesn't short-circuit it);
+// anything routable is REJECTED so a prod misconfig can never reroute real
+// traffic. 能红: widen the gate (e.g. drop the ".test" suffix check) and the
+// routable-host cases fire.
+func TestTestOnlyBaseURLAllowed(t *testing.T) {
+	allowed := []string{
+		"http://127.0.0.1:8080",
+		"http://localhost:9999",
+		"http://e2e-oauth.aikey.test:18080", // egress E2E form
+		"http://mock.test:1",
+	}
+	rejected := []string{
+		"",
+		"https://api.anthropic.com",
+		"http://evil.com:80",              // routable host
+		"http://test.evil.com:80",         // ".test" only as a LABEL, not the TLD
+		"https://e2e-oauth.aikey.test:18", // https not allowed — hook is plain-http mocks only
+		"http://10.0.0.9:1080",            // private IP is still routable
+		"::not a url::",
+	}
+	for _, u := range allowed {
+		if !testOnlyBaseURLAllowed(u) {
+			t.Errorf("must ALLOW %q", u)
+		}
+	}
+	for _, u := range rejected {
+		if testOnlyBaseURLAllowed(u) {
+			t.Errorf("must REJECT %q (routable → could reroute real traffic)", u)
+		}
+	}
+}
