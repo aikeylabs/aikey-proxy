@@ -40,15 +40,28 @@ type outboundCapture struct {
 	// the N8c cooldown path.
 	status     int
 	respHeader http.Header
+	// N9 failover test hooks: per-Authorization status/error overrides (so one
+	// pool account can fail while another serves within the SAME request) and a
+	// round-trip counter (asserting how many upstream attempts a request made).
+	statusByAuth map[string]int
+	errByAuth    map[string]error
+	calls        int
 }
 
 func (c *outboundCapture) RoundTrip(req *http.Request) (*http.Response, error) {
+	c.calls++
 	c.host = req.URL.Host
 	c.auth = req.Header.Get("Authorization")
 	c.apiKey = req.Header.Get("x-api-key")
 	c.session = req.Header.Get("X-Claude-Code-Session-Id")
 	c.stainlessOS = req.Header.Get("X-Stainless-OS")
+	if err, ok := c.errByAuth[c.auth]; ok && err != nil {
+		return nil, err
+	}
 	st := c.status
+	if s, ok := c.statusByAuth[c.auth]; ok {
+		st = s
+	}
 	if st == 0 {
 		st = 200
 	}
@@ -696,28 +709,36 @@ func TestGroupServe_FallbackAttributesToServedAccount(t *testing.T) {
 	p.SetWAL(wal)
 	p.SetReporter(nil, "proxy-grp", "test", "gen-grp", 0, "acc-grp")
 
-	// Request 1: the primary account serves; upstream 401 cools it down.
-	tr.status = http.StatusUnauthorized
-	req1, w1 := groupReq(groupBody)
-	p.Handle(w1, req1)
+	// Probe: learn which account seatassign ranks first (all-200, no cooldowns).
+	probeReq, probeW := groupReq(groupBody)
+	p.Handle(probeW, probeReq)
+	if probeW.Code != http.StatusOK {
+		t.Fatalf("probe request failed: %d %s", probeW.Code, probeW.Body.String())
+	}
 	served1 := tokToAcct[strings.TrimPrefix(tr.auth, "Bearer ")]
 	if served1 == "" {
-		t.Fatalf("req1 outbound auth %q did not map to a known account", tr.auth)
-	}
-	if !p.poolCooldown.skipSet()[served1] {
-		t.Fatalf("401 must cool the serving account %s", served1)
+		t.Fatalf("probe outbound auth %q did not map to a known account", tr.auth)
 	}
 
-	// Request 2: primary cooling → the proxy switches to the OTHER account.
-	tr.status = 0
+	// The failing request: ONLY the primary 401s. N9 in-request failover must cool
+	// it, retry on the other account and return 200 — the client never sees the 401.
+	tr.statusByAuth = map[string]int{"Bearer tok-1": 200, "Bearer tok-2": 200}
+	primaryTok := "tok-1"
+	if served1 == "acc-2" {
+		primaryTok = "tok-2"
+	}
+	tr.statusByAuth["Bearer "+primaryTok] = http.StatusUnauthorized
 	req2, w2 := groupReq(groupBody)
 	p.Handle(w2, req2)
 	if w2.Code != http.StatusOK {
-		t.Fatalf("fallback request should succeed via the other account, got %d: %s", w2.Code, w2.Body.String())
+		t.Fatalf("in-request failover should succeed via the other account, got %d: %s", w2.Code, w2.Body.String())
+	}
+	if !p.poolCooldown.skipSet()[served1] {
+		t.Fatalf("401 must cool the failing primary %s", served1)
 	}
 	served2 := tokToAcct[strings.TrimPrefix(tr.auth, "Bearer ")]
 	if served2 == "" || served2 == served1 {
-		t.Fatalf("req2 must serve via a DIFFERENT account; served1=%s served2=%s (auth=%q)", served1, served2, tr.auth)
+		t.Fatalf("failover must serve via a DIFFERENT account; served1=%s served2=%s (auth=%q)", served1, served2, tr.auth)
 	}
 
 	// AUDIT assertion: poll the recorded events for the 200 (fallback) request and

@@ -441,6 +441,32 @@ func Run() {
 		return egressState(explicit, sysWatcher)
 	}
 
+	// Escape hatch (2026-07-19): apply the persisted opt-in flag at boot so it
+	// survives restart, then expose GET/PUT. Set persists to aikey-user.yaml +
+	// hot-applies across generations (sup.SetOAuthEgressOverride). Node-local.
+	sup.SetOAuthEgressOverride(cfg.UpstreamProxy.OAuthEgressOverride)
+	adminHandler.GetOAuthEgressOverrideFn = func() bool { return sup.OAuthEgressOverride() }
+	adminHandler.SetOAuthEgressOverrideFn = func(on bool) error {
+		if err := config.PersistOAuthEgressOverride(resolvedPath, on); err != nil {
+			return err
+		}
+		sup.SetOAuthEgressOverride(on)
+		return nil
+	}
+
+	// LiveUpstreamTransportFn hands ProbePing the transport currently serving
+	// forwarding, so an engine-spec upstream (mihomo fragment / socks5 chain) is
+	// pinged through the ALREADY-BUILT runtime route instead of rebuilding the
+	// engine per call (seconds of build cost — over the CLI's 4s ping budget;
+	// bugfix 2026-07-19). During the engine boot window this is the interim
+	// direct transport — truthful, that IS what forwarding would use right then.
+	adminHandler.LiveUpstreamTransportFn = func() http.RoundTripper {
+		if t := liveTransport.Load(); t != nil {
+			return t
+		}
+		return nil
+	}
+
 	// ProbeUpstreamProxyFn tests a CANDIDATE egress URL end-to-end (through the same
 	// buildTransport the live path uses) to a provider host, WITHOUT persisting it, so
 	// the web "Test connectivity" button can verify before Save. Any HTTP response

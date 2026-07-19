@@ -410,11 +410,21 @@ func (p *Proxy) serveRoute(w http.ResponseWriter, r *http.Request, route *vkeys.
 	// /user/settings only serves traffic WITHOUT a per-account egress (api_key / VK /
 	// OAuth accounts without one) — it no longer overrides an account's egress. This
 	// keeps single-IP-per-account防封 intact while letting the user proxy their
-	// non-egress traffic. Trade-off: if the admin's per-account proxy is down, the
-	// account's request fails loudly (ErrCodeAccountEgressProxy 503) rather than
-	// silently rerouting through the node upstream out a different IP.
-	// See update/20260718-per-account-egress-与节点上游共存.md.
-	if route.EgressProxyURL != "" {
+	// non-egress traffic.
+	//
+	// Escape hatch (2026-07-19, OPT-IN — update/20260719-oauth-egress-override-逃生舱.md):
+	// `oauthEgressOverride` re-adds a GATED override for self-rescue. Default OFF →
+	// the condition is byte-identical to the 2026-07-18 coexist behavior (a
+	// per-account egress applies unconditionally). When a member deliberately flips
+	// it ON (Settings → Upstream proxy), an OAuth account's egress is SKIPPED and its
+	// traffic falls to the node chain (`inner`, unchanged below) — the same transport
+	// non-egress traffic already uses — so a member whose admin egress line is down
+	// can route out their own upstream instead of eating a 503. Node-local; the cost
+	// (all OAuth accounts then share this node's exit IP) is surfaced in the UI.
+	// Trade-off when OFF: if the admin's per-account proxy is down, the account's
+	// request fails loudly (ErrCodeAccountEgressProxy 503) — the escape hatch is the
+	// deliberate opt-out of that fail-loud.
+	if route.EgressProxyURL != "" && !p.oauthEgressOverride.Load() {
 		egT, egErr := p.accountEgressTransport(route.EgressProxyURL)
 		if egErr != nil {
 			p.errors.Add(1)
@@ -533,13 +543,60 @@ func (p *Proxy) serveRoute(w http.ResponseWriter, r *http.Request, route *vkeys.
 				if epoch, ok := observedResetEpoch(resp.Header); ok {
 					p.poolObservedResets.record(route.AccountID, epoch)
 				}
-				if until, ok := cooldownDecision(resp, time.Now()); ok {
+				// P1-C tier-first guard (2026-07-19, sub2api "must not fall through"):
+				// a 429 whose SOLE trigger is a premium-model window (Fable 7d_oi)
+				// cools (account, tier) only — the aggregate unified headers mirror
+				// the representative claim, so without this guard the generic
+				// evidence path below would cool the WHOLE account and block every
+				// other model's traffic too (pool-wide, via in-request failover).
+				nowT := time.Now()
+				tierUntil, tierKey, tierOnly := time.Time{}, "", false
+				if resp.StatusCode == http.StatusTooManyRequests {
+					tierUntil, tierKey, tierOnly = anthropicTierOnlyLimit(resp.Header, nowT)
+					// self-surfacing tier-table gap detection (Phase 0 folded into
+					// post-deploy log verification): an exhausted window id we don't
+					// map yet is loudly visible instead of silently misclassified.
+					if wins := unknownExhaustedWindows(resp.Header); len(wins) > 0 {
+						logger.Warn("pool 429 carries unmapped exhausted rate-limit window(s)",
+							"event.name", observability.EventProxyGroupModelTierCooldown,
+							"account_id", route.AccountID,
+							"window_ids", strings.Join(wins, ","))
+					}
+				}
+				if tierOnly {
+					p.poolCooldown.markTier(route.AccountID, tierKey, tierUntil)
+					logger.Warn("pool account model-tier cooled down (other models keep serving)",
+						"event.name", observability.EventProxyGroupModelTierCooldown,
+						"oauth_group_id", route.OauthGroupID,
+						"account_id", route.AccountID,
+						"tier", tierKey,
+						"until", tierUntil.Unix())
+				} else if until, ok := cooldownDecision(resp, nowT); ok {
 					p.poolCooldown.mark(route.AccountID, until)
 					logger.Warn("pool account cooled down after upstream failure",
 						"event.name", observability.EventProxyGroupAccountCooldown,
 						"oauth_group_id", route.OauthGroupID,
 						"account_id", route.AccountID,
 						"status", resp.StatusCode)
+				} else if resp.StatusCode >= 500 {
+					// P0-B (2026-07-19): generic 5xx cools only after CONSECUTIVE
+					// repeats — a single transient 502/503 must not pull a good
+					// account, but a persistently-broken one must stop eating one
+					// wasted in-request-failover attempt per request (N9 hides the
+					// failure from the CLIENT; this stops the WASTE).
+					if _, cooled := p.poolCooldown.noteServerError(route.AccountID); cooled {
+						// noteServerError marked the cooldown itself (atomic with the
+						// streak reset) — this is the observability side only.
+						logger.Warn("pool account cooled down after repeated server errors",
+							"event.name", observability.EventProxyGroupAccountCooldown,
+							"oauth_group_id", route.OauthGroupID,
+							"account_id", route.AccountID,
+							"status", resp.StatusCode,
+							"streak_threshold", serverErrStreakThreshold)
+					}
+				} else if resp.StatusCode < 400 {
+					// success proves the account serves → reset its 5xx streak.
+					p.poolCooldown.noteSuccess(route.AccountID)
 				}
 				// N10 防封 pre-cut: even on a 200, if the account's utilization
 				// crossed its randomized cap, cool it down for this window so it
@@ -840,6 +897,26 @@ func (p *Proxy) serveRoute(w http.ResponseWriter, r *http.Request, route *vkeys.
 		ErrorHandler: func(w http.ResponseWriter, r *http.Request, err error) {
 			p.errors.Add(1)
 			latencyMs := time.Since(startTime).Milliseconds()
+			// P0-B (2026-07-19): transport-level failures (dial refused, TLS
+			// failure, pre-response timeout, egress hop down) never reach
+			// ModifyResponse, so they were invisible to the pool health path —
+			// sticky binding kept sending every next request into the dead lane.
+			// Count them toward the account's CONSECUTIVE server-error streak
+			// (same threshold as generic 5xx; one blip cools nobody). The 502/503
+			// written below flows through N9's first-byte gate, so group routes
+			// ALSO retry this request on another account. context.Canceled is the
+			// CLIENT hanging up (streaming keeps the client context) — not the
+			// account's fault, never counted.
+			if route.OauthGroupID != "" && route.AccountID != "" && !errors.Is(err, context.Canceled) {
+				if _, cooled := p.poolCooldown.noteServerError(route.AccountID); cooled {
+					logger.Warn("pool account cooled down after repeated transport errors",
+						"event.name", observability.EventProxyGroupAccountCooldown,
+						"oauth_group_id", route.OauthGroupID,
+						"account_id", route.AccountID,
+						"error.message", err.Error(),
+						"streak_threshold", serverErrStreakThreshold)
+				}
+			}
 			// Per-account egress dial failure (a socks5 hop refused, or a
 			// fallback/url-test group has NO reachable member): surface it plainly
 			// so the user knows it's THEIR egress, not the provider, and NEVER fall

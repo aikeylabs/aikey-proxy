@@ -77,3 +77,71 @@ func TestServeRoute_PerAccountEgress_CoexistsWithNodeUpstream(t *testing.T) {
 		t.Fatalf("account WITHOUT egress must NOT touch another account's egress — account socks5 got %d new connects", after-before)
 	}
 }
+
+// Escape hatch (2026-07-19, update/20260719-oauth-egress-override-逃生舱.md): the
+// OPT-IN override makes an OAuth account's per-account egress fall back to the node
+// upstream chain — the self-rescue lever when the admin's egress line is down.
+// Same harness as coexistence above; the ONLY difference is the flag.
+//
+// 能红: delete the `&& !p.oauthEgressOverride.Load()` gate in serveRoute and
+// assertion (A) fires — the account rides its own egress (account socks5 connects>0,
+// node hits=0) instead of the node upstream, i.e. the override is inert.
+func TestServeRoute_OAuthEgressOverride_RoutesThroughNodeUpstream(t *testing.T) {
+	noEgressBypass(t)
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"type":"message","content":[{"type":"text","text":"hi"}],"usage":{"input_tokens":1,"output_tokens":1}}`))
+	}))
+	defer upstream.Close()
+	accountExit := egresstest.NewSocks5Server(t, "", "")
+	node := &recordingNodeTransport{}
+
+	p := setupTestProxy(t, upstream.URL)
+	p.SetTransport(node)
+	prov, err := p.providers.Get("anthropic")
+	if err != nil {
+		t.Fatalf("anthropic provider: %v", err)
+	}
+	body := `{"model":"claude-sonnet-4-5","messages":[{"role":"user","content":"hi"}]}`
+	oauthRoute := &vkeys.ResolvedRoute{
+		VirtualKeyID: "vk-oauth", Provider: "anthropic", BaseURL: upstream.URL,
+		ProtocolType: "anthropic", SeatID: "seat-1", AccountID: "acc-oauth",
+		EgressProxyURL: "socks5://" + accountExit.Addr(),
+	}
+
+	// Default OFF (control): coexist — the account rides its own egress (proves the
+	// escape hatch is inert until flipped; the default path is byte-unchanged).
+	p.serveRoute(httptest.NewRecorder(), httptest.NewRequest("POST", "/v1/messages", strings.NewReader(body)),
+		oauthRoute, prov, "sk-oauth", "aikey_team_oauth", time.Now(), discardLogger())
+	if n, _ := accountExit.Stats(); n == 0 {
+		t.Fatalf("[default OFF] OAuth account must ride its per-account egress (coexist) — account socks5 connects=0")
+	}
+	if node.hits.Load() != 0 {
+		t.Fatalf("[default OFF] OAuth account must NOT ride the node upstream — node hits=%d", node.hits.Load())
+	}
+
+	// Flip the escape hatch ON.
+	p.SetOAuthEgressOverride(true)
+	beforeAcct, _ := accountExit.Stats()
+
+	// (A) With override ON, the SAME OAuth account now routes through the NODE
+	//     upstream (self-rescue), NOT its own egress.
+	w := httptest.NewRecorder()
+	p.serveRoute(w, httptest.NewRequest("POST", "/v1/messages", strings.NewReader(body)),
+		oauthRoute, prov, "sk-oauth", "aikey_team_oauth", time.Now(), discardLogger())
+	if node.hits.Load() == 0 {
+		t.Fatalf("[override ON] OAuth account must fall back to the node upstream (self-rescue) — node hits=0")
+	}
+	if after, _ := accountExit.Stats(); after != beforeAcct {
+		t.Fatalf("[override ON] OAuth account must SKIP its per-account egress — account socks5 got %d new connects", after-beforeAcct)
+	}
+
+	// (B) Flip back OFF → coexist restored (the toggle is reversible, not sticky).
+	p.SetOAuthEgressOverride(false)
+	beforeNode := node.hits.Load()
+	p.serveRoute(httptest.NewRecorder(), httptest.NewRequest("POST", "/v1/messages", strings.NewReader(body)),
+		oauthRoute, prov, "sk-oauth", "aikey_team_oauth", time.Now(), discardLogger())
+	if node.hits.Load() != beforeNode {
+		t.Fatalf("[toggled back OFF] OAuth account must ride its egress again (no new node hits) — node hits grew by %d", node.hits.Load()-beforeNode)
+	}
+}

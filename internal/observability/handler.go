@@ -44,6 +44,11 @@ const (
 	EventProxyEgressSysProxyChanged       = "proxy.egress.sysproxy_changed"
 	EventProxyEgressSysProxyReadFailed    = "proxy.egress.sysproxy_read_failed"
 	EventProxyEgressSysProxyReadRecovered = "proxy.egress.sysproxy_read_recovered"
+	// EventProxyEgressPingEngineDialFailed: /admin/probe/ping could not reach
+	// the target through the configured engine-spec egress (socks5 chain /
+	// mihomo fragment). The raw engine error is logged at Debug only — it can
+	// quote the spec verbatim, credentials included (bugfix 2026-07-19).
+	EventProxyEgressPingEngineDialFailed = "proxy.egress.ping_engine_dial_failed"
 )
 
 // SyncRail events (2026-07-03): control-plane sync rail state transitions.
@@ -116,6 +121,16 @@ const (
 	// its randomized window cap (window_max_util_pct), so it was pre-cut for that
 	// window (cooled until reset) — staying under 100% which looks like abuse.
 	EventProxyGroupWindowPrecut = "proxy.group.window_precut"
+	// EventProxyGroupRequestFailover (N9): a pool account's upstream failure was
+	// retried IN-REQUEST on another candidate account (first-byte gate held — the
+	// client saw nothing of the failed attempt). One event per switch, carrying
+	// from/to account + the failed status.
+	EventProxyGroupRequestFailover = "proxy.group.request_failover"
+	// EventProxyGroupModelTierCooldown (P1-C): a premium-model window (e.g. the
+	// Fable 7d_oi weekly window) exhausted — the account is cooled for THAT model
+	// tier only and keeps serving every other model. Also used for the
+	// unmapped-exhausted-window observability WARN (tier-table gap detection).
+	EventProxyGroupModelTierCooldown = "proxy.group.model_tier_cooldown"
 	// EventProxyGroupSeatBlocked (§5.5): the engine left this seat UNBOUND because
 	// every account in its pool/segment is at the ≤3-人/号 cap, so the proxy 429s it
 	// (never WRH-falls-back, which would route a 4th user onto a full account).
@@ -167,6 +182,11 @@ const (
 	// is at the per-account user cap, or no usable account remains. Neutral wording
 	// (does not guess the cause); the user waits or contacts the admin.
 	ErrCodeGroupPoolFull = "GROUP_POOL_FULL"
+	// ErrCodeModelTierExhausted (P1-C Phase 2, 用户拍板 2026-07-19): 429 when the
+	// REQUESTED MODEL's premium weekly window (e.g. Fable 7d_oi) is exhausted on
+	// every usable pool account, while other models still serve — the message
+	// tells the user to switch model instead of implying the whole pool is down.
+	ErrCodeModelTierExhausted = "MODEL_TIER_EXHAUSTED"
 	// ErrCodeOAuthResponsesOnly (2026-07-13): the request targets an endpoint the
 	// credential's OAuth upstream doesn't serve. Codex OAuth (ChatGPT accounts)
 	// speaks ONLY the Responses API at chatgpt.com/backend-api/codex — a

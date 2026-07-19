@@ -112,6 +112,39 @@ func PersistUpstreamProxyURL(systemConfigPath, rawURL string) error {
 	return atomicWrite(userPath, out)
 }
 
+// PersistOAuthEgressOverride writes the escape-hatch flag into aikey-user.yaml's
+// `proxy.upstream_proxy.oauth_egress_override` (2026-07-19), read-modify-write so
+// it sits ALONGSIDE url without disturbing it or any other CLI-owned field. Same
+// user-layer + atomic-write posture as PersistUpstreamProxyURL — so the toggle
+// survives system-yaml re-render.
+func PersistOAuthEgressOverride(systemConfigPath string, on bool) error {
+	userPath := userConfigPathFor(systemConfigPath)
+
+	root := map[string]any{}
+	if b, err := os.ReadFile(userPath); err == nil {
+		if err := yaml.Unmarshal(b, &root); err != nil {
+			return fmt.Errorf("parse %s: %w", userPath, err)
+		}
+		if root == nil {
+			root = map[string]any{}
+		}
+	} else if !os.IsNotExist(err) {
+		return fmt.Errorf("read %s: %w", userPath, err)
+	}
+
+	proxySec := asStringMap(root["proxy"])
+	upstream := asStringMap(proxySec["upstream_proxy"])
+	upstream["oauth_egress_override"] = on
+	proxySec["upstream_proxy"] = upstream
+	root["proxy"] = proxySec
+
+	out, err := yaml.Marshal(root)
+	if err != nil {
+		return fmt.Errorf("marshal user config: %w", err)
+	}
+	return atomicWrite(userPath, out)
+}
+
 // asStringMap coerces a yaml-decoded value into a map[string]any we can extend.
 // yaml.v3 decodes mappings into map[string]any already; a nil / wrong-typed value
 // (e.g. the key was absent or held a scalar) is replaced with a fresh map so the

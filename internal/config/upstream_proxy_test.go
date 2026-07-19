@@ -59,6 +59,41 @@ func TestPersistUpstreamProxyURL_RoundTripThroughLoad(t *testing.T) {
 	}
 }
 
+// TestPersistOAuthEgressOverride_RoundTripThroughLoad (2026-07-19): the escape-hatch
+// flag must land in aikey-user.yaml AND read back via Load() as
+// cfg.UpstreamProxy.OAuthEgressOverride, AND sit ALONGSIDE url without disturbing it.
+func TestPersistOAuthEgressOverride_RoundTripThroughLoad(t *testing.T) {
+	sysPath := writeTestPair(t, systemProxyYaml, "")
+	// Persist a URL first, THEN the flag — the flag write must preserve the url.
+	if err := PersistUpstreamProxyURL(sysPath, "socks5://127.0.0.1:7891"); err != nil {
+		t.Fatalf("PersistUpstreamProxyURL: %v", err)
+	}
+	if err := PersistOAuthEgressOverride(sysPath, true); err != nil {
+		t.Fatalf("PersistOAuthEgressOverride: %v", err)
+	}
+	cfg, err := Load(sysPath)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if !cfg.UpstreamProxy.OAuthEgressOverride {
+		t.Fatalf("OAuthEgressOverride = false, want true")
+	}
+	if cfg.UpstreamProxy.URL != "socks5://127.0.0.1:7891" {
+		t.Fatalf("url sibling clobbered by the flag write: %q", cfg.UpstreamProxy.URL)
+	}
+	// Flip back off → the round-trip reflects false (reversible).
+	if err := PersistOAuthEgressOverride(sysPath, false); err != nil {
+		t.Fatalf("PersistOAuthEgressOverride(false): %v", err)
+	}
+	cfg2, err := Load(sysPath)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if cfg2.UpstreamProxy.OAuthEgressOverride {
+		t.Fatalf("OAuthEgressOverride = true after clear, want false")
+	}
+}
+
 // TestPersistUpstreamProxyURL_PreservesSiblings: the read-modify-write must keep the
 // CLI-owned proxy.* fields (e.g. an events.collector_routes override written by
 // `aikey login --control-url`) intact — we only touch upstream_proxy.url. Re-read the

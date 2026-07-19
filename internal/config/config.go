@@ -219,6 +219,14 @@ type UpstreamProxyConfig struct {
 	//   http://127.0.0.1:7890   (Clash HTTP mode)
 	//   socks5://127.0.0.1:7891 (Clash SOCKS5 / proxychains)
 	URL string `yaml:"url"`
+	// OAuthEgressOverride is the OPT-IN emergency escape hatch (2026-07-19): when
+	// true, OAuth pool accounts' per-account egress is bypassed and their traffic
+	// falls back to this node's upstream chain (URL above > env > system > direct).
+	// Default false = coexist (per-account egress applies unconditionally). Member-
+	// facing self-rescue for when an admin-configured account egress line is down;
+	// while on, all OAuth accounts share this node's exit IP (anti-ban off). Stored
+	// in the USER layer so it survives system-yaml re-render, like URL.
+	OAuthEgressOverride bool `yaml:"oauth_egress_override,omitempty"`
 }
 
 // Load reads and parses a YAML config file, applying defaults.

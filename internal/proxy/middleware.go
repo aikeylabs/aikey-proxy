@@ -226,7 +226,23 @@ func codexUpstreamBaseURL() string {
 func resolveOAuthUpstream(canonicalCode string, r *http.Request) (baseURL string, req *http.Request) {
 	switch canonicalCode {
 	case "openai":
-		return codexUpstreamBaseURL(), captureCodexModel(r)
+		req = captureCodexModel(r)
+		// Version-prefix normalization (bugfix 2026-07-19): the codex OAuth
+		// upstream serves /responses — no /v1 segment. But OpenAI-convention
+		// clients carry base_urls ENDING in /v1 (the group-lane agent base_url
+		// must, to clear the ingress allowlist), so the path arrives here as
+		// /v1/responses; verbatim append then produced
+		// backend-api/codex/v1/responses → upstream FastAPI 404
+		// {"detail":"Not Found"} (live codex repro, cf-ray …-LAX). The dialect
+		// gate (oauthUpstreamRejectsPath) already accepts BOTH shapes — this
+		// makes the forwarded shape match the upstream too. Mirrors the
+		// version-segment re-normalization providerroutes.Stitch does for
+		// table-known API-key hosts.
+		if strings.HasPrefix(req.URL.Path, "/v1/") {
+			req.URL.Path = strings.TrimPrefix(req.URL.Path, "/v1")
+			req.URL.RawPath = ""
+		}
+		return codexUpstreamBaseURL(), req
 	default:
 		return providerDefaultBaseURL(canonicalCode), r
 	}

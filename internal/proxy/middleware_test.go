@@ -32,6 +32,32 @@ func TestWriteJSONError_MarksAikeyOrigin(t *testing.T) {
 // anything routable is REJECTED so a prod misconfig can never reroute real
 // traffic. 能红: widen the gate (e.g. drop the ".test" suffix check) and the
 // routable-host cases fire.
+// TestResolveOAuthUpstream_StripsV1ForCodex pins the version-prefix
+// normalization: the codex OAuth upstream (backend-api/codex) serves /responses
+// with NO /v1 segment, but the group lane's agent base_url ends in /v1 (ingress
+// allowlist requirement) so requests arrive as /v1/responses. Verbatim append
+// 404'd at ChatGPT's backend ({"detail":"Not Found"}, live repro 2026-07-19).
+// Both shapes must forward as /responses; non-openai providers keep their path.
+func TestResolveOAuthUpstream_StripsV1ForCodex(t *testing.T) {
+	cases := []struct {
+		code     string
+		inPath   string
+		wantPath string
+	}{
+		{"openai", "/v1/responses", "/responses"},
+		{"openai", "/responses", "/responses"},
+		{"anthropic", "/v1/messages", "/v1/messages"},
+	}
+	for _, c := range cases {
+		r := httptest.NewRequest("POST", c.inPath, strings.NewReader(`{"model":"gpt-5"}`))
+		_, out := resolveOAuthUpstream(c.code, r)
+		if out.URL.Path != c.wantPath {
+			t.Errorf("resolveOAuthUpstream(%q, %q): forwarded path = %q, want %q",
+				c.code, c.inPath, out.URL.Path, c.wantPath)
+		}
+	}
+}
+
 func TestTestOnlyBaseURLAllowed(t *testing.T) {
 	allowed := []string{
 		"http://127.0.0.1:8080",

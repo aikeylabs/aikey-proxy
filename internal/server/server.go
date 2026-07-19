@@ -95,6 +95,10 @@ func New(ln net.Listener, dataHandler http.Handler, adminHandler *admin.Handler,
 	// "Settings → Upstream proxy" card (R25 出口收敛: egress lives on the proxy node).
 	mux.HandleFunc("GET /admin/upstream-proxy", adminHandler.UpstreamProxyGet)
 	mux.HandleFunc("PUT /admin/upstream-proxy", adminHandler.UpstreamProxySet)
+	// Escape hatch (2026-07-19): opt-in override that routes OAuth per-account
+	// egress traffic through the node upstream chain (Settings checkbox).
+	mux.HandleFunc("GET /admin/oauth-egress-override", adminHandler.OAuthEgressOverrideGet)
+	mux.HandleFunc("PUT /admin/oauth-egress-override", adminHandler.OAuthEgressOverrideSet)
 	mux.HandleFunc("POST /admin/upstream-proxy/probe", adminHandler.UpstreamProxyProbe)
 	// Exit-IP identity probe for a candidate/current upstream spec (节点管理
 	// Nodes page test button, update 20260718). Distinct from probe above:

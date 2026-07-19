@@ -19,8 +19,10 @@
 package proxy
 
 import (
+	"bytes"
 	"encoding/json"
 	"fmt"
+	"io"
 	"log/slog"
 	"net/http"
 	"strings"
@@ -65,27 +67,112 @@ func (p *Proxy) handleOauthGroupRoute(
 			"No available account in your pool right now. Contact your administrator if this persists.")
 		return
 	}
-	// Skip accounts cooling down from a recent upstream failure (N8c reactive
-	// fallback) so this request routes around them. The allocation engine's
-	// routing override for this seat (§6.5; "" when off / no redirect) is applied
-	// inside the resolver ONLY if it's still a valid candidate — fault-isolated,
-	// falls back to the local pick on any miss.
+	// N9 in-request failover (2026-07-19, sub2api blueprint — see group_failover.go):
+	// buffer the request body ONCE so every attempt can replay a pristine clone;
+	// per-attempt header/context mutations (oauthInject persona, URL rewrite,
+	// window-cap stash) live on that attempt's clone only.
+	reqBody, rerr := io.ReadAll(r.Body)
+	if rerr != nil {
+		p.degradeGroup(w, logger, route, observability.ErrCodeGroupKeyUnavailable,
+			"Failed to read the request body. Please retry.")
+		return
+	}
+	_ = r.Body.Close()
+	baseReq := r
+
+	// failed accounts of THIS request (merged into the resolver skip set): the
+	// shared cooldown store already learns 401/evidence-429 via ModifyResponse,
+	// but a 529/5xx attempt must also never be re-picked within this request.
+	failed := map[string]bool{}
+	var lastCaptured *groupFailoverWriter
+
+	// P1-C: the skip set is MODEL-AWARE — an account cooled only for a premium
+	// tier (Fable weekly window) is skipped for that tier's requests and stays
+	// fully available to everything else.
+	reqModel := extractModelLazy(reqBody)
+
 	override := p.routingOverrides.lookup(route.SeatID, route.OauthGroupID)
-	res, err := resolveGroupCredential(route, p.groupKey.DerivedKey(), time.Now().Unix(), p.poolCooldown.skipSet(), override)
-	if err != nil {
-		code := observability.ErrCodeGroupKeyUnavailable
-		if ge, ok := err.(*groupResolveError); ok {
-			// RW2/D2: the routed account has no token for this member — return a
-			// structured login prompt (not a 503 degrade) so the client triggers the
-			// local OAuth login for THAT account.
-			if ge.Code == groupErrLoginRequired {
+	for attempt := 0; ; attempt++ {
+		skip := p.poolCooldown.skipSetFor(reqModel)
+		if len(failed) > 0 {
+			merged := make(map[string]bool, len(skip)+len(failed))
+			for id := range skip {
+				merged[id] = true
+			}
+			for id := range failed {
+				merged[id] = true
+			}
+			skip = merged
+		}
+		res, err := resolveGroupCredential(route, p.groupKey.DerivedKey(), time.Now().Unix(), skip, override)
+		if err != nil {
+			ge, isGE := err.(*groupResolveError)
+			// 1. RW2/D2: the routed account has no token for this member — a
+			//    structured login prompt (not a degrade) so the client triggers the
+			//    local OAuth login for THAT account. Actionable + account-specific,
+			//    so it wins even over a captured upstream error.
+			if isGE && ge.Code == groupErrLoginRequired {
 				p.respondLoginRequired(w, logger, route, ge.Account)
 				return
 			}
-			code = ge.Code
+			// 2. P1-C Phase 2 guidance (用户拍板 2026-07-19): when the REQUESTED
+			//    model's premium tier is what emptied the candidate set, say so —
+			//    and say it EVEN on the request that DISCOVERED the exhaustion via
+			//    failover (guidance beats flushing the raw upstream 429, which lacks
+			//    the switch-model hint). The generic "all accounts unavailable"
+			//    wording implies the whole pool is down; this tells the user that
+			//    switching model unblocks them right now.
+			if isGE && ge.Code == groupErrAllUnusable {
+				if tier := tierForModel(reqModel); tier != nil {
+					if until, cooled := p.poolCooldown.tierCooldownUntil(tier.Key); cooled {
+						p.respondModelTierExhausted(w, logger, route, reqModel, tier.Key, until)
+						return
+					}
+				}
+			}
+			// 3. Mid-failover candidate exhaustion (non-tier): the last upstream
+			//    error IS the final answer — flush it verbatim (transparent, never
+			//    invent a shape).
+			if lastCaptured != nil {
+				lastCaptured.flushCaptured()
+				return
+			}
+			// 4. Resolve-time degrade (nothing served this request at all).
+			code := observability.ErrCodeGroupKeyUnavailable
+			if isGE {
+				code = ge.Code
+			}
+			p.degradeGroup(w, logger, route, code, groupDegradeMessage(code))
+			return
 		}
-		p.degradeGroup(w, logger, route, code, groupDegradeMessage(code))
-		return
+		done := p.serveGroupAttempt(w, baseReq, reqBody, route, res, inboundBearer, startTime, logger, traceID,
+			attempt, failed, &lastCaptured)
+		if done {
+			return
+		}
+	}
+}
+
+// serveGroupAttempt forwards ONE candidate attempt of a group request. Returns
+// true when a response reached (or was flushed to) the client; false when the
+// attempt's upstream failure was captured behind the first-byte gate and the
+// caller should retry on the next candidate (res.AccountID has been added to
+// the failed set).
+func (p *Proxy) serveGroupAttempt(
+	w http.ResponseWriter, baseReq *http.Request, reqBody []byte,
+	route *vkeys.ResolvedRoute, res *groupResolution, inboundBearer string,
+	startTime time.Time, logger *slog.Logger, traceID string,
+	attempt int, failed map[string]bool, lastCaptured **groupFailoverWriter,
+) bool {
+	// fresh clone per attempt: pristine headers + replayed body + inherited
+	// context stashes (route/model extraction ride the context, not the body).
+	r := baseReq.Clone(baseReq.Context())
+	if len(reqBody) > 0 {
+		r.Body = io.NopCloser(bytes.NewReader(reqBody))
+		r.ContentLength = int64(len(reqBody))
+	} else {
+		r.Body = http.NoBody
+		r.ContentLength = 0
 	}
 
 	// Member has a token for the routed account ⇒ any earlier "login required"
@@ -141,7 +228,7 @@ func (p *Proxy) handleOauthGroupRoute(
 			)
 			writeJSONError(w, http.StatusBadRequest, "invalid_request_error",
 				observability.ErrCodeOAuthResponsesOnly, reason)
-			return
+			return true
 		}
 		// B2 guard (2026-07-17, verify-first 红灯实证 group_serve_verify_b2_test.go):
 		// an anthropic OAuth account whose material lacks ExternalID (the OAuth
@@ -158,7 +245,7 @@ func (p *Proxy) handleOauthGroupRoute(
 		// use it — only the anthropic family needs the uuid.
 		if canonicalCode == "anthropic" && res.OAuth != nil && res.OAuth.ExternalID == "" {
 			p.respondLoginRequired(w, logger, route, res.AccountID)
-			return
+			return true
 		}
 		// Per-provider OAuth upstream (base URL + any provider setup like codex's
 		// deferred model capture) via the shared resolver — same source as the
@@ -188,7 +275,7 @@ func (p *Proxy) handleOauthGroupRoute(
 		)
 		writeJSONError(w, http.StatusBadGateway, "server_error", observability.ErrCodeProviderError,
 			"Unknown provider protocol: "+adapterKey)
-		return
+		return true
 	}
 
 	// N9 #8: audit a fallback — the seat's primary account was unusable (cooled /
@@ -221,8 +308,28 @@ func (p *Proxy) handleOauthGroupRoute(
 	// is fixed, so the observer's ProtocolFamily fallback fires.
 	rc.ProviderCode = canonicalCode
 
-	p.serveRouteWithObserver(w, r, &rc, prov, realKey, inboundBearer, startTime, logger,
+	// N9 first-byte gate: forward through the capture writer. A failover-eligible
+	// upstream failure (401 / evidence-429 / >=500 incl. the ReverseProxy-
+	// synthesized 502 for transport errors) is DEFERRED — nothing reaches the
+	// client — and we signal the caller to retry on the next candidate. Capture is
+	// disabled on the last permitted attempt so its outcome streams straight
+	// through (no pointless buffering when no retry can follow).
+	fw := newGroupFailoverWriter(w, attempt < groupFailoverMaxSwitches)
+	p.serveRouteWithObserver(fw, r, &rc, prov, realKey, inboundBearer, startTime, logger,
 		observer.StreamUserChat, traceID)
+	if !fw.capturedResponse() {
+		return true // streamed to the client (success, non-eligible error, or final attempt)
+	}
+	failed[res.AccountID] = true
+	*lastCaptured = fw
+	logger.Warn("oauth-group in-request failover: retrying on next candidate",
+		"event.name", observability.EventProxyGroupRequestFailover,
+		"oauth_group_id", rc.OauthGroupID,
+		"from_account_id", res.AccountID,
+		"failed_status", fw.status,
+		"attempt", attempt+1,
+	)
+	return false
 }
 
 // groupDegradeMessage maps a resolver failure code to an actionable, end-user
@@ -331,6 +438,31 @@ func (p *Proxy) respondLoginRequired(w http.ResponseWriter, logger *slog.Logger,
 		"login_url": loginURL,
 	})
 	_, _ = w.Write(body)
+}
+
+// respondModelTierExhausted is the P1-C Phase 2 guidance response: the
+// REQUESTED model's premium weekly window (e.g. Fable's) is exhausted on every
+// usable pool account, but the pool itself is healthy for other models. The
+// message must say BOTH facts — which budget ran out (with its reset horizon)
+// and that switching model unblocks the user right now. Standard
+// "rate_limit_error" type so claude/codex render the message verbatim (the same
+// display contract the login-required prompt verified); machine consumers get
+// the precise signal via error.code + the error-source header.
+func (p *Proxy) respondModelTierExhausted(w http.ResponseWriter, logger *slog.Logger,
+	route *vkeys.ResolvedRoute, reqModel, tierKey string, until time.Time) {
+	resetIn := humanDuration(int64(time.Until(until).Seconds()))
+	logger.Warn("group route: requested model's tier window exhausted pool-wide",
+		"event.name", observability.EventProxyGroupModelTierCooldown,
+		"error.code", observability.ErrCodeModelTierExhausted,
+		"oauth_group_id", route.OauthGroupID,
+		"model", reqModel,
+		"tier", tierKey,
+		"reset_in", resetIn,
+	)
+	w.Header().Set(HeaderAikeyErrorSource, observability.ErrCodeModelTierExhausted)
+	writeJSONError(w, http.StatusTooManyRequests, "rate_limit_error", observability.ErrCodeModelTierExhausted,
+		"The weekly limit for "+reqModel+" (premium-tier models) is used up on all pool accounts; it resets in about "+resetIn+". "+
+			"Other models are still available — switch your model to continue working.")
 }
 
 // humanDuration renders seconds as a coarse "N min" / "N h" for user-facing
