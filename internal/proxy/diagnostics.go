@@ -34,8 +34,11 @@ const (
 	MappingInactive MappingStatus = "inactive"
 	// MappingOK: mappings are configured and applying cleanly (no recent misses).
 	MappingOK MappingStatus = "ok"
-	// MappingDegraded: a model_map IS configured but requests are NOT matching it
-	// (reject/passthrough seen) — the "配置了但没生效" case the four surfaces warn on.
+	// MappingDegraded: a model_map IS configured but the MOST RECENT relevant
+	// event was a passthrough-miss (a request slipped past unchanged) newer than
+	// the last successful apply — the "配置了但没生效" case the four surfaces warn
+	// on. Recoverable: a later successful apply clears it. A reject does NOT
+	// count (unmatched=reject policy WORKING is not a degradation).
 	MappingDegraded MappingStatus = "degraded"
 )
 
@@ -72,11 +75,13 @@ func (p *Proxy) mappingHealth() MappingHealth {
 	rejected := p.mapRejected.Load()
 	passthrough := p.mapPassthrough.Load()
 	last := p.lastMapMiss.Load()
+	missNano := p.lastMapMissNano.Load()
+	applyNano := p.lastMapApplyNano.Load()
 
 	hasMappings := len(provider.Routes().AllModelMaps()) > 0
 	h := MappingHealth{
 		Applied:            applied,
-		Rejected:           rejected,
+		Rejected:           rejected, // kept for visibility; deliberately OUT of the verdict
 		PassthroughMissing: passthrough,
 		LastMiss:           last,
 	}
@@ -84,7 +89,13 @@ func (p *Proxy) mappingHealth() MappingHealth {
 	case !hasMappings:
 		h.Status = MappingInactive
 		h.Reason = "No model mapping is configured in this build's registry."
-	case rejected+passthrough > 0:
+	case missNano > applyNano:
+		// RECOVERABLE, not a monotonic latch (health-signal-surface: assert
+		// transition, not terminal): degraded only while the most-recent
+		// passthrough-miss is newer than the most-recent successful apply — the
+		// CURRENT state. A later apply (applyNano advances) flips this back to
+		// ok. A `reject` (unmatched=reject policy WORKED) never stamps missNano,
+		// so a working reject policy is NOT degraded.
 		h.Status = MappingDegraded
 		h.Reason = "A model mapping is configured but recent requests did not match it — the mapping may not be taking effect for this client."
 	default:

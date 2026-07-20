@@ -48,30 +48,74 @@ func TestDiagnosticsPipeline_RegistryProvenanceAndHealth(t *testing.T) {
 	}
 }
 
-// 7.9/3.5 fence: mappingHealth flips to "degraded" once a configured-but-missing
-// occurrence is recorded — the single source-of-truth the four surfaces read.
-// This MUST go red if a caller stops feeding the counters (mapping silently
-// ineffective would then read as healthy — the exact "system lies to the user" bug).
-func TestMappingHealth_DegradedWhenConfiguredButMissed(t *testing.T) {
+// 7.9/3.5 fence: the mapping-health verdict is a RECOVERABLE transition, not a
+// monotonic latch (health-signal-surface: assert transition, not terminal).
+// Drives the full ok → degraded → ok cycle:
+//   - degraded requires a passthrough-miss stamped MORE RECENTLY than the last
+//     successful apply (the CURRENT state). This ALSO keeps the "must go red if
+//     the passthrough site stops feeding the counter/clock" fence: a silently-
+//     ineffective mapping would otherwise read healthy — the "system lies to the
+//     user" bug.
+//   - a later successful apply (applyNano advances past missNano) flips it back
+//     to ok, proving the verdict reflects current state and recovers.
+func TestMappingHealth_TransitionOkDegradedRecovered(t *testing.T) {
 	p := &Proxy{}
 
+	// ok: fresh — mappings ARE configured (embedded zhipu) and no miss seen.
 	if got := p.mappingHealth().Status; got != MappingOK {
 		t.Fatalf("precondition: fresh status = %q, want ok", got)
 	}
 
-	// Simulate a provider that HAS a model_map but a request that didn't match it.
+	// degraded: a provider that HAS a model_map but a request that slipped past
+	// unchanged (passthrough policy, no rule matched). Mirrors the passthrough
+	// site: bump the counter, stamp the miss clock, record the last miss.
+	// Explicit monotonic nano stamps keep the transition deterministic.
 	p.mapPassthrough.Add(1)
+	p.lastMapMissNano.Store(200)
 	p.recordMappingMiss("zhipu", "some-unmapped-model")
 
 	h := p.mappingHealth()
 	if h.Status != MappingDegraded {
-		t.Fatalf("after a miss, status = %q, want degraded", h.Status)
+		t.Fatalf("after a passthrough-miss, status = %q, want degraded", h.Status)
 	}
 	if h.LastMiss == nil || h.LastMiss.Provider != "zhipu" {
 		t.Fatalf("last_miss must record the provider; got %+v", h.LastMiss)
 	}
+	if h.PassthroughMissing != 1 {
+		t.Errorf("passthrough_missing must surface in the payload; got %d", h.PassthroughMissing)
+	}
 	if h.Reason == "" {
 		t.Errorf("degraded verdict must carry a surface-agnostic reason")
+	}
+
+	// recovered: a LATER successful apply (applyNano > missNano) flips it back
+	// to ok. A monotonic latch would stay degraded here — that's the regression
+	// this asserts against.
+	p.mapApplied.Add(1)
+	p.lastMapApplyNano.Store(300)
+	if got := p.mappingHealth().Status; got != MappingOK {
+		t.Fatalf("after a later successful apply, status = %q, want ok (recovered)", got)
+	}
+}
+
+// 7.9/3.5 fence: a `reject` means the unmatched=reject policy WORKED (the client
+// asked for a model the map doesn't allow and the proxy correctly refused). It
+// must NOT trip degraded. Pre-fix the verdict was `rejected+passthrough > 0`, so
+// this test goes RED on that old logic — the behavior-change guard.
+func TestMappingHealth_RejectPolicyIsNotDegraded(t *testing.T) {
+	p := &Proxy{}
+
+	// Simulate the reject path: counter bumped + last-miss recorded, but the
+	// degrade clock (lastMapMissNano) deliberately NOT stamped.
+	p.mapRejected.Add(1)
+	p.recordMappingMiss("zhipu", "rejected-model")
+
+	h := p.mappingHealth()
+	if h.Status != MappingOK {
+		t.Fatalf("a working reject policy must stay ok, got %q", h.Status)
+	}
+	if h.Rejected != 1 {
+		t.Errorf("rejected count must still surface in the payload for visibility; got %d", h.Rejected)
 	}
 }
 

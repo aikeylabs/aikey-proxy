@@ -73,6 +73,20 @@ func (p *Proxy) serveRouteWithObserver(
 	startTime time.Time, logger *slog.Logger,
 	stream string, traceID string,
 ) {
+	// P1d (R-C, design D-10): normalize provider ATTRIBUTION to the truthful
+	// upstream vendor BEFORE building obsReqCtx below. obsReqCtx.ProviderID and
+	// SessionID (resolveSessionID keys on ProviderCode) are stamped from
+	// route.ProviderCode here; without this hoist the observer / rhythm-audit
+	// stream recorded the DECLARED provider (anthropic) while the usage ledger —
+	// normalized later inside serveRoute — recorded the real vendor (zhipu for a
+	// GLM /api/anthropic binding declared anthropic), a two-source split. serveRoute
+	// re-applies the SAME normalization idempotently (LookupByBaseURL on the
+	// already-truthful code returns it unchanged), which also covers the direct
+	// (app / probe) serveRoute callers that don't funnel through here.
+	if route != nil {
+		route.ProviderCode = truthfulProviderCode(route.BaseURL, route.ProviderCode)
+	}
+
 	var obsReqCtx *observer.RequestContext
 	if p.observerRegistry != nil && p.observerRegistry.Active() > 0 {
 		// User_chat-side ProtocolFamily fallback (2026-05-23): the legacy
@@ -325,7 +339,11 @@ func (p *Proxy) serveRoute(w http.ResponseWriter, r *http.Request, route *vkeys.
 	// the same code) and for third-party gateways absent from the table (!ok).
 	// Adapter selection is unchanged — it's driven by the path's wire protocol,
 	// which is correct (the client speaks that wire). This is the single funnel
-	// every pipeline passes through, so one fix covers all.
+	// every pipeline passes through, so one fix covers all. IDEMPOTENT: the
+	// observer path (serveRouteWithObserver) already applied this before building
+	// obsReqCtx so the audit stream sees the real vendor too; re-applying here is
+	// a no-op for it (LookupByBaseURL on the truthful code returns it unchanged)
+	// and still covers the direct app / probe callers that skip the observer wrap.
 	if route != nil {
 		route.ProviderCode = truthfulProviderCode(route.BaseURL, route.ProviderCode)
 	}
@@ -748,8 +766,9 @@ func (p *Proxy) serveRoute(w http.ResponseWriter, r *http.Request, route *vkeys.
 				// P3 (design D-5): restore the response model name to the
 				// client's original when the request leg mapped it, so the
 				// client recognizes its own model (N2). No-op unless mapping
-				// happened. Non-streaming only — streaming SSE restoration is
-				// tracked separately (stream drainer forwards frames verbatim).
+				// happened. This is the non-streaming leg; the streaming leg's
+				// SSE restoration is IMPLEMENTED via newSSEModelRewriter (P3.3),
+				// wired in the streaming branch below.
 				body = restoreResponseModel(r.Context(), body)
 
 				// Rebuffer with the FINAL body (post-translation if engaged,

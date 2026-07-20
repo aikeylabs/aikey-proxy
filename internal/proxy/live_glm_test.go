@@ -18,6 +18,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -181,13 +182,52 @@ func min(a, b int) int {
 	return b
 }
 
-// captureEventStore records inserted usage events for assertions.
-type captureEventStore struct{ events []eventRow }
+// captureEventStore records inserted usage events for assertions. The
+// collector Inserts from its own goroutine while the test reads, so `events`
+// is guarded by `mu` — without it `go test -race` flags the append-vs-read
+// data race (the collector flush is asynchronous).
+type captureEventStore struct {
+	mu     sync.Mutex
+	events []eventRow
+}
 type eventRow struct{ Model, RequestedModel, Provider string }
 
 func (c *captureEventStore) Insert(evs []events.UsageEvent) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
 	for _, e := range evs {
 		c.events = append(c.events, eventRow{Model: e.Model, RequestedModel: e.RequestedModel, Provider: e.Provider})
 	}
 	return nil
+}
+
+// len reports the number of captured events under the lock.
+func (c *captureEventStore) len() int {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return len(c.events)
+}
+
+// first returns the first captured event (ok=false when none) under the lock.
+func (c *captureEventStore) first() (eventRow, bool) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if len(c.events) == 0 {
+		return eventRow{}, false
+	}
+	return c.events[0], true
+}
+
+// waitFirst polls up to `timeout` for the first captured event to appear —
+// the async-flush wait every reader needs (mirrors live_persist_sqlite_test.go's
+// poll loop). Returns ok=false if none arrived in time.
+func (c *captureEventStore) waitFirst(timeout time.Duration) (eventRow, bool) {
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		if row, ok := c.first(); ok {
+			return row, true
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	return eventRow{}, false
 }

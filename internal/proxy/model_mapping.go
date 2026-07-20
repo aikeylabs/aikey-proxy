@@ -20,8 +20,9 @@ import (
 // it (design D-5 / P3.1-3.2). Returns the body unchanged when no mapping
 // happened or the field already matches. 🚫 Never substitutes a hardcoded
 // constant — only the exact client string carried in context (cc-switch #3600
-// anti-pattern). Streaming SSE restoration is a separate, larger change (the
-// stream drainer forwards frames verbatim) — see tasks P3.3.
+// anti-pattern). Streaming SSE restoration is IMPLEMENTED separately for the
+// stream path via newSSEModelRewriter (P3.3), which rewrites the model in the
+// first message_start event; this function handles the non-streaming leg.
 func restoreResponseModel(ctx context.Context, body []byte) []byte {
 	clientModel, ok := ctx.Value(ctxKeyMappedClientModel).(string)
 	if !ok || clientModel == "" {
@@ -162,7 +163,7 @@ func (p *Proxy) applyModelMappingToRequest(w http.ResponseWriter, r *http.Reques
 	if res.Reject {
 		r.Body = io.NopCloser(bytes.NewReader(bodyBytes))
 		p.errors.Add(1)
-		p.mapRejected.Add(1)                          // 7.9/3.5: configured-but-missing (reject)
+		p.mapRejected.Add(1)                         // 7.9/3.5: configured-but-missing (reject)
 		p.recordMappingMiss(res.Provider, requested) // 7.9/3.5: stash last miss
 		logger.Warn("model mapping: unmatched model rejected",
 			"event.name", "proxy.request.model_mapping_missing",
@@ -184,7 +185,8 @@ func (p *Proxy) applyModelMappingToRequest(w http.ResponseWriter, r *http.Reques
 		ctx := context.WithValue(r.Context(), ctxKeyMappedClientModel, requested)
 		ctx = context.WithValue(ctx, ctxKeyMappedEffectiveModel, res.EffectiveModel)
 		*r = *r.WithContext(ctx)
-		p.mapApplied.Add(1) // 7.9/3.5: healthy — a rule rewrote the model
+		p.mapApplied.Add(1)                             // 7.9/3.5: healthy — a rule rewrote the model
+		p.lastMapApplyNano.Store(time.Now().UnixNano()) // recovery clock: a fresh apply flips degraded→ok
 		logger.Debug("model mapped",
 			"event.name", "proxy.request.model_mapped",
 			"provider", res.Provider, "requested_model", requested, "effective_model", res.EffectiveModel)
@@ -195,7 +197,8 @@ func (p *Proxy) applyModelMappingToRequest(w http.ResponseWriter, r *http.Reques
 	r.Body = io.NopCloser(bytes.NewReader(bodyBytes))
 	if res.HadMap && !res.Mapped {
 		// passthrough policy, no rule matched — surface it (禁止 #32).
-		p.mapPassthrough.Add(1) // 7.9/3.5: configured-but-missing (passthrough)
+		p.mapPassthrough.Add(1)                        // 7.9/3.5: configured-but-missing (passthrough)
+		p.lastMapMissNano.Store(time.Now().UnixNano()) // stamp the CURRENT miss (degrade clock; reject path does NOT)
 		p.recordMappingMiss(res.Provider, requested)
 		logger.Warn("model mapping: passthrough, no rule matched",
 			"event.name", "proxy.request.model_mapping_missing",

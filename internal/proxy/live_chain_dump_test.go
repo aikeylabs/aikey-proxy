@@ -53,9 +53,13 @@ func TestLive_RequestChainMetadata(t *testing.T) {
 	}
 	_ = json.Unmarshal(w.Body.Bytes(), &out)
 
+	// Wait for the collector's async flush before reading the captured event —
+	// serveRoute returns before the collector goroutine has necessarily
+	// Inserted. Reading cap.events without this poll is both flaky AND a data
+	// race (see captureEventStore.waitFirst / live_persist_sqlite_test.go).
 	var evReq, evEff, evProv string
-	if len(cap.events) > 0 {
-		evReq, evEff, evProv = cap.events[0].RequestedModel, cap.events[0].Model, cap.events[0].Provider
+	if row, ok := cap.waitFirst(4 * time.Second); ok {
+		evReq, evEff, evProv = row.RequestedModel, row.Model, row.Provider
 	}
 
 	chain := []any{
