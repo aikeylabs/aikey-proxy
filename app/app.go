@@ -244,6 +244,11 @@ func Run() {
 	// os.Exit below would skip a defer (gocritic exitAfterDefer), so on this
 	// fatal path we remove the snapshot explicitly and defer it only once the
 	// supervisor is up (normal-shutdown cleanup).
+	// P1 error-origin (20260719): fix this process's component label for the
+	// X-Aikey-Error-Origin header BEFORE serving — "worker-proxy" when a cluster
+	// node id is set, else "local-proxy". Single source: cluster.node_id.
+	proxy.SetErrorOriginComponent(cfg.Cluster.NodeID)
+
 	sup, err := supervisor.New(cfg, resolvedPath, password, buildinfo.Get().Version)
 	if err != nil {
 		slog.Error("failed to start supervisor", "error", err)
@@ -521,7 +526,11 @@ func Run() {
 
 	// Build the outbound transport for upstream providers. Always non-nil now:
 	// even the direct path needs MaxIdleConnsPerHost tuning (see buildTransport).
-	dataHandler := sup.Handler()
+	// P2 error-origin (20260719): wrap the data plane so every error response
+	// (status ≥ 400) is captured — reusing the X-Aikey-Error-* headers P1 set —
+	// into the last-errors ring for `aikey doctor --last-errors`. Best-effort,
+	// response-direction only; never touches the upstream request.
+	dataHandler := proxy.WrapLastErrorCapture(sup.Handler())
 	// A single-URL / empty upstream builds without dialing → install synchronously.
 	// A CHAIN / multi-protocol / group upstream is different: building it primes a
 	// health-check that DIALS the (possibly slow or unreachable) exit nodes. Doing

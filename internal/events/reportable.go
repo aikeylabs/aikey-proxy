@@ -156,6 +156,14 @@ type ReportableEvent struct {
 	// app_slug = "" had M2 launched today. This block closes that gap.
 	AppSlug  string `json:"app_slug,omitempty"`
 	AppKeyID string `json:"app_key_id,omitempty"`
+	// ExtJSON is the extensible per-event blob stored verbatim in the collector's
+	// usage_event_ods.ext_json column (already wired collector-side; the proxy
+	// simply populates it now). Durable per-request egress attribution rides here
+	// (2026-07-19): {"egress":{"applied":bool,"engine":..,"fingerprint":..}} so an
+	// event can be traced to the egress it exited through in the usage store,
+	// mirroring the live proxy.egress.request_attribution log. omitempty → events
+	// with nothing to record (personal direct traffic) keep the pre-existing wire.
+	ExtJSON any `json:"ext_json,omitempty"`
 	// timestamps: int64 Unix epoch milliseconds (UTC). Wire format switched
 	// from RFC3339 strings in v1.0.3-alpha — see the design doc at
 	// roadmap20260320/技术实现/update/20260424-时间戳统一为int64毫秒-data-service.md.
@@ -191,6 +199,12 @@ type ReportOpts struct {
 	// RequestPath is the inbound r.URL.Path — see ReportableEvent.RequestPath.
 	RequestPath string
 	Completion  string
+	// Per-request egress attribution (2026-07-19), derived by the proxy via
+	// egressAttribution(). Stamped into ExtJSON.egress for durable audit. Engine
+	// "" / "none" → no egress block written (personal direct traffic).
+	EgressApplied     bool
+	EgressEngine      string
+	EgressFingerprint string
 	// UI anchor fields (see ReportableEvent docs for semantics).
 	// SessionID comes from the X-Claude-Code-Session-Id request header.
 	// Completion defaults to "complete" if left empty.
@@ -426,6 +440,20 @@ func BuildReportableEvent(opts *ReportOpts) ReportableEvent {
 		Model:                    opts.Model,
 		ProviderCode:             route.ProviderCode,
 	})
+
+	// Durable per-request egress attribution (2026-07-19): record it in ext_json
+	// (reused verbatim by the collector) ONLY when the route actually had an
+	// egress spec — engine "" / "none" means personal direct traffic, and writing
+	// applied=false for every such event would bloat the wire for no audit value.
+	if opts.EgressEngine != "" && opts.EgressEngine != "none" {
+		ev.ExtJSON = map[string]any{
+			"egress": map[string]any{
+				"applied":     opts.EgressApplied,
+				"engine":      opts.EgressEngine,
+				"fingerprint": opts.EgressFingerprint,
+			},
+		}
+	}
 
 	return ev
 }

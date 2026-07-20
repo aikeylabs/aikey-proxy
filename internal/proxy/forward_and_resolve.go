@@ -424,7 +424,23 @@ func (p *Proxy) serveRoute(w http.ResponseWriter, r *http.Request, route *vkeys.
 	// Trade-off when OFF: if the admin's per-account proxy is down, the account's
 	// request fails loudly (ErrCodeAccountEgressProxy 503) — the escape hatch is the
 	// deliberate opt-out of that fail-loud.
-	if route.EgressProxyURL != "" && !p.oauthEgressOverride.Load() {
+	// Per-request egress attribution (2026-07-19): derive ONCE from the resolved
+	// account egress + node override, then (A) log it at Info for live trace_id
+	// grep and (B) let recordEvent stamp the same onto the usage event's ext_json.
+	// egApplied is byte-identical to the old gate below. Logged for BOTH cases
+	// (applied per-account egress, or fell to node/direct) so any request is
+	// traceable, not just the egress ones. Never logs the spec verbatim — only
+	// its fingerprint (a mihomo fragment carries socks5 credentials).
+	egApplied, egEngine, egFingerprint := egressAttribution(route.EgressProxyURL, p.oauthEgressOverride.Load())
+	logger.Info("egress attribution",
+		"event.name", observability.EventProxyEgressRequestAttribution,
+		"account_id", route.AccountID,
+		"oauth_identity", route.OAuthIdentity,
+		"egress_applied", egApplied,
+		"egress_engine", egEngine,
+		"egress_fingerprint", egFingerprint,
+	)
+	if egApplied && route.EgressProxyURL != "" {
 		egT, egErr := p.accountEgressTransport(route.EgressProxyURL)
 		if egErr != nil {
 			p.errors.Add(1)
@@ -439,7 +455,6 @@ func (p *Proxy) serveRoute(w http.ResponseWriter, r *http.Request, route *vkeys.
 			return
 		}
 		inner = egT
-		logger.Debug("using per-account egress transport", "account_id", route.AccountID)
 	}
 	var transport http.RoundTripper = inner
 	if !streaming {
@@ -485,12 +500,10 @@ func (p *Proxy) serveRoute(w http.ResponseWriter, r *http.Request, route *vkeys.
 			// that the request isn't a real Claude Code session, returning
 			// 429 with no X-RateLimit-Reset (business rejection signature).
 			// Strip the whole `x-aikey-*` namespace so future internal
-			// annotations don't repeat this leak.
-			for k := range req.Header {
-				if len(k) >= 8 && strings.EqualFold(k[:8], "X-Aikey-") {
-					req.Header.Del(k)
-				}
-			}
+			// annotations don't repeat this leak. Floor invariant (§6): no
+			// X-Aikey-* ever reaches the upstream — fenced by
+			// TestStripAikeyRequestHeaders.
+			stripAikeyRequestHeaders(req.Header)
 			// Why: tell upstream we only accept identity (uncompressed) so the
 			// drainer and non-streaming token extractor can parse the body
 			// directly. Anthropic's OAuth endpoint in particular returns
@@ -520,6 +533,27 @@ func (p *Proxy) serveRoute(w http.ResponseWriter, r *http.Request, route *vkeys.
 			}
 		},
 		ModifyResponse: func(resp *http.Response) error {
+			// P1 error-origin (20260719): tag relayed error responses so a client
+			// can tell WHO produced the error. First-writer-wins: if a deeper aikey
+			// hop (worker/ingress) already set X-Aikey-Error-Origin, keep it (that's
+			// the root cause); only when it's UNTAGGED and ≥400 do we attribute it to
+			// the provider we forwarded to (upstream:<provider>) — the body is left
+			// byte-identical (protocol transparency). Every hop appends itself to the
+			// path. RESPONSE direction only — never touches the upstream request.
+			if resp.StatusCode >= 400 {
+				if resp.Header.Get(HeaderAikeyErrorOrigin) == "" {
+					resp.Header.Set(HeaderAikeyErrorOrigin, "upstream:"+route.ProviderCode)
+				}
+				resp.Header.Add(HeaderAikeyErrorPath, errorOriginComponent)
+			}
+			// P3 correlation (20260719): re-expose the provider's own request id
+			// under the ONE consistent aikey key so a user can JOIN it across the
+			// log / usage store / provider support — no request-header propagation
+			// (RESPONSE direction only). Set whenever the provider returned one.
+			if id := upstreamRequestIDFromHeader(resp.Header); id != "" {
+				resp.Header.Set(HeaderAikeyUpstreamRequestID, id)
+			}
+
 			// Codex OAuth model capture — only persist on 2xx so a bad
 			// `model: gpt-4o` request (rejected by ChatGPT-account
 			// Codex) can't poison the state file the connectivity probe

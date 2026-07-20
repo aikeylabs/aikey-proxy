@@ -420,16 +420,108 @@ func providerCanonicalCode(providerCode string) string {
 // which never sets it; providers don't emit the X-Aikey-* namespace).
 const HeaderAikeyErrorSource = "X-Aikey-Error-Source"
 
+// Error-origin traceability headers (P1, 20260719-错误产地标签方案). These are
+// RESPONSE-direction only — they ride the response back to the client and NEVER
+// go to the upstream (the request-direction X-Aikey-* strip in forward Director
+// removes anything before the LLM; see §6 floor-invariant 6). They let a user
+// tell WHO produced an error without SSH-grepping every hop:
+//
+//   X-Aikey-Error-Origin: <component>.<code>  — the ORIGIN of the error.
+//       First-writer-wins: whoever GENERATES the error sets it; a component
+//       RELAYING a deeper error must NOT overwrite it (the deepest producer is
+//       the root cause, Java caused-by style). component ∈ {local-proxy,
+//       worker-proxy, oauth-ingress, upstream:<provider>}.
+//   X-Aikey-Error-Path: <component>              — the HOP CHAIN. Each aikey hop
+//       APPENDS itself (multi-value header) so the client sees the route the
+//       error traversed, e.g. "local-proxy, oauth-ingress".
+const (
+	HeaderAikeyErrorOrigin = "X-Aikey-Error-Origin"
+	HeaderAikeyErrorPath   = "X-Aikey-Error-Path"
+	// HeaderAikeyUpstreamRequestID re-exposes the provider's own request id under
+	// ONE consistent aikey-namespaced RESPONSE header (P3, 20260719). WHY: cross-
+	// request correlation must NOT propagate a trace header to the upstream
+	// (WAF/撞墙 risk — §6 floor-invariant 6). Instead we surface the provider's
+	// request id (the natural anchor that already crosses the aikey↔provider
+	// boundary) so a user can JOIN it across the proxy log / usage store / the
+	// provider's support — without needing to know each provider's own header
+	// name (request-id vs openai-request-id vs x-request-id). RESPONSE direction
+	// only; the request-side strip removes any X-Aikey-* before the upstream.
+	HeaderAikeyUpstreamRequestID = "X-Aikey-Upstream-Request-Id"
+)
+
+// stripAikeyRequestHeaders removes the ENTIRE X-Aikey-* namespace from an
+// OUTBOUND request before it reaches the upstream provider. This is the floor
+// invariant (§6) that keeps error-origin / trace annotations from ever polluting
+// the LLM request — Anthropic's OAuth WAF treats unrecognized headers as a
+// non-Claude-Code persona signal and returns a business 429 with no
+// X-RateLimit-Reset (撞墙 signature). Extracted from the forward Director so a
+// fence test can assert the invariant directly.
+func stripAikeyRequestHeaders(h http.Header) {
+	for k := range h {
+		if len(k) >= 8 && strings.EqualFold(k[:8], "X-Aikey-") {
+			h.Del(k)
+		}
+	}
+}
+
+// upstreamRequestIDFromHeader reads the provider's own request id from a header
+// set (the http.Header form of extractUpstreamRequestID, for the response-
+// capturing middleware which has headers but no *http.Response).
+func upstreamRequestIDFromHeader(h http.Header) string {
+	for _, name := range []string{"request-id", "x-request-id", "openai-request-id"} {
+		if v := h.Get(name); v != "" {
+			return v
+		}
+	}
+	return ""
+}
+
+// errorOriginComponent is THIS process's component label for the origin header —
+// "local-proxy" (personal/no cluster.node_id) or "worker-proxy" (cluster node).
+// Set once at startup via SetErrorOriginComponent before serving; read-only
+// thereafter (no lock needed). Default "local-proxy" so tests / older wiring
+// still produce a sensible origin.
+var errorOriginComponent = "local-proxy"
+
+// SetErrorOriginComponent fixes this process's component label from the cluster
+// node id (empty → local-proxy, set → worker-proxy). Single source: the SAME
+// cluster.node_id existence check the rest of the proxy uses to tell editions
+// apart. Call once at startup (app.Run) before the server accepts traffic.
+func SetErrorOriginComponent(clusterNodeID string) {
+	if strings.TrimSpace(clusterNodeID) != "" {
+		errorOriginComponent = "worker-proxy"
+	} else {
+		errorOriginComponent = "local-proxy"
+	}
+}
+
+// setErrorOrigin stamps the error-origin traceability headers on a response THIS
+// component is generating. First-writer-wins on Origin (defensive: a fresh
+// self-generated response has none, so we set it); always append this component
+// to the path. code is the aikey error code (origin value = component.code).
+func setErrorOrigin(h http.Header, code string) {
+	if h.Get(HeaderAikeyErrorOrigin) == "" {
+		h.Set(HeaderAikeyErrorOrigin, errorOriginComponent+"."+code)
+	}
+	h.Add(HeaderAikeyErrorPath, errorOriginComponent)
+}
+
 // writeJSONError writes a JSON error response in OpenAI-compatible format.
 func writeJSONError(w http.ResponseWriter, statusCode int, errType, code, message string) {
-	w.Header().Set("Content-Type", "application/json")
+	h := w.Header()
+	h.Set("Content-Type", "application/json")
 	// Mark every aikey-GENERATED error so callers can distinguish it from an
 	// upstream pass-through (esp. quota 429 vs provider rate-limit 429). Value =
 	// the aikey error code (presence alone is the discriminator; the code adds detail).
-	w.Header().Set(HeaderAikeyErrorSource, code)
+	h.Set(HeaderAikeyErrorSource, code)
+	// P1 error-origin: this component GENERATED the error → stamp origin + path.
+	setErrorOrigin(h, code)
 	w.WriteHeader(statusCode)
 	// Write error JSON inline to avoid encoding/json import for this simple case.
-	_, _ = w.Write([]byte(`{"error":{"message":"` + escapeJSON(message) + `","type":"` + errType + `","code":"` + code + `"}}`))
+	// origin (top-level) mirrors the header so a client that reads only the body
+	// still learns who produced the error.
+	origin := escapeJSON(h.Get(HeaderAikeyErrorOrigin))
+	_, _ = w.Write([]byte(`{"error":{"message":"` + escapeJSON(message) + `","type":"` + errType + `","code":"` + code + `"},"origin":"` + origin + `"}`))
 }
 
 func escapeJSON(s string) string {

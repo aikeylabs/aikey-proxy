@@ -421,6 +421,8 @@ func (p *Proxy) respondLoginRequired(w http.ResponseWriter, logger *slog.Logger,
 
 	w.Header().Set("Content-Type", "application/json")
 	w.Header().Set(HeaderAikeyErrorSource, groupErrLoginRequired)
+	// P1 error-origin: this component GENERATED the login-required error.
+	setErrorOrigin(w.Header(), groupErrLoginRequired)
 	w.WriteHeader(http.StatusUnauthorized)
 	errObj := map[string]string{
 		"message": message,
@@ -436,6 +438,7 @@ func (p *Proxy) respondLoginRequired(w http.ResponseWriter, logger *slog.Logger,
 		"error":     errObj,
 		"account":   accountID,
 		"login_url": loginURL,
+		"origin":    w.Header().Get(HeaderAikeyErrorOrigin),
 	})
 	_, _ = w.Write(body)
 }

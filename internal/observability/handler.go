@@ -49,6 +49,14 @@ const (
 	// mihomo fragment). The raw engine error is logged at Debug only — it can
 	// quote the spec verbatim, credentials included (bugfix 2026-07-19).
 	EventProxyEgressPingEngineDialFailed = "proxy.egress.ping_engine_dial_failed"
+	// EventProxyEgressRequestAttribution: per-request egress traceability
+	// (2026-07-19). One Info line per forwarded request carrying trace_id +
+	// account_id + oauth_identity + egress_applied/engine/fingerprint, so a real
+	// request can be traced from logs to the egress it exited through (grep the
+	// trace_id). fingerprint→exit_ip comes from /admin/egress/selfcheck, off the
+	// hot path. The same attribution rides the usage event's ext_json (durable
+	// audit). See internal/proxy/egress_attribution.go.
+	EventProxyEgressRequestAttribution = "proxy.egress.request_attribution"
 )
 
 // SyncRail events (2026-07-03): control-plane sync rail state transitions.
