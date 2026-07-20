@@ -205,11 +205,16 @@ const (
 	// reason + the way out (use an API-key credential for this client). 400.
 	ErrCodeOAuthResponsesOnly = "OAUTH_RESPONSES_ONLY"
 	// ErrCodeAccountEgressProxy (§11.7, P7): the resolved oauth-group account pins
-	// a per-account egress proxy that could not be built into a working dialer —
-	// e.g. a non-socks5 scheme, or a socks5 account proxy that cannot be chained
-	// through a non-socks5 node front proxy. 503; the request is REFUSED rather
-	// than sent out the node's IP (which would defeat the per-account isolation).
+	// a per-account egress proxy whose already-constructed dial path is currently
+	// unreachable. 503; the request is REFUSED rather than sent out the node's IP
+	// (which would defeat the per-account isolation).
 	ErrCodeAccountEgressProxy = "ACCOUNT_EGRESS_PROXY_UNAVAILABLE"
+	// ErrCodeAccountEgressEngine means the configured per-account egress could
+	// not even be constructed by this proxy build (for example a Hysteria2
+	// fragment when no compatible engine is installed). This is a deterministic
+	// local configuration/capability failure, not an account-health signal, so
+	// oauth-group in-request failover must not route around it.
+	ErrCodeAccountEgressEngine = "ACCOUNT_EGRESS_ENGINE_UNAVAILABLE"
 )
 
 // ---- HealthSnapshot ----

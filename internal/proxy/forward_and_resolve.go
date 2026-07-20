@@ -422,8 +422,8 @@ func (p *Proxy) serveRoute(w http.ResponseWriter, r *http.Request, route *vkeys.
 	// can route out their own upstream instead of eating a 503. Node-local; the cost
 	// (all OAuth accounts then share this node's exit IP) is surfaced in the UI.
 	// Trade-off when OFF: if the admin's per-account proxy is down, the account's
-	// request fails loudly (ErrCodeAccountEgressProxy 503) — the escape hatch is the
-	// deliberate opt-out of that fail-loud.
+	// request fails loudly (ErrCodeAccountEgressEngine/ErrCodeAccountEgressProxy
+	// 503) — the escape hatch is the deliberate opt-out of that fail-loud.
 	// Per-request egress attribution (2026-07-19): derive ONCE from the resolved
 	// account egress + node override, then (A) log it at Info for live trace_id
 	// grep and (B) let recordEvent stamp the same onto the usage event's ext_json.
@@ -446,12 +446,13 @@ func (p *Proxy) serveRoute(w http.ResponseWriter, r *http.Request, route *vkeys.
 			p.errors.Add(1)
 			logger.Error("per-account egress proxy unavailable",
 				"event.name", observability.EventProxyRequestUpstreamError,
-				"error.code", observability.ErrCodeAccountEgressProxy,
+				"error.code", observability.ErrCodeAccountEgressEngine,
 				"error.message", egErr.Error(),
 				"account_id", route.AccountID,
 			)
-			writeJSONError(w, http.StatusServiceUnavailable, "server_error", observability.ErrCodeAccountEgressProxy,
-				"This account's egress proxy is misconfigured and traffic was not sent out the wrong IP. Ask your admin to check the account's egress proxy setting.")
+			writeJSONError(w, http.StatusServiceUnavailable, "server_error", observability.ErrCodeAccountEgressEngine,
+				accountEgressErrorMessage(route,
+					"its configured egress could not be started. Traffic was not sent without the required egress. Check the account egress setting and whether the required egress engine is installed."))
 			return
 		}
 		inner = egT
@@ -965,7 +966,8 @@ func (p *Proxy) serveRoute(w http.ResponseWriter, r *http.Request, route *vkeys.
 					"account_id", route.AccountID,
 				)
 				writeJSONError(w, http.StatusServiceUnavailable, "server_error", observability.ErrCodeAccountEgressProxy,
-					"egress connect fail: this account's egress upstream(s) are unreachable. Run `aikey doctor` to diagnose.")
+					accountEgressErrorMessage(route,
+						"its configured egress upstream is unreachable. Run `aikey doctor` and check this account's egress setting."))
 				return
 			}
 			logger.Error("upstream error",
@@ -1009,4 +1011,16 @@ func (p *Proxy) serveRoute(w http.ResponseWriter, r *http.Request, route *vkeys.
 			"threshold_ms", p.SlowRequestMs,
 		)
 	}
+}
+
+// accountEgressErrorMessage names the selected shared account when that identity
+// is available. Members can see the same identity on /user/team-oauth, so this
+// is actionable context rather than a secret; omitting it made failover errors
+// look like an unrelated account/login problem.
+func accountEgressErrorMessage(route *vkeys.ResolvedRoute, detail string) string {
+	subject := "The selected shared account"
+	if route != nil && strings.TrimSpace(route.OAuthIdentity) != "" {
+		subject += " (" + strings.TrimSpace(route.OAuthIdentity) + ")"
+	}
+	return "AiKey: " + subject + " is signed in, but " + detail
 }

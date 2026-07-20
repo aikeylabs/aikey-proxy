@@ -11,6 +11,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/AiKeyLabs/aikey-proxy/internal/observability"
 	"github.com/AiKeyLabs/aikey-proxy/internal/vkeys"
 )
 
@@ -156,6 +157,58 @@ func TestGroupFailover_AllCandidatesFailFlushesLastError(t *testing.T) {
 	}
 }
 
+// A local AiKey failure on the correctly routed/logged-in account must not be
+// overwritten by LOGIN_REQUIRED from the next failover candidate. Live dev2
+// regression shape (2026-07-20): test3 logged in + unsupported Hysteria2 egress
+// became a misleading "log in test10" 401.
+func TestGroupFailover_LocalEgressEngineErrorDoesNotBypassCurrentRoute(t *testing.T) {
+	key := grKey()
+	refs := []vkeys.GroupAccountRef{
+		{AccountID: "acc-logged", ProviderCode: "anthropic", Identity: "test3@gmail.com"},
+		{AccountID: "acc-needs-login", ProviderCode: "anthropic", Identity: "test10@gmail.com"},
+	}
+	mat := map[string]vkeys.GroupRuntimeAccount{
+		"acc-logged": encMat(t, key, vkeys.GroupRuntimeAccount{
+			CredentialType: "oauth_account", ExpiresAt: 9_000_000_000, ExternalID: "uuid-logged",
+			Identity: "test3@gmail.com",
+			EgressProxyURL: `proxies:
+  - name: unsupported-hy2
+    type: hysteria2
+    server: 203.0.113.10
+    port: 443
+    password: test-only`,
+		}, "tok-logged"),
+		"acc-needs-login": {CredentialType: "oauth_account", NeedsLogin: true, Identity: "test10@gmail.com"},
+	}
+	route := &vkeys.ResolvedRoute{
+		VirtualKeyID: "vk-grp", Provider: "anthropic", ProtocolType: "anthropic",
+		ProviderCode: "anthropic", RouteSource: "team",
+		SeatID: "seat-1", OauthGroupID: "grp-1",
+		GroupAccounts: mustJSON(t, refs), GroupRuntime: mustJSON(t, mat),
+	}
+	p, _ := setupGroupProxy(t, key, route)
+	cache := NewRoutingOverrideCache()
+	cache.StoreAll(1, map[string]string{routeKey("seat-1", "grp-1"): "acc-logged"}, nil)
+	p.SetRoutingOverrides(cache)
+
+	req, w := groupReq(groupBody)
+	p.Handle(w, req)
+
+	if w.Code != http.StatusServiceUnavailable {
+		t.Fatalf("local egress root cause must remain 503, got %d: %s", w.Code, w.Body.String())
+	}
+	if got := w.Header().Get(HeaderAikeyErrorSource); got != observability.ErrCodeAccountEgressEngine {
+		t.Fatalf("error source=%q want %q", got, observability.ErrCodeAccountEgressEngine)
+	}
+	body := w.Body.String()
+	if !strings.Contains(body, observability.ErrCodeAccountEgressEngine) || !strings.Contains(body, "test3@gmail.com") {
+		t.Fatalf("response must name the real code and routed account: %s", body)
+	}
+	if strings.Contains(body, groupErrLoginRequired) || strings.Contains(body, "test10@gmail.com") {
+		t.Fatalf("later candidate login state must not mask the root cause: %s", body)
+	}
+}
+
 // The switch budget caps total upstream attempts at groupFailoverMaxSwitches+1
 // even with more candidates available: the final permitted attempt streams its
 // outcome directly (no capture), so the client sees that attempt's error.
@@ -294,18 +347,20 @@ func TestGroupCooldown_SuccessResetsStreak(t *testing.T) {
 // Unit: eligibility table for the capture gate.
 func TestFailoverEligibleResponse(t *testing.T) {
 	evidence := http.Header{"Anthropic-Ratelimit-Unified-Status": {"rate_limited"}}
+	localEngineFailure := http.Header{HeaderAikeyErrorSource: {observability.ErrCodeAccountEgressEngine}}
 	cases := []struct {
 		status int
 		h      http.Header
 		want   bool
 	}{
 		{401, nil, true},
-		{429, nil, false},      // WAF-suspect: no evidence
-		{429, evidence, true},  // real exhaustion
+		{429, nil, false},     // WAF-suspect: no evidence
+		{429, evidence, true}, // real exhaustion
 		{500, nil, true},
 		{502, nil, true},
 		{529, nil, true},
 		{503, nil, true},
+		{503, localEngineFailure, false},
 		{200, nil, false},
 		{400, nil, false}, // request-shaped error: switching cannot help
 		{403, nil, false}, // may be permission/WAF; conservative no-switch this phase

@@ -38,6 +38,8 @@ package proxy
 import (
 	"bytes"
 	"net/http"
+
+	"github.com/AiKeyLabs/aikey-proxy/internal/observability"
 )
 
 const (
@@ -67,6 +69,14 @@ const (
 //   - >=500 (incl. 529 overload and the ReverseProxy-synthesized 502 for
 //     transport errors): upstream/account-side failure worth one try elsewhere.
 func failoverEligibleResponse(status int, h http.Header) bool {
+	// The scheduling engine already selected this account. If its configured
+	// egress cannot be constructed locally, no upstream request happened and no
+	// account-health evidence exists. Retrying another account here would bypass
+	// the engine's current_routed decision and make /user/team-oauth disagree
+	// with the account that actually served the request.
+	if h.Get(HeaderAikeyErrorSource) == observability.ErrCodeAccountEgressEngine {
+		return false
+	}
 	switch {
 	case status == http.StatusUnauthorized:
 		return true
