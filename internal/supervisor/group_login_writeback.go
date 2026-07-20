@@ -20,6 +20,7 @@ import (
 	"io"
 	"log/slog"
 	"net/http"
+	"net/url"
 	"time"
 
 	"github.com/AiKeyLabs/aikey-proxy/internal/httpx"
@@ -35,6 +36,59 @@ type memberTokenWriteback struct {
 	// ExternalID (optional, C5): the provider account UUID from the exchange, so
 	// master backfills it on first login (Claude metadata.user_id).
 	ExternalID string `json:"external_id,omitempty"`
+	// ProviderCode and Identity come from the immutable login session context.
+	// Master re-validates ProviderCode before persistence; Identity stays advisory
+	// under the availability-first mismatch policy but is never inferred later.
+	ProviderCode string `json:"provider_code,omitempty"`
+	OauthGroupID string `json:"oauth_group_id,omitempty"`
+	AccountID    string `json:"account_id,omitempty"`
+	Identity     string `json:"identity,omitempty"`
+}
+
+// poolLoginContext is the non-secret master binding fetched before starting an
+// OAuth provider flow. It prevents UI display fallbacks from selecting a model.
+type poolLoginContext struct {
+	CredentialID     string `json:"credential_id"`
+	OauthGroupID     string `json:"oauth_group_id"`
+	AccountID        string `json:"account_id"`
+	ProviderCode     string `json:"provider_code"`
+	ExpectedIdentity string `json:"expected_identity"`
+	ExternalID       string `json:"external_id"`
+}
+
+type poolLoginContextHTTPError struct {
+	StatusCode int
+	Detail     string
+}
+
+func (e *poolLoginContextHTTPError) Error() string {
+	return fmt.Sprintf("master OAuth login-context failed: %d: %s", e.StatusCode, e.Detail)
+}
+
+func fetchPoolLoginContext(ctx context.Context, client *http.Client, masterURL, bearer, credentialID string) (poolLoginContext, error) {
+	u := masterURL + "/accounts/me/oauth-login-context?credential_id=" + url.QueryEscape(credentialID)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u, nil)
+	if err != nil {
+		return poolLoginContext{}, err
+	}
+	req.Header.Set("Authorization", "Bearer "+bearer)
+	resp, err := client.Do(req)
+	if err != nil {
+		return poolLoginContext{}, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		snippet, _ := io.ReadAll(io.LimitReader(resp.Body, 2<<10))
+		return poolLoginContext{}, &poolLoginContextHTTPError{StatusCode: resp.StatusCode, Detail: string(snippet)}
+	}
+	var out poolLoginContext
+	if err := json.NewDecoder(io.LimitReader(resp.Body, 8<<10)).Decode(&out); err != nil {
+		return poolLoginContext{}, fmt.Errorf("decode master OAuth login-context: %w", err)
+	}
+	if out.CredentialID != credentialID || out.ProviderCode == "" || out.OauthGroupID == "" || out.AccountID == "" {
+		return poolLoginContext{}, fmt.Errorf("master OAuth login-context incomplete for credential %q", credentialID)
+	}
+	return out, nil
 }
 
 // writebackMaxAttempts / writebackBaseBackoff / writebackMaxBackoff bound the retry

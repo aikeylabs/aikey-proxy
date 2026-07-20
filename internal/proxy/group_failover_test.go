@@ -209,6 +209,48 @@ func TestGroupFailover_LocalEgressEngineErrorDoesNotBypassCurrentRoute(t *testin
 	}
 }
 
+// A retryable upstream error from the engine-assigned account must not be
+// rewritten as LOGIN_REQUIRED for a different, request-level failover
+// candidate. That candidate is not current on /user/team-oauth, so the prompt
+// would be both misleading and unactionable. Preserve the captured root cause.
+func TestGroupFailover_UpstreamErrorNotMaskedByFailoverCandidateLogin(t *testing.T) {
+	key := grKey()
+	refs := []vkeys.GroupAccountRef{
+		{AccountID: "acc-assigned", ProviderCode: "anthropic", Identity: "assigned@example.com"},
+		{AccountID: "acc-needs-login", ProviderCode: "anthropic", Identity: "fallback@example.com"},
+	}
+	mat := map[string]vkeys.GroupRuntimeAccount{
+		"acc-assigned": encMat(t, key, vkeys.GroupRuntimeAccount{
+			CredentialType: "oauth_account", ExpiresAt: 9_000_000_000, ExternalID: "uuid-assigned",
+		}, "tok-assigned"),
+		"acc-needs-login": {CredentialType: "oauth_account", NeedsLogin: true, Identity: "fallback@example.com"},
+	}
+	route := &vkeys.ResolvedRoute{
+		VirtualKeyID: "vk-grp", Provider: "anthropic", ProtocolType: "anthropic",
+		ProviderCode: "anthropic", RouteSource: "team",
+		SeatID: "seat-1", OauthGroupID: "grp-1",
+		GroupAccounts: mustJSON(t, refs), GroupRuntime: mustJSON(t, mat),
+	}
+	p, tr := setupGroupProxy(t, key, route)
+	cache := NewRoutingOverrideCache()
+	cache.StoreAll(1, map[string]string{routeKey("seat-1", "grp-1"): "acc-assigned"}, nil)
+	p.SetRoutingOverrides(cache)
+	tr.status = http.StatusServiceUnavailable
+
+	req, w := groupReq(groupBody)
+	p.Handle(w, req)
+
+	if w.Code != http.StatusServiceUnavailable {
+		t.Fatalf("captured assigned-account error must remain 503, got %d: %s", w.Code, w.Body.String())
+	}
+	if tr.calls != 1 {
+		t.Fatalf("needs-login fallback has no usable credential and must not be attempted, calls=%d", tr.calls)
+	}
+	if strings.Contains(w.Body.String(), groupErrLoginRequired) || strings.Contains(w.Body.String(), "fallback@example.com") {
+		t.Fatalf("fallback login state must not mask assigned-account failure: %s", w.Body.String())
+	}
+}
+
 // The switch budget caps total upstream attempts at groupFailoverMaxSwitches+1
 // even with more candidates available: the final permitted attempt streams its
 // outcome directly (no capture), so the client sees that attempt's error.

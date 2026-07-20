@@ -107,10 +107,10 @@ func (p *Proxy) handleOauthGroupRoute(
 		res, err := resolveGroupCredential(route, p.groupKey.DerivedKey(), time.Now().Unix(), skip, override)
 		if err != nil {
 			ge, isGE := err.(*groupResolveError)
-			// 1. RW2/D2: the routed account has no token for this member — a
-			//    structured login prompt (not a degrade) so the client triggers the
-			//    local OAuth login for THAT account. Actionable + account-specific,
-			//    so it wins even over a captured upstream error.
+			// 1. RW2/D2: the engine/HRW-assigned account has no token for this member —
+			//    a structured login prompt so the client opens THAT account. The shared
+			//    picker never emits LOGIN_REQUIRED for a request-level fallback, so this
+			//    cannot overwrite an assigned-account failure with another account.
 			if isGE && ge.Code == groupErrLoginRequired {
 				p.respondLoginRequired(w, logger, route, ge.Account)
 				return

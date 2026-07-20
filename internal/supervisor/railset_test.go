@@ -103,6 +103,45 @@ func TestRailSet_KickAllNonBlocking(t *testing.T) {
 	}
 }
 
+// A writeback completion wait must observe the result of the exact named cycle,
+// not stale last_error/last_success state from an earlier periodic run.
+func TestRailSet_KickAndWaitReturnsRequestedCycleResult(t *testing.T) {
+	rs := newRailSet(railSpec{name: "other"}, railSpec{name: "group_runtime"})
+	wantErr := errors.New("runtime fetch failed")
+	go func() {
+		ack := <-rs.rails[1].kick
+		ack <- railCycleResult{attempted: true, err: wantErr}
+		close(ack)
+	}()
+
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	if err := rs.kickAndWait(ctx, "group_runtime"); !errors.Is(err, wantErr) {
+		t.Fatalf("kickAndWait error=%v want %v", err, wantErr)
+	}
+	select {
+	case <-rs.rails[0].kick:
+		t.Fatal("named kick must not disturb another rail")
+	default:
+	}
+}
+
+func TestRailSet_KickAndWaitRejectsIdleCycle(t *testing.T) {
+	rs := newRailSet(railSpec{name: "group_runtime"})
+	go func() {
+		ack := <-rs.rails[0].kick
+		ack <- railCycleResult{}
+		close(ack)
+	}()
+
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	err := rs.kickAndWait(ctx, "group_runtime")
+	if err == nil || !strings.Contains(err.Error(), "readiness gate") {
+		t.Fatalf("idle cycle must be explicit, got %v", err)
+	}
+}
+
 type stubRefreshTokenSource struct {
 	token string
 	err   error

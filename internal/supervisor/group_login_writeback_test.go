@@ -3,9 +3,11 @@ package supervisor
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -51,6 +53,42 @@ func TestPostMemberToken_PostsToMasterWithBearer(t *testing.T) {
 	}
 	if gotBody.CredentialID != "c1" || gotBody.AccessToken != "tok" || gotBody.ExternalID != "uuid-1" {
 		t.Errorf("body mismatch: %+v", gotBody)
+	}
+}
+
+func TestFetchPoolLoginContext_BindsExactCredential(t *testing.T) {
+	var gotAuth, gotCredential string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotAuth = r.Header.Get("Authorization")
+		gotCredential = r.URL.Query().Get("credential_id")
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"credential_id":"c/a","oauth_group_id":"g1","account_id":"a1","provider_code":"openai","expected_identity":"codex@team.com","external_id":"uuid-1"}`))
+	}))
+	defer srv.Close()
+
+	got, err := fetchPoolLoginContext(context.Background(), srv.Client(), srv.URL, "JWT123", "c/a")
+	if err != nil {
+		t.Fatalf("fetchPoolLoginContext: %v", err)
+	}
+	if gotAuth != "Bearer JWT123" || gotCredential != "c/a" {
+		t.Fatalf("request binding lost: auth=%q credential=%q", gotAuth, gotCredential)
+	}
+	if got.ProviderCode != "openai" || got.ExpectedIdentity != "codex@team.com" || got.ExternalID != "uuid-1" {
+		t.Fatalf("context decode mismatch: %+v", got)
+	}
+}
+
+func TestFetchPoolLoginContext_PreservesMasterConflict(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusConflict)
+		_, _ = w.Write([]byte(`{"error":"BIZ_OAUTH_LOGIN_CONTEXT_UNAVAILABLE"}`))
+	}))
+	defer srv.Close()
+
+	_, err := fetchPoolLoginContext(context.Background(), srv.Client(), srv.URL, "JWT", "c1")
+	var httpErr *poolLoginContextHTTPError
+	if !errors.As(err, &httpErr) || httpErr.StatusCode != http.StatusConflict || !strings.Contains(httpErr.Detail, "BIZ_OAUTH_LOGIN_CONTEXT_UNAVAILABLE") {
+		t.Fatalf("master conflict must retain status and detail: %#v err=%v", httpErr, err)
 	}
 }
 

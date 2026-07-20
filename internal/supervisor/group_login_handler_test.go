@@ -3,6 +3,7 @@ package supervisor
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -14,23 +15,25 @@ import (
 // fakePoolExchanger stands in for the memory-store broker so the handler's
 // session-tracking + writeback chain is testable without a live provider.
 type fakePoolExchanger struct {
-	authURL    string
-	accountID  string
-	access     string
-	refresh    string
-	expiresAt  int64
-	externalID string
-	identity   string
-	submitErr  error
-	submitN    int    // # of SubmitCode calls (idempotent-retry assertions)
-	forgotN    int    // # of Forget calls (cache-clear-on-success assertions)
-	forgotSess string // last Forget sessionID
-	forgotAcct string // last Forget accountID
-	status     string // LoginStatus result (codex polling leg); "" ⇒ pending
-	statusErr  string // LoginStatus provider error text
+	authURL         string
+	accountID       string
+	access          string
+	refresh         string
+	expiresAt       int64
+	externalID      string
+	identity        string
+	submitErr       error
+	submitN         int    // # of SubmitCode calls (idempotent-retry assertions)
+	forgotN         int    // # of Forget calls (cache-clear-on-success assertions)
+	forgotSess      string // last Forget sessionID
+	forgotAcct      string // last Forget accountID
+	status          string // LoginStatus result (codex polling leg); "" ⇒ pending
+	statusErr       string // LoginStatus provider error text
+	startedProvider string
 }
 
-func (f *fakePoolExchanger) StartLogin(_ context.Context, _ string) (string, string, error) {
+func (f *fakePoolExchanger) StartLogin(_ context.Context, provider string) (string, string, error) {
+	f.startedProvider = provider
 	return "sess-1", f.authURL, nil
 }
 func (f *fakePoolExchanger) SubmitCode(_ context.Context, _, _ string) (string, string, string, int64, string, string, error) {
@@ -59,6 +62,12 @@ func newPoolHandler(t *testing.T, ex poolExchanger, masterURL string) *poolLogin
 		masterURL: func() string { return masterURL },
 		bearer:    func(context.Context) (string, error) { return "JWT", nil },
 		client:    http.DefaultClient,
+		resolveContext: func(_ context.Context, credentialID string) (poolLoginContext, error) {
+			return poolLoginContext{
+				CredentialID: credentialID, OauthGroupID: "g1", AccountID: "account-" + credentialID,
+				ProviderCode: "anthropic", ExpectedIdentity: "member@team.com",
+			}, nil
+		},
 	}
 }
 
@@ -109,7 +118,7 @@ func TestPoolLogin_EndToEnd(t *testing.T) {
 		t.Fatalf("submit-code: %d %s", w2.Code, w2.Body.String())
 	}
 	// writeback carried the SESSION'S credential_id + the exchanged token.
-	if gotWB.CredentialID != "c1" || gotWB.AccessToken != "TOK" || gotWB.RefreshToken != "RT" || gotWB.ExpiresAt != 42 || gotWB.ExternalID != "uuid-x" {
+	if gotWB.CredentialID != "c1" || gotWB.AccessToken != "TOK" || gotWB.RefreshToken != "RT" || gotWB.ExpiresAt != 42 || gotWB.ExternalID != "uuid-x" || gotWB.ProviderCode != "anthropic" || gotWB.OauthGroupID != "g1" || gotWB.AccountID != "account-c1" || gotWB.Identity != "member@team.com" {
 		t.Fatalf("writeback wrong: %+v", gotWB)
 	}
 	// token must NOT be echoed to the caller.
@@ -125,6 +134,50 @@ func TestPoolLogin_EndToEnd(t *testing.T) {
 	_ = json.Unmarshal(w2.Body.Bytes(), &okResp)
 	if okResp.Identity != "member@team.com" {
 		t.Fatalf("submit-code response should carry identity email, got %q", okResp.Identity)
+	}
+}
+
+// The client/provider display value is never authoritative. The credential's
+// master binding selects both broker provider and flow at session creation.
+func TestPoolLogin_AuthorizeUsesServerBindingNotClientProvider(t *testing.T) {
+	ex := &fakePoolExchanger{authURL: "https://login"}
+	h := newPoolHandler(t, ex, "https://master.invalid")
+	h.resolveContext = func(_ context.Context, credentialID string) (poolLoginContext, error) {
+		return poolLoginContext{
+			CredentialID: credentialID, OauthGroupID: "g-openai", AccountID: "a-openai",
+			ProviderCode: "openai", ExpectedIdentity: "codex@team.com",
+		}, nil
+	}
+
+	w := doJSON(h.authorizeURL, `{"provider":"claude","credential_id":"c-openai"}`)
+	if w.Code != http.StatusOK {
+		t.Fatalf("authorize: %d %s", w.Code, w.Body.String())
+	}
+	if ex.startedProvider != "codex" {
+		t.Fatalf("server-bound openai must start codex, client claude must be ignored; got %q", ex.startedProvider)
+	}
+	var got struct {
+		ProviderCode     string `json:"provider_code"`
+		Flow             string `json:"flow"`
+		ExpectedIdentity string `json:"expected_identity"`
+	}
+	_ = json.Unmarshal(w.Body.Bytes(), &got)
+	if got.ProviderCode != "openai" || got.Flow != "auth_code" || got.ExpectedIdentity != "codex@team.com" {
+		t.Fatalf("server login context not returned intact: %+v", got)
+	}
+}
+
+func TestPoolLogin_AuthorizeSurfacesMasterContextConflict(t *testing.T) {
+	h := newPoolHandler(t, &fakePoolExchanger{authURL: "https://login"}, "https://master.invalid")
+	h.resolveContext = func(context.Context, string) (poolLoginContext, error) {
+		return poolLoginContext{}, &poolLoginContextHTTPError{
+			StatusCode: http.StatusConflict,
+			Detail:     `{"error":"BIZ_OAUTH_LOGIN_CONTEXT_UNAVAILABLE"}`,
+		}
+	}
+	w := doJSON(h.authorizeURL, `{"credential_id":"c1"}`)
+	if w.Code != http.StatusConflict || !strings.Contains(w.Body.String(), "BIZ_OAUTH_LOGIN_CONTEXT_UNAVAILABLE") {
+		t.Fatalf("master login-context conflict must stay visible, got %d %s", w.Code, w.Body.String())
 	}
 }
 
@@ -176,6 +229,47 @@ func TestPoolLogin_PendingThenConfirm(t *testing.T) {
 	}
 	if ex.forgotN != 1 {
 		t.Fatalf("step 2 should Forget on success, got %d", ex.forgotN)
+	}
+}
+
+// Once master has accepted the token, a runtime-sync failure is not allowed to
+// turn the completed OAuth login into a retry loop. It is returned as an
+// explicit pending state while the normal rail keeps retrying in background.
+func TestPoolLogin_RuntimeSyncFailureIsVisibleButNonBlocking(t *testing.T) {
+	var writebacks int32
+	master := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		atomic.AddInt32(&writebacks, 1)
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{"status":"ok"}`))
+	}))
+	defer master.Close()
+
+	ex := &fakePoolExchanger{authURL: "u", accountID: "acc-x", access: "T", identity: "member@team.com"}
+	h := newPoolHandler(t, ex, master.URL)
+	h.client = master.Client()
+	h.syncAfterWriteback = func(context.Context) error {
+		if atomic.LoadInt32(&writebacks) != 1 {
+			t.Fatal("runtime sync ran before the token was durable on master")
+		}
+		return errors.New("group runtime fetch failed")
+	}
+
+	_ = doJSON(h.authorizeURL, `{"credential_id":"c1"}`)
+	w := doJSON(h.submitCode, `{"session_id":"sess-1","code":"abc#st","confirm":true}`)
+	if w.Code != http.StatusOK {
+		t.Fatalf("durable login must stay successful, got %d %s", w.Code, w.Body.String())
+	}
+	var got struct {
+		Status     string `json:"status"`
+		SyncStatus string `json:"sync_status"`
+		SyncError  string `json:"sync_error"`
+	}
+	_ = json.Unmarshal(w.Body.Bytes(), &got)
+	if got.Status != "ok" || got.SyncStatus != "pending" || !strings.Contains(got.SyncError, "runtime fetch failed") {
+		t.Fatalf("pending sync must be explicit without failing login: %+v", got)
+	}
+	if ex.forgotN != 1 {
+		t.Fatalf("durable login session must be consumed despite pending sync, got forgot=%d", ex.forgotN)
 	}
 }
 
