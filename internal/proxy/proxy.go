@@ -43,7 +43,9 @@ type ActiveKeyReader interface {
 	// v1.0.2: provider-level binding from user_profile_provider_bindings.
 	GetProviderBinding(providerCode string) (*vault.ProviderBinding, error)
 	// v1.0.2: resolve team key by exact virtual_key_id (no local_state filter).
-	GetTeamKeyByID(virtualKeyID string) (*vault.ManagedKey, error)
+	// P1e (D-11): targetProviderCode selects the matching binding (one row per
+	// binding, ciphertext per row) — empty falls back to the primary binding.
+	GetTeamKeyByID(virtualKeyID, targetProviderCode string) (*vault.ManagedKey, error)
 }
 
 // OAuthBroker is the minimal interface the proxy data-plane needs from the broker.
@@ -205,6 +207,15 @@ type Proxy struct {
 	proxyInstanceID  string
 	requests         atomic.Int64
 	errors           atomic.Int64
+	// Model-mapping runtime health (task 7.9 / 3.5 four-surface visibility): the
+	// read-only /v1/diagnostics/pipeline endpoint reads these to answer "was a
+	// mapping configured but not taking effect?". `mapPassthrough`/`mapRejected`
+	// are the "configured-but-missing" signal (a provider HAS a model_map yet the
+	// client's request didn't match a rule); `mapApplied` is the healthy path.
+	mapApplied   atomic.Int64
+	mapRejected  atomic.Int64
+	mapPassthrough atomic.Int64
+	lastMapMiss  atomic.Pointer[mapMissRecord]
 	loadedControlSeq int64 // vault change_seq loaded at generation build time
 	// Configurable slow-request thresholds (milliseconds).
 	SlowRequestMs     int64

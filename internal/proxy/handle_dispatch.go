@@ -66,6 +66,15 @@ func (p *Proxy) Handle(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// 0-diag. Read-only pipeline diagnostics (task 7.9). GET-only, no auth, no
+	// mutation — exposes the embedded registry provenance + model-mapping runtime
+	// health so the four surfaces (3.5) can show "configured but not effective".
+	// Checked before any routing branch so it never collides with a provider prefix.
+	if r.URL.Path == "/v1/diagnostics/pipeline" {
+		p.handleDiagnosticsPipeline(w, r)
+		return
+	}
+
 	// 0a-prime. Probe pipeline path: /probe/<alias>/v1/... (mode C, SPEC
 	// 2026-05-23-credential-mode-architecture §1.3).
 	//

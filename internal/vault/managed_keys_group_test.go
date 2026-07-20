@@ -114,3 +114,72 @@ func TestGetActiveManagedKeys_LegacyVaultFallback(t *testing.T) {
 		t.Fatalf("legacy vault must yield empty group fields: %q", keys[0].OauthGroupID)
 	}
 }
+
+// 🔴 P1e (design D-11) PROXY CAPABILITY FENCE: one VK carries TWO bindings, each
+// with its own credential, on the composite-PK cache. Routing must select the
+// binding matching the request's resolved upstream provider and decrypt THAT
+// binding's own key — so "GLM(zhipu key)" and "official(anthropic key)" on one
+// VK each reach their own upstream. If GetTeamKeyByID ever ignores the target
+// provider (pre-P1e first-row-wins), this goes red.
+func TestGetTeamKeyByID_MultiBindingSelectsByProvider(t *testing.T) {
+	db, err := sql.Open("sqlite", ":memory:")
+	if err != nil {
+		t.Fatalf("open sqlite: %v", err)
+	}
+	t.Cleanup(func() { db.Close() })
+	// Composite-PK cache (the P1e grain: one row per binding).
+	if _, err := db.Exec(`CREATE TABLE managed_virtual_keys_cache (
+		virtual_key_id TEXT NOT NULL, alias TEXT NOT NULL, local_alias TEXT,
+		provider_code TEXT NOT NULL DEFAULT '', protocol_type TEXT NOT NULL DEFAULT 'openai_compatible',
+		base_url TEXT, provider_key_nonce BLOB, provider_key_ciphertext BLOB, provider_base_urls TEXT,
+		org_id TEXT, seat_id TEXT, credential_id TEXT, credential_revision TEXT,
+		virtual_key_revision TEXT, owner_account_id TEXT, key_status TEXT, local_state TEXT,
+		PRIMARY KEY (virtual_key_id, protocol_type, provider_code))`); err != nil {
+		t.Fatalf("create table: %v", err)
+	}
+	key := make([]byte, 32)
+	for i := range key {
+		key[i] = byte(i + 7)
+	}
+	r := &Reader{db: db, derivedKey: key}
+	insert := func(prov, base, plaintext string) {
+		nonce, ct, encErr := Encrypt(r.derivedKey, []byte(plaintext))
+		if encErr != nil {
+			t.Fatalf("encrypt: %v", encErr)
+		}
+		if _, err := db.Exec(`INSERT INTO managed_virtual_keys_cache
+			(virtual_key_id, alias, provider_code, protocol_type, base_url,
+			 provider_key_nonce, provider_key_ciphertext, org_id, seat_id,
+			 credential_id, credential_revision, virtual_key_revision, owner_account_id, key_status)
+			VALUES ('vk-dual', 'dual', ?, 'anthropic', ?, ?, ?, 'org', 'seat', 'cred', 'r', 'vr', 'acct', 'active')`,
+			prov, base, nonce, ct); err != nil {
+			t.Fatalf("insert %s binding: %v", prov, err)
+		}
+	}
+	insert("zhipu", "https://open.bigmodel.cn/api/anthropic", "sk-glm-key")
+	insert("anthropic", "https://api.anthropic.com", "sk-official-key")
+
+	// Each provider selects ITS OWN binding's key + base_url.
+	glm, err := r.GetTeamKeyByID("vk-dual", "zhipu")
+	if err != nil || glm == nil {
+		t.Fatalf("GetTeamKeyByID(zhipu): %v / %v", glm, err)
+	}
+	if glm.PlaintextKey != "sk-glm-key" || glm.ProviderCode != "zhipu" {
+		t.Errorf("zhipu binding wrong: key=%q provider=%q", glm.PlaintextKey, glm.ProviderCode)
+	}
+	official, err := r.GetTeamKeyByID("vk-dual", "anthropic")
+	if err != nil || official == nil {
+		t.Fatalf("GetTeamKeyByID(anthropic): %v / %v", official, err)
+	}
+	if official.PlaintextKey != "sk-official-key" || official.ProviderCode != "anthropic" {
+		t.Errorf("anthropic binding wrong: key=%q provider=%q", official.PlaintextKey, official.ProviderCode)
+	}
+	// Empty target → deterministic primary (stable provider_code order: anthropic < zhipu).
+	primary, err := r.GetTeamKeyByID("vk-dual", "")
+	if err != nil || primary == nil {
+		t.Fatalf("GetTeamKeyByID(primary): %v / %v", primary, err)
+	}
+	if primary.ProviderCode != "anthropic" {
+		t.Errorf("empty target must resolve a deterministic primary, got provider=%q", primary.ProviderCode)
+	}
+}

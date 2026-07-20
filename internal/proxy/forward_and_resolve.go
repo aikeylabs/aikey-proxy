@@ -85,10 +85,18 @@ func (p *Proxy) serveRouteWithObserver(
 		// pipeline uses so user_chat observers see the same shape app
 		// observers do. No change for paths that already filled the
 		// field (route.ProtocolFamily != "" wins).
+		// P1d (design D-10, safe slice): prefer the path-aware route row keyed
+		// on the resolved base_url so multi-endpoint hosts (GLM /api/anthropic
+		// vs /api/paas) get the right wire family; fall back to the path-blind
+		// ByProvider when the base_url host isn't in the table. Audit-only.
 		pf := route.ProtocolFamily
-		if pf == "" && route.ProviderCode != "" {
-			if pr, ok := provider.Routes().ByProvider(route.ProviderCode); ok {
+		if pf == "" {
+			if pr, ok := provider.Routes().LookupByBaseURL(route.BaseURL); ok {
 				pf = pr.Protocol
+			} else if route.ProviderCode != "" {
+				if pr, ok := provider.Routes().ByProvider(route.ProviderCode); ok {
+					pf = pr.Protocol
+				}
 			}
 		}
 		obsReqCtx = &observer.RequestContext{
@@ -254,7 +262,11 @@ func (p *Proxy) ResolveBindingCredential(
 		return out, nil
 
 	case "team":
-		mk, err := p.activeReader.GetTeamKeyByID(binding.KeySourceRef)
+		// P1e (D-11): pass the resolved upstream provider so a multi-binding VK
+		// (e.g. GLM + official on one VK) picks THIS request's binding + its own
+		// key. canonicalCode is the truthful upstream vendor; empty/unmatched
+		// falls back to the VK's primary binding (legacy single-binding behavior).
+		mk, err := p.activeReader.GetTeamKeyByID(binding.KeySourceRef, canonicalCode)
 		if err != nil {
 			logger.Warn("vault: team key lookup via binding failed", "vk_id", binding.KeySourceRef, "error", err)
 			return out, nil // soft fail — caller will try legacy fallback
@@ -304,6 +316,19 @@ func (p *Proxy) ResolveBindingCredential(
 // serveRoute executes the forwarding pipeline (streaming detection, transport
 // selection, reverse proxy) shared by token-based and path-prefix routing.
 func (p *Proxy) serveRoute(w http.ResponseWriter, r *http.Request, route *vkeys.ResolvedRoute, prov provider.Provider, realKey, bearerToken string, startTime time.Time, logger *slog.Logger) {
+	// P1d (R-C, design D-10 refined): normalize provider ATTRIBUTION to the
+	// truthful upstream vendor resolved from the binding's base_url. A binding
+	// declared as anthropic but pointing at GLM's .../api/anthropic endpoint
+	// then attributes usage/pricing to zhipu (the real vendor), fixing "metadata
+	// shows anthropic instead of glm". No-op for the overwhelming majority whose
+	// declared provider already matches their endpoint (LookupByBaseURL returns
+	// the same code) and for third-party gateways absent from the table (!ok).
+	// Adapter selection is unchanged — it's driven by the path's wire protocol,
+	// which is correct (the client speaks that wire). This is the single funnel
+	// every pipeline passes through, so one fix covers all.
+	if route != nil {
+		route.ProviderCode = truthfulProviderCode(route.BaseURL, route.ProviderCode)
+	}
 	// Phase 2 quota gate — UNIVERSAL chokepoint (Stage 3 + D-U8/P7). serveRoute is
 	// the single funnel EVERY real route passes through (Tier1 token, OAuth,
 	// active-sentinel, app pipeline, default binding; serveRouteWithObserver
@@ -352,6 +377,16 @@ func (p *Proxy) serveRoute(w http.ResponseWriter, r *http.Request, route *vkeys.
 	// forwarding. On Mask, r.Body is rewritten to the redacted version so the
 	// upstream LLM never sees the raw sensitive prompt. Fail-open on degraded.
 	if !p.applyInboundFilter(w, r, extractModel(r), route.RouteSource, route.OrgID, route.VirtualKeyID, route.SeatID, resolveSessionID(r, route.ProtocolType, route.ProviderCode), logger) {
+		return
+	}
+
+	// 6d. P2 model mapping (design D-1/D-2): rewrite the outbound body.model to
+	// the upstream model name for providers with a model_map (GLM). Independent
+	// layer, run after route resolution + client-model allowlist (D-4) and
+	// before the adapter RewriteRequest. Inert for non-mapped providers (body
+	// byte-identical), so blast radius is scoped to GLM traffic. On an unmatched
+	// reject it answers MODEL_MAPPING_NOT_FOUND and we stop.
+	if !p.applyModelMappingToRequest(w, r, route, logger) {
 		return
 	}
 
@@ -436,6 +471,17 @@ func (p *Proxy) serveRoute(w http.ResponseWriter, r *http.Request, route *vkeys.
 	}
 
 	logger.Debug("forwarding request", "base_url", route.BaseURL, "path", r.URL.Path, "provider_code", route.ProviderCode)
+
+	// P1j (design D-17, 禁止 #32): the stitch fallback (literal-prepend for a
+	// host absent from provider_routes) is the degraded path — third-party
+	// gateways with an explicit base_url still flow, but it must NOT be silent.
+	// WARN so "UI shows one upstream, proxy forwards another" is observable.
+	if route.BaseURL != "" && realKey != "__oauth__" {
+		if _, known := provider.Routes().LookupByBaseURL(route.BaseURL); !known {
+			logger.Warn("upstream host not in provider_routes — using degraded literal-prepend stitch",
+				"event.name", "proxy.route.not_found", "base_url", route.BaseURL, "provider_code", route.ProviderCode)
+		}
+	}
 
 	// 9. Build and execute reverse proxy.
 	rp := &httputil.ReverseProxy{
@@ -699,6 +745,13 @@ func (p *Proxy) serveRoute(w http.ResponseWriter, r *http.Request, route *vkeys.
 					resp.Header.Del("Transfer-Encoding")
 				}
 
+				// P3 (design D-5): restore the response model name to the
+				// client's original when the request leg mapped it, so the
+				// client recognizes its own model (N2). No-op unless mapping
+				// happened. Non-streaming only — streaming SSE restoration is
+				// tracked separately (stream drainer forwards frames verbatim).
+				body = restoreResponseModel(r.Context(), body)
+
 				// Rebuffer with the FINAL body (post-translation if engaged,
 				// otherwise unchanged from upstream).
 				resp.Body = io.NopCloser(bytes.NewReader(body))
@@ -814,6 +867,12 @@ func (p *Proxy) serveRoute(w http.ResponseWriter, r *http.Request, route *vkeys.
 				// them. newSSEToolNameRewriter is a no-op pass-through when
 				// the mapping is empty (real CLI traffic).
 				upstream := newSSEToolNameRewriter(resp.Body, toolNameRevMapping)
+				// P3.3 (design D-5/D-6): restore the streaming response model to
+				// the client's original name in the first message_start event.
+				// No-op (returns upstream unchanged) unless the request was mapped.
+				if clientModel, ok := r.Context().Value(ctxKeyMappedClientModel).(string); ok {
+					upstream = newSSEModelRewriter(upstream, clientModel)
+				}
 				// Phase 4 M2 plugin observer dispatch: pluck the observer
 				// context + registry that handleAppPipeline stashed on the
 				// route (App pipeline branch only — legacy /v1/... routes

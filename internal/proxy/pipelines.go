@@ -347,8 +347,18 @@ func (p *Proxy) handleAppPipeline(w http.ResponseWriter, r *http.Request, appCtx
 	// construction in this branch). ProtocolFamily resolves the provider
 	// to its wire family via pkg/providerroutes yaml (single source of
 	// truth, see ResolvedRoute.ProtocolFamily doc-comment).
+	// P1d (design D-10, safe slice): resolve the wire protocol family from the
+	// path-aware route row keyed on the credential's base_url, not the
+	// path-blind ByProvider — which returns a multi-endpoint provider's FIRST
+	// row (wrong for GLM's /api/anthropic vs /api/paas). Audit-only consumer
+	// (SSE parser selection), so no routing/attribution/adapter change here.
+	// Full provider↔protocol weld removal (attribution + isProviderCompatible
+	// + adapter-key kimi special-case) is tracked as an open item pending live
+	// cross-provider verification — see baseline-forensics §六.
 	protocolFamily := ""
-	if pr, ok := provider.Routes().ByProvider(binding.ProviderCode); ok {
+	if pr, ok := provider.Routes().LookupByBaseURL(cred.BaseURL); ok {
+		protocolFamily = pr.Protocol
+	} else if pr, ok := provider.Routes().ByProvider(binding.ProviderCode); ok {
 		protocolFamily = pr.Protocol
 	}
 	appResolvedRoute := &vkeys.ResolvedRoute{
@@ -693,8 +703,12 @@ func (p *Proxy) handleProbePipeline(w http.ResponseWriter, r *http.Request, prob
 	// Stage 6: build the ResolvedRoute for serveRoute. RouteSource="probe"
 	// distinguishes probe traffic from app/legacy in usage_event records;
 	// trust-local reads this to attribute probe events to the right pipeline.
+	// P1d (design D-10, safe slice): path-aware protocol-family resolution
+	// (see the App-pipeline sibling comment above). Audit-only blast radius.
 	protocolFamily := ""
-	if pr, ok := provider.Routes().ByProvider(binding.ProviderCode); ok {
+	if pr, ok := provider.Routes().LookupByBaseURL(cred.BaseURL); ok {
+		protocolFamily = pr.Protocol
+	} else if pr, ok := provider.Routes().ByProvider(binding.ProviderCode); ok {
 		protocolFamily = pr.Protocol
 	}
 	probeResolvedRoute := &vkeys.ResolvedRoute{
@@ -1055,6 +1069,20 @@ func (p *Proxy) handlePathPrefixRoute(w http.ResponseWriter, r *http.Request, pr
 		tokenBaseURL := route.BaseURL
 		if tokenBaseURL == "" {
 			tokenBaseURL = providerDefaultBaseURL(canonicalCode)
+		}
+		// P1j (design D-17): fail-loud instead of forwarding to an empty base_url.
+		// providerDefaultBaseURL returns "" for a provider it doesn't know; with
+		// no vault base_url either, there is no upstream to reach — surface it as
+		// PROVIDER_ROUTE_NOT_FOUND rather than silently building a broken URL
+		// (禁止 #32: no silent fallback).
+		if tokenBaseURL == "" {
+			p.errors.Add(1)
+			logger.Warn("no upstream base_url resolved for provider",
+				"event.name", "proxy.route.not_found", "provider", canonicalCode)
+			writeJSONError(w, http.StatusBadGateway, "server_error", "PROVIDER_ROUTE_NOT_FOUND",
+				"No upstream endpoint is configured for provider '"+canonicalCode+"'. "+
+					"Set a base URL on the key, or use a supported provider.")
+			return
 		}
 
 		prov, err := p.providers.Get(protocolType)

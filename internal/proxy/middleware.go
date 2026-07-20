@@ -7,6 +7,7 @@ import (
 	"strings"
 
 	"github.com/AiKeyLabs/aikey-proxy/internal/observability"
+	"github.com/AiKeyLabs/aikey-proxy/internal/provider"
 	"github.com/AiKeyLabs/aikey-proxy/internal/vkeys"
 )
 
@@ -50,6 +51,18 @@ const (
 	// serveRoute's ModifyResponse to pre-cut the account when the upstream's
 	// unified-utilization header crosses the cap (N10 防封). Absent → no pre-cut.
 	ctxKeyPoolWindowCap
+	// ctxKeyMappedClientModel carries the client's ORIGINAL model name when the
+	// P2 model-mapping layer rewrote the request body to a different upstream
+	// model (design D-5). The response leg reads it to write the model name
+	// back to what the client sent, so the client recognizes its own model.
+	// 🚫 Never a hardcoded constant (cc-switch #3600 anti-pattern) — always the
+	// exact string the client requested. Absent → no restoration (no mapping).
+	ctxKeyMappedClientModel
+	// ctxKeyMappedEffectiveModel carries the UPSTREAM (effective) model the
+	// request was mapped to (e.g. glm-4.6). buildBaseEvent reads it so the
+	// usage event / pricing use the effective model (audit 双口径 I2 / P4.1),
+	// while RequestedModel keeps the client model. Absent → no mapping.
+	ctxKeyMappedEffectiveModel
 )
 
 // traceFromContext retrieves the request's TraceContext. Returns the zero value
@@ -144,8 +157,21 @@ func isProviderCompatible(route *vkeys.ResolvedRoute, canonicalCode string) bool
 	if routeCanonical == canonicalCode {
 		return true
 	}
-	// Team managed keys with ProviderBaseURLs support multiple providers.
-	// TODO: when ProviderBaseURLs is added to ResolvedRoute, check it here.
+	// P1d (R-C, design D-10 refined): cross-provider SAME-protocol. A binding
+	// whose real upstream endpoint speaks the same wire protocol the path
+	// prefix implies is compatible — e.g. a zhipu binding with base_url
+	// .../api/anthropic accessed via the /anthropic path (GLM's anthropic
+	// endpoint). The route row for the binding's base_url is the truth source
+	// for the endpoint's protocol; providerToProtocol(canonicalCode) is the
+	// protocol the path implies. Same protocol → adapter/wire are compatible,
+	// and the credential + base_url stay fixed by the binding (no upstream
+	// escalation), so this is a routing allowance, not a permission bypass.
+	if route.BaseURL != "" {
+		pathProtocol := providerToProtocol(canonicalCode)
+		if pr, ok := provider.Routes().LookupByBaseURL(route.BaseURL); ok && pr.Protocol == pathProtocol {
+			return true
+		}
+	}
 	return false
 }
 
