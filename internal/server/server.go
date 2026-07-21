@@ -95,7 +95,19 @@ func New(ln net.Listener, dataHandler http.Handler, adminHandler *admin.Handler,
 	// "Settings → Upstream proxy" card (R25 出口收敛: egress lives on the proxy node).
 	mux.HandleFunc("GET /admin/upstream-proxy", adminHandler.UpstreamProxyGet)
 	mux.HandleFunc("PUT /admin/upstream-proxy", adminHandler.UpstreamProxySet)
+	// Escape hatch (2026-07-19): opt-in override that routes OAuth per-account
+	// egress traffic through the node upstream chain (Settings checkbox).
+	mux.HandleFunc("GET /admin/oauth-egress-override", adminHandler.OAuthEgressOverrideGet)
+	mux.HandleFunc("PUT /admin/oauth-egress-override", adminHandler.OAuthEgressOverrideSet)
 	mux.HandleFunc("POST /admin/upstream-proxy/probe", adminHandler.UpstreamProxyProbe)
+	// Exit-IP identity probe for a candidate/current upstream spec (节点管理
+	// Nodes page test button, update 20260718). Distinct from probe above:
+	// probe asks "can this URL reach the provider", this asks "WHICH exit IP
+	// does a spec leave from" (TestDial through the same engine registry the
+	// forwarding transport uses). Public face never sees it — worker nginx
+	// denies /admin/* (P3 方案C); the master console calls it over the
+	// cluster-internal network.
+	mux.HandleFunc("POST /admin/egress-test", adminHandler.EgressTest)
 
 	// Per-account egress connectivity self-check (§5.4): `aikey test` (presence)
 	// / `aikey doctor` (?dial=1) read this to verify each pool account's egress.

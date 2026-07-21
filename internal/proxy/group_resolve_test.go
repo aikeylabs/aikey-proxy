@@ -154,10 +154,11 @@ func TestResolveGroup_AbsentMaterialSkips(t *testing.T) {
 	}
 }
 
-// TestResolveGroup_LoginRequiredAfterExhausted (RW2): quota fallback still skips
-// an exhausted account, but stops at the next account the member hasn't logged
-// into (login required), rather than skipping further to a usable one.
-func TestResolveGroup_LoginRequiredAfterExhausted(t *testing.T) {
+// A needs-login account discovered only after the assigned account became
+// unavailable is a failover candidate, not an actionable login target. The
+// member UI can only act on the assigned account, so resolution must continue to
+// the next usable account instead of returning a misleading LOGIN_REQUIRED.
+func TestResolveGroup_NeedsLoginFailoverCandidateSkipped(t *testing.T) {
 	key := grKey()
 	seat := "seat-9"
 	order := rankOrder(seat, "x", "y", "z")
@@ -174,13 +175,12 @@ func TestResolveGroup_LoginRequiredAfterExhausted(t *testing.T) {
 	}
 	route := &vkeys.ResolvedRoute{SeatID: seat, OauthGroupID: "grp", GroupAccounts: mustJSON(t, refs), GroupRuntime: mustJSON(t, mat)}
 
-	_, err := resolveGroupCredential(route, key, 1_000_000, nil, "")
-	ge, ok := err.(*groupResolveError)
-	if !ok || ge.Code != groupErrLoginRequired {
-		t.Fatalf("want LOGIN_REQUIRED after skipping exhausted, got %v", err)
+	res, err := resolveGroupCredential(route, key, 1_000_000, nil, "")
+	if err != nil {
+		t.Fatalf("non-assigned needs_login candidate must be skipped, got %v", err)
 	}
-	if ge.Account != second {
-		t.Fatalf("should stop at rank-1 %q (skip exhausted rank-0, not jump to usable rank-2); got %q", second, ge.Account)
+	if res.AccountID != order[2] {
+		t.Fatalf("want usable rank-2 %q after skipping exhausted + needs-login fallbacks, got %q", order[2], res.AccountID)
 	}
 }
 

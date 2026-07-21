@@ -244,6 +244,11 @@ func Run() {
 	// os.Exit below would skip a defer (gocritic exitAfterDefer), so on this
 	// fatal path we remove the snapshot explicitly and defer it only once the
 	// supervisor is up (normal-shutdown cleanup).
+	// P1 error-origin (20260719): fix this process's component label for the
+	// X-Aikey-Error-Origin header BEFORE serving — "worker-proxy" when a cluster
+	// node id is set, else "local-proxy". Single source: cluster.node_id.
+	proxy.SetErrorOriginComponent(cfg.Cluster.NodeID)
+
 	sup, err := supervisor.New(cfg, resolvedPath, password, buildinfo.Get().Version)
 	if err != nil {
 		slog.Error("failed to start supervisor", "error", err)
@@ -424,10 +429,9 @@ func Run() {
 			return err
 		}
 		installTransport(buildTransport(spec, sysWatcher.ProxyFunc()))
-		// L1 override: a set explicit node upstream wins over per-account egress for
-		// ALL routes (api-key / OAuth / team-oauth). Clearing it restores per-account
-		// precedence. (User decision 2026-07-16 — escape hatch when admin proxy down.)
-		sup.SetNodeExplicitEgress(spec != "")
+		// 2026-07-18 (reversed the L1 override): the node upstream serves only
+		// non-egress traffic; per-account egress stays independent, so setting/clearing
+		// the node upstream no longer touches per-account egress precedence.
 		broker.SetHTTPClient(broker.NewImpersonateChromeHTTPClient(effectiveBrokerEgress(spec)))
 		egressMu.Lock()
 		egressURL = spec
@@ -440,6 +444,32 @@ func Run() {
 		explicit := egressURL
 		egressMu.Unlock()
 		return egressState(explicit, sysWatcher)
+	}
+
+	// Escape hatch (2026-07-19): apply the persisted opt-in flag at boot so it
+	// survives restart, then expose GET/PUT. Set persists to aikey-user.yaml +
+	// hot-applies across generations (sup.SetOAuthEgressOverride). Node-local.
+	sup.SetOAuthEgressOverride(cfg.UpstreamProxy.OAuthEgressOverride)
+	adminHandler.GetOAuthEgressOverrideFn = func() bool { return sup.OAuthEgressOverride() }
+	adminHandler.SetOAuthEgressOverrideFn = func(on bool) error {
+		if err := config.PersistOAuthEgressOverride(resolvedPath, on); err != nil {
+			return err
+		}
+		sup.SetOAuthEgressOverride(on)
+		return nil
+	}
+
+	// LiveUpstreamTransportFn hands ProbePing the transport currently serving
+	// forwarding, so an engine-spec upstream (mihomo fragment / socks5 chain) is
+	// pinged through the ALREADY-BUILT runtime route instead of rebuilding the
+	// engine per call (seconds of build cost — over the CLI's 4s ping budget;
+	// bugfix 2026-07-19). During the engine boot window this is the interim
+	// direct transport — truthful, that IS what forwarding would use right then.
+	adminHandler.LiveUpstreamTransportFn = func() http.RoundTripper {
+		if t := liveTransport.Load(); t != nil {
+			return t
+		}
+		return nil
 	}
 
 	// ProbeUpstreamProxyFn tests a CANDIDATE egress URL end-to-end (through the same
@@ -496,7 +526,11 @@ func Run() {
 
 	// Build the outbound transport for upstream providers. Always non-nil now:
 	// even the direct path needs MaxIdleConnsPerHost tuning (see buildTransport).
-	dataHandler := sup.Handler()
+	// P2 error-origin (20260719): wrap the data plane so every error response
+	// (status ≥ 400) is captured — reusing the X-Aikey-Error-* headers P1 set —
+	// into the last-errors ring for `aikey doctor --last-errors`. Best-effort,
+	// response-direction only; never touches the upstream request.
+	dataHandler := proxy.WrapLastErrorCapture(sup.Handler())
 	// A single-URL / empty upstream builds without dialing → install synchronously.
 	// A CHAIN / multi-protocol / group upstream is different: building it primes a
 	// health-check that DIALS the (possibly slow or unreachable) exit nodes. Doing
@@ -515,13 +549,6 @@ func Run() {
 			installTransport(buildTransport(cfg.UpstreamProxy.URL, sysWatcher.ProxyFunc()))
 		}()
 	}
-	// Seed the L1 override from the persisted config so a node that boots with an
-	// explicit upstream already overrides per-account egress (matches the runtime
-	// SetUpstreamProxyFn behavior — no first-request window where per-account wins).
-	// Set synchronously (independent of the async transport install above) so the
-	// override is in effect from the first request even while the group builds.
-	sup.SetNodeExplicitEgress(bootSpec != "")
-
 	// Start the system-proxy poll loop (inert when env config is authoritative,
 	// on unsupported platforms, and — via the explicit-egress guard below —
 	// effectively when upstream_proxy.url is set). On change: flush the idle

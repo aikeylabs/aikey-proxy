@@ -109,6 +109,47 @@ func (h *Handler) UpstreamProxySet(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, upstreamProxyBody{URL: body.URL})
 }
 
+// oauthEgressOverrideBody is the GET/PUT /admin/oauth-egress-override wire shape.
+type oauthEgressOverrideBody struct {
+	Enabled bool `json:"enabled"`
+}
+
+// OAuthEgressOverrideGet serves GET /admin/oauth-egress-override — the live
+// escape-hatch state for the Settings checkbox. 503 if not wired (older build).
+func (h *Handler) OAuthEgressOverrideGet(w http.ResponseWriter, _ *http.Request) {
+	if h.GetOAuthEgressOverrideFn == nil {
+		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "oauth-egress-override not supported"})
+		return
+	}
+	writeJSON(w, http.StatusOK, oauthEgressOverrideBody{Enabled: h.GetOAuthEgressOverrideFn()})
+}
+
+// OAuthEgressOverrideSet serves PUT /admin/oauth-egress-override. Persists the
+// flag to aikey-user.yaml and hot-applies it across generations (no restart).
+// No spec to validate — a bool. 503 if not wired, 500 if persist/apply fails.
+func (h *Handler) OAuthEgressOverrideSet(w http.ResponseWriter, r *http.Request) {
+	tc := observability.ExtractOrCreate(r)
+	logger := slog.With("trace_id", tc.TraceID, "request_id", tc.RequestID)
+
+	if h.SetOAuthEgressOverrideFn == nil {
+		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "oauth-egress-override not supported"})
+		return
+	}
+	var body oauthEgressOverrideBody
+	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<10)).Decode(&body); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid request body"})
+		return
+	}
+	if err := h.SetOAuthEgressOverrideFn(body.Enabled); err != nil {
+		logger.Error("admin: oauth-egress-override update failed", "error.message", err.Error())
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+		return
+	}
+	logger.Info("admin: oauth-egress-override updated + hot-applied",
+		"event.name", "proxy.egress.oauth_override_set", "enabled", body.Enabled)
+	writeJSON(w, http.StatusOK, oauthEgressOverrideBody{Enabled: body.Enabled})
+}
+
 // upstreamProbeResult is the POST /admin/upstream-proxy/probe response. Ok=true with
 // a Status means the candidate proxy carried a request through to the provider (any
 // HTTP status counts as reachable — auth/404 still proves the tunnel works). Ok=false

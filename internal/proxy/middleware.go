@@ -3,6 +3,7 @@ package proxy
 import (
 	"context"
 	"net/http"
+	"net/url"
 	"os"
 	"strings"
 
@@ -251,7 +252,23 @@ func codexUpstreamBaseURL() string {
 func resolveOAuthUpstream(canonicalCode string, r *http.Request) (baseURL string, req *http.Request) {
 	switch canonicalCode {
 	case "openai":
-		return codexUpstreamBaseURL(), captureCodexModel(r)
+		req = captureCodexModel(r)
+		// Version-prefix normalization (bugfix 2026-07-19): the codex OAuth
+		// upstream serves /responses — no /v1 segment. But OpenAI-convention
+		// clients carry base_urls ENDING in /v1 (the group-lane agent base_url
+		// must, to clear the ingress allowlist), so the path arrives here as
+		// /v1/responses; verbatim append then produced
+		// backend-api/codex/v1/responses → upstream FastAPI 404
+		// {"detail":"Not Found"} (live codex repro, cf-ray …-LAX). The dialect
+		// gate (oauthUpstreamRejectsPath) already accepts BOTH shapes — this
+		// makes the forwarded shape match the upstream too. Mirrors the
+		// version-segment re-normalization providerroutes.Stitch does for
+		// table-known API-key hosts.
+		if strings.HasPrefix(req.URL.Path, "/v1/") {
+			req.URL.Path = strings.TrimPrefix(req.URL.Path, "/v1")
+			req.URL.RawPath = ""
+		}
+		return codexUpstreamBaseURL(), req
 	default:
 		return providerDefaultBaseURL(canonicalCode), r
 	}
@@ -293,17 +310,39 @@ func oauthUpstreamRejectsPath(canonicalCode, urlPath string) string {
 		"or use a Responses-API client such as codex."
 }
 
+// testOnlyBaseURLAllowed gates the AIKEY_PROXY_TEST_* base-url hooks. Allowed:
+// plain-http loopback, or a plain-http hostname under the RFC 6761 reserved
+// ".test" TLD — public DNS can never resolve ".test", so a prod misconfig still
+// cannot reroute real traffic anywhere routable. Why ".test" is needed at all:
+// the egress-coexistence E2E must send OAuth traffic THROUGH a per-account
+// egress, and the always-on loopback egress bypass (egress_engine.go, 2026-07-16
+// security fix) would short-circuit a 127.0.0.1 mock — so the mock is addressed
+// by a fake ".test" hostname the test's socks5 exit resolves back to loopback.
+// See aikey-test/oauthgroup/egress_coexist_e2e_test.go.
+func testOnlyBaseURLAllowed(raw string) bool {
+	if raw == "" {
+		return false
+	}
+	if strings.HasPrefix(raw, "http://127.0.0.1:") || strings.HasPrefix(raw, "http://localhost:") {
+		return true
+	}
+	u, err := url.Parse(raw)
+	if err != nil {
+		return false
+	}
+	return u.Scheme == "http" && strings.HasSuffix(u.Hostname(), ".test")
+}
+
 func providerDefaultBaseURL(providerCode string) string {
 	switch strings.ToLower(providerCode) {
 	case "anthropic", "claude":
-		// Test-only hook (gated to loopback): the cross-component OAuth-account
-		// routing E2E points the otherwise-hardcoded Anthropic upstream at a local
-		// mock. OAuth accounts carry no configurable base_url (unlike api_key
-		// material), so without this the OAuth inject path can't be exercised
-		// against a mock. The loopback guard means a prod misconfig can never
+		// Test-only hook (gated to loopback / .test): the cross-component
+		// OAuth-account routing E2E points the otherwise-hardcoded Anthropic
+		// upstream at a local mock. OAuth accounts carry no configurable base_url
+		// (unlike api_key material), so without this the OAuth inject path can't
+		// be exercised against a mock. The guard means a prod misconfig can never
 		// reroute real traffic. See aikey-test/oauthgroup/oauth_account_routing_test.go.
-		if o := os.Getenv("AIKEY_PROXY_TEST_ANTHROPIC_BASE_URL"); o != "" &&
-			(strings.HasPrefix(o, "http://127.0.0.1:") || strings.HasPrefix(o, "http://localhost:")) {
+		if o := os.Getenv("AIKEY_PROXY_TEST_ANTHROPIC_BASE_URL"); testOnlyBaseURLAllowed(o) {
 			return o
 		}
 		return "https://api.anthropic.com"
@@ -407,16 +446,108 @@ func providerCanonicalCode(providerCode string) string {
 // which never sets it; providers don't emit the X-Aikey-* namespace).
 const HeaderAikeyErrorSource = "X-Aikey-Error-Source"
 
+// Error-origin traceability headers (P1, 20260719-错误产地标签方案). These are
+// RESPONSE-direction only — they ride the response back to the client and NEVER
+// go to the upstream (the request-direction X-Aikey-* strip in forward Director
+// removes anything before the LLM; see §6 floor-invariant 6). They let a user
+// tell WHO produced an error without SSH-grepping every hop:
+//
+//   X-Aikey-Error-Origin: <component>.<code>  — the ORIGIN of the error.
+//       First-writer-wins: whoever GENERATES the error sets it; a component
+//       RELAYING a deeper error must NOT overwrite it (the deepest producer is
+//       the root cause, Java caused-by style). component ∈ {local-proxy,
+//       worker-proxy, oauth-ingress, upstream:<provider>}.
+//   X-Aikey-Error-Path: <component>              — the HOP CHAIN. Each aikey hop
+//       APPENDS itself (multi-value header) so the client sees the route the
+//       error traversed, e.g. "local-proxy, oauth-ingress".
+const (
+	HeaderAikeyErrorOrigin = "X-Aikey-Error-Origin"
+	HeaderAikeyErrorPath   = "X-Aikey-Error-Path"
+	// HeaderAikeyUpstreamRequestID re-exposes the provider's own request id under
+	// ONE consistent aikey-namespaced RESPONSE header (P3, 20260719). WHY: cross-
+	// request correlation must NOT propagate a trace header to the upstream
+	// (WAF/撞墙 risk — §6 floor-invariant 6). Instead we surface the provider's
+	// request id (the natural anchor that already crosses the aikey↔provider
+	// boundary) so a user can JOIN it across the proxy log / usage store / the
+	// provider's support — without needing to know each provider's own header
+	// name (request-id vs openai-request-id vs x-request-id). RESPONSE direction
+	// only; the request-side strip removes any X-Aikey-* before the upstream.
+	HeaderAikeyUpstreamRequestID = "X-Aikey-Upstream-Request-Id"
+)
+
+// stripAikeyRequestHeaders removes the ENTIRE X-Aikey-* namespace from an
+// OUTBOUND request before it reaches the upstream provider. This is the floor
+// invariant (§6) that keeps error-origin / trace annotations from ever polluting
+// the LLM request — Anthropic's OAuth WAF treats unrecognized headers as a
+// non-Claude-Code persona signal and returns a business 429 with no
+// X-RateLimit-Reset (撞墙 signature). Extracted from the forward Director so a
+// fence test can assert the invariant directly.
+func stripAikeyRequestHeaders(h http.Header) {
+	for k := range h {
+		if len(k) >= 8 && strings.EqualFold(k[:8], "X-Aikey-") {
+			h.Del(k)
+		}
+	}
+}
+
+// upstreamRequestIDFromHeader reads the provider's own request id from a header
+// set (the http.Header form of extractUpstreamRequestID, for the response-
+// capturing middleware which has headers but no *http.Response).
+func upstreamRequestIDFromHeader(h http.Header) string {
+	for _, name := range []string{"request-id", "x-request-id", "openai-request-id"} {
+		if v := h.Get(name); v != "" {
+			return v
+		}
+	}
+	return ""
+}
+
+// errorOriginComponent is THIS process's component label for the origin header —
+// "local-proxy" (personal/no cluster.node_id) or "worker-proxy" (cluster node).
+// Set once at startup via SetErrorOriginComponent before serving; read-only
+// thereafter (no lock needed). Default "local-proxy" so tests / older wiring
+// still produce a sensible origin.
+var errorOriginComponent = "local-proxy"
+
+// SetErrorOriginComponent fixes this process's component label from the cluster
+// node id (empty → local-proxy, set → worker-proxy). Single source: the SAME
+// cluster.node_id existence check the rest of the proxy uses to tell editions
+// apart. Call once at startup (app.Run) before the server accepts traffic.
+func SetErrorOriginComponent(clusterNodeID string) {
+	if strings.TrimSpace(clusterNodeID) != "" {
+		errorOriginComponent = "worker-proxy"
+	} else {
+		errorOriginComponent = "local-proxy"
+	}
+}
+
+// setErrorOrigin stamps the error-origin traceability headers on a response THIS
+// component is generating. First-writer-wins on Origin (defensive: a fresh
+// self-generated response has none, so we set it); always append this component
+// to the path. code is the aikey error code (origin value = component.code).
+func setErrorOrigin(h http.Header, code string) {
+	if h.Get(HeaderAikeyErrorOrigin) == "" {
+		h.Set(HeaderAikeyErrorOrigin, errorOriginComponent+"."+code)
+	}
+	h.Add(HeaderAikeyErrorPath, errorOriginComponent)
+}
+
 // writeJSONError writes a JSON error response in OpenAI-compatible format.
 func writeJSONError(w http.ResponseWriter, statusCode int, errType, code, message string) {
-	w.Header().Set("Content-Type", "application/json")
+	h := w.Header()
+	h.Set("Content-Type", "application/json")
 	// Mark every aikey-GENERATED error so callers can distinguish it from an
 	// upstream pass-through (esp. quota 429 vs provider rate-limit 429). Value =
 	// the aikey error code (presence alone is the discriminator; the code adds detail).
-	w.Header().Set(HeaderAikeyErrorSource, code)
+	h.Set(HeaderAikeyErrorSource, code)
+	// P1 error-origin: this component GENERATED the error → stamp origin + path.
+	setErrorOrigin(h, code)
 	w.WriteHeader(statusCode)
 	// Write error JSON inline to avoid encoding/json import for this simple case.
-	_, _ = w.Write([]byte(`{"error":{"message":"` + escapeJSON(message) + `","type":"` + errType + `","code":"` + code + `"}}`))
+	// origin (top-level) mirrors the header so a client that reads only the body
+	// still learns who produced the error.
+	origin := escapeJSON(h.Get(HeaderAikeyErrorOrigin))
+	_, _ = w.Write([]byte(`{"error":{"message":"` + escapeJSON(message) + `","type":"` + errType + `","code":"` + code + `"},"origin":"` + origin + `"}`))
 }
 
 func escapeJSON(s string) string {

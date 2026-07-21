@@ -457,27 +457,58 @@ func (p *Proxy) serveRoute(w http.ResponseWriter, r *http.Request, route *vkeys.
 	// (e.g. non-socks5 node front cannot chain a socks5 account) fails the request
 	// loudly rather than silently leaking traffic out the wrong (node) IP.
 	//
-	// L1 override (2026-07-16): when the user pinned an explicit node-level upstream
-	// via /user/settings, it wins over per-account egress — the escape hatch when
-	// the admin's per-account proxy is down (avoids total unavailability). So this
-	// block is skipped and the request rides the node-level transport (SetTransport)
-	// like api-key / OAuth traffic. Precedence: user-local explicit > per-account.
-	if route.EgressProxyURL != "" && !p.nodeExplicitEgress.Load() {
+	// Coexistence (2026-07-18, reversed the 2026-07-16 L1 override): per-account
+	// egress is an ACCOUNT-level attribute — it applies whenever the resolved account
+	// has one, INDEPENDENT of any node-level upstream. A node upstream set via
+	// /user/settings only serves traffic WITHOUT a per-account egress (api_key / VK /
+	// OAuth accounts without one) — it no longer overrides an account's egress. This
+	// keeps single-IP-per-account防封 intact while letting the user proxy their
+	// non-egress traffic.
+	//
+	// Escape hatch (2026-07-19, OPT-IN — update/20260719-oauth-egress-override-逃生舱.md):
+	// `oauthEgressOverride` re-adds a GATED override for self-rescue. Default OFF →
+	// the condition is byte-identical to the 2026-07-18 coexist behavior (a
+	// per-account egress applies unconditionally). When a member deliberately flips
+	// it ON (Settings → Upstream proxy), an OAuth account's egress is SKIPPED and its
+	// traffic falls to the node chain (`inner`, unchanged below) — the same transport
+	// non-egress traffic already uses — so a member whose admin egress line is down
+	// can route out their own upstream instead of eating a 503. Node-local; the cost
+	// (all OAuth accounts then share this node's exit IP) is surfaced in the UI.
+	// Trade-off when OFF: if the admin's per-account proxy is down, the account's
+	// request fails loudly (ErrCodeAccountEgressEngine/ErrCodeAccountEgressProxy
+	// 503) — the escape hatch is the deliberate opt-out of that fail-loud.
+	// Per-request egress attribution (2026-07-19): derive ONCE from the resolved
+	// account egress + node override, then (A) log it at Info for live trace_id
+	// grep and (B) let recordEvent stamp the same onto the usage event's ext_json.
+	// egApplied is byte-identical to the old gate below. Logged for BOTH cases
+	// (applied per-account egress, or fell to node/direct) so any request is
+	// traceable, not just the egress ones. Never logs the spec verbatim — only
+	// its fingerprint (a mihomo fragment carries socks5 credentials).
+	egApplied, egEngine, egFingerprint := egressAttribution(route.EgressProxyURL, p.oauthEgressOverride.Load())
+	logger.Info("egress attribution",
+		"event.name", observability.EventProxyEgressRequestAttribution,
+		"account_id", route.AccountID,
+		"oauth_identity", route.OAuthIdentity,
+		"egress_applied", egApplied,
+		"egress_engine", egEngine,
+		"egress_fingerprint", egFingerprint,
+	)
+	if egApplied && route.EgressProxyURL != "" {
 		egT, egErr := p.accountEgressTransport(route.EgressProxyURL)
 		if egErr != nil {
 			p.errors.Add(1)
 			logger.Error("per-account egress proxy unavailable",
 				"event.name", observability.EventProxyRequestUpstreamError,
-				"error.code", observability.ErrCodeAccountEgressProxy,
+				"error.code", observability.ErrCodeAccountEgressEngine,
 				"error.message", egErr.Error(),
 				"account_id", route.AccountID,
 			)
-			writeJSONError(w, http.StatusServiceUnavailable, "server_error", observability.ErrCodeAccountEgressProxy,
-				"This account's egress proxy is misconfigured and traffic was not sent out the wrong IP. Ask your admin to check the account's egress proxy setting.")
+			writeJSONError(w, http.StatusServiceUnavailable, "server_error", observability.ErrCodeAccountEgressEngine,
+				accountEgressErrorMessage(route,
+					"its configured egress could not be started. Traffic was not sent without the required egress. Check the account egress setting and whether the required egress engine is installed."))
 			return
 		}
 		inner = egT
-		logger.Debug("using per-account egress transport", "account_id", route.AccountID)
 	}
 	var transport http.RoundTripper = inner
 	if !streaming {
@@ -534,12 +565,10 @@ func (p *Proxy) serveRoute(w http.ResponseWriter, r *http.Request, route *vkeys.
 			// that the request isn't a real Claude Code session, returning
 			// 429 with no X-RateLimit-Reset (business rejection signature).
 			// Strip the whole `x-aikey-*` namespace so future internal
-			// annotations don't repeat this leak.
-			for k := range req.Header {
-				if len(k) >= 8 && strings.EqualFold(k[:8], "X-Aikey-") {
-					req.Header.Del(k)
-				}
-			}
+			// annotations don't repeat this leak. Floor invariant (§6): no
+			// X-Aikey-* ever reaches the upstream — fenced by
+			// TestStripAikeyRequestHeaders.
+			stripAikeyRequestHeaders(req.Header)
 			// Why: tell upstream we only accept identity (uncompressed) so the
 			// drainer and non-streaming token extractor can parse the body
 			// directly. Anthropic's OAuth endpoint in particular returns
@@ -569,6 +598,27 @@ func (p *Proxy) serveRoute(w http.ResponseWriter, r *http.Request, route *vkeys.
 			}
 		},
 		ModifyResponse: func(resp *http.Response) error {
+			// P1 error-origin (20260719): tag relayed error responses so a client
+			// can tell WHO produced the error. First-writer-wins: if a deeper aikey
+			// hop (worker/ingress) already set X-Aikey-Error-Origin, keep it (that's
+			// the root cause); only when it's UNTAGGED and ≥400 do we attribute it to
+			// the provider we forwarded to (upstream:<provider>) — the body is left
+			// byte-identical (protocol transparency). Every hop appends itself to the
+			// path. RESPONSE direction only — never touches the upstream request.
+			if resp.StatusCode >= 400 {
+				if resp.Header.Get(HeaderAikeyErrorOrigin) == "" {
+					resp.Header.Set(HeaderAikeyErrorOrigin, "upstream:"+route.ProviderCode)
+				}
+				resp.Header.Add(HeaderAikeyErrorPath, errorOriginComponent)
+			}
+			// P3 correlation (20260719): re-expose the provider's own request id
+			// under the ONE consistent aikey key so a user can JOIN it across the
+			// log / usage store / provider support — no request-header propagation
+			// (RESPONSE direction only). Set whenever the provider returned one.
+			if id := upstreamRequestIDFromHeader(resp.Header); id != "" {
+				resp.Header.Set(HeaderAikeyUpstreamRequestID, id)
+			}
+
 			// Codex OAuth model capture — only persist on 2xx so a bad
 			// `model: gpt-4o` request (rejected by ChatGPT-account
 			// Codex) can't poison the state file the connectivity probe
@@ -592,13 +642,60 @@ func (p *Proxy) serveRoute(w http.ResponseWriter, r *http.Request, route *vkeys.
 				if epoch, ok := observedResetEpoch(resp.Header); ok {
 					p.poolObservedResets.record(route.AccountID, epoch)
 				}
-				if until, ok := cooldownDecision(resp, time.Now()); ok {
+				// P1-C tier-first guard (2026-07-19, sub2api "must not fall through"):
+				// a 429 whose SOLE trigger is a premium-model window (Fable 7d_oi)
+				// cools (account, tier) only — the aggregate unified headers mirror
+				// the representative claim, so without this guard the generic
+				// evidence path below would cool the WHOLE account and block every
+				// other model's traffic too (pool-wide, via in-request failover).
+				nowT := time.Now()
+				tierUntil, tierKey, tierOnly := time.Time{}, "", false
+				if resp.StatusCode == http.StatusTooManyRequests {
+					tierUntil, tierKey, tierOnly = anthropicTierOnlyLimit(resp.Header, nowT)
+					// self-surfacing tier-table gap detection (Phase 0 folded into
+					// post-deploy log verification): an exhausted window id we don't
+					// map yet is loudly visible instead of silently misclassified.
+					if wins := unknownExhaustedWindows(resp.Header); len(wins) > 0 {
+						logger.Warn("pool 429 carries unmapped exhausted rate-limit window(s)",
+							"event.name", observability.EventProxyGroupModelTierCooldown,
+							"account_id", route.AccountID,
+							"window_ids", strings.Join(wins, ","))
+					}
+				}
+				if tierOnly {
+					p.poolCooldown.markTier(route.AccountID, tierKey, tierUntil)
+					logger.Warn("pool account model-tier cooled down (other models keep serving)",
+						"event.name", observability.EventProxyGroupModelTierCooldown,
+						"oauth_group_id", route.OauthGroupID,
+						"account_id", route.AccountID,
+						"tier", tierKey,
+						"until", tierUntil.Unix())
+				} else if until, ok := cooldownDecision(resp, nowT); ok {
 					p.poolCooldown.mark(route.AccountID, until)
 					logger.Warn("pool account cooled down after upstream failure",
 						"event.name", observability.EventProxyGroupAccountCooldown,
 						"oauth_group_id", route.OauthGroupID,
 						"account_id", route.AccountID,
 						"status", resp.StatusCode)
+				} else if resp.StatusCode >= 500 {
+					// P0-B (2026-07-19): generic 5xx cools only after CONSECUTIVE
+					// repeats — a single transient 502/503 must not pull a good
+					// account, but a persistently-broken one must stop eating one
+					// wasted in-request-failover attempt per request (N9 hides the
+					// failure from the CLIENT; this stops the WASTE).
+					if _, cooled := p.poolCooldown.noteServerError(route.AccountID); cooled {
+						// noteServerError marked the cooldown itself (atomic with the
+						// streak reset) — this is the observability side only.
+						logger.Warn("pool account cooled down after repeated server errors",
+							"event.name", observability.EventProxyGroupAccountCooldown,
+							"oauth_group_id", route.OauthGroupID,
+							"account_id", route.AccountID,
+							"status", resp.StatusCode,
+							"streak_threshold", serverErrStreakThreshold)
+					}
+				} else if resp.StatusCode < 400 {
+					// success proves the account serves → reset its 5xx streak.
+					p.poolCooldown.noteSuccess(route.AccountID)
 				}
 				// N10 防封 pre-cut: even on a 200, if the account's utilization
 				// crossed its randomized cap, cool it down for this window so it
@@ -913,6 +1010,26 @@ func (p *Proxy) serveRoute(w http.ResponseWriter, r *http.Request, route *vkeys.
 		ErrorHandler: func(w http.ResponseWriter, r *http.Request, err error) {
 			p.errors.Add(1)
 			latencyMs := time.Since(startTime).Milliseconds()
+			// P0-B (2026-07-19): transport-level failures (dial refused, TLS
+			// failure, pre-response timeout, egress hop down) never reach
+			// ModifyResponse, so they were invisible to the pool health path —
+			// sticky binding kept sending every next request into the dead lane.
+			// Count them toward the account's CONSECUTIVE server-error streak
+			// (same threshold as generic 5xx; one blip cools nobody). The 502/503
+			// written below flows through N9's first-byte gate, so group routes
+			// ALSO retry this request on another account. context.Canceled is the
+			// CLIENT hanging up (streaming keeps the client context) — not the
+			// account's fault, never counted.
+			if route.OauthGroupID != "" && route.AccountID != "" && !errors.Is(err, context.Canceled) {
+				if _, cooled := p.poolCooldown.noteServerError(route.AccountID); cooled {
+					logger.Warn("pool account cooled down after repeated transport errors",
+						"event.name", observability.EventProxyGroupAccountCooldown,
+						"oauth_group_id", route.OauthGroupID,
+						"account_id", route.AccountID,
+						"error.message", err.Error(),
+						"streak_threshold", serverErrStreakThreshold)
+				}
+			}
 			// Per-account egress dial failure (a socks5 hop refused, or a
 			// fallback/url-test group has NO reachable member): surface it plainly
 			// so the user knows it's THEIR egress, not the provider, and NEVER fall
@@ -927,7 +1044,8 @@ func (p *Proxy) serveRoute(w http.ResponseWriter, r *http.Request, route *vkeys.
 					"account_id", route.AccountID,
 				)
 				writeJSONError(w, http.StatusServiceUnavailable, "server_error", observability.ErrCodeAccountEgressProxy,
-					"egress connect fail: this account's egress upstream(s) are unreachable. Run `aikey doctor` to diagnose.")
+					accountEgressErrorMessage(route,
+						"its configured egress upstream is unreachable. Run `aikey doctor` and check this account's egress setting."))
 				return
 			}
 			logger.Error("upstream error",
@@ -971,4 +1089,16 @@ func (p *Proxy) serveRoute(w http.ResponseWriter, r *http.Request, route *vkeys.
 			"threshold_ms", p.SlowRequestMs,
 		)
 	}
+}
+
+// accountEgressErrorMessage names the selected shared account when that identity
+// is available. Members can see the same identity on /user/team-oauth, so this
+// is actionable context rather than a secret; omitting it made failover errors
+// look like an unrelated account/login problem.
+func accountEgressErrorMessage(route *vkeys.ResolvedRoute, detail string) string {
+	subject := "The selected shared account"
+	if route != nil && strings.TrimSpace(route.OAuthIdentity) != "" {
+		subject += " (" + strings.TrimSpace(route.OAuthIdentity) + ")"
+	}
+	return "AiKey: " + subject + " is signed in, but " + detail
 }

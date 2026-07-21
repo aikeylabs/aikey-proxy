@@ -3,6 +3,7 @@ package server
 import (
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"strings"
 	"testing"
 
@@ -79,6 +80,37 @@ func TestRecoverMiddleware_HappyPathPassThrough(t *testing.T) {
 	}
 	if rec.Body.String() != `{"hello":"world"}` {
 		t.Fatalf("body corrupted: %s", rec.Body.String())
+	}
+}
+
+// TestRecoverMiddleware_AbortHandlerIsNotReportedAsCrash protects the
+// ReverseProxy disconnect path. net/http.ErrAbortHandler is a control-flow
+// sentinel consumed by the outer net/http server, not an application crash.
+func TestRecoverMiddleware_AbortHandlerIsNotReportedAsCrash(t *testing.T) {
+	dumpDir := t.TempDir()
+	observability.SetCrashDumpDir(dumpDir)
+
+	h := recoverMiddleware(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {
+		panic(http.ErrAbortHandler)
+	}))
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, "/stream", nil)
+
+	func() {
+		defer func() {
+			if got := recover(); got != http.ErrAbortHandler {
+				t.Fatalf("expected ErrAbortHandler to reach outer net/http server, got %v", got)
+			}
+		}()
+		h.ServeHTTP(rec, req)
+	}()
+
+	entries, err := os.ReadDir(dumpDir)
+	if err != nil {
+		t.Fatalf("read crash dir: %v", err)
+	}
+	if len(entries) != 0 {
+		t.Fatalf("ErrAbortHandler must not create a crash dump; got %v", entries)
 	}
 }
 

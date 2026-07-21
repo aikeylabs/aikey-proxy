@@ -133,6 +133,7 @@ type generation struct {
 	collector       *events.Collector
 	eventStore      *events.Store
 	drained         chan struct{} // closed when inflight reaches 0 after draining is set
+	closeOnce       sync.Once     // close() may be reached by both reload drain_old and Shutdown (bugfix 2026-07-19)
 	vault           *vault.Reader
 	canary          *events.CanaryProbe // synthetic canary probe (nil when reporter or control_url is not configured)
 	contentSeqAlloc *events.SeqAllocator
@@ -169,8 +170,17 @@ func (g *generation) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	g.proxy.Handle(w, r)
 }
 
-// close releases all resources held by this generation.
+// close releases all resources held by this generation. Idempotent (bugfix
+// 2026-07-19): Reload's async drain_old goroutine and Shutdown can both reach
+// the same generation under a restart-during-reload race — the second run
+// panicked in canary.Close ("close of closed channel") and skipped the rest of
+// the teardown. Guarding HERE (not just in each member) makes every member's
+// release run exactly once regardless of which caller wins.
 func (g *generation) close() {
+	g.closeOnce.Do(g.closeAll)
+}
+
+func (g *generation) closeAll() {
 	// Stop the filter child first so it stops consuming stdin/stdout and exits
 	// before the rest of the generation tears down. Bounded shutdown — a stuck
 	// child must not block the reload drain (the new generation already serves).
@@ -277,10 +287,11 @@ type Supervisor struct {
 	// generation's proxy (nil = default). atomic.Pointer so an egress hot-swap
 	// (SetTransport, 2026-06-30) can't race the gen-build read in applyToProxy.
 	transport atomic.Pointer[transportBox]
-	// nodeExplicitEgress carries the L1 override (user's node-level explicit
-	// upstream wins over per-account egress) across generation rebuilds, so a
-	// reload/hot-swap doesn't silently restore per-account precedence.
-	nodeExplicitEgress atomic.Bool
+	// oauthEgressOverride is the opt-in escape hatch (2026-07-19), supervisor-scoped
+	// so it SURVIVES reloads/5s syncs (like transport/broker): buildGeneration
+	// re-applies it to every new generation's proxy. Default false → coexist
+	// unchanged. Set via SetOAuthEgressOverride (from the /admin toggle).
+	oauthEgressOverride atomic.Bool
 	// ctx / cancel bound the lifetime of all detached upstream calls.
 	// Canceled in Shutdown() to stop any in-flight upstream requests.
 	ctx    context.Context
@@ -610,16 +621,19 @@ func (s *Supervisor) SetTransport(t http.RoundTripper) {
 	}
 }
 
-// SetNodeExplicitEgress mirrors the L1 override onto the live proxy (and stores
-// it so future generations inherit it). See proxy.SetNodeExplicitEgress: when on,
-// the user's node-level explicit upstream wins over per-account egress for ALL
-// routes (api-key / OAuth / team-oauth).
-func (s *Supervisor) SetNodeExplicitEgress(on bool) {
-	s.nodeExplicitEgress.Store(on)
+// SetOAuthEgressOverride flips the opt-in escape hatch (2026-07-19) across all
+// generations. Stores it supervisor-scoped (so reloads inherit it via
+// buildGeneration) AND hot-applies to the running generation — same pattern as
+// SetTransport. Node-local, default false.
+func (s *Supervisor) SetOAuthEgressOverride(on bool) {
+	s.oauthEgressOverride.Store(on)
 	if gen := s.active.Load(); gen != nil {
-		gen.proxy.SetNodeExplicitEgress(on)
+		gen.proxy.SetOAuthEgressOverride(on)
 	}
 }
+
+// OAuthEgressOverride reports the current escape-hatch state (for GET /admin).
+func (s *Supervisor) OAuthEgressOverride() bool { return s.oauthEgressOverride.Load() }
 
 // transportBox boxes the RoundTripper so it can live in an atomic.Pointer (atomics
 // can't hold an interface value directly). nil rt = use the default transport.
@@ -1483,9 +1497,10 @@ func (s *Supervisor) buildGeneration() (*generation, error) {
 	if b := s.transport.Load(); b != nil && b.rt != nil {
 		p.SetTransport(b.rt)
 	}
-	// Inherit the L1 override so a rebuilt generation keeps user-local-explicit
-	// precedence over per-account egress (see SetNodeExplicitEgress).
-	p.SetNodeExplicitEgress(s.nodeExplicitEgress.Load())
+	// Escape hatch (2026-07-19): a reload must inherit the member's opt-in state,
+	// so it doesn't silently revert to coexist mid-emergency. Unconditional store
+	// (default false is a no-op) — same inheritance pattern as transport above.
+	p.SetOAuthEgressOverride(s.oauthEgressOverride.Load())
 	if s.broker != nil {
 		p.SetBroker(s.broker)
 	}

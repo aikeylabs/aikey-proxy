@@ -49,7 +49,6 @@ const (
 	groupErrLoginRequired = "OAUTH_GROUP_MEMBER_LOGIN_REQUIRED"
 )
 
-
 // groupResolveError is a typed resolver failure so the caller can map a precise
 // HTTP status + error code without string matching.
 type groupResolveError struct {
@@ -143,6 +142,12 @@ func resolveGroupCredential(route *vkeys.ResolvedRoute, derivedKey []byte, nowUn
 	}
 	ordered := seatassign.Rank(route.SeatID, accounts)
 	primary := ordered[0].AccountID // rank-0; audited when the actual pick differs
+	assigned := primary
+	if overrideAccountID != "" {
+		if _, ok := refByID[overrideAccountID]; ok {
+			assigned = overrideAccountID
+		}
+	}
 
 	// SINGLE SOURCE OF TRUTH (2026-07-01): the pick — engine override first (§6.5,
 	// member-validity re-checked; needs_login overrides are HONORED per the owner rule
@@ -159,8 +164,10 @@ func resolveGroupCredential(route *vkeys.ResolvedRoute, derivedKey []byte, nowUn
 		acc, oc := vkeys.PickRoutedAccount(route.SeatID, refs, material, overrideAccountID, localSkip, nowUnix)
 		switch oc {
 		case vkeys.PickNeedsLogin:
-			// RW2/D2: prompt login for THE routed account (engine pick or strict-HRW
-			// rank stop) — never silently hop past it to a later logged-in account.
+			// RW2/D2: PickRoutedAccount only emits this for THE assigned account
+			// (engine override or strict-HRW rank 0). A needs-login row reached only
+			// during request failover is skipped inside the shared picker, because the
+			// member page cannot act on that non-current account.
 			return nil, &groupResolveError{Code: groupErrLoginRequired,
 				Reason: "member has no token for the routed account — login required", Account: acc}
 		case vkeys.PickOK:
@@ -183,21 +190,14 @@ func resolveGroupCredential(route *vkeys.ResolvedRoute, derivedKey []byte, nowUn
 			res.Primary = primary
 			return res, nil
 		default: // PickNone
-			// R36 (2026-07-04, codex pools): before declaring the admin-facing
-			// ALL_UNUSABLE dead-end, check whether some candidate's ONLY blocker is an
-			// EXPIRED member token — that's member-fixable (re-login mints a new one;
-			// codex tokens live ~10 days so this is their steady-state path) → prompt
-			// 401 login for the highest-ranked such account instead of a 503 "contact
-			// your admin". Mid-scan fallback THROUGH an expired account to a usable one
-			// is unchanged above (availability first — ExpiredPrimaryFallsToNext).
-			for _, a := range ordered {
-				if localSkip[a.AccountID] {
-					continue // cooled-down / undecryptable — not a login problem
-				}
-				m, ok := material[a.AccountID]
+			// R36 (2026-07-04, codex pools): expiry is member-fixable, but only the
+			// assigned account is an actionable re-login target. Never promote an
+			// expired request-level fallback to LOGIN_REQUIRED.
+			if !localSkip[assigned] {
+				m, ok := material[assigned]
 				if ok && vkeys.MaterialExpired(m, nowUnix) && m.WindowStatus != "exhausted" {
 					return nil, &groupResolveError{Code: groupErrLoginRequired,
-						Reason: "member token for the routed account expired — re-login required", Account: a.AccountID}
+						Reason: "member token for the routed account expired — re-login required", Account: assigned}
 				}
 			}
 			return nil, &groupResolveError{Code: groupErrAllUnusable, Reason: "all group candidates expired, exhausted, or undecryptable"}

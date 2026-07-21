@@ -87,19 +87,25 @@ type Proxy struct {
 	// cache key. Only populated for accounts that configure an egress proxy; the
 	// default hot path never touches it.
 	accountEgressTransports sync.Map // map[string]accountEgressEntry
-	// nodeExplicitEgress is set when the user pinned an explicit node-level
-	// upstream proxy via /user/settings (SetUpstreamProxyFn). When true the
-	// per-account egress branch in serveRoute is SKIPPED so the user's own local
-	// proxy wins over admin-configured per-account egress (L1 highest, the escape
-	// hatch when the admin proxy is down — user decision "自己配置的代理优先级最高",
-	// 2026-07-16). The trade-off (all accounts then share one exit IP, temporarily
-	// breaking single-account-single-IP anti-ban) is accepted for availability.
-	nodeExplicitEgress atomic.Bool
-	activeReader       ActiveKeyReader       // non-nil when vault implements ActiveKeyReader
-	appVault           apppipe.VaultReader   // non-nil when vault implements the App pipeline read surface (Phase 4)
-	probeVault         probepipe.VaultReader // non-nil when vault implements the Probe pipeline read surface (mode C, SPEC 2026-05-23)
-	broker             OAuthBroker           // OAuth credential provider (nil = OAuth not available)
-	vault              VaultGetter
+	// oauthEgressOverride is the OPT-IN emergency escape hatch (2026-07-19): when
+	// true, an OAuth pool account's per-account egress (②) is IGNORED and its
+	// traffic falls back to the NODE-level chain (currentTransport: /user/settings
+	// upstream > env > system > direct), the SAME transport non-egress traffic
+	// uses. Default false → coexist behavior is byte-unchanged (the 2026-07-18
+	// invariant): a per-account egress applies unconditionally. This re-introduces
+	// a GATED form of the removed nodeExplicitEgress override, but driven by an
+	// EXPLICIT member toggle (Settings → Upstream proxy), never auto-derived —
+	// so it stays inert until a member deliberately flips it to self-rescue when
+	// the admin's egress line is down. Node-local (this proxy only): flipping it
+	// changes only THIS machine's outbound, never master or other members. The
+	// cost (surfaced in the UI): while on, all OAuth accounts share this node's
+	// exit IP → single-IP-per-account anti-ban is temporarily off for this node.
+	oauthEgressOverride atomic.Bool
+	activeReader        ActiveKeyReader       // non-nil when vault implements ActiveKeyReader
+	appVault            apppipe.VaultReader   // non-nil when vault implements the App pipeline read surface (Phase 4)
+	probeVault          probepipe.VaultReader // non-nil when vault implements the Probe pipeline read surface (mode C, SPEC 2026-05-23)
+	broker              OAuthBroker           // OAuth credential provider (nil = OAuth not available)
+	vault               VaultGetter
 	// groupKey exposes the vault derived key for oauth-group material decryption
 	// (N8). nil when the injected vault doesn't implement DerivedKey() (tests) →
 	// group routing degrades to GROUP_KEY_UNAVAILABLE rather than panicking.
@@ -277,13 +283,6 @@ func (p *Proxy) SetTransport(t http.RoundTripper) {
 	}
 }
 
-// SetNodeExplicitEgress toggles the L1 override: when on, the user's node-level
-// explicit upstream proxy (/user/settings) applies to ALL traffic — api-key,
-// OAuth, AND team-oauth (per-account) routes — by making serveRoute skip the
-// per-account egress branch. Off restores per-account egress precedence. Called
-// from SetUpstreamProxyFn on every node-upstream change (set → on, clear → off).
-func (p *Proxy) SetNodeExplicitEgress(on bool) { p.nodeExplicitEgress.Store(on) }
-
 // transportBox boxes the RoundTripper so it can live in an atomic.Pointer (atomics
 // can't hold an interface value directly). A nil rt means "use the default".
 type transportBox struct{ rt http.RoundTripper }
@@ -297,6 +296,19 @@ func (p *Proxy) currentTransport() http.RoundTripper {
 	}
 	return nil
 }
+
+// SetOAuthEgressOverride flips the opt-in escape hatch (2026-07-19). true → an
+// OAuth account's per-account egress is bypassed and its traffic uses the node
+// chain; false (default) → per-account egress applies unconditionally (coexist).
+// Hot-applied: the next request reads the flag on the hot path. Node-local.
+func (p *Proxy) SetOAuthEgressOverride(on bool) {
+	p.oauthEgressOverride.Store(on)
+	slog.Info("proxy: oauth per-account egress override set", "event.name", "proxy.egress.oauth_override_set", "enabled", on)
+}
+
+// OAuthEgressOverride reports the current escape-hatch state (for GET /admin and
+// the hot-path gate).
+func (p *Proxy) OAuthEgressOverride() bool { return p.oauthEgressOverride.Load() }
 
 // New creates a new Proxy. ctx is the proxy lifecycle context; canceling it
 // stops all detached upstream calls (called on proxy shutdown).

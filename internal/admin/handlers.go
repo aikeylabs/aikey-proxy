@@ -3,6 +3,7 @@ package admin
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log/slog"
 	"net"
@@ -16,6 +17,7 @@ import (
 	"github.com/AiKeyLabs/aikey-proxy/internal/observability"
 	"github.com/AiKeyLabs/aikey-proxy/internal/proxy/apppipe"
 	"github.com/AiKeyLabs/aikey-proxy/internal/vkeys"
+	"github.com/AiKeyLabs/pkg/egress"
 )
 
 const Version = "0.1.0"
@@ -103,6 +105,14 @@ type Handler struct {
 	GetUpstreamProxyFn func() string
 	SetUpstreamProxyFn func(url string) error
 
+	// GetOAuthEgressOverrideFn / SetOAuthEgressOverrideFn back GET/PUT
+	// /admin/oauth-egress-override — the "Settings → Upstream proxy" escape-hatch
+	// checkbox (2026-07-19). Get returns the live flag; Set persists it to
+	// aikey-user.yaml and hot-applies it across all proxy generations (no restart).
+	// nil → 503 (endpoint disabled — e.g. an older build). Node-local, default false.
+	GetOAuthEgressOverrideFn func() bool
+	SetOAuthEgressOverrideFn func(on bool) error
+
 	// EgressStateFn backs the layered "egress" block in GET /admin/upstream-proxy
 	// (2026-07-08, `aikey env` 逐级显示需求): the daemon-truth view of the egress
 	// decision — explicit URL > daemon process env > OS system proxy — plus the
@@ -125,6 +135,15 @@ type Handler struct {
 	// probes each via the shared egress.TestDial. nil → empty list. See
 	// egress_selfcheck.go + the app.Run wiring.
 	EgressSelfCheckFn func(ctx context.Context, dial bool) []EgressCheckResult
+
+	// LiveUpstreamTransportFn returns the transport CURRENTLY serving forwarding
+	// (node upstream already resolved: direct / single URL / engine spec; see
+	// app.go installTransport). ProbePing's engine-spec branch rides it so ping
+	// measures the exact runtime route at ZERO per-call engine cost — building a
+	// mihomo fragment dialer takes seconds, which blew the CLI's 4s ping budget
+	// when done per call (bugfix 2026-07-19). nil / returns nil → one-shot
+	// egress.TestDial fallback (tests / older wiring).
+	LiveUpstreamTransportFn func() http.RoundTripper
 }
 
 // KeyCheckTarget holds decrypted credentials for one provider, used by GET /health/keys.
@@ -931,11 +950,19 @@ type ProbePingResponse struct {
 //     HTTPS_PROXY / HTTP_PROXY / ALL_PROXY env var): raw TCP connect to
 //     `host:port`. Fastest; measures pure network RTT.
 //
-//  2. Upstream proxy configured: TCP connect to the provider host will be
-//     blocked in restricted networks. Fall through to an HTTP HEAD that
-//     rides the same proxy the data plane uses at runtime — otherwise the
-//     ping fails even though the real proxied requests succeed (the bug
-//     the user's China-network deployment was reporting).
+//  2. Upstream proxy configured as a single URL: TCP connect to the provider
+//     host will be blocked in restricted networks. Fall through to an HTTP
+//     HEAD that rides the same proxy the data plane uses at runtime —
+//     otherwise the ping fails even though the real proxied requests succeed
+//     (the bug the user's China-network deployment was reporting).
+//
+//  3. Upstream proxy configured as an ENGINE SPEC (socks5 chain / mihomo
+//     config fragment): a fragment is YAML, not a URL — url.Parse chokes on
+//     it, so mode 2 would fail every ping with "invalid proxy URL" even
+//     though the data plane dials fragments fine (bugfix 2026-07-19,
+//     PROXY_UPSTREAM_UNREACHABLE false negative). Dial the target through
+//     the same engine registry the forwarding transport uses
+//     (egress.TestDial), so ping measures the route real traffic takes.
 //
 // Always returns 200 OK so the CLI can read the structured result even on
 // network failure. Transport errors go into the Error field.
@@ -1010,14 +1037,54 @@ func (h *Handler) ProbePing(w http.ResponseWriter, r *http.Request) {
 
 	start := time.Now()
 	var err error
-	if proxyURL == "" {
+	switch {
+	case proxyURL == "":
 		// Direct TCP connect — fastest path, accurate RTT measurement.
 		var conn net.Conn
 		conn, err = net.DialTimeout("tcp", net.JoinHostPort(host, fmt.Sprintf("%d", port)), probeTimeout)
 		if conn != nil {
 			conn.Close()
 		}
-	} else {
+	case egress.IsEngineSpec(proxyURL):
+		// Engine spec (socks5 chain / mihomo fragment) — mode 3. Prefer the
+		// LIVE forwarding transport (already built at startup / hot-swap):
+		// ping then measures the exact runtime route with no per-call engine
+		// build (a fragment build takes seconds — over the CLI's 4s budget).
+		// Fallback: one-shot egress.TestDial through the same engine registry
+		// (mirrors egresstest.go's branching; single source of truth). Any
+		// HTTP response from the target — 2xx/4xx alike — proves
+		// reachability, same semantics as httpHeadViaProxy below.
+		var liveRT http.RoundTripper
+		if h.LiveUpstreamTransportFn != nil {
+			liveRT = h.LiveUpstreamTransportFn()
+		}
+		if liveRT != nil {
+			err = httpHeadViaTransport(baseURL, liveRT, probeTimeout)
+		} else {
+			_, err = egress.TestDial(r.Context(), proxyURL, baseURL, probeTimeout)
+		}
+		if err != nil {
+			// Never echo the raw engine error to the caller: BuildDialer /
+			// yaml errors can quote the spec verbatim, credentials included.
+			// Full detail stays in local Debug logs only.
+			logger.Debug("probe ping: engine egress dial failed",
+				"provider", req.Provider,
+				"host", host,
+				"error.message", err.Error(),
+			)
+			reason := classifyNetErrorKnown(err)
+			if reason == "" {
+				reason = "egress engine dial failed; run Settings → Upstream proxy → Test for the detailed reason"
+			}
+			logger.Warn("probe ping failed via engine egress",
+				"event.name", observability.EventProxyEgressPingEngineDialFailed,
+				"provider", req.Provider,
+				"host", host,
+				"error.class", reason,
+			)
+			err = errors.New(reason)
+		}
+	default:
 		// Proxied path: HTTP HEAD through the configured proxy. TCP-level
 		// ping can't traverse HTTP proxies, so this is the only option.
 		// Any non-5xx response (200/301/401/403/404/etc.) counts as "reached
@@ -1047,6 +1114,30 @@ func (h *Handler) ProbePing(w http.ResponseWriter, r *http.Request) {
 		LatencyMs: latency,
 		Host:      host,
 	})
+}
+
+// httpHeadViaTransport sends an HTTP HEAD to targetURL riding an EXISTING
+// RoundTripper (the live forwarding transport — never closed here, the app owns
+// it). Same reachability semantics as httpHeadViaProxy: any HTTP response
+// (4xx/5xx included) is success; a transport-level error is the failure signal.
+func httpHeadViaTransport(targetURL string, rt http.RoundTripper, timeout time.Duration) error {
+	client := &http.Client{
+		Transport: rt,
+		Timeout:   timeout,
+		CheckRedirect: func(_ *http.Request, _ []*http.Request) error {
+			return http.ErrUseLastResponse
+		},
+	}
+	req, err := http.NewRequestWithContext(context.Background(), http.MethodHead, targetURL, http.NoBody)
+	if err != nil {
+		return fmt.Errorf("build request: %w", err)
+	}
+	resp, err := client.Do(req)
+	if err != nil {
+		return err
+	}
+	_ = resp.Body.Close()
+	return nil
 }
 
 // httpHeadViaProxy sends an HTTP HEAD to `targetURL` through the given
@@ -1130,6 +1221,18 @@ func extractHostPort(rawURL string) (host string, port int) {
 
 // classifyNetError converts a Go net error into a short human-readable message.
 func classifyNetError(err error) string {
+	if known := classifyNetErrorKnown(err); known != "" {
+		return known
+	}
+	return err.Error()
+}
+
+// classifyNetErrorKnown returns the stable label for well-known transport
+// failures, or "" when unrecognized. Split out (2026-07-19) so the engine-spec
+// ping path can substitute a generic message for unknown errors instead of
+// echoing raw engine output (which can quote the egress spec, credentials
+// included) back to the caller.
+func classifyNetErrorKnown(err error) string {
 	s := err.Error()
 	switch {
 	case strings.Contains(s, "timeout") || strings.Contains(s, "context deadline"):
@@ -1139,7 +1242,7 @@ func classifyNetError(err error) string {
 	case strings.Contains(s, "no such host"):
 		return "DNS lookup failed"
 	default:
-		return s
+		return ""
 	}
 }
 

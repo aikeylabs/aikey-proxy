@@ -61,6 +61,13 @@ func TestPickRoutedAccount(t *testing.T) {
 		}
 	})
 
+	t.Run("needs_login failover candidate never replaces the assigned account", func(t *testing.T) {
+		mat := map[string]GroupRuntimeAccount{hrw: fresh, other: needsLogin}
+		if acc, oc := PickRoutedAccount("seat-1", refs, mat, "", map[string]bool{hrw: true}, now); acc != "" || oc != PickNone {
+			t.Fatalf("non-assigned needs_login candidate is not actionable: want none, got (%q, %v)", acc, oc)
+		}
+	})
+
 	t.Run("no-material candidate is a retryable skip, not a login prompt", func(t *testing.T) {
 		mat := map[string]GroupRuntimeAccount{other: fresh} // hrw's material not delivered yet
 		if acc, oc := PickRoutedAccount("seat-1", refs, mat, "", nil, now); acc != other || oc != PickOK {

@@ -130,7 +130,15 @@ type railRunner struct {
 	attempted     bool
 	failedSince   int64 // unix of the first failure in the current streak (recovery log)
 
-	kick chan struct{} // buffered(1): Reload/settings nudge → immediate cycle
+	// nil = fire-and-forget; non-nil receives the outcome of the specifically
+	// requested cycle. A buffered result channel lets the rail finish even when
+	// the waiting HTTP request has already timed out.
+	kick chan chan railCycleResult
+}
+
+type railCycleResult struct {
+	attempted bool
+	err       error
 }
 
 // railSet drives all declared rails. One goroutine per rail (GoSafe/Isolated —
@@ -142,7 +150,7 @@ type railSet struct {
 func newRailSet(specs ...railSpec) *railSet {
 	rs := &railSet{}
 	for _, sp := range specs {
-		rs.rails = append(rs.rails, &railRunner{spec: sp, kick: make(chan struct{}, 1)})
+		rs.rails = append(rs.rails, &railRunner{spec: sp, kick: make(chan chan railCycleResult, 1)})
 	}
 	return rs
 }
@@ -163,10 +171,37 @@ func (rs *railSet) start(s *Supervisor) {
 func (rs *railSet) kickAll() {
 	for _, r := range rs.rails {
 		select {
-		case r.kick <- struct{}{}:
+		case r.kick <- nil:
 		default:
 		}
 	}
+}
+
+// kickAndWait schedules one named rail and waits for that cycle to complete.
+// A caller-supplied timeout keeps the user path bounded; the background rail
+// continues retrying normally after a timeout or failed cycle.
+func (rs *railSet) kickAndWait(ctx context.Context, name string) error {
+	for _, r := range rs.rails {
+		if r.spec.name != name {
+			continue
+		}
+		done := make(chan railCycleResult, 1)
+		select {
+		case r.kick <- done:
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+		select {
+		case result := <-done:
+			if !result.attempted {
+				return errors.New("sync rail did not run because its local readiness gate was not satisfied: " + name)
+			}
+			return result.err
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+	}
+	return errors.New("sync rail not found: " + name)
 }
 
 // snapshot returns the /status view. Rails that never had anything to do
@@ -241,8 +276,12 @@ func (r *railRunner) loop(s *Supervisor) {
 			return
 		case <-ticker.C:
 			r.cycle(s)
-		case <-r.kick:
-			r.cycle(s)
+		case done := <-r.kick:
+			result := r.cycle(s)
+			if done != nil {
+				done <- result
+				close(done)
+			}
 		}
 	}
 }
@@ -252,33 +291,35 @@ var (
 	errRailNoControlURL = errors.New("control panel URL not configured")
 )
 
-func (r *railRunner) cycle(s *Supervisor) {
+func (r *railRunner) cycle(s *Supervisor) railCycleResult {
 	gen := s.active.Load()
 	if gen == nil || gen.vault == nil {
 		// Local not-ready (mid-reload window / early start): neither success nor
 		// failure — the master isn't being blamed for a local swap.
-		return
+		return railCycleResult{}
 	}
 	if r.spec.gate != nil && !r.spec.gate(gen) {
-		return // idle by design (feature off / nothing local to sync) — not a failure
+		return railCycleResult{} // idle by design (feature off / nothing local to sync) — not a failure
 	}
 	masterURL := readControlPanelURL()
 	if masterURL == "" {
 		// A team rail with local work but no control URL is a real broken state
 		// (e.g. config wiped) — count it so it surfaces, don't silently idle.
 		r.finish(s, errRailNoControlURL)
-		return
+		return railCycleResult{attempted: true, err: errRailNoControlURL}
 	}
 	bearer := ""
 	if r.spec.needsTeamJWT {
 		b, err := s.teamCred.bearer(s.ctx, gen.vault, masterURL)
 		if err != nil {
 			r.finish(s, err)
-			return
+			return railCycleResult{attempted: true, err: err}
 		}
 		bearer = b
 	}
-	r.finish(s, r.spec.sync(s.ctx, gen, masterURL, bearer))
+	err := r.spec.sync(s.ctx, gen, masterURL, bearer)
+	r.finish(s, err)
+	return railCycleResult{attempted: true, err: err}
 }
 
 // finish records the cycle outcome and, on a state TRANSITION, refreshes the

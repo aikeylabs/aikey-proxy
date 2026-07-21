@@ -62,6 +62,7 @@ type CanaryProbe struct {
 	reporter            *Reporter
 	client              *httpx.SwappableClient // control-plane→diagnostics: rebuilt on host network change (self-heal registry)
 	done                chan struct{}
+	closeOnce           sync.Once
 	cfg                 CanaryConfig
 	lastResult          CanaryResult
 	wg                  sync.WaitGroup
@@ -125,10 +126,17 @@ func (p *CanaryProbe) ConsecutiveFailures() int {
 	return p.consecutiveFailures
 }
 
-// Close stops the canary probe.
+// Close stops the canary probe. Idempotent (bugfix 2026-07-19): a supervisor
+// reload's async drain_old and a concurrent shutdown can both tear down the
+// same generation, and the second close(p.done) panicked "close of closed
+// channel" (recovered as an isolated goroutine panic, but the old generation's
+// remaining teardown was skipped → leak). io.Closer convention: multiple Close
+// calls must be safe.
 func (p *CanaryProbe) Close() {
-	close(p.done)
-	p.wg.Wait()
+	p.closeOnce.Do(func() {
+		close(p.done)
+		p.wg.Wait()
+	})
 }
 
 func (p *CanaryProbe) loop() {

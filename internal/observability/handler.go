@@ -44,6 +44,19 @@ const (
 	EventProxyEgressSysProxyChanged       = "proxy.egress.sysproxy_changed"
 	EventProxyEgressSysProxyReadFailed    = "proxy.egress.sysproxy_read_failed"
 	EventProxyEgressSysProxyReadRecovered = "proxy.egress.sysproxy_read_recovered"
+	// EventProxyEgressPingEngineDialFailed: /admin/probe/ping could not reach
+	// the target through the configured engine-spec egress (socks5 chain /
+	// mihomo fragment). The raw engine error is logged at Debug only — it can
+	// quote the spec verbatim, credentials included (bugfix 2026-07-19).
+	EventProxyEgressPingEngineDialFailed = "proxy.egress.ping_engine_dial_failed"
+	// EventProxyEgressRequestAttribution: per-request egress traceability
+	// (2026-07-19). One Info line per forwarded request carrying trace_id +
+	// account_id + oauth_identity + egress_applied/engine/fingerprint, so a real
+	// request can be traced from logs to the egress it exited through (grep the
+	// trace_id). fingerprint→exit_ip comes from /admin/egress/selfcheck, off the
+	// hot path. The same attribution rides the usage event's ext_json (durable
+	// audit). See internal/proxy/egress_attribution.go.
+	EventProxyEgressRequestAttribution = "proxy.egress.request_attribution"
 )
 
 // SyncRail events (2026-07-03): control-plane sync rail state transitions.
@@ -116,6 +129,16 @@ const (
 	// its randomized window cap (window_max_util_pct), so it was pre-cut for that
 	// window (cooled until reset) — staying under 100% which looks like abuse.
 	EventProxyGroupWindowPrecut = "proxy.group.window_precut"
+	// EventProxyGroupRequestFailover (N9): a pool account's upstream failure was
+	// retried IN-REQUEST on another candidate account (first-byte gate held — the
+	// client saw nothing of the failed attempt). One event per switch, carrying
+	// from/to account + the failed status.
+	EventProxyGroupRequestFailover = "proxy.group.request_failover"
+	// EventProxyGroupModelTierCooldown (P1-C): a premium-model window (e.g. the
+	// Fable 7d_oi weekly window) exhausted — the account is cooled for THAT model
+	// tier only and keeps serving every other model. Also used for the
+	// unmapped-exhausted-window observability WARN (tier-table gap detection).
+	EventProxyGroupModelTierCooldown = "proxy.group.model_tier_cooldown"
 	// EventProxyGroupSeatBlocked (§5.5): the engine left this seat UNBOUND because
 	// every account in its pool/segment is at the ≤3-人/号 cap, so the proxy 429s it
 	// (never WRH-falls-back, which would route a 4th user onto a full account).
@@ -167,6 +190,11 @@ const (
 	// is at the per-account user cap, or no usable account remains. Neutral wording
 	// (does not guess the cause); the user waits or contacts the admin.
 	ErrCodeGroupPoolFull = "GROUP_POOL_FULL"
+	// ErrCodeModelTierExhausted (P1-C Phase 2, 用户拍板 2026-07-19): 429 when the
+	// REQUESTED MODEL's premium weekly window (e.g. Fable 7d_oi) is exhausted on
+	// every usable pool account, while other models still serve — the message
+	// tells the user to switch model instead of implying the whole pool is down.
+	ErrCodeModelTierExhausted = "MODEL_TIER_EXHAUSTED"
 	// ErrCodeOAuthResponsesOnly (2026-07-13): the request targets an endpoint the
 	// credential's OAuth upstream doesn't serve. Codex OAuth (ChatGPT accounts)
 	// speaks ONLY the Responses API at chatgpt.com/backend-api/codex — a
@@ -177,11 +205,16 @@ const (
 	// reason + the way out (use an API-key credential for this client). 400.
 	ErrCodeOAuthResponsesOnly = "OAUTH_RESPONSES_ONLY"
 	// ErrCodeAccountEgressProxy (§11.7, P7): the resolved oauth-group account pins
-	// a per-account egress proxy that could not be built into a working dialer —
-	// e.g. a non-socks5 scheme, or a socks5 account proxy that cannot be chained
-	// through a non-socks5 node front proxy. 503; the request is REFUSED rather
-	// than sent out the node's IP (which would defeat the per-account isolation).
+	// a per-account egress proxy whose already-constructed dial path is currently
+	// unreachable. 503; the request is REFUSED rather than sent out the node's IP
+	// (which would defeat the per-account isolation).
 	ErrCodeAccountEgressProxy = "ACCOUNT_EGRESS_PROXY_UNAVAILABLE"
+	// ErrCodeAccountEgressEngine means the configured per-account egress could
+	// not even be constructed by this proxy build (for example a Hysteria2
+	// fragment when no compatible engine is installed). This is a deterministic
+	// local configuration/capability failure, not an account-health signal, so
+	// oauth-group in-request failover must not route around it.
+	ErrCodeAccountEgressEngine = "ACCOUNT_EGRESS_ENGINE_UNAVAILABLE"
 )
 
 // ---- HealthSnapshot ----

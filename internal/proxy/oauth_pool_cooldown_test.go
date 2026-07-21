@@ -2,6 +2,7 @@ package proxy
 
 import (
 	"net/http"
+	"strconv"
 	"testing"
 	"time"
 )
@@ -21,10 +22,32 @@ func TestCooldownDecision_Classification(t *testing.T) {
 		t.Fatalf("401 must cool down for the default window, got until=%v ok=%v", until, ok)
 	}
 
-	// 429 WITH a rate-limit signal → cool down.
-	rl := http.Header{"Anthropic-Ratelimit-Reset": {"123"}}
-	if _, ok := cooldownDecision(resp(429, rl), now); !ok {
-		t.Fatal("exhaustion 429 (rate-limit header) must cool down")
+	// 429 WITH real exhaustion evidence (status flip + window at 1.0) → cool down
+	// until the exhausted window's unified reset epoch (B1: the reactive path now
+	// consumes unified-reset instead of the flat default).
+	resetAt := now.Add(42 * time.Minute)
+	rl := http.Header{
+		"Anthropic-Ratelimit-Unified-Status":         {"rate_limited"},
+		"Anthropic-Ratelimit-Unified-5h-Utilization": {"1.0"},
+		"Anthropic-Ratelimit-Unified-5h-Reset":       {strconv.FormatInt(resetAt.Unix(), 10)},
+	}
+	if until, ok := cooldownDecision(resp(429, rl), now); !ok || !until.Equal(resetAt) {
+		t.Fatalf("exhaustion 429 must cool until the exhausted window's reset, got until=%v ok=%v", until, ok)
+	}
+
+	// B1 fence (2026-07-19, sub2api-style value-based discrimination): the
+	// unified-* headers ride on EVERY anthropic response — a WAF/business 429
+	// that carries routine telemetry (status=allowed, util well under 1.0) shows
+	// NO exhaustion evidence and must NOT cool the account. The old
+	// name-contains-"ratelimit" rule cooled it 5min; a correlated WAF burst
+	// could chain-cool the whole pool.
+	wafWithTelemetry := http.Header{
+		"Anthropic-Ratelimit-Unified-Status":         {"allowed"},
+		"Anthropic-Ratelimit-Unified-5h-Utilization": {"0.42"},
+		"Anthropic-Ratelimit-Unified-Reset":          {strconv.FormatInt(resetAt.Unix(), 10)},
+	}
+	if _, ok := cooldownDecision(resp(429, wafWithTelemetry), now); ok {
+		t.Fatal("429 with routine unified telemetry but NO exhaustion evidence must NOT cool the account")
 	}
 
 	// 429 with Retry-After → honor it (capped).
@@ -37,10 +60,25 @@ func TestCooldownDecision_Classification(t *testing.T) {
 		t.Fatalf("oversized Retry-After must be capped at max, got %v", until)
 	}
 
+	// evidence of limiting but NO reset info anywhere → transient per-minute
+	// class → SHORT cool (not the 5-min default; R4 限流→短退避).
+	transient := http.Header{"Anthropic-Ratelimit-Unified-Status": {"rate_limited"}}
+	if until, ok := cooldownDecision(resp(429, transient), now); !ok || until != now.Add(poolCooldown429NoReset) {
+		t.Fatalf("limit evidence without reset info must short-cool (%v), got until=%v ok=%v",
+			poolCooldown429NoReset, until, ok)
+	}
+
 	// 429 WITHOUT any rate-limit signal = WAF business rejection → NOT the
 	// account's fault, do not cool it down.
 	if _, ok := cooldownDecision(resp(429, nil), now); ok {
 		t.Fatal("WAF 429 (no rate-limit signal) must NOT cool down the account")
+	}
+
+	// 529 (P0-B): the upstream's explicit overload signal → immediate short
+	// overload-scoped cooldown (distinct from both the 429 semantics and the
+	// generic-5xx streak path).
+	if until, ok := cooldownDecision(resp(529, nil), now); !ok || until != now.Add(poolCooldown529Overload) {
+		t.Fatalf("529 must cool for the overload window, got until=%v ok=%v", until, ok)
 	}
 
 	// Success / other → no cooldown.
@@ -48,7 +86,45 @@ func TestCooldownDecision_Classification(t *testing.T) {
 		t.Fatal("200 must not cool down")
 	}
 	if _, ok := cooldownDecision(resp(500, nil), now); ok {
-		t.Fatal("500 must not cool down (transient upstream, not account-specific)")
+		t.Fatal("500 must not cool down IMMEDIATELY (generic 5xx cools via the consecutive streak, P0-B)")
+	}
+}
+
+// P0-B fence (2026-07-19): generic 5xx / transport failures cool an account only
+// after CONSECUTIVE repeats; any success resets the streak; a literally-built
+// store (nil streak map) stays safe.
+func TestPoolCooldownStore_ServerErrorStreak(t *testing.T) {
+	now := time.Unix(1_750_000_000, 0)
+	s := &poolCooldownStore{m: map[string]time.Time{}, now: func() time.Time { return now }}
+
+	if _, cooled := s.noteServerError("acc-a"); cooled {
+		t.Fatal("first server error must not cool (transient blip)")
+	}
+	if _, cooled := s.noteServerError("acc-a"); cooled {
+		t.Fatal("second server error must not cool")
+	}
+	until, cooled := s.noteServerError("acc-a")
+	if !cooled || until != now.Add(serverErrCooldown) {
+		t.Fatalf("threshold(%d) consecutive errors must cool for %v, got until=%v cooled=%v",
+			serverErrStreakThreshold, serverErrCooldown, until, cooled)
+	}
+	if !s.skipSet()["acc-a"] {
+		t.Fatal("streak cool must land in the skip set")
+	}
+
+	// success resets: 2 errors + success + 2 errors → never cooled.
+	if _, cooled := s.noteServerError("acc-b"); cooled {
+		t.Fatal("b: first error must not cool")
+	}
+	if _, cooled := s.noteServerError("acc-b"); cooled {
+		t.Fatal("b: second error must not cool")
+	}
+	s.noteSuccess("acc-b")
+	if _, cooled := s.noteServerError("acc-b"); cooled {
+		t.Fatal("b: streak must reset on success — error after success is a fresh streak")
+	}
+	if _, cooled := s.noteServerError("acc-b"); cooled {
+		t.Fatal("b: second error of the fresh streak must not cool")
 	}
 }
 

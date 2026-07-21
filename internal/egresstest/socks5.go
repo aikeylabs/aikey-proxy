@@ -31,6 +31,17 @@ type Socks5Server struct {
 	connects   int
 }
 
+// isLoopbackHost reports whether a CONNECT target host is loopback — the only
+// destination this test recorder may dial (host-safety, 2026-07-19). Accepts the
+// literal "localhost" plus any IP that parses as loopback (127.0.0.0/8, ::1).
+func isLoopbackHost(host string) bool {
+	if host == "localhost" {
+		return true
+	}
+	ip := net.ParseIP(host)
+	return ip != nil && ip.IsLoopback()
+}
+
 // NewSocks5Server starts a socks5 recorder on 127.0.0.1:0. Pass user/pass to
 // require username/password auth ("" = no-auth). Closed automatically via t.Cleanup.
 func NewSocks5Server(t *testing.T, user, pass string) *Socks5Server {
@@ -127,6 +138,15 @@ func (s *Socks5Server) handle(c net.Conn) {
 	s.lastTarget = target
 	s.mu.Unlock()
 
+	// Host-safety (2026-07-19): this recorder only ever fronts loopback httptest
+	// upstreams, so it must NEVER dial a non-loopback host. If a test's route ever
+	// carried a real BaseURL (regression / typo), dialing it here would leak off
+	// the box. The CONNECT is already recorded above (tripwire-visible); we just
+	// refuse to dial anything but loopback. Reply socks5 0x04 (host unreachable).
+	if !isLoopbackHost(host) {
+		_, _ = c.Write([]byte{0x05, 0x04, 0x00, 0x01, 0, 0, 0, 0, 0, 0})
+		return
+	}
 	up, err := net.DialTimeout("tcp", target, 5*time.Second)
 	if err != nil {
 		_, _ = c.Write([]byte{0x05, 0x01, 0x00, 0x01, 0, 0, 0, 0, 0, 0})

@@ -14,9 +14,11 @@
 // OWNER RULE (2026-07-01): the engine is ALLOWED to route a member to an account they
 // have NOT logged into. So an override naming a needs_login account is HONORED
 // (PickNeedsLogin → the hot path returns LOGIN_REQUIRED for THAT account, the pages show
-// that account with a "log in" prompt) — it is NOT treated as a stale redirect to fall
-// through. Only a genuinely unusable override (not a candidate / no material / expired /
-// window-exhausted / cooling) falls through to the local ranked pick.
+// that account with a "log in" prompt). A needs_login account discovered only after the
+// assigned account was skipped is NOT actionable: it is a request-level failover
+// candidate and the team-oauth page still names the engine/HRW-assigned account. Such a
+// fallback is skipped so it can never replace the assigned account's real error with a
+// misleading login prompt.
 package vkeys
 
 import "github.com/AiKeyLabs/pkg/seatassign"
@@ -49,8 +51,9 @@ const (
 //	skip      — accounts to route around (cooldown / this-request retries). nil ok.
 //	nowUnix   — clock for the expiry gate (injected for deterministic tests).
 //
-// The ranked loop STOPS at the first non-skipped needs_login candidate (strict HRW —
-// never silently hop past an account the member merely needs to log into; RW2/D2).
+// The assigned account (valid override, otherwise strict-HRW rank 0) may return
+// PickNeedsLogin. Later needs_login candidates are skipped; only usable fallbacks may
+// serve a request whose assigned account is unavailable.
 func PickRoutedAccount(seatID string, refs []GroupAccountRef, material map[string]GroupRuntimeAccount, override string, skip map[string]bool, nowUnix int64) (string, PickOutcome) {
 	if len(refs) == 0 {
 		return "", PickNone
@@ -62,6 +65,11 @@ func PickRoutedAccount(seatID string, refs []GroupAccountRef, material map[strin
 		inSet[r.AccountID] = true
 	}
 	blind := len(material) == 0 // pre-poll display mode: no usability info yet
+	ordered := seatassign.Rank(seatID, accounts)
+	assigned := ordered[0].AccountID
+	if override != "" && inSet[override] {
+		assigned = override
+	}
 
 	gate := func(accountID string) PickOutcome {
 		if !inSet[accountID] || skip[accountID] {
@@ -83,15 +91,18 @@ func PickRoutedAccount(seatID string, refs []GroupAccountRef, material map[strin
 		return PickOK
 	}
 
-	// Engine override first (owner rule: needs_login is a valid, honored destination).
+	// Engine override first (owner rule: needs_login is a valid, honored destination
+	// only when this is the actual engine-assigned account).
 	if override != "" {
-		if oc := gate(override); oc != PickNone {
+		if oc := gate(override); oc == PickOK || (oc == PickNeedsLogin && override == assigned) {
 			return override, oc
 		}
 	}
-	// Local ranked pick — stop at the first usable OR needs_login candidate.
-	for _, a := range seatassign.Rank(seatID, accounts) {
-		if oc := gate(a.AccountID); oc != PickNone {
+	// Local ranked pick. A login prompt is valid only for the nominally assigned
+	// account; later needs_login rows are non-actionable failover candidates.
+	for _, a := range ordered {
+		oc := gate(a.AccountID)
+		if oc == PickOK || (oc == PickNeedsLogin && a.AccountID == assigned) {
 			return a.AccountID, oc
 		}
 	}

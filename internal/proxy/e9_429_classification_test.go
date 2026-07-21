@@ -10,11 +10,12 @@ package proxy
 //   - 限额 (5h window quota exhausted): cool the account until the window resets.
 //   - WAF (business rejection, no rate-limit headers): not the account's fault — do not cool.
 //
-// cooldownDecision today is BINARY: any 429 carrying a *ratelimit* header (and no
-// Retry-After) gets the flat poolCooldownDefault, so 限流 is over-cooled exactly like 限额.
-// It never reads unified-status, so it cannot split the two. The WAF + 限额 buckets already
-// behave correctly (asserted live below); the 限流 bucket is the gap and is xfail-skipped
-// with a pointer until the split lands — never passing by asserting the broken 300s cool.
+// 2026-07-19 (B1 fix, sub2api-style value-based discrimination): the split LANDED —
+// cooldownDecision now derives the cooldown from limit EVIDENCE (unified status flip /
+// util≥1.0 / reset epochs / Retry-After), and evidence-without-reset short-cools
+// (poolCooldown429NoReset) instead of the flat 5-min default. The per_minute subtest
+// below flipped from xfail-skip to green accordingly; its Skipf branch is kept as the
+// regression tripwire (it fires again only if someone re-flattens the cooldown).
 //
 // Fixture-based per wire format (logging-conventions: parser/classifier changes must be
 // fixture-tested per wire shape). Reuses resp() from oauth_pool_cooldown_test.go.

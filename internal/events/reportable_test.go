@@ -204,6 +204,43 @@ func TestBuildReportableEvent_AppPipelineFieldsIsolated(t *testing.T) {
 	}
 }
 
+// TestBuildReportableEvent_EgressExtJSON pins the durable per-request egress
+// audit (B layer, 2026-07-19): when the route had an egress spec, the event's
+// ext_json carries the egress block (applied/engine/fingerprint) — so a usage
+// row can be traced to the egress it exited through. Personal direct traffic
+// (engine "none") writes NO ext_json so the pre-existing wire is unchanged.
+// 能红: remove the ExtJSON stamping in BuildReportableEvent → the egress block
+// assertion fails.
+func TestBuildReportableEvent_EgressExtJSON(t *testing.T) {
+	route := &vkeys.ResolvedRoute{VirtualKeyID: "aikey_team_x", RouteSource: "team_managed", OrgID: "org1", ProviderCode: "openai", AccountID: "acc-1"}
+
+	// With egress → ext_json.egress present.
+	ev := BuildReportableEvent(&ReportOpts{
+		EventID: "evt-eg", Route: route, StatusCode: 200,
+		EgressApplied: true, EgressEngine: "mihomo", EgressFingerprint: "abc123def456",
+	})
+	m, ok := ev.ExtJSON.(map[string]any)
+	if !ok {
+		t.Fatalf("ExtJSON = %T, want map with egress block", ev.ExtJSON)
+	}
+	eg, ok := m["egress"].(map[string]any)
+	if !ok {
+		t.Fatalf("ext_json.egress missing: %+v", m)
+	}
+	if eg["applied"] != true || eg["engine"] != "mihomo" || eg["fingerprint"] != "abc123def456" {
+		t.Errorf("egress block = %+v, want applied=true engine=mihomo fingerprint=abc123def456", eg)
+	}
+
+	// No egress (engine none) → ext_json omitted (wire unchanged for direct traffic).
+	ev2 := BuildReportableEvent(&ReportOpts{
+		EventID: "evt-direct", Route: route, StatusCode: 200,
+		EgressApplied: false, EgressEngine: "none", EgressFingerprint: "",
+	})
+	if ev2.ExtJSON != nil {
+		t.Errorf("direct traffic must write no ext_json, got %+v", ev2.ExtJSON)
+	}
+}
+
 // TestBuildReportableEvent_AppPipelineFieldsFollowActive pins the
 // follow-active variant — degrade-detector's expected steady-state mode
 // (first-party, follow_user_active=true). AppMode + BoundVia must

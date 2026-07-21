@@ -7,12 +7,13 @@
 //
 // Flow:
 //
-//	POST /oauth/pool/authorize-url {provider, credential_id}
-//	    → broker.StartLogin → {session_id, authorize_url}; remember session→credential
+//	POST /oauth/pool/authorize-url {credential_id}
+//	    → master login-context → broker.StartLogin(canonical provider)
+//	    → {session_id, authorize_url, flow}; bind session→credential/group/account/provider
 //	POST /oauth/pool/submit-code  {session_id, code}
 //	    → broker.SubmitCode → read token from memory store
 //	    → postMemberToken(master RW10, team JWT, {credential_id, token…})
-//	    → {status:"ok"}   (no token in the response)
+//	    → targeted group_runtime sync → {status:"ok", sync_status} (no token)
 package supervisor
 
 import (
@@ -21,6 +22,7 @@ import (
 	"errors"
 	"log/slog"
 	"net/http"
+	"strings"
 	"sync"
 	"time"
 
@@ -33,11 +35,22 @@ import (
 // authorize-url so the session map can't grow unbounded (P2).
 const poolSessionTTL = 15 * time.Minute
 
+// The credential is already durable on master before this wait begins. Keep
+// the request bounded: on timeout/failure the rail keeps its normal retry loop
+// and the caller gets an explicit pending state instead of a failed login.
+const poolLoginRuntimeSyncTimeout = 12 * time.Second
+
 // poolSession is the value stored per started login: which account it binds to +
 // when it started (for TTL reaping).
 type poolSession struct {
-	credentialID string
-	createdAt    time.Time
+	credentialID     string
+	oauthGroupID     string
+	accountID        string
+	providerCode     string
+	expectedIdentity string
+	externalID       string
+	flow             string
+	createdAt        time.Time
 }
 
 // errNoTeamCredential — no team account-JWT available (not logged in to a team).
@@ -124,11 +137,29 @@ func (e *brokerPoolExchanger) LoginStatus(ctx context.Context, sessionID string)
 // (the supervisor wires them from the team credential + control-panel URL) so the
 // handler stays testable.
 type poolLoginHandler struct {
-	ex        poolExchanger
-	masterURL func() string
-	bearer    func(ctx context.Context) (string, error)
-	client    *http.Client
-	sessions  sync.Map // sessionID → credentialID (the account being logged into)
+	ex                 poolExchanger
+	masterURL          func() string
+	bearer             func(ctx context.Context) (string, error)
+	client             *http.Client
+	resolveContext     func(ctx context.Context, credentialID string) (poolLoginContext, error) // tests; nil=master
+	syncAfterWriteback func(ctx context.Context) error                                          // nil only in focused tests
+	sessions           sync.Map                                                                 // sessionID → immutable credential/provider/group binding
+}
+
+type poolProviderProfile struct {
+	broker string
+	flow   string
+}
+
+func poolProviderFor(code string) (poolProviderProfile, bool) {
+	switch strings.ToLower(strings.TrimSpace(code)) {
+	case "anthropic":
+		return poolProviderProfile{broker: "claude", flow: "setup_token"}, true
+	case "openai":
+		return poolProviderProfile{broker: "codex", flow: "auth_code"}, true
+	default:
+		return poolProviderProfile{}, false
+	}
 }
 
 func (h *poolLoginHandler) authorizeURL(w http.ResponseWriter, r *http.Request) {
@@ -144,7 +175,43 @@ func (h *poolLoginHandler) authorizeURL(w http.ResponseWriter, r *http.Request) 
 		poolErr(w, http.StatusBadRequest, "MISSING_CREDENTIAL_ID", "credential_id is required")
 		return
 	}
-	sid, authURL, err := h.ex.StartLogin(r.Context(), req.Provider)
+	bearer, err := h.bearer(r.Context())
+	if err != nil {
+		poolErr(w, http.StatusUnauthorized, "NO_TEAM_CREDENTIAL", "not logged in to the team (run aikey login)")
+		return
+	}
+	masterURL := h.masterURL()
+	if masterURL == "" {
+		poolErr(w, http.StatusServiceUnavailable, "NO_MASTER_URL", "control-panel URL not configured")
+		return
+	}
+	var loginCtx poolLoginContext
+	if h.resolveContext != nil {
+		loginCtx, err = h.resolveContext(r.Context(), req.CredentialID)
+	} else {
+		loginCtx, err = fetchPoolLoginContext(r.Context(), h.writebackClientFn()(), masterURL, bearer, req.CredentialID)
+	}
+	if err != nil {
+		status := http.StatusBadGateway
+		var httpErr *poolLoginContextHTTPError
+		if errors.As(err, &httpErr) && httpErr.StatusCode >= 400 && httpErr.StatusCode < 500 {
+			status = httpErr.StatusCode
+		}
+		poolErr(w, status, "LOGIN_CONTEXT_UNAVAILABLE", err.Error())
+		return
+	}
+	profile, supported := poolProviderFor(loginCtx.ProviderCode)
+	if !supported {
+		poolErr(w, http.StatusUnprocessableEntity, "LOGIN_PROVIDER_UNSUPPORTED",
+			"this account's provider is not supported by the local pool-login broker: "+loginCtx.ProviderCode)
+		return
+	}
+	if req.Provider != "" && !strings.EqualFold(req.Provider, profile.broker) {
+		slog.Warn("broker.pool.client_provider_ignored",
+			"credential_id", req.CredentialID, "client_provider", req.Provider,
+			"bound_provider", loginCtx.ProviderCode)
+	}
+	sid, authURL, err := h.ex.StartLogin(r.Context(), profile.broker)
 	if err != nil {
 		poolErr(w, http.StatusBadGateway, "LOGIN_START_FAILED", err.Error())
 		return
@@ -153,8 +220,16 @@ func (h *poolLoginHandler) authorizeURL(w http.ResponseWriter, r *http.Request) 
 	// bind this session to the account so submit-code writes the token to the right
 	// credential (the account the proxy told the member to log into).
 	h.sweepExpiredSessions()
-	h.sessions.Store(sid, poolSession{credentialID: req.CredentialID, createdAt: time.Now()})
-	poolJSON(w, map[string]any{"session_id": sid, "authorize_url": authURL})
+	h.sessions.Store(sid, poolSession{
+		credentialID: loginCtx.CredentialID, oauthGroupID: loginCtx.OauthGroupID,
+		accountID: loginCtx.AccountID, providerCode: loginCtx.ProviderCode,
+		expectedIdentity: loginCtx.ExpectedIdentity, externalID: loginCtx.ExternalID,
+		flow: profile.flow, createdAt: time.Now(),
+	})
+	poolJSON(w, map[string]any{
+		"session_id": sid, "authorize_url": authURL, "provider_code": loginCtx.ProviderCode,
+		"flow": profile.flow, "expected_identity": loginCtx.ExpectedIdentity,
+	})
 }
 
 func (h *poolLoginHandler) submitCode(w http.ResponseWriter, r *http.Request) {
@@ -199,7 +274,10 @@ func (h *poolLoginHandler) submitCode(w http.ResponseWriter, r *http.Request) {
 	// follow-up confirm call replays it WITHOUT re-spending the one-shot code. If the
 	// member never confirms, the 15-min session TTL reaps the held token.
 	if !req.Confirm {
-		poolJSON(w, map[string]any{"status": "pending", "identity": identity})
+		poolJSON(w, map[string]any{
+			"status": "pending", "identity": identity,
+			"expected_identity": sess.expectedIdentity, "provider_code": sess.providerCode,
+		})
 		return
 	}
 
@@ -215,7 +293,9 @@ func (h *poolLoginHandler) submitCode(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if err := postMemberToken(r.Context(), h.writebackClientFn(), masterURL, bearer, memberTokenWriteback{
-		CredentialID: credentialID, AccessToken: access, RefreshToken: refresh, ExpiresAt: exp, ExternalID: externalID,
+		CredentialID: credentialID, AccessToken: access, RefreshToken: refresh, ExpiresAt: exp,
+		ExternalID: externalID, ProviderCode: sess.providerCode,
+		OauthGroupID: sess.oauthGroupID, AccountID: sess.accountID, Identity: identity,
 	}); err != nil {
 		// DELIBERATELY keep the session (do NOT delete here): the code was already
 		// spent, so the member must be able to retry just the writeback. SubmitCode is
@@ -228,6 +308,24 @@ func (h *poolLoginHandler) submitCode(w http.ResponseWriter, r *http.Request) {
 		poolErr(w, http.StatusBadGateway, "WRITEBACK_FAILED", err.Error())
 		return
 	}
+
+	// Make the just-written member token available to the data path immediately.
+	// This targets only group_runtime: a global reload would disturb unrelated
+	// rails and still would not prove that this credential reached the runtime.
+	syncStatus := "ok"
+	syncError := ""
+	if h.syncAfterWriteback != nil {
+		syncCtx, cancel := context.WithTimeout(r.Context(), poolLoginRuntimeSyncTimeout)
+		err = h.syncAfterWriteback(syncCtx)
+		cancel()
+		if err != nil {
+			syncStatus = "pending"
+			syncError = err.Error()
+			slog.Warn("broker.pool.runtime_sync_pending",
+				"error", syncError, "credential_id", credentialID,
+				"oauth_group_id", sess.oauthGroupID, "account_id", sess.accountID)
+		}
+	}
 	// Durably on master now: drop the proxy-side binding AND the broker's cached token
 	// (Forget) so the per-member token doesn't linger in proxy memory. One-shot done.
 	h.sessions.Delete(req.SessionID)
@@ -236,7 +334,11 @@ func (h *poolLoginHandler) submitCode(w http.ResponseWriter, r *http.Request) {
 	// shows which Claude account was actually logged into and can warn (yellow) if it
 	// doesn't match the team account this slot expects. Email is not a secret (already
 	// shown as the account identity); the token still never leaves the proxy.
-	poolJSON(w, map[string]any{"status": "ok", "identity": identity})
+	resp := map[string]any{"status": "ok", "identity": identity, "sync_status": syncStatus}
+	if syncError != "" {
+		resp["sync_error"] = syncError
+	}
+	poolJSON(w, resp)
 }
 
 // status serves GET /oauth/pool/status?session_id=<id> — the codex (auth_code)
@@ -311,6 +413,12 @@ func (s *Supervisor) NewPoolLoginHandler() *poolLoginHandler {
 		ex:        &brokerPoolExchanger{brk: brk, memTok: memTok, memAcc: memAcc},
 		masterURL: readControlPanelURL,
 		bearer:    s.teamBearer,
+		syncAfterWriteback: func(ctx context.Context) error {
+			if s.railset == nil {
+				return errors.New("group runtime sync rail is not initialized")
+			}
+			return s.railset.kickAndWait(ctx, "group_runtime")
+		},
 		// client left nil in production ⇒ writebackClientFn() resolves the LIVE
 		// swappable groupRuntimeClient each retry, so a network-change rebuild
 		// heals the writeback. Tests inject a fixed h.client (see writebackClientFn).

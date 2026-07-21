@@ -591,12 +591,25 @@ func (p *Proxy) reportUsage(route *vkeys.ResolvedRoute, bearerToken, model strin
 		}
 	}
 
+	// Per-request egress attribution for the durable ext_json audit (B layer,
+	// 2026-07-19) — derived from the SAME helper the live log (A layer) uses, so
+	// the usage-store record and the proxy.egress.request_attribution log always
+	// agree. Deterministic in (spec, override) → recomputing here can't drift.
+	egressSpec := ""
+	if route != nil {
+		egressSpec = route.EgressProxyURL
+	}
+	egApplied, egEngine, egFingerprint := egressAttribution(egressSpec, p.oauthEgressOverride.Load())
+
 	ev := events.BuildReportableEvent(&events.ReportOpts{
 		EventID:                  observability.NewID(),
 		ProxyInstanceID:          p.proxyInstanceID,
 		SourceID:                 sourceID,
 		SourceSeq:                sourceSeq,
 		Route:                    route,
+		EgressApplied:            egApplied,
+		EgressEngine:             egEngine,
+		EgressFingerprint:        egFingerprint,
 		BearerToken:              bearerToken,
 		Model:                    model,
 		StartTime:                startTime,
