@@ -101,6 +101,20 @@ const (
 	// only). Rejected locally with ErrCodeOAuthResponsesOnly instead of letting
 	// ChatGPT's edge answer with a misleading "invalid x-api-key".
 	EventProxyRequestDialectUnsupported = "proxy.request.dialect_unsupported"
+	// Fence I13 runtime guard (2026-07-21). EventProxyRequestIdentityScrubbed:
+	// an outbound header carried one of the control-plane member-identity shapes
+	// enumerated in proxy/member_identity_guard.go (that file is the only place
+	// in the data plane allowed to spell them out, so the vocabulary fence
+	// TestProxySource_DoesNotReferenceMemberIdentityFields keeps meaning
+	// something) and was dropped before the upstream saw it.
+	// EventProxyRequestIdentityBlocked: the
+	// proxy was about to write such a value into the request body's
+	// metadata.user_id and refused. Both are WARN, never INFO: they mean code
+	// upstream of the guard learned a member's provider identity, which is the
+	// thing to go fix — the guard only stops it reaching Anthropic/OpenAI.
+	// Neither ever logs the offending value; only the shape name.
+	EventProxyRequestIdentityScrubbed = "proxy.request.identity_scrubbed"
+	EventProxyRequestIdentityBlocked  = "proxy.request.identity_inject_blocked"
 	// EventProxyQuotaModelUnpriced: a completed request's model has no entry in
 	// the edge price summary (D-U8/P7), so its usd was NOT counted locally — the
 	// token quota floor backstops it and the server baseline catches up on

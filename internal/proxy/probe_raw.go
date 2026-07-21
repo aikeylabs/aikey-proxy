@@ -236,6 +236,18 @@ func (p *Proxy) handleProbeRaw(w http.ResponseWriter, r *http.Request, canonical
 	// invariant per spec §4.3).
 	stripAikeyHeaders(upstreamReq.Header)
 
+	// 4e. Fence I13 value rule (2026-07-21) — same guard the forward Director
+	// runs. Steps 4a/4d are NAME rules; neither can see a member-identity value
+	// parked under an allowlisted header name. Expected to be a no-op here
+	// (default-deny allowlist + fixed UA + proxy-set auth), so a hit is a real
+	// signal and is logged, not swallowed.
+	if scrubbed := scrubMemberIdentityHeaders(upstreamReq.Header); len(scrubbed) > 0 {
+		logger.Warn("member identity scrubbed from probe upstream request headers",
+			"event.name", observability.EventProxyRequestIdentityScrubbed,
+			"headers", scrubbed,
+		)
+	}
+
 	// 5. Send + time. Use p.transport so HTTP_PROXY env etc are honored
 	// the same way as the regular upstream path.
 	transport := p.currentTransport()
@@ -324,17 +336,17 @@ func copyAllowlistedHeaders(src, dst http.Header) {
 // but a second guard ensures even an allowlist regression doesn't leak
 // probe bearer to upstream. Cost: one map iteration on outbound headers
 // (typically < 10 entries).
+//
+// 2026-07-21: this used to be a second, independently written implementation of
+// the same "X-Aikey-* never reaches an upstream" invariant that
+// middleware.go's stripAikeyRequestHeaders enforces on the forward path — two
+// bodies of code, one invariant, and fence I13 only pinned one of them. It now
+// DELEGATES, so the invariant has a single source of truth and both call sites
+// are covered by TestStripperConvergence_ProbeDelegatesToForwardPath. The layer
+// order on this path is unchanged and still three-deep: outboundHeaderAllowlist
+// (default-deny) → namespace strip (here) → member-identity value scrub.
 func stripAikeyHeaders(h http.Header) {
-	var toDelete []string
-	for name := range h {
-		canonical := http.CanonicalHeaderKey(name)
-		if strings.HasPrefix(canonical, "X-Aikey-") {
-			toDelete = append(toDelete, name)
-		}
-	}
-	for _, name := range toDelete {
-		h.Del(name)
-	}
+	stripAikeyRequestHeaders(h)
 }
 
 // injectProbeAuth sets the upstream Authorization (or x-api-key) header
