@@ -569,6 +569,19 @@ func (p *Proxy) serveRoute(w http.ResponseWriter, r *http.Request, route *vkeys.
 			// X-Aikey-* ever reaches the upstream — fenced by
 			// TestStripAikeyRequestHeaders.
 			stripAikeyRequestHeaders(req.Header)
+			// Fence I13 second half (2026-07-21): the namespace strip above is a
+			// NAME rule and cannot see an identity value parked under a header
+			// that simply doesn't start with X-Aikey- (e.g. a future
+			// `X-Member-Union-Id`). This is the VALUE rule — see
+			// member_identity_guard.go for what it does and does not promise.
+			// Fail-loud: a hit means some code above learned a member's provider
+			// identity, so it WARNs rather than scrubbing silently.
+			if scrubbed := scrubMemberIdentityHeaders(req.Header); len(scrubbed) > 0 {
+				logger.Warn("member identity scrubbed from upstream request headers",
+					"event.name", observability.EventProxyRequestIdentityScrubbed,
+					"headers", scrubbed,
+				)
+			}
 			// Why: tell upstream we only accept identity (uncompressed) so the
 			// drainer and non-streaming token extractor can parse the body
 			// directly. Anthropic's OAuth endpoint in particular returns
