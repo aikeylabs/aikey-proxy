@@ -8,8 +8,11 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"log/slog"
 	"net/http"
 	"strings"
+
+	"github.com/AiKeyLabs/aikey-proxy/internal/observability"
 )
 
 // oauthInject replaces the original API Key auth with OAuth credential injection.
@@ -332,7 +335,27 @@ func setRequestBody(req *http.Request, bodyBytes []byte) {
 // injectMetadataUserIDIfAbsent reads the request body JSON and injects
 // metadata.user_id only if it's not already set. This preserves the CLI's
 // own user_id when proxying Claude Code requests (forward compatibility).
+//
+// Fence I13 body chokepoint (2026-07-21): this is the ONLY place the proxy
+// writes an identifier into an outbound body, so the member-identity guard sits
+// here rather than at today's single call site — a future caller ("attribute
+// upstream usage per member") inherits the fence instead of re-opening the hole.
+// Refusing the write is the safe failure: metadata.user_id is optional to the
+// WAF's persona check in the sense that a MISSING one degrades to a fresh
+// session, whereas a leaked one is unrecoverable — the third party has it.
 func injectMetadataUserIDIfAbsent(req *http.Request, userID string) {
+	if shape := memberIdentityShape(userID); shape != "" {
+		tc := traceFromContext(req.Context())
+		slog.Warn("refused to write member identity into upstream body",
+			"event.name", observability.EventProxyRequestIdentityBlocked,
+			"identity_shape", shape,
+			"path", req.URL.Path,
+			"trace_id", tc.TraceID,
+			"span_id", tc.SpanID,
+			"request_id", tc.RequestID,
+		)
+		return
+	}
 	mutateJSONBody(req, func(body map[string]any) bool {
 		// Skip if metadata.user_id already present.
 		if metadata, ok := body["metadata"].(map[string]any); ok {

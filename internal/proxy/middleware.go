@@ -459,7 +459,15 @@ const (
 func stripAikeyRequestHeaders(h http.Header) {
 	for k := range h {
 		if len(k) >= 8 && strings.EqualFold(k[:8], "X-Aikey-") {
-			h.Del(k)
+			// delete(), not h.Del(): Del canonicalizes its argument before
+			// deleting, so for a key written straight into the map in
+			// non-canonical form ("x-aikey-…", as a verbatim copy from another
+			// hop can be) it deletes a DIFFERENT, absent key and the real entry
+			// survives the strip — the case-insensitive match above then reads
+			// as protection that isn't there. Found 2026-07-21 by the probe/
+			// forward convergence fence. net/http canonicalizes inbound server
+			// headers, so this was not a live leak; it was a live blind spot.
+			delete(h, k)
 		}
 	}
 }
