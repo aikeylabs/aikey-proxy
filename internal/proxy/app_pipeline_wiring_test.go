@@ -891,7 +891,7 @@ func TestProtocolFamilyLookup_PinsExpectedMapping(t *testing.T) {
 	}{
 		// Direct providers — one provider per family.
 		{"anthropic", "anthropic"},
-		{"google_gemini", "gemini"},
+		{"google", "gemini"},
 		// OpenAI wire family — multiple providers map to the same family
 		// (degrade-detector parser dispatch must group these together).
 		{"openai", "openai_compatible"},

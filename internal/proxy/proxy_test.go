@@ -501,6 +501,53 @@ type mockActiveVault struct {
 	personalBaseURL string
 }
 
+func TestSelectTokenBinding_UsesClientRouteToChooseExactMockBinding(t *testing.T) {
+	anthropic := &vkeys.ResolvedRoute{
+		VirtualKeyID: "vk-mock", ProviderCode: "mock", ProtocolType: "anthropic", CredentialID: "cred-a",
+	}
+	openai := &vkeys.ResolvedRoute{
+		VirtualKeyID: "vk-mock", ProviderCode: "mock", ProtocolType: "openai_compatible", CredentialID: "cred-o",
+	}
+	container := &vkeys.ResolvedRoute{VirtualKeyID: "vk-mock", Bindings: []*vkeys.ResolvedRoute{anthropic, openai}}
+	reader := &mockActiveVault{providerBindings: map[string]*vault.ProviderBinding{
+		"anthropic": {
+			ClientRoute: "anthropic", ProviderCode: "mock", ProtocolType: "anthropic",
+			KeySourceType: "managed_virtual_key", KeySourceRef: "vk-mock",
+		},
+	}}
+	p := &Proxy{activeReader: reader}
+
+	got, err := p.selectTokenBinding(container, "anthropic", "anthropic")
+	if err != nil {
+		t.Fatalf("selectTokenBinding: %v", err)
+	}
+	if got.ProviderCode != "mock" || got.ProtocolType != "anthropic" || got.CredentialID != "cred-a" {
+		t.Fatalf("selected %+v, want exact mock+anthropic binding", got)
+	}
+
+	got, err = p.selectTokenBinding(container, "openai", "openai_compatible")
+	if err != nil {
+		t.Fatalf("unique protocol fallback: %v", err)
+	}
+	if got.CredentialID != "cred-o" {
+		t.Fatalf("selected credential=%q, want cred-o", got.CredentialID)
+	}
+}
+
+func TestSelectTokenBinding_RejectsAmbiguousSameProtocolBindings(t *testing.T) {
+	container := &vkeys.ResolvedRoute{
+		VirtualKeyID: "vk-ambiguous",
+		Bindings: []*vkeys.ResolvedRoute{
+			{VirtualKeyID: "vk-ambiguous", ProviderCode: "openai", ProtocolType: "openai_compatible"},
+			{VirtualKeyID: "vk-ambiguous", ProviderCode: "mock", ProtocolType: "openai_compatible"},
+		},
+	}
+	p := &Proxy{}
+	if _, err := p.selectTokenBinding(container, "openai", "openai_compatible"); err == nil {
+		t.Fatal("ambiguous same-protocol token must fail until aikey use selects an exact binding")
+	}
+}
+
 func (m *mockActiveVault) GetSecret(alias string) (string, error) {
 	s, ok := m.secrets[alias]
 	if !ok {
@@ -513,12 +560,15 @@ func (m *mockActiveVault) GetActiveKeyConfig() (*vault.ActiveKeyConfig, error) {
 	return m.activeKeyConfig, nil
 }
 
-func (m *mockActiveVault) GetActiveTeamKeyByProvider(providerCode string) (*vault.ManagedKey, error) {
+func (m *mockActiveVault) GetActiveTeamKeyByProvider(providerCode, protocolType string) (*vault.ManagedKey, error) {
 	if m.activeTeamKeys == nil {
 		return nil, nil
 	}
 	mk, ok := m.activeTeamKeys[strings.ToLower(providerCode)]
 	if !ok {
+		return nil, nil
+	}
+	if protocolType != "" && !strings.EqualFold(mk.ProtocolType, protocolType) {
 		return nil, nil
 	}
 	return mk, nil
@@ -531,22 +581,26 @@ func (m *mockActiveVault) GetPersonalKeyByAlias(alias string) (string, string, s
 	return "", "", "", fmt.Errorf("personal key %q not found", alias)
 }
 
-func (m *mockActiveVault) GetTeamKeyByID(virtualKeyID, targetProviderCode string) (*vault.ManagedKey, error) {
-	// P1e: prefer the binding matching targetProviderCode (multi-binding VK),
-	// else fall back to the first binding with this ID (legacy single-binding).
+func (m *mockActiveVault) GetTeamKeyByID(virtualKeyID, targetProviderCode, protocolType string) (*vault.ManagedKey, error) {
+	// Exact axes never fall through to another binding. A fully unspecified
+	// lookup retains the deterministic legacy single-binding fallback.
 	var fallback *vault.ManagedKey
 	for _, mk := range m.activeTeamKeys {
 		if mk.VirtualKeyID != virtualKeyID {
 			continue
 		}
-		if targetProviderCode != "" && strings.EqualFold(mk.ProviderCode, targetProviderCode) {
+		if targetProviderCode != "" && strings.EqualFold(mk.ProviderCode, targetProviderCode) &&
+			(protocolType == "" || strings.EqualFold(mk.ProtocolType, protocolType)) {
 			return mk, nil
 		}
 		if fallback == nil {
 			fallback = mk
 		}
 	}
-	return fallback, nil
+	if targetProviderCode == "" && protocolType == "" {
+		return fallback, nil
+	}
+	return nil, nil
 }
 
 func (m *mockActiveVault) GetProviderBinding(providerCode string) (*vault.ProviderBinding, error) {

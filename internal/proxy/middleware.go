@@ -2,6 +2,7 @@ package proxy
 
 import (
 	"context"
+	"fmt"
 	"net/http"
 	"net/url"
 	"os"
@@ -10,6 +11,7 @@ import (
 	"github.com/AiKeyLabs/aikey-proxy/internal/observability"
 	"github.com/AiKeyLabs/aikey-proxy/internal/provider"
 	"github.com/AiKeyLabs/aikey-proxy/internal/vkeys"
+	"github.com/AiKeyLabs/pkg/providerroutes"
 )
 
 // contextKey is an unexported type for context keys in this package.
@@ -153,9 +155,13 @@ func extractRawAuthValue(req *http.Request) string {
 
 // isProviderCompatible checks if a route token's provider matches the request path's provider.
 // Compares canonical codes so broker aliases (claude→anthropic, codex→openai) match correctly.
-func isProviderCompatible(route *vkeys.ResolvedRoute, canonicalCode string) bool {
+func isProviderCompatible(route *vkeys.ResolvedRoute, canonicalCode, requestedProtocol string) bool {
 	routeCanonical := providerCanonicalCode(route.ProviderCode)
 	if routeCanonical == canonicalCode {
+		return true
+	}
+	if route.ProtocolType != "" && requestedProtocol != "" &&
+		strings.EqualFold(route.ProtocolType, requestedProtocol) {
 		return true
 	}
 	// P1d (R-C, design D-10 refined): cross-provider SAME-protocol. A binding
@@ -163,17 +169,61 @@ func isProviderCompatible(route *vkeys.ResolvedRoute, canonicalCode string) bool
 	// prefix implies is compatible — e.g. a zhipu binding with base_url
 	// .../api/anthropic accessed via the /anthropic path (GLM's anthropic
 	// endpoint). The route row for the binding's base_url is the truth source
-	// for the endpoint's protocol; providerToProtocol(canonicalCode) is the
-	// protocol the path implies. Same protocol → adapter/wire are compatible,
+	// for the endpoint's protocol; requestedProtocol comes from the request
+	// endpoint/client route, never from the upstream Provider identity. Same
+	// protocol → adapter/wire are compatible,
 	// and the credential + base_url stay fixed by the binding (no upstream
 	// escalation), so this is a routing allowance, not a permission bypass.
 	if route.BaseURL != "" {
-		pathProtocol := providerToProtocol(canonicalCode)
-		if pr, ok := provider.Routes().LookupByBaseURL(route.BaseURL); ok && pr.Protocol == pathProtocol {
+		if pr, ok := provider.Routes().LookupByBaseURL(route.BaseURL); ok && pr.Protocol == requestedProtocol {
 			return true
 		}
 	}
 	return false
+}
+
+// selectTokenBinding resolves a multi-binding managed token before any route
+// field is consumed. The active client-route binding is authoritative when it
+// points at this VK; otherwise a unique requested-protocol candidate is safe.
+func (p *Proxy) selectTokenBinding(route *vkeys.ResolvedRoute, clientRoute, requestedProtocol string) (*vkeys.ResolvedRoute, error) {
+	if route == nil || len(route.Bindings) == 0 {
+		return route, nil
+	}
+	if p.activeReader != nil && clientRoute != "" {
+		if binding, err := p.activeReader.GetProviderBinding(clientRoute); err == nil && binding != nil &&
+			(binding.KeySourceType == "team" || binding.KeySourceType == "managed_virtual_key") &&
+			binding.KeySourceRef == route.VirtualKeyID {
+			for _, candidate := range route.Bindings {
+				if strings.EqualFold(candidate.ProviderCode, binding.ProviderCode) &&
+					(binding.ProtocolType == "" || strings.EqualFold(candidate.ProtocolType, binding.ProtocolType)) {
+					copy := *candidate
+					return &copy, nil
+				}
+			}
+		}
+	}
+	var candidates []*vkeys.ResolvedRoute
+	for _, candidate := range route.Bindings {
+		if requestedProtocol == "" || strings.EqualFold(candidate.ProtocolType, requestedProtocol) {
+			candidates = append(candidates, candidate)
+		}
+	}
+	if len(candidates) == 1 {
+		copy := *candidates[0]
+		return &copy, nil
+	}
+	return nil, fmt.Errorf("managed token has %d bindings for protocol %q; select an exact client-route binding with `aikey use`", len(candidates), requestedProtocol)
+}
+
+func requestProtocolFromPath(path string) string {
+	switch {
+	case strings.HasSuffix(path, "/messages"):
+		return "anthropic"
+	case strings.HasSuffix(path, "/responses"), strings.HasSuffix(path, "/chat/completions"):
+		return "openai_compatible"
+	default:
+		return ""
+	}
 }
 
 // extractProviderFromPath checks if path starts with a known provider prefix
@@ -181,11 +231,13 @@ func isProviderCompatible(route *vkeys.ResolvedRoute, canonicalCode string) bool
 // stripped path (e.g., "anthropic", "/v1/messages"). Returns ("", "") if no
 // prefix matched.
 func extractProviderFromPath(path string) (providerCode, strippedPath string) {
-	// List covers both canonical codes and common brand-name aliases that may
-	// appear in base URLs written by older CLI versions or non-normalised keys.
+	// This is a client-route list, not a Provider list. In particular `mock`
+	// must never become a URL/client namespace: Mock credentials enter through
+	// `/anthropic` or `/openai` according to their exact stored protocol.
+	// Aliases remain for old active.env files.
 	// 2026-05-08 Kimi 双平台拆分: 加 'kimi_code' 作为 path-prefix 候选。'kimi' 保留
 	// 作为 deprecated path-prefix(老 shell hook 已写到用户 env,不能断流)。
-	known := []string{"anthropic", "claude", "openai", "google", "kimi_code", "kimi", "deepseek", "moonshot"}
+	known := []string{"anthropic", "claude", "openai", "google", "kimi_code", "kimi", "deepseek", "moonshot", "groq", "xai", "openrouter", "perplexity", "zhipu", "qwen", "doubao", "siliconflow"}
 	for _, code := range known {
 		prefix := "/" + code
 		if strings.HasPrefix(path, prefix+"/") || path == prefix {
@@ -193,16 +245,6 @@ func extractProviderFromPath(path string) (providerCode, strippedPath string) {
 		}
 	}
 	return "", ""
-}
-
-// providerToProtocol maps a provider code (or brand alias) to its proxy protocol name.
-func providerToProtocol(providerCode string) string {
-	switch strings.ToLower(providerCode) {
-	case "anthropic", "claude":
-		return "anthropic"
-	default:
-		return "openai_compatible"
-	}
 }
 
 // providerDefaultBaseURL returns the default upstream base URL for a provider.
@@ -249,7 +291,7 @@ func codexUpstreamBaseURL() string {
 // It also needs deferred model capture (captureCodexModel returns a NEW request
 // carrying the model in context; the caller must use the returned request).
 // Every other provider's OAuth base == providerDefaultBaseURL and needs no setup.
-func resolveOAuthUpstream(canonicalCode string, r *http.Request) (baseURL string, req *http.Request) {
+func resolveOAuthUpstream(canonicalCode, protocolType string, r *http.Request) (baseURL string, req *http.Request) {
 	switch canonicalCode {
 	case "openai":
 		req = captureCodexModel(r)
@@ -270,6 +312,9 @@ func resolveOAuthUpstream(canonicalCode string, r *http.Request) (baseURL string
 		}
 		return codexUpstreamBaseURL(), req
 	default:
+		if protocolType != "" {
+			return providerBaseURLForProtocol(canonicalCode, protocolType), r
+		}
 		return providerDefaultBaseURL(canonicalCode), r
 	}
 }
@@ -334,8 +379,24 @@ func testOnlyBaseURLAllowed(raw string) bool {
 }
 
 func providerDefaultBaseURL(providerCode string) string {
-	switch strings.ToLower(providerCode) {
-	case "anthropic", "claude":
+	canonical := providerCanonicalCode(providerCode)
+	protocol, ok := provider.ProtocolFamily(canonical, "")
+	if !ok {
+		return ""
+	}
+	route, ok := provider.Routes().ByProviderProtocol(canonical, protocol)
+	if !ok {
+		return ""
+	}
+	// This legacy helper returns the root because its callers append an
+	// incoming path that already carries the version segment. Exact routing
+	// paths that need the effective endpoint use providerBaseURLForProtocol.
+	return route.BaseURL
+}
+
+func providerBaseURLForProtocol(providerCode, protocolType string) string {
+	canonical := providerCanonicalCode(providerCode)
+	if canonical == "anthropic" && protocolType == "anthropic" {
 		// Test-only hook (gated to loopback / .test): the cross-component
 		// OAuth-account routing E2E points the otherwise-hardcoded Anthropic
 		// upstream at a local mock. OAuth accounts carry no configurable base_url
@@ -345,57 +406,12 @@ func providerDefaultBaseURL(providerCode string) string {
 		if o := os.Getenv("AIKEY_PROXY_TEST_ANTHROPIC_BASE_URL"); testOnlyBaseURLAllowed(o) {
 			return o
 		}
-		return "https://api.anthropic.com"
-	case "openai", "gpt", "chatgpt", "codex":
-		// Why: OpenAI SDK clients (including Codex) treat base_url as already
-		// containing /v1, sending paths like /responses or /chat/completions
-		// without the /v1 prefix. Without /v1 here, requests hit wrong endpoints.
-		// Ref: bugfix/20260406-ux-feedback-p0-p1-fixes.md
-		return "https://api.openai.com/v1"
-	case "google", "gemini":
-		return "https://generativelanguage.googleapis.com"
-	case "kimi_code", "kimi":
-		// 2026-05-08 Kimi 双平台拆分:
-		//   - 'kimi_code' = canonical 新码 (Kimi Code 平台 https://api.kimi.com/coding)
-		//   - 'kimi'      = deprecated alias, mirrors kimi_code (vault 升级残留 / 手工
-		//                   构造数据兜底; provider_registry.yaml 同样把 'kimi' 留作 alias)
-		// Why no /v1: path-prefix routing strips "/kimi_code" / "/kimi" leaving
-		// "/v1/chat/completions". applyBaseURL prepends the base path, so /coding +
-		// /v1/... = /coding/v1/... If we used /coding/v1 here, it would become
-		// /coding/v1/v1/... (double v1).
-		return "https://api.kimi.com/coding"
-	case "moonshot":
-		// 2026-05-08 Kimi 双平台拆分: Moonshot 平台真实 upstream (api.moonshot.cn);
-		// pre-split 这里和 'kimi' 共用同一 case 错误地路由到 Kimi Code endpoint。
-		// Why no /v1: 同 kimi_code,path-prefix routing 已剥掉 /moonshot,留下 /v1/...
-		return "https://api.moonshot.cn"
-	case "deepseek":
-		// Why: same reason as openai — deepseek SDK expects /v1 in base_url.
-		return "https://api.deepseek.com/v1"
-
-	// ── P0 (2026-04-24) ── OpenAI-compatible Western providers ──
-	case "groq":
-		return "https://api.groq.com/openai/v1"
-	case "xai", "grok", "xai_grok":
-		return "https://api.x.ai/v1"
-	case "openrouter":
-		return "https://openrouter.ai/api/v1"
-	case "perplexity", "pplx":
-		return "https://api.perplexity.ai/v1"
-
-	// ── P1 (2026-04-24) ── China-market providers ──
-	case "zhipu", "glm", "zhipuai":
-		return "https://open.bigmodel.cn/api/paas/v4"
-	case "qwen", "dashscope", "tongyi":
-		return "https://dashscope.aliyuncs.com/compatible-mode/v1"
-	case "doubao", "ark", "volcengine":
-		return "https://ark.cn-beijing.volces.com/api/v3"
-	case "siliconflow":
-		return "https://api.siliconflow.cn/v1"
-
-	default:
+	}
+	route, ok := provider.Routes().ByProviderProtocol(canonical, protocolType)
+	if !ok {
 		return ""
 	}
+	return providerroutes.EffectiveUpstream(route)
 }
 
 // providerCanonicalCode maps a brand alias back to the canonical provider code
@@ -452,14 +468,14 @@ const HeaderAikeyErrorSource = "X-Aikey-Error-Source"
 // removes anything before the LLM; see §6 floor-invariant 6). They let a user
 // tell WHO produced an error without SSH-grepping every hop:
 //
-//   X-Aikey-Error-Origin: <component>.<code>  — the ORIGIN of the error.
-//       First-writer-wins: whoever GENERATES the error sets it; a component
-//       RELAYING a deeper error must NOT overwrite it (the deepest producer is
-//       the root cause, Java caused-by style). component ∈ {local-proxy,
-//       worker-proxy, oauth-ingress, upstream:<provider>}.
-//   X-Aikey-Error-Path: <component>              — the HOP CHAIN. Each aikey hop
-//       APPENDS itself (multi-value header) so the client sees the route the
-//       error traversed, e.g. "local-proxy, oauth-ingress".
+//	X-Aikey-Error-Origin: <component>.<code>  — the ORIGIN of the error.
+//	    First-writer-wins: whoever GENERATES the error sets it; a component
+//	    RELAYING a deeper error must NOT overwrite it (the deepest producer is
+//	    the root cause, Java caused-by style). component ∈ {local-proxy,
+//	    worker-proxy, oauth-ingress, upstream:<provider>}.
+//	X-Aikey-Error-Path: <component>              — the HOP CHAIN. Each aikey hop
+//	    APPENDS itself (multi-value header) so the client sees the route the
+//	    error traversed, e.g. "local-proxy, oauth-ingress".
 const (
 	HeaderAikeyErrorOrigin = "X-Aikey-Error-Origin"
 	HeaderAikeyErrorPath   = "X-Aikey-Error-Path"

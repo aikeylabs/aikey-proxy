@@ -105,7 +105,7 @@ func TestSave_GeneratesRouteTokenOnFirstSave(t *testing.T) {
 	}
 }
 
-// TestSave_PreservesRouteTokenOnResave covers the `INSERT OR REPLACE`
+// TestSave_PreservesRouteTokenOnResave covers the old `INSERT OR REPLACE`
 // rowscape issue: re-saving the same account_id (broker re-sync, status
 // update, display rename, etc) must NOT regenerate route_token.
 // Otherwise existing clients holding the bearer would suddenly 401.
@@ -178,6 +178,68 @@ func TestSave_PreservesExternallySeededRouteToken(t *testing.T) {
 	tok := selectRouteToken(t, store, acct.ProviderAccountID)
 	if tok.String != preExistingToken {
 		t.Fatalf("pre-existing route_token must be preserved across broker Save;\n  expected: %s\n  got:      %s", preExistingToken, tok.String)
+	}
+}
+
+func TestSave_PersistsIndependentMockProviderAndProtocol(t *testing.T) {
+	store := newTestAccountStore(t)
+	if _, err := store.db.Exec(
+		"ALTER TABLE provider_accounts ADD COLUMN protocol_type TEXT NOT NULL DEFAULT ''",
+	); err != nil {
+		t.Fatalf("add protocol_type: %v", err)
+	}
+	acct := sampleAccount()
+	acct.Provider = "mock"
+	acct.ProtocolType = "anthropic"
+
+	if err := store.Save(context.Background(), acct); err != nil {
+		t.Fatalf("Save: %v", err)
+	}
+
+	var providerCode, protocolType string
+	if err := store.db.QueryRow(
+		"SELECT provider, protocol_type FROM provider_accounts WHERE provider_account_id = ?",
+		acct.ProviderAccountID,
+	).Scan(&providerCode, &protocolType); err != nil {
+		t.Fatalf("read provider axes: %v", err)
+	}
+	if providerCode != "mock" || protocolType != "anthropic" {
+		t.Fatalf("axes=(%q,%q), want provider=mock protocol=anthropic", providerCode, protocolType)
+	}
+	got, err := store.GetByID(context.Background(), acct.ProviderAccountID)
+	if err != nil || got == nil {
+		t.Fatalf("GetByID: account=%+v err=%v", got, err)
+	}
+	if got.Provider != "mock" || got.ProtocolType != "anthropic" {
+		t.Fatalf("read model collapsed axes: %+v", got)
+	}
+}
+
+func TestSave_UpsertPreservesUsageState(t *testing.T) {
+	store := newTestAccountStore(t)
+	acct := sampleAccount()
+	if err := store.Save(context.Background(), acct); err != nil {
+		t.Fatalf("first Save: %v", err)
+	}
+	if _, err := store.db.Exec(
+		"UPDATE provider_accounts SET use_count=9 WHERE provider_account_id=?",
+		acct.ProviderAccountID,
+	); err != nil {
+		t.Fatalf("seed use_count: %v", err)
+	}
+	acct.DisplayIdentity = "fresh@example.com"
+	if err := store.Save(context.Background(), acct); err != nil {
+		t.Fatalf("second Save: %v", err)
+	}
+	var useCount int
+	if err := store.db.QueryRow(
+		"SELECT use_count FROM provider_accounts WHERE provider_account_id=?",
+		acct.ProviderAccountID,
+	).Scan(&useCount); err != nil {
+		t.Fatalf("read use_count: %v", err)
+	}
+	if useCount != 9 {
+		t.Fatalf("use_count=%d, broker metadata refresh must not reset local usage state", useCount)
 	}
 }
 

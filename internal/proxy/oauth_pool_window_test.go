@@ -61,6 +61,55 @@ func TestWindowPreCutDecision(t *testing.T) {
 	}
 }
 
+func TestSuccessfulWindowPreCutDecision_IgnoresExhaustion429(t *testing.T) {
+	now := time.Unix(1_750_000_000, 0)
+	reset := strconv.FormatInt(now.Add(time.Hour).Unix(), 10)
+	h := hdr(map[string]string{
+		hdrUtil5h:  "1.0",
+		hdrReset5h: reset,
+	})
+
+	if _, ok := successfulWindowPreCutDecision(resp(http.StatusTooManyRequests, h), 95, now); ok {
+		t.Fatal("exhaustion 429 is reactive cooldown evidence, not a successful pre-cut")
+	}
+	until, ok := successfulWindowPreCutDecision(resp(http.StatusOK, h), 95, now)
+	if !ok || until.Unix() != now.Add(time.Hour).Unix() {
+		t.Fatalf("successful 100%% utilization must still pre-cut until reset, got until=%v ok=%v", until, ok)
+	}
+}
+
+func TestDualWindowPreCutDecision_UsesIndependentCapsAndResets(t *testing.T) {
+	now := time.Unix(1_750_000_000, 0)
+	reset5h := now.Add(2 * time.Hour)
+	reset7d := now.Add(5 * 24 * time.Hour)
+	h := hdr(map[string]string{
+		hdrUtil5h:  "0.92", // below 5h line 93
+		hdrUtil7d:  "0.88", // reaches weekly line 88
+		hdrReset5h: strconv.FormatInt(reset5h.Unix(), 10),
+		hdrReset7d: strconv.FormatInt(reset7d.Unix(), 10),
+	})
+	until, ok := dualWindowPreCutDecision(h, poolWindowCaps{FiveHour: 93, SevenDay: 88}, now)
+	if !ok || !until.Equal(reset7d) {
+		t.Fatalf("weekly-only hit must use weekly reset: until=%v ok=%v", until, ok)
+	}
+	if _, ok := dualWindowPreCutDecision(h, poolWindowCaps{FiveHour: 93, SevenDay: 89}, now); ok {
+		t.Fatal("both windows below their own lines must keep serving")
+	}
+}
+
+func TestDualWindowPreCutDecision_UnifiedResetCannotReleaseWeekly(t *testing.T) {
+	now := time.Unix(1_750_000_000, 0)
+	shortReset := now.Add(time.Hour)
+	h := hdr(map[string]string{
+		hdrUtil7d: "0.88",
+		hdrReset:  strconv.FormatInt(shortReset.Unix(), 10),
+	})
+	until, ok := dualWindowPreCutDecision(h, poolWindowCaps{FiveHour: 93, SevenDay: 88}, now)
+	if !ok || !until.Equal(now.Add(7*24*time.Hour)) {
+		t.Fatalf("ambiguous unified reset must not short-release weekly protection: until=%v ok=%v", until, ok)
+	}
+}
+
 func TestParseUtil(t *testing.T) {
 	if _, ok := parseUtil(hdr(nil), hdrUtil5h); ok {
 		t.Fatal("missing header → not present")

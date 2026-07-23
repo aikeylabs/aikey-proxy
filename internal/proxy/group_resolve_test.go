@@ -289,6 +289,35 @@ func TestResolveGroup_SkipSetAdvances(t *testing.T) {
 	}
 }
 
+func TestResolveGroup_RuntimeBaseURLOverridesStaticCandidate(t *testing.T) {
+	key := grKey()
+	refs := []vkeys.GroupAccountRef{{
+		AccountID: "acc-mock", ProviderCode: "mock", ProtocolType: "anthropic",
+		BaseURL: "http://127.0.0.1:3000/mock-provider/anthropic",
+	}}
+	mat := map[string]vkeys.GroupRuntimeAccount{
+		"acc-mock": encMat(t, key, vkeys.GroupRuntimeAccount{
+			CredentialType: "oauth_account",
+			ProviderCode:   "mock",
+			ProtocolType:   "anthropic",
+			BaseURL:        "http://host.docker.internal:3000/mock-provider/anthropic",
+			ExternalID:     "mock-external-id",
+			ExpiresAt:      9_000_000_000,
+		}, "mock-token"),
+	}
+	route := &vkeys.ResolvedRoute{
+		SeatID: "seat-1", GroupAccounts: mustJSON(t, refs), GroupRuntime: mustJSON(t, mat),
+	}
+
+	res, err := resolveGroupCredential(route, key, 1_000_000, nil, "")
+	if err != nil {
+		t.Fatalf("resolve: %v", err)
+	}
+	if res.BaseURL != "http://host.docker.internal:3000/mock-provider/anthropic" {
+		t.Fatalf("base URL=%q, want consumer-specific runtime rail", res.BaseURL)
+	}
+}
+
 func TestResolveGroup_ErrorCodes(t *testing.T) {
 	key := grKey()
 	refs := []vkeys.GroupAccountRef{{AccountID: "acc-a", ProviderCode: "anthropic"}}

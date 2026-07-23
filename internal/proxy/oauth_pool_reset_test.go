@@ -10,28 +10,47 @@ func TestPoolResetStore_RecordKeepsMaxAndSnapshotIsCopy(t *testing.T) {
 	if s.snapshot() != nil {
 		t.Fatal("empty store must snapshot nil")
 	}
-	s.record("acc-1", 100)
-	s.record("acc-1", 50)  // older → ignored (monotonic: resets only advance)
-	s.record("acc-1", 200) // newer → kept
-	s.record("acc-2", 300)
-	s.record("", 999)    // empty id → ignored
-	s.record("acc-x", 0) // non-positive → ignored
+	s.record("acc-1", ObservedWindowResets{FiveHour: 100, SevenDay: 1000})
+	s.record("acc-1", ObservedWindowResets{FiveHour: 50, SevenDay: 500})  // older → ignored independently
+	s.record("acc-1", ObservedWindowResets{FiveHour: 200, SevenDay: 900}) // only 5h advances
+	s.record("acc-2", ObservedWindowResets{FiveHour: 300})
+	s.record("", ObservedWindowResets{FiveHour: 999}) // empty id → ignored
+	s.record("acc-x", ObservedWindowResets{})         // non-positive → ignored
 
 	snap := s.snapshot()
-	if snap["acc-1"] != 200 {
-		t.Fatalf("acc-1=%d want 200 (max kept, stale 50 ignored)", snap["acc-1"])
+	if snap["acc-1"] != (ObservedWindowResets{FiveHour: 200, SevenDay: 1000}) {
+		t.Fatalf("acc-1=%+v want independent maxima", snap["acc-1"])
 	}
-	if snap["acc-2"] != 300 {
-		t.Fatalf("acc-2=%d want 300", snap["acc-2"])
+	if snap["acc-2"].FiveHour != 300 {
+		t.Fatalf("acc-2=%+v want 5h=300", snap["acc-2"])
 	}
 	if len(snap) != 2 {
 		t.Fatalf("snapshot size=%d want 2 (empty id + zero epoch dropped)", len(snap))
 	}
 
 	// snapshot is a copy — mutating it must not affect the store.
-	snap["acc-1"] = 1
-	if s.snapshot()["acc-1"] != 200 {
+	snap["acc-1"] = ObservedWindowResets{FiveHour: 1}
+	if s.snapshot()["acc-1"].FiveHour != 200 {
 		t.Fatal("snapshot must be a defensive copy")
+	}
+}
+
+func TestObservedWindowResetEpochsAreIndependent(t *testing.T) {
+	h := http.Header{}
+	h.Set(hdrReset5h, "1750000500")
+	h.Set(hdrReset7d, "1750600000")
+	got, ok := observedWindowResetEpochs(h)
+	if !ok || got.FiveHour != 1750000500 || got.SevenDay != 1750600000 {
+		t.Fatalf("got=%+v ok=%v", got, ok)
+	}
+}
+
+func TestObservedWindowResetEpochs_UnifiedCannotAdvanceWeekly(t *testing.T) {
+	h := http.Header{}
+	h.Set(hdrReset, "1750000000")
+	got, ok := observedWindowResetEpochs(h)
+	if !ok || got.FiveHour != 1750000000 || got.SevenDay != 0 {
+		t.Fatalf("ambiguous unified reset must remain 5h-only: got=%+v ok=%v", got, ok)
 	}
 }
 

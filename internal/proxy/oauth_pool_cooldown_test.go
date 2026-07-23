@@ -3,6 +3,7 @@ package proxy
 import (
 	"net/http"
 	"strconv"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -90,6 +91,29 @@ func TestCooldownDecision_Classification(t *testing.T) {
 	}
 }
 
+func TestCooldownRouteState_WindowExhaustedCarriesProviderReset(t *testing.T) {
+	now := time.Unix(1_750_000_000, 0)
+	resetAt := now.Add(3 * time.Hour)
+	h := http.Header{
+		"Anthropic-Ratelimit-Unified-Status":         {"exceeded"},
+		"Anthropic-Ratelimit-Unified-5h-Utilization": {"1.0"},
+		"Anthropic-Ratelimit-Unified-5h-Reset":       {strconv.FormatInt(resetAt.Unix(), 10)},
+	}
+	// Routing caps the local cooldown to one hour, while the display must still
+	// name the provider's actual three-hour window boundary.
+	state := cooldownRouteState(resp(http.StatusTooManyRequests, h), now, now.Add(poolCooldownMax))
+	if state.Status != poolRouteWindowExhausted || state.RetryAt != resetAt.Unix() {
+		t.Fatalf("window state = %+v, want exhausted reset=%d", state, resetAt.Unix())
+	}
+
+	transient := cooldownRouteState(
+		resp(http.StatusTooManyRequests, http.Header{"Retry-After": {"30"}}),
+		now, now.Add(30*time.Second))
+	if transient.Status != poolRouteRateLimited || transient.RetryAt != now.Add(30*time.Second).Unix() {
+		t.Fatalf("transient 429 must not masquerade as exhausted: %+v", transient)
+	}
+}
+
 // P0-B fence (2026-07-19): generic 5xx / transport failures cool an account only
 // after CONSECUTIVE repeats; any success resets the streak; a literally-built
 // store (nil streak map) stays safe.
@@ -140,10 +164,10 @@ func TestCooldownDecision_CodexRateLimit(t *testing.T) {
 	// even though there is NO Retry-After and NO *ratelimit* header (only x-codex-*).
 	// The other window is below 100% so it does not gate.
 	sec := http.Header{
-		"X-Codex-Secondary-Used-Percent":       {"100"},
+		"X-Codex-Secondary-Used-Percent":        {"100"},
 		"X-Codex-Secondary-Reset-After-Seconds": {"300"},
-		"X-Codex-Primary-Used-Percent":         {"40"},
-		"X-Codex-Primary-Reset-After-Seconds":  {"600000"},
+		"X-Codex-Primary-Used-Percent":          {"40"},
+		"X-Codex-Primary-Reset-After-Seconds":   {"600000"},
 	}
 	if until, ok := cooldownDecision(resp(429, sec), now); !ok || until != now.Add(300*time.Second) {
 		t.Fatalf("codex one-window-exhausted 429 must cool for that window's reset (300s), got until=%v ok=%v", until, ok)
@@ -151,9 +175,9 @@ func TestCooldownDecision_CodexRateLimit(t *testing.T) {
 
 	// Both windows exhausted, LONGER reset is on PRIMARY → cool for the longer wall.
 	wk := http.Header{
-		"X-Codex-Primary-Used-Percent":         {"100"},
-		"X-Codex-Primary-Reset-After-Seconds":  {"3600"},
-		"X-Codex-Secondary-Used-Percent":       {"100"},
+		"X-Codex-Primary-Used-Percent":          {"100"},
+		"X-Codex-Primary-Reset-After-Seconds":   {"3600"},
+		"X-Codex-Secondary-Used-Percent":        {"100"},
 		"X-Codex-Secondary-Reset-After-Seconds": {"120"},
 	}
 	if until, ok := cooldownDecision(resp(429, wk), now); !ok || until != now.Add(3600*time.Second) {
@@ -166,9 +190,9 @@ func TestCooldownDecision_CodexRateLimit(t *testing.T) {
 	// the shorter wall → re-429. Must cool for the longer reset (1800s) regardless
 	// of which window is named primary/secondary.
 	bugBothExhaustedLongerSecondary := http.Header{
-		"X-Codex-Primary-Used-Percent":         {"100"},
-		"X-Codex-Primary-Reset-After-Seconds":  {"120"}, // 5h — shorter
-		"X-Codex-Secondary-Used-Percent":       {"100"},
+		"X-Codex-Primary-Used-Percent":          {"100"},
+		"X-Codex-Primary-Reset-After-Seconds":   {"120"}, // 5h — shorter
+		"X-Codex-Secondary-Used-Percent":        {"100"},
 		"X-Codex-Secondary-Reset-After-Seconds": {"1800"}, // 7d — longer, MUST win
 	}
 	if until, ok := cooldownDecision(resp(429, bugBothExhaustedLongerSecondary), now); !ok || until != now.Add(1800*time.Second) {
@@ -177,9 +201,9 @@ func TestCooldownDecision_CodexRateLimit(t *testing.T) {
 
 	// 429 but neither window at 100% → cool for the larger visible reset.
 	partial := http.Header{
-		"X-Codex-Primary-Used-Percent":         {"80"},
-		"X-Codex-Primary-Reset-After-Seconds":  {"200"},
-		"X-Codex-Secondary-Used-Percent":       {"90"},
+		"X-Codex-Primary-Used-Percent":          {"80"},
+		"X-Codex-Primary-Reset-After-Seconds":   {"200"},
+		"X-Codex-Secondary-Used-Percent":        {"90"},
 		"X-Codex-Secondary-Reset-After-Seconds": {"50"},
 	}
 	if until, ok := cooldownDecision(resp(429, partial), now); !ok || until != now.Add(200*time.Second) {
@@ -241,5 +265,54 @@ func TestPoolCooldownStore_MarkAndExpire(t *testing.T) {
 	}
 	if len(s.m) != 0 {
 		t.Fatalf("lapsed entry must be pruned, map still has %d", len(s.m))
+	}
+}
+
+// Regression fence (2026-07-22): current_routed already used the same
+// cooldown-aware picker as the hot path, but the display stamp stayed stale
+// because a cooldown mutation never woke the supervisor. The hook is about
+// WHOLE-ACCOUNT skip-set membership, not timestamps: entering and expiring
+// notify; extending an active cooldown and model-tier-only cooldowns do not.
+func TestPoolCooldownStore_AccountSetChangeHook(t *testing.T) {
+	t.Setenv("AIKEY_RUN_DIR", t.TempDir())
+	now := time.Unix(1_750_000_000, 0)
+	s := &poolCooldownStore{
+		m:               map[string]time.Time{},
+		tierM:           map[string]time.Time{},
+		serverErrStreak: map[string]int{},
+		now:             func() time.Time { return now },
+	}
+	var calls atomic.Int32
+	s.setAccountSetChangedHook(func() { calls.Add(1) })
+
+	s.mark("acc-a", now.Add(5*time.Minute))
+	if got := calls.Load(); got != 1 {
+		t.Fatalf("entering cooldown must notify once, got %d", got)
+	}
+	// Neither a shorter no-op nor a longer extension changes skip membership.
+	s.mark("acc-a", now.Add(time.Minute))
+	s.mark("acc-a", now.Add(10*time.Minute))
+	s.mark("acc-past", now.Add(-time.Second))
+	if got := calls.Load(); got != 1 {
+		t.Fatalf("cooldown timestamp updates must not restamp, got %d notifications", got)
+	}
+	// A tier-specific cool affects only some models and cannot be projected into
+	// the model-agnostic current_routed boolean.
+	s.markTier("acc-a", "premium", now.Add(time.Hour))
+	if got := calls.Load(); got != 1 {
+		t.Fatalf("tier cooldown must not notify current_routed, got %d", got)
+	}
+
+	now = now.Add(11 * time.Minute)
+	_ = s.skipSet() // lazy expiry is the membership-removal edge
+	if got := calls.Load(); got != 2 {
+		t.Fatalf("cooldown expiry must notify once, got %d", got)
+	}
+
+	for i := 0; i < serverErrStreakThreshold; i++ {
+		_, _ = s.noteServerError("acc-b")
+	}
+	if got := calls.Load(); got != 3 {
+		t.Fatalf("5xx streak entering cooldown must notify once, got %d", got)
 	}
 }

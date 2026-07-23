@@ -103,6 +103,25 @@ func TestExtractProviderFromPath_KimiDeprecatedPathStillWorks(t *testing.T) {
 	}
 }
 
+func TestExtractProviderFromPath_MockProviderHasNoClientNamespace(t *testing.T) {
+	tests := []struct {
+		name string
+		path string
+	}{
+		{name: "anthropic-shaped", path: "/mock/v1/messages"},
+		{name: "codex-shaped", path: "/mock/responses"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			provider, stripped := extractProviderFromPath(tt.path)
+			if provider != "" || stripped != "" {
+				t.Fatalf("extractProviderFromPath(%q) = (%q,%q), Mock must route through anthropic/openai", tt.path, provider, stripped)
+			}
+		})
+	}
+}
+
 // ─────────────────────────────────────────────────────────────────────────
 // Legacy /v1 adapter-fallback regression tests (split E2E Case 7c true coverage).
 //

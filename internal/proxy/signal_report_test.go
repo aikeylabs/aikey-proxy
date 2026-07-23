@@ -53,15 +53,15 @@ func TestParseUnifiedUtil5h(t *testing.T) {
 func TestEnqueueNilAndEmptyAreSafe(t *testing.T) {
 	// nil receiver guard: feature-off reporter must not panic.
 	var nilR *signalReporter
-	nilR.enqueue("c1", 100, 0.5, 0) // must not panic
+	nilR.enqueue("c1", 100, 0.5, nil) // must not panic
 
 	// empty credentialID is dropped — observable via the buffered channel.
 	r := &signalReporter{in: make(chan signalSample, 4)}
-	r.enqueue("", 100, 0.5, 0)
+	r.enqueue("", 100, 0.5, nil)
 	if len(r.in) != 0 {
 		t.Fatalf("empty credentialID should be dropped, buffered = %d", len(r.in))
 	}
-	r.enqueue("c1", 100, 0.5, 0)
+	r.enqueue("c1", 100, 0.5, nil)
 	if len(r.in) != 1 {
 		t.Fatalf("valid sample should be queued, buffered = %d", len(r.in))
 	}
@@ -390,7 +390,8 @@ func TestParseUnifiedUtil7d(t *testing.T) {
 
 func TestSignalSampleUtil7dSerialization(t *testing.T) {
 	// both readings present → both serialize, util_7d after util_5h.
-	both, _ := json.Marshal(signalSample{CredentialID: "c1", TS: 100, Util5h: 0.6, Util7d: 0.4})
+	u7d := 0.4
+	both, _ := json.Marshal(signalSample{CredentialID: "c1", TS: 100, Util5h: 0.6, Util7d: &u7d})
 	if want := `{"credential_id":"c1","ts":100,"util_5h":0.6,"util_7d":0.4}`; string(both) != want {
 		t.Fatalf("both = %s, want %s", both, want)
 	}
@@ -492,8 +493,9 @@ func TestSignalPostSendsConcurrency(t *testing.T) {
 
 	// mixed all-four batch: samples (with util_7d) + revoked + rate_limits +
 	// concurrency all serialize.
+	u7d := 0.4
 	r.post(
-		[]signalSample{{CredentialID: "c1", TS: 100, Util5h: 0.6, Util7d: 0.4}},
+		[]signalSample{{CredentialID: "c1", TS: 100, Util5h: 0.6, Util7d: &u7d}},
 		[]revokedSample{{CredentialID: "c2", Reason: "revoked"}},
 		[]rateLimitSample{{CredentialID: "c3", Count: 5, WindowSecs: 30}},
 		[]concurrencySample{{CredentialID: "c4", Peak: 2}})
@@ -507,7 +509,8 @@ func TestSignalPostSendsConcurrency(t *testing.T) {
 	if err := json.Unmarshal(body, &decoded); err != nil {
 		t.Fatalf("body not valid JSON: %v (raw %s)", err, body)
 	}
-	if len(decoded.Samples) != 1 || decoded.Samples[0] != (signalSample{CredentialID: "c1", TS: 100, Util5h: 0.6, Util7d: 0.4}) {
+	if len(decoded.Samples) != 1 || decoded.Samples[0].CredentialID != "c1" || decoded.Samples[0].TS != 100 ||
+		decoded.Samples[0].Util5h != 0.6 || decoded.Samples[0].Util7d == nil || *decoded.Samples[0].Util7d != 0.4 {
 		t.Fatalf("decoded samples = %+v, want one {c1,100,0.6,0.4}", decoded.Samples)
 	}
 	if len(decoded.Revoked) != 1 || decoded.Revoked[0] != (revokedSample{CredentialID: "c2", Reason: "revoked"}) {

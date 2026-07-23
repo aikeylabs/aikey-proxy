@@ -13,6 +13,13 @@ package proxy
 
 import "sync"
 
+// ObservedWindowResets is the independent reset observation sent to master.
+// The JSON keys are part of the rolling-compatible Path-Z header contract.
+type ObservedWindowResets struct {
+	FiveHour int64 `json:"5h,omitempty"`
+	SevenDay int64 `json:"7d,omitempty"`
+}
+
 // poolResetStore holds the latest observed upstream window-reset epoch per pool
 // account. Concurrency-safe. Monotonic per account (resets only advance across
 // windows; a stale/smaller value never overwrites), so master's
@@ -20,35 +27,40 @@ import "sync"
 // every pull triggers at most one re-roll.
 type poolResetStore struct {
 	mu sync.Mutex
-	m  map[string]int64 // accountID → latest observed unified-reset epoch (seconds)
+	m  map[string]ObservedWindowResets
 }
 
 func newPoolResetStore() *poolResetStore {
-	return &poolResetStore{m: make(map[string]int64)}
+	return &poolResetStore{m: make(map[string]ObservedWindowResets)}
 }
 
 // record stores the account's observed reset epoch, keeping the max. No-op for
 // an empty id or a non-positive epoch.
-func (s *poolResetStore) record(accountID string, resetEpoch int64) {
-	if accountID == "" || resetEpoch <= 0 {
+func (s *poolResetStore) record(accountID string, observed ObservedWindowResets) {
+	if accountID == "" || (observed.FiveHour <= 0 && observed.SevenDay <= 0) {
 		return
 	}
 	s.mu.Lock()
-	if resetEpoch > s.m[accountID] {
-		s.m[accountID] = resetEpoch
+	current := s.m[accountID]
+	if observed.FiveHour > current.FiveHour {
+		current.FiveHour = observed.FiveHour
 	}
+	if observed.SevenDay > current.SevenDay {
+		current.SevenDay = observed.SevenDay
+	}
+	s.m[accountID] = current
 	s.mu.Unlock()
 }
 
 // snapshot returns a copy of the per-account observed resets for the pull to
 // piggyback. Returns nil when empty (so the pull omits the header).
-func (s *poolResetStore) snapshot() map[string]int64 {
+func (s *poolResetStore) snapshot() map[string]ObservedWindowResets {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if len(s.m) == 0 {
 		return nil
 	}
-	out := make(map[string]int64, len(s.m))
+	out := make(map[string]ObservedWindowResets, len(s.m))
 	for k, v := range s.m {
 		out[k] = v
 	}

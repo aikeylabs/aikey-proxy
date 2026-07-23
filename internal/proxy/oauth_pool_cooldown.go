@@ -63,15 +63,38 @@ const (
 	// restart legitimately starts a fresh streak).
 	serverErrStreakThreshold = 3
 	serverErrCooldown        = 60 * time.Second
+
+	poolRouteWindowExhausted     = "window_exhausted"
+	poolRouteWindowProtected     = "window_protected"
+	poolRouteRateLimited         = "rate_limited"
+	poolRouteAuthFailed          = "auth_failed"
+	poolRouteUpstreamUnavailable = "upstream_unavailable"
 )
+
+// PoolAccountRouteState is the display-safe projection of one whole-account
+// cooldown. The cooldown store remains the routing truth; this value only lets
+// the local vault explain why an account was skipped and when it is expected to
+// recover. RetryAt is unix seconds. Tier-only cooldowns are intentionally absent.
+type PoolAccountRouteState struct {
+	Status  string `json:"status"`
+	RetryAt int64  `json:"retry_at,omitempty"`
+}
 
 // poolCooldownStore holds a per-account "avoid until" time. Concurrency-safe.
 // Bounded by the number of distinct pool accounts; lapsed entries are dropped
 // lazily on read.
 type poolCooldownStore struct {
-	mu  sync.Mutex
-	m   map[string]time.Time // accountID → avoid-until (whole account)
-	now func() time.Time     // injectable clock (tests)
+	mu   sync.Mutex
+	m    map[string]time.Time             // accountID → avoid-until (whole account)
+	meta map[string]PoolAccountRouteState // accountID → display reason/recovery
+	now  func() time.Time                 // injectable clock (tests)
+	// onAccountSetChanged is a best-effort notification that the WHOLE-ACCOUNT
+	// skip-set membership changed (enter cooldown or expire). The callback must be
+	// non-blocking: mark() runs on the request hot path. It is copied under mu and
+	// invoked after unlock so a consumer may safely call skipSet() while recomputing
+	// the current_routed display projection. Tier-only cooldowns deliberately do not
+	// notify because current_routed has no model dimension.
+	onAccountSetChanged func()
 	// serverErrStreak counts CONSECUTIVE 5xx/transport failures per account
 	// (P0-B); reset by any success. Deliberately NOT persisted — a streak is a
 	// live-liveness observation, not durable state.
@@ -87,7 +110,7 @@ func tierCooldownKey(accountID, tierKey string) string { return accountID + "|" 
 
 func newPoolCooldownStore() *poolCooldownStore {
 	s := &poolCooldownStore{m: make(map[string]time.Time), now: time.Now,
-		serverErrStreak: make(map[string]int), tierM: make(map[string]time.Time)}
+		meta: make(map[string]PoolAccountRouteState), serverErrStreak: make(map[string]int), tierM: make(map[string]time.Time)}
 	// Cross-restart persistence (2026-07-04 self-heal, §S4): without it a proxy
 	// restart forgot every cooldown and could immediately route traffic back
 	// onto an account that just 401'd / rate-limited. STRICTLY an enhancement,
@@ -95,6 +118,14 @@ func newPoolCooldownStore() *poolCooldownStore {
 	// falls back to an empty store and the main link proceeds untouched.
 	s.hydrateFromFile()
 	return s
+}
+
+// setAccountSetChangedHook installs the display-projection wake-up hook. The
+// store owns only the cooldown truth; it does not perform vault I/O itself.
+func (s *poolCooldownStore) setAccountSetChangedHook(hook func()) {
+	s.mu.Lock()
+	s.onAccountSetChanged = hook
+	s.mu.Unlock()
 }
 
 // ── cross-restart persistence (bypass state file, §S4 2026-07-04) ───────────
@@ -115,6 +146,10 @@ type poolCooldownFileBody struct {
 	// restart matters even more than for the short account-level cools).
 	// Additive field: older proxies ignore it, older files parse without it.
 	TierAccounts map[string]int64 `json:"tier_accounts,omitempty"`
+	// AccountStates is additive metadata for the user-facing runtime projection.
+	// The authoritative avoid-until remains Accounts; old files without this map
+	// continue to route correctly and simply render no explanatory status.
+	AccountStates map[string]PoolAccountRouteState `json:"account_states,omitempty"`
 }
 
 func poolCooldownPath() (string, error) {
@@ -150,6 +185,12 @@ func (s *poolCooldownStore) hydrateFromFile() {
 		until := time.Unix(untilUnix, 0)
 		if id != "" && now.Before(until) {
 			s.m[id] = until
+			if state, ok := body.AccountStates[id]; ok && state.Status != "" {
+				if s.meta == nil {
+					s.meta = make(map[string]PoolAccountRouteState)
+				}
+				s.meta[id] = state
+			}
 			loaded++
 		}
 	}
@@ -201,7 +242,13 @@ func (s *poolCooldownStore) persistLocked() {
 		if mkErr := os.MkdirAll(filepath.Dir(path), 0o700); mkErr != nil {
 			return mkErr
 		}
-		data, mErr := json.Marshal(poolCooldownFileBody{Accounts: accounts, TierAccounts: tierAccounts, WrittenAt: time.Now().UnixMilli()})
+		states := make(map[string]PoolAccountRouteState, len(accounts))
+		for id := range accounts {
+			if state, ok := s.meta[id]; ok && state.Status != "" {
+				states[id] = state
+			}
+		}
+		data, mErr := json.Marshal(poolCooldownFileBody{Accounts: accounts, AccountStates: states, TierAccounts: tierAccounts, WrittenAt: time.Now().UnixMilli()})
 		if mErr != nil {
 			return mErr
 		}
@@ -226,19 +273,31 @@ func (s *poolCooldownStore) noteServerError(accountID string) (time.Time, bool) 
 		return time.Time{}, false
 	}
 	s.mu.Lock()
-	defer s.mu.Unlock()
 	if s.serverErrStreak == nil { // tests build the store literally; stay nil-safe
 		s.serverErrStreak = make(map[string]int)
 	}
 	s.serverErrStreak[accountID]++
 	if s.serverErrStreak[accountID] < serverErrStreakThreshold {
+		s.mu.Unlock()
 		return time.Time{}, false
 	}
 	delete(s.serverErrStreak, accountID)
-	until := s.now().Add(serverErrCooldown)
-	if cur, ok := s.m[accountID]; !ok || until.After(cur) {
+	now := s.now()
+	until := now.Add(serverErrCooldown)
+	cur, existed := s.m[accountID]
+	wasCooling := existed && now.Before(cur)
+	if !existed || until.After(cur) {
 		s.m[accountID] = until
+		if s.meta == nil {
+			s.meta = make(map[string]PoolAccountRouteState)
+		}
+		s.meta[accountID] = PoolAccountRouteState{Status: poolRouteUpstreamUnavailable, RetryAt: until.Unix()}
 		s.persistLocked()
+	}
+	hook := s.onAccountSetChanged
+	s.mu.Unlock()
+	if !wasCooling && hook != nil {
+		hook()
 	}
 	return until, true
 }
@@ -256,18 +315,50 @@ func (s *poolCooldownStore) noteSuccess(accountID string) {
 	s.mu.Unlock()
 }
 
-// mark cools an account down until `until`. A no-op for an empty id or a time
-// already in the past.
+// mark keeps the historical generic entry point used by tests and callers that
+// have no display classification. Routing behavior is identical; existing
+// explanatory metadata, if any, is preserved.
 func (s *poolCooldownStore) mark(accountID string, until time.Time) {
+	s.markWithState(accountID, until, PoolAccountRouteState{})
+}
+
+// markWithState cools an account and records why the whole account is being
+// skipped. A metadata-only change also wakes the projection even when the
+// account was already cooling, so a transient limit that becomes confirmed
+// window exhaustion is reflected without waiting for the next material pull.
+func (s *poolCooldownStore) markWithState(accountID string, until time.Time, state PoolAccountRouteState) {
 	if accountID == "" {
 		return
 	}
 	s.mu.Lock()
-	if cur, ok := s.m[accountID]; !ok || until.After(cur) {
+	now := s.now()
+	if !until.After(now) {
+		s.mu.Unlock()
+		return
+	}
+	cur, existed := s.m[accountID]
+	wasCooling := existed && now.Before(cur)
+	metaChanged := false
+	if !existed || until.After(cur) {
 		s.m[accountID] = until
+	}
+	if state.Status != "" {
+		if s.meta == nil {
+			s.meta = make(map[string]PoolAccountRouteState)
+		}
+		if prior, ok := s.meta[accountID]; !ok || prior != state {
+			s.meta[accountID] = state
+			metaChanged = true
+		}
+	}
+	if !existed || until.After(cur) || metaChanged {
 		s.persistLocked()
 	}
+	hook := s.onAccountSetChanged
 	s.mu.Unlock()
+	if (!wasCooling || metaChanged) && hook != nil {
+		hook()
+	}
 }
 
 // skipSet returns the accounts currently cooling down, for the resolver's `skip`
@@ -275,9 +366,9 @@ func (s *poolCooldownStore) mark(accountID string, until time.Time) {
 // (so the resolver's `skip[id]` lookups stay cheap).
 func (s *poolCooldownStore) skipSet() map[string]bool {
 	s.mu.Lock()
-	defer s.mu.Unlock()
 	now := s.now()
 	var out map[string]bool
+	pruned := false
 	for id, until := range s.m {
 		if now.Before(until) {
 			if out == nil {
@@ -286,7 +377,43 @@ func (s *poolCooldownStore) skipSet() map[string]bool {
 			out[id] = true
 		} else {
 			delete(s.m, id)
+			delete(s.meta, id)
+			pruned = true
 		}
+	}
+	hook := s.onAccountSetChanged
+	s.mu.Unlock()
+	if pruned && hook != nil {
+		hook()
+	}
+	return out
+}
+
+// routeStateSnapshot returns the active whole-account display states. It uses
+// the same expiry test as skipSet, so the UI cannot claim an account is still
+// exhausted after routing has admitted it again. The returned map is detached.
+func (s *poolCooldownStore) routeStateSnapshot() map[string]PoolAccountRouteState {
+	s.mu.Lock()
+	now := s.now()
+	var out map[string]PoolAccountRouteState
+	pruned := false
+	for id, state := range s.meta {
+		until, ok := s.m[id]
+		if !ok || !now.Before(until) {
+			delete(s.meta, id)
+			delete(s.m, id)
+			pruned = true
+			continue
+		}
+		if out == nil {
+			out = make(map[string]PoolAccountRouteState)
+		}
+		out[id] = state
+	}
+	hook := s.onAccountSetChanged
+	s.mu.Unlock()
+	if pruned && hook != nil {
+		hook()
 	}
 	return out
 }
@@ -363,9 +490,9 @@ func (s *poolCooldownStore) tierCooldownUntil(tierKey string) (time.Time, bool) 
 // skipSet). Returns nil when nothing is cooling.
 func (s *poolCooldownStore) snapshot() map[string]int {
 	s.mu.Lock()
-	defer s.mu.Unlock()
 	now := s.now()
 	var out map[string]int
+	pruned := false
 	for id, until := range s.m {
 		if now.Before(until) {
 			if out == nil {
@@ -374,7 +501,14 @@ func (s *poolCooldownStore) snapshot() map[string]int {
 			out[id] = int(until.Sub(now).Seconds())
 		} else {
 			delete(s.m, id)
+			delete(s.meta, id)
+			pruned = true
 		}
+	}
+	hook := s.onAccountSetChanged
+	s.mu.Unlock()
+	if pruned && hook != nil {
+		hook()
 	}
 	return out
 }
@@ -421,6 +555,49 @@ func cooldownDecision(resp *http.Response, now time.Time) (time.Time, bool) {
 	default:
 		return time.Time{}, false
 	}
+}
+
+// cooldownRouteState classifies the already-approved whole-account cooldown for
+// display. It never participates in routing; cooldownDecision + the store's
+// avoid-until remain authoritative. For confirmed window exhaustion, RetryAt
+// prefers the provider's actual reset evidence even when routing caps the local
+// cooldown duration as a safety valve.
+func cooldownRouteState(resp *http.Response, now, cooldownUntil time.Time) PoolAccountRouteState {
+	state := PoolAccountRouteState{RetryAt: cooldownUntil.Unix()}
+	switch resp.StatusCode {
+	case http.StatusUnauthorized:
+		state.Status = poolRouteAuthFailed
+	case 529:
+		state.Status = poolRouteUpstreamUnavailable
+	case http.StatusTooManyRequests:
+		state.Status = poolRouteRateLimited
+		if windowExhaustionEvidence(resp.Header) {
+			state.Status = poolRouteWindowExhausted
+			if d := codexRateLimitReset(resp.Header); d > 0 {
+				state.RetryAt = now.Add(d).Unix()
+			} else if d := anthropicUnifiedResetDuration(resp.Header, now); d > 0 {
+				state.RetryAt = now.Add(d).Unix()
+			}
+		}
+	default:
+		state.Status = poolRouteUpstreamUnavailable
+	}
+	return state
+}
+
+// windowExhaustionEvidence is narrower than hasRateLimitSignal: Retry-After by
+// itself is a transient throttling hint, not proof that a quota window is full.
+// The Mock Provider and real upstreams expose 100%-used/status evidence here.
+func windowExhaustionEvidence(h http.Header) bool {
+	switch strings.ToLower(strings.TrimSpace(h.Get("anthropic-ratelimit-unified-status"))) {
+	case "exceeded", "exhausted":
+		return true
+	}
+	if anthropicWindowExhausted(h, "5h") || anthropicWindowExhausted(h, "7d") {
+		return true
+	}
+	return codexHeaderFloat(h, "x-codex-primary-used-percent") >= 100 ||
+		codexHeaderFloat(h, "x-codex-secondary-used-percent") >= 100
 }
 
 // hasRateLimitSignal reports whether the response carries REAL rate-limit /

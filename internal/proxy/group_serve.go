@@ -207,6 +207,26 @@ func (p *Proxy) serveGroupAttempt(
 		provCode = rc.ProviderCode
 	}
 	canonicalCode := providerCanonicalCode(provCode)
+	protocolType := res.ProtocolType
+	if protocolType == "" {
+		protocolType = rc.ProtocolType
+	}
+	if protocolType != "" {
+		rc.ProtocolType = protocolType
+	}
+	oauthCode := canonicalCode
+	if canonicalCode == "mock" {
+		switch protocolType {
+		case "anthropic":
+			oauthCode = "anthropic"
+		case "openai_compatible":
+			oauthCode = "openai"
+		default:
+			writeJSONError(w, http.StatusBadGateway, "server_error", observability.ErrCodeProviderError,
+				"Mock Provider account has no supported protocol_type")
+			return true
+		}
+	}
 	var realKey string
 	switch res.CredentialType {
 	case credTypeKey:
@@ -219,7 +239,7 @@ func (p *Proxy) serveGroupAttempt(
 		// Without this, a /chat/completions client's path got appended to
 		// chatgpt.com/backend-api/codex and ChatGPT's edge answered with a
 		// misleading "invalid x-api-key". Fail fast with the real reason.
-		if reason := oauthUpstreamRejectsPath(canonicalCode, r.URL.Path); reason != "" {
+		if reason := oauthUpstreamRejectsPath(oauthCode, r.URL.Path); reason != "" {
 			logger.Warn("group route: OAuth upstream does not serve this endpoint",
 				"event.name", observability.EventProxyRequestDialectUnsupported,
 				"error.code", observability.ErrCodeOAuthResponsesOnly,
@@ -243,7 +263,7 @@ func (p *Proxy) serveGroupAttempt(
 		// backfilled the prompt self-heals on the next material pull (§6.3:
 		// incomplete material = 不可选). Codex keys off AccountID and Kimi doesn't
 		// use it — only the anthropic family needs the uuid.
-		if canonicalCode == "anthropic" && res.OAuth != nil && res.OAuth.ExternalID == "" {
+		if oauthCode == "anthropic" && res.OAuth != nil && res.OAuth.ExternalID == "" {
 			p.respondLoginRequired(w, logger, route, res.AccountID)
 			return true
 		}
@@ -251,12 +271,27 @@ func (p *Proxy) serveGroupAttempt(
 		// deferred model capture) via the shared resolver — same source as the
 		// legacy /v1 path. Headers injected here; the Director sees the sentinel
 		// and only rewrites the upstream URL.
-		rc.BaseURL, r = resolveOAuthUpstream(canonicalCode, r)
-		oauthInject(r, res.OAuth, canonicalCode)
+		if canonicalCode == "mock" {
+			if strings.TrimSpace(res.BaseURL) == "" {
+				logger.Error("Mock Provider OAuth account has no runtime base URL",
+					"event.name", observability.EventProxyRequestUpstreamError,
+					"error.code", observability.ErrCodeProviderError,
+					"account_id", res.AccountID,
+					"protocol_type", protocolType,
+				)
+				writeJSONError(w, http.StatusBadGateway, "server_error", observability.ErrCodeProviderError,
+					"Mock Provider account has no runtime base URL")
+				return true
+			}
+			rc.BaseURL = res.BaseURL
+		} else {
+			rc.BaseURL, r = resolveOAuthUpstream(oauthCode, protocolType, r)
+		}
+		oauthInject(r, res.OAuth, oauthCode)
 		// Stash the window cap so ModifyResponse can pre-cut this account when the
 		// upstream's unified-utilization crosses it (N10 防封).
-		if res.WindowMaxUtilPct != nil {
-			r = stashWindowCap(r, *res.WindowMaxUtilPct)
+		if res.WindowMaxUtilPct != nil || res.Window7dMaxUtilPct != nil {
+			r = stashWindowCaps(r, intValue(res.WindowMaxUtilPct), intValue(res.Window7dMaxUtilPct))
 		}
 		realKey = oauthSentinelKey
 	}

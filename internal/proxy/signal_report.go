@@ -29,18 +29,14 @@ const signalFlushInterval = 30 * time.Second
 // harmless); the upload runs in a background goroutine whose failures are only
 // logged, never surfaced to the request. A nil reporter = feature off.
 
-// signalSample is one parsed util reading queued for delivery. Util7d is the
-// 7-day-window sibling of Util5h (master reads it into engine_meta.util_7d for
-// the weekly-squeeze target). It's `omitempty` so a 5h-only reading stays
-// byte-identical to the pre-7d wire — ponytail: a genuine util_7d==0.0 is
-// indistinguishable from "no 7d header" on the wire, which is fine for a trend
-// signal (other samples in the window carry the non-zero reading); switch to
-// *float64 only if master ever needs to tell zero-util from no-data.
+// signalSample is one parsed util reading queued for delivery. Util7d is a
+// pointer so the wire preserves "provider reported 0%" vs "provider omitted the
+// 7d window". The vault quota display must never turn unknown into a fake 0%.
 type signalSample struct {
-	CredentialID string  `json:"credential_id"`
-	TS           int64   `json:"ts"`
-	Util5h       float64 `json:"util_5h"`
-	Util7d       float64 `json:"util_7d,omitempty"`
+	CredentialID string   `json:"credential_id"`
+	TS           int64    `json:"ts"`
+	Util5h       float64  `json:"util_5h"`
+	Util7d       *float64 `json:"util_7d,omitempty"`
 }
 
 // concurrencySample reports the PEAK number of concurrent in-flight forwarded
@@ -141,10 +137,8 @@ func (r *signalReporter) Close() error {
 }
 
 // enqueue is a non-blocking best-effort hand-off from the forward path. util7d
-// is the optional 7-day reading (pass 0 when the upstream sent no 7d header —
-// signalSample.Util7d is omitempty so a 0 drops off the wire and util_5h stays
-// byte-identical to the pre-7d format).
-func (r *signalReporter) enqueue(credentialID string, ts int64, util5h, util7d float64) {
+// is nil when the upstream sent no 7d window and non-nil even for a genuine 0%.
+func (r *signalReporter) enqueue(credentialID string, ts int64, util5h float64, util7d *float64) {
 	if r == nil || credentialID == "" {
 		return
 	}
@@ -420,34 +414,33 @@ const codex5hThresholdMinutes = 360
 //     fixed to 5h/7d (a Plus account's primary is 5h, but sub2api's own comment
 //     had it backwards). We classify by X-Codex-*-Window-Minutes — smaller = 5h,
 //     larger = 7d — NEVER by the primary/secondary name.
+//
 // Returns (0,0,false) when no X-Codex-*-used-percent header is present (i.e. the
 // response is not Codex traffic), so the caller simply skips the sample — the
 // same "clean-parse-only" contract as parseUnifiedUtil5h. util_7d is 0 when its
 // window is absent (matches the Anthropic path's omitempty-0 behavior).
-func parseCodexUtil(h http.Header) (util5h, util7d float64, ok bool) {
+func parseCodexUtil(h http.Header) (util5h float64, util7d *float64, ok bool) {
 	pUsed, pOK := parseCodexPercent(h.Get("X-Codex-Primary-Used-Percent"))
 	sUsed, sOK := parseCodexPercent(h.Get("X-Codex-Secondary-Used-Percent"))
 	if !pOK && !sOK {
-		return 0, 0, false // not Codex traffic (or no util headers) → skip
+		return 0, nil, false // not Codex traffic (or no util headers) → skip
 	}
-	pMin := parseCodexInt(h.Get("X-Codex-Primary-Window-Minutes"))
-	sMin := parseCodexInt(h.Get("X-Codex-Secondary-Window-Minutes"))
-
-	// primaryIs5h: is the primary window the SHORT (5h) one? Classify by duration.
-	primaryIs5h := true // default when minutes are absent: primary = 5h (head signal)
-	switch {
-	case pMin > 0 && sMin > 0:
-		primaryIs5h = pMin <= sMin
-	case pMin > 0:
-		primaryIs5h = pMin <= codex5hThresholdMinutes
-	case sMin > 0:
-		primaryIs5h = sMin > codex5hThresholdMinutes
-	}
+	// Shared with pre-cut/reset reporting so all three consumers classify the
+	// provider's primary/secondary names by duration identically.
+	primaryIs5h := codexPrimaryIs5h(h)
 
 	if primaryIs5h {
-		util5h, util7d = pUsed/100, sUsed/100
+		util5h = pUsed / 100
+		if sOK {
+			v := sUsed / 100
+			util7d = &v
+		}
 	} else {
-		util5h, util7d = sUsed/100, pUsed/100
+		util5h = sUsed / 100
+		if pOK {
+			v := pUsed / 100
+			util7d = &v
+		}
 	}
 	return util5h, util7d, true
 }

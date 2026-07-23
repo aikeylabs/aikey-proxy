@@ -24,7 +24,11 @@ package proxy
 //
 // Spec: roadmap20260320/技术实现/update/20260429-token前缀按角色重命名.md §3
 
-import "strings"
+import (
+	"strings"
+
+	"github.com/AiKeyLabs/aikey-proxy/internal/provider"
+)
 
 // DispatchAction enumerates the routing decisions for a token after
 // namespace-authority filtering. Returned by ClassifyToken.
@@ -188,22 +192,17 @@ func ClassifyToken(token string) DispatchAction {
 //
 //	`grep -A2 "case \"" middleware.go::providerDefaultBaseURL | grep "case"`
 //	must produce same set as keys of canonicalProviderCodes.
-var canonicalProviderCodes = map[string]struct{}{
-	"anthropic":   {},
-	"openai":      {},
-	"google":      {},
-	"deepseek":    {},
-	"kimi_code":   {},
-	"moonshot":    {},
-	"groq":        {},
-	"xai":         {},
-	"openrouter":  {},
-	"perplexity":  {},
-	"zhipu":       {},
-	"qwen":        {},
-	"doubao":      {},
-	"siliconflow": {},
-}
+var canonicalProviderCodes = func() map[string]struct{} {
+	out := make(map[string]struct{})
+	for _, route := range provider.Routes().All() {
+		code := providerCanonicalCode(route.Provider)
+		// Mock is master-resident and has no local raw-probe/client namespace.
+		if code != "" && code != "mock" {
+			out[code] = struct{}{}
+		}
+	}
+	return out
+}()
 
 // isCanonicalProviderCode returns true iff `code` is a known canonical
 // provider code (NOT an alias). Used by ClassifyToken to validate

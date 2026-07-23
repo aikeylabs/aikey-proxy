@@ -19,10 +19,11 @@ func TestParseCodexUtil(t *testing.T) {
 	}
 
 	cases := []struct {
-		name            string
-		h               http.Header
-		wantOK          bool
-		want5h, want7d  float64
+		name           string
+		h              http.Header
+		wantOK         bool
+		want5h, want7d float64
+		want7dPresent  bool
 	}{
 		{
 			// Exact live Plus capture: primary IS the 5h window here (300min),
@@ -35,7 +36,7 @@ func TestParseCodexUtil(t *testing.T) {
 				"X-Codex-Secondary-Used-Percent":   "0",
 				"X-Codex-Secondary-Window-Minutes": "10080",
 			}),
-			wantOK: true, want5h: 0.01, want7d: 0.0,
+			wantOK: true, want5h: 0.01, want7d: 0.0, want7dPresent: true,
 		},
 		{
 			// Adversarial: primary carries the 7d window (10080min), secondary the
@@ -48,7 +49,7 @@ func TestParseCodexUtil(t *testing.T) {
 				"X-Codex-Secondary-Used-Percent":   "90",
 				"X-Codex-Secondary-Window-Minutes": "300",
 			}),
-			wantOK: true, want5h: 0.90, want7d: 0.50,
+			wantOK: true, want5h: 0.90, want7d: 0.50, want7dPresent: true,
 		},
 		{
 			// percent can exceed 100 briefly → clamp to fraction 1.0.
@@ -59,7 +60,7 @@ func TestParseCodexUtil(t *testing.T) {
 				"X-Codex-Secondary-Used-Percent":   "0",
 				"X-Codex-Secondary-Window-Minutes": "10080",
 			}),
-			wantOK: true, want5h: 1.0, want7d: 0.0,
+			wantOK: true, want5h: 1.0, want7d: 0.0, want7dPresent: true,
 		},
 		{
 			// Only the 5h window present (no secondary) → util_7d stays 0.
@@ -95,8 +96,10 @@ func TestParseCodexUtil(t *testing.T) {
 			if !ok {
 				return
 			}
-			if !floatEq(got5h, c.want5h) || !floatEq(got7d, c.want7d) {
-				t.Errorf("util5h,util7d = %v,%v; want %v,%v", got5h, got7d, c.want5h, c.want7d)
+			if !floatEq(got5h, c.want5h) || (got7d != nil) != c.want7dPresent {
+				t.Errorf("util5h,util7d = %v,%v; want %v,present=%v", got5h, got7d, c.want5h, c.want7dPresent)
+			} else if got7d != nil && !floatEq(*got7d, c.want7d) {
+				t.Errorf("util7d = %v; want %v", *got7d, c.want7d)
 			}
 		})
 	}

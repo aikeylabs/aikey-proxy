@@ -4,6 +4,7 @@ import (
 	"errors"
 	"log/slog"
 
+	providerreg "github.com/AiKeyLabs/aikey-proxy/internal/provider"
 	"github.com/AiKeyLabs/aikey-proxy/internal/vault"
 	"github.com/AiKeyLabs/aikey-proxy/internal/vkeys"
 )
@@ -65,17 +66,62 @@ func managedKeyToRoute(mk *vault.ManagedKey) *vkeys.ResolvedRoute {
 	}
 }
 
+// buildManagedRoutes groups cache rows at the bearer-token grain while
+// retaining every exact Provider+Protocol binding. The old map assignment
+// silently kept whichever row SQLite happened to return last.
+func buildManagedRoutes(keys []vault.ManagedKey) map[string]*vkeys.ResolvedRoute {
+	grouped := make(map[string][]*vkeys.ResolvedRoute)
+	for i := range keys {
+		mk := &keys[i]
+		if mk.OauthGroupID != "" && !oauthGroupRoutingEnabled() {
+			continue
+		}
+		token, err := NormalizeTeamToken(mk.VirtualKeyID)
+		if err != nil {
+			slog.Warn("registry load: skip team key with invalid vk_id",
+				"vk_id", mk.VirtualKeyID, "credential_id", mk.CredentialID, "error", err.Error())
+			continue
+		}
+		grouped[token] = append(grouped[token], managedKeyToRoute(mk))
+	}
+	out := make(map[string]*vkeys.ResolvedRoute, len(grouped))
+	for token, bindings := range grouped {
+		if len(bindings) == 1 {
+			out[token] = bindings[0]
+			continue
+		}
+		container := *bindings[0]
+		container.Bindings = bindings
+		// These fields are intentionally blank on the container. Consuming a
+		// multi-binding token without dispatch selection must fail visibly.
+		container.Provider = ""
+		container.ProviderCode = ""
+		container.ProtocolType = ""
+		container.BaseURL = ""
+		container.PlaintextKey = ""
+		container.CredentialID = ""
+		out[token] = &container
+	}
+	return out
+}
+
 // personalTokenToRoute builds a personal BYOK route from a vault personal
 // route-token record. Called at proxy startup and again on managed-key sync
 // (the personal table can change via CLI between reloads).
 func personalTokenToRoute(pt vault.PersonalRouteToken) *vkeys.ResolvedRoute {
+	protocolType := ""
+	if route, ok := providerreg.Routes().LookupByBaseURL(pt.BaseURL); ok {
+		protocolType = route.Protocol
+	} else if protocol, ok := providerreg.ProtocolFamily(pt.ProviderCode, ""); ok {
+		protocolType = protocol
+	}
 	return &vkeys.ResolvedRoute{
 		VirtualKeyID: "personal:" + pt.Alias,
 		Provider:     pt.ProviderCode,
 		BaseURL:      pt.BaseURL,
 		KeyAlias:     pt.Alias,
 		ProviderCode: pt.ProviderCode,
-		ProtocolType: providerToProtocol(pt.ProviderCode),
+		ProtocolType: protocolType,
 		RouteSource:  "personal",
 	}
 }
@@ -85,13 +131,17 @@ func personalTokenToRoute(pt vault.PersonalRouteToken) *vkeys.ResolvedRoute {
 // uses to know it must go through the OAuth broker for credential
 // injection at request time rather than a direct vault lookup.
 func oauthTokenToRoute(ot vault.OAuthRouteToken) *vkeys.ResolvedRoute {
+	protocolType := ot.ProtocolType
+	if protocolType == "" {
+		protocolType, _ = providerreg.ProtocolFamily(ot.Provider, "")
+	}
 	return &vkeys.ResolvedRoute{
 		VirtualKeyID:  "oauth:" + ot.AccountID,
 		Provider:      ot.Provider,
-		BaseURL:       providerDefaultBaseURL(ot.Provider),
+		BaseURL:       providerBaseURLForProtocol(ot.Provider, protocolType),
 		KeyAlias:      "__oauth__",
 		ProviderCode:  ot.Provider,
-		ProtocolType:  providerToProtocol(ot.Provider),
+		ProtocolType:  protocolType,
 		AccountID:     ot.AccountID,
 		OAuthIdentity: ot.Identity,
 		RouteSource:   "oauth",

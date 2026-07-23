@@ -37,6 +37,7 @@ import (
 	"time"
 
 	"github.com/AiKeyLabs/aikey-proxy/internal/observability"
+	"github.com/AiKeyLabs/aikey-proxy/internal/provider"
 )
 
 // ── Constants ─────────────────────────────────────────────────────────────
@@ -179,17 +180,22 @@ func (p *Proxy) handleProbeRaw(w http.ResponseWriter, r *http.Request, canonical
 	// otherwise providerDefaultBaseURL (same source-of-truth as legacy paths).
 	baseURL := probeBaseURL
 	if baseURL == "" {
-		baseURL = providerDefaultBaseURL(canonicalCode)
+		protocolType := requestProtocolFromPath(strippedPath)
+		if protocolType == "" {
+			protocolType, _ = provider.ProtocolFamily(canonicalCode, "")
+		}
+		if route, ok := provider.Routes().ByProviderProtocol(canonicalCode, protocolType); ok {
+			// Probe appends the incoming path below; use the route root rather
+			// than EffectiveUpstream to avoid duplicating /v1.
+			baseURL = route.BaseURL
+		}
 	}
 	if baseURL == "" {
-		// canonicalProviderCodes accepted the token but providerDefaultBaseURL
-		// returned empty — drift between the two allowlists. Surface loud (this
-		// is the cross-language drift fence the spec calls out).
-		logger.Error("probe_raw: canonical accepted but no default base URL — drift bug",
+		logger.Error("probe_raw: no exact provider/protocol route for request",
 			"event.name", observability.EventProxyRequestVaultFailed,
 		)
-		writeJSONError(w, http.StatusInternalServerError, "server_error", "PROBE_BASEURL_DRIFT",
-			"internal: provider "+canonicalCode+" lacks default base URL (config drift)")
+		writeJSONError(w, http.StatusBadGateway, "server_error", "PROVIDER_ROUTE_NOT_FOUND",
+			"provider "+canonicalCode+" has no unambiguous endpoint for this request protocol")
 		return
 	}
 

@@ -120,10 +120,21 @@ func MaterialUsable(mat GroupRuntimeAccount, nowUnix int64) bool {
 	if mat.ExpiresAt > 0 && mat.ExpiresAt <= nowUnix {
 		return false // access_token expired (refresh is master's job — N7b)
 	}
-	if mat.WindowStatus == "exhausted" {
+	if MaterialWindowExhausted(mat) {
 		return false // oauth-group quota window used up — route around it
 	}
 	return true
+}
+
+// WindowExhausted accepts the canonical master value plus the pre-canonical
+// legacy value already present in older local vault rows. Writers must emit
+// exhausted_current_window; the compatibility read keeps online upgrades safe.
+func WindowExhausted(status string) bool {
+	return status == "exhausted_current_window" || status == "exhausted"
+}
+
+func MaterialWindowExhausted(mat GroupRuntimeAccount) bool {
+	return WindowExhausted(mat.WindowStatus) || WindowExhausted(mat.Window7dStatus)
 }
 
 // MaterialExpired reports whether an OAuth account's material is stale

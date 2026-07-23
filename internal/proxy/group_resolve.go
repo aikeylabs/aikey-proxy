@@ -68,6 +68,7 @@ type groupResolution struct {
 	CredentialID   string // real credential_id of the chosen account → route.CredentialID for I5 signal reporting (T2 uplink)
 	CredentialType string // "oauth_account" | "api_key"
 	ProviderCode   string // candidate's resolved provider code (oauthInject dispatch)
+	ProtocolType   string // independent wire-protocol axis
 	Identity       string // display / audit only — never sent upstream
 	// Primary is the seat's rank-0 account (seatassign top pick). When it differs
 	// from AccountID, a fallback happened (the primary was cooled / exhausted /
@@ -80,11 +81,10 @@ type groupResolution struct {
 	PlaintextKey string
 	BaseURL      string
 	Revision     string
-	// WindowMaxUtilPct is master's randomized pre-cut cap (95-99) for this
-	// account's quota window (N11). When the upstream response says utilization
-	// ≥ this/100, N10 pre-cuts the account before it hits 100% (which looks like
-	// abuse). nil → no cap delivered → proxy uses 100% (natural exhaustion only).
-	WindowMaxUtilPct *int
+	// WindowMaxUtilPct is the legacy-compatible 5h cap (93-97);
+	// Window7dMaxUtilPct is the independent weekly cap (87-89).
+	WindowMaxUtilPct   *int
+	Window7dMaxUtilPct *int
 	// EgressProxyURL is the chosen account's optional per-account egress proxy
 	// (§11.7, P7). "" → node-level egress applies. Non-secret; carried so the
 	// caller can pin this account's outbound to its own exit IP.
@@ -195,7 +195,7 @@ func resolveGroupCredential(route *vkeys.ResolvedRoute, derivedKey []byte, nowUn
 			// expired request-level fallback to LOGIN_REQUIRED.
 			if !localSkip[assigned] {
 				m, ok := material[assigned]
-				if ok && vkeys.MaterialExpired(m, nowUnix) && m.WindowStatus != "exhausted" {
+				if ok && vkeys.MaterialExpired(m, nowUnix) && !vkeys.MaterialWindowExhausted(m) {
 					return nil, &groupResolveError{Code: groupErrLoginRequired,
 						Reason: "member token for the routed account expired — re-login required", Account: assigned}
 				}
@@ -230,17 +230,32 @@ func decryptGroupSecret(derivedKey []byte, mat vkeys.GroupRuntimeAccount) (strin
 // buildGroupResolution assembles the injectable credential for the chosen account.
 func buildGroupResolution(accountID string, ref vkeys.GroupAccountRef, mat vkeys.GroupRuntimeAccount, secret string) *groupResolution {
 	res := &groupResolution{
-		AccountID:        accountID,
-		CredentialID:     ref.CredentialID,
-		CredentialType:   mat.CredentialType,
-		ProviderCode:     ref.ProviderCode,
-		Identity:         ref.Identity,
-		WindowMaxUtilPct: mat.WindowMaxUtilPct, // master's pre-cut cap (N10)
-		EgressProxyURL:   mat.EgressProxyURL,   // per-account egress (§11.7, P7)
+		AccountID:          accountID,
+		CredentialID:       ref.CredentialID,
+		CredentialType:     mat.CredentialType,
+		ProviderCode:       ref.ProviderCode,
+		ProtocolType:       ref.ProtocolType,
+		Identity:           ref.Identity,
+		WindowMaxUtilPct:   mat.WindowMaxUtilPct, // master's pre-cut cap (N10)
+		Window7dMaxUtilPct: mat.Window7dMaxUtilPct,
+		EgressProxyURL:     mat.EgressProxyURL, // per-account egress (§11.7, P7)
+	}
+	if res.ProviderCode == "" {
+		res.ProviderCode = mat.ProviderCode
+	}
+	if res.ProtocolType == "" {
+		res.ProtocolType = mat.ProtocolType
+	}
+	// Runtime material is consumer-specific: a host member receives the public
+	// URL while a cluster worker receives its internal URL. Prefer that fresh
+	// rail over the structural candidate snapshot, which may still carry the
+	// other environment's address during convergence.
+	res.BaseURL = mat.BaseURL
+	if res.BaseURL == "" {
+		res.BaseURL = ref.BaseURL
 	}
 	if mat.CredentialType == credTypeKey {
 		res.PlaintextKey = secret
-		res.BaseURL = mat.BaseURL
 		res.Revision = mat.Revision
 		return res
 	}
@@ -249,10 +264,10 @@ func buildGroupResolution(accountID string, ref vkeys.GroupAccountRef, mat vkeys
 	// AccountPersona normalization was removed 2026-06-29 (see oauth_inject.go).
 	res.OAuth = &OAuthCredential{
 		AccessToken: secret,
-		Provider:    ref.ProviderCode,
+		Provider:    res.ProviderCode,
 		AccountID:   accountID,
 		ExternalID:  mat.ExternalID, // Claude metadata.user_id (empty until master N7a fills it)
-		Identity:    ref.Identity,
+		Identity:    res.Identity,
 		ExpiresAt:   mat.ExpiresAt,
 	}
 	return res

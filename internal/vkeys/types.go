@@ -31,6 +31,10 @@ type ResponseTransform func(ctx context.Context, body []byte) ([]byte, error)
 // ResolvedRoute contains everything needed to forward a request after
 // virtual key resolution.
 type ResolvedRoute struct {
+	// Bindings holds the exact routes that share one bearer token. It is set
+	// for a multi-binding managed VK; dispatch selects one by requested client
+	// route + Protocol before any credential or upstream field is consumed.
+	Bindings         []*ResolvedRoute
 	ObserverRegistry any
 	// ── Phase 4 M2 plugin observer hook fields (App pipeline only) ────
 	//
@@ -147,9 +151,9 @@ type ResolvedRoute struct {
 	BaseURL  string // upstream base URL
 	// ProtocolFamily is the wire-protocol category of the upstream binding,
 	// derived from pkg/providerroutes (yaml provider_fingerprint single
-	// source of truth). Distinct from ProtocolType above, which carries the
-	// PROVIDER code (e.g. "anthropic", "kimi", "openai"); ProtocolFamily
-	// collapses providers into the wire family they speak:
+	// source of truth). ProtocolType carries the credential's independent
+	// protocol axis (for example provider=mock with protocol_type=anthropic
+	// or openai_compatible); ProtocolFamily is the normalized wire family:
 	//
 	//   "anthropic"          — Anthropic messages API (anthropic upstream)
 	//   "openai_compatible"  — OpenAI chat-completions API (openai, kimi,
