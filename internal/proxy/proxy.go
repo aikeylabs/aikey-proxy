@@ -43,7 +43,9 @@ type ActiveKeyReader interface {
 	// v1.0.2: provider-level binding from user_profile_provider_bindings.
 	GetProviderBinding(providerCode string) (*vault.ProviderBinding, error)
 	// v1.0.2: resolve team key by exact virtual_key_id (no local_state filter).
-	GetTeamKeyByID(virtualKeyID string) (*vault.ManagedKey, error)
+	// P1e (D-11): targetProviderCode selects the matching binding (one row per
+	// binding, ciphertext per row) — empty falls back to the primary binding.
+	GetTeamKeyByID(virtualKeyID, targetProviderCode string) (*vault.ManagedKey, error)
 }
 
 // OAuthBroker is the minimal interface the proxy data-plane needs from the broker.
@@ -99,11 +101,11 @@ type Proxy struct {
 	// cost (surfaced in the UI): while on, all OAuth accounts share this node's
 	// exit IP → single-IP-per-account anti-ban is temporarily off for this node.
 	oauthEgressOverride atomic.Bool
-	activeReader            ActiveKeyReader       // non-nil when vault implements ActiveKeyReader
-	appVault     apppipe.VaultReader   // non-nil when vault implements the App pipeline read surface (Phase 4)
-	probeVault   probepipe.VaultReader // non-nil when vault implements the Probe pipeline read surface (mode C, SPEC 2026-05-23)
-	broker       OAuthBroker           // OAuth credential provider (nil = OAuth not available)
-	vault        VaultGetter
+	activeReader        ActiveKeyReader       // non-nil when vault implements ActiveKeyReader
+	appVault            apppipe.VaultReader   // non-nil when vault implements the App pipeline read surface (Phase 4)
+	probeVault          probepipe.VaultReader // non-nil when vault implements the Probe pipeline read surface (mode C, SPEC 2026-05-23)
+	broker              OAuthBroker           // OAuth credential provider (nil = OAuth not available)
+	vault               VaultGetter
 	// groupKey exposes the vault derived key for oauth-group material decryption
 	// (N8). nil when the injected vault doesn't implement DerivedKey() (tests) →
 	// group routing degrades to GROUP_KEY_UNAVAILABLE rather than panicking.
@@ -207,10 +209,28 @@ type Proxy struct {
 	// identity stamped on every reported event; seqAlloc hands out the
 	// per-source never-reused sequence. Both nil/empty until SetDeliveryIntegrity
 	// wires them (offline-only or pre-seqalloc builds report v1-shaped events).
-	sourceID         string
-	proxyInstanceID  string
-	requests         atomic.Int64
-	errors           atomic.Int64
+	sourceID        string
+	proxyInstanceID string
+	requests        atomic.Int64
+	errors          atomic.Int64
+	// Model-mapping runtime health (task 7.9 / 3.5 four-surface visibility): the
+	// read-only /v1/diagnostics/pipeline endpoint reads these to answer "was a
+	// mapping configured but not taking effect?". `mapPassthrough`/`mapRejected`
+	// are the "configured-but-missing" signal (a provider HAS a model_map yet the
+	// client's request didn't match a rule); `mapApplied` is the healthy path.
+	mapApplied     atomic.Int64
+	mapRejected    atomic.Int64
+	mapPassthrough atomic.Int64
+	// lastMapApplyNano / lastMapMissNano make the mapping-health verdict
+	// RECOVERABLE rather than a monotonic latch (health-signal-surface: assert
+	// transition, not terminal). mappingHealth reports `degraded` only when a
+	// passthrough-miss is MORE RECENT than the last successful apply — the
+	// CURRENT state — so a later successful apply flips it back to `ok`. A
+	// `reject` (unmatched=reject policy WORKED) deliberately does NOT stamp
+	// lastMapMissNano, so a working reject policy never trips degraded.
+	lastMapApplyNano atomic.Int64
+	lastMapMissNano  atomic.Int64
+	lastMapMiss      atomic.Pointer[mapMissRecord]
 	loadedControlSeq int64 // vault change_seq loaded at generation build time
 	// Configurable slow-request thresholds (milliseconds).
 	SlowRequestMs     int64

@@ -531,14 +531,22 @@ func (m *mockActiveVault) GetPersonalKeyByAlias(alias string) (string, string, s
 	return "", "", "", fmt.Errorf("personal key %q not found", alias)
 }
 
-func (m *mockActiveVault) GetTeamKeyByID(virtualKeyID string) (*vault.ManagedKey, error) {
-	// Search all team keys for the specific ID.
+func (m *mockActiveVault) GetTeamKeyByID(virtualKeyID, targetProviderCode string) (*vault.ManagedKey, error) {
+	// P1e: prefer the binding matching targetProviderCode (multi-binding VK),
+	// else fall back to the first binding with this ID (legacy single-binding).
+	var fallback *vault.ManagedKey
 	for _, mk := range m.activeTeamKeys {
-		if mk.VirtualKeyID == virtualKeyID {
+		if mk.VirtualKeyID != virtualKeyID {
+			continue
+		}
+		if targetProviderCode != "" && strings.EqualFold(mk.ProviderCode, targetProviderCode) {
 			return mk, nil
 		}
+		if fallback == nil {
+			fallback = mk
+		}
 	}
-	return nil, nil
+	return fallback, nil
 }
 
 func (m *mockActiveVault) GetProviderBinding(providerCode string) (*vault.ProviderBinding, error) {

@@ -93,6 +93,16 @@ func (p *Proxy) buildBaseEvent(req *http.Request, resp *http.Response, startTime
 		ev.Model = model
 		ev.RequestedModel = model // Phase 4 §5.3 — captured at request entry, may differ from upstream `Model` after translator remaps
 	}
+	// P2/P4 audit 双口径 (I2, design D-5): when the model-mapping layer rewrote
+	// the request to a different upstream model, ev.Model must carry the
+	// EFFECTIVE (upstream) model so pricing prices the real vendor model
+	// (glm-4.6), while ev.RequestedModel keeps the CLIENT model
+	// (claude-opus-4-8). Without this, both collapse to the client model and
+	// the ledger mis-prices. The effective model is stashed on the request
+	// context by applyModelMappingToRequest.
+	if eff, ok := req.Context().Value(ctxKeyMappedEffectiveModel).(string); ok && eff != "" {
+		ev.Model = eff
+	}
 	// SessionID (v1.0.0-rc.6): populate the local UsageEvent so the
 	// offline-retry upload path (events.db → collector ingest) preserves
 	// the session dimension even when the live reporter is down. Uses

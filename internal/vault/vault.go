@@ -778,17 +778,44 @@ func (r *Reader) GetActiveTeamKeyByProvider(providerCode string) (*ManagedKey, e
 	}, nil
 }
 
-// GetTeamKeyByID returns the decrypted team key for a specific virtual_key_id.
-// Unlike GetActiveTeamKeyByProvider, this does not filter by local_state — the
-// provider binding already tells us which key to use.
+// GetTeamKeyByID returns the decrypted team key for a specific virtual_key_id,
+// selecting the BINDING whose provider matches the request's resolved upstream
+// (targetProviderCode). Unlike GetActiveTeamKeyByProvider, this does not filter
+// by local_state — the provider binding already tells us which key to use.
 // Returns nil if the key is not found or has no ciphertext.
-func (r *Reader) GetTeamKeyByID(virtualKeyID string) (*ManagedKey, error) {
+//
+// P1e (design D-11): the cache is now ONE ROW PER BINDING
+// `(virtual_key_id, protocol_type, provider_code)`, each row carrying its OWN
+// ciphertext and base_url. A single VK can therefore hold e.g. GLM(zhipu key)
+// AND the official Anthropic(official key) at once. `targetProviderCode` is the
+// truthful upstream provider the request resolved to (canonicalCode at the call
+// site); we pick the binding for that provider so each request reaches its own
+// upstream with its own credential. When the target is empty or the VK does not
+// carry it, we fall back to the deterministic primary (stable provider_code
+// order) — byte-identical to the pre-P1e single-row behavior for legacy VKs.
+func (r *Reader) GetTeamKeyByID(virtualKeyID, targetProviderCode string) (*ManagedKey, error) {
 	var provCode, protType, baseURL, effectiveAlias string
 	var nonce, ciphertext []byte
 	var providerBaseURLsJSON *string
 	var orgID, seatID string
 	var ownerAccountID *string
 
+	// Prefer the binding whose provider_code matches the resolved upstream
+	// (expanded to known aliases so "anthropic" also matches "claude" etc.), then
+	// a stable order for determinism. args: vk_id, then one arg per alias, all
+	// bound (no injection); the only concatenated part is the "?,?,…" list length.
+	aliases := providerCodeAliases(targetProviderCode)
+	placeholders := make([]string, len(aliases))
+	args := make([]any, 0, len(aliases)+1)
+	args = append(args, virtualKeyID)
+	for i, a := range aliases {
+		placeholders[i] = "?"
+		args = append(args, a)
+	}
+	preferMatch := "0"
+	if len(aliases) > 0 {
+		preferMatch = "CASE WHEN LOWER(provider_code) IN (" + strings.Join(placeholders, ",") + ") THEN 0 ELSE 1 END"
+	}
 	// 2026-05-09: include effective alias (COALESCE local_alias / alias) so
 	// route's KeyAlias surfaces in WAL `key_label` and statusline receipt.
 	// Hot path (binding-driven team-key fetch) — without this column, the
@@ -802,7 +829,9 @@ func (r *Reader) GetTeamKeyByID(virtualKeyID string) (*ManagedKey, error) {
 		WHERE virtual_key_id = ?
 		  AND key_status = 'active'
 		  AND provider_key_ciphertext IS NOT NULL
-	`, virtualKeyID).Scan(
+		ORDER BY `+preferMatch+` ASC, provider_code ASC
+		LIMIT 1
+	`, args...).Scan(
 		&provCode, &protType, &baseURL, &effectiveAlias, &nonce, &ciphertext, &providerBaseURLsJSON,
 		&orgID, &seatID, &ownerAccountID,
 	)
