@@ -27,8 +27,10 @@ type GroupAccountRef struct {
 	AccountID    string `json:"account_id"`
 	Identity     string `json:"identity"`      // email / alias (display + audit only)
 	ProviderCode string `json:"provider_code"` // resolved provider code (injection dispatch)
-	Priority     int    `json:"priority"`      // deterministic tie-break (lower wins)
-	Assigned     bool   `json:"assigned"`      // master's rank-0 pick (advisory; proxy re-ranks)
+	ProtocolType string `json:"protocol_type,omitempty"`
+	BaseURL      string `json:"base_url,omitempty"`
+	Priority     int    `json:"priority"` // deterministic tie-break (lower wins)
+	Assigned     bool   `json:"assigned"` // master's rank-0 pick (advisory; proxy re-ranks)
 	// CredentialID is the account's real credential_id (same id the engine,
 	// auth-gate, and static-key track use). The proxy stamps it onto the resolved
 	// route so I5 usage signals enqueue keyed by credential_id instead of being
@@ -51,8 +53,8 @@ type GroupAccountRef struct {
 // WRITER: supervisor.buildGroupRuntimeJSON (N7c-2). READER:
 // proxy.resolveGroupCredential (N8a).
 type GroupRuntimeAccount struct {
-	CredentialType   string `json:"credential_type"` // oauth_account | api_key
-	SecretNonce      string `json:"secret_nonce"`    // base64(nonce)
+	CredentialType   string `json:"credential_type"`   // oauth_account | api_key
+	SecretNonce      string `json:"secret_nonce"`      // base64(nonce)
 	SecretCiphertext string `json:"secret_ciphertext"` // base64(enc(access_token|key))
 	// Display meta (non-secret, 2026-07-01): identity/provider_code/priority carried on
 	// the fast rail so the client's candidate LIST membership refreshes here (a fast-rail-
@@ -61,25 +63,44 @@ type GroupRuntimeAccount struct {
 	// is NOT omitempty (0 is a valid priority).
 	Identity     string `json:"identity,omitempty"`
 	ProviderCode string `json:"provider_code,omitempty"`
+	ProtocolType string `json:"protocol_type,omitempty"`
 	Priority     int    `json:"priority"`
 	// NeedsLogin: the member has no token for this OAuth account (master said so) →
 	// the resolver returns LOGIN_REQUIRED for it. No secret when true. P1.
 	NeedsLogin bool `json:"needs_login,omitempty"`
 	// IsCurrentRouted: DISPLAY-ONLY (C2, 2026-06-30) — true on the ONE account this
-	// seat's traffic is currently routed to in steady state = routing-override ??
-	// seatassign rank-0. NOT read by the resolver (which re-decides per request incl.
-	// cooldown failover); it exists only so /user/vault can show "current routed"
+	// seat's proxy currently prefers after routing override, material usability,
+	// whole-account cooldown, and seatassign ranking. NOT read by the resolver
+	// (which re-decides per request); it exists only so /user/vault can show "current routed"
 	// distinct from the static "assigned" default. Recomputed on every material
-	// refresh AND on every routing-override change (couples the two 60s rails, owner-
-	// approved 2026-06-30). Per-VK (per-seat): the same group's VKs carry different
-	// flags. Deliberately excludes transient per-request cooldown failover (would
-	// flap; owner chose the stable pick).
+	// refresh, every routing-override change, and every whole-account cooldown-set
+	// change. Per-VK (per-seat): the same group's VKs carry different flags. A
+	// model-tier-only cooldown remains request-local because one boolean cannot
+	// truthfully represent different routed accounts for different models.
 	IsCurrentRouted bool `json:"is_current_routed,omitempty"`
 	// OAuth meta:
-	ExpiresAt        int64  `json:"expires_at,omitempty"`
-	WindowMaxUtilPct *int   `json:"window_max_util_pct,omitempty"`
-	WindowStatus     string `json:"window_status,omitempty"`
-	WindowResetAt    *int64 `json:"window_reset_at,omitempty"`
+	ExpiresAt          int64  `json:"expires_at,omitempty"`
+	WindowMaxUtilPct   *int   `json:"window_max_util_pct,omitempty"`
+	WindowStatus       string `json:"window_status,omitempty"`
+	WindowResetAt      *int64 `json:"window_reset_at,omitempty"`
+	Window7dMaxUtilPct *int   `json:"window_7d_max_util_pct,omitempty"`
+	Window7dStatus     string `json:"window_7d_status,omitempty"`
+	Window7dResetAt    *int64 `json:"window_7d_reset_at,omitempty"`
+	// RouteStatus/RouteRetryAt are the proxy's DISPLAY projection of the local
+	// whole-account cooldown that the hot-path resolver already enforces. They
+	// deliberately stay separate from WindowStatus: the latter is master-owned
+	// material and participates in routing, while these fields describe the
+	// locally observed reason/expected recovery time without becoming a second
+	// routing gate. Model-tier cooldowns are never projected at account scope.
+	RouteStatus  string `json:"route_status,omitempty"`
+	RouteRetryAt *int64 `json:"route_retry_at,omitempty"`
+	// Util5h/Util7d are the latest provider-reported utilization fractions
+	// (0..1) sourced from master's existing engine_meta signal ring. Pointers
+	// preserve the important distinction between a genuine 0% and no observation.
+	// UtilObservedAt is unix seconds for the latest 5h sample.
+	Util5h         *float64 `json:"util_5h,omitempty"`
+	Util7d         *float64 `json:"util_7d,omitempty"`
+	UtilObservedAt *int64   `json:"util_observed_at,omitempty"`
 	// ExternalID is the OAuth provider's account UUID (e.g. Claude account.uuid).
 	// Claude's OAuth injection needs it to build a valid metadata.user_id;
 	// without it Claude returns a 429 business rejection. Codex uses AccountID
@@ -93,7 +114,9 @@ type GroupRuntimeAccount struct {
 	// selection), chaining through the node's own socks5 front proxy when present
 	// (2-hop). Empty → the node's node-level egress chain applies unchanged.
 	EgressProxyURL string `json:"egress_proxy_url,omitempty"`
-	// KEY meta:
+	// BaseURL is non-secret routing metadata for both credential types. Mock
+	// OAuth accounts require the deployment-resolved URL; official OAuth may
+	// leave it empty and use the provider profile default. Revision is KEY-only.
 	BaseURL  string `json:"base_url,omitempty"`
 	Revision string `json:"revision,omitempty"`
 }

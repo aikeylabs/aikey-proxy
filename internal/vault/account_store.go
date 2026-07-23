@@ -7,6 +7,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"strings"
 	"time"
 
 	broker "github.com/AiKeyLabs/aikey-auth-broker"
@@ -45,10 +46,11 @@ func NewAccountStore(db *sql.DB) *VaultAccountStore {
 }
 
 func (s *VaultAccountStore) Save(_ context.Context, acct *broker.ProviderAccount) error {
+	hasProtocolColumn := hasColumn(s.db, "provider_accounts", "protocol_type")
 	// BR-rc.5 fix (2026-05-25): preserve / generate `route_token`.
 	//
 	// Pre-fix: this INSERT covered 12 columns NOT including route_token.
-	// `INSERT OR REPLACE` semantics replace the entire row, so any
+	// The old `INSERT OR REPLACE` semantics replaced the entire row, so any
 	// existing route_token (e.g. seeded later by `aikey route` or by an
 	// earlier CLI `aikey auth login` against the same account) would be
 	// nuked on every broker save. New OAuth accounts created via the
@@ -68,7 +70,7 @@ func (s *VaultAccountStore) Save(_ context.Context, acct *broker.ProviderAccount
 	//      from a prior save or from CLI-side ensure).
 	//   2. If empty / NULL, generate a fresh one matching CLI format
 	//      ("aikey_personal_" + 64 lowercase hex).
-	//   3. INSERT OR REPLACE with the resolved token in the value list.
+	//   3. UPSERT the mutable broker fields while preserving local-only state.
 	//
 	// Wrapped in a transaction so the read + insert is atomic against
 	// concurrent saves of the same account_id (rare but possible if the
@@ -99,27 +101,75 @@ func (s *VaultAccountStore) Save(_ context.Context, acct *broker.ProviderAccount
 		}
 	}
 
-	if _, err := tx.Exec(
-		`INSERT OR REPLACE INTO provider_accounts
+	storedProvider := strings.ToLower(strings.TrimSpace(acct.Provider))
+	protocolType := strings.ToLower(strings.TrimSpace(acct.ProtocolType))
+	if protocolType == "" {
+		// Legacy official broker profiles predate an explicit protocol field.
+		// This compatibility is safe only for their single known dialect; Mock
+		// is multi-protocol and must never be inferred from Provider.
+		switch storedProvider {
+		case "anthropic", "claude":
+			protocolType = "anthropic"
+		case "mock":
+			return fmt.Errorf("save provider account: provider mock requires protocol_type")
+		default:
+			protocolType = "openai_compatible"
+		}
+	}
+	if storedProvider == "mock" && !hasProtocolColumn {
+		return fmt.Errorf("save provider account: vault schema cannot preserve Mock protocol_type")
+	}
+	var saveErr error
+	if hasProtocolColumn {
+		_, saveErr = tx.Exec(
+			`INSERT INTO provider_accounts
+			(provider_account_id, provider, protocol_type, auth_type, credential_type, status,
+			 external_id, display_identity, org_uuid, account_tier,
+			 created_at, last_used_at, owner_type, route_token)
+			VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+			ON CONFLICT(provider_account_id) DO UPDATE SET
+			 provider=excluded.provider, protocol_type=excluded.protocol_type,
+			 auth_type=excluded.auth_type, credential_type=excluded.credential_type,
+			 status=excluded.status, external_id=excluded.external_id,
+			 display_identity=excluded.display_identity, org_uuid=excluded.org_uuid,
+			 account_tier=excluded.account_tier, last_used_at=excluded.last_used_at,
+			 owner_type=excluded.owner_type, route_token=excluded.route_token`,
+			acct.ProviderAccountID, storedProvider, protocolType, acct.AuthType,
+			string(acct.CredentialType), string(acct.Status), nullStr(acct.ExternalID),
+			nullStr(acct.DisplayIdentity), nullStr(acct.OrgUUID), nullStr(acct.AccountTier),
+			acct.CreatedAt.Unix(), nullTime(acct.LastUsedAt), "local_user", routeToken,
+		)
+	} else {
+		_, saveErr = tx.Exec(
+			`INSERT INTO provider_accounts
 			(provider_account_id, provider, auth_type, credential_type, status,
 			 external_id, display_identity, org_uuid, account_tier,
 			 created_at, last_used_at, owner_type, route_token)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-		acct.ProviderAccountID,
-		acct.Provider,
-		acct.AuthType,
-		string(acct.CredentialType),
-		string(acct.Status),
-		nullStr(acct.ExternalID),
-		nullStr(acct.DisplayIdentity),
-		nullStr(acct.OrgUUID),
-		nullStr(acct.AccountTier),
-		acct.CreatedAt.Unix(),
-		nullTime(acct.LastUsedAt),
-		"local_user",
-		routeToken,
-	); err != nil {
-		return fmt.Errorf("save provider account: %w", err)
+			VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+			ON CONFLICT(provider_account_id) DO UPDATE SET
+			 provider=excluded.provider, auth_type=excluded.auth_type,
+			 credential_type=excluded.credential_type, status=excluded.status,
+			 external_id=excluded.external_id, display_identity=excluded.display_identity,
+			 org_uuid=excluded.org_uuid, account_tier=excluded.account_tier,
+			 last_used_at=excluded.last_used_at, owner_type=excluded.owner_type,
+			 route_token=excluded.route_token`,
+			acct.ProviderAccountID,
+			storedProvider,
+			acct.AuthType,
+			string(acct.CredentialType),
+			string(acct.Status),
+			nullStr(acct.ExternalID),
+			nullStr(acct.DisplayIdentity),
+			nullStr(acct.OrgUUID),
+			nullStr(acct.AccountTier),
+			acct.CreatedAt.Unix(),
+			nullTime(acct.LastUsedAt),
+			"local_user",
+			routeToken,
+		)
+	}
+	if saveErr != nil {
+		return fmt.Errorf("save provider account: %w", saveErr)
 	}
 
 	if err := tx.Commit(); err != nil {
@@ -130,28 +180,34 @@ func (s *VaultAccountStore) Save(_ context.Context, acct *broker.ProviderAccount
 
 func (s *VaultAccountStore) GetByID(_ context.Context, accountID string) (*broker.ProviderAccount, error) {
 	return s.queryOne(
-		"SELECT "+accountCols+" FROM provider_accounts WHERE provider_account_id = ?",
+		"SELECT "+s.accountCols()+" FROM provider_accounts WHERE provider_account_id = ?",
 		accountID,
 	)
 }
 
-func (s *VaultAccountStore) GetByExternalID(_ context.Context, provider, externalID string) (*broker.ProviderAccount, error) {
-	return s.queryOne(
-		"SELECT "+accountCols+" FROM provider_accounts WHERE provider = ? AND external_id = ?",
-		provider, externalID,
-	)
+func (s *VaultAccountStore) GetByExternalID(_ context.Context, provider, protocol, externalID string) (*broker.ProviderAccount, error) {
+	query := "SELECT " + s.accountCols() + " FROM provider_accounts WHERE provider = ? AND external_id = ?"
+	args := []any{provider, externalID}
+	if protocol != "" {
+		if !hasColumn(s.db, "provider_accounts", "protocol_type") {
+			return nil, nil
+		}
+		query += " AND protocol_type = ?"
+		args = append(args, protocol)
+	}
+	return s.queryOne(query, args...)
 }
 
 func (s *VaultAccountStore) ListByProvider(_ context.Context, provider string) ([]*broker.ProviderAccount, error) {
 	return s.queryMany(
-		"SELECT "+accountCols+" FROM provider_accounts WHERE provider = ? ORDER BY created_at",
+		"SELECT "+s.accountCols()+" FROM provider_accounts WHERE provider = ? ORDER BY created_at",
 		provider,
 	)
 }
 
 func (s *VaultAccountStore) ListAll(_ context.Context) ([]*broker.ProviderAccount, error) {
 	return s.queryMany(
-		"SELECT " + accountCols + " FROM provider_accounts ORDER BY provider, created_at",
+		"SELECT " + s.accountCols() + " FROM provider_accounts ORDER BY provider, created_at",
 	)
 }
 
@@ -190,8 +246,14 @@ func (s *VaultAccountStore) Delete(_ context.Context, accountID string) error {
 
 // --- internal helpers ---
 
-const accountCols = "provider_account_id, provider, auth_type, credential_type, status, " +
-	"external_id, display_identity, org_uuid, account_tier, created_at, last_used_at"
+func (s *VaultAccountStore) accountCols() string {
+	protocolExpr := "''"
+	if hasColumn(s.db, "provider_accounts", "protocol_type") {
+		protocolExpr = "COALESCE(protocol_type, '')"
+	}
+	return "provider_account_id, provider, " + protocolExpr + ", auth_type, credential_type, status, " +
+		"external_id, display_identity, org_uuid, account_tier, created_at, last_used_at"
+}
 
 func (s *VaultAccountStore) queryOne(query string, args ...any) (*broker.ProviderAccount, error) {
 	row := s.db.QueryRow(query, args...)
@@ -225,42 +287,43 @@ func (s *VaultAccountStore) queryMany(query string, args ...any) ([]*broker.Prov
 
 func scanAccount(row *sql.Row) (*broker.ProviderAccount, error) {
 	var (
-		id, provider, authType, credType, status string
-		extID, display, orgUUID, tier            sql.NullString
-		createdAt                                int64
-		lastUsedAt                               sql.NullInt64
+		id, provider, protocolType, authType, credType, status string
+		extID, display, orgUUID, tier                          sql.NullString
+		createdAt                                              int64
+		lastUsedAt                                             sql.NullInt64
 	)
-	err := row.Scan(&id, &provider, &authType, &credType, &status,
+	err := row.Scan(&id, &provider, &protocolType, &authType, &credType, &status,
 		&extID, &display, &orgUUID, &tier, &createdAt, &lastUsedAt)
 	if err != nil {
 		return nil, err
 	}
-	return buildAccount(id, provider, authType, credType, status,
+	return buildAccount(id, provider, protocolType, authType, credType, status,
 		extID, display, orgUUID, tier, createdAt, lastUsedAt), nil
 }
 
 func scanAccountFromRows(rows *sql.Rows) (*broker.ProviderAccount, error) {
 	var (
-		id, provider, authType, credType, status string
-		extID, display, orgUUID, tier            sql.NullString
-		createdAt                                int64
-		lastUsedAt                               sql.NullInt64
+		id, provider, protocolType, authType, credType, status string
+		extID, display, orgUUID, tier                          sql.NullString
+		createdAt                                              int64
+		lastUsedAt                                             sql.NullInt64
 	)
-	err := rows.Scan(&id, &provider, &authType, &credType, &status,
+	err := rows.Scan(&id, &provider, &protocolType, &authType, &credType, &status,
 		&extID, &display, &orgUUID, &tier, &createdAt, &lastUsedAt)
 	if err != nil {
 		return nil, err
 	}
-	return buildAccount(id, provider, authType, credType, status,
+	return buildAccount(id, provider, protocolType, authType, credType, status,
 		extID, display, orgUUID, tier, createdAt, lastUsedAt), nil
 }
 
-func buildAccount(id, provider, authType, credType, status string,
+func buildAccount(id, provider, protocolType, authType, credType, status string,
 	extID, display, orgUUID, tier sql.NullString,
 	createdAt int64, lastUsedAt sql.NullInt64) *broker.ProviderAccount {
 	acct := &broker.ProviderAccount{
 		ProviderAccountID: id,
 		Provider:          provider,
+		ProtocolType:      protocolType,
 		AuthType:          authType,
 		CredentialType:    broker.CredentialType(credType),
 		Status:            broker.AccountStatus(status),

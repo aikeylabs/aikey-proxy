@@ -48,10 +48,10 @@ type upstreamCall struct {
 // programmableUpstream is a scriptable fake upstream RoundTripper. The test sets
 // reply(call) per phase; every attempt is recorded for count/order assertions.
 type programmableUpstream struct {
-	mu       sync.Mutex
-	tokAcct  map[string]string // Bearer token → account id
-	reply    func(upstreamCall) upstreamReply
-	calls    []upstreamCall
+	mu      sync.Mutex
+	tokAcct map[string]string // Bearer token → account id
+	reply   func(upstreamCall) upstreamReply
+	calls   []upstreamCall
 }
 
 func (u *programmableUpstream) RoundTrip(req *http.Request) (*http.Response, error) {
@@ -121,6 +121,7 @@ func (u *programmableUpstream) accountsHit() map[string]int {
 func setupE2EPool(t *testing.T, n int) (*Proxy, *programmableUpstream) {
 	t.Helper()
 	key := grKey()
+	capPct := 95
 	refs := make([]vkeys.GroupAccountRef, 0, n)
 	mat := map[string]vkeys.GroupRuntimeAccount{}
 	tokAcct := map[string]string{}
@@ -130,6 +131,7 @@ func setupE2EPool(t *testing.T, n int) (*Proxy, *programmableUpstream) {
 		refs = append(refs, vkeys.GroupAccountRef{AccountID: acc, ProviderCode: "anthropic"})
 		mat[acc] = encMat(t, key, vkeys.GroupRuntimeAccount{
 			CredentialType: "oauth_account", ExpiresAt: 9_000_000_000, ExternalID: "uuid-" + strconv.Itoa(i),
+			WindowMaxUtilPct: &capPct,
 		}, tok)
 		tokAcct["Bearer "+tok] = acc // stored with prefix for convenience? no — strip below
 		tokAcct[tok] = acc
@@ -220,6 +222,10 @@ func TestE2E_Pool_RealExhaustionFailsOverAndCools(t *testing.T) {
 	}
 	if !p.poolCooldown.skipSet()[firstAcct] {
 		t.Fatalf("the exhausted account %s must be cooled", firstAcct)
+	}
+	state := p.poolCooldown.routeStateSnapshot()[firstAcct]
+	if state.Status != poolRouteWindowExhausted {
+		t.Fatalf("confirmed 429 must remain window_exhausted for the drawer, got %+v", state)
 	}
 }
 

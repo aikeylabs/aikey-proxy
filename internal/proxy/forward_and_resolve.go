@@ -108,9 +108,7 @@ func (p *Proxy) serveRouteWithObserver(
 			if pr, ok := provider.Routes().LookupByBaseURL(route.BaseURL); ok {
 				pf = pr.Protocol
 			} else if route.ProviderCode != "" {
-				if pr, ok := provider.Routes().ByProvider(route.ProviderCode); ok {
-					pf = pr.Protocol
-				}
+				pf, _ = provider.ProtocolFamily(route.ProviderCode, route.ProtocolType)
 			}
 		}
 		obsReqCtx = &observer.RequestContext{
@@ -256,7 +254,7 @@ func (p *Proxy) ResolveBindingCredential(
 		// resolver — same source as the group route. Codex's chatgpt.com override +
 		// deferred model capture live in resolveOAuthUpstream; pinned by
 		// TestFence_OAuthBinding_OpenAICodexBaseURLOverride.
-		out.BaseURL, r = resolveOAuthUpstream(canonicalCode, r)
+		out.BaseURL, r = resolveOAuthUpstream(canonicalCode, binding.ProtocolType, r)
 		oauthInject(r, cred, canonicalCode)
 
 		identityTag := cred.Identity
@@ -275,12 +273,12 @@ func (p *Proxy) ResolveBindingCredential(
 		out.OAuthAccountID = binding.KeySourceRef
 		return out, nil
 
-	case "team":
+	case "team", "managed_virtual_key":
 		// P1e (D-11): pass the resolved upstream provider so a multi-binding VK
 		// (e.g. GLM + official on one VK) picks THIS request's binding + its own
 		// key. canonicalCode is the truthful upstream vendor; empty/unmatched
 		// falls back to the VK's primary binding (legacy single-binding behavior).
-		mk, err := p.activeReader.GetTeamKeyByID(binding.KeySourceRef, canonicalCode)
+		mk, err := p.activeReader.GetTeamKeyByID(binding.KeySourceRef, canonicalCode, binding.ProtocolType)
 		if err != nil {
 			logger.Warn("vault: team key lookup via binding failed", "vk_id", binding.KeySourceRef, "error", err)
 			return out, nil // soft fail — caller will try legacy fallback
@@ -321,7 +319,7 @@ func (p *Proxy) ResolveBindingCredential(
 		if entryBaseURL != "" {
 			out.BaseURL = entryBaseURL
 		} else {
-			out.BaseURL = providerDefaultBaseURL(canonicalCode)
+			out.BaseURL = providerBaseURLForProtocol(canonicalCode, binding.ProtocolType)
 		}
 		return out, nil
 	}
@@ -540,7 +538,15 @@ func (p *Proxy) serveRoute(w http.ResponseWriter, r *http.Request, route *vkeys.
 				// OAuth: headers already injected by oauthInject() — only set upstream URL.
 				// BaseURL may contain a path prefix (e.g. https://api.kimi.com/coding)
 				// that must be prepended to the request path.
-				if u, err := url.Parse(route.BaseURL); err == nil {
+				if route.ProviderCode == "mock" {
+					// The resident Mock Provider uses deployment-specific host/cluster
+					// addresses, so host lookup cannot identify its fingerprint row.
+					// Use the two explicit axes to attach the canonical version while
+					// preserving the runtime rail and its /mock-provider prefix.
+					if err := provider.Routes().StitchForProviderProtocol(req, route.BaseURL, route.ProviderCode, route.ProtocolType); err != nil {
+						logger.Error("rewrite Mock OAuth request failed", "error", err)
+					}
+				} else if u, err := url.Parse(route.BaseURL); err == nil {
 					req.URL.Scheme = u.Scheme
 					req.URL.Host = u.Host
 					req.Host = u.Host
@@ -652,8 +658,8 @@ func (p *Proxy) serveRoute(w http.ResponseWriter, r *http.Request, route *vkeys.
 				// next N7c pull piggybacks it to master, which re-rolls this
 				// account's window_max_util_pct when a new window starts. Present on
 				// 200s too. Observability-only side effect; never blocks the request.
-				if epoch, ok := observedResetEpoch(resp.Header); ok {
-					p.poolObservedResets.record(route.AccountID, epoch)
+				if resets, ok := observedWindowResetEpochs(resp.Header); ok {
+					p.poolObservedResets.record(route.AccountID, resets)
 				}
 				// P1-C tier-first guard (2026-07-19, sub2api "must not fall through"):
 				// a 429 whose SOLE trigger is a premium-model window (Fable 7d_oi)
@@ -684,7 +690,7 @@ func (p *Proxy) serveRoute(w http.ResponseWriter, r *http.Request, route *vkeys.
 						"tier", tierKey,
 						"until", tierUntil.Unix())
 				} else if until, ok := cooldownDecision(resp, nowT); ok {
-					p.poolCooldown.mark(route.AccountID, until)
+					p.poolCooldown.markWithState(route.AccountID, until, cooldownRouteState(resp, nowT, until))
 					logger.Warn("pool account cooled down after upstream failure",
 						"event.name", observability.EventProxyGroupAccountCooldown,
 						"oauth_group_id", route.OauthGroupID,
@@ -710,17 +716,23 @@ func (p *Proxy) serveRoute(w http.ResponseWriter, r *http.Request, route *vkeys.
 					// success proves the account serves → reset its 5xx streak.
 					p.poolCooldown.noteSuccess(route.AccountID)
 				}
-				// N10 防封 pre-cut: even on a 200, if the account's utilization
+				// N10 防封 pre-cut: on a successful response, if the account's utilization
 				// crossed its randomized cap, cool it down for this window so it
-				// never hits 100% (which looks like abuse upstream).
-				if capPct, ok := windowCapFromContext(resp.Request); ok {
-					if until, hit := windowPreCutDecision(resp.Header, capPct, time.Now()); hit {
-						p.poolCooldown.mark(route.AccountID, until)
+				// never hits 100% (which looks like abuse upstream). Error responses
+				// are owned by the reactive classifier above; an exhaustion 429 often
+				// carries the same 100%-used headers and must retain its precise state.
+				if caps, ok := windowCapsFromContext(resp.Request); ok {
+					if until, hit := successfulDualWindowPreCutDecision(resp, caps, time.Now()); hit {
+						retryAt := until.Unix()
+						p.poolCooldown.markWithState(route.AccountID, until, PoolAccountRouteState{
+							Status: poolRouteWindowProtected, RetryAt: retryAt,
+						})
 						logger.Warn("pool account pre-cut at window cap",
 							"event.name", observability.EventProxyGroupWindowPrecut,
 							"oauth_group_id", route.OauthGroupID,
 							"account_id", route.AccountID,
-							"cap_pct", capPct)
+							"cap_5h_pct", caps.FiveHour,
+							"cap_7d_pct", caps.SevenDay)
 					}
 				}
 			}

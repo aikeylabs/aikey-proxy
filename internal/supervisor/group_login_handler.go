@@ -47,6 +47,7 @@ type poolSession struct {
 	oauthGroupID     string
 	accountID        string
 	providerCode     string
+	protocolType     string
 	expectedIdentity string
 	externalID       string
 	flow             string
@@ -61,7 +62,7 @@ var errNoTeamCredential = errors.New("supervisor: no team credential (run aikey 
 // provider. brokerPoolExchanger is the production impl (memory-store broker).
 type poolExchanger interface {
 	// StartLogin begins an OAuth login and returns the session id + authorize URL.
-	StartLogin(ctx context.Context, provider string) (sessionID, authURL string, err error)
+	StartLogin(ctx context.Context, profile poolProviderProfile) (sessionID, authURL string, err error)
 	// SubmitCode exchanges the pasted code and returns the member's token material
 	// for writeback (access/refresh/expiry + the provider account UUID) plus the
 	// exchanged account's identity (email) for display / mismatch-warning. It is
@@ -89,8 +90,16 @@ type brokerPoolExchanger struct {
 	memAcc broker.AccountStore
 }
 
-func (e *brokerPoolExchanger) StartLogin(ctx context.Context, provider string) (string, string, error) {
-	s, err := e.brk.StartLogin(ctx, provider)
+func (e *brokerPoolExchanger) StartLogin(ctx context.Context, profile poolProviderProfile) (string, string, error) {
+	var (
+		s   *broker.LoginSession
+		err error
+	)
+	if profile.config != nil {
+		s, err = e.brk.StartLoginWithConfig(ctx, *profile.config)
+	} else {
+		s, err = e.brk.StartLogin(ctx, profile.broker)
+	}
 	if err != nil {
 		return "", "", err
 	}
@@ -149,23 +158,76 @@ type poolLoginHandler struct {
 type poolProviderProfile struct {
 	broker string
 	flow   string
+	config *broker.ProviderConfig
 }
 
-func poolProviderFor(code string) (poolProviderProfile, bool) {
-	switch strings.ToLower(strings.TrimSpace(code)) {
+func poolProviderFor(loginCtx poolLoginContext) (poolProviderProfile, bool) {
+	switch strings.ToLower(strings.TrimSpace(loginCtx.ProviderCode)) {
 	case "anthropic":
 		return poolProviderProfile{broker: "claude", flow: "setup_token"}, true
 	case "openai":
 		return poolProviderProfile{broker: "codex", flow: "auth_code"}, true
+	case "mock":
+		if loginCtx.OAuthAuthorizeURL == "" || loginCtx.OAuthTokenURL == "" {
+			return poolProviderProfile{}, false
+		}
+		switch strings.ToLower(strings.TrimSpace(loginCtx.ProtocolType)) {
+		case "anthropic":
+			if strings.TrimSpace(loginCtx.OAuthContext) == "" {
+				return poolProviderProfile{}, false
+			}
+			cfg := broker.ClaudeConfig
+			cfg.Code = "mock:anthropic"
+			cfg.DisplayName = "Mock Provider (Anthropic)"
+			cfg.ProviderCode = "mock"
+			cfg.ProtocolType = "anthropic"
+			cfg.IdentityProvider = "claude"
+			cfg.AuthorizeURL = loginCtx.OAuthAuthorizeURL
+			cfg.TokenURL = loginCtx.OAuthTokenURL
+			cfg.RequireTLSImpersonation = false
+			cfg.ExtraAuthorizeParams = cloneStringMap(cfg.ExtraAuthorizeParams)
+			cfg.ExtraAuthorizeParams["credential_id"] = loginCtx.CredentialID
+			cfg.ExtraAuthorizeParams["login_hint"] = loginCtx.ExpectedIdentity
+			cfg.ExtraAuthorizeParams["oauth_context"] = loginCtx.OAuthContext
+			return poolProviderProfile{broker: cfg.Code, flow: "setup_token", config: &cfg}, true
+		case "openai_compatible":
+			if strings.TrimSpace(loginCtx.OAuthContext) == "" {
+				return poolProviderProfile{}, false
+			}
+			cfg := broker.CodexConfig
+			cfg.Code = "mock:openai_compatible"
+			cfg.DisplayName = "Mock Provider (OpenAI/Codex)"
+			cfg.ProviderCode = "mock"
+			cfg.ProtocolType = "openai_compatible"
+			cfg.IdentityProvider = "codex"
+			cfg.AuthorizeURL = loginCtx.OAuthAuthorizeURL
+			cfg.TokenURL = loginCtx.OAuthTokenURL
+			cfg.ExtraAuthorizeParams = cloneStringMap(cfg.ExtraAuthorizeParams)
+			cfg.ExtraAuthorizeParams["credential_id"] = loginCtx.CredentialID
+			cfg.ExtraAuthorizeParams["login_hint"] = loginCtx.ExpectedIdentity
+			cfg.ExtraAuthorizeParams["oauth_context"] = loginCtx.OAuthContext
+			return poolProviderProfile{broker: cfg.Code, flow: "auth_code", config: &cfg}, true
+		default:
+			return poolProviderProfile{}, false
+		}
 	default:
 		return poolProviderProfile{}, false
 	}
+}
+
+func cloneStringMap(in map[string]string) map[string]string {
+	out := make(map[string]string, len(in)+1)
+	for k, v := range in {
+		out[k] = v
+	}
+	return out
 }
 
 func (h *poolLoginHandler) authorizeURL(w http.ResponseWriter, r *http.Request) {
 	var req struct {
 		Provider     string `json:"provider"`
 		CredentialID string `json:"credential_id"`
+		Namespace    string `json:"namespace,omitempty"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		poolErr(w, http.StatusBadRequest, "BAD_BODY", "invalid request body")
@@ -200,18 +262,29 @@ func (h *poolLoginHandler) authorizeURL(w http.ResponseWriter, r *http.Request) 
 		poolErr(w, status, "LOGIN_CONTEXT_UNAVAILABLE", err.Error())
 		return
 	}
-	profile, supported := poolProviderFor(loginCtx.ProviderCode)
+	profile, supported := poolProviderFor(loginCtx)
 	if !supported {
 		poolErr(w, http.StatusUnprocessableEntity, "LOGIN_PROVIDER_UNSUPPORTED",
 			"this account's provider is not supported by the local pool-login broker: "+loginCtx.ProviderCode)
 		return
+	}
+	if profile.config != nil {
+		namespace, valid := normalizeMockNamespace(req.Namespace)
+		if !valid {
+			poolErr(w, http.StatusBadRequest, "INVALID_NAMESPACE", "namespace must be 1-64 ASCII letters, digits, '.', '_', '-' or ':'")
+			return
+		}
+		cfg := *profile.config
+		cfg.ExtraAuthorizeParams = cloneStringMap(cfg.ExtraAuthorizeParams)
+		cfg.ExtraAuthorizeParams["namespace"] = namespace
+		profile.config = &cfg
 	}
 	if req.Provider != "" && !strings.EqualFold(req.Provider, profile.broker) {
 		slog.Warn("broker.pool.client_provider_ignored",
 			"credential_id", req.CredentialID, "client_provider", req.Provider,
 			"bound_provider", loginCtx.ProviderCode)
 	}
-	sid, authURL, err := h.ex.StartLogin(r.Context(), profile.broker)
+	sid, authURL, err := h.ex.StartLogin(r.Context(), profile)
 	if err != nil {
 		poolErr(w, http.StatusBadGateway, "LOGIN_START_FAILED", err.Error())
 		return
@@ -223,6 +296,7 @@ func (h *poolLoginHandler) authorizeURL(w http.ResponseWriter, r *http.Request) 
 	h.sessions.Store(sid, poolSession{
 		credentialID: loginCtx.CredentialID, oauthGroupID: loginCtx.OauthGroupID,
 		accountID: loginCtx.AccountID, providerCode: loginCtx.ProviderCode,
+		protocolType:     loginCtx.ProtocolType,
 		expectedIdentity: loginCtx.ExpectedIdentity, externalID: loginCtx.ExternalID,
 		flow: profile.flow, createdAt: time.Now(),
 	})
@@ -230,6 +304,23 @@ func (h *poolLoginHandler) authorizeURL(w http.ResponseWriter, r *http.Request) 
 		"session_id": sid, "authorize_url": authURL, "provider_code": loginCtx.ProviderCode,
 		"flow": profile.flow, "expected_identity": loginCtx.ExpectedIdentity,
 	})
+}
+
+func normalizeMockNamespace(raw string) (string, bool) {
+	value := strings.TrimSpace(raw)
+	if value == "" {
+		value = "manual"
+	}
+	if len(value) > 64 {
+		return "", false
+	}
+	for _, c := range value {
+		if (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '.' || c == '_' || c == '-' || c == ':' {
+			continue
+		}
+		return "", false
+	}
+	return value, true
 }
 
 func (h *poolLoginHandler) submitCode(w http.ResponseWriter, r *http.Request) {
@@ -294,7 +385,7 @@ func (h *poolLoginHandler) submitCode(w http.ResponseWriter, r *http.Request) {
 	}
 	if err := postMemberToken(r.Context(), h.writebackClientFn(), masterURL, bearer, memberTokenWriteback{
 		CredentialID: credentialID, AccessToken: access, RefreshToken: refresh, ExpiresAt: exp,
-		ExternalID: externalID, ProviderCode: sess.providerCode,
+		ExternalID: externalID, ProviderCode: sess.providerCode, ProtocolType: sess.protocolType,
 		OauthGroupID: sess.oauthGroupID, AccountID: sess.accountID, Identity: identity,
 	}); err != nil {
 		// DELIBERATELY keep the session (do NOT delete here): the code was already

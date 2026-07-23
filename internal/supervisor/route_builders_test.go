@@ -71,6 +71,38 @@ func TestManagedKeyToRoute_AttributesToOwnerAccount(t *testing.T) {
 	}
 }
 
+func TestBuildManagedRoutes_PreservesBothMockProtocolBindings(t *testing.T) {
+	keys := []vault.ManagedKey{
+		{
+			VirtualKeyID: "vk-mock-both", ProviderCode: "mock", ProtocolType: "anthropic",
+			BaseURL: "http://master/mock-provider/anthropic", PlaintextKey: "token-a", CredentialID: "cred-a",
+		},
+		{
+			VirtualKeyID: "vk-mock-both", ProviderCode: "mock", ProtocolType: "openai_compatible",
+			BaseURL: "http://master/mock-provider/openai", PlaintextKey: "token-o", CredentialID: "cred-o",
+		},
+	}
+
+	routes := buildManagedRoutes(keys)
+	route := routes["aikey_team_vk-mock-both"]
+	if route == nil {
+		t.Fatal("shared team token was not registered")
+	}
+	if len(route.Bindings) != 2 {
+		t.Fatalf("Bindings=%d, want both exact Mock bindings", len(route.Bindings))
+	}
+	if route.ProviderCode != "" || route.ProtocolType != "" || route.PlaintextKey != "" {
+		t.Fatalf("multi-binding container leaked an arbitrary binding: %+v", route)
+	}
+	got := map[string]string{}
+	for _, binding := range route.Bindings {
+		got[binding.ProtocolType] = binding.CredentialID
+	}
+	if got["anthropic"] != "cred-a" || got["openai_compatible"] != "cred-o" {
+		t.Fatalf("exact binding set=%v", got)
+	}
+}
+
 func TestPersonalTokenToRoute_SetsPersonalSource(t *testing.T) {
 	pt := vault.PersonalRouteToken{
 		RouteToken:   "aikey_personal_abc",

@@ -203,6 +203,20 @@ func (p *Proxy) Handle(w http.ResponseWriter, r *http.Request) {
 			"Invalid virtual key. Token not found in registry.")
 		return
 	}
+	requestedProtocol := requestProtocolFromPath(r.URL.Path)
+	clientRoute := ""
+	if requestedProtocol == "anthropic" {
+		clientRoute = "anthropic"
+	} else if requestedProtocol == "openai_compatible" {
+		clientRoute = "openai"
+	}
+	var selectErr error
+	route, selectErr = p.selectTokenBinding(route, clientRoute, requestedProtocol)
+	if selectErr != nil {
+		p.errors.Add(1)
+		writeJSONError(w, http.StatusConflict, "invalid_request_error", "PROVIDER_ROUTE_AMBIGUOUS", selectErr.Error())
+		return
+	}
 
 	// Enrich logger with route context (no secrets).
 	logger = logger.With(

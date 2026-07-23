@@ -355,11 +355,18 @@ func (p *Proxy) handleAppPipeline(w http.ResponseWriter, r *http.Request, appCtx
 	// Full provider↔protocol weld removal (attribution + isProviderCompatible
 	// + adapter-key kimi special-case) is tracked as an open item pending live
 	// cross-provider verification — see baseline-forensics §六.
+	protocolType := binding.ProtocolType
+	if protocolType == "" && cred.ManagedKey != nil && cred.ManagedKey.ProtocolType != "" {
+		protocolType = cred.ManagedKey.ProtocolType
+	}
 	protocolFamily := ""
 	if pr, ok := provider.Routes().LookupByBaseURL(cred.BaseURL); ok {
 		protocolFamily = pr.Protocol
-	} else if pr, ok := provider.Routes().ByProvider(binding.ProviderCode); ok {
-		protocolFamily = pr.Protocol
+	} else if pf, ok := provider.ProtocolFamily(binding.ProviderCode, protocolType); ok {
+		protocolFamily = pf
+	}
+	if protocolType == "" {
+		protocolType = protocolFamily
 	}
 	appResolvedRoute := &vkeys.ResolvedRoute{
 		VirtualKeyID:     route.VirtualKeyID, // "app:<slug>"
@@ -370,7 +377,7 @@ func (p *Proxy) handleAppPipeline(w http.ResponseWriter, r *http.Request, appCtx
 		OAuthIdentity:    cred.OAuthIdentity,
 		AccountID:        cred.OAuthAccountID,
 		ProviderCode:     binding.ProviderCode,
-		ProtocolType:     binding.ProviderCode,
+		ProtocolType:     protocolType,
 		ProtocolFamily:   protocolFamily,
 		RouteSource:      "app",
 		AppSlug:          route.AppSlug,
@@ -705,11 +712,18 @@ func (p *Proxy) handleProbePipeline(w http.ResponseWriter, r *http.Request, prob
 	// trust-local reads this to attribute probe events to the right pipeline.
 	// P1d (design D-10, safe slice): path-aware protocol-family resolution
 	// (see the App-pipeline sibling comment above). Audit-only blast radius.
+	protocolType := binding.ProtocolType
+	if protocolType == "" && cred.ManagedKey != nil && cred.ManagedKey.ProtocolType != "" {
+		protocolType = cred.ManagedKey.ProtocolType
+	}
 	protocolFamily := ""
 	if pr, ok := provider.Routes().LookupByBaseURL(cred.BaseURL); ok {
 		protocolFamily = pr.Protocol
-	} else if pr, ok := provider.Routes().ByProvider(binding.ProviderCode); ok {
-		protocolFamily = pr.Protocol
+	} else if pf, ok := provider.ProtocolFamily(binding.ProviderCode, protocolType); ok {
+		protocolFamily = pf
+	}
+	if protocolType == "" {
+		protocolType = protocolFamily
 	}
 	probeResolvedRoute := &vkeys.ResolvedRoute{
 		VirtualKeyID:     "probe:" + probeCtx.AliasName,
@@ -720,7 +734,7 @@ func (p *Proxy) handleProbePipeline(w http.ResponseWriter, r *http.Request, prob
 		OAuthIdentity:    cred.OAuthIdentity,
 		AccountID:        cred.OAuthAccountID,
 		ProviderCode:     binding.ProviderCode,
-		ProtocolType:     binding.ProviderCode,
+		ProtocolType:     protocolType,
 		ProtocolFamily:   protocolFamily,
 		RouteSource:      "probe",
 		FollowUserActive: false, // Probe NEVER follows active — that's the whole point of mode C.
@@ -928,10 +942,14 @@ func (p *Proxy) handlePathPrefixRoute(w http.ResponseWriter, r *http.Request, pr
 	// the query matches the provider_code stored by the server.
 	canonicalCode := providerCanonicalCode(providerCode)
 
-	// Protocol type is determined by the URL path provider code — the user's
-	// intent is explicit (e.g. /anthropic/v1/messages → Anthropic protocol).
-	// This is authoritative for both team and personal keys.
-	protocolType = providerToProtocol(canonicalCode)
+	// Protocol comes from the request dialect first. Endpoints such as /models
+	// do not identify a dialect, so legacy client routes may use the routing
+	// table only when that route name has exactly one supported protocol.
+	// Never infer a multi-protocol Provider's protocol from its identity.
+	protocolType = requestProtocolFromPath(strippedPath)
+	if protocolType == "" {
+		protocolType, _ = provider.ProtocolFamily(canonicalCode, "")
+	}
 
 	// ── 2026-04-29 prefix rename: namespace-authority dispatch ─────────────
 	// `aikey_*` tokens are AiKey's routing namespace; proxy is the
@@ -988,6 +1006,16 @@ func (p *Proxy) handlePathPrefixRoute(w http.ResponseWriter, r *http.Request, pr
 				"Route token not found in registry. Run 'aikey route' to see available tokens.")
 			return
 		}
+		var selectErr error
+		route, selectErr = p.selectTokenBinding(route, canonicalCode, protocolType)
+		if selectErr != nil {
+			p.errors.Add(1)
+			writeJSONError(w, http.StatusConflict, "invalid_request_error", "PROVIDER_ROUTE_AMBIGUOUS", selectErr.Error())
+			return
+		}
+		if route.ProtocolType != "" {
+			protocolType = route.ProtocolType
+		}
 
 		// Oauth-group VK: serve via the group handler — the path-prefix entry must
 		// wire this exactly like the legacy /v1 dispatch (handle_dispatch.go:235).
@@ -1019,7 +1047,7 @@ func (p *Proxy) handlePathPrefixRoute(w http.ResponseWriter, r *http.Request, pr
 		}
 
 		// Provider compatibility check: token's provider must match path's provider.
-		if !isProviderCompatible(route, canonicalCode) {
+		if !isProviderCompatible(route, canonicalCode, protocolType) {
 			p.errors.Add(1)
 			writeJSONError(w, http.StatusForbidden, "permission_error", "PROVIDER_MISMATCH",
 				"Route token is bound to provider '"+route.ProviderCode+
@@ -1068,7 +1096,7 @@ func (p *Proxy) handlePathPrefixRoute(w http.ResponseWriter, r *http.Request, pr
 		// Override baseURL from path's provider default if route doesn't specify one.
 		tokenBaseURL := route.BaseURL
 		if tokenBaseURL == "" {
-			tokenBaseURL = providerDefaultBaseURL(canonicalCode)
+			tokenBaseURL = providerBaseURLForProtocol(route.ProviderCode, protocolType)
 		}
 		// P1j (design D-17): fail-loud instead of forwarding to an empty base_url.
 		// providerDefaultBaseURL returns "" for a provider it doesn't know; with
@@ -1094,17 +1122,20 @@ func (p *Proxy) handlePathPrefixRoute(w http.ResponseWriter, r *http.Request, pr
 		}
 
 		tokenRoute := &vkeys.ResolvedRoute{
-			VirtualKeyID:  route.VirtualKeyID,
-			Provider:      providerCode,
-			BaseURL:       tokenBaseURL,
-			PlaintextKey:  tokenRealKey,
-			ProviderCode:  canonicalCode,
-			ProtocolType:  protocolType,
-			OrgID:         route.OrgID,
-			AccountID:     route.AccountID,
-			SeatID:        route.SeatID,
-			OAuthIdentity: oauthIdentity,
-			AllowedModels: route.AllowedModels, // Why: serveRoute checks this field for model allowlist enforcement
+			VirtualKeyID:       route.VirtualKeyID,
+			Provider:           providerCode,
+			BaseURL:            tokenBaseURL,
+			PlaintextKey:       tokenRealKey,
+			ProviderCode:       route.ProviderCode,
+			ProtocolType:       protocolType,
+			CredentialID:       route.CredentialID,
+			CredentialRevision: route.CredentialRevision,
+			VirtualKeyRevision: route.VirtualKeyRevision,
+			OrgID:              route.OrgID,
+			AccountID:          route.AccountID,
+			SeatID:             route.SeatID,
+			OAuthIdentity:      oauthIdentity,
+			AllowedModels:      route.AllowedModels, // Why: serveRoute checks this field for model allowlist enforcement
 			// Why: KeyAlias is the user-facing label for team/personal/BYOK
 			// routes (see deriveKeyLabel in reportable.go). Without copying
 			// it through, path-prefix receipts degrade to a truncated
@@ -1368,7 +1399,14 @@ func (p *Proxy) handlePathPrefixRoute(w http.ResponseWriter, r *http.Request, pr
 	// also serves the App pipeline so both paths produce identical
 	// credential records — see helper docstring for per-KeySourceType semantics.
 	binding, _ := p.activeReader.GetProviderBinding(canonicalCode)
+	upstreamProviderCode := canonicalCode
 	if binding != nil {
+		if binding.ProviderCode != "" {
+			upstreamProviderCode = binding.ProviderCode
+		}
+		if binding.ProtocolType != "" {
+			protocolType = binding.ProtocolType
+		}
 		// ── Group VK on the follow-active path (N8 / bugfix 2026-06-30) ────────
 		// A group VK (OAuth account pool) carries NO static PlaintextKey — its
 		// per-account material lives in GroupRuntime and must be served via
@@ -1402,7 +1440,7 @@ func (p *Proxy) handlePathPrefixRoute(w http.ResponseWriter, r *http.Request, pr
 			}
 		}
 
-		cred, bindErr := p.ResolveBindingCredential(r, binding, providerCode, canonicalCode, logger)
+		cred, bindErr := p.ResolveBindingCredential(r, binding, providerCode, upstreamProviderCode, logger)
 		if bindErr != nil {
 			// OAuth path: writeJSONError + return (helper does NOT increment
 			// p.errors because the caller's view of "what's an error" may
@@ -1431,7 +1469,7 @@ func (p *Proxy) handlePathPrefixRoute(w http.ResponseWriter, r *http.Request, pr
 	// user_profile_provider_bindings table.
 	if realKey == "" {
 		var err error
-		mk, err = p.activeReader.GetActiveTeamKeyByProvider(canonicalCode)
+		mk, err = p.activeReader.GetActiveTeamKeyByProvider(canonicalCode, protocolType)
 		if err != nil {
 			p.errors.Add(1)
 			logger.Error("vault: active team key lookup failed", "error", err)
@@ -1521,7 +1559,7 @@ func (p *Proxy) handlePathPrefixRoute(w http.ResponseWriter, r *http.Request, pr
 		Provider:     providerCode,
 		BaseURL:      baseURL,
 		PlaintextKey: realKey,
-		ProviderCode: canonicalCode,
+		ProviderCode: upstreamProviderCode,
 		ProtocolType: protocolType,
 		// Why: for personal/BYOK path-prefix routes, keyAlias was captured
 		// above at vault-lookup time. Without this field, reportable.go's

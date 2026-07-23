@@ -55,43 +55,44 @@ func TestIsProviderCompatible_CrossProviderSameProtocol(t *testing.T) {
 		providerCode  string
 		baseURL       string
 		canonicalPath string // path-prefix provider
+		protocol      string
 		want          bool
 	}{
 		{
 			name:         "same provider (existing)",
 			providerCode: "anthropic", baseURL: "https://api.anthropic.com",
-			canonicalPath: "anthropic", want: true,
+			canonicalPath: "anthropic", protocol: "anthropic", want: true,
 		},
 		{
 			name:         "zhipu binding on anthropic path (GLM anthropic endpoint)",
 			providerCode: "zhipu", baseURL: "https://open.bigmodel.cn/api/anthropic",
-			canonicalPath: "anthropic", want: true, // same wire protocol → compatible
+			canonicalPath: "anthropic", protocol: "anthropic", want: true, // same wire protocol → compatible
 		},
 		{
 			name:         "zhipu binding on openai path (GLM coding endpoint)",
 			providerCode: "zhipu", baseURL: "https://open.bigmodel.cn/api/coding/paas/v4",
-			canonicalPath: "openai", want: true, // both openai_compatible
+			canonicalPath: "openai", protocol: "openai_compatible", want: true, // both openai_compatible
 		},
 		{
 			name:         "zhipu anthropic endpoint on openai path — cross-protocol, reject",
 			providerCode: "zhipu", baseURL: "https://open.bigmodel.cn/api/anthropic",
-			canonicalPath: "openai", want: false, // anthropic != openai_compatible
+			canonicalPath: "openai", protocol: "openai_compatible", want: false, // anthropic != openai_compatible
 		},
 		{
 			name:         "openai binding on anthropic path — cross-protocol, reject",
 			providerCode: "openai", baseURL: "https://api.openai.com",
-			canonicalPath: "anthropic", want: false,
+			canonicalPath: "anthropic", protocol: "anthropic", want: false,
 		},
 		{
 			name:         "no base_url falls back to strict provider match",
 			providerCode: "zhipu", baseURL: "",
-			canonicalPath: "anthropic", want: false,
+			canonicalPath: "anthropic", protocol: "anthropic", want: false,
 		},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
 			route := &vkeys.ResolvedRoute{ProviderCode: c.providerCode, BaseURL: c.baseURL}
-			if got := isProviderCompatible(route, c.canonicalPath); got != c.want {
+			if got := isProviderCompatible(route, c.canonicalPath, c.protocol); got != c.want {
 				t.Errorf("isProviderCompatible(%s@%s, path=%s) = %v, want %v",
 					c.providerCode, c.baseURL, c.canonicalPath, got, c.want)
 			}

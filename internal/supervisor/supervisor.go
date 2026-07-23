@@ -53,40 +53,15 @@ import (
 	"github.com/AiKeyLabs/aikey-proxy/internal/vault"
 	"github.com/AiKeyLabs/aikey-proxy/internal/vkeys"
 	"github.com/AiKeyLabs/aikey-proxy/pkg/heartbeat"
+	"github.com/AiKeyLabs/pkg/providerroutes"
 )
 
-// providerToProtocol maps a provider code to its proxy protocol name.
-// Duplicated from proxy/middleware.go (unexported) to avoid cross-package dependency.
-func providerToProtocol(providerCode string) string {
-	switch strings.ToLower(providerCode) {
-	case "anthropic", "claude":
-		return "anthropic"
-	default:
-		return "openai_compatible"
-	}
-}
-
-// providerDefaultBaseURL returns the default upstream base URL for a provider.
-// Duplicated from proxy/middleware.go (unexported).
-func providerDefaultBaseURL(providerCode string) string {
-	switch strings.ToLower(providerCode) {
-	case "anthropic", "claude":
-		return "https://api.anthropic.com"
-	case "openai", "gpt", "chatgpt":
-		return "https://api.openai.com/v1"
-	case "google", "gemini":
-		return "https://generativelanguage.googleapis.com"
-	// 2026-05-08 Kimi 双平台拆分: kimi/moonshot 拆 case (pre-split 共用 case
-	// 错误地把 moonshot 路由到 Kimi Code endpoint)。'kimi' 为 deprecated alias。
-	case "kimi_code", "kimi":
-		return "https://api.kimi.com/coding"
-	case "moonshot":
-		return "https://api.moonshot.cn"
-	case "deepseek":
-		return "https://api.deepseek.com/v1"
-	default:
+func providerBaseURLForProtocol(providerCode, protocolType string) string {
+	route, ok := provider.Routes().ByProviderProtocol(providerCode, protocolType)
+	if !ok {
 		return ""
 	}
+	return providerroutes.EffectiveUpstream(route)
 }
 
 const (
@@ -321,6 +296,14 @@ type Supervisor struct {
 	// Reloads ONLY when the material actually changed (a token refreshed), so a
 	// 60s poll over unchanged tokens adds no churn. Mirrors lastQuotaSig.
 	lastGroupRuntimeSig atomic.Pointer[string]
+	// currentRoutedRestampKick bridges reactive whole-account cooldown changes
+	// from the request hot path to the display-only group_runtime projection.
+	// Capacity 1 intentionally coalesces an error burst; the callback never blocks
+	// and one worker performs the SQLite RMW off-path. The mutex serializes every
+	// group_runtime projection writer: reactive/override restamps and the 60s
+	// material sync, preventing an older poll snapshot from reverting a 429 switch.
+	currentRoutedRestampKick chan struct{}
+	currentRoutedRestampMu   sync.Mutex
 	// routingOverrides is the allocation engine's seat→account routing-override
 	// cache (I-side §6.5). Supervisor-scoped (not per-generation) so a reload never
 	// loses it — the same instance is injected into every Proxy. Populated by
@@ -398,18 +381,19 @@ func (s *Supervisor) VaultReader() *vault.Reader {
 func New(cfg *config.Config, configPath, password, version string) (*Supervisor, error) {
 	ctx, cancel := context.WithCancel(context.Background())
 	s := &Supervisor{
-		cfg:              cfg,
-		configPath:       configPath,
-		password:         password,
-		version:          version,
-		startedAt:        time.Now(),
-		ctx:              ctx,
-		cancel:           cancel,
-		quotaEnabled:     quotaEnabledFromEnv(),
-		quotaSnapshot:    quota.NewSnapshot(),
-		quotaCounter:     quota.NewCounter(),
-		routingOverrides: proxy.NewRoutingOverrideCache(),
-		teamCred:         &teamCredentialSource{},
+		cfg:                      cfg,
+		configPath:               configPath,
+		password:                 password,
+		version:                  version,
+		startedAt:                time.Now(),
+		ctx:                      ctx,
+		cancel:                   cancel,
+		quotaEnabled:             quotaEnabledFromEnv(),
+		quotaSnapshot:            quota.NewSnapshot(),
+		quotaCounter:             quota.NewCounter(),
+		routingOverrides:         proxy.NewRoutingOverrideCache(),
+		teamCred:                 &teamCredentialSource{},
+		currentRoutedRestampKick: make(chan struct{}, 1),
 	}
 	s.railset = newRailSet(s.groupRuntimeRail(), s.routingOverrideRail())
 	gen, err := s.buildGeneration()
@@ -417,6 +401,11 @@ func New(cfg *config.Config, configPath, password, version string) (*Supervisor,
 		return nil, fmt.Errorf("initial generation failed: %w", err)
 	}
 	s.active.Store(gen)
+	observability.GoSafe("supervisor.current_routed_restamp_loop", observability.Isolated, s.currentRoutedRestampLoop)
+	// Re-project any cooldowns hydrated from pool-cooldown.json. buildGeneration
+	// creates the Proxy before it becomes active, so the post-swap kick is the
+	// first point at which restampCurrentRouted can read the correct generation.
+	s.requestCurrentRoutedRestamp()
 	slog.Info("supervisor started",
 		"generation_id", gen.id,
 	)
@@ -765,33 +754,8 @@ func (s *Supervisor) syncManagedKeys() {
 	if err != nil {
 		slog.Warn("managed key sync: GetActiveManagedKeys failed", "error", err)
 	}
-	for i := range managedKeys {
-		mk := &managedKeys[i]
-		// N7c safety gate: a group VK (OauthGroupID != "") carries NO PlaintextKey —
-		// its per-account material lives in GroupRuntime and routing requires the
-		// group resolver (N8). Until that's enabled, do NOT register group VKs;
-		// otherwise the hot path's `PlaintextKey != ""` check fails and the request
-		// falls to the personal-key path and 401s. Gated by
-		// AIKEY_PROXY_OAUTH_GROUP_ENABLED (default off) → direct-bind path unchanged.
-		if mk.OauthGroupID != "" && !oauthGroupRoutingEnabled() {
-			continue
-		}
-		// 2026-04-29 prefix rename: team token = aikey_team_<vk_id>.
-		// Use NormalizeTeamToken so historical-prefix dirty data in
-		// mk.VirtualKeyID gets stripped+rebuilt (defense-in-depth: should
-		// be bare vk_id in cache, but we don't trust it). Empty vk_id is
-		// upstream bug — log warning and skip the row rather than register
-		// a degenerate "aikey_team_" token.
-		token, terr := NormalizeTeamToken(mk.VirtualKeyID)
-		if terr != nil {
-			slog.Warn("managed key sync: skip team key with invalid vk_id",
-				"vk_id", mk.VirtualKeyID,
-				"credential_id", mk.CredentialID,
-				"error", terr.Error(),
-			)
-			continue
-		}
-		allRoutes[token] = managedKeyToRoute(mk)
+	for token, route := range buildManagedRoutes(managedKeys) {
+		allRoutes[token] = route
 	}
 
 	// 3. Personal key route tokens. Strict-form filter is centralized in
@@ -1185,8 +1149,39 @@ func (s *Supervisor) GetKeyCheckTargets() ([]admin.KeyCheckTarget, error) {
 	var targets []admin.KeyCheckTarget
 	switch cfg.KeyType {
 	case "team":
-		for _, providerCode := range cfg.Providers {
-			mk, err := gen.vault.GetActiveTeamKeyByProvider(providerCode)
+		for _, clientRoute := range cfg.Providers {
+			// active_key_providers is a legacy name: current CLI versions store
+			// client routes here. Resolve the exact active binding first so a
+			// Mock+Anthropic key is probed as provider=mock/protocol=anthropic,
+			// never as a fictitious provider=anthropic key or a Mock protocol.
+			binding, bindErr := gen.vault.GetProviderBinding(clientRoute)
+			if bindErr != nil {
+				slog.Warn("team key binding resolve failed for health probe",
+					"event.name", "usage.health.team_binding_resolve_failed",
+					"error.code", "KEY_BINDING_RESOLVE_FAILED",
+					"client_route", clientRoute,
+					"error", bindErr)
+				continue
+			}
+
+			var mk *vault.ManagedKey
+			var err error
+			if binding != nil {
+				if binding.KeySourceType != "team" && binding.KeySourceType != "managed_virtual_key" {
+					slog.Warn("team active config points to a non-team binding",
+						"event.name", "usage.health.team_binding_type_mismatch",
+						"error.code", "KEY_BINDING_TYPE_MISMATCH",
+						"client_route", clientRoute,
+						"key_source_type", binding.KeySourceType)
+					continue
+				}
+				mk, err = gen.vault.GetTeamKeyByID(
+					binding.KeySourceRef, binding.ProviderCode, binding.ProtocolType)
+			} else {
+				// Pre-binding-table compatibility only. There is no exact Provider
+				// or Protocol available in this legacy state.
+				mk, err = gen.vault.GetActiveTeamKeyByProvider(clientRoute, "")
+			}
 			if err != nil || mk == nil {
 				// WHY: a team key that fails to resolve/decrypt used to be silently
 				// skipped here, so /health/keys just showed fewer keys and ops had no
@@ -1198,7 +1193,7 @@ func (s *Supervisor) GetKeyCheckTargets() ([]admin.KeyCheckTarget, error) {
 					slog.Warn("team key decrypt/resolve failed for health probe",
 						"event.name", "usage.health.team_key_decrypt_failed",
 						"error.code", "KEY_DECRYPT_FAILED",
-						"provider", providerCode,
+						"client_route", clientRoute,
 						"error", err,
 					)
 				}
@@ -1206,12 +1201,12 @@ func (s *Supervisor) GetKeyCheckTargets() ([]admin.KeyCheckTarget, error) {
 			}
 			baseURL := mk.BaseURL
 			if baseURL == "" {
-				if u, ok := mk.ProviderBaseURLs[providerCode]; ok && u != "" {
+				if u, ok := mk.ProviderBaseURLs[mk.ProviderCode]; ok && u != "" {
 					baseURL = u
 				}
 			}
 			targets = append(targets, admin.KeyCheckTarget{
-				Provider: providerCode,
+				Provider: mk.ProviderCode,
 				Protocol: mk.ProtocolType,
 				BaseURL:  baseURL,
 				APIKey:   mk.PlaintextKey,
@@ -1234,15 +1229,33 @@ func (s *Supervisor) GetKeyCheckTargets() ([]admin.KeyCheckTarget, error) {
 			}
 		}
 		for _, pcode := range providerList {
-			// Each provider may have its own default base URL; use the stored URL if set
-			// (custom gateways share one URL across all protocols).
+			// Resolve the endpoint row as a pair. A custom URL is authoritative;
+			// otherwise the Provider must have one unambiguous protocol in the
+			// routing table. Do not restore the former provider→protocol switch.
+			resolvedProvider := pcode
+			protocol := ""
 			burl := baseURL
-			if burl == "" {
-				burl = personalProviderBaseURL(pcode)
+			if burl != "" {
+				if route, ok := provider.Routes().LookupByBaseURL(burl); ok {
+					resolvedProvider = route.Provider
+					protocol = route.Protocol
+				} else {
+					protocol, _ = provider.ProtocolFamily(pcode, "")
+				}
+			} else if uniqueProtocol, ok := provider.ProtocolFamily(pcode, ""); ok {
+				protocol = uniqueProtocol
+				burl = providerBaseURLForProtocol(pcode, protocol)
+			}
+			if protocol == "" || burl == "" {
+				slog.Warn("personal key health target has no exact provider/protocol route",
+					"event.name", "usage.health.personal_route_unresolved",
+					"provider", pcode,
+					"key_ref", cfg.KeyRef)
+				continue
 			}
 			targets = append(targets, admin.KeyCheckTarget{
-				Provider: pcode,
-				Protocol: providerProtocol(pcode),
+				Provider: resolvedProvider,
+				Protocol: protocol,
 				BaseURL:  burl,
 				APIKey:   plaintext,
 				KeyRef:   cfg.KeyRef,
@@ -1250,40 +1263,6 @@ func (s *Supervisor) GetKeyCheckTargets() ([]admin.KeyCheckTarget, error) {
 		}
 	}
 	return targets, nil
-}
-
-// personalProviderBaseURL returns the default upstream base URL for a known provider code.
-// Used when a personal key entry has no custom base_url stored.
-func personalProviderBaseURL(code string) string {
-	switch strings.ToLower(code) {
-	case "anthropic", "claude":
-		return "https://api.anthropic.com"
-	case "openai":
-		return "https://api.openai.com/v1"
-	case "google", "gemini":
-		return "https://generativelanguage.googleapis.com"
-	// 2026-05-08 Kimi 双平台拆分(同 supervisor.providerDefaultBaseURL)
-	case "kimi_code", "kimi":
-		return "https://api.kimi.com/coding"
-	case "moonshot":
-		return "https://api.moonshot.cn"
-	case "deepseek":
-		return "https://api.deepseek.com/v1"
-	default:
-		return ""
-	}
-}
-
-// providerProtocol maps a provider code to its auth/wire protocol name.
-func providerProtocol(code string) string {
-	switch strings.ToLower(code) {
-	case "anthropic", "claude":
-		return "anthropic"
-	case "google", "gemini":
-		return "google"
-	default:
-		return "openai"
-	}
 }
 
 // Reload builds a new generation, swaps it as active if the readiness gate
@@ -1336,6 +1315,9 @@ func (s *Supervisor) Reload(ctx context.Context) error {
 
 	// Swap to new generation — new requests go to newGen from this point.
 	s.active.Store(newGen)
+	// The new Proxy hydrates persisted cooldowns independently; re-stamp its
+	// display projection after the generation becomes active.
+	s.requestCurrentRoutedRestamp()
 	slog.Info("reload: new generation active",
 		"event.name", observability.EventProxyReloadCompleted,
 		"reload_id", reloadID,
@@ -1422,21 +1404,7 @@ func (s *Supervisor) buildGeneration() (*generation, error) {
 	if managedKeys, mkErr := vaultReader.GetActiveManagedKeys(); mkErr != nil {
 		slog.Warn("could not load managed virtual keys", "error", mkErr)
 	} else if len(managedKeys) > 0 {
-		managedRoutes := make(map[string]*vkeys.ResolvedRoute, len(managedKeys))
-		for i := range managedKeys {
-			mk := &managedKeys[i]
-			token, terr := NormalizeTeamToken(mk.VirtualKeyID)
-			if terr != nil {
-				slog.Warn("buildGeneration: skip team key with invalid vk_id",
-					"vk_id", mk.VirtualKeyID,
-					"credential_id", mk.CredentialID,
-					"error", terr.Error(),
-				)
-				continue
-			}
-			managedRoutes[token] = managedKeyToRoute(mk)
-		}
-		registry.Merge(managedRoutes)
+		registry.Merge(buildManagedRoutes(managedKeys))
 	}
 
 	// Load personal-key + OAuth bearers (v1.0.4+) into the registry.
@@ -1485,6 +1453,10 @@ func (s *Supervisor) buildGeneration() (*generation, error) {
 	// Unconditional + nil-safe: an empty cache (no team cred / control URL / poll
 	// not landed) just means every request uses the local seatassign pick.
 	p.SetRoutingOverrides(s.routingOverrides)
+	// Whole-account cooldown changes happen on the request hot path. The hook is
+	// deliberately a non-blocking channel kick; SQLite restamping runs in the
+	// supervisor-owned worker and can never delay the upstream response.
+	p.SetPoolCooldownChangeHook(s.requestCurrentRoutedRestamp)
 	// Local console base for member-login URLs in group login-required 401s
 	// (20260703 update). Explicitly-empty (cluster/server configs) → URL-less
 	// fallback; absent key (pre-20260703 preserved configs) → default 8090.

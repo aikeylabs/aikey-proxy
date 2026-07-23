@@ -25,6 +25,8 @@ var ErrSecretNotFound = errors.New("secret not found in vault")
 // (e.g. "Claude", "claude", or "anthropic" all refer to the same provider).
 func providerCodeAliases(code string) []string {
 	switch strings.ToLower(code) {
+	case "":
+		return nil
 	case "anthropic", "claude":
 		return []string{"anthropic", "claude"}
 	case "openai", "gpt", "chatgpt":
@@ -416,21 +418,21 @@ func (r *Reader) queryManagedKeys(withGroup bool) ([]ManagedKey, error) {
 			_ = json.Unmarshal([]byte(*providerBaseURLsJSON), &providerBaseURLs)
 		}
 		keys = append(keys, ManagedKey{
-			VirtualKeyID:       vkID,
-			LocalAlias:         derefStr(localAlias),
-			ProviderCode:       provCode,
-			ProtocolType:       protType,
-			BaseURL:            baseURL,
-			PlaintextKey:       plaintextKey,
-			ProviderBaseURLs:   providerBaseURLs,
-			OrgID:              orgID,
-			SeatID:             seatID,
-			CredentialID:       credID,
-			CredentialRevision: credRev,
-			VirtualKeyRevision: vkRev,
-			OwnerAccountID:     derefStr(ownerAccountID),
-			OauthGroupID:        sgID,
-			GroupAccounts:      derefStr(groupAccounts),
+			VirtualKeyID:         vkID,
+			LocalAlias:           derefStr(localAlias),
+			ProviderCode:         provCode,
+			ProtocolType:         protType,
+			BaseURL:              baseURL,
+			PlaintextKey:         plaintextKey,
+			ProviderBaseURLs:     providerBaseURLs,
+			OrgID:                orgID,
+			SeatID:               seatID,
+			CredentialID:         credID,
+			CredentialRevision:   credRev,
+			VirtualKeyRevision:   vkRev,
+			OwnerAccountID:       derefStr(ownerAccountID),
+			OauthGroupID:         sgID,
+			GroupAccounts:        derefStr(groupAccounts),
 			GroupRuntime:         derefStr(groupRuntime),
 			RoutingConfig:        derefStr(routingConfig),
 			MyAssignmentOverride: derefStr(myAssignmentOverride),
@@ -683,8 +685,10 @@ func (r *Reader) GetActiveKeyConfig() (*ActiveKeyConfig, error) {
 }
 
 // GetActiveTeamKeyByProvider returns the first usable decrypted team key for the
-// given provider code. Used as a legacy fallback by the Tier3 active-sentinel
-// path when `user_profile_provider_bindings` has no entry (pre-v1.0.2 vaults).
+// given provider and optional protocol. Used as a legacy fallback by the Tier3
+// active-sentinel path when `user_profile_provider_bindings` has no entry
+// (pre-v1.0.2 vaults). Routing callers must pass protocolType; an empty protocol
+// is reserved for legacy diagnostics that genuinely have no request dialect.
 //
 // Why no local_state='active' gate (2026-05-09): same reason as
 // GetActiveManagedKeys — the CLI never promotes keys to that state, so the
@@ -693,12 +697,12 @@ func (r *Reader) GetActiveKeyConfig() (*ActiveKeyConfig, error) {
 // and this fallback now matches that semantic. Bugfix:
 // workflow/CI/bugfix/20260509-team-key-tier1-registry-empty.md.
 //
-// LIMIT 1 picks an arbitrary row when multiple usable team keys exist for the
-// same provider — acceptable because real routing always goes through the
-// binding table; this fallback only fires for legacy vaults with one team key.
+// LIMIT 1 may still choose among multiple rows of the same exact pair; that is
+// acceptable only for this pre-binding-table compatibility path. It must never
+// choose across protocols when protocolType is supplied.
 //
 // Returns nil if no usable team key exists for that provider.
-func (r *Reader) GetActiveTeamKeyByProvider(providerCode string) (*ManagedKey, error) {
+func (r *Reader) GetActiveTeamKeyByProvider(providerCode, protocolType string) (*ManagedKey, error) {
 	// Expand the provider code to all known aliases so that e.g. "anthropic"
 	// also matches rows stored as "Claude" or "claude" by the server.
 	aliases := providerCodeAliases(providerCode)
@@ -707,6 +711,11 @@ func (r *Reader) GetActiveTeamKeyByProvider(providerCode string) (*ManagedKey, e
 	for i, a := range aliases {
 		placeholders[i] = "?"
 		args[i] = a
+	}
+	protocolFilter := ""
+	if protocolType != "" {
+		protocolFilter = " AND LOWER(protocol_type) = ?"
+		args = append(args, strings.ToLower(protocolType))
 	}
 	// 2026-05-09: include effective alias (COALESCE local_alias / alias) for
 	// receipt / WAL surfacing of team key alias.
@@ -725,7 +734,7 @@ func (r *Reader) GetActiveTeamKeyByProvider(providerCode string) (*ManagedKey, e
 		  AND COALESCE(local_state, '') != 'stale'
 		  AND COALESCE(local_state, '') NOT LIKE 'disabled_by_%'
 		  AND LOWER(provider_code) IN (`
-	const querySuffix = `)
+	querySuffix := `)` + protocolFilter + `
 		LIMIT 1
 	`
 	query := queryPrefix + strings.Join(placeholders, ",") + querySuffix
@@ -790,31 +799,34 @@ func (r *Reader) GetActiveTeamKeyByProvider(providerCode string) (*ManagedKey, e
 // AND the official Anthropic(official key) at once. `targetProviderCode` is the
 // truthful upstream provider the request resolved to (canonicalCode at the call
 // site); we pick the binding for that provider so each request reaches its own
-// upstream with its own credential. When the target is empty or the VK does not
-// carry it, we fall back to the deterministic primary (stable provider_code
-// order) — byte-identical to the pre-P1e single-row behavior for legacy VKs.
-func (r *Reader) GetTeamKeyByID(virtualKeyID, targetProviderCode string) (*ManagedKey, error) {
+// upstream with its own credential. A non-empty target is exact and never
+// falls through to another row. Only callers that provide neither axis get the
+// deterministic legacy primary.
+func (r *Reader) GetTeamKeyByID(virtualKeyID, targetProviderCode, protocolType string) (*ManagedKey, error) {
 	var provCode, protType, baseURL, effectiveAlias string
 	var nonce, ciphertext []byte
 	var providerBaseURLsJSON *string
 	var orgID, seatID string
 	var ownerAccountID *string
 
-	// Prefer the binding whose provider_code matches the resolved upstream
-	// (expanded to known aliases so "anthropic" also matches "claude" etc.), then
-	// a stable order for determinism. args: vk_id, then one arg per alias, all
-	// bound (no injection); the only concatenated part is the "?,?,…" list length.
+	// Exact Provider+Protocol filters are authoritative. A specified pair that
+	// is absent must not fall through to another row of the same VK.
 	aliases := providerCodeAliases(targetProviderCode)
 	placeholders := make([]string, len(aliases))
-	args := make([]any, 0, len(aliases)+1)
+	args := make([]any, 0, len(aliases)+2)
 	args = append(args, virtualKeyID)
 	for i, a := range aliases {
 		placeholders[i] = "?"
 		args = append(args, a)
 	}
-	preferMatch := "0"
+	providerFilter := ""
 	if len(aliases) > 0 {
-		preferMatch = "CASE WHEN LOWER(provider_code) IN (" + strings.Join(placeholders, ",") + ") THEN 0 ELSE 1 END"
+		providerFilter = " AND LOWER(provider_code) IN (" + strings.Join(placeholders, ",") + ")"
+	}
+	protocolFilter := ""
+	if protocolType != "" {
+		protocolFilter = " AND LOWER(protocol_type) = ?"
+		args = append(args, strings.ToLower(protocolType))
 	}
 	// 2026-05-09: include effective alias (COALESCE local_alias / alias) so
 	// route's KeyAlias surfaces in WAL `key_label` and statusline receipt.
@@ -829,7 +841,8 @@ func (r *Reader) GetTeamKeyByID(virtualKeyID, targetProviderCode string) (*Manag
 		WHERE virtual_key_id = ?
 		  AND key_status = 'active'
 		  AND provider_key_ciphertext IS NOT NULL
-		ORDER BY `+preferMatch+` ASC, provider_code ASC
+		  `+providerFilter+protocolFilter+`
+		ORDER BY provider_code ASC, protocol_type ASC
 		LIMIT 1
 	`, args...).Scan(
 		&provCode, &protType, &baseURL, &effectiveAlias, &nonce, &ciphertext, &providerBaseURLsJSON,
@@ -901,7 +914,9 @@ func (r *Reader) GetTeamKeyByID(virtualKeyID, targetProviderCode string) (*Manag
 // written by the CLI; "personal_api_key" / "managed_virtual_key" are
 // accepted on read but never produced.
 type ProviderBinding struct {
+	ClientRoute   string
 	ProviderCode  string
+	ProtocolType  string
 	KeySourceType string
 	KeySourceRef  string // alias (personal) / virtual_key_id (team) / provider_account_id (oauth)
 }
@@ -927,14 +942,26 @@ func (r *Reader) GetProviderBinding(providerCode string) (*ProviderBinding, erro
 // no enum constraint, so any string value is structurally valid — the
 // `app:` prefix is a writer-side convention enforced by `aikey app
 // authorize`, not by SQL.
-func (r *Reader) GetProviderBindingWithScope(profileID, providerCode string) (*ProviderBinding, error) {
-	var sourceType, sourceRef string
-	err := r.db.QueryRow(
-		`SELECT key_source_type, key_source_ref
-		   FROM user_profile_provider_bindings
-		  WHERE profile_id = ? AND provider_code = ?`,
-		profileID, providerCode,
-	).Scan(&sourceType, &sourceRef)
+func (r *Reader) GetProviderBindingWithScope(profileID, clientRoute string) (*ProviderBinding, error) {
+	var providerCode, protocolType, sourceType, sourceRef string
+	var err error
+	if hasColumn(r.db, "user_profile_provider_bindings", "binding_provider_code") &&
+		hasColumn(r.db, "user_profile_provider_bindings", "protocol_type") {
+		err = r.db.QueryRow(
+			`SELECT binding_provider_code, protocol_type, key_source_type, key_source_ref
+			   FROM user_profile_provider_bindings
+			  WHERE profile_id = ? AND provider_code = ?`,
+			profileID, clientRoute,
+		).Scan(&providerCode, &protocolType, &sourceType, &sourceRef)
+	} else {
+		providerCode = clientRoute
+		err = r.db.QueryRow(
+			`SELECT key_source_type, key_source_ref
+			   FROM user_profile_provider_bindings
+			  WHERE profile_id = ? AND provider_code = ?`,
+			profileID, clientRoute,
+		).Scan(&sourceType, &sourceRef)
+	}
 	if err == sql.ErrNoRows {
 		return nil, nil
 	}
@@ -943,10 +970,12 @@ func (r *Reader) GetProviderBindingWithScope(profileID, providerCode string) (*P
 		if strings.Contains(err.Error(), "no such table") {
 			return nil, nil
 		}
-		return nil, fmt.Errorf("read provider binding for profile=%q provider=%q: %w", profileID, providerCode, err)
+		return nil, fmt.Errorf("read provider binding for profile=%q client_route=%q: %w", profileID, clientRoute, err)
 	}
 	return &ProviderBinding{
+		ClientRoute:   clientRoute,
 		ProviderCode:  providerCode,
+		ProtocolType:  protocolType,
 		KeySourceType: sourceType,
 		KeySourceRef:  sourceRef,
 	}, nil
@@ -1058,10 +1087,11 @@ type PersonalRouteToken struct {
 
 // OAuthRouteToken represents an OAuth account's route token for Registry registration.
 type OAuthRouteToken struct {
-	AccountID  string
-	RouteToken string
-	Provider   string
-	Identity   string // display identity (email or display name)
+	AccountID    string
+	RouteToken   string
+	Provider     string
+	ProtocolType string
+	Identity     string // display identity (email or display name)
 }
 
 // hasColumn checks if a column exists on a table (via PRAGMA table_info).
@@ -1139,8 +1169,15 @@ func (r *Reader) GetAllOAuthRouteTokens() ([]OAuthRouteToken, error) {
 		return nil, ErrMissingRouteTokenColumn
 	}
 
+	// A pre-protocol-column vault has no truthful protocol axis. Leave it empty;
+	// the supervisor may recover only a unique protocol from the declarative
+	// route table. Never encode provider→protocol inference in SQL.
+	protocolExpr := `''`
+	if hasColumn(r.db, "provider_accounts", "protocol_type") {
+		protocolExpr = "protocol_type"
+	}
 	rows, err := r.db.Query(
-		"SELECT provider_account_id, route_token, provider, display_identity " +
+		"SELECT provider_account_id, route_token, provider, " + protocolExpr + ", display_identity " +
 			"FROM provider_accounts WHERE route_token IS NOT NULL AND status = 'active'",
 	)
 	if err != nil {
@@ -1152,7 +1189,7 @@ func (r *Reader) GetAllOAuthRouteTokens() ([]OAuthRouteToken, error) {
 	for rows.Next() {
 		var t OAuthRouteToken
 		var identity *string
-		if err := rows.Scan(&t.AccountID, &t.RouteToken, &t.Provider, &identity); err != nil {
+		if err := rows.Scan(&t.AccountID, &t.RouteToken, &t.Provider, &t.ProtocolType, &identity); err != nil {
 			slog.Warn("skip oauth route token row", "error", err)
 			continue
 		}

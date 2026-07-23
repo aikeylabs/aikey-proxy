@@ -152,7 +152,7 @@ func TestResolveOAuthUpstream_StripsV1ForCodex(t *testing.T) {
 	}
 	for _, c := range cases {
 		r := httptest.NewRequest("POST", c.inPath, strings.NewReader(`{"model":"gpt-5"}`))
-		_, out := resolveOAuthUpstream(c.code, r)
+		_, out := resolveOAuthUpstream(c.code, "", r)
 		if out.URL.Path != c.wantPath {
 			t.Errorf("resolveOAuthUpstream(%q, %q): forwarded path = %q, want %q",
 				c.code, c.inPath, out.URL.Path, c.wantPath)

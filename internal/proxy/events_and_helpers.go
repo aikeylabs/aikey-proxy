@@ -149,7 +149,10 @@ func (p *Proxy) buildBaseEvent(req *http.Request, resp *http.Response, startTime
 	// window duration, so master/engine see the identical (util_5h, util_7d) shape.
 	if resp != nil {
 		if util5h, ok := parseUnifiedUtil5h(resp.Header); ok {
-			util7d, _ := parseUnifiedUtil7d(resp.Header)
+			var util7d *float64
+			if observed, present := parseUnifiedUtil7d(resp.Header); present {
+				util7d = &observed
+			}
 			p.signalReporter.enqueue(route.CredentialID, time.Now().Unix(), util5h, util7d)
 		} else if util5h, util7d, ok := parseCodexUtil(resp.Header); ok {
 			p.signalReporter.enqueue(route.CredentialID, time.Now().Unix(), util5h, util7d)

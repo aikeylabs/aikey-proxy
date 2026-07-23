@@ -10,9 +10,12 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
+	"github.com/AiKeyLabs/aikey-proxy/internal/proxy"
 	"github.com/AiKeyLabs/aikey-proxy/internal/vault"
 	"github.com/AiKeyLabs/aikey-proxy/internal/vkeys"
+	"github.com/AiKeyLabs/pkg/routingwire"
 	_ "modernc.org/sqlite"
 )
 
@@ -31,6 +34,7 @@ func TestBuildGroupRuntimeJSON_EncryptsBothTypesNoRefresh(t *testing.T) {
 	accts := []grAccount{
 		{AccountID: "a-oauth", CredentialType: "oauth_account", AccessToken: "at-live", ExpiresAt: 200,
 			WindowMaxUtilPct: &pct, WindowStatus: "active", WindowResetAt: &reset,
+			BaseURL:        "http://127.0.0.1:3000/mock-provider/anthropic",
 			EgressProxyURL: "socks5://10.0.0.9:1080"}, // per-account egress (§11.7, P7) — member rail
 		{AccountID: "a-key", CredentialType: "api_key", Key: "sk-real", BaseURL: "https://x", Revision: "r9"},
 	}
@@ -59,8 +63,8 @@ func TestBuildGroupRuntimeJSON_EncryptsBothTypesNoRefresh(t *testing.T) {
 	if oa.ExpiresAt != 200 || oa.WindowMaxUtilPct == nil || *oa.WindowMaxUtilPct != 97 || oa.WindowStatus != "active" {
 		t.Fatalf("oauth meta wrong: %+v", oa)
 	}
-	if oa.BaseURL != "" || oa.Revision != "" {
-		t.Fatalf("oauth must not carry KEY meta: %+v", oa)
+	if oa.BaseURL != "http://127.0.0.1:3000/mock-provider/anthropic" || oa.Revision != "" {
+		t.Fatalf("oauth routing metadata or KEY-only revision wrong: %+v", oa)
 	}
 	// Per-account egress (§11.7, P7) must survive the member-rail projection into the
 	// vault material so the resolver hands it to accountEgressTransport — without this
@@ -108,7 +112,7 @@ func TestFetchGroupRuntime_ParsesAndSendsBearer(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	groups, body, err := fetchGroupRuntime(context.Background(), srv.URL, "JWT123", map[string]int64{"acc-1": 1750000000})
+	groups, body, err := fetchGroupRuntime(context.Background(), srv.URL, "JWT123", map[string]proxy.ObservedWindowResets{"acc-1": {FiveHour: 1750000000, SevenDay: 1750600000}})
 	if err != nil || len(groups) != 1 || groups[0].OauthGroupID != "grp-1" || len(groups[0].Accounts) != 1 {
 		t.Fatalf("fetch: err=%v groups=%+v", err, groups)
 	}
@@ -129,8 +133,8 @@ func TestFetchGroupRuntime_ParsesAndSendsBearer(t *testing.T) {
 	if decErr != nil {
 		t.Fatalf("observed-resets header not base64: %v", decErr)
 	}
-	var m map[string]int64
-	if json.Unmarshal(raw, &m) != nil || m["acc-1"] != 1750000000 {
+	var m map[string]proxy.ObservedWindowResets
+	if json.Unmarshal(raw, &m) != nil || m["acc-1"].FiveHour != 1750000000 || m["acc-1"].SevenDay != 1750600000 {
 		t.Fatalf("observed-resets header payload wrong: %q → %+v", string(raw), m)
 	}
 
@@ -313,9 +317,10 @@ func TestComputeRoutedAccountID_CoolingAware_MatchesHotPath(t *testing.T) {
 	if got := computeRoutedAccountID(mk, nil, func(string, string) string { return def }, map[string]bool{def: true}, 1_000_000); got != other {
 		t.Fatalf("cooled override must fall through to %q, got %q", other, got)
 	}
-	// ALL cooled → nominal rank-0 (hot path would 429; display shows the engine pick).
-	if got := computeRoutedAccountID(mk, nil, nil, map[string]bool{"a1": true, "a2": true}, 1_000_000); got != def {
-		t.Fatalf("all cooled → nominal rank-0 %q, got %q", def, got)
+	// ALL cooled → no current route. The hot path cannot forward, so the
+	// display must not invent a nominal account that is not actually usable.
+	if got := computeRoutedAccountID(mk, nil, nil, map[string]bool{"a1": true, "a2": true}, 1_000_000); got != "" {
+		t.Fatalf("all cooled → no current route, got %q", got)
 	}
 }
 
@@ -343,8 +348,8 @@ func TestWriteGroupRuntimeForGroups_StampsCurrentRouted(t *testing.T) {
 		{VirtualKeyID: "vk-s2", OauthGroupID: "grp-1", SeatID: "seat-2", GroupAccounts: twoCandGroupAccounts},
 	}
 	groups := []grGroup{{OauthGroupID: "grp-1", Accounts: []grAccount{
-		{AccountID: "a1", CredentialType: "oauth_account", AccessToken: "t1", ExpiresAt: 9},
-		{AccountID: "a2", CredentialType: "oauth_account", AccessToken: "t2", ExpiresAt: 9},
+		{AccountID: "a1", CredentialType: "oauth_account", AccessToken: "t1", ExpiresAt: 4_000_000_000},
+		{AccountID: "a2", CredentialType: "oauth_account", AccessToken: "t2", ExpiresAt: 4_000_000_000},
 	}}}
 	// Force seat-1 → a1 via override; seat-2 gets no override (rank-0).
 	overrideFor := func(seat, _ string) string {
@@ -408,5 +413,183 @@ func TestStampCurrentRoutedJSON_FlipsFlagInPlace(t *testing.T) {
 	// Idempotent: re-stamping the same routed account reports no change.
 	if _, changed2, _ := stampCurrentRoutedJSON(out, "a2"); changed2 {
 		t.Fatalf("re-stamp of unchanged routed must report changed=false")
+	}
+}
+
+func TestStampGroupRuntimeProjection_ProjectsAndClearsCooldownState(t *testing.T) {
+	orig := `{"a1":{"credential_type":"oauth_account","secret_ciphertext":"ZZ","is_current_routed":true},"a2":{"credential_type":"oauth_account","secret_ciphertext":"YY"}}`
+	resetAt := int64(1_750_003_600)
+	out, changed, err := stampGroupRuntimeProjectionJSON(orig, "a2", map[string]proxy.PoolAccountRouteState{
+		"a1": {Status: "window_exhausted", RetryAt: resetAt},
+	})
+	if err != nil || !changed {
+		t.Fatalf("project: changed=%v err=%v", changed, err)
+	}
+	var projected map[string]vkeys.GroupRuntimeAccount
+	if err := json.Unmarshal([]byte(out), &projected); err != nil {
+		t.Fatalf("decode projection: %v", err)
+	}
+	if projected["a1"].RouteStatus != "window_exhausted" || projected["a1"].RouteRetryAt == nil || *projected["a1"].RouteRetryAt != resetAt {
+		t.Fatalf("a1 route state missing: %+v", projected["a1"])
+	}
+	if !projected["a2"].IsCurrentRouted || projected["a1"].IsCurrentRouted {
+		t.Fatalf("current route must switch a1→a2: %+v", projected)
+	}
+	if projected["a1"].SecretCiphertext != "ZZ" {
+		t.Fatalf("projection must not alter secrets: %+v", projected["a1"])
+	}
+
+	cleared, changed, err := stampGroupRuntimeProjectionJSON(out, "a1", nil)
+	if err != nil || !changed {
+		t.Fatalf("clear: changed=%v err=%v", changed, err)
+	}
+	if err := json.Unmarshal([]byte(cleared), &projected); err != nil {
+		t.Fatalf("decode cleared projection: %v", err)
+	}
+	if projected["a1"].RouteStatus != "" || projected["a1"].RouteRetryAt != nil {
+		t.Fatalf("expired cooldown projection must clear: %+v", projected["a1"])
+	}
+}
+
+// Regression fence (2026-07-22): cooldown mutations reach this worker through
+// a non-blocking hook. The cooldown-store test fences that producer; this test
+// fences the consumer end-to-end through a real vault row, proving one wake-up
+// moves the display flag without a material fetch or Proxy reload.
+func TestCurrentRoutedRestampWorker_ProjectsWakeup(t *testing.T) {
+	dbPath, reader := newOpenableVault(t, []map[string]string{
+		{"vk": "vk-route", "seat": "seat-route", "group": "grp-route", "override": ""},
+	})
+
+	mk := vault.ManagedKey{
+		VirtualKeyID:  "vk-route",
+		SeatID:        "seat-route",
+		OauthGroupID:  "grp-route",
+		GroupAccounts: twoCandGroupAccounts,
+	}
+	correct := computeRoutedAccountID(mk, nil, nil, nil, 1_000_000)
+	wrong := "a1"
+	if correct == wrong {
+		wrong = "a2"
+	}
+	runtimeJSON, err := json.Marshal(map[string]vkeys.GroupRuntimeAccount{
+		"a1": {CredentialType: "api_key", IsCurrentRouted: wrong == "a1"},
+		"a2": {CredentialType: "api_key", IsCurrentRouted: wrong == "a2"},
+	})
+	if err != nil {
+		t.Fatalf("marshal runtime: %v", err)
+	}
+	db, err := sql.Open("sqlite", dbPath)
+	if err != nil {
+		t.Fatalf("open update db: %v", err)
+	}
+	if _, err := db.Exec(`UPDATE managed_virtual_keys_cache
+		SET group_accounts=?, group_runtime=? WHERE virtual_key_id='vk-route'`,
+		twoCandGroupAccounts, string(runtimeJSON)); err != nil {
+		db.Close()
+		t.Fatalf("seed stale current_routed: %v", err)
+	}
+	db.Close()
+
+	s := newPersistSupervisor(dbPath, reader)
+	s.currentRoutedRestampKick = make(chan struct{}, 1)
+	s.ctx, s.cancel = context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		s.currentRoutedRestampLoop()
+	}()
+	t.Cleanup(func() {
+		s.cancel()
+		<-done
+	})
+
+	s.requestCurrentRoutedRestamp()
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		db, err := sql.Open("sqlite", dbPath)
+		if err != nil {
+			t.Fatalf("open verify db: %v", err)
+		}
+		var gotJSON string
+		err = db.QueryRow(`SELECT group_runtime FROM managed_virtual_keys_cache
+			WHERE virtual_key_id='vk-route'`).Scan(&gotJSON)
+		db.Close()
+		if err != nil {
+			t.Fatalf("read restamped runtime: %v", err)
+		}
+		var got map[string]vkeys.GroupRuntimeAccount
+		if json.Unmarshal([]byte(gotJSON), &got) == nil && got[correct].IsCurrentRouted && !got[wrong].IsCurrentRouted {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("wake-up did not move current_routed %s→%s; runtime=%s", wrong, correct, gotJSON)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+}
+
+// The material rail and reactive restamp both write the same group_runtime
+// column. The material writer must join the projection mutex and capture routing
+// state only after it owns that lock; otherwise a slow 60s pull can overwrite a
+// newer 429-driven account switch with its stale current_routed flag.
+func TestWriteGroupRuntimeSnapshot_SerializesWithReactiveRestamp(t *testing.T) {
+	dbPath, reader := newOpenableVault(t, []map[string]string{
+		{"vk": "vk-route", "seat": "seat-route", "group": "grp-route", "override": ""},
+	})
+	s := newPersistSupervisor(dbPath, reader)
+	mk := vault.ManagedKey{
+		VirtualKeyID:  "vk-route",
+		SeatID:        "seat-route",
+		OauthGroupID:  "grp-route",
+		GroupAccounts: twoCandGroupAccounts,
+	}
+	groups := []grGroup{{OauthGroupID: "grp-route", Accounts: []grAccount{
+		{AccountID: "a1", CredentialType: "oauth_account", AccessToken: "t1", ExpiresAt: time.Now().Add(time.Hour).Unix()},
+		{AccountID: "a2", CredentialType: "oauth_account", AccessToken: "t2", ExpiresAt: time.Now().Add(time.Hour).Unix()},
+	}}}
+
+	// Hold the same lock a reactive restamp owns. A material writer launched now
+	// must not reach SQLite until that restamp has published its latest assignment.
+	s.currentRoutedRestampMu.Lock()
+	started := make(chan struct{})
+	done := make(chan error, 1)
+	go func() {
+		close(started)
+		done <- s.writeGroupRuntimeSnapshot(s.active.Load(), []vault.ManagedKey{mk}, groups)
+	}()
+	<-started
+	select {
+	case err := <-done:
+		s.currentRoutedRestampMu.Unlock()
+		t.Fatalf("material writer bypassed projection mutex: %v", err)
+	case <-time.After(50 * time.Millisecond):
+	}
+
+	// Publish the newest routing truth while the writer is blocked. It must read
+	// this value after acquiring the mutex, not retain a pre-lock snapshot.
+	s.routingOverrides.StoreRoutes(91, []routingwire.RouteEntry{{
+		SeatID: "seat-route", GroupID: "grp-route", AccountID: "a2",
+	}})
+	s.currentRoutedRestampMu.Unlock()
+	if err := <-done; err != nil {
+		t.Fatalf("write material snapshot: %v", err)
+	}
+
+	db, err := sql.Open("sqlite", dbPath)
+	if err != nil {
+		t.Fatalf("open verify db: %v", err)
+	}
+	defer db.Close()
+	var gotJSON string
+	if err := db.QueryRow(`SELECT group_runtime FROM managed_virtual_keys_cache
+		WHERE virtual_key_id='vk-route'`).Scan(&gotJSON); err != nil {
+		t.Fatalf("read group_runtime: %v", err)
+	}
+	var got map[string]vkeys.GroupRuntimeAccount
+	if err := json.Unmarshal([]byte(gotJSON), &got); err != nil {
+		t.Fatalf("parse group_runtime: %v", err)
+	}
+	if !got["a2"].IsCurrentRouted || got["a1"].IsCurrentRouted {
+		t.Fatalf("material writer reverted newest route; runtime=%s", gotJSON)
 	}
 }

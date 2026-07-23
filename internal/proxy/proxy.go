@@ -38,14 +38,14 @@ type groupKeyProvider interface {
 type ActiveKeyReader interface {
 	VaultGetter
 	GetActiveKeyConfig() (*vault.ActiveKeyConfig, error)
-	GetActiveTeamKeyByProvider(providerCode string) (*vault.ManagedKey, error)
+	GetActiveTeamKeyByProvider(providerCode, protocolType string) (*vault.ManagedKey, error)
 	GetPersonalKeyByAlias(alias string) (plaintext, providerCode, baseURL string, err error)
 	// v1.0.2: provider-level binding from user_profile_provider_bindings.
 	GetProviderBinding(providerCode string) (*vault.ProviderBinding, error)
 	// v1.0.2: resolve team key by exact virtual_key_id (no local_state filter).
 	// P1e (D-11): targetProviderCode selects the matching binding (one row per
 	// binding, ciphertext per row) — empty falls back to the primary binding.
-	GetTeamKeyByID(virtualKeyID, targetProviderCode string) (*vault.ManagedKey, error)
+	GetTeamKeyByID(virtualKeyID, targetProviderCode, protocolType string) (*vault.ManagedKey, error)
 }
 
 // OAuthBroker is the minimal interface the proxy data-plane needs from the broker.
@@ -451,11 +451,30 @@ func (p *Proxy) CooldownSkipSet() map[string]bool {
 	return p.poolCooldown.skipSet()
 }
 
+// CooldownRouteStateSnapshot returns display metadata for the same active
+// whole-account cooldown set CooldownSkipSet exposes to routing. It is a
+// detached snapshot; callers may safely project it into the local vault.
+func (p *Proxy) CooldownRouteStateSnapshot() map[string]PoolAccountRouteState {
+	return p.poolCooldown.routeStateSnapshot()
+}
+
+// SetPoolCooldownChangeHook installs a non-blocking wake-up hook for changes to
+// the whole-account cooldown set. The supervisor uses it to refresh the
+// display-only is_current_routed projection; routing itself reads poolCooldown
+// directly and never depends on this hook. Tier-only cooldowns do not fire it
+// because a single current_routed flag cannot represent per-model choices.
+func (p *Proxy) SetPoolCooldownChangeHook(hook func()) {
+	if p == nil || p.poolCooldown == nil {
+		return
+	}
+	p.poolCooldown.setAccountSetChangedHook(hook)
+}
+
 // ObservedResetsSnapshot returns the latest upstream window-reset epoch observed
 // per pool account (account_id → epoch). The supervisor's N7c pull piggybacks
 // it to master (Path Z) so master re-rolls window_max_util_pct per window. nil
 // when nothing observed yet.
-func (p *Proxy) ObservedResetsSnapshot() map[string]int64 {
+func (p *Proxy) ObservedResetsSnapshot() map[string]ObservedWindowResets {
 	return p.poolObservedResets.snapshot()
 }
 

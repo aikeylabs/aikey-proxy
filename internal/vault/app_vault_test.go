@@ -94,6 +94,8 @@ func newTestReaderWithAppTables(t *testing.T) *Reader {
 		`CREATE TABLE user_profile_provider_bindings (
 			profile_id TEXT NOT NULL,
 			provider_code TEXT NOT NULL,
+			binding_provider_code TEXT NOT NULL DEFAULT '',
+			protocol_type TEXT NOT NULL DEFAULT '',
 			key_source_type TEXT NOT NULL,
 			key_source_ref TEXT NOT NULL,
 			updated_at INTEGER NOT NULL DEFAULT (strftime('%s', 'now')),
@@ -139,6 +141,31 @@ func TestGetProviderBindingWithScope_DefaultProfile(t *testing.T) {
 	}
 	if got.KeySourceType != "personal" || got.KeySourceRef != "my-claude-alias" {
 		t.Errorf("binding fields: got %+v, want type=personal ref=my-claude-alias", got)
+	}
+}
+
+func TestGetProviderBindingWithScope_PreservesClientRouteProviderAndProtocol(t *testing.T) {
+	r := newTestReaderWithAppTables(t)
+
+	_, err := r.db.Exec(
+		`INSERT INTO user_profile_provider_bindings
+		 (profile_id, provider_code, binding_provider_code, protocol_type, key_source_type, key_source_ref)
+		 VALUES (?, ?, ?, ?, ?, ?)`,
+		"default", "anthropic", "mock", "anthropic", "team", "vk-mock-anthropic",
+	)
+	if err != nil {
+		t.Fatalf("seed exact binding: %v", err)
+	}
+
+	got, err := r.GetProviderBindingWithScope("default", "anthropic")
+	if err != nil {
+		t.Fatalf("GetProviderBindingWithScope: %v", err)
+	}
+	if got == nil {
+		t.Fatal("expected binding, got nil")
+	}
+	if got.ClientRoute != "anthropic" || got.ProviderCode != "mock" || got.ProtocolType != "anthropic" {
+		t.Fatalf("binding axes collapsed: got %+v", got)
 	}
 }
 

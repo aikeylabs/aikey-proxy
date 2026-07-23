@@ -28,9 +28,9 @@ import (
 
 	"github.com/AiKeyLabs/aikey-proxy/internal/httpx"
 	"github.com/AiKeyLabs/aikey-proxy/internal/observability"
+	"github.com/AiKeyLabs/aikey-proxy/internal/proxy"
 	"github.com/AiKeyLabs/aikey-proxy/internal/vault"
 	"github.com/AiKeyLabs/aikey-proxy/internal/vkeys"
-	"github.com/AiKeyLabs/pkg/seatassign"
 )
 
 func defaultGroupRuntimeClient() *http.Client { return httpx.NewDirectClient(10 * time.Second) }
@@ -75,7 +75,7 @@ func (s *Supervisor) syncGroupRuntime(ctx context.Context, gen *generation, mast
 	}
 	// Path Z (通道3 §14): piggyback the proxy's observed window-reset epochs so
 	// master re-rolls each account's window_max_util_pct per window.
-	var observedResets map[string]int64
+	var observedResets map[string]proxy.ObservedWindowResets
 	if gen.proxy != nil {
 		observedResets = gen.proxy.ObservedResetsSnapshot()
 	}
@@ -87,14 +87,7 @@ func (s *Supervisor) syncGroupRuntime(ctx context.Context, gen *generation, mast
 	if prev := s.lastGroupRuntimeSig.Load(); prev != nil && *prev == sig {
 		return nil
 	}
-	// s.routingOverrides.Assignment is nil-safe (guards nil receiver → "" = rank-0),
-	// so the routed-account stamp degrades to the local pick when overrides are unset.
-	// Same cooldown view the hot path uses, so is_current_routed reflects cooling failover.
-	var grSkip map[string]bool
-	if gen.proxy != nil {
-		grSkip = gen.proxy.CooldownSkipSet()
-	}
-	if err := writeGroupRuntimeForGroups(s.cfg.Vault.Path, gen.vault.DerivedKey(), mks, groups, s.routingOverrides.Assignment, grSkip); err != nil {
+	if err := s.writeGroupRuntimeSnapshot(gen, mks, groups); err != nil {
 		slog.Warn("group_runtime write failed",
 			"event.name", "proxy.group_runtime.write_failed", "error", err.Error())
 		return err // leave lastGroupRuntimeSig unchanged → retry next tick
@@ -109,6 +102,35 @@ func (s *Supervisor) syncGroupRuntime(ctx context.Context, gen *generation, mast
 			"event.name", "proxy.group_runtime.reload_failed", "error", err.Error())
 	}
 	return nil
+}
+
+// writeGroupRuntimeSnapshot is the single material-sync writer for group_runtime.
+// It shares the projection mutex with restampCurrentRouted so a 60s material pull
+// cannot snapshot the old cooldown set and overwrite a newer reactive 429 switch.
+// Capture cooldown/override state only after taking the lock: those two inputs are
+// the local routing truth at the instant the SQLite projection is committed.
+func (s *Supervisor) writeGroupRuntimeSnapshot(gen *generation, mks []vault.ManagedKey, groups []grGroup) error {
+	s.currentRoutedRestampMu.Lock()
+	defer s.currentRoutedRestampMu.Unlock()
+
+	// s.routingOverrides.Assignment is nil-safe (guards nil receiver → "" = rank-0),
+	// so the routed-account stamp degrades to the local pick when overrides are unset.
+	// Same cooldown view the hot path uses, so is_current_routed reflects cooling failover.
+	var grSkip map[string]bool
+	var routeStates map[string]proxy.PoolAccountRouteState
+	if gen.proxy != nil {
+		grSkip = gen.proxy.CooldownSkipSet()
+		routeStates = gen.proxy.CooldownRouteStateSnapshot()
+	}
+	return writeGroupRuntimeForGroupsWithRouteState(
+		s.cfg.Vault.Path,
+		gen.vault.DerivedKey(),
+		mks,
+		groups,
+		s.routingOverrides.Assignment,
+		grSkip,
+		routeStates,
+	)
 }
 
 // ── master response (mirrors groupruntime.GroupDelivery / AccountMaterial) ──
@@ -134,17 +156,24 @@ type grAccount struct {
 	// email/provider, not a bare UUID). Threaded straight through to group_runtime.
 	Identity     string `json:"identity"`
 	ProviderCode string `json:"provider_code"`
+	ProtocolType string `json:"protocol_type"`
 	Priority     int    `json:"priority"`
 	// NeedsLogin: master delivered this OAuth account as "member not logged in"
 	// (no token) — the proxy returns LOGIN_REQUIRED for it (vs an absent account =
 	// material not pulled yet → retryable skip). P1.
 	NeedsLogin bool `json:"needs_login"`
 	// OAuth-only:
-	AccessToken      string `json:"access_token"`
-	ExpiresAt        int64  `json:"expires_at"`
-	WindowMaxUtilPct *int   `json:"window_max_util_pct"`
-	WindowStatus     string `json:"window_status"`
-	WindowResetAt    *int64 `json:"window_reset_at"`
+	AccessToken        string   `json:"access_token"`
+	ExpiresAt          int64    `json:"expires_at"`
+	WindowMaxUtilPct   *int     `json:"window_max_util_pct"`
+	WindowStatus       string   `json:"window_status"`
+	WindowResetAt      *int64   `json:"window_reset_at"`
+	Window7dMaxUtilPct *int     `json:"window_7d_max_util_pct"`
+	Window7dStatus     string   `json:"window_7d_status"`
+	Window7dResetAt    *int64   `json:"window_7d_reset_at"`
+	Util5h             *float64 `json:"util_5h"`
+	Util7d             *float64 `json:"util_7d"`
+	UtilObservedAt     *int64   `json:"util_observed_at"`
 	// ExternalID is the OAuth provider's account UUID. Required for Claude's
 	// metadata.user_id injection (N8); empty for non-Claude. Master's N7a
 	// producer must populate it for Claude OAuth group accounts — until then it
@@ -155,7 +184,9 @@ type grAccount struct {
 	// (personal/team-member) proxy pins the account's outbound to its own exit IP,
 	// same as a cluster worker gets via the org rail. "" → node-level egress chain.
 	EgressProxyURL string `json:"egress_proxy_url"`
-	// KEY-only:
+	// Key and Revision are API-key-only. BaseURL is shared routing metadata:
+	// resident Mock OAuth needs its deployment URL while official OAuth may
+	// leave it empty and use the profile default.
 	Key      string `json:"key"`
 	BaseURL  string `json:"base_url"`
 	Revision string `json:"revision"`
@@ -194,7 +225,7 @@ func groupRuntimeClient() *http.Client { return groupRuntimeSwap.Get() }
 // window_reset_at. Optional — master ignores it when absent (backward compatible).
 const observedResetsHeader = "X-Aikey-Observed-Resets"
 
-func fetchGroupRuntime(ctx context.Context, masterURL, bearer string, observedResets map[string]int64) ([]grGroup, string, error) {
+func fetchGroupRuntime(ctx context.Context, masterURL, bearer string, observedResets map[string]proxy.ObservedWindowResets) ([]grGroup, string, error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, masterURL+"/accounts/me/group-runtime", http.NoBody)
 	if err != nil {
 		return nil, "", err
@@ -245,17 +276,20 @@ func fetchGroupRuntime(ctx context.Context, masterURL, bearer string, observedRe
 }
 
 // restampCurrentRouted recomputes IsCurrentRouted on every local group VK's EXISTING
-// group_runtime after a routing-override change — WITHOUT refetching material from
-// master or re-encrypting secrets (it reads the already-loaded mk.GroupRuntime and
-// flips only the plaintext display flag). This couples the routing-override rail to
-// the group_runtime display column (owner-approved 2026-06-30) so /user/vault reflects
-// an engine redirect within one override poll, not only on the next material refresh.
+// group_runtime after a routing-override or whole-account cooldown change — WITHOUT
+// refetching material from master or re-encrypting secrets (it reads the already-loaded
+// mk.GroupRuntime and flips only the plaintext display flag). This keeps /user/vault
+// aligned with both centrally assigned redirects and local reactive failover instead of
+// waiting for the next material refresh.
 //
 // NO Reload: IsCurrentRouted is display-only (the hot-path resolver never reads it),
 // and the CLI/web read the vault column directly — so writing the column suffices.
 // The actual routing redirect already took effect via the RoutingOverrideCache the
 // resolver reads at request time; this only keeps the DISPLAY in step.
 func (s *Supervisor) restampCurrentRouted() {
+	s.currentRoutedRestampMu.Lock()
+	defer s.currentRoutedRestampMu.Unlock()
+
 	gen := s.active.Load()
 	if gen == nil || gen.vault == nil {
 		return
@@ -267,8 +301,10 @@ func (s *Supervisor) restampCurrentRouted() {
 	// Same cooldown view the hot-path resolver uses, so the stamp names the account the
 	// proxy actually forwards to (cooling-driven failover included).
 	var skip map[string]bool
+	var routeStates map[string]proxy.PoolAccountRouteState
 	if gen.proxy != nil {
 		skip = gen.proxy.CooldownSkipSet()
+		routeStates = gen.proxy.CooldownRouteStateSnapshot()
 	}
 	nowUnix := time.Now().Unix()
 	for i := range mks {
@@ -280,7 +316,11 @@ func (s *Supervisor) restampCurrentRouted() {
 		// usability gates as the hot path (unparseable → nil = blind mode, nominal pick).
 		var material map[string]vkeys.GroupRuntimeAccount
 		_ = json.Unmarshal([]byte(mk.GroupRuntime), &material)
-		newJSON, changed, err := stampCurrentRoutedJSON(mk.GroupRuntime, computeRoutedAccountID(mk, material, s.routingOverrides.Assignment, skip, nowUnix))
+		newJSON, changed, err := stampGroupRuntimeProjectionJSON(
+			mk.GroupRuntime,
+			computeRoutedAccountID(mk, material, s.routingOverrides.Assignment, skip, nowUnix),
+			routeStates,
+		)
 		if err != nil {
 			slog.Warn("group_runtime restamp parse failed",
 				"event.name", "proxy.group_runtime.restamp_failed",
@@ -294,6 +334,31 @@ func (s *Supervisor) restampCurrentRouted() {
 			slog.Warn("group_runtime restamp write failed",
 				"event.name", "proxy.group_runtime.restamp_failed",
 				"virtual_key_id", mk.VirtualKeyID, "error", err.Error())
+		}
+	}
+}
+
+// requestCurrentRoutedRestamp wakes the display-projection worker without ever
+// blocking a request. A capacity-one channel coalesces repeated 429/401/529/5xx
+// cooldown changes; restampCurrentRouted always re-reads the active generation,
+// so the event is only a wake-up signal and never becomes a second routing truth.
+func (s *Supervisor) requestCurrentRoutedRestamp() {
+	if s.currentRoutedRestampKick == nil { // literal Supervisor values in tests
+		return
+	}
+	select {
+	case s.currentRoutedRestampKick <- struct{}{}:
+	default:
+	}
+}
+
+func (s *Supervisor) currentRoutedRestampLoop() {
+	for {
+		select {
+		case <-s.ctx.Done():
+			return
+		case <-s.currentRoutedRestampKick:
+			s.restampCurrentRouted()
 		}
 	}
 }
@@ -312,7 +377,9 @@ func buildGroupRuntimeMap(derivedKey []byte, accounts []grAccount) map[string]vk
 		if a.NeedsLogin {
 			out[a.AccountID] = vkeys.GroupRuntimeAccount{
 				CredentialType: a.CredentialType, NeedsLogin: true,
-				Identity: a.Identity, ProviderCode: a.ProviderCode, Priority: a.Priority,
+				Identity: a.Identity, ProviderCode: a.ProviderCode, ProtocolType: a.ProtocolType,
+				BaseURL: a.BaseURL, Priority: a.Priority,
+				Util5h: a.Util5h, Util7d: a.Util7d, UtilObservedAt: a.UtilObservedAt,
 			}
 			continue
 		}
@@ -330,16 +397,23 @@ func buildGroupRuntimeMap(derivedKey []byte, accounts []grAccount) map[string]vk
 			SecretCiphertext: base64.StdEncoding.EncodeToString(ct),
 			Identity:         a.Identity,     // non-secret display meta → client list refresh
 			ProviderCode:     a.ProviderCode, //
-			Priority:         a.Priority,     //
+			ProtocolType:     a.ProtocolType,
+			BaseURL:          a.BaseURL,
+			Priority:         a.Priority, //
+			Util5h:           a.Util5h,
+			Util7d:           a.Util7d,
+			UtilObservedAt:   a.UtilObservedAt,
 		}
 		if a.CredentialType == "api_key" {
-			gra.BaseURL = a.BaseURL
 			gra.Revision = a.Revision
 		} else {
 			gra.ExpiresAt = a.ExpiresAt
 			gra.WindowMaxUtilPct = a.WindowMaxUtilPct
 			gra.WindowStatus = a.WindowStatus
 			gra.WindowResetAt = a.WindowResetAt
+			gra.Window7dMaxUtilPct = a.Window7dMaxUtilPct
+			gra.Window7dStatus = a.Window7dStatus
+			gra.Window7dResetAt = a.Window7dResetAt
 			gra.ExternalID = a.ExternalID
 			gra.EgressProxyURL = a.EgressProxyURL // per-account egress (§11.7, P7) — member rail
 		}
@@ -402,15 +476,9 @@ func computeRoutedAccountID(mk vault.ManagedKey, material map[string]vkeys.Group
 	if acc, oc := vkeys.PickRoutedAccount(mk.SeatID, refs, material, override, skip, nowUnix); oc != vkeys.PickNone {
 		return acc
 	}
-	// Nothing pickable (hot path would 429/ALL_UNUSABLE) → show the nominal seatassign
-	// rank-0 rather than blank (display-only fallback; no traffic is served here anyway).
-	accounts := make([]seatassign.Account, 0, len(refs))
-	for _, r := range refs {
-		accounts = append(accounts, seatassign.Account{AccountID: r.AccountID, Priority: r.Priority})
-	}
-	if ordered := seatassign.Rank(mk.SeatID, accounts); len(ordered) > 0 {
-		return ordered[0].AccountID
-	}
+	// Nothing pickable means the hot path cannot forward. Keep every display flag
+	// false instead of inventing a nominal "current" account that traffic would
+	// never reach. Blind pre-poll mode is already handled inside PickRoutedAccount.
 	return ""
 }
 
@@ -420,6 +488,18 @@ func computeRoutedAccountID(mk vault.ManagedKey, material map[string]vkeys.Group
 // changed=false when nothing moved (caller skips the write). Unparseable input is
 // returned unchanged with the error so a corrupt column can't crash the poll.
 func stampCurrentRoutedJSON(runtimeJSON, routedAccountID string) (string, bool, error) {
+	return stampGroupRuntimeJSON(runtimeJSON, routedAccountID, nil, false)
+}
+
+// stampGroupRuntimeProjectionJSON updates both display projections owned by the
+// local proxy: the selected account and each whole-account cooldown reason.
+// Secrets and master-owned material fields remain byte-equivalent values after
+// the JSON round trip. Missing route state actively clears a prior projection.
+func stampGroupRuntimeProjectionJSON(runtimeJSON, routedAccountID string, routeStates map[string]proxy.PoolAccountRouteState) (string, bool, error) {
+	return stampGroupRuntimeJSON(runtimeJSON, routedAccountID, routeStates, true)
+}
+
+func stampGroupRuntimeJSON(runtimeJSON, routedAccountID string, routeStates map[string]proxy.PoolAccountRouteState, projectRouteStates bool) (string, bool, error) {
 	if runtimeJSON == "" || runtimeJSON == "{}" {
 		return runtimeJSON, false, nil
 	}
@@ -432,9 +512,24 @@ func stampCurrentRoutedJSON(runtimeJSON, routedAccountID string) (string, bool, 
 		want := id == routedAccountID
 		if acc.IsCurrentRouted != want {
 			acc.IsCurrentRouted = want
-			m[id] = acc
 			changed = true
 		}
+		if projectRouteStates {
+			state, cooling := routeStates[id]
+			if cooling {
+				if acc.RouteStatus != state.Status || acc.RouteRetryAt == nil || *acc.RouteRetryAt != state.RetryAt {
+					acc.RouteStatus = state.Status
+					retryAt := state.RetryAt
+					acc.RouteRetryAt = &retryAt
+					changed = true
+				}
+			} else if acc.RouteStatus != "" || acc.RouteRetryAt != nil {
+				acc.RouteStatus = ""
+				acc.RouteRetryAt = nil
+				changed = true
+			}
+		}
+		m[id] = acc
 	}
 	if !changed {
 		return runtimeJSON, false, nil
@@ -455,6 +550,10 @@ func stampCurrentRoutedJSON(runtimeJSON, routedAccountID string) (string, bool, 
 // skip is the current cooldown view (proxy.CooldownSkipSet) so the routed stamp reflects
 // cooling-driven failover, matching the hot path (nil → no cooldown view).
 func writeGroupRuntimeForGroups(dbPath string, derivedKey []byte, mks []vault.ManagedKey, groups []grGroup, overrideFor func(seatID, groupID string) string, skip map[string]bool) error {
+	return writeGroupRuntimeForGroupsWithRouteState(dbPath, derivedKey, mks, groups, overrideFor, skip, nil)
+}
+
+func writeGroupRuntimeForGroupsWithRouteState(dbPath string, derivedKey []byte, mks []vault.ManagedKey, groups []grGroup, overrideFor func(seatID, groupID string) string, skip map[string]bool, routeStates map[string]proxy.PoolAccountRouteState) error {
 	// group_id → its locally-known managed keys (need the whole mk for SeatID +
 	// GroupAccounts to compute the per-seat routed account, not just the VK id).
 	mksByGroup := make(map[string][]vault.ManagedKey)
@@ -475,6 +574,7 @@ func writeGroupRuntimeForGroups(dbPath string, derivedKey []byte, mks []vault.Ma
 		// fed the FRESH material map being written (not the stale stored column) so the
 		// stamp's usability gates see exactly what the hot path will read next.
 		base := buildGroupRuntimeMap(derivedKey, g.Accounts)
+		applyPoolRouteStates(base, routeStates)
 		nowUnix := time.Now().Unix()
 		for _, mk := range groupMks {
 			jsonVal, err := marshalGroupRuntime(base, computeRoutedAccountID(mk, base, overrideFor, skip, nowUnix))
@@ -506,4 +606,19 @@ func writeGroupRuntimeForGroups(dbPath string, derivedKey []byte, mks []vault.Ma
 		}
 	}
 	return nil
+}
+
+func applyPoolRouteStates(material map[string]vkeys.GroupRuntimeAccount, routeStates map[string]proxy.PoolAccountRouteState) {
+	for id, acc := range material {
+		state, ok := routeStates[id]
+		if !ok || state.Status == "" {
+			acc.RouteStatus = ""
+			acc.RouteRetryAt = nil
+		} else {
+			acc.RouteStatus = state.Status
+			retryAt := state.RetryAt
+			acc.RouteRetryAt = &retryAt
+		}
+		material[id] = acc
+	}
 }

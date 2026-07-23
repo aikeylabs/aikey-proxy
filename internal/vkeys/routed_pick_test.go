@@ -93,4 +93,14 @@ func TestPickRoutedAccount(t *testing.T) {
 			t.Fatalf("want PickNone, got (%q, %v)", acc, oc)
 		}
 	})
+
+	t.Run("weekly exhausted is as unroutable as 5h exhausted", func(t *testing.T) {
+		mat := map[string]GroupRuntimeAccount{
+			hrw:   {CredentialType: "oauth_account", Window7dStatus: "exhausted_current_window"},
+			other: fresh,
+		}
+		if acc, oc := PickRoutedAccount("seat-1", refs, mat, "", nil, now); acc != other || oc != PickOK {
+			t.Fatalf("weekly-exhausted primary must route to %q, got (%q,%v)", other, acc, oc)
+		}
+	})
 }

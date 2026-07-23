@@ -142,7 +142,7 @@ func TestGetTeamKeyByID_MultiBindingSelectsByProvider(t *testing.T) {
 		key[i] = byte(i + 7)
 	}
 	r := &Reader{db: db, derivedKey: key}
-	insert := func(prov, base, plaintext string) {
+	insert := func(prov, protocol, base, plaintext string) {
 		nonce, ct, encErr := Encrypt(r.derivedKey, []byte(plaintext))
 		if encErr != nil {
 			t.Fatalf("encrypt: %v", encErr)
@@ -151,31 +151,47 @@ func TestGetTeamKeyByID_MultiBindingSelectsByProvider(t *testing.T) {
 			(virtual_key_id, alias, provider_code, protocol_type, base_url,
 			 provider_key_nonce, provider_key_ciphertext, org_id, seat_id,
 			 credential_id, credential_revision, virtual_key_revision, owner_account_id, key_status)
-			VALUES ('vk-dual', 'dual', ?, 'anthropic', ?, ?, ?, 'org', 'seat', 'cred', 'r', 'vr', 'acct', 'active')`,
-			prov, base, nonce, ct); err != nil {
+			VALUES ('vk-dual', 'dual', ?, ?, ?, ?, ?, 'org', 'seat', 'cred', 'r', 'vr', 'acct', 'active')`,
+			prov, protocol, base, nonce, ct); err != nil {
 			t.Fatalf("insert %s binding: %v", prov, err)
 		}
 	}
-	insert("zhipu", "https://open.bigmodel.cn/api/anthropic", "sk-glm-key")
-	insert("anthropic", "https://api.anthropic.com", "sk-official-key")
+	insert("zhipu", "anthropic", "https://open.bigmodel.cn/api/anthropic", "sk-glm-key")
+	insert("anthropic", "anthropic", "https://api.anthropic.com", "sk-official-key")
+	insert("mock", "anthropic", "http://mock/anthropic", "mock-anthropic")
+	insert("mock", "openai_compatible", "http://mock/openai", "mock-openai")
 
 	// Each provider selects ITS OWN binding's key + base_url.
-	glm, err := r.GetTeamKeyByID("vk-dual", "zhipu")
+	glm, err := r.GetTeamKeyByID("vk-dual", "zhipu", "")
 	if err != nil || glm == nil {
 		t.Fatalf("GetTeamKeyByID(zhipu): %v / %v", glm, err)
 	}
 	if glm.PlaintextKey != "sk-glm-key" || glm.ProviderCode != "zhipu" {
 		t.Errorf("zhipu binding wrong: key=%q provider=%q", glm.PlaintextKey, glm.ProviderCode)
 	}
-	official, err := r.GetTeamKeyByID("vk-dual", "anthropic")
+	official, err := r.GetTeamKeyByID("vk-dual", "anthropic", "")
 	if err != nil || official == nil {
 		t.Fatalf("GetTeamKeyByID(anthropic): %v / %v", official, err)
 	}
 	if official.PlaintextKey != "sk-official-key" || official.ProviderCode != "anthropic" {
 		t.Errorf("anthropic binding wrong: key=%q provider=%q", official.PlaintextKey, official.ProviderCode)
 	}
+	missing, err := r.GetTeamKeyByID("vk-dual", "google", "gemini")
+	if err != nil {
+		t.Fatalf("GetTeamKeyByID(missing exact pair): %v", err)
+	}
+	if missing != nil {
+		t.Fatalf("missing exact pair must not fall through to another binding: %+v", missing)
+	}
+	mockOpenAI, err := r.GetActiveTeamKeyByProvider("mock", "openai_compatible")
+	if err != nil || mockOpenAI == nil {
+		t.Fatalf("GetActiveTeamKeyByProvider(mock,openai_compatible): %v / %v", mockOpenAI, err)
+	}
+	if mockOpenAI.PlaintextKey != "mock-openai" || mockOpenAI.ProtocolType != "openai_compatible" {
+		t.Fatalf("legacy provider lookup crossed protocol axes: %+v", mockOpenAI)
+	}
 	// Empty target → deterministic primary (stable provider_code order: anthropic < zhipu).
-	primary, err := r.GetTeamKeyByID("vk-dual", "")
+	primary, err := r.GetTeamKeyByID("vk-dual", "", "")
 	if err != nil || primary == nil {
 		t.Fatalf("GetTeamKeyByID(primary): %v / %v", primary, err)
 	}

@@ -27,6 +27,8 @@ import (
 	"strings"
 	"sync"
 	"testing"
+
+	"github.com/AiKeyLabs/aikey-proxy/internal/provider"
 )
 
 // ── Recording upstream: captures the headers AND Authorization the proxy
@@ -472,14 +474,18 @@ func TestProbeRaw_EmptyBearer_StillProbes(t *testing.T) {
 	}
 }
 
-// Drift sanity: every canonical provider in canonicalProviderCodes MUST
-// have a matching providerDefaultBaseURL entry. The handler's PROBE_BASEURL_DRIFT
-// internal-error branch should NEVER fire for legitimately accepted suffixes.
-func TestProbeRaw_NoCanonicalToBaseURLDrift(t *testing.T) {
-	for code := range canonicalProviderCodes {
-		base := providerDefaultBaseURL(code)
-		if base == "" {
-			t.Errorf("canonicalProviderCodes has %q but providerDefaultBaseURL returned empty — drift bug. Either remove from canonical or add to base URL switch.", code)
+// Every declared Provider+Protocol pair must have an unambiguous default.
+// This is the correct grain for multi-protocol suppliers such as zhipu/mock.
+func TestProbeRaw_EveryProviderProtocolPairHasDefaultRoute(t *testing.T) {
+	seen := map[string]struct{}{}
+	for _, route := range provider.Routes().All() {
+		pair := route.Provider + "\x00" + route.Protocol
+		if _, duplicate := seen[pair]; duplicate {
+			continue
+		}
+		seen[pair] = struct{}{}
+		if got := providerBaseURLForProtocol(route.Provider, route.Protocol); got == "" {
+			t.Errorf("provider/protocol pair (%q,%q) has no explicit or unique default route", route.Provider, route.Protocol)
 		}
 	}
 }

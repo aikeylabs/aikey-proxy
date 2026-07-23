@@ -38,8 +38,8 @@ func TestWindowPreCutDecision_Codex(t *testing.T) {
 
 	t.Run("at/over cap → pre-cut until that window reset-at", func(t *testing.T) {
 		h := hdr(map[string]string{
-			"X-Codex-Primary-Used-Percent": "96",
-			"X-Codex-Primary-Reset-At":     "1783341932",
+			"X-Codex-Primary-Used-Percent":   "96",
+			"X-Codex-Primary-Reset-At":       "1783341932",
 			"X-Codex-Secondary-Used-Percent": "0",
 		})
 		until, ok := windowPreCutDecision(h, 95, now)
@@ -63,8 +63,8 @@ func TestWindowPreCutDecision_Codex(t *testing.T) {
 
 	t.Run("no absolute reset-at → falls back to now+reset-after-seconds", func(t *testing.T) {
 		h := hdr(map[string]string{
-			"X-Codex-Primary-Used-Percent":          "98",
-			"X-Codex-Primary-Reset-After-Seconds":   "3600",
+			"X-Codex-Primary-Used-Percent":        "98",
+			"X-Codex-Primary-Reset-After-Seconds": "3600",
 		})
 		until, ok := windowPreCutDecision(h, 95, now)
 		if !ok || !until.Equal(now.Add(3600*time.Second)) {
@@ -109,5 +109,25 @@ func TestObservedResetEpoch_Codex(t *testing.T) {
 
 	if _, ok := observedResetEpoch(http.Header{}); ok {
 		t.Fatal("no reset headers → (0,false)")
+	}
+}
+
+func TestCodexDualWindowPreCutClassifiesByDuration(t *testing.T) {
+	now := time.Unix(1_783_300_000, 0)
+	h := http.Header{}
+	// Deliberately swap the provider names: primary is weekly, secondary is 5h.
+	h.Set("X-Codex-Primary-Used-Percent", "88")
+	h.Set("X-Codex-Primary-Window-Minutes", "10080")
+	h.Set("X-Codex-Primary-Reset-At", "1783928732")
+	h.Set("X-Codex-Secondary-Used-Percent", "92")
+	h.Set("X-Codex-Secondary-Window-Minutes", "300")
+	h.Set("X-Codex-Secondary-Reset-At", "1783341932")
+	until, ok := dualWindowPreCutDecision(h, poolWindowCaps{FiveHour: 93, SevenDay: 88}, now)
+	if !ok || until.Unix() != 1783928732 {
+		t.Fatalf("weekly primary must hit its 88 line/reset, until=%v ok=%v", until, ok)
+	}
+	resets, ok := observedWindowResetEpochs(h)
+	if !ok || resets.FiveHour != 1783341932 || resets.SevenDay != 1783928732 {
+		t.Fatalf("duration-classified resets=%+v ok=%v", resets, ok)
 	}
 }

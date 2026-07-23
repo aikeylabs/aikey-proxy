@@ -17,8 +17,12 @@ LDFLAGS    := -ldflags "\
 CONFIG     := aikey-proxy.yaml
 # Installation directory — override with: make install INSTALL_DIR=/your/path
 INSTALL_DIR ?= $(HOME)/.aikey/bin
-# Go workspace — needed for local aikey-auth-broker dependency
-GOWORK     ?= $(shell cd .. && pwd)/go.work
+# Prefer the optional repository workspace when it exists.  A normal checkout
+# is also self-contained because go.mod carries the sibling-module replace
+# directives (including aikey-auth-broker); exporting a nonexistent go.work
+# makes every Make target fail before Go can use those replacements.
+GOWORK_FILE := $(abspath ../go.work)
+GOWORK     ?= $(if $(wildcard $(GOWORK_FILE)),$(GOWORK_FILE),off)
 export GOWORK
 
 .PHONY: build test run install uninstall restart clean lint cross-compile sync-fingerprint chaos-gap7 chaos-gap8 chaos filter-integration

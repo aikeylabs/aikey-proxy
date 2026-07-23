@@ -30,10 +30,12 @@ type fakePoolExchanger struct {
 	status          string // LoginStatus result (codex polling leg); "" ⇒ pending
 	statusErr       string // LoginStatus provider error text
 	startedProvider string
+	startedProfile  poolProviderProfile
 }
 
-func (f *fakePoolExchanger) StartLogin(_ context.Context, provider string) (string, string, error) {
-	f.startedProvider = provider
+func (f *fakePoolExchanger) StartLogin(_ context.Context, profile poolProviderProfile) (string, string, error) {
+	f.startedProvider = profile.broker
+	f.startedProfile = profile
 	return "sess-1", f.authURL, nil
 }
 func (f *fakePoolExchanger) SubmitCode(_ context.Context, _, _ string) (string, string, string, int64, string, string, error) {
@@ -164,6 +166,88 @@ func TestPoolLogin_AuthorizeUsesServerBindingNotClientProvider(t *testing.T) {
 	_ = json.Unmarshal(w.Body.Bytes(), &got)
 	if got.ProviderCode != "openai" || got.Flow != "auth_code" || got.ExpectedIdentity != "codex@team.com" {
 		t.Fatalf("server login context not returned intact: %+v", got)
+	}
+}
+
+func TestPoolProviderFor_MockUsesCredentialProtocolAndMasterEndpoints(t *testing.T) {
+	tests := []struct {
+		name              string
+		protocol          string
+		wantFlow          string
+		wantIdentity      string
+		wantImpersonation bool
+	}{
+		{name: "anthropic", protocol: "anthropic", wantFlow: "setup_token", wantIdentity: "claude"},
+		{name: "codex", protocol: "openai_compatible", wantFlow: "auth_code", wantIdentity: "codex"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			ctx := poolLoginContext{
+				CredentialID: "cred-1", ProviderCode: "mock", ProtocolType: tt.protocol,
+				OAuthAuthorizeURL: "https://master.example/mock-provider/oauth/" + tt.protocol + "/authorize",
+				OAuthTokenURL:     "https://master.example/mock-provider/oauth/" + tt.protocol + "/token",
+				OAuthContext:      "signed-context",
+				ExpectedIdentity:  "member@example.test",
+			}
+			profile, ok := poolProviderFor(ctx)
+			if !ok || profile.config == nil {
+				t.Fatalf("mock %s must resolve to a session-scoped broker config: %+v", tt.protocol, profile)
+			}
+			if profile.flow != tt.wantFlow || profile.config.IdentityProvider != tt.wantIdentity {
+				t.Fatalf("wrong mock profile: flow=%q identity=%q", profile.flow, profile.config.IdentityProvider)
+			}
+			if profile.config.ProviderCode != "mock" || profile.config.ProtocolType != tt.protocol {
+				t.Fatalf("OAuth profile collapsed account axes: provider=%q protocol=%q",
+					profile.config.ProviderCode, profile.config.ProtocolType)
+			}
+			if profile.config.AuthorizeURL != ctx.OAuthAuthorizeURL || profile.config.TokenURL != ctx.OAuthTokenURL {
+				t.Fatalf("master endpoints not preserved: %+v", profile.config)
+			}
+			if profile.config.ExtraAuthorizeParams["credential_id"] != "cred-1" || profile.config.ExtraAuthorizeParams["login_hint"] != "member@example.test" {
+				t.Fatalf("credential binding missing from authorize params: %+v", profile.config.ExtraAuthorizeParams)
+			}
+			if profile.config.ExtraAuthorizeParams["oauth_context"] != "signed-context" {
+				t.Fatalf("signed Master context missing from authorize params: %+v", profile.config.ExtraAuthorizeParams)
+			}
+			if tt.protocol == "anthropic" && profile.config.RequireTLSImpersonation {
+				t.Fatal("the internal mock endpoint must not use Anthropic TLS impersonation")
+			}
+		})
+	}
+
+	for _, bad := range []poolLoginContext{
+		{ProviderCode: "mock", ProtocolType: "anthropic"},
+		{ProviderCode: "mock", ProtocolType: "unknown", OAuthAuthorizeURL: "https://a", OAuthTokenURL: "https://t"},
+	} {
+		if _, ok := poolProviderFor(bad); ok {
+			t.Fatalf("ambiguous mock binding must fail closed: %+v", bad)
+		}
+	}
+}
+
+func TestPoolLogin_MockNamespaceIsSessionScoped(t *testing.T) {
+	ex := &fakePoolExchanger{authURL: "https://login"}
+	h := newPoolHandler(t, ex, "https://master.invalid")
+	h.resolveContext = func(_ context.Context, credentialID string) (poolLoginContext, error) {
+		return poolLoginContext{
+			CredentialID: credentialID, OauthGroupID: "g-mock", AccountID: "a-mock",
+			ProviderCode: "mock", ProtocolType: "anthropic", ExpectedIdentity: "mock@example.test",
+			OAuthAuthorizeURL: "https://master.example/mock-provider/oauth/anthropic/authorize",
+			OAuthTokenURL:     "https://master.example/mock-provider/oauth/anthropic/token",
+			OAuthContext:      "signed-context",
+		}, nil
+	}
+	w := doJSON(h.authorizeURL, `{"credential_id":"c-mock","namespace":"ci:run-1"}`)
+	if w.Code != http.StatusOK {
+		t.Fatalf("authorize: %d %s", w.Code, w.Body.String())
+	}
+	if ex.startedProfile.config == nil || ex.startedProfile.config.ExtraAuthorizeParams["namespace"] != "ci:run-1" {
+		t.Fatalf("namespace was not frozen into the Mock OAuth session: %+v", ex.startedProfile)
+	}
+
+	w = doJSON(h.authorizeURL, `{"credential_id":"c-mock","namespace":"bad/scope"}`)
+	if w.Code != http.StatusBadRequest || !strings.Contains(w.Body.String(), "INVALID_NAMESPACE") {
+		t.Fatalf("invalid namespace must fail before broker start: %d %s", w.Code, w.Body.String())
 	}
 }
 

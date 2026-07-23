@@ -18,6 +18,7 @@ import (
 	"time"
 
 	"github.com/AiKeyLabs/aikey-proxy/internal/events"
+	"github.com/AiKeyLabs/aikey-proxy/internal/observability"
 	"github.com/AiKeyLabs/aikey-proxy/internal/vkeys"
 )
 
@@ -32,6 +33,7 @@ func (f fakeGroupKey) DerivedKey() []byte { return f.k }
 // asserting on the outbound request is the correct semantics.
 type outboundCapture struct {
 	host        string
+	path        string
 	auth        string
 	apiKey      string
 	session     string
@@ -51,6 +53,7 @@ type outboundCapture struct {
 func (c *outboundCapture) RoundTrip(req *http.Request) (*http.Response, error) {
 	c.calls++
 	c.host = req.URL.Host
+	c.path = req.URL.Path
 	c.auth = req.Header.Get("Authorization")
 	c.apiKey = req.Header.Get("x-api-key")
 	c.session = req.Header.Get("X-Claude-Code-Session-Id")
@@ -130,6 +133,82 @@ func TestGroupServe_OAuthAccountInjectsBearer(t *testing.T) {
 	}
 	if tr.apiKey != "" {
 		t.Fatalf("x-api-key must be stripped on OAuth path, got %q", tr.apiKey)
+	}
+}
+
+func TestGroupServe_MockCodexOAuthUsesRuntimeRailAndFingerprintVersion(t *testing.T) {
+	key := grKey()
+	refs := []vkeys.GroupAccountRef{{
+		AccountID: "acc-mock-codex", ProviderCode: "mock", ProtocolType: "openai_compatible",
+	}}
+	mat := map[string]vkeys.GroupRuntimeAccount{
+		"acc-mock-codex": encMat(t, key, vkeys.GroupRuntimeAccount{
+			CredentialType: "oauth_account",
+			ProviderCode:   "mock",
+			ProtocolType:   "openai_compatible",
+			BaseURL:        "http://127.0.0.1:3000/mock-provider/openai",
+			ExpiresAt:      9_000_000_000,
+		}, "mock-oauth-token"),
+	}
+	route := &vkeys.ResolvedRoute{
+		VirtualKeyID: "vk-grp", ProtocolType: "openai_compatible", RouteSource: "team",
+		SeatID: "seat-1", OauthGroupID: "grp-mock-codex",
+		GroupAccounts: mustJSON(t, refs), GroupRuntime: mustJSON(t, mat),
+	}
+	p, tr := setupGroupProxy(t, key, route)
+	req := httptest.NewRequest(http.MethodPost, "/responses", strings.NewReader(`{"model":"gpt-5-codex","input":"hi"}`))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", "Bearer aikey_team_grouptest")
+	w := httptest.NewRecorder()
+
+	p.Handle(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("Mock Codex OAuth group route: status=%d body=%s", w.Code, w.Body.String())
+	}
+	if tr.host != "127.0.0.1:3000" {
+		t.Fatalf("outbound host=%q want runtime host 127.0.0.1:3000", tr.host)
+	}
+	if tr.path != "/mock-provider/openai/v1/responses" {
+		t.Fatalf("outbound path=%q want /mock-provider/openai/v1/responses", tr.path)
+	}
+	if tr.auth != "Bearer mock-oauth-token" {
+		t.Fatalf("outbound Authorization=%q want Mock OAuth bearer", tr.auth)
+	}
+}
+
+func TestGroupServe_MockOAuthMissingBaseURLFailsClosed(t *testing.T) {
+	key := grKey()
+	refs := []vkeys.GroupAccountRef{{
+		AccountID: "acc-mock", ProviderCode: "mock", ProtocolType: "anthropic",
+	}}
+	mat := map[string]vkeys.GroupRuntimeAccount{
+		"acc-mock": encMat(t, key, vkeys.GroupRuntimeAccount{
+			CredentialType: "oauth_account",
+			ProviderCode:   "mock",
+			ProtocolType:   "anthropic",
+			ExternalID:     "mock-external-id",
+			ExpiresAt:      9_000_000_000,
+		}, "mock-oauth-token"),
+	}
+	route := &vkeys.ResolvedRoute{
+		VirtualKeyID: "vk-grp", ProtocolType: "anthropic", RouteSource: "team",
+		SeatID: "seat-1", OauthGroupID: "grp-mock",
+		GroupAccounts: mustJSON(t, refs), GroupRuntime: mustJSON(t, mat),
+	}
+	p, tr := setupGroupProxy(t, key, route)
+	req, w := groupReq(groupBody)
+
+	p.Handle(w, req)
+
+	if w.Code != http.StatusBadGateway {
+		t.Fatalf("missing Mock base URL: status=%d body=%s", w.Code, w.Body.String())
+	}
+	if !strings.Contains(w.Body.String(), observability.ErrCodeProviderError) {
+		t.Fatalf("missing Mock base URL must surface provider error: %s", w.Body.String())
+	}
+	if tr.calls != 0 {
+		t.Fatalf("missing Mock base URL must not reach any upstream, calls=%d host=%q", tr.calls, tr.host)
 	}
 }
 

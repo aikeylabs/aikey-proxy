@@ -183,8 +183,11 @@ func TestGetAllOAuthRouteTokens_FiltersNonStrictForms(t *testing.T) {
 	}
 
 	gotAccountIDs := make(map[string]bool, len(got))
-	for _, t := range got {
-		gotAccountIDs[t.AccountID] = true
+	for _, token := range got {
+		gotAccountIDs[token.AccountID] = true
+		if token.ProtocolType != "" {
+			t.Errorf("legacy row %q invented protocol %q from provider", token.AccountID, token.ProtocolType)
+		}
 	}
 
 	for _, row := range rows {
