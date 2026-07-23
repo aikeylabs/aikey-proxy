@@ -77,6 +77,28 @@ func TestGroupFailover_5xxRetriesOnNextAccount(t *testing.T) {
 	}
 }
 
+// Every upstream attempt belongs to one logical client request. The provider,
+// usage ledger and proxy logs must therefore receive one stable request id even
+// when the pool switches A→B before the first client-visible byte.
+func TestGroupFailover_RetryPreservesRequestID(t *testing.T) {
+	p, tr, tokToAcct := twoAccountPool(t)
+	_, ptok := probePrimary(t, p, tr, tokToAcct)
+
+	tr.statusByAuth = map[string]int{"Bearer " + ptok: http.StatusServiceUnavailable}
+	tr.requestIDs = nil
+	req, w := groupReq(groupBody)
+	p.Handle(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("client must see the failover 200, got %d: %s", w.Code, w.Body.String())
+	}
+	if len(tr.requestIDs) != 2 {
+		t.Fatalf("want two recorded attempts, got request ids %q", tr.requestIDs)
+	}
+	if tr.requestIDs[0] == "" || tr.requestIDs[0] != tr.requestIDs[1] {
+		t.Fatalf("A→B attempts must preserve one non-empty request id, got %q", tr.requestIDs)
+	}
+}
+
 // An evidence-429 (real exhaustion: unified status flip) fails over; the client
 // sees the other account's 200.
 func TestGroupFailover_Evidence429Retries(t *testing.T) {
@@ -248,6 +270,53 @@ func TestGroupFailover_UpstreamErrorNotMaskedByFailoverCandidateLogin(t *testing
 	}
 	if strings.Contains(w.Body.String(), groupErrLoginRequired) || strings.Contains(w.Body.String(), "fallback@example.com") {
 		t.Fatalf("fallback login state must not mask assigned-account failure: %s", w.Body.String())
+	}
+}
+
+// A confirmed account-wide cooldown is different from the transient 503 above:
+// it changes the durable route. When A proves exhausted and B needs login, the
+// same request must return an actionable LOGIN_REQUIRED for B rather than flush
+// A's 429. The display picker consumes the same cooldown and therefore also
+// converges to B.
+func TestGroupFailover_ExhaustedAccountPromotesNeedsLoginSuccessor(t *testing.T) {
+	key := grKey()
+	refs := []vkeys.GroupAccountRef{
+		{AccountID: "acc-exhausted", ProviderCode: "anthropic", Identity: "exhausted@example.com"},
+		{AccountID: "acc-needs-login", ProviderCode: "anthropic", Identity: "fallback@example.com"},
+	}
+	mat := map[string]vkeys.GroupRuntimeAccount{
+		"acc-exhausted": encMat(t, key, vkeys.GroupRuntimeAccount{
+			CredentialType: "oauth_account", ExpiresAt: 9_000_000_000, ExternalID: "uuid-exhausted",
+		}, "tok-exhausted"),
+		"acc-needs-login": {CredentialType: "oauth_account", NeedsLogin: true, Identity: "fallback@example.com"},
+	}
+	route := &vkeys.ResolvedRoute{
+		VirtualKeyID: "vk-grp", Provider: "anthropic", ProtocolType: "anthropic",
+		ProviderCode: "anthropic", RouteSource: "team",
+		SeatID: "seat-1", OauthGroupID: "grp-1",
+		GroupAccounts: mustJSON(t, refs), GroupRuntime: mustJSON(t, mat),
+	}
+	p, tr := setupGroupProxy(t, key, route)
+	cache := NewRoutingOverrideCache()
+	cache.StoreAll(1, map[string]string{routeKey("seat-1", "grp-1"): "acc-exhausted"}, nil)
+	p.SetRoutingOverrides(cache)
+	tr.status = http.StatusTooManyRequests
+	tr.respHeader = http.Header{"Anthropic-Ratelimit-Unified-Status": {"rate_limited"}}
+
+	req, w := groupReq(groupBody)
+	p.Handle(w, req)
+
+	if w.Code != http.StatusUnauthorized {
+		t.Fatalf("confirmed exhaustion must promote the login target, got %d: %s", w.Code, w.Body.String())
+	}
+	if tr.calls != 1 {
+		t.Fatalf("only the exhausted account has usable material, calls=%d", tr.calls)
+	}
+	if !p.poolCooldown.skipSet()["acc-exhausted"] {
+		t.Fatal("evidence 429 must put the exhausted account in durable cooldown")
+	}
+	if !strings.Contains(w.Body.String(), groupErrLoginRequired) || !strings.Contains(w.Body.String(), "acc-needs-login") {
+		t.Fatalf("response must name the promoted login target: %s", w.Body.String())
 	}
 }
 

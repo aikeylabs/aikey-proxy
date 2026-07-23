@@ -164,10 +164,10 @@ func resolveGroupCredential(route *vkeys.ResolvedRoute, derivedKey []byte, nowUn
 		acc, oc := vkeys.PickRoutedAccount(route.SeatID, refs, material, overrideAccountID, localSkip, nowUnix)
 		switch oc {
 		case vkeys.PickNeedsLogin:
-			// RW2/D2: PickRoutedAccount only emits this for THE assigned account
-			// (engine override or strict-HRW rank 0). A needs-login row reached only
-			// during request failover is skipped inside the shared picker, because the
-			// member page cannot act on that non-current account.
+			// RW2/D2: the first non-skipped routed account has no member token. The
+			// caller decides whether its skip set is durable/global (actionable login)
+			// or only request-local (preserve the captured upstream error). Keeping that
+			// policy out of this resolver lets display and forwarding share this pick.
 			return nil, &groupResolveError{Code: groupErrLoginRequired,
 				Reason: "member has no token for the routed account — login required", Account: acc}
 		case vkeys.PickOK:

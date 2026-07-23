@@ -61,10 +61,10 @@ func TestPickRoutedAccount(t *testing.T) {
 		}
 	})
 
-	t.Run("needs_login failover candidate never replaces the assigned account", func(t *testing.T) {
+	t.Run("globally skipped account routes to the next needs_login account", func(t *testing.T) {
 		mat := map[string]GroupRuntimeAccount{hrw: fresh, other: needsLogin}
-		if acc, oc := PickRoutedAccount("seat-1", refs, mat, "", map[string]bool{hrw: true}, now); acc != "" || oc != PickNone {
-			t.Fatalf("non-assigned needs_login candidate is not actionable: want none, got (%q, %v)", acc, oc)
+		if acc, oc := PickRoutedAccount("seat-1", refs, mat, "", map[string]bool{hrw: true}, now); acc != other || oc != PickNeedsLogin {
+			t.Fatalf("cooled rank-0 must converge on needs-login successor %q, got (%q, %v)", other, acc, oc)
 		}
 	})
 

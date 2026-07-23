@@ -312,6 +312,16 @@ func TestComputeRoutedAccountID_CoolingAware_MatchesHotPath(t *testing.T) {
 	if got := computeRoutedAccountID(mk, nil, nil, map[string]bool{def: true}, 1_000_000); got != other {
 		t.Fatalf("cooled rank-0 → stamp must move to next non-cooled %q, got %q", other, got)
 	}
+	// The successor may not have been logged in yet. It is still the new current
+	// route and must be stamped so Vault can show the login action instead of
+	// leaving every account non-current.
+	material := map[string]vkeys.GroupRuntimeAccount{
+		def:   {CredentialType: "oauth_account", ExpiresAt: 9_000_000_000},
+		other: {CredentialType: "oauth_account", NeedsLogin: true},
+	}
+	if got := computeRoutedAccountID(mk, material, nil, map[string]bool{def: true}, 1_000_000); got != other {
+		t.Fatalf("cooled rank-0 → needs-login successor must be stamped current %q, got %q", other, got)
+	}
 	// Override account COOLED → the override is NOT honored; fall through to non-cooled
 	// (same gate as the hot path: `override != "" && !skip[override]`).
 	if got := computeRoutedAccountID(mk, nil, func(string, string) string { return def }, map[string]bool{def: true}, 1_000_000); got != other {

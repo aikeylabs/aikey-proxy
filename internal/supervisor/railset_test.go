@@ -216,6 +216,44 @@ func TestTeamCredentialSource_NoTokenIsAnError(t *testing.T) {
 	src.invalidate()
 }
 
+// Allocation-engine signals are a control-plane rail, not a usage-collector
+// upload. Current installs may have no events.collector_credentials YAML at all;
+// the signal reporter must still authenticate from the same vault refresh token
+// as group-runtime/routing-override polling.
+func TestSignalReportingAuth_UsesTeamRailCredentialWithoutCollectorBundle(t *testing.T) {
+	mint := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != cliTokenRefreshPath {
+			w.WriteHeader(http.StatusNotFound)
+			return
+		}
+		_, _ = w.Write([]byte(`{"access_token":"signal-team-jwt","expires_in":3600}`))
+	}))
+	defer mint.Close()
+
+	masterURL, bearer := signalReportingAuth(
+		mint.URL,
+		&teamCredentialSource{},
+		stubRefreshTokenSource{token: "vault-refresh-token"},
+	)
+	if masterURL != mint.URL || bearer == nil {
+		t.Fatalf("signal auth not wired: url=%q bearer_nil=%v", masterURL, bearer == nil)
+	}
+	got, err := bearer(context.Background())
+	if err != nil || got != "signal-team-jwt" {
+		t.Fatalf("signal bearer=%q err=%v", got, err)
+	}
+}
+
+func TestSignalReportingAuth_DisabledWithoutControlPlaneInputs(t *testing.T) {
+	vault := stubRefreshTokenSource{token: "refresh"}
+	if url, bearer := signalReportingAuth("", &teamCredentialSource{}, vault); url != "" || bearer != nil {
+		t.Fatalf("empty master URL must disable signal reporter: url=%q bearer_nil=%v", url, bearer == nil)
+	}
+	if url, bearer := signalReportingAuth("http://master", nil, vault); url != "" || bearer != nil {
+		t.Fatalf("nil team credential source must disable signal reporter: url=%q bearer_nil=%v", url, bearer == nil)
+	}
+}
+
 // The §5.5 sync-health bypass file lifecycle: a rail transitioning into STALE
 // writes the file (with failed_since so the reader renders a live duration);
 // recovery back to OK removes it — statusline recovery is automatic. Uses the

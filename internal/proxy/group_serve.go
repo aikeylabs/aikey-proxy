@@ -93,7 +93,12 @@ func (p *Proxy) handleOauthGroupRoute(
 
 	override := p.routingOverrides.lookup(route.SeatID, route.OauthGroupID)
 	for attempt := 0; ; attempt++ {
-		skip := p.poolCooldown.skipSetFor(reqModel)
+		// baseSkip is durable routing state (whole-account/model-tier cooldown).
+		// Keep it separate from this request's failed attempts: a needs_login account
+		// selected after baseSkip is actionable and must become the visible route;
+		// one reached only because of a transient request-local 5xx is not.
+		baseSkip := p.poolCooldown.skipSetFor(reqModel)
+		skip := baseSkip
 		if len(failed) > 0 {
 			merged := make(map[string]bool, len(skip)+len(failed))
 			for id := range skip {
@@ -104,15 +109,27 @@ func (p *Proxy) handleOauthGroupRoute(
 			}
 			skip = merged
 		}
-		res, err := resolveGroupCredential(route, p.groupKey.DerivedKey(), time.Now().Unix(), skip, override)
+		nowUnix := time.Now().Unix()
+		res, err := resolveGroupCredential(route, p.groupKey.DerivedKey(), nowUnix, skip, override)
 		if err != nil {
 			ge, isGE := err.(*groupResolveError)
-			// 1. RW2/D2: the engine/HRW-assigned account has no token for this member —
-			//    a structured login prompt so the client opens THAT account. The shared
-			//    picker never emits LOGIN_REQUIRED for a request-level fallback, so this
-			//    cannot overwrite an assigned-account failure with another account.
+			// 1. RW2/D2: a needs_login destination is actionable when no upstream
+			//    attempt preceded it, or when the same destination is selected from the
+			//    durable cooldown set alone. If it appears only after merging a transient
+			//    request-local failure, preserve that captured upstream error instead.
 			if isGE && ge.Code == groupErrLoginRequired {
-				p.respondLoginRequired(w, logger, route, ge.Account)
+				actionable := lastCaptured == nil
+				if !actionable {
+					_, baseErr := resolveGroupCredential(route, p.groupKey.DerivedKey(), nowUnix, baseSkip, override)
+					if baseGE, ok := baseErr.(*groupResolveError); ok && baseGE.Code == groupErrLoginRequired && baseGE.Account == ge.Account {
+						actionable = true
+					}
+				}
+				if actionable {
+					p.respondLoginRequired(w, logger, route, ge.Account)
+				} else {
+					lastCaptured.flushCaptured()
+				}
 				return
 			}
 			// 2. P1-C Phase 2 guidance (用户拍板 2026-07-19): when the REQUESTED

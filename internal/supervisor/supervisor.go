@@ -1657,11 +1657,15 @@ func (s *Supervisor) buildGeneration() (*generation, error) {
 				loadedSeq = int64(seq)
 			}
 			p.SetReporter(reporter, fmt.Sprintf("proxy-%d", id), s.version, fmt.Sprintf("gen-%d", id), loadedSeq, vaultReader.GetLoggedInAccountID())
-			// I5: wire the allocation-engine util signal reporter with the team
-			// account-JWT (same credential the group-runtime poll uses) → master
-			// /accounts/me/signals. Off unless a team credential + control URL exist.
-			if teamCred := buildCollectorCredentials(s.cfg.Events.CollectorCredentials, vaultReader)["team"]; teamCred != nil {
-				p.EnableSignalReporting(readControlPanelURL(), teamCred.Bearer)
+			// I5: wire the allocation-engine signal reporter with the SAME live team
+			// account-JWT source as the group-runtime/routing rails. Do not gate this
+			// control-plane path on events.collector_credentials: current local/stage
+			// installs intentionally keep that legacy YAML bundle empty while the
+			// railSet authenticates from the vault refresh token. The old gate made
+			// 429 cooldowns local-only, so Master never updated its assignment ledger
+			// and the member could never be routed to/log into the replacement account.
+			if masterURL, bearer := signalReportingAuth(readControlPanelURL(), s.teamCred, vaultReader); bearer != nil {
+				p.EnableSignalReporting(masterURL, bearer)
 			}
 			slog.Info("usage reporter enabled", "collector_url", s.cfg.Events.CollectorURL)
 
@@ -1903,4 +1907,25 @@ func buildCollectorCredentials(
 		return nil
 	}
 	return out
+}
+
+// signalReportingAuth returns the control-plane endpoint and bearer source used
+// by Proxy's allocation-engine signal reporter. It deliberately reuses the
+// railSet's teamCredentialSource instead of the usage reporter's legacy
+// collector_credentials bundle: group runtime, routing overrides, and signals
+// are three views of the same team control plane and must share one auth source.
+// The master URL is captured with the closure so a request can never mint a token
+// for one server and POST it to another. A settings/control-URL change rebuilds
+// the Proxy generation and therefore this pair.
+func signalReportingAuth(
+	masterURL string,
+	teamCred *teamCredentialSource,
+	vaultReader refreshTokenSource,
+) (string, func(context.Context) (string, error)) {
+	if masterURL == "" || teamCred == nil || vaultReader == nil {
+		return "", nil
+	}
+	return masterURL, func(ctx context.Context) (string, error) {
+		return teamCred.bearer(ctx, vaultReader, masterURL)
+	}
 }

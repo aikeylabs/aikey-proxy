@@ -562,6 +562,19 @@ func (p *Proxy) serveRoute(w http.ResponseWriter, r *http.Request, route *vkeys.
 			// Remove hop-by-hop headers the proxy shouldn't forward.
 			req.Header.Del("X-Forwarded-For")
 
+			// Propagate the proxy's logical request id to every upstream attempt.
+			// Group failover clones the same inbound request for A→B retries; the
+			// TraceContext is inherited by every clone, so this produces one stable
+			// correlation key for the whole logical request instead of letting each
+			// provider attempt invent an unrelated id. Preserve a caller-supplied
+			// X-Request-Id (ExtractOrCreate already adopted it as the trace request
+			// id); only synthesize the missing header.
+			if req.Header.Get("X-Request-Id") == "" {
+				if tc := traceFromContext(req.Context()); tc.RequestID != "" {
+					req.Header.Set("X-Request-Id", tc.RequestID)
+				}
+			}
+
 			// Strip AiKey-internal annotations before forwarding. These are
 			// stashed onto the incoming request by extractModel() /
 			// stashExtractedFields() for downstream usage-event recording

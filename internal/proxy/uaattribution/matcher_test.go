@@ -39,6 +39,19 @@ func TestMatch(t *testing.T) {
 		// codex-tui/<semver>, NOT codex/, which is why it bucketed to unknown-app
 		// until the codex-tui/ rule was added.
 		{"codex-tui real client", "codex-tui/0.137.0 (Mac OS 15.0; arm64)", "codex"},
+		// Real Codex DESKTOP app UA (verified live 2026-07-23, Win10 guest).
+		// Capitalized + contains a space, so it matches none of the CLI
+		// prefixes — it bucketed to unknown-app until this rule was added.
+		{"codex desktop real client", "Codex Desktop/0.144.5 (Windows 10.0.19045; x86_64) unknown (Codex Desktop; 26.707.91948)", "codex-desktop"},
+		// Desktop must NOT collapse into the CLI slug.
+		{"codex desktop is not the cli slug", "Codex Desktop/0.144.5", "codex-desktop"},
+		// Real `codex exec` UA (verified live 2026-07-23). UNDERSCORE, so
+		// the "codex/" forward-compat rule never covered it.
+		{"codex_exec real client", "codex_exec/0.144.5 (Windows 10.0.19045; x86_64) unknown (codex_exec; 0.144.5)", "codex"},
+		// Case sensitivity is load-bearing here: the desktop rule is
+		// capitalized, the CLI rules are not. A lowercase "codex desktop/"
+		// is not a client we've ever observed and must not match.
+		{"lowercase codex desktop → fallback", "codex desktop/0.144.5", "unknown-app"},
 		{"unknown UA → fallback", "FooBar/1.0", "unknown-app"},
 		{"Mozilla browser → fallback", "Mozilla/5.0 (Macintosh)", "unknown-app"},
 		// Prefix match is anchored at start — a substring match must NOT win.

@@ -48,6 +48,7 @@ type outboundCapture struct {
 	statusByAuth map[string]int
 	errByAuth    map[string]error
 	calls        int
+	requestIDs   []string
 }
 
 func (c *outboundCapture) RoundTrip(req *http.Request) (*http.Response, error) {
@@ -58,6 +59,7 @@ func (c *outboundCapture) RoundTrip(req *http.Request) (*http.Response, error) {
 	c.apiKey = req.Header.Get("x-api-key")
 	c.session = req.Header.Get("X-Claude-Code-Session-Id")
 	c.stainlessOS = req.Header.Get("X-Stainless-OS")
+	c.requestIDs = append(c.requestIDs, req.Header.Get("X-Request-Id"))
 	if err, ok := c.errByAuth[c.auth]; ok && err != nil {
 		return nil, err
 	}

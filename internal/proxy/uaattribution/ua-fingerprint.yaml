@@ -44,12 +44,45 @@ rules:
     slug: "continue"
     # Continue.dev IDE extension.
 
+  - prefix: "Codex Desktop/"
+    slug: "codex-desktop"
+    # OpenAI Codex DESKTOP app (Microsoft Store / standalone GUI), a
+    # different binary from the CLI. Format:
+    #   Codex Desktop/<codex-core-semver> (<os>; <arch>) unknown (Codex Desktop; <app-version>)
+    # Verified live 2026-07-23 on the Win10 guest from the proxy's
+    # ua-attribution WARN log:
+    #   "Codex Desktop/0.144.5 (Windows 10.0.19045; x86_64) unknown (Codex Desktop; 26.707.91948)"
+    #
+    # Why this needs its own rule rather than a "Codex" catch-all: the
+    # prefix is capitalized AND contains a space, so it matches none of
+    # the CLI patterns below (matching is case-sensitive, anchored at
+    # start). Desktop traffic was bucketing to "unknown-app".
+    #
+    # Why its own SLUG (not merged into "codex" like the CLI faces):
+    # desktop and CLI are separate surfaces with different usage shapes,
+    # and the dashboard already distinguishes surfaces of one vendor
+    # (claude vs claude-code). Decision 2026-07-23.
+    #
+    # MUST stay ABOVE any future generic "Codex"/"codex" rule — first
+    # match wins, so a broader prefix placed earlier would swallow this.
+
   - prefix: "codex-tui/"
     slug: "codex"
-    # OpenAI Codex CLI — the ACTUAL client UA (the TUI). Format:
-    # codex-tui/<semver> (...). Verified live 2026-06-05 from the proxy's
-    # ua-attribution WARN log; the older "codex/" guess below never matched
-    # the real client, so codex traffic was bucketing to "unknown-app".
+    # OpenAI Codex CLI, interactive TUI mode — the ACTUAL client UA.
+    # Format: codex-tui/<semver> (...). Verified live 2026-06-05 from the
+    # proxy's ua-attribution WARN log; the older "codex/" guess below
+    # never matched the real client, so codex traffic was bucketing to
+    # "unknown-app".
+
+  - prefix: "codex_exec/"
+    slug: "codex"
+    # OpenAI Codex CLI, NON-interactive `codex exec` mode. Same binary as
+    # codex-tui, different UA. Verified live 2026-07-23 on the Win10 guest:
+    #   "codex_exec/0.144.5 (Windows 10.0.19045; x86_64) unknown (codex_exec; 0.144.5)"
+    # Note the UNDERSCORE — "codex_exec/" does not start with "codex/",
+    # so the forward-compat rule below never covered it. Deliberately
+    # shares the "codex" slug with codex-tui: both are the CLI surface,
+    # only the invocation mode differs. Decision 2026-07-23.
 
   - prefix: "codex/"
     slug: "codex"
