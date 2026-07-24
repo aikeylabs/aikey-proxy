@@ -1096,7 +1096,19 @@ func (p *Proxy) handlePathPrefixRoute(w http.ResponseWriter, r *http.Request, pr
 		// Override baseURL from path's provider default if route doesn't specify one.
 		tokenBaseURL := route.BaseURL
 		if tokenBaseURL == "" {
-			tokenBaseURL = providerBaseURLForProtocol(route.ProviderCode, protocolType)
+			// An OAuth route forwards through applyOAuthUpstreamURL (literal
+			// prepend onto a path that already carries the version), so it needs
+			// the ROOT form — the effective form double-counts the version and
+			// 404s every model (2026-07-24). API-key routes go through
+			// provider.RewriteRequest → providerroutes.Stitch, which is
+			// version-aware AND selects a row by path prefix, so they keep the
+			// effective form: the root of a versioned path_prefix row (zhipu's
+			// /api/coding/paas/v4) would re-select a different row.
+			if tokenRealKey == oauthSentinelKey {
+				tokenBaseURL = providerRootBaseURLForProtocol(route.ProviderCode, protocolType)
+			} else {
+				tokenBaseURL = providerBaseURLForProtocol(route.ProviderCode, protocolType)
+			}
 		}
 		// P1j (design D-17): fail-loud instead of forwarding to an empty base_url.
 		// providerDefaultBaseURL returns "" for a provider it doesn't know; with

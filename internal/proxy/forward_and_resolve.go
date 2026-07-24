@@ -30,7 +30,6 @@ import (
 	"log/slog"
 	"net/http"
 	"net/http/httputil"
-	"net/url"
 	"strings"
 	"time"
 
@@ -345,6 +344,32 @@ func (p *Proxy) serveRoute(w http.ResponseWriter, r *http.Request, route *vkeys.
 	if route != nil {
 		route.ProviderCode = truthfulProviderCode(route.BaseURL, route.ProviderCode)
 	}
+
+	// Base-URL fault fence (2026-07-24). OAuth routes forward through
+	// applyOAuthUpstreamURL, a literal prepend that cannot repair a base URL
+	// which already carries the version segment — the result is /v1/v1/messages
+	// and a bare upstream 404 on EVERY model, attributed to the provider rather
+	// than to us. Fail loud with the fix instead, BEFORE the quota gate: a
+	// request we cannot forward must not consume the seat's quota.
+	//
+	// Excluded: the mock provider (joins via StitchForProviderProtocol, which is
+	// version-aware) and every API-key route (joins via providerroutes.Stitch,
+	// likewise version-aware). See oauthBaseURLFault's scope note.
+	if route != nil && realKey == oauthSentinelKey && route.ProviderCode != "mock" {
+		if reason := oauthBaseURLFault(route.BaseURL, r.URL.Path); reason != "" {
+			p.errors.Add(1)
+			logger.Error("oauth upstream base URL misconfigured — refusing to forward",
+				"event.name", "proxy.route.base_url_misconfigured",
+				"base_url", route.BaseURL,
+				"request_path", r.URL.Path,
+				"provider_code", route.ProviderCode,
+				"protocol_type", route.ProtocolType,
+			)
+			writeJSONError(w, http.StatusBadGateway, "server_error", "BASE_URL_MISCONFIGURED", reason)
+			return
+		}
+	}
+
 	// Phase 2 quota gate — UNIVERSAL chokepoint (Stage 3 + D-U8/P7). serveRoute is
 	// the single funnel EVERY real route passes through (Tier1 token, OAuth,
 	// active-sentinel, app pipeline, default binding; serveRouteWithObserver
@@ -546,13 +571,8 @@ func (p *Proxy) serveRoute(w http.ResponseWriter, r *http.Request, route *vkeys.
 					if err := provider.Routes().StitchForProviderProtocol(req, route.BaseURL, route.ProviderCode, route.ProtocolType); err != nil {
 						logger.Error("rewrite Mock OAuth request failed", "error", err)
 					}
-				} else if u, err := url.Parse(route.BaseURL); err == nil {
-					req.URL.Scheme = u.Scheme
-					req.URL.Host = u.Host
-					req.Host = u.Host
-					if u.Path != "" && u.Path != "/" {
-						req.URL.Path = strings.TrimRight(u.Path, "/") + req.URL.Path
-					}
+				} else {
+					applyOAuthUpstreamURL(req, route.BaseURL)
 				}
 			} else {
 				if err := prov.RewriteRequest(req, realKey, route.BaseURL); err != nil {
