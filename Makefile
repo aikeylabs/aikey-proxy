@@ -25,7 +25,14 @@ GOWORK_FILE := $(abspath ../go.work)
 GOWORK     ?= $(if $(wildcard $(GOWORK_FILE)),$(GOWORK_FILE),off)
 export GOWORK
 
-.PHONY: build test run install uninstall restart clean lint cross-compile sync-fingerprint chaos-gap7 chaos-gap8 chaos filter-integration
+# The strict lint profile was enabled after this repository had accumulated
+# pre-existing findings.  Keep that debt visible via `lint-full`, while the
+# release fence fails on every finding introduced after this reviewed, pinned
+# baseline.  This SHA must only move together with a debt-audit document; never
+# derive it from origin/HEAD or a new commit could silently baseline itself.
+LINT_BASE_REV ?= 9695facb96c1fefb8a2f8ba1f4b41823cf1efad6
+
+.PHONY: build test run install uninstall restart clean lint lint-full cross-compile sync-fingerprint chaos-gap7 chaos-gap8 chaos filter-integration
 
 # v4.3 (2026-05-01): aikey-cli/data/provider_fingerprint.yaml is the single
 # source of truth for provider routing. The pkg/providerroutes Go package
@@ -107,6 +114,16 @@ clean:
 	rm -rf bin/
 
 lint:
+	@git cat-file -e "$(LINT_BASE_REV)^{commit}" 2>/dev/null || { \
+		echo "ERROR: lint baseline commit $(LINT_BASE_REV) is unavailable; fetch repository history" >&2; \
+		exit 1; \
+	}
+	golangci-lint run --new-from-rev=$(LINT_BASE_REV) ./...
+
+# Explicit debt audit.  This is intentionally not the release fence until the
+# pinned baseline findings are paid down; unlike `lint`, it reports the entire
+# repository and is expected to remain red meanwhile.
+lint-full:
 	golangci-lint run ./...
 
 cross-compile: sync-fingerprint
