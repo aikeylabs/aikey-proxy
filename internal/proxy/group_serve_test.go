@@ -130,6 +130,9 @@ func TestGroupServe_OAuthAccountInjectsBearer(t *testing.T) {
 	if tr.host != "api.anthropic.com" {
 		t.Fatalf("outbound host=%q want api.anthropic.com", tr.host)
 	}
+	if tr.path != "/v1/messages" {
+		t.Fatalf("outbound path=%q want /v1/messages", tr.path)
+	}
 	if tr.auth != "Bearer oauth-tok-live" {
 		t.Fatalf("outbound Authorization=%q want decrypted OAuth Bearer (oauthInject must run)", tr.auth)
 	}

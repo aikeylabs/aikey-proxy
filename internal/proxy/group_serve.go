@@ -231,19 +231,6 @@ func (p *Proxy) serveGroupAttempt(
 	if protocolType != "" {
 		rc.ProtocolType = protocolType
 	}
-	oauthCode := canonicalCode
-	if canonicalCode == "mock" {
-		switch protocolType {
-		case "anthropic":
-			oauthCode = "anthropic"
-		case "openai_compatible":
-			oauthCode = "openai"
-		default:
-			writeJSONError(w, http.StatusBadGateway, "server_error", observability.ErrCodeProviderError,
-				"Mock Provider account has no supported protocol_type")
-			return true
-		}
-	}
 	var realKey string
 	switch res.CredentialType {
 	case credTypeKey:
@@ -252,6 +239,12 @@ func (p *Proxy) serveGroupAttempt(
 			rc.BaseURL = res.BaseURL
 		}
 	default: // oauth_account
+		oauthCode, oauthCodeOK := oauthInjectionProvider(canonicalCode, protocolType)
+		if !oauthCodeOK {
+			writeJSONError(w, http.StatusBadGateway, "server_error", observability.ErrCodeProviderError,
+				"OAuth account has no supported provider persona for provider="+canonicalCode+" protocol_type="+protocolType)
+			return true
+		}
 		// Dialect gate (2026-07-13): codex OAuth serves ONLY the Responses API.
 		// Without this, a /chat/completions client's path got appended to
 		// chatgpt.com/backend-api/codex and ChatGPT's edge answered with a
@@ -288,22 +281,22 @@ func (p *Proxy) serveGroupAttempt(
 		// deferred model capture) via the shared resolver — same source as the
 		// legacy /v1 path. Headers injected here; the Director sees the sentinel
 		// and only rewrites the upstream URL.
-		if canonicalCode == "mock" {
-			if strings.TrimSpace(res.BaseURL) == "" {
-				logger.Error("Mock Provider OAuth account has no runtime base URL",
-					"event.name", observability.EventProxyRequestUpstreamError,
-					"error.code", observability.ErrCodeProviderError,
-					"account_id", res.AccountID,
-					"protocol_type", protocolType,
-				)
-				writeJSONError(w, http.StatusBadGateway, "server_error", observability.ErrCodeProviderError,
-					"Mock Provider account has no runtime base URL")
-				return true
-			}
-			rc.BaseURL = res.BaseURL
-		} else {
-			rc.BaseURL, r = resolveOAuthUpstream(oauthCode, protocolType, r)
+		if canonicalCode == "mock" && strings.TrimSpace(res.BaseURL) == "" {
+			logger.Error("Mock Provider OAuth account has no runtime base URL",
+				"event.name", observability.EventProxyRequestUpstreamError,
+				"error.code", observability.ErrCodeProviderError,
+				"account_id", res.AccountID,
+				"protocol_type", protocolType,
+			)
+			writeJSONError(w, http.StatusBadGateway, "server_error", observability.ErrCodeProviderError,
+				"Mock Provider account has no runtime base URL")
+			return true
 		}
+		resolvedBase := res.BaseURL
+		if strings.TrimSpace(resolvedBase) == "" {
+			resolvedBase = rc.BaseURL
+		}
+		rc.BaseURL, r = resolveOAuthUpstream(canonicalCode, protocolType, resolvedBase, r)
 		oauthInject(r, res.OAuth, oauthCode)
 		// Stash the window cap so ModifyResponse can pre-cut this account when the
 		// upstream's unified-utilization crosses it (N10 防封).

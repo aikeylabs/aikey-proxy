@@ -279,31 +279,23 @@ func (p *Proxy) handleAppPipeline(w http.ResponseWriter, r *http.Request, appCtx
 		return
 	}
 
-	// B mode normalization (2026-05-23, credential-mode-architecture SPEC §1.1.B):
-	// When the binding came from a bound_alias dereference, its ProviderCode
-	// may be a brand alias from the vault row (e.g., OAuth provider="claude")
-	// rather than the canonical code body.model resolves to ("anthropic").
-	// Normalize both sides via providerCanonicalCode — same lockstep
-	// canonicalization handleProbePipeline applies for mode C — so downstream
-	// stages (provider adapter, WAF inject) see a single canonical value.
-	// Mismatch is a caller-side bug (e.g., bound_alias=oauth(anthropic) but
-	// body.model=gpt-4); fail loud rather than letting the upstream reject
-	// the wrong-provider credential.
-	if resolved.AppRecord != nil && resolved.AppRecord.BoundAlias != "" {
-		canonicalBound := providerCanonicalCode(binding.ProviderCode)
-		canonicalUpstream := providerCanonicalCode(inferredUpstream)
-		if canonicalBound != "" && canonicalBound != canonicalUpstream {
-			p.errors.Add(1)
-			writeJSONError(w, http.StatusBadRequest, "invalid_request_error",
-				"BOUND_ALIAS_PROVIDER_MISMATCH",
-				"App \""+appCtx.Slug+"\" is bound to alias \""+resolved.AppRecord.BoundAlias+
-					"\" (provider=\""+binding.ProviderCode+"\") but body.model resolves to upstream \""+
-					inferredUpstream+"\". Use a body.model matching the bound alias's provider, "+
-					"or `aikey app update "+appCtx.Slug+" --bound-alias <name>` to re-bind.")
-			return
+	// Preserve the independent client-route, physical-provider and protocol
+	// axes. Bound aliases have no stored ClientRoute, so this request supplies
+	// it; the credential's ProviderCode is never overwritten with that route.
+	normalizedBinding, axesErr := normalizeBindingForClientRoute(binding, inferredUpstream)
+	if axesErr != nil {
+		p.errors.Add(1)
+		errorCode := "BINDING_ROUTE_MISMATCH"
+		message := "App \"" + appCtx.Slug + "\" has an invalid binding for body.model route \"" +
+			inferredUpstream + "\": " + axesErr.Error()
+		if resolved.AppRecord != nil && resolved.AppRecord.BoundAlias != "" {
+			errorCode = "BOUND_ALIAS_PROVIDER_MISMATCH"
+			message += ". Re-bind with `aikey app update " + appCtx.Slug + " --bound-alias <name>`."
 		}
-		binding.ProviderCode = canonicalUpstream
+		writeJSONError(w, http.StatusBadRequest, "invalid_request_error", errorCode, message)
+		return
 	}
+	binding = normalizedBinding
 
 	// Capture inbound bearer BEFORE Stage 5 — ResolveBindingCredential calls
 	// oauthInject which overwrites r.Header.Authorization with the upstream
@@ -319,8 +311,16 @@ func (p *Proxy) handleAppPipeline(w http.ResponseWriter, r *http.Request, appCtx
 	// Stage 5: resolve credential from binding (shared with legacy path).
 	// p.ResolveBindingCredential walks the same OAuth/team/personal branches
 	// used by handlePathPrefixRoute — pinned by oauth_binding_fence_test.go.
-	// Mutates r headers via oauthInject on the OAuth path.
-	cred, bindErr := p.ResolveBindingCredential(r, binding, inferredUpstream, inferredUpstream, logger)
+	// Provider setup is path/body-aware, so present the upstream-facing path and
+	// a replayable sanitized body before entering it. This ordering is part of
+	// the contract: Codex normalizes /v1/responses and captures body.model here.
+	r.URL.Path = "/v1" + appCtx.StrippedPath
+	if r.URL.RawPath != "" {
+		r.URL.RawPath = r.URL.Path
+	}
+	r.Body = io.NopCloser(bytes.NewReader(sanitized))
+	r.ContentLength = int64(len(sanitized))
+	cred, resolvedReq, bindErr := p.ResolveBindingCredential(r, binding, logger)
 	if bindErr != nil {
 		p.errors.Add(1)
 		logger.Warn("app pipeline credential resolution failed",
@@ -330,6 +330,7 @@ func (p *Proxy) handleAppPipeline(w http.ResponseWriter, r *http.Request, appCtx
 		writeJSONError(w, bindErr.StatusCode, bindErr.ErrorType, bindErr.ErrorCode, bindErr.Message)
 		return
 	}
+	r = resolvedReq
 	if cred.RealKey == "" {
 		p.errors.Add(1)
 		writeJSONError(w, http.StatusServiceUnavailable, "server_error", "BINDING_CREDENTIAL_UNRESOLVED",
@@ -341,20 +342,11 @@ func (p *Proxy) handleAppPipeline(w http.ResponseWriter, r *http.Request, appCtx
 		return
 	}
 
-	// Stage 6: build the ResolvedRoute for serveRoute. Provider /
-	// ProviderCode / ProtocolType reflect the BINDING's upstream provider
-	// (the inferred-from-model value, equal to binding.ProviderCode by
-	// construction in this branch). ProtocolFamily resolves the provider
-	// to its wire family via pkg/providerroutes yaml (single source of
-	// truth, see ResolvedRoute.ProtocolFamily doc-comment).
-	// P1d (design D-10, safe slice): resolve the wire protocol family from the
-	// path-aware route row keyed on the credential's base_url, not the
-	// path-blind ByProvider — which returns a multi-endpoint provider's FIRST
-	// row (wrong for GLM's /api/anthropic vs /api/paas). Audit-only consumer
-	// (SSE parser selection), so no routing/attribution/adapter change here.
-	// Full provider↔protocol weld removal (attribution + isProviderCompatible
-	// + adapter-key kimi special-case) is tracked as an open item pending live
-	// cross-provider verification — see baseline-forensics §六.
+	// Stage 6: build the ResolvedRoute without collapsing its axes.
+	// ProviderCode is the physical upstream vendor; ProtocolType is the wire
+	// adapter selected by the binding. ProtocolFamily prefers the path-aware
+	// base_url row (important for GLM's multiple endpoints) and otherwise uses
+	// the exact Provider+Protocol compatibility row.
 	protocolType := binding.ProtocolType
 	if protocolType == "" && cred.ManagedKey != nil && cred.ManagedKey.ProtocolType != "" {
 		protocolType = cred.ManagedKey.ProtocolType
@@ -394,23 +386,16 @@ func (p *Proxy) handleAppPipeline(w http.ResponseWriter, r *http.Request, appCtx
 	}
 
 	// Stage 7: provider adapter selected by the BINDING's upstream protocol.
-	prov, err := p.providers.Get(binding.ProviderCode)
+	prov, err := p.providers.Get(protocolType)
 	if err != nil {
 		p.errors.Add(1)
 		writeJSONError(w, http.StatusBadGateway, "server_error", "PROVIDER_ERROR",
-			"Unknown upstream provider protocol: "+binding.ProviderCode)
+			"Unknown upstream provider protocol: "+protocolType)
 		return
 	}
 
-	// Strip /apps/<slug>/v1 prefix → leave only the upstream path part
-	// (e.g., "/chat/completions"). serveRoute prepends BaseURL.
-	r.URL.Path = "/v1" + appCtx.StrippedPath
-	if r.URL.RawPath != "" {
-		r.URL.RawPath = r.URL.Path
-	}
-
 	// Stage 8 (Phase 2 protocol translation, optional): if inbound wire
-	// differs from upstream wire (binding.ProviderCode), translate the
+	// differs from upstream wire (binding.ProtocolType), translate the
 	// request body + arm a response-side closure on the ResolvedRoute.
 	// No-op when from == to. Phase 2 中方案 (2026-05-21): inbound wire
 	// is inferred from URL path — `/v1/messages` ≡ Anthropic, else
@@ -458,18 +443,16 @@ func (p *Proxy) handleAppPipeline(w http.ResponseWriter, r *http.Request, appCtx
 	r.ContentLength = int64(len(translateOut.Body))
 
 	// Phase 4 fix (2026-05-22, Stage 7 smoke): when OAuth → Anthropic, the
-	// WAF body fingerprint must be present in body.system[0]. The body
-	// rewriter ran inside ResolveBindingCredential's oauthInject() call
-	// above, but at that point r.Body had already been consumed by Stage 3
-	// (line 606 io.ReadAll); the rewriter saw an empty body, no-oped, and
-	// returned without injecting. Now that r.Body carries the post-
-	// translation bytes, re-run the WAF rewriter so the body that actually
-	// goes upstream gets the magic-intro + billing-header fingerprint.
+	// WAF body fingerprint must be present in body.system[0]. Stage 5 runs
+	// oauthInject against a replay copy, but translation below deliberately
+	// rebuilds the final body from the sanitized source. Re-run the WAF rewrite
+	// on that final body so translation cannot discard the fingerprint.
 	// Without this, Anthropic returns 429 "rate_limit_error" with no
 	// anthropic-ratelimit-* headers (business rejection signature, ref
 	// workflow/CI/research/oauth-token-response-identity/2026-04-15-oauth-token-response-identity.md).
+	oauthCode, _ := oauthInjectionProvider(binding.ProviderCode, protocolType)
 	if binding.KeySourceType == "personal_oauth_account" &&
-		binding.ProviderCode == "anthropic" &&
+		oauthCode == "anthropic" &&
 		!inboundUAWasClaudeCode {
 		injectClaudeWAFFingerprintFull(r)
 		// injectClaudeWAFFingerprintFull may have rewritten r.Body; sync
@@ -644,15 +627,9 @@ func (p *Proxy) handleProbePipeline(w http.ResponseWriter, r *http.Request, prob
 		logger.Warn("probe pipeline field degraded", "degradation", warning)
 	}
 
-	// Stage 4: infer upstream from body.model and sanity-check it matches the
-	// alias's recorded provider. Probing FreySilvaqzs@... (Anthropic OAuth)
-	// with a body that says "gpt-4o" is a caller-side bug — fail loud.
-	//
-	// Compare via canonical codes so brand aliases agree:
-	// vault may store "claude" (OAuth) while InferUpstreamFromModel returns
-	// "anthropic"; both must reconcile. providerCanonicalCode is the same
-	// helper apppipe + path-prefix routing use, so the probe pipeline
-	// inherits identical alias semantics with no drift.
+	// Stage 4: infer the client route from body.model and validate that the
+	// alias's protocol can serve it. The physical provider may deliberately
+	// differ (Mock or GLM), so Provider equality is not a valid gate.
 	inboundModel := extractModelLazy(sanitized)
 	inferredUpstream := provider.InferUpstreamFromModel(inboundModel)
 	if inferredUpstream == "" {
@@ -663,20 +640,15 @@ func (p *Proxy) handleProbePipeline(w http.ResponseWriter, r *http.Request, prob
 				"can confirm the alias's provider matches the request.")
 		return
 	}
-	canonicalUpstream := providerCanonicalCode(inferredUpstream)
-	canonicalBound := providerCanonicalCode(binding.ProviderCode)
-	if canonicalBound != "" && canonicalBound != canonicalUpstream {
+	normalizedBinding, axesErr := normalizeBindingForClientRoute(binding, inferredUpstream)
+	if axesErr != nil {
 		p.errors.Add(1)
 		writeJSONError(w, http.StatusBadRequest, "invalid_request_error", "PROBE_PROVIDER_MISMATCH",
-			"Alias \""+probeCtx.AliasName+"\" is bound to provider \""+binding.ProviderCode+
-				"\" but body.model resolves to upstream \""+inferredUpstream+
-				"\". Use a body.model that matches the alias's provider.")
+			"Alias \""+probeCtx.AliasName+"\" cannot serve body.model route \""+inferredUpstream+
+				"\": "+axesErr.Error()+". Use a model matching the alias's protocol.")
 		return
 	}
-	// Normalize binding's ProviderCode to canonical form so downstream
-	// stages (provider adapter lookup, ResolveBindingCredential, translate)
-	// see the same code regardless of vault storage convention.
-	binding.ProviderCode = canonicalUpstream
+	binding = normalizedBinding
 
 	// Capture inbound bearer BEFORE Stage 5 — same reason as handleAppPipeline:
 	// ResolveBindingCredential → oauthInject overwrites r.Header.Authorization
@@ -687,8 +659,15 @@ func (p *Proxy) handleProbePipeline(w http.ResponseWriter, r *http.Request, prob
 	inboundBearer := extractRawAuthValue(r)
 
 	// Stage 5: resolve credential via the shared App/legacy machinery.
-	upstream := binding.ProviderCode
-	cred, bindErr := p.ResolveBindingCredential(r, binding, upstream, upstream, logger)
+	// As in the App pipeline, provider setup must see the upstream-facing path
+	// and a replayable sanitized body before it runs.
+	r.URL.Path = "/v1" + probeCtx.StrippedPath
+	if r.URL.RawPath != "" {
+		r.URL.RawPath = r.URL.Path
+	}
+	r.Body = io.NopCloser(bytes.NewReader(sanitized))
+	r.ContentLength = int64(len(sanitized))
+	cred, resolvedReq, bindErr := p.ResolveBindingCredential(r, binding, logger)
 	if bindErr != nil {
 		p.errors.Add(1)
 		logger.Warn("probe pipeline credential resolution failed",
@@ -698,6 +677,7 @@ func (p *Proxy) handleProbePipeline(w http.ResponseWriter, r *http.Request, prob
 		writeJSONError(w, bindErr.StatusCode, bindErr.ErrorType, bindErr.ErrorCode, bindErr.Message)
 		return
 	}
+	r = resolvedReq
 	if cred.RealKey == "" {
 		p.errors.Add(1)
 		writeJSONError(w, http.StatusServiceUnavailable, "server_error", "BINDING_CREDENTIAL_UNRESOLVED",
@@ -748,18 +728,12 @@ func (p *Proxy) handleProbePipeline(w http.ResponseWriter, r *http.Request, prob
 	}
 
 	// Stage 7: provider adapter.
-	prov, err := p.providers.Get(binding.ProviderCode)
+	prov, err := p.providers.Get(protocolType)
 	if err != nil {
 		p.errors.Add(1)
 		writeJSONError(w, http.StatusBadGateway, "server_error", "PROVIDER_ERROR",
-			"Unknown upstream provider: "+binding.ProviderCode)
+			"Unknown upstream provider protocol: "+protocolType)
 		return
-	}
-
-	// Strip /probe/<alias>/v1 prefix → leave only upstream path.
-	r.URL.Path = "/v1" + probeCtx.StrippedPath
-	if r.URL.RawPath != "" {
-		r.URL.RawPath = r.URL.Path
 	}
 
 	// Stage 8: protocol translation (reuses apppipe — no-op when inbound and
@@ -799,11 +773,12 @@ func (p *Proxy) handleProbePipeline(w http.ResponseWriter, r *http.Request, prob
 	r.Body = io.NopCloser(bytes.NewReader(translateOut.Body))
 	r.ContentLength = int64(len(translateOut.Body))
 
-	// OAuth → Anthropic WAF fingerprint rewrite (same rationale as App pipeline
-	// — body had been consumed at sanitize stage, oauthInject saw empty body
-	// and no-oped; re-run on the final post-translation body).
+	// OAuth → Anthropic WAF fingerprint rewrite (same rationale as App pipeline:
+	// translation rebuilds the body after the Stage-5 replay copy, so apply the
+	// fingerprint to the final post-translation bytes).
+	oauthCode, _ := oauthInjectionProvider(binding.ProviderCode, protocolType)
 	if binding.KeySourceType == "personal_oauth_account" &&
-		binding.ProviderCode == "anthropic" &&
+		oauthCode == "anthropic" &&
 		!inboundUAWasClaudeCode {
 		injectClaudeWAFFingerprintFull(r)
 		if r.Body != nil {
@@ -1171,6 +1146,12 @@ func (p *Proxy) handlePathPrefixRoute(w http.ResponseWriter, r *http.Request, pr
 
 		// Handle OAuth credential injection if this is an OAuth route token.
 		if tokenRealKey == oauthSentinelKey && oauthAccountID != "" && p.broker != nil {
+			if reason := oauthUpstreamRejectsPath(canonicalCode, r.URL.Path); reason != "" {
+				p.errors.Add(1)
+				writeJSONError(w, http.StatusBadRequest, "invalid_request_error",
+					observability.ErrCodeOAuthResponsesOnly, reason)
+				return
+			}
 			if err := p.broker.EnsureFresh(r.Context(), oauthAccountID); err != nil {
 				p.errors.Add(1)
 				writeJSONError(w, http.StatusUnauthorized, "auth_error", "OAUTH_TOKEN_EXPIRED",
@@ -1183,11 +1164,8 @@ func (p *Proxy) handlePathPrefixRoute(w http.ResponseWriter, r *http.Request, pr
 				writeJSONError(w, http.StatusServiceUnavailable, "server_error", "OAUTH_RESOLVE_FAILED", err.Error())
 				return
 			}
-			// Why override for openai: Codex OAuth uses chatgpt.com/backend-api/codex
-			// (Responses API), NOT api.openai.com/v1 (Chat Completions API).
-			if canonicalCode == "openai" {
-				tokenRoute.BaseURL = "https://chatgpt.com/backend-api/codex"
-			}
+			tokenRoute.BaseURL, r = resolveOAuthUpstream(
+				canonicalCode, protocolType, tokenRoute.BaseURL, r)
 			oauthInject(r, cred, canonicalCode)
 		}
 
@@ -1267,15 +1245,21 @@ func (p *Proxy) handlePathPrefixRoute(w http.ResponseWriter, r *http.Request, pr
 					return
 				}
 
-				// BaseURL: same rule as Tier3 active-OAuth path (proxy.go:629).
-				// openai OAuth uses chatgpt.com/backend-api/codex (Codex API),
-				// not api.openai.com (API-key path).
-				var oauthBase string
-				if canonicalCode == "openai" {
-					oauthBase = "https://chatgpt.com/backend-api/codex"
-				} else {
-					oauthBase = providerDefaultBaseURL(canonicalCode)
+				// Remove the client-facing provider namespace before provider-specific
+				// OAuth setup. Codex normalization intentionally operates on
+				// /v1/responses, not /openai/v1/responses.
+				r.URL.Path = strippedPath
+				if r.URL.RawPath != "" {
+					r.URL.RawPath = strippedPath
 				}
+				if reason := oauthUpstreamRejectsPath(canonicalCode, r.URL.Path); reason != "" {
+					p.errors.Add(1)
+					writeJSONError(w, http.StatusBadRequest, "invalid_request_error",
+						observability.ErrCodeOAuthResponsesOnly, reason)
+					return
+				}
+				oauthBase, resolvedReq := resolveOAuthUpstream(canonicalCode, protocolType, "", r)
+				r = resolvedReq
 				oauthInject(r, cred, canonicalCode)
 
 				identityTag := cred.Identity
@@ -1288,14 +1272,6 @@ func (p *Proxy) handlePathPrefixRoute(w http.ResponseWriter, r *http.Request, pr
 					"account_id", alias,
 					"routing", "tier2-probe",
 				)
-
-				// Strip provider prefix (e.g. /anthropic/v1/messages →
-				// /v1/messages) before forwarding — same as personal-probe
-				// fallback below.
-				r.URL.Path = strippedPath
-				if r.URL.RawPath != "" {
-					r.URL.RawPath = strippedPath
-				}
 
 				prov, err := p.providers.Get(protocolType)
 				if err != nil {
@@ -1391,6 +1367,14 @@ func (p *Proxy) handlePathPrefixRoute(w http.ResponseWriter, r *http.Request, pr
 	}
 
 	// ── No auth header: fall through to default binding ────────────────────
+	// Strip the client-facing provider namespace before credential resolution.
+	// OAuth provider setup is path-aware (Codex maps /v1/responses to
+	// /responses), so doing this afterward both hides the request dialect and
+	// overwrites the normalized path with the pre-resolution value.
+	r.URL.Path = strippedPath
+	if r.URL.RawPath != "" {
+		r.URL.RawPath = strippedPath
+	}
 
 	// ── v1.0.2: try provider binding first ─────────────────────────────────
 	// The new model stores per-provider primary key selection in
@@ -1401,12 +1385,16 @@ func (p *Proxy) handlePathPrefixRoute(w http.ResponseWriter, r *http.Request, pr
 	binding, _ := p.activeReader.GetProviderBinding(canonicalCode)
 	upstreamProviderCode := canonicalCode
 	if binding != nil {
-		if binding.ProviderCode != "" {
-			upstreamProviderCode = binding.ProviderCode
+		normalizedBinding, axesErr := normalizeBindingForClientRoute(binding, canonicalCode)
+		if axesErr != nil {
+			p.errors.Add(1)
+			writeJSONError(w, http.StatusBadGateway, "server_error", "BINDING_AXES_INVALID",
+				"Active binding is invalid: "+axesErr.Error())
+			return
 		}
-		if binding.ProtocolType != "" {
-			protocolType = binding.ProtocolType
-		}
+		binding = normalizedBinding
+		upstreamProviderCode = binding.ProviderCode
+		protocolType = binding.ProtocolType
 		// ── Group VK on the follow-active path (N8 / bugfix 2026-06-30) ────────
 		// A group VK (OAuth account pool) carries NO static PlaintextKey — its
 		// per-account material lives in GroupRuntime and must be served via
@@ -1440,7 +1428,7 @@ func (p *Proxy) handlePathPrefixRoute(w http.ResponseWriter, r *http.Request, pr
 			}
 		}
 
-		cred, bindErr := p.ResolveBindingCredential(r, binding, providerCode, upstreamProviderCode, logger)
+		cred, resolvedReq, bindErr := p.ResolveBindingCredential(r, binding, logger)
 		if bindErr != nil {
 			// OAuth path: writeJSONError + return (helper does NOT increment
 			// p.errors because the caller's view of "what's an error" may
@@ -1450,6 +1438,7 @@ func (p *Proxy) handlePathPrefixRoute(w http.ResponseWriter, r *http.Request, pr
 			writeJSONError(w, bindErr.StatusCode, bindErr.ErrorType, bindErr.ErrorCode, bindErr.Message)
 			return
 		}
+		r = resolvedReq
 		// Soft-fail path (team / personal with empty cred): RealKey="" leaves
 		// the variables blank below and the legacy fallback block fires.
 		// OAuth-success path: cred fields populated, RealKey="__oauth__".
@@ -1546,12 +1535,6 @@ func (p *Proxy) handlePathPrefixRoute(w http.ResponseWriter, r *http.Request, pr
 		writeJSONError(w, http.StatusBadGateway, "server_error", "PROVIDER_ERROR",
 			"Unknown provider protocol: "+protocolType+" (from path: "+providerCode+")")
 		return
-	}
-
-	// Strip provider prefix from path before forwarding.
-	r.URL.Path = strippedPath
-	if r.URL.RawPath != "" {
-		r.URL.RawPath = strippedPath
 	}
 
 	route := &vkeys.ResolvedRoute{

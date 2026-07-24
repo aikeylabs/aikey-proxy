@@ -43,6 +43,7 @@ func newTestReaderWithAliasTables(t *testing.T) *Reader {
 		`CREATE TABLE provider_accounts (
 			provider_account_id  TEXT PRIMARY KEY,
 			provider             TEXT NOT NULL,
+			protocol_type        TEXT NOT NULL DEFAULT '',
 			auth_type            TEXT NOT NULL,
 			credential_type      TEXT NOT NULL DEFAULT 'personal_oauth_account',
 			status               TEXT NOT NULL DEFAULT 'active',
@@ -106,8 +107,8 @@ func TestGetAliasCredential_PersonalEntry(t *testing.T) {
 func TestGetAliasCredential_OAuthByDisplayIdentity(t *testing.T) {
 	r := newTestReaderWithAliasTables(t)
 	_, err := r.db.Exec(
-		`INSERT INTO provider_accounts (provider_account_id, provider, auth_type, display_identity, status)
-		 VALUES ('acct-abc', 'anthropic', 'oauth', 'user@host.com', 'active')`,
+		`INSERT INTO provider_accounts (provider_account_id, provider, protocol_type, auth_type, display_identity, status)
+		 VALUES ('acct-abc', 'mock', 'anthropic', 'oauth', 'user@host.com', 'active')`,
 	)
 	if err != nil {
 		t.Fatalf("seed provider_accounts: %v", err)
@@ -132,8 +133,11 @@ func TestGetAliasCredential_OAuthByDisplayIdentity(t *testing.T) {
 	if got.Binding.KeySourceRef != "acct-abc" {
 		t.Errorf("key_source_ref: got %q, want acct-abc", got.Binding.KeySourceRef)
 	}
-	if got.Binding.ProviderCode != "anthropic" {
-		t.Errorf("provider_code: got %q, want anthropic", got.Binding.ProviderCode)
+	if got.Binding.ProviderCode != "mock" {
+		t.Errorf("provider_code: got %q, want mock", got.Binding.ProviderCode)
+	}
+	if got.Binding.ProtocolType != "anthropic" {
+		t.Errorf("protocol_type: got %q, want anthropic", got.Binding.ProtocolType)
 	}
 }
 
@@ -271,5 +275,38 @@ func TestGetAliasCredential_PreV103Vault(t *testing.T) {
 	}
 	if got != nil {
 		t.Errorf("expected nil on pre-v1.0.3 vault, got %+v", got)
+	}
+}
+
+func TestGetAliasCredential_PreProtocolColumnOAuthRemainsReadable(t *testing.T) {
+	db, err := sql.Open("sqlite", ":memory:")
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	t.Cleanup(func() { db.Close() })
+	for _, stmt := range []string{
+		`CREATE TABLE entries (alias TEXT PRIMARY KEY, provider_code TEXT)`,
+		`CREATE TABLE provider_accounts (
+			provider_account_id TEXT PRIMARY KEY,
+			provider TEXT NOT NULL,
+			status TEXT NOT NULL,
+			display_identity TEXT,
+			local_alias TEXT
+		)`,
+		`INSERT INTO provider_accounts
+			(provider_account_id, provider, status, display_identity)
+			VALUES ('legacy-oauth', 'anthropic', 'active', 'legacy@example.com')`,
+	} {
+		if _, execErr := db.Exec(stmt); execErr != nil {
+			t.Fatalf("schema/seed: %v", execErr)
+		}
+	}
+
+	got, err := (&Reader{db: db}).GetAliasCredential("legacy@example.com")
+	if err != nil {
+		t.Fatalf("GetAliasCredential: %v", err)
+	}
+	if got == nil || got.Binding.ProviderCode != "anthropic" || got.Binding.ProtocolType != "" {
+		t.Fatalf("legacy OAuth binding = %+v, want provider preserved and empty protocol for downstream single-protocol fallback", got)
 	}
 }

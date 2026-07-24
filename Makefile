@@ -32,7 +32,7 @@ export GOWORK
 # derive it from origin/HEAD or a new commit could silently baseline itself.
 LINT_BASE_REV ?= 9695facb96c1fefb8a2f8ba1f4b41823cf1efad6
 
-.PHONY: build test run install uninstall restart clean lint lint-full cross-compile sync-fingerprint chaos-gap7 chaos-gap8 chaos filter-integration
+.PHONY: build test test-bugfix-provider-routing run install uninstall restart clean lint lint-full cross-compile sync-fingerprint chaos-gap7 chaos-gap8 chaos filter-integration
 
 # v4.3 (2026-05-01): aikey-cli/data/provider_fingerprint.yaml is the single
 # source of truth for provider routing. The pkg/providerroutes Go package
@@ -58,6 +58,17 @@ build: sync-fingerprint
 # they drive the REAL buildTransport — internal/... alone would skip them.
 test:
 	go test -race -v ./internal/... ./cmd/aikey-proxy/
+
+# Regression fence for the 2026-07-24 OAuth URL composer and the adjacent
+# Provider/Protocol consumer regressions. This target is the canonical entry
+# referenced by both bugfix records; keep new routing lanes in this matrix so
+# a release does not depend on remembering a list of ad-hoc go test commands.
+test-bugfix-provider-routing: ## regression: OAuth Stitch + App/Probe axes + health URL + vault projection
+	go test -v -count=1 ./internal/provider/ -run 'TestProtocolFamily'
+	go test -v -count=1 ./internal/vault/ -run 'TestGetAliasCredential_(OAuthByDisplayIdentity|PreProtocolColumnOAuthRemainsReadable)'
+	go test -v -count=1 ./internal/supervisor/ -run 'Test(OAuthTokenToRoute_SetsOAuthSource|BuildManagedRoutes_PreservesBothMockProtocolBindings)'
+	go test -v -count=1 ./internal/admin/ -run 'TestProbeKey_UsesProviderRouteStitchForEveryVersionShape'
+	go test -v -count=1 ./internal/proxy/ -run 'Test(StitchOAuthRequestURL_OneProviderTableRule|Fence_OAuthBinding|Fence_Tier1OAuthRouteStitchesVersionExactlyOnce|Fence_CodexOAuth|GroupServe_(OAuthAccountInjectsBearer|MockCodexOAuthUsesRuntimeRailAndFingerprintVersion|MockOAuthMissingBaseURLFailsClosed|EmptyRouteProviderUsesAccountProvider)|AppPipeline_PreservesProviderAndUsesProtocolAdapter|ProbePipeline_PreservesProviderAndUsesProtocolAdapter|NormalizeBindingForClientRouteKeepsIndependentAxes)'
 
 # Chaos experiments (缺口7/8) — build-tagged so they stay OUT of the normal
 # `test` suite. They drive the real newStreamDrainer / http.Server code paths

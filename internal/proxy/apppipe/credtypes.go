@@ -79,6 +79,10 @@ func (e *BindingResolveError) Error() string { return e.ErrorCode + ": " + e.Mes
 // production implementation is proxy.Proxy itself — its method
 // ResolveBindingCredential satisfies this interface.
 //
+// The returned request is authoritative for all downstream stages. OAuth
+// setup can return a shallow clone carrying a normalized path and context
+// metadata; continuing with the input request would silently discard both.
+//
 // The interface is here (not in proxy) to avoid an import cycle: proxy
 // already imports apppipe, so apppipe owns the contract and proxy
 // fulfillls it.
@@ -86,7 +90,6 @@ type BindingResolver interface {
 	ResolveBindingCredential(
 		r *http.Request,
 		binding *vault.ProviderBinding,
-		providerCode, canonicalCode string,
 		logger *slog.Logger,
-	) (*BindingCredential, *BindingResolveError)
+	) (*BindingCredential, *http.Request, *BindingResolveError)
 }

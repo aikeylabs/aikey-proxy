@@ -154,6 +154,12 @@ func TestOAuthTokenToRoute_SetsOAuthSource(t *testing.T) {
 	if r.VirtualKeyID != "oauth:session_abcdef" {
 		t.Errorf("VirtualKeyID prefix wrong: %q", r.VirtualKeyID)
 	}
+	if r.ProtocolType != "anthropic" {
+		t.Errorf("ProtocolType = %q, want anthropic", r.ProtocolType)
+	}
+	if r.BaseURL != "https://api.anthropic.com/v1" {
+		t.Errorf("BaseURL = %q, want provider effective endpoint", r.BaseURL)
+	}
 }
 
 // Belt-and-suspenders coverage: if someone adds a 4th route type, this
