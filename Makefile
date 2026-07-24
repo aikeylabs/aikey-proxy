@@ -32,7 +32,7 @@ export GOWORK
 # derive it from origin/HEAD or a new commit could silently baseline itself.
 LINT_BASE_REV ?= 9695facb96c1fefb8a2f8ba1f4b41823cf1efad6
 
-.PHONY: build test test-bugfix-provider-routing run install uninstall restart clean lint lint-full cross-compile sync-fingerprint chaos-gap7 chaos-gap8 chaos filter-integration
+.PHONY: build test test-bugfix-provider-routing run install uninstall restart clean lint lint-full cross-compile sync-fingerprint sync-provider-registry sync-provider-data chaos-gap7 chaos-gap8 chaos filter-integration
 
 # v4.3 (2026-05-01): aikey-cli/data/provider_fingerprint.yaml is the single
 # source of truth for provider routing. The pkg/providerroutes Go package
@@ -40,16 +40,37 @@ LINT_BASE_REV ?= 9695facb96c1fefb8a2f8ba1f4b41823cf1efad6
 # go build so all consumers (this proxy + control service + future Go
 # consumers) compile against the same yaml content.
 #
-# The pkg/providerroutes/data/ copy is gitignored — canonical lives in
-# aikey-cli; editing the copy is a build-step concern, not a code change.
+# The pkg/providerroutes/data/ copy is CHECKED IN (design D-7) so every Go
+# consumer wired via a go.mod replace compiles without a per-service sync step.
+# Canonical still lives in aikey-cli; editing the copy directly is wrong — the
+# sync target regenerates it and the package's SHA gate fails the build when the
+# two diverge.
 FINGERPRINT_SRC := ../aikey-cli/data/provider_fingerprint.yaml
 FINGERPRINT_DST := ../pkg/providerroutes/data/provider_fingerprint.yaml
+
+# provider_registry.yaml is the SECOND provider source of truth and answers a
+# different question: fingerprint owns (provider × protocol → base_url), registry
+# owns provider identity — canonical code, brand aliases, family, proxy_path
+# (requirement spec 2026-07-18-provider-protocol-compatibility-and-baseurl §3).
+# Go had no path to it until pkg/providerregistry, which is why alias tables were
+# hand-copied into Go; §10 of that spec forbids exactly that. Synced the same way
+# and for the same reason as the fingerprint copy.
+REGISTRY_SRC := ../aikey-cli/data/provider_registry.yaml
+REGISTRY_DST := ../pkg/providerregistry/data/provider_registry.yaml
 
 sync-fingerprint:
 	@mkdir -p ../pkg/providerroutes/data
 	@cp $(FINGERPRINT_SRC) $(FINGERPRINT_DST)
 
-build: sync-fingerprint
+sync-provider-registry:
+	@mkdir -p ../pkg/providerregistry/data
+	@cp $(REGISTRY_SRC) $(REGISTRY_DST)
+
+# Both provider sources must be fresh before any compile — a build that embeds
+# one stale copy misroutes exactly as badly as embedding two.
+sync-provider-data: sync-fingerprint sync-provider-registry
+
+build: sync-provider-data
 	@go build $(LDFLAGS) -o bin/aikey-proxy ./cmd/aikey-proxy
 	@cp $(CONFIG) bin/$(CONFIG)
 
@@ -137,7 +158,7 @@ lint:
 lint-full:
 	golangci-lint run ./...
 
-cross-compile: sync-fingerprint
+cross-compile: sync-provider-data
 	@mkdir -p bin
 	GOOS=darwin  GOARCH=arm64 go build $(LDFLAGS) -o bin/aikey-proxy-darwin-arm64  ./cmd/aikey-proxy
 	GOOS=darwin  GOARCH=amd64 go build $(LDFLAGS) -o bin/aikey-proxy-darwin-amd64  ./cmd/aikey-proxy
