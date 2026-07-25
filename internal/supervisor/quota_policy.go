@@ -129,15 +129,27 @@ func fetchQuotaPolicy(ctx context.Context, masterURL, orgID string, seats []stri
 	if decErr := json.NewDecoder(resp.Body).Decode(&body); decErr != nil {
 		return nil, "", false
 	}
-	// Signature from the decoded+re-marshaled subjects (order-stabilized): the
-	// server returns subjects in a stable order, but re-marshaling a normalized
-	// slice makes the change-signal independent of whitespace/key-order quirks.
-	sort.Slice(body.Subjects, func(i, j int) bool { return body.Subjects[i].SubjectID < body.Subjects[j].SubjectID })
-	sigBytes, err := json.Marshal(body.Subjects)
+	sig, err := quotaSubjectsSig(body.Subjects)
 	if err != nil {
 		return nil, "", false
 	}
-	return body.Subjects, string(sigBytes), true
+	return body.Subjects, sig, true
+}
+
+// quotaSubjectsSig computes the change-signal over a subjects slice, order-
+// stabilized (sort by SubjectID + JSON re-marshal) so it is independent of
+// whitespace/key-order quirks. Shared by the poller (fetchQuotaPolicy) and the
+// startup baseline seed (Supervisor.seedQuotaSig) so the two can NEVER drift — a
+// seed computed here must equal the poller's sig for identical subjects, else the
+// first post-boot poll would false-fire a reload. Sorts in place (matches the
+// poller's prior behavior, which returned the sorted slice for WriteSubjects).
+func quotaSubjectsSig(subjects []quota.PolicySubject) (string, error) {
+	sort.Slice(subjects, func(i, j int) bool { return subjects[i].SubjectID < subjects[j].SubjectID })
+	sigBytes, err := json.Marshal(subjects)
+	if err != nil {
+		return "", err
+	}
+	return string(sigBytes), nil
 }
 
 // distinctSeatIDsFromKeys collects the unique, non-empty seat ids from the active

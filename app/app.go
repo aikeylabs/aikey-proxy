@@ -362,7 +362,25 @@ func Run() {
 		// proxy watcher supplies the live OS value (launchd-spawned proxies
 		// have no login-shell env), keeping OAuth on the same egress as AI
 		// forwarding.
-		installBrokerClient(cfg.UpstreamProxy.URL)
+		// Mirror the forwarding transport's 2026-07-17 async pattern (the bootSpec
+		// block below): an ENGINE-spec broker egress primes a health-check that
+		// DIALS possibly-slow/unreachable exit nodes, and installBrokerClient does
+		// that build synchronously — which blocks the pre-serve startup path past
+		// the CLI's 5s health gate when a node is down (bugfix
+		// 20260725-proxy-startup-broker-egress-engine-build-blocks-serve: a
+		// persisted engine upstream with an unreachable node landed serve at
+		// ~5.04s, 0.04s over the gate). OAuth egress is a BYPASS (only OAuth login
+		// uses it), so — exactly like AI forwarding — install a fast fallback
+		// client now and build the real engine dialer in the background, hot-
+		// swapping when ready. installBrokerClient is atomic (mutex + closer swap).
+		if brokerBootSpec := strings.TrimSpace(cfg.UpstreamProxy.URL); brokerBootSpec == "" || !egress.IsEngineSpec(brokerBootSpec) {
+			installBrokerClient(cfg.UpstreamProxy.URL) // single-URL/empty: builds without dialing
+		} else {
+			installBrokerClient("") // interim: fast fallback client, no engine build
+			observability.GoSafe("app.broker_egress_async_build", observability.Isolated, func() {
+				installBrokerClient(cfg.UpstreamProxy.URL)
+			})
+		}
 
 		brk := broker.NewEmbedded(tokenStore, accountStore)
 		oauthHandler = broker.NewHandler(brk)
@@ -614,6 +632,14 @@ func Run() {
 			os.Exit(1)
 		}
 	})
+
+	// Start the master-policy pollers (compliance / quota / group_runtime rails)
+	// only AFTER the serve goroutine is launched, so their first-sync reloads —
+	// and any ai-compliance-detector cold start on a mandate org — run in the
+	// background instead of racing the pre-serve setup and tripping the CLI's 5s
+	// /health gate. See Supervisor.StartPolicyPollers. Bugfix
+	// 20260725-proxy-startup-reload-storm-5s-health-fail.
+	sup.StartPolicyPollers()
 
 	// Wait for either an OS shutdown signal OR a graceful self-restart request
 	// from the control-plane healer (selfheal.go): the proxy went stale after a

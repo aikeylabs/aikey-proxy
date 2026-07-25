@@ -95,3 +95,54 @@ func WriteSubjects(dbPath string, subjects []PolicySubject) error {
 	}
 	return tx.Commit()
 }
+
+// LoadPolicySubjects reads quota_rules_cache back into the WIRE form
+// (PolicySubject, raw rules/baseline bytes) — the inverse of WriteSubjects, and
+// distinct from snapshot.LoadSubjects which parses into the enforcement Subject.
+//
+// Used by the proxy's startup quota sig-seed (Supervisor.seedQuotaSig) so the seed
+// signs byte-identically to what the poller signs off a fresh master fetch —
+// eliminating the phantom "quota changed" reload on every boot. Same missing-
+// table/column tolerance as LoadSubjects (a pre-Phase-2 vault → nil, no error).
+//
+// Fail-safe by construction: if a rule stored here does not byte-match a fresh
+// fetch (e.g. the master omits an empty `rules` field so WriteSubjects normalized
+// "" → "[]"), the seed simply won't match and the first poll falls back to the
+// pre-seed behavior (one reload) — never a wrong result, and post-fix that reload
+// runs after serve so it can't affect startup health.
+func LoadPolicySubjects(db *sql.DB) ([]PolicySubject, error) {
+	rows, err := db.Query(`SELECT subject_id, subject_kind, members, rules, baseline FROM quota_rules_cache`)
+	if err != nil {
+		if isMissingTableOrColumn(err) {
+			return nil, nil
+		}
+		return nil, err
+	}
+	defer rows.Close()
+
+	var out []PolicySubject
+	for rows.Next() {
+		var (
+			sub         PolicySubject
+			members     sql.NullString
+			rulesStr    string
+			baselineStr sql.NullString
+		)
+		if err := rows.Scan(&sub.SubjectID, &sub.SubjectKind, &members, &rulesStr, &baselineStr); err != nil {
+			return nil, err
+		}
+		if rulesStr != "" {
+			sub.Rules = json.RawMessage(rulesStr)
+		}
+		if members.Valid && members.String != "" {
+			if err := json.Unmarshal([]byte(members.String), &sub.Members); err != nil {
+				return nil, fmt.Errorf("quota: parse members for %q: %w", sub.SubjectID, err)
+			}
+		}
+		if baselineStr.Valid && baselineStr.String != "" {
+			sub.Baselines = json.RawMessage(baselineStr.String)
+		}
+		out = append(out, sub)
+	}
+	return out, rows.Err()
+}

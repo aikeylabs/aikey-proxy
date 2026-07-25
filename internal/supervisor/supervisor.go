@@ -401,6 +401,13 @@ func New(cfg *config.Config, configPath, password, version string) (*Supervisor,
 		return nil, fmt.Errorf("initial generation failed: %w", err)
 	}
 	s.active.Store(gen)
+	// Seed the quota change-signal from the quota_rules_cache the initial
+	// generation just loaded, so the FIRST quota poll after boot is a no-op when
+	// the master's rules are unchanged — instead of always detecting a phantom
+	// "changed" against a nil baseline and forcing a reload. Stateless: the
+	// baseline is reconstructed from the already-persisted cache every boot,
+	// nothing new is persisted. Bugfix 20260725-proxy-startup-reload-storm-*.
+	s.seedQuotaSig(gen)
 	observability.GoSafe("supervisor.current_routed_restamp_loop", observability.Isolated, s.currentRoutedRestampLoop)
 	// Re-project any cooldowns hydrated from pool-cooldown.json. buildGeneration
 	// creates the Proxy before it becomes active, so the post-swap kick is the
@@ -436,32 +443,20 @@ func New(cfg *config.Config, configPath, password, version string) (*Supervisor,
 		})
 	}
 
-	// G3: poll the org-level compliance master switch so an enterprise can mandate
-	// compliance from the control backend (force-spawn the detector regardless of
-	// the user's local toggle). No-op when no team/org is configured (Personal).
-	observability.GoSafe("supervisor.compliance_policy_poll", observability.Isolated, func() { s.pollComplianceMasterPolicy(s.ctx) })
-
 	// Conversation audit (v1.0.1-alpha.2): poll the org-level capture switch so an
 	// enterprise can turn employee conversation capture on from the control backend.
 	// No-op when no team/org (Personal). A flip just gates the forward-path capture
-	// hook (reads the atomic) — no detector to spawn, unlike compliance.
+	// hook (reads the atomic) — no detector to spawn, unlike compliance. Kept here
+	// (started in New) precisely because it never triggers a Reload, so it cannot
+	// contribute to the pre-serve reload storm the way compliance/quota/group do.
 	observability.GoSafe("supervisor.conversation_audit_policy_poll", observability.Isolated, func() { s.pollConversationAuditPolicy(s.ctx) })
 
-	// C′ (2026-06-17): poll the org's quota policy so an admin's limit edit on the
-	// master takes effect on this node within 60s WITHOUT the employee running any
-	// aikey command. Quota is the last org policy that was CLI-sync-only; this puts
-	// it on the same master-poll rail as compliance/audit. No-op when no team/org
-	// or no active seats (Personal), or when quota is disabled.
-	observability.GoSafe("supervisor.quota_policy_poll", observability.Isolated, func() { s.pollQuotaPolicy(s.ctx) })
-
-	// SyncRail (2026-07-03): the group_runtime (N7c-2 channel ③ material) and
-	// routing_override (I-side §6.5 engine assignments) rails, driven by the
-	// declarative framework in railset.go — gate/URL/credential re-evaluated every
-	// cycle, failures counted into the OK→STALE→OFFLINE visibility state machine,
-	// Reload kicks an immediate re-sync. One GoSafe/Isolated goroutine per rail
-	// (names kept from the old hand-written polls so log filters carry over).
-	// quota/compliance/audit stay on their legacy loops until Phase 2.
-	s.railset.start(s)
+	// The master-policy pollers whose first sync CAN trigger a Reload — compliance
+	// mandate, quota rules, and the group_runtime / routing-override rails — are
+	// deliberately NOT started here. They are launched by StartPolicyPollers()
+	// AFTER the HTTP server is serving. See that method for why (pre-serve reload
+	// storm vs the CLI's 5s health gate). Bugfix
+	// 20260725-proxy-startup-reload-storm-5s-health-fail.
 
 	// Control-plane self-heal, Stage 2 (2026-07-01): proactively rebuild the
 	// control-plane client the moment the host's network changes (WiFi switch /
@@ -532,6 +527,63 @@ func New(cfg *config.Config, configPath, password, version string) (*Supervisor,
 	s.startQuotaHeartbeat()
 
 	return s, nil
+}
+
+// StartPolicyPollers launches the master-policy pollers whose first sync can
+// trigger a generation Reload: the compliance mandate switch, the quota rules,
+// and the group_runtime / routing-override rails.
+//
+// Why they are NOT started in New(): their immediate first sync runs concurrently
+// with the pre-serve setup (broker + credential warm-up), and on a mandate org
+// each triggered reload re-spawns the ai-compliance-detector child — a ~3s+ cold
+// start (CRF models + AC lexicons). Three such reloads at boot starve the main
+// goroutine before it reaches http.Serve, so the CLI's 5s health probe on /health
+// kills the proxy before it ever listens (found 2026-07-25: every restart-personal
+// failed with "did not become healthy in 5s"). Starting them AFTER the server is
+// serving moves that work off the startup-critical path: /health (admin mux, never
+// gated by the data-path filter) answers immediately and the pollers converge in
+// the background. The conversation-audit poller stays in New() because it never
+// triggers a Reload. Call exactly once, right after the serve goroutine launches.
+// Bugfix 20260725-proxy-startup-reload-storm-5s-health-fail.
+func (s *Supervisor) StartPolicyPollers() {
+	// G3: org-level compliance master switch (force-spawn the detector regardless
+	// of the user's local toggle). No-op when no team/org (Personal).
+	observability.GoSafe("supervisor.compliance_policy_poll", observability.Isolated, func() { s.pollComplianceMasterPolicy(s.ctx) })
+	// C′ (2026-06-17): the org's quota policy so an admin's limit edit on the master
+	// takes effect within 60s without the employee running any aikey command. No-op
+	// when no team/org, no active seats, or quota disabled.
+	observability.GoSafe("supervisor.quota_policy_poll", observability.Isolated, func() { s.pollQuotaPolicy(s.ctx) })
+	// SyncRail (2026-07-03): group_runtime (N7c-2 channel ③ material) + routing_override
+	// (I-side §6.5 engine assignments) rails. One GoSafe/Isolated goroutine per rail.
+	s.railset.start(s)
+}
+
+// seedQuotaSig primes lastQuotaSig from the quota_rules_cache that the initial
+// generation already loaded (reloadQuotaSnapshot → quota.LoadSubjects), computing
+// the signal with the SAME function the poller uses (quotaSubjectsSig). So the
+// first quota poll after boot is a no-op when the master's rules are unchanged
+// since last run, instead of always detecting a phantom "changed" against a nil
+// baseline and forcing a reload. Stateless — the baseline is rebuilt from the
+// already-persisted cache each boot; nothing new is persisted. No-op (leaves the
+// baseline nil, i.e. legacy behavior) when quota is off or the cache is
+// unreadable. Bugfix 20260725-proxy-startup-reload-storm-5s-health-fail.
+func (s *Supervisor) seedQuotaSig(gen *generation) {
+	if !s.quotaEnabled || gen == nil || gen.vault == nil {
+		return
+	}
+	subjects, err := quota.LoadPolicySubjects(gen.vault.DB())
+	if err != nil {
+		slog.Warn("quota.sig_seed.load_failed",
+			"event.name", "proxy.quota.sig_seed_failed", "error", err.Error())
+		return
+	}
+	sig, err := quotaSubjectsSig(subjects)
+	if err != nil {
+		slog.Warn("quota.sig_seed.marshal_failed",
+			"event.name", "proxy.quota.sig_seed_failed", "error", err.Error())
+		return
+	}
+	s.lastQuotaSig.Store(&sig)
 }
 
 // startQuotaHeartbeat wires the traffic-independent server-reachability probe for
