@@ -149,6 +149,44 @@ func BuildEgressTransport(spec string) (*http.Transport, io.Closer, error) {
 	return dialerToTransport(d), closer, nil
 }
 
+// BuildEgressDialContext returns just the DIAL half of BuildEgressTransport, for
+// callers that own their own HTTP client and cannot accept an *http.Transport.
+//
+// The OAuth broker is that caller (2026-07-24): its Cloudflare-bypass client is an
+// imroc/req client doing a uTLS Chrome handshake, so it needs `SetDial`, not a
+// transport. Before this, a multi-protocol node upstream had no URL form to hand
+// that client, so token exchange silently fell back to the system/env proxy while
+// AI forwarding used the real egress — one node, two different exits, and on a box
+// with a stale system proxy the login simply failed.
+//
+// Same dialer, same NO_PROXY/loopback bypass and same EgressDialError wrapping as
+// the transport path, so both exits stay identical by construction. The closer has
+// the same contract as BuildEgressTransport's: non-nil for group-backed dialers and
+// MUST be Closed when the upstream is swapped, or health-check goroutines leak.
+func BuildEgressDialContext(spec string) (func(ctx context.Context, network, addr string) (net.Conn, error), io.Closer, error) {
+	d, err := egress.BuildDialer(spec)
+	if err != nil {
+		return nil, nil, err
+	}
+	var closer io.Closer
+	if c, ok := d.(io.Closer); ok {
+		closer = c
+	}
+	dial := dialerDialContext(d)
+	bypass := egressBypass()
+	directDial := (&net.Dialer{Timeout: 30 * time.Second, KeepAlive: 30 * time.Second}).DialContext
+	return func(ctx context.Context, network, addr string) (net.Conn, error) {
+		if host, _, herr := net.SplitHostPort(addr); herr == nil && bypass(host) {
+			return directDial(ctx, network, addr)
+		}
+		conn, derr := dial(ctx, network, addr)
+		if derr != nil {
+			return nil, &EgressDialError{err: derr}
+		}
+		return conn, nil
+	}, closer, nil
+}
+
 // EgressDialError tags a failure to establish the per-account egress connection
 // (a socks5 hop refused, or a fallback/url-test group has NO reachable member).
 // The forward path's ErrorHandler detects it and returns a clear "egress connect

@@ -281,20 +281,60 @@ func Run() {
 	// falls back to its own env handling, the pre-2026-07-08 behavior).
 	effectiveBrokerEgress := func(cfgURL string) string {
 		s := strings.TrimSpace(cfgURL)
-		// The impersonate (uTLS Chrome) client only speaks a single proxy URL — it
-		// cannot consume a mihomo chain/fragment. So when the node upstream is
-		// multi-protocol, OAuth token refresh falls back to the system/env egress
-		// while AI forwarding still rides the full engine. LIMITATION (2026-07-16):
-		// token refresh through a multi-protocol-only egress is not yet supported;
-		// single-URL upstreams (the common case) refresh through the same proxy as
-		// forwarding, unchanged.
-		if egress.IsEngineSpec(s) {
-			return sysWatcher.BrokerEgressURL()
-		}
-		if s != "" {
+		if s != "" && !egress.IsEngineSpec(s) {
 			return s
 		}
+		// Engine specs are handled by installBrokerClient's dialer path; reaching
+		// here with one means that path declined it, so fall back like an empty
+		// value does.
 		return sysWatcher.BrokerEgressURL()
+	}
+
+	// brokerEgressCloser holds the group dialer backing the CURRENT broker client
+	// (non-nil only for mihomo fallback/url-test/load-balance groups). Swapping the
+	// node upstream must Close the previous one or its health-check goroutines leak
+	// — the same contract BuildEgressTransport documents for the forwarding path.
+	var (
+		brokerEgressMu     sync.Mutex
+		brokerEgressCloser io.Closer
+	)
+
+	// installBrokerClient points the OAuth broker at the node's CURRENT egress.
+	//
+	// One egress, both paths (2026-07-24). A multi-protocol spec has no URL form,
+	// so OAuth used to fall back to the system/env proxy while AI forwarding rode
+	// the engine — one node, two exits. On a machine whose system proxy is stale
+	// that surfaced as a bare `token exchange request failed: ... proxyconnect tcp`
+	// and looked to the user like their new egress "didn't take effect" (Win10 VM
+	// field case). Now an engine spec builds a dialer and the impersonate client
+	// dials THROUGH it; URL/empty specs keep the previous proxy-URL behavior.
+	//
+	// A dialer that fails to build is NOT fatal: OAuth degrades to the URL path
+	// rather than becoming unusable, and the WARN says which spec failed. The live
+	// forwarding transport reports the same failure separately.
+	installBrokerClient := func(spec string) {
+		var newCloser io.Closer
+		if s := strings.TrimSpace(spec); s != "" && egress.IsEngineSpec(s) {
+			dial, closer, err := proxy.BuildEgressDialContext(s)
+			if err == nil {
+				broker.SetHTTPClient(broker.NewImpersonateChromeHTTPClientWithDialer(dial))
+				newCloser = closer
+				slog.Info("OAuth broker egress: multi-protocol engine (same exit as forwarding)")
+			} else {
+				slog.Warn("OAuth broker egress: engine spec failed to build, using system/env proxy for token exchange",
+					"error", err)
+				broker.SetHTTPClient(broker.NewImpersonateChromeHTTPClient(effectiveBrokerEgress(spec)))
+			}
+		} else {
+			broker.SetHTTPClient(broker.NewImpersonateChromeHTTPClient(effectiveBrokerEgress(spec)))
+		}
+		brokerEgressMu.Lock()
+		old := brokerEgressCloser
+		brokerEgressCloser = newCloser
+		brokerEgressMu.Unlock()
+		if old != nil {
+			_ = old.Close()
+		}
 	}
 
 	// 5b. Build OAuth broker (embedded, uses vault stores).
@@ -322,7 +362,7 @@ func Run() {
 		// proxy watcher supplies the live OS value (launchd-spawned proxies
 		// have no login-shell env), keeping OAuth on the same egress as AI
 		// forwarding.
-		broker.SetHTTPClient(broker.NewImpersonateChromeHTTPClient(effectiveBrokerEgress(cfg.UpstreamProxy.URL)))
+		installBrokerClient(cfg.UpstreamProxy.URL)
 
 		brk := broker.NewEmbedded(tokenStore, accountStore)
 		oauthHandler = broker.NewHandler(brk)
@@ -432,7 +472,7 @@ func Run() {
 		// 2026-07-18 (reversed the L1 override): the node upstream serves only
 		// non-egress traffic; per-account egress stays independent, so setting/clearing
 		// the node upstream no longer touches per-account egress precedence.
-		broker.SetHTTPClient(broker.NewImpersonateChromeHTTPClient(effectiveBrokerEgress(spec)))
+		installBrokerClient(spec)
 		egressMu.Lock()
 		egressURL = spec
 		egressMu.Unlock()
@@ -472,29 +512,12 @@ func Run() {
 		return nil
 	}
 
-	// ProbeUpstreamProxyFn tests a CANDIDATE egress URL end-to-end (through the same
-	// buildTransport the live path uses) to a provider host, WITHOUT persisting it, so
-	// the web "Test connectivity" button can verify before Save. Any HTTP response
-	// (even 401/404) proves the tunnel carries traffic; a transport error means the
-	// proxy couldn't reach out.
+	// ProbeUpstreamProxyFn tests a CANDIDATE egress URL end-to-end WITHOUT persisting
+	// it, so the web "Test connectivity" button can verify before Save. Extracted to
+	// probeUpstreamProxy so the strict-vs-fallback choice is reachable by a test —
+	// as a closure it was not, and that choice IS the bug this fixes.
 	adminHandler.ProbeUpstreamProxyFn = func(rawURL string) (int, int64, error) {
-		probeT, probeCloser := buildTransport(rawURL, sysWatcher.ProxyFunc())
-		if probeCloser != nil {
-			defer probeCloser.Close() // throwaway group dialer: stop its health checks
-		}
-		client := &http.Client{Transport: probeT, Timeout: 10 * time.Second}
-		req, err := http.NewRequest(http.MethodGet, upstreamProbeTarget, nil)
-		if err != nil {
-			return 0, 0, err
-		}
-		start := time.Now()
-		resp, err := client.Do(req)
-		elapsed := time.Since(start).Milliseconds()
-		if err != nil {
-			return 0, elapsed, err
-		}
-		_ = resp.Body.Close()
-		return resp.StatusCode, elapsed, nil
+		return probeUpstreamProxy(rawURL, sysWatcher.ProxyFunc(), upstreamProbeTarget())
 	}
 
 	// EgressSelfCheckFn (§5.4): the per-account egress self-check for `aikey test`
@@ -565,7 +588,7 @@ func Run() {
 			if t := liveTransport.Load(); t != nil {
 				t.CloseIdleConnections()
 			}
-			broker.SetHTTPClient(broker.NewImpersonateChromeHTTPClient(effectiveBrokerEgress("")))
+			installBrokerClient("")
 		})
 	})
 
@@ -682,11 +705,85 @@ func cloneDefaultTransport() *http.Transport {
 	return &http.Transport{}
 }
 
-// upstreamProbeTarget is the provider host the "Test connectivity" probe reaches for
-// through a candidate egress proxy. api.anthropic.com is the Claude-centric primary
-// forwarding target; any HTTP response (even 401/404, no key sent) proves the tunnel
-// carries traffic to the AI world.
-const upstreamProbeTarget = "https://api.anthropic.com/"
+// probeUpstreamProxy dials `target` THROUGH a candidate egress spec and reports the
+// outcome. Any HTTP response (even 401/404) proves the tunnel carries traffic; a
+// transport error means the proxy could not reach out.
+//
+// It builds the transport STRICTLY (buildTransportStrict, not buildTransport): a
+// test must exercise the spec it was handed. Under the live path's fallback an
+// unparseable fragment silently became "dial through the machine's system proxy",
+// and the button reported THAT proxy's timeout — users debugged a node that was
+// never contacted while mihomo's real complaint sat in an unread WARN log
+// (2026-07-24). Returning the build error puts that diagnostic in front of the
+// person who can act on it.
+func probeUpstreamProxy(
+	rawURL string,
+	sysProxy func(*http.Request) (*url.URL, error),
+	target string,
+) (status int, elapsedMs int64, err error) {
+	probeT, probeCloser, buildErr := buildTransportStrict(rawURL, sysProxy)
+	if buildErr != nil {
+		return 0, 0, buildErr
+	}
+	if probeCloser != nil {
+		defer probeCloser.Close() // throwaway group dialer: stop its health checks
+	}
+	client := &http.Client{Transport: probeT, Timeout: 10 * time.Second}
+	req, err := http.NewRequestWithContext(context.Background(), http.MethodGet, target, http.NoBody)
+	if err != nil {
+		return 0, 0, err
+	}
+	start := time.Now()
+	resp, err := client.Do(req)
+	elapsed := time.Since(start).Milliseconds()
+	if err != nil {
+		return 0, elapsed, err
+	}
+	_ = resp.Body.Close()
+	return resp.StatusCode, elapsed, nil
+}
+
+// upstreamProbeTarget is what the "Test connectivity" probe reaches for THROUGH a
+// candidate egress proxy. Neutral IP-echo by default, sharing AIKEY_EGRESS_TEST_ECHO
+// with egressSelfCheckEcho and the admin egress-test endpoint so all three probes
+// behave identically across control-plane and node (and one env var points an
+// air-gapped deployment at an internal echo).
+//
+// It used to be a hardcoded https://api.anthropic.com/. Two reasons that was wrong,
+// and the second one is why it also made the button unreliable (2026-07-24):
+//
+//   - Same rule egressSelfCheckEcho already states: never probe a provider from the
+//     user's freshly configured residential/datacenter exit. This probe is the WORST
+//     place to violate it — it is user-triggered right after pasting a new node, so
+//     the very first packet that exit sends to Anthropic is an unauthenticated GET.
+//   - Providers fronted by Cloudflare silently BLACKHOLE datacenter IP ranges: no
+//     RST, no response, just the 10s client timeout. Field case: a working GCP
+//     Shadowsocks node tunneled fine but the probe reported "context deadline
+//     exceeded", i.e. a healthy egress was rendered as broken and could not be saved.
+//     A neutral echo answers from anywhere, so the probe measures the TUNNEL rather
+//     than one provider's opinion of the exit IP.
+//
+// Probe semantics are unchanged: any HTTP response proves the tunnel carries traffic
+// (no credential is ever sent). The echo additionally returns the exit IP, which is
+// what a user configuring an egress actually wants to confirm.
+func upstreamProbeTarget() string {
+	if v := strings.TrimSpace(os.Getenv("AIKEY_EGRESS_TEST_ECHO")); v != "" {
+		return v
+	}
+	return "https://api.ipify.org"
+}
+
+// proxyResolutionTarget is a PROVIDER URL used only to ASK http.Transport which
+// proxy it would pick — egressState builds a Request from it and dials NOTHING
+// (see its call site). It must stay a provider host precisely because the answer
+// is proxy-rule dependent: a NO_PROXY listing ipify.org but not anthropic.com
+// would make a neutral-echo resolution report "direct" while real provider
+// traffic goes through the proxy, i.e. `aikey env` would display an egress that
+// contradicts the hot path.
+//
+// This is deliberately NOT upstreamProbeTarget: that one leaves the machine and
+// must be neutral; this one never leaves the process and must be representative.
+const proxyResolutionTarget = "https://api.anthropic.com/"
 
 // egressState assembles the layered egress decision for GET /admin/upstream-proxy
 // (`aikey env`, 2026-07-08 逐级显示需求). The effective value is computed through
@@ -714,7 +811,7 @@ func egressState(explicit string, watcher *sysproxy.Watcher) admin.EgressState {
 	}
 	// Resolve exactly like the transport would for a provider target.
 	// Request object only — nothing is dialed.
-	req, err := http.NewRequest(http.MethodGet, upstreamProbeTarget, nil)
+	req, err := http.NewRequestWithContext(context.Background(), http.MethodGet, proxyResolutionTarget, http.NoBody)
 	if err != nil {
 		st.EffectiveSource = "direct"
 		return st
@@ -769,23 +866,59 @@ func egressSelfCheckEcho() string {
 	return "https://api.ipify.org"
 }
 
+// buildTransport builds the egress transport for the LIVE request path, falling
+// back to env/system proxy whenever the spec can't be honored. The fallback is
+// deliberate there: a request in flight should degrade rather than fail hard.
+//
+// It must NOT be used to TEST a candidate spec — see buildTransportStrict.
 func buildTransport(proxyURL string, sysProxy func(*http.Request) (*url.URL, error)) (*http.Transport, io.Closer) {
-	// All providers resolve to a handful of hosts (api.anthropic.com etc.),
-	// so a generous per-host idle pool is bounded in practice by MaxIdleConns.
-	const perHost = 100
-
-	direct := func() *http.Transport {
-		t := cloneDefaultTransport()
-		if sysProxy != nil {
-			t.Proxy = sysProxy
-		}
-		t.MaxIdleConnsPerHost = perHost
-		return t
+	t, closer, err := buildTransportStrict(proxyURL, sysProxy)
+	if err != nil {
+		// Same WARN text the hot path has always emitted, so log-based alerting
+		// and the operator runbooks keep matching.
+		slog.Warn("upstream_proxy engine spec failed to build, falling back to env/system proxy", "error", err)
+		return directTransport(sysProxy), nil
 	}
+	return t, closer
+}
+
+// directTransport is the "no egress spec" transport: env/system proxy only.
+func directTransport(sysProxy func(*http.Request) (*url.URL, error)) *http.Transport {
+	t := cloneDefaultTransport()
+	if sysProxy != nil {
+		t.Proxy = sysProxy
+	}
+	t.MaxIdleConnsPerHost = transportPerHostIdle
+	return t
+}
+
+// transportPerHostIdle — all providers resolve to a handful of hosts
+// (api.anthropic.com etc.), so a generous per-host idle pool is bounded in
+// practice by MaxIdleConns.
+const transportPerHostIdle = 100
+
+// buildTransportStrict is buildTransport WITHOUT the fallback: an unusable spec
+// is returned as an error instead of silently degrading to env/system proxy.
+//
+// WHY BOTH EXIST (2026-07-24). The fallback is right for the live path and wrong
+// for the "Test connectivity" button, and the difference is user-visible:
+//
+//	A malformed mihomo fragment (a YAML-vs-JS syntax slip is the common case)
+//	made BuildEgressTransport fail, the probe fell back to the machine's system
+//	proxy, and then reported THAT proxy's timeout. The user reads
+//	`Get "https://api.ipify.org": context deadline exceeded` and debugs their
+//	node — while the node was never dialed and the real fault, sitting in a WARN
+//	log they never see, was "expected a proxies/proxy-groups fragment".
+//
+// A test must exercise exactly what it was given. 失败要显眼，不要沉默.
+func buildTransportStrict(proxyURL string, sysProxy func(*http.Request) (*url.URL, error)) (*http.Transport, io.Closer, error) {
+	const perHost = transportPerHostIdle
+
+	direct := func() *http.Transport { return directTransport(sysProxy) }
 
 	spec := strings.TrimSpace(proxyURL)
 	if spec == "" {
-		return direct(), nil
+		return direct(), nil, nil
 	}
 
 	if egress.IsEngineSpec(spec) {
@@ -795,8 +928,7 @@ func buildTransport(proxyURL string, sysProxy func(*http.Request) (*url.URL, err
 		// symmetric with per-account egress). So gate ONLY fragments; let chains
 		// build. requirements/2026-07-17-egress-spec-capability-by-edition.md.
 		if egress.IsFragment(spec) && !egress.MultiProtocolAvailable() {
-			slog.Warn("upstream_proxy multi-protocol fragment ignored: it needs the enterprise package (this build supports a single URL or a socks5 chain); falling back to env/system proxy")
-			return direct(), nil
+			return nil, nil, fmt.Errorf("multi-protocol egress (ss/vmess/trojan/…) needs the offline enterprise package; this build supports a single URL or a socks5 chain")
 		}
 		// The engine transport (dialerToTransport) already applies the shared
 		// NO_PROXY/loopback bypass — internal targets dial direct, the SAME code
@@ -804,17 +936,15 @@ func buildTransport(proxyURL string, sysProxy func(*http.Request) (*url.URL, err
 		// no extra wrapping here.
 		t, closer, err := proxy.BuildEgressTransport(spec)
 		if err != nil {
-			slog.Warn("upstream_proxy engine spec failed to build, falling back to env/system proxy", "error", err)
-			return direct(), nil
+			return nil, nil, err
 		}
 		slog.Info("upstream proxy configured (egress engine)")
-		return t, closer
+		return t, closer, nil
 	}
 
 	parsed, err := url.Parse(spec)
 	if err != nil {
-		slog.Warn("upstream_proxy.url is invalid, falling back to env/system proxy", "url", proxyURL, "error", err)
-		return direct(), nil
+		return nil, nil, fmt.Errorf("invalid upstream proxy URL %q: %w", proxyURL, err)
 	}
 	// Internal-destination bypass (option ②, 2026-07-16): even with an explicit
 	// single-URL upstream, loopback + NO_PROXY targets go DIRECT (a self-hosted /
@@ -836,7 +966,7 @@ func buildTransport(proxyURL string, sysProxy func(*http.Request) (*url.URL, err
 		TLSHandshakeTimeout: 10 * time.Second,
 	}
 	slog.Info("upstream proxy configured", "url", proxyURL)
-	return t, nil
+	return t, nil, nil
 }
 
 // validateNodeUpstream gates a candidate /user/settings upstream spec at write
