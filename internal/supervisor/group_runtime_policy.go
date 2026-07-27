@@ -410,7 +410,7 @@ func buildGroupRuntimeMap(derivedKey []byte, accounts []grAccount) map[string]vk
 		// return LOGIN_REQUIRED for it (P1), distinct from an absent account.
 		if a.NeedsLogin {
 			out[a.AccountID] = vkeys.GroupRuntimeAccount{
-				CredentialType: a.CredentialType, NeedsLogin: true,
+				CredentialType: a.CredentialType, CredentialID: a.CredentialID, NeedsLogin: true,
 				Identity: a.Identity, ProviderCode: a.ProviderCode, ProtocolType: a.ProtocolType,
 				BaseURL: a.BaseURL, Priority: a.Priority,
 				Util5h: a.Util5h, Util7d: a.Util7d, UtilObservedAt: a.UtilObservedAt,
@@ -427,6 +427,7 @@ func buildGroupRuntimeMap(derivedKey []byte, accounts []grAccount) map[string]vk
 		}
 		gra := vkeys.GroupRuntimeAccount{
 			CredentialType:   a.CredentialType,
+			CredentialID:     a.CredentialID,
 			SecretNonce:      base64.StdEncoding.EncodeToString(nonce),
 			SecretCiphertext: base64.StdEncoding.EncodeToString(ct),
 			Identity:         a.Identity,     // non-secret display meta → client list refresh
@@ -500,7 +501,11 @@ func buildGroupRuntimeJSON(derivedKey []byte, accounts []grAccount) (string, err
 // "" when the candidate list is absent/unparseable. overrideFor may be nil (→ rank-0).
 func computeRoutedAccountID(mk vault.ManagedKey, material map[string]vkeys.GroupRuntimeAccount, overrideFor func(seatID, groupID string) string, skip map[string]bool, nowUnix int64) string {
 	var refs []vkeys.GroupAccountRef
-	if mk.GroupAccounts == "" || json.Unmarshal([]byte(mk.GroupAccounts), &refs) != nil || len(refs) == 0 {
+	if mk.GroupAccounts != "" {
+		_ = json.Unmarshal([]byte(mk.GroupAccounts), &refs)
+	}
+	refs = vkeys.MergeLiveGroupAccountRefs(refs, material)
+	if len(refs) == 0 {
 		return ""
 	}
 	override := ""

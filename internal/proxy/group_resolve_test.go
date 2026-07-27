@@ -99,6 +99,34 @@ func TestResolveGroup_OAuthPrimaryDecrypts(t *testing.T) {
 	}
 }
 
+func TestResolveGroup_RuntimeOnlyAddedAccountCanServeWithoutKeySync(t *testing.T) {
+	key := grKey()
+	material := map[string]vkeys.GroupRuntimeAccount{
+		"account-2": encMat(t, key, vkeys.GroupRuntimeAccount{
+			CredentialType: "oauth_account",
+			CredentialID:   "credential-2",
+			Identity:       "member@example.com",
+			ProviderCode:   "anthropic",
+			ProtocolType:   "anthropic",
+			Priority:       2,
+			ExpiresAt:      9_000_000_000,
+		}, "token-2"),
+	}
+	route := &vkeys.ResolvedRoute{
+		SeatID:        "seat-existing",
+		GroupAccounts: `[{"account_id":"account-1","priority":1,"credential_id":"credential-1"}]`,
+		GroupRuntime:  mustJSON(t, material),
+	}
+
+	got, err := resolveGroupCredential(route, key, 1_000_000, nil, "")
+	if err != nil {
+		t.Fatalf("runtime-only added account should route without key sync: %v", err)
+	}
+	if got.AccountID != "account-2" || got.CredentialID != "credential-2" || got.OAuth == nil || got.OAuth.AccessToken != "token-2" {
+		t.Fatalf("runtime-only account resolution wrong: %+v", got)
+	}
+}
+
 // TestResolveGroup_LoginRequiredNoSkip (RW2/D2): the HRW-primary account has no
 // material (member hasn't logged into it) while a LATER candidate does — the
 // resolver returns LOGIN_REQUIRED for the PRIMARY and does NOT skip to the

@@ -106,6 +106,7 @@ func TestPersistThenHydrate_RestartConsistency(t *testing.T) {
 	dbPath, reader := newOpenableVault(t, []map[string]string{
 		{"vk": "vk-a", "seat": "seat-1", "group": "grp-1", "override": ""},
 		{"vk": "vk-b", "seat": "seat-2", "group": "grp-1", "override": ""},
+		{"vk": "vk-c", "seat": "seat-3", "group": "grp-old", "override": ""},
 	})
 
 	// Process 1: a live pull stored assignments; persist mirrors them to vault.
@@ -113,6 +114,7 @@ func TestPersistThenHydrate_RestartConsistency(t *testing.T) {
 	s1.routingOverrides.StoreRoutes(42, []routingwire.RouteEntry{
 		{SeatID: "seat-1", GroupID: "grp-1", AccountID: "acc-engine"},
 		{SeatID: "seat-2", GroupID: "grp-1", Blocked: true},
+		{SeatID: "seat-3", GroupID: "grp-old", Removed: true},
 	})
 	s1.persistAssignmentOverrides(s1.active.Load(), 42)
 
@@ -130,6 +132,13 @@ func TestPersistThenHydrate_RestartConsistency(t *testing.T) {
 	if !pb.Blocked {
 		t.Fatalf("vk-b must persist the blocked directive: %+v", pb)
 	}
+	var pc persistedAssignment
+	if err := json.Unmarshal([]byte(readOverrideColumn(t, dbPath, "vk-c")), &pc); err != nil {
+		t.Fatalf("vk-c column not valid JSON: %v", err)
+	}
+	if !pc.Removed {
+		t.Fatalf("vk-c must persist the removal tombstone: %+v", pc)
+	}
 
 	// Process 2 (simulated restart): fresh cache, same vault → hydrate.
 	s2 := newPersistSupervisor(dbPath, reader)
@@ -140,6 +149,9 @@ func TestPersistThenHydrate_RestartConsistency(t *testing.T) {
 	}
 	if !s2.routingOverrides.Blocked("seat-2", "grp-1") {
 		t.Fatal("post-restart blocked seat lost — engine cap would be re-admitted")
+	}
+	if !s2.routingOverrides.Removed("seat-3", "grp-old") {
+		t.Fatal("post-restart removal tombstone lost — deleted access could be resurrected")
 	}
 	if v := s2.routingOverrides.Version(); v != 42 {
 		t.Fatalf("hydrated version=%d want 42", v)

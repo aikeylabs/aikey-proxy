@@ -43,7 +43,12 @@ func routeKey(seatID, groupID string) string { return seatID + "|" + groupID }
 func (c *RoutingOverrideCache) StoreRoutes(version int64, routes []routingwire.RouteEntry) (bound, blocked int) {
 	assignments := make(map[string]string, len(routes))
 	blockedSet := map[string]bool{}
+	removedSet := map[string]bool{}
 	for _, r := range routes {
+		if r.Removed {
+			removedSet[routeKey(r.SeatID, r.GroupID)] = true
+			continue
+		}
 		if r.Blocked {
 			blockedSet[routeKey(r.SeatID, r.GroupID)] = true
 			continue
@@ -52,7 +57,7 @@ func (c *RoutingOverrideCache) StoreRoutes(version int64, routes []routingwire.R
 			assignments[routeKey(r.SeatID, r.GroupID)] = r.AccountID
 		}
 	}
-	c.StoreAll(version, assignments, blockedSet)
+	c.storeAllWithRemoved(version, assignments, blockedSet, removedSet)
 	return len(assignments), len(blockedSet)
 }
 
@@ -61,6 +66,7 @@ func (c *RoutingOverrideCache) StoreRoutes(version int64, routes []routingwire.R
 type RoutingOverrideCache struct {
 	m       atomic.Value // map[string]string; immutable once Stored (poll builds a fresh map each pull)
 	blocked atomic.Value // map[string]bool; seats the engine left UNBOUND (pool at the ≤3-人/号 cap)
+	removed atomic.Value // map[string]bool; retired access tombstones (never local-fallback)
 	version atomic.Int64
 	stored  atomic.Bool // false until the first Store — distinguishes "never pulled" from "pulled at version 0"
 }
@@ -78,6 +84,13 @@ func (c *RoutingOverrideCache) Store(version int64, assignments map[string]strin
 // the version. nil maps are normalized to empty so readers can always type-assert;
 // the maps are read-only after StoreAll, so lookup/Blocked need no lock.
 func (c *RoutingOverrideCache) StoreAll(version int64, assignments map[string]string, blocked map[string]bool) {
+	c.storeAllWithRemoved(version, assignments, blocked, nil)
+}
+
+// storeAllWithRemoved atomically replaces all three mutually-exclusive route
+// states. Kept private so only the shared wire decoder can create access
+// tombstones; older callers of Store/StoreAll retain their exact behavior.
+func (c *RoutingOverrideCache) storeAllWithRemoved(version int64, assignments map[string]string, blocked, removed map[string]bool) {
 	if c == nil {
 		return
 	}
@@ -87,10 +100,28 @@ func (c *RoutingOverrideCache) StoreAll(version int64, assignments map[string]st
 	if blocked == nil {
 		blocked = map[string]bool{} // empty = no seat is pool-full-blocked
 	}
+	if removed == nil {
+		removed = map[string]bool{} // empty = no access tombstone
+	}
 	c.m.Store(assignments)
 	c.blocked.Store(blocked)
+	c.removed.Store(removed)
 	c.version.Store(version)
 	c.stored.Store(true)
+}
+
+// Removed reports whether this exact (seat,group) access was durably retired.
+// It is intentionally distinct from an unknown pair: unknown retains the
+// legacy ≤1-tick local-pick fallback, removed must fail closed.
+func (c *RoutingOverrideCache) Removed(seatID, groupID string) bool {
+	if c == nil || seatID == "" || groupID == "" {
+		return false
+	}
+	v := c.removed.Load()
+	if v == nil {
+		return false
+	}
+	return v.(map[string]bool)[routeKey(seatID, groupID)]
 }
 
 // Stored reports whether anything has ever been Stored. The poll uses it to

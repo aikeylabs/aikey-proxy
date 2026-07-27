@@ -50,6 +50,17 @@ func (p *Proxy) handleOauthGroupRoute(
 		return
 	}
 
+	// A deleted group has an explicit access tombstone. Runtime material is
+	// keep-last-known for availability and may still list usable accounts, so it
+	// must never be allowed to reconstruct serving authorization after deletion.
+	// Unknown routes remain backward-compatible local picks; only Removed fails
+	// closed with the established permanent no-candidates response.
+	if p.routingOverrides.Removed(route.SeatID, route.OauthGroupID) {
+		p.degradeGroup(w, logger, route, groupErrNoCandidates,
+			groupDegradeMessage(groupErrNoCandidates))
+		return
+	}
+
 	// §5.5: the engine left this seat UNBOUND (every pool account at the ≤3-人/号
 	// cap, or no usable account at all). 429 here; do NOT fall through to the
 	// local pick, which is cap-blind and would route a 4th user onto a full

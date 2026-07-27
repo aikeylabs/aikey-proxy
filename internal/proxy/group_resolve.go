@@ -106,8 +106,8 @@ type groupResolution struct {
 // fails to decrypt (corrupt). If every candidate is skipped → GROUP_ALL_UNUSABLE.
 func resolveGroupCredential(route *vkeys.ResolvedRoute, derivedKey []byte, nowUnix int64, skip map[string]bool, overrideAccountID string) (*groupResolution, error) {
 	var refs []vkeys.GroupAccountRef
-	if route.GroupAccounts == "" || json.Unmarshal([]byte(route.GroupAccounts), &refs) != nil || len(refs) == 0 {
-		return nil, &groupResolveError{Code: groupErrNoCandidates, Reason: "no parseable group candidates on route"}
+	if route.GroupAccounts != "" {
+		_ = json.Unmarshal([]byte(route.GroupAccounts), &refs)
 	}
 
 	// Distinguish "not pulled yet" from "pulled → nothing for this seat" (2026-06-30):
@@ -131,6 +131,10 @@ func resolveGroupCredential(route *vkeys.ResolvedRoute, derivedKey []byte, nowUn
 	}
 	if len(material) == 0 {
 		return nil, &groupResolveError{Code: groupErrNoCandidates, Reason: "group_runtime delivered no accounts for this seat (unbound/removed member or empty group)"}
+	}
+	refs = vkeys.MergeLiveGroupAccountRefs(refs, material)
+	if len(refs) == 0 {
+		return nil, &groupResolveError{Code: groupErrNoCandidates, Reason: "group_runtime contained no valid candidate accounts"}
 	}
 
 	// Rank exactly as master does: Account{AccountID, Priority}, Weight unset.
@@ -239,6 +243,9 @@ func buildGroupResolution(accountID string, ref vkeys.GroupAccountRef, mat vkeys
 		WindowMaxUtilPct:   mat.WindowMaxUtilPct, // master's pre-cut cap (N10)
 		Window7dMaxUtilPct: mat.Window7dMaxUtilPct,
 		EgressProxyURL:     mat.EgressProxyURL, // per-account egress (§11.7, P7)
+	}
+	if res.CredentialID == "" {
+		res.CredentialID = mat.CredentialID
 	}
 	if res.ProviderCode == "" {
 		res.ProviderCode = mat.ProviderCode

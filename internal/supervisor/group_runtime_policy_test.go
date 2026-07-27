@@ -32,7 +32,7 @@ func TestBuildGroupRuntimeJSON_EncryptsBothTypesNoRefresh(t *testing.T) {
 	pct := 97
 	reset := int64(1750000000)
 	accts := []grAccount{
-		{AccountID: "a-oauth", CredentialType: "oauth_account", AccessToken: "at-live", ExpiresAt: 200,
+		{AccountID: "a-oauth", CredentialID: "cred-oauth", CredentialType: "oauth_account", AccessToken: "at-live", ExpiresAt: 200,
 			WindowMaxUtilPct: &pct, WindowStatus: "active", WindowResetAt: &reset,
 			BaseURL:        "http://127.0.0.1:3000/mock-provider/anthropic",
 			EgressProxyURL: "socks5://10.0.0.9:1080"}, // per-account egress (§11.7, P7) — member rail
@@ -62,6 +62,9 @@ func TestBuildGroupRuntimeJSON_EncryptsBothTypesNoRefresh(t *testing.T) {
 	}
 	if oa.ExpiresAt != 200 || oa.WindowMaxUtilPct == nil || *oa.WindowMaxUtilPct != 97 || oa.WindowStatus != "active" {
 		t.Fatalf("oauth meta wrong: %+v", oa)
+	}
+	if oa.CredentialID != "cred-oauth" {
+		t.Fatalf("credential identity missing from fast rail: %+v", oa)
 	}
 	if oa.BaseURL != "http://127.0.0.1:3000/mock-provider/anthropic" || oa.Revision != "" {
 		t.Fatalf("oauth routing metadata or KEY-only revision wrong: %+v", oa)

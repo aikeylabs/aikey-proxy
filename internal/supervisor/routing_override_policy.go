@@ -63,6 +63,7 @@ func (s *Supervisor) routingOverrideRail() railSpec {
 type persistedAssignment struct {
 	AccountID string `json:"account_id,omitempty"`
 	Blocked   bool   `json:"blocked,omitempty"`
+	Removed   bool   `json:"removed,omitempty"`
 	// RoutingVersion audits which engine version issued this assignment and
 	// lets hydrate pick the newest across rows written at different times.
 	RoutingVersion int64 `json:"routing_version"`
@@ -97,12 +98,12 @@ func (s *Supervisor) hydrateRoutingOverrides(gen *generation) {
 		if json.Unmarshal([]byte(mk.MyAssignmentOverride), &pa) != nil {
 			continue // corrupt row: skip it, never fail the hydrate
 		}
-		if !pa.Blocked && pa.AccountID == "" {
+		if !pa.Blocked && !pa.Removed && pa.AccountID == "" {
 			continue
 		}
 		entries = append(entries, routingwire.RouteEntry{
 			SeatID: mk.SeatID, GroupID: mk.OauthGroupID,
-			AccountID: pa.AccountID, Blocked: pa.Blocked,
+			AccountID: pa.AccountID, Blocked: pa.Blocked, Removed: pa.Removed,
 		})
 		if pa.RoutingVersion > version {
 			version = pa.RoutingVersion
@@ -137,10 +138,11 @@ func (s *Supervisor) persistAssignmentOverrides(gen *generation, version int64) 
 		}
 		acct := s.routingOverrides.Assignment(mk.SeatID, mk.OauthGroupID)
 		blk := s.routingOverrides.Blocked(mk.SeatID, mk.OauthGroupID)
+		removed := s.routingOverrides.Removed(mk.SeatID, mk.OauthGroupID)
 		desired := ""
-		if acct != "" || blk {
+		if acct != "" || blk || removed {
 			b, mErr := json.Marshal(persistedAssignment{
-				AccountID: acct, Blocked: blk, RoutingVersion: version, SyncedAt: now,
+				AccountID: acct, Blocked: blk, Removed: removed, RoutingVersion: version, SyncedAt: now,
 			})
 			if mErr != nil {
 				continue
@@ -173,7 +175,7 @@ func sameAssignmentPayload(existing, desired string) bool {
 	if json.Unmarshal([]byte(existing), &a) != nil || json.Unmarshal([]byte(desired), &b) != nil {
 		return false
 	}
-	return a.AccountID == b.AccountID && a.Blocked == b.Blocked && a.RoutingVersion == b.RoutingVersion
+	return a.AccountID == b.AccountID && a.Blocked == b.Blocked && a.Removed == b.Removed && a.RoutingVersion == b.RoutingVersion
 }
 
 // syncRoutingOverrides runs one pull. Only when the routing_version actually
