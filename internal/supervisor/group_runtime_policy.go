@@ -115,7 +115,8 @@ func (s *Supervisor) syncGroupRuntime(ctx context.Context, gen *generation, mast
 // some unrelated token change. Sorting makes vault enumeration order irrelevant.
 func groupRuntimeSyncSignature(remoteMaterial string, mks []vault.ManagedKey) string {
 	topology := make([][3]string, 0, len(mks))
-	for _, mk := range mks {
+	for i := range mks { // index, not value-copy: vault.ManagedKey is a large struct (gocritic rangeValCopy)
+		mk := &mks[i] // read-only below — pointer form only avoids the 280-byte per-iteration copy
 		if mk.OauthGroupID == "" {
 			continue
 		}
