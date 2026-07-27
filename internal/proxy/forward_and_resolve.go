@@ -970,7 +970,7 @@ func (p *Proxy) serveRoute(w http.ResponseWriter, r *http.Request, route *vkeys.
 					// either the full JSON or it's an error we surface elsewhere.
 					sessionID := resolveSessionID(r, route.ProtocolType, route.ProviderCode)
 					upstreamReqID := extractUpstreamRequestID(resp)
-					p.reportUsage(route, bearerToken, ev.Model, startTime, resp.StatusCode, breakdown, "", "", realKey, sessionID, "complete", upstreamReqID, r.URL.Path)
+					p.reportUsage(route, bearerToken, ev.Model, startTime, resp.StatusCode, breakdown, "", "", realKey, sessionID, "complete", upstreamReqID, r.URL.Path, ev.RequestID, ev.TraceID)
 					// Phase 2: accrue token + local usd quota for this completed request.
 					// Backfill the model for local usd pricing when the adapter left it
 					// empty (mirrors the streaming path) so codex/others aren't unpriced.
@@ -990,6 +990,8 @@ func (p *Proxy) serveRoute(w http.ResponseWriter, r *http.Request, route *vkeys.
 				sessionID := resolveSessionID(r, route.ProtocolType, route.ProviderCode)
 				// Capture the path now too — same request-recycling caveat.
 				requestPath := r.URL.Path
+				requestID := baseEvent.RequestID
+				traceID := baseEvent.TraceID
 				// Capture upstreamReqID NOW (response headers are stable from
 				// here onward; the streaming body keeps draining in a goroutine
 				// but headers are already finalized by upstream).
@@ -1015,7 +1017,7 @@ func (p *Proxy) serveRoute(w http.ResponseWriter, r *http.Request, route *vkeys.
 							model = br.Model
 						}
 						if p.reporter != nil {
-							p.reportUsage(route, bearerToken, model, startTime, resp.StatusCode, br, "", "", realKey, sessionID, completion, upstreamReqID, requestPath)
+							p.reportUsage(route, bearerToken, model, startTime, resp.StatusCode, br, "", "", realKey, sessionID, completion, upstreamReqID, requestPath, requestID, traceID)
 						}
 						// Phase 2: accrue token + local usd quota on stream completion,
 						// independent of the reporter.

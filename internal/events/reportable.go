@@ -109,10 +109,10 @@ type ReportableEvent struct {
 	// enricher's generation-endpoint table). Additive + omitempty: legacy
 	// consumers (CLI WAL serde, older collectors) ignore it; events from
 	// older proxies simply lack it and keep their current classification.
-	RequestPath string `json:"request_path,omitempty"`
-	DeviceID          string `json:"device_id,omitempty"`
-	ProxyInstanceID   string `json:"proxy_instance_id,omitempty"`
-	TraceID           string `json:"trace_id,omitempty"`
+	RequestPath     string `json:"request_path,omitempty"`
+	DeviceID        string `json:"device_id,omitempty"`
+	ProxyInstanceID string `json:"proxy_instance_id,omitempty"`
+	TraceID         string `json:"trace_id,omitempty"`
 	// StopReason is the raw provider-specific termination reason (Anthropic
 	// `stop_reason` or OpenAI/Kimi `choices[0].finish_reason`), passed
 	// through un-normalized. Used by UI to hint at "max_tokens"/"length"
@@ -191,6 +191,11 @@ type ReportOpts struct {
 	// the proxy's SeqAllocator just before building this event. Leave SourceSeq
 	// nil for events that must not participate in gap detection (e.g. canary).
 	SourceID string
+	// RequestID and TraceID come from the same request-scoped TraceContext used
+	// by buildBaseEvent/logging. The Collector wire must preserve them verbatim;
+	// otherwise ODS cannot correlate one user action with its projected usage.
+	RequestID string
+	TraceID   string
 	// UpstreamRequestID is the provider's own request id from response headers
 	// (anthropic: `request-id`, openai/kimi: `x-request-id` or
 	// `openai-request-id`). Carried through so support can pivot from a local
@@ -292,6 +297,8 @@ func BuildReportableEvent(opts *ReportOpts) ReportableEvent {
 
 	ev := ReportableEvent{
 		EventID:            opts.EventID,
+		RequestID:          opts.RequestID,
+		TraceID:            opts.TraceID,
 		UpstreamRequestID:  opts.UpstreamRequestID,
 		RequestPath:        opts.RequestPath,
 		ProxyInstanceID:    opts.ProxyInstanceID,

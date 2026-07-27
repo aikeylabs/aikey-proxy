@@ -453,3 +453,22 @@ func TestBuildReportableEvent_RequestPathOnWire(t *testing.T) {
 		t.Error("legacy event unexpectedly carries request_path on the wire")
 	}
 }
+
+// The local UsageEvent and Collector ReportableEvent are two projections of
+// one request. Removing either assignment in BuildReportableEvent must turn
+// this fence red; otherwise ODS request-level investigations collapse back to
+// seat/model guesses and cannot prove per-operation Team Usage continuity.
+func TestBuildReportableEvent_PreservesRequestAndTraceCorrelation(t *testing.T) {
+	route := &vkeys.ResolvedRoute{OrgID: "org-correlation", SeatID: "seat-correlation"}
+	ev := BuildReportableEvent(&ReportOpts{
+		EventID:    "event-correlation",
+		RequestID:  "request-correlation",
+		TraceID:    "trace-correlation",
+		Route:      route,
+		StatusCode: 200,
+	})
+	if ev.RequestID != "request-correlation" || ev.TraceID != "trace-correlation" {
+		t.Fatalf("collector correlation drifted: request_id=%q trace_id=%q",
+			ev.RequestID, ev.TraceID)
+	}
+}

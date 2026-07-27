@@ -166,6 +166,24 @@ func TestResolveOAuthUpstream_StripsV1ForCodex(t *testing.T) {
 	}
 }
 
+// The member runtime now carries the provider default BaseURL even when an
+// OAuth credential has no custom override. A configured, safety-gated test
+// upstream must still win; otherwise real-binary E2Es silently contact the
+// provider edge instead of their hermetic loopback / .test upstream.
+func TestResolveOAuthUpstream_AnthropicTestOverrideWinsRuntimeDefault(t *testing.T) {
+	t.Setenv("AIKEY_PROXY_TEST_ANTHROPIC_BASE_URL", "http://mock.test:18080/anthropic")
+	r := httptest.NewRequest(http.MethodPost, "/v1/messages", strings.NewReader(`{"model":"claude-test"}`))
+
+	base, out := resolveOAuthUpstream("anthropic", "anthropic", "https://api.anthropic.com", r)
+
+	if base != "http://mock.test:18080/anthropic" {
+		t.Fatalf("test override lost to delivered runtime default: base=%q", base)
+	}
+	if out.URL.Path != "/v1/messages" {
+		t.Fatalf("Anthropic test override must preserve incoming path, got %q", out.URL.Path)
+	}
+}
+
 func TestTestOnlyBaseURLAllowed(t *testing.T) {
 	allowed := []string{
 		"http://127.0.0.1:8080",

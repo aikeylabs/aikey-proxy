@@ -317,6 +317,16 @@ func resolveOAuthUpstream(canonicalCode, protocolType, existingBase string, r *h
 		}
 		return codexUpstreamBaseURL(), req
 	default:
+		// A configured test-only override is the final upstream for hermetic
+		// Anthropic E2Es, even when the member runtime carries the provider's
+		// non-empty default URL. runtimeDeps began delivering that default in
+		// 2026-07-23; checking only in providerBaseURLForProtocol then silently
+		// bypassed the hook and sent test traffic to the real provider edge.
+		// Production is unchanged: this branch is inert unless the explicit env
+		// value also passes the loopback / RFC 6761 .test safety gate.
+		if testBase, ok := anthropicTestBaseURL(canonicalCode, protocolType); ok {
+			return testBase, r
+		}
 		if strings.TrimSpace(existingBase) != "" {
 			return existingBase, r
 		}
@@ -386,6 +396,22 @@ func testOnlyBaseURLAllowed(raw string) bool {
 	return u.Scheme == "http" && strings.HasSuffix(u.Hostname(), ".test")
 }
 
+// anthropicTestBaseURL is the single reader for the Anthropic real-binary E2E
+// override. The bool means a valid, safety-gated override is configured. Keep
+// this separate from the production registry/runtime order: test code needs an
+// absolute final target, while production must continue honoring custom runtime
+// gateways before provider defaults.
+func anthropicTestBaseURL(canonicalCode, protocolType string) (string, bool) {
+	if canonicalCode != "anthropic" || protocolType != "anthropic" {
+		return "", false
+	}
+	o := os.Getenv("AIKEY_PROXY_TEST_ANTHROPIC_BASE_URL")
+	if !testOnlyBaseURLAllowed(o) {
+		return "", false
+	}
+	return o, true
+}
+
 func providerDefaultBaseURL(providerCode string) string {
 	canonical := providerCanonicalCode(providerCode)
 	protocol, ok := provider.ProtocolFamily(canonical, "")
@@ -404,16 +430,13 @@ func providerDefaultBaseURL(providerCode string) string {
 
 func providerBaseURLForProtocol(providerCode, protocolType string) string {
 	canonical := providerCanonicalCode(providerCode)
-	if canonical == "anthropic" && protocolType == "anthropic" {
-		// Test-only hook (gated to loopback / .test): the cross-component
-		// OAuth-account routing E2E points the otherwise-hardcoded Anthropic
-		// upstream at a local mock. OAuth accounts carry no configurable base_url
-		// (unlike api_key material), so without this the OAuth inject path can't
-		// be exercised against a mock. The guard means a prod misconfig can never
-		// reroute real traffic. See aikey-test/oauthgroup/oauth_account_routing_test.go.
-		if o := os.Getenv("AIKEY_PROXY_TEST_ANTHROPIC_BASE_URL"); testOnlyBaseURLAllowed(o) {
-			return o
-		}
+	// Test-only hook (gated to loopback / .test): the cross-component
+	// OAuth-account routing E2E points the otherwise-hardcoded Anthropic
+	// upstream at a local mock. This shared reader is also consulted BEFORE a
+	// non-empty runtime BaseURL in resolveOAuthUpstream; otherwise delivery of a
+	// provider default would bypass the same hook.
+	if o, ok := anthropicTestBaseURL(canonical, protocolType); ok {
+		return o
 	}
 	route, ok := provider.Routes().ByProviderProtocol(canonical, protocolType)
 	if !ok {

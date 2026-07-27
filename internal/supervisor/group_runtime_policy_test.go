@@ -153,6 +153,29 @@ func TestFetchGroupRuntime_ParsesAndSendsBearer(t *testing.T) {
 	}
 }
 
+func TestGroupRuntimeSyncSignature_IncludesStableLocalVKTopology(t *testing.T) {
+	first := []vault.ManagedKey{
+		{VirtualKeyID: "vk-b", SeatID: "seat-b", OauthGroupID: "group-1"},
+		{VirtualKeyID: "vk-direct", SeatID: "seat-x"},
+		{VirtualKeyID: "vk-a", SeatID: "seat-a", OauthGroupID: "group-1"},
+	}
+	reordered := []vault.ManagedKey{first[2], first[0], first[1]}
+	if a, b := groupRuntimeSyncSignature(`{"groups":[]}`, first), groupRuntimeSyncSignature(`{"groups":[]}`, reordered); a != b {
+		t.Fatalf("vault enumeration order changed signature: %q != %q", a, b)
+	}
+	added := append(append([]vault.ManagedKey{}, first...), vault.ManagedKey{
+		VirtualKeyID: "vk-new", SeatID: "seat-new", OauthGroupID: "group-1",
+	})
+	if groupRuntimeSyncSignature(`{"groups":[]}`, first) == groupRuntimeSyncSignature(`{"groups":[]}`, added) {
+		t.Fatal("new group VK with unchanged master body must force a projection write")
+	}
+	changedSeat := append([]vault.ManagedKey{}, first...)
+	changedSeat[0].SeatID = "seat-reassigned"
+	if groupRuntimeSyncSignature(`{"groups":[]}`, first) == groupRuntimeSyncSignature(`{"groups":[]}`, changedSeat) {
+		t.Fatal("seat topology change with unchanged master body must force a projection write")
+	}
+}
+
 func TestWriteGroupRuntimeForGroups_PerVKEncrypted(t *testing.T) {
 	dbPath := filepath.Join(t.TempDir(), "vault.db")
 	db, err := sql.Open("sqlite", dbPath)

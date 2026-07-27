@@ -68,7 +68,7 @@ func TestSeedQuotaSig_MatchesPollerSig(t *testing.T) {
 
 	// The proxy persists them, then on the NEXT boot seeds the baseline from the
 	// cache — via the exact path Supervisor.seedQuotaSig uses.
-	if err := quota.WriteSubjects(path, fetched); err != nil {
+	if err = quota.WriteSubjects(path, fetched); err != nil {
 		t.Fatalf("WriteSubjects: %v", err)
 	}
 	loaded, err := quota.LoadPolicySubjects(db)

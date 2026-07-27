@@ -18,12 +18,15 @@ package supervisor
 
 import (
 	"context"
+	"crypto/sha256"
 	"encoding/base64"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
 	"log/slog"
 	"net/http"
+	"sort"
 	"time"
 
 	"github.com/AiKeyLabs/aikey-proxy/internal/httpx"
@@ -83,6 +86,7 @@ func (s *Supervisor) syncGroupRuntime(ctx context.Context, gen *generation, mast
 	if err != nil {
 		return err // unreachable / bad response → keep last-known (don't flap)
 	}
+	sig = groupRuntimeSyncSignature(sig, mks)
 	// Steady state: same material (no token refresh) → no rewrite/reload.
 	if prev := s.lastGroupRuntimeSig.Load(); prev != nil && *prev == sig {
 		return nil
@@ -102,6 +106,35 @@ func (s *Supervisor) syncGroupRuntime(ctx context.Context, gen *generation, mast
 			"event.name", "proxy.group_runtime.reload_failed", "error", err.Error())
 	}
 	return nil
+}
+
+// groupRuntimeSyncSignature covers both material returned by master and the
+// local consumers that material must be projected into. Comparing only the
+// response body skipped writes when a newly synced/replaced group VK arrived
+// while master returned identical account material, leaving that VK empty until
+// some unrelated token change. Sorting makes vault enumeration order irrelevant.
+func groupRuntimeSyncSignature(remoteMaterial string, mks []vault.ManagedKey) string {
+	topology := make([][3]string, 0, len(mks))
+	for _, mk := range mks {
+		if mk.OauthGroupID == "" {
+			continue
+		}
+		topology = append(topology, [3]string{mk.VirtualKeyID, mk.SeatID, mk.OauthGroupID})
+	}
+	sort.Slice(topology, func(i, j int) bool {
+		for axis := 0; axis < len(topology[i]); axis++ {
+			if topology[i][axis] != topology[j][axis] {
+				return topology[i][axis] < topology[j][axis]
+			}
+		}
+		return false
+	})
+	topologyJSON, _ := json.Marshal(topology) // fixed primitive shape cannot fail
+	h := sha256.New()
+	_, _ = h.Write([]byte(remoteMaterial))
+	_, _ = h.Write([]byte{0})
+	_, _ = h.Write(topologyJSON)
+	return hex.EncodeToString(h.Sum(nil))
 }
 
 // writeGroupRuntimeSnapshot is the single material-sync writer for group_runtime.
