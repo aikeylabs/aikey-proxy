@@ -72,6 +72,21 @@ func (s *Supervisor) groupRuntimeRail() railSpec {
 // column and reloads so the resolver (N8) picks up the fresh tokens. Any error
 // keeps the last-known material (don't flap) and is COUNTED by the framework.
 func (s *Supervisor) syncGroupRuntime(ctx context.Context, gen *generation, masterURL, bearer string) error {
+	return s.syncGroupRuntimeWithReload(ctx, gen, masterURL, bearer, s.Reload)
+}
+
+// syncGroupRuntimeWithReload keeps the durable vault projection and the active
+// generation under one convergence contract. The write is idempotent, but the
+// signature is committed only after reload succeeds. Otherwise an identical
+// master response would be skipped forever while the live registry kept serving
+// stale tokens or egress settings. reload is injected only to make the failure
+// and recovery boundary deterministic in tests; production always passes Reload.
+func (s *Supervisor) syncGroupRuntimeWithReload(
+	ctx context.Context,
+	gen *generation,
+	masterURL, bearer string,
+	reload func(context.Context) error,
+) error {
 	mks, err := gen.vault.GetActiveManagedKeys()
 	if err != nil {
 		return err
@@ -93,18 +108,20 @@ func (s *Supervisor) syncGroupRuntime(ctx context.Context, gen *generation, mast
 	}
 	if err := s.writeGroupRuntimeSnapshot(gen, mks, groups); err != nil {
 		slog.Warn("group_runtime write failed",
-			"event.name", "proxy.group_runtime.write_failed", "error", err.Error())
+			"event.name", observability.EventProxyGroupRuntimeWriteFailed, "error", err.Error())
 		return err // leave lastGroupRuntimeSig unchanged → retry next tick
+	}
+	if err := reload(ctx); err != nil {
+		// The vault is current but the serving generation is not. Keep the
+		// signature uncommitted and fail this rail cycle so the next poll retries
+		// the idempotent write + reload and /status cannot report a false green.
+		slog.Warn("group_runtime reload failed",
+			"event.name", observability.EventProxyGroupRuntimeReloadFailed, "error", err.Error())
+		return fmt.Errorf("reload group_runtime projection: %w", err)
 	}
 	s.lastGroupRuntimeSig.Store(&sig)
 	slog.Info("group runtime material changed",
-		"event.name", "proxy.group_runtime.changed", "groups", len(groups))
-	if err := s.Reload(ctx); err != nil {
-		// Local reload hiccup, not a master-sync failure: the material IS stored
-		// (next reload picks it up), so the cycle still counts as a success.
-		slog.Warn("group_runtime reload failed",
-			"event.name", "proxy.group_runtime.reload_failed", "error", err.Error())
-	}
+		"event.name", observability.EventProxyGroupRuntimeChanged, "groups", len(groups))
 	return nil
 }
 

@@ -545,24 +545,10 @@ func Run() {
 	// duplicate probeEgress must NOT come back). Stateless: one-shot, no health
 	// loop. Neutral echo — never claude.ai (§5.4 #2).
 	adminHandler.EgressSelfCheckFn = func(ctx context.Context, dial bool) []admin.EgressCheckResult {
-		specs := sup.Registry().EgressSpecs()
-		out := make([]admin.EgressCheckResult, 0, len(specs))
-		for _, s := range specs {
-			if !dial {
-				out = append(out, admin.EgressCheckResult{Label: s.Label, Dialed: false})
-				continue
-			}
-			res, err := egress.TestDial(ctx, s.Spec, egressSelfCheckEcho(), egressSelfCheckDialTimeout)
-			if err != nil {
-				out = append(out, admin.EgressCheckResult{Label: s.Label, Dialed: true, OK: false, Reason: err.Error()})
-				continue
-			}
-			out = append(out, admin.EgressCheckResult{
-				Label: s.Label, Dialed: true, OK: true,
-				Engine: res.Engine, ExitIP: res.ExitIP, LatencyMs: res.LatencyMs,
+		return runEgressSelfCheck(ctx, sup.Registry().EgressSpecs(), dial,
+			func(ctx context.Context, spec string) (*egress.TestResult, error) {
+				return egress.TestDial(ctx, spec, egressSelfCheckEcho(), egressSelfCheckDialTimeout)
 			})
-		}
-		return out
 	}
 
 	// Build the outbound transport for upstream providers. Always non-nil now:
@@ -874,10 +860,105 @@ func egressState(explicit string, watcher *sysproxy.Watcher) admin.EgressState {
 //     2026-07-16). Validation at SetUpstreamProxyFn rejects it upfront too; this
 //     is the belt-and-suspenders fallback so a persisted-then-downgraded config
 //     never hard-fails the daemon.
+//
 // egressSelfCheckDialTimeout bounds ONE account's egress dial in the self-check
-// (§5.4). Per-account; a node's few accounts dial sequentially, so the CLI uses a
-// generous overall client timeout.
+// (§5.4).
 const egressSelfCheckDialTimeout = 10 * time.Second
+
+// egressSelfCheckBudget bounds the WHOLE self-check, and egressSelfCheckParallel
+// how many accounts dial at once.
+//
+// WHY THESE EXIST (bugfix 2026-07-28): the dial used to run SEQUENTIALLY, so the
+// endpoint's wall clock was N_accounts × egressSelfCheckDialTimeout — and a
+// BROKEN account is the SLOW one (it burns the full dial timeout, a healthy one
+// answers in ~1s). The master console's 「查看实际生效（拨测）」 calls this with a
+// fixed 20s client budget, so on a node with 6 accounts of which 4 were broken
+// the probe took 24.7s and the console reported "node admin face unreachable (is
+// the node up?)" — a MISDIAGNOSIS that sent the operator chasing firewall rules
+// while the node was healthy and answering. Worse, the failure mode scaled the
+// wrong way: the more accounts are broken, the more certainly the one tool built
+// to diagnose them refuses to answer.
+//
+// The fix is to make this endpoint LATENCY-BOUNDED BY CONSTRUCTION rather than
+// asking every caller to guess a budget:
+//   - dial concurrently → wall clock ≈ one dial, independent of account count;
+//   - hard overall budget → the response ALWAYS returns inside it. Accounts that
+//     did not finish are reported as explicit not-probed ROWS (see
+//     egressSelfCheckBudgetReason), never dropped and never turned into a
+//     whole-request failure: partial truth beats a blank screen (失败要显眼).
+//
+// 15s is not arbitrary — the master's client comment already asserted "must
+// exceed the node-side probe timeout (15s)". The contract was right; the node
+// just never honored it. This makes the assumption TRUE instead of relaxing the
+// caller to match a drifting reality.
+const (
+	egressSelfCheckBudget   = 15 * time.Second
+	egressSelfCheckParallel = 8
+)
+
+// egressSelfCheckBudgetReason marks a row the budget cut off. Distinct from a
+// dial failure on purpose: "we never asked" must not read as "the egress is
+// broken", or an operator retires a healthy account.
+const egressSelfCheckBudgetReason = "not probed: the node's egress self-check budget (15s) was exhausted by the other accounts — re-run to probe this one"
+
+// egressDialFunc probes ONE spec. A seam so the fan-out below is testable
+// without real network (the closure form was not — same reason
+// ProbeUpstreamProxyFn above is a named field).
+type egressDialFunc func(ctx context.Context, spec string) (*egress.TestResult, error)
+
+// runEgressSelfCheck fans the per-account dials out under egressSelfCheckParallel
+// and egressSelfCheckBudget, returning one row per spec IN INPUT ORDER (the
+// registry sorts by label; a nondeterministic order would make the console's
+// node-to-node exit-IP comparison unreadable).
+//
+// dial=false is presence-only — no network, no budget, hot-path safe for
+// `aikey test` (§5.4 #2: never probe on a cadence).
+func runEgressSelfCheck(ctx context.Context, specs []vkeys.AccountEgressSpec, dial bool, probe egressDialFunc) []admin.EgressCheckResult {
+	out := make([]admin.EgressCheckResult, len(specs))
+	if !dial {
+		for i, s := range specs {
+			out[i] = admin.EgressCheckResult{Label: s.Label, Dialed: false}
+		}
+		return out
+	}
+
+	// Pre-fill so a budget cutoff leaves an explicit row rather than a zero
+	// value that reads as "dialed and failed for no stated reason".
+	for i, s := range specs {
+		out[i] = admin.EgressCheckResult{Label: s.Label, Dialed: false, OK: false, Reason: egressSelfCheckBudgetReason}
+	}
+
+	bctx, cancel := context.WithTimeout(ctx, egressSelfCheckBudget)
+	defer cancel()
+
+	sem := make(chan struct{}, egressSelfCheckParallel)
+	var wg sync.WaitGroup
+	var mu sync.Mutex
+	for i, s := range specs {
+		wg.Add(1)
+		go func(i int, s vkeys.AccountEgressSpec) {
+			defer wg.Done()
+			select {
+			case sem <- struct{}{}:
+				defer func() { <-sem }()
+			case <-bctx.Done():
+				return // budget gone before this one got a slot → keep the pre-filled row
+			}
+			row := admin.EgressCheckResult{Label: s.Label, Dialed: true}
+			res, err := probe(bctx, s.Spec)
+			if err != nil {
+				row.OK, row.Reason = false, err.Error()
+			} else {
+				row.OK, row.Engine, row.ExitIP, row.LatencyMs = true, res.Engine, res.ExitIP, res.LatencyMs
+			}
+			mu.Lock()
+			out[i] = row
+			mu.Unlock()
+		}(i, s)
+	}
+	wg.Wait()
+	return out
+}
 
 // egressSelfCheckEcho is the neutral IP-echo the self-check dials THROUGH each
 // account's egress to learn its exit IP. Mirrors the master endpoint's env +
