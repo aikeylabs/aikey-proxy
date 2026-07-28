@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/AiKeyLabs/aikey-proxy/internal/observability"
 	"github.com/AiKeyLabs/aikey-proxy/internal/vkeys"
@@ -416,8 +417,8 @@ func TestGroupCooldown_5xxStreakCoolsAcrossRequests(t *testing.T) {
 	if tr.calls != 0 {
 		t.Fatalf("cooled account must not be attempted, got %d upstream calls", tr.calls)
 	}
-	if w.Code != http.StatusTooManyRequests {
-		t.Fatalf("all-unusable pool surfaces the honest 429, got %d", w.Code)
+	if w.Code != http.StatusServiceUnavailable || !strings.Contains(w.Body.String(), observability.ErrCodeGroupUpstreamUnavailable) {
+		t.Fatalf("5xx-cooled pool must preserve upstream-unavailable as 503, got %d: %s", w.Code, w.Body.String())
 	}
 }
 
@@ -433,6 +434,72 @@ func TestGroupCooldown_TransportErrorStreakCools(t *testing.T) {
 	}
 	if !p.poolCooldown.skipSet()["acc-1"] {
 		t.Fatalf("%d consecutive transport failures must cool the account", serverErrStreakThreshold)
+	}
+	tr.calls = 0
+	req, w := groupReq(groupBody)
+	p.Handle(w, req)
+	if tr.calls != 0 {
+		t.Fatalf("cooled account must not be attempted, got %d upstream calls", tr.calls)
+	}
+	if w.Code != http.StatusServiceUnavailable || !strings.Contains(w.Body.String(), observability.ErrCodeGroupUpstreamUnavailable) {
+		t.Fatalf("transport-cooled pool must preserve upstream-unavailable as 503, got %d: %s", w.Code, w.Body.String())
+	}
+}
+
+// An account-specific egress failure already has a precise public error code on
+// the request that discovers it. Entering the resilience cooldown must not erase
+// that cause and turn the next request into a fake quota/rate-limit 429.
+func TestGroupCooldown_EgressFailureStays503AfterCooldown(t *testing.T) {
+	p, tr := singleAccountPool(t)
+	tr.errByAuth = map[string]error{
+		"Bearer tok-1": &EgressDialError{err: errors.New("rejected username/password")},
+	}
+	for i := 0; i < serverErrStreakThreshold; i++ {
+		req, w := groupReq(groupBody)
+		p.Handle(w, req)
+		if w.Code != http.StatusServiceUnavailable || !strings.Contains(w.Body.String(), observability.ErrCodeAccountEgressProxy) {
+			t.Fatalf("req %d: egress failure must be precise 503, got %d: %s", i+1, w.Code, w.Body.String())
+		}
+	}
+	tr.calls = 0
+	req, w := groupReq(groupBody)
+	p.Handle(w, req)
+	if tr.calls != 0 {
+		t.Fatalf("cooled egress account must not be attempted, got %d upstream calls", tr.calls)
+	}
+	if w.Code != http.StatusServiceUnavailable || !strings.Contains(w.Body.String(), observability.ErrCodeAccountEgressProxy) {
+		t.Fatalf("cooled egress failure must remain precise 503, got %d: %s", w.Code, w.Body.String())
+	}
+}
+
+// A transport/egress cooldown is a bounded circuit breaker, not a permanent
+// account tombstone. Once it expires, the same group key must automatically
+// re-admit the account and recover on the next successful request without a
+// proxy restart or any client-side key/config change.
+func TestGroupCooldown_EgressFailureAutomaticallyRecoversAfterCooldown(t *testing.T) {
+	p, tr := singleAccountPool(t)
+	now := time.Unix(1_800_000_000, 0)
+	p.poolCooldown.now = func() time.Time { return now }
+	tr.errByAuth = map[string]error{
+		"Bearer tok-1": &EgressDialError{err: errors.New("rejected username/password")},
+	}
+	for i := 0; i < serverErrStreakThreshold; i++ {
+		req, w := groupReq(groupBody)
+		p.Handle(w, req)
+		if w.Code != http.StatusServiceUnavailable {
+			t.Fatalf("req %d: want egress 503, got %d: %s", i+1, w.Code, w.Body.String())
+		}
+	}
+
+	delete(tr.errByAuth, "Bearer tok-1")
+	now = now.Add(serverErrCooldown + time.Second)
+	req, w := groupReq(groupBody)
+	p.Handle(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("expired cooldown must automatically re-admit the recovered account, got %d: %s", w.Code, w.Body.String())
+	}
+	if p.poolCooldown.skipSet()["acc-1"] {
+		t.Fatal("recovered account must no longer remain in the cooldown skip set")
 	}
 }
 

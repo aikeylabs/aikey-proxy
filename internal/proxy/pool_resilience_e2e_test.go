@@ -26,6 +26,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/AiKeyLabs/aikey-proxy/internal/observability"
 	"github.com/AiKeyLabs/aikey-proxy/internal/vkeys"
 )
 
@@ -386,8 +387,8 @@ func TestE2E_Pool_StreamingFailsOverBeforeFirstByte(t *testing.T) {
 // account A hard-broken (401), account B overloaded (529). A single request
 // fails over A→B, both get cooled, and the client receives the last upstream
 // error verbatim (no invented shape). The NEXT request finds an all-cooled pool
-// and gets the honest all-unusable 429.
-func TestE2E_Pool_MixedFailuresExhaustThenHonest429(t *testing.T) {
+// and must preserve the non-quota upstream-unavailable cause as 503.
+func TestE2E_Pool_MixedFailuresExhaustThenPreservesCause(t *testing.T) {
 	p, up := setupE2EPool(t, 2)
 	up.reset(func(c upstreamCall) upstreamReply {
 		if strings.HasSuffix(c.account, "1") {
@@ -404,12 +405,12 @@ func TestE2E_Pool_MixedFailuresExhaustThenHonest429(t *testing.T) {
 	if len(p.poolCooldown.skipSet()) != 2 {
 		t.Fatalf("both failed accounts must be cooled, got %v", p.poolCooldown.skipSet())
 	}
-	// next request: everything cooled → honest all-unusable 429, zero attempts.
+	// next request: everything cooled for non-quota failures → 503, zero attempts.
 	up.reset(func(upstreamCall) upstreamReply { return upstreamReply{status: 200} })
 	req2, w2 := groupReq(modelBody("claude-sonnet-4-5"))
 	p.Handle(w2, req2)
-	if w2.Code != http.StatusTooManyRequests {
-		t.Fatalf("all-cooled pool → honest 429, got %d", w2.Code)
+	if w2.Code != http.StatusServiceUnavailable || !strings.Contains(w2.Body.String(), observability.ErrCodeGroupUpstreamUnavailable) {
+		t.Fatalf("all-cooled non-quota pool must preserve upstream-unavailable as 503, got %d: %s", w2.Code, w2.Body.String())
 	}
 	if up.callCount() != 0 {
 		t.Fatalf("all-cooled pool must make zero upstream attempts, got %d", up.callCount())

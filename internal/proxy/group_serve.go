@@ -165,6 +165,17 @@ func (p *Proxy) handleOauthGroupRoute(
 				lastCaptured.flushCaptured()
 				return
 			}
+			// A durable 5xx/transport cooldown is not quota exhaustion. The
+			// resolver intentionally consumes a bool skip set, so recover the
+			// reason from the cooldown store before the generic 429 mapping. Do
+			// this only when this request has no concrete upstream response to
+			// preserve verbatim.
+			if isGE && ge.Code == groupErrAllUnusable {
+				if code := p.groupUnavailableCooldownCode(route, baseSkip); code != "" {
+					p.degradeGroup(w, logger, route, code, groupDegradeMessage(code))
+					return
+				}
+			}
 			// 4. Resolve-time degrade (nothing served this request at all).
 			code := observability.ErrCodeGroupKeyUnavailable
 			if isGE {
@@ -410,6 +421,12 @@ func groupDegradeMessage(code string) string {
 		// Every candidate is expired / quota-exhausted / undecryptable right now.
 		return "All accounts in this credential-sharing group are currently unavailable " +
 			"(rate-limited or expired). Contact your administrator if this persists."
+	case observability.ErrCodeAccountEgressProxy:
+		return "The credential-sharing group's configured account egress is unavailable. " +
+			"Run `aikey doctor` and ask your administrator to check the account egress credentials and connectivity."
+	case observability.ErrCodeGroupUpstreamUnavailable:
+		return "All currently routable accounts in this credential-sharing group have an upstream connection failure. " +
+			"Please retry shortly; if it persists, ask your administrator to check account egress and upstream connectivity."
 	default:
 		return "Group routing is temporarily unavailable. Please retry shortly."
 	}
@@ -567,11 +584,58 @@ func groupDegradeStatus(code string) (status int, errType string) {
 		// recovers when the upstream window resets. 429 is the honest code (the
 		// client MAY back off and retry, which is legitimate here).
 		return http.StatusTooManyRequests, "rate_limit_error"
+	case observability.ErrCodeAccountEgressProxy, observability.ErrCodeGroupUpstreamUnavailable:
+		return http.StatusServiceUnavailable, "server_error"
 	default:
 		// NO_MATERIAL (channel-③ poll in flight) / group key unavailable (vault
 		// reload) → genuinely transient; retrying shortly IS the right action → 503.
 		return http.StatusServiceUnavailable, "server_error"
 	}
+}
+
+// groupUnavailableCooldownCode preserves the reason when every route candidate
+// was skipped by durable cooldown state. A precise egress failure wins over a
+// generic upstream failure; either wins over the generic all-unusable 429,
+// because a mixed pool is not truthfully "all quota exhausted".
+func (p *Proxy) groupUnavailableCooldownCode(route *vkeys.ResolvedRoute, skip map[string]bool) string {
+	if route == nil || len(skip) == 0 {
+		return ""
+	}
+	ids := make(map[string]bool)
+	var refs []vkeys.GroupAccountRef
+	if json.Unmarshal([]byte(route.GroupAccounts), &refs) == nil {
+		for _, ref := range refs {
+			if ref.AccountID != "" {
+				ids[ref.AccountID] = true
+			}
+		}
+	}
+	var material map[string]vkeys.GroupRuntimeAccount
+	if json.Unmarshal([]byte(route.GroupRuntime), &material) == nil {
+		for id := range material {
+			ids[id] = true
+		}
+	}
+
+	states := p.poolCooldown.routeStateSnapshot()
+	hasUpstreamFailure := false
+	for id := range ids {
+		if !skip[id] {
+			continue
+		}
+		state, ok := states[id]
+		if !ok || state.Status != poolRouteUpstreamUnavailable {
+			continue
+		}
+		if state.ErrorCode == observability.ErrCodeAccountEgressProxy {
+			return observability.ErrCodeAccountEgressProxy
+		}
+		hasUpstreamFailure = true
+	}
+	if hasUpstreamFailure {
+		return observability.ErrCodeGroupUpstreamUnavailable
+	}
+	return ""
 }
 
 // degradeGroup fails a group request loudly (never silently routes it to a wrong

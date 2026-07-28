@@ -200,6 +200,11 @@ const (
 	// (GROUP_NO_CANDIDATES / GROUP_NO_MATERIAL / GROUP_ALL_UNUSABLE) are surfaced
 	// verbatim; GROUP_KEY_UNAVAILABLE is the proxy-local "can't decrypt" case.
 	ErrCodeGroupKeyUnavailable = "GROUP_KEY_UNAVAILABLE"
+	// ErrCodeGroupUpstreamUnavailable preserves a non-quota pool outage after
+	// every candidate has entered a 5xx/transport cooldown. It must remain 503;
+	// collapsing it into GROUP_ALL_UNUSABLE would falsely tell clients that the
+	// provider quota or rate limit was exhausted.
+	ErrCodeGroupUpstreamUnavailable = "GROUP_UPSTREAM_UNAVAILABLE"
 	// ErrCodeGroupPoolFull (§5.5): 429 when the seat is blocked — every pool account
 	// is at the per-account user cap, or no usable account remains. Neutral wording
 	// (does not guess the cause); the user waits or contacts the admin.

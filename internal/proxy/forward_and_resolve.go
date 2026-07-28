@@ -1079,8 +1079,14 @@ func (p *Proxy) serveRoute(w http.ResponseWriter, r *http.Request, route *vkeys.
 			// ALSO retry this request on another account. context.Canceled is the
 			// CLIENT hanging up (streaming keeps the client context) — not the
 			// account's fault, never counted.
+			var egErr *EgressDialError
+			isEgressDialFailure := errors.As(err, &egErr)
 			if route.OauthGroupID != "" && route.AccountID != "" && !errors.Is(err, context.Canceled) {
-				if _, cooled := p.poolCooldown.noteServerError(route.AccountID); cooled {
+				state := PoolAccountRouteState{Status: poolRouteUpstreamUnavailable}
+				if isEgressDialFailure {
+					state.ErrorCode = observability.ErrCodeAccountEgressProxy
+				}
+				if _, cooled := p.poolCooldown.noteServerErrorWithState(route.AccountID, state); cooled {
 					logger.Warn("pool account cooled down after repeated transport errors",
 						"event.name", observability.EventProxyGroupAccountCooldown,
 						"oauth_group_id", route.OauthGroupID,
@@ -1093,8 +1099,7 @@ func (p *Proxy) serveRoute(w http.ResponseWriter, r *http.Request, route *vkeys.
 			// fallback/url-test group has NO reachable member): surface it plainly
 			// so the user knows it's THEIR egress, not the provider, and NEVER fall
 			// through to a direct dial (the engine already failed rather than leak).
-			var egErr *EgressDialError
-			if errors.As(err, &egErr) {
+			if isEgressDialFailure {
 				logger.Error("per-account egress connect failed",
 					"event.name", observability.EventProxyRequestUpstreamError,
 					"error.code", observability.ErrCodeAccountEgressProxy,

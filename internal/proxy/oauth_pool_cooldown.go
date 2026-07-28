@@ -76,8 +76,9 @@ const (
 // the local vault explain why an account was skipped and when it is expected to
 // recover. RetryAt is unix seconds. Tier-only cooldowns are intentionally absent.
 type PoolAccountRouteState struct {
-	Status  string `json:"status"`
-	RetryAt int64  `json:"retry_at,omitempty"`
+	Status    string `json:"status"`
+	RetryAt   int64  `json:"retry_at,omitempty"`
+	ErrorCode string `json:"error_code,omitempty"`
 }
 
 // poolCooldownStore holds a per-account "avoid until" time. Concurrency-safe.
@@ -269,6 +270,16 @@ func (s *poolCooldownStore) persistLocked() {
 // threshold (the streak resets so recovery gets a fresh count after the cool).
 // Below threshold → (zero, false): a transient blip cools nobody.
 func (s *poolCooldownStore) noteServerError(accountID string) (time.Time, bool) {
+	return s.noteServerErrorWithState(accountID, PoolAccountRouteState{
+		Status: poolRouteUpstreamUnavailable,
+	})
+}
+
+// noteServerErrorWithState is the reason-preserving variant used when the
+// transport already classified a precise failure (notably per-account egress).
+// Routing still depends only on the cooldown deadline; the extra state prevents
+// the next request from being mislabeled as quota/rate-limit exhaustion.
+func (s *poolCooldownStore) noteServerErrorWithState(accountID string, state PoolAccountRouteState) (time.Time, bool) {
 	if accountID == "" {
 		return time.Time{}, false
 	}
@@ -291,7 +302,11 @@ func (s *poolCooldownStore) noteServerError(accountID string) (time.Time, bool) 
 		if s.meta == nil {
 			s.meta = make(map[string]PoolAccountRouteState)
 		}
-		s.meta[accountID] = PoolAccountRouteState{Status: poolRouteUpstreamUnavailable, RetryAt: until.Unix()}
+		if state.Status == "" {
+			state.Status = poolRouteUpstreamUnavailable
+		}
+		state.RetryAt = until.Unix()
+		s.meta[accountID] = state
 		s.persistLocked()
 	}
 	hook := s.onAccountSetChanged

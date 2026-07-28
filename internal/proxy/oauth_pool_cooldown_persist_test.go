@@ -4,6 +4,8 @@ import (
 	"os"
 	"testing"
 	"time"
+
+	"github.com/AiKeyLabs/aikey-proxy/internal/observability"
 )
 
 // ── cross-restart cooldown persistence (§S4, 2026-07-04 self-heal) ──────────
@@ -28,6 +30,27 @@ func TestPoolCooldown_PersistAndHydrateAcrossRestart(t *testing.T) {
 	skip := s2.skipSet()
 	if !skip["acc-cooled"] {
 		t.Fatalf("hydrated store must keep cooling acc-cooled, skip=%v", skip)
+	}
+}
+
+func TestPoolCooldown_ErrorCauseSurvivesRestart(t *testing.T) {
+	t.Setenv("AIKEY_RUN_DIR", t.TempDir())
+
+	s1 := newPoolCooldownStore()
+	s1.markWithState("acc-egress", time.Now().Add(30*time.Minute), PoolAccountRouteState{
+		Status:    poolRouteUpstreamUnavailable,
+		ErrorCode: observability.ErrCodeAccountEgressProxy,
+	})
+
+	// "Restart": routing and its public failure reason must hydrate together;
+	// otherwise the first post-restart request regresses to a fake quota 429.
+	s2 := newPoolCooldownStore()
+	state, ok := s2.routeStateSnapshot()["acc-egress"]
+	if !ok {
+		t.Fatal("hydrated store must retain the active egress cooldown")
+	}
+	if state.Status != poolRouteUpstreamUnavailable || state.ErrorCode != observability.ErrCodeAccountEgressProxy {
+		t.Fatalf("hydrated cooldown lost its cause: %+v", state)
 	}
 }
 
