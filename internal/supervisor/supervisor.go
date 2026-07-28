@@ -335,6 +335,13 @@ type Supervisor struct {
 	convAuditMaxBytes atomic.Int64
 	genID             atomic.Int64
 	reloadMu          sync.Mutex // serialize concurrent reload requests
+	// runtimeStateMu serializes the short generation-activation boundary with
+	// hot updates of supervisor-owned runtime state. buildGeneration deliberately
+	// stays outside this lock: only applying the latest transport/override/broker
+	// snapshot and swapping active must be atomic. Without this fence, a generation
+	// built from an older snapshot can become active after a Settings PUT returned
+	// 200 and silently restore direct/old egress.
+	runtimeStateMu sync.Mutex
 	// convAuditEnabled / convAuditMaxBytes: org-level conversation-audit capture
 	// switch + per-turn content cap, polled from the control backend by
 	// pollConversationAuditPolicy (mirrors masterCompliance, v1.0.1-alpha.2).
@@ -400,7 +407,7 @@ func New(cfg *config.Config, configPath, password, version string) (*Supervisor,
 	if err != nil {
 		return nil, fmt.Errorf("initial generation failed: %w", err)
 	}
-	s.active.Store(gen)
+	s.activateGeneration(gen)
 	// Seed the quota change-signal from the quota_rules_cache the initial
 	// generation just loaded, so the FIRST quota poll after boot is a no-op when
 	// the master's rules are unchanged — instead of always detecting a phantom
@@ -643,30 +650,66 @@ func (s *Supervisor) startQuotaHeartbeat() {
 		"health_url", healthURL, "interval", interval, "max_staleness", maxStaleness)
 }
 
-// SetTransport sets the outbound RoundTripper used by all generations.
-// Must be called before any requests are served (right after New).
+// generationRuntimeTarget is the complete supervisor-owned runtime state that a
+// Proxy generation must inherit at activation. Keeping the three setters behind
+// one interface makes omission visible in the activation regression test.
+type generationRuntimeTarget interface {
+	SetTransport(http.RoundTripper)
+	SetOAuthEgressOverride(bool)
+	SetBroker(proxy.OAuthBroker)
+}
+
+// applyRuntimeState installs the latest supervisor-owned runtime state on target.
+// The caller must hold runtimeStateMu whenever target can become active.
+func (s *Supervisor) applyRuntimeState(target generationRuntimeTarget) {
+	var transport http.RoundTripper
+	if box := s.transport.Load(); box != nil {
+		transport = box.rt
+	}
+	target.SetTransport(transport)
+	target.SetOAuthEgressOverride(s.oauthEgressOverride.Load())
+	target.SetBroker(s.broker)
+}
+
+// activateGeneration is the only active-generation swap path. A concurrent hot
+// update either completes first and is copied into newGen, or completes second
+// and updates newGen after it becomes active; neither ordering can lose state.
+func (s *Supervisor) activateGeneration(newGen *generation) {
+	s.runtimeStateMu.Lock()
+	defer s.runtimeStateMu.Unlock()
+	s.applyRuntimeState(newGen.proxy)
+	s.active.Store(newGen)
+}
+
 // SetBroker sets the OAuth broker for all proxy generations.
 func (s *Supervisor) SetBroker(b proxy.OAuthBroker) {
+	s.runtimeStateMu.Lock()
+	defer s.runtimeStateMu.Unlock()
 	s.broker = b
 	if gen := s.active.Load(); gen != nil {
 		gen.proxy.SetBroker(b)
 	}
 }
 
+// SetTransport hot-swaps the outbound RoundTripper used by the active generation
+// and guarantees that a concurrently activating generation cannot restore the
+// previous transport after this call returns.
 func (s *Supervisor) SetTransport(t http.RoundTripper) {
+	s.runtimeStateMu.Lock()
+	defer s.runtimeStateMu.Unlock()
 	s.transport.Store(&transportBox{rt: t})
-	// Also apply to the already-running initial generation. proxy.SetTransport is
-	// itself atomic, so this hot-swap is safe while the generation serves requests.
 	if gen := s.active.Load(); gen != nil {
 		gen.proxy.SetTransport(t)
 	}
 }
 
 // SetOAuthEgressOverride flips the opt-in escape hatch (2026-07-19) across all
-// generations. Stores it supervisor-scoped (so reloads inherit it via
-// buildGeneration) AND hot-applies to the running generation — same pattern as
+// generations. Stores it supervisor-scoped (so activateGeneration applies it to
+// reloads) AND hot-applies to the running generation — same pattern as
 // SetTransport. Node-local, default false.
 func (s *Supervisor) SetOAuthEgressOverride(on bool) {
+	s.runtimeStateMu.Lock()
+	defer s.runtimeStateMu.Unlock()
 	s.oauthEgressOverride.Store(on)
 	if gen := s.active.Load(); gen != nil {
 		gen.proxy.SetOAuthEgressOverride(on)
@@ -1365,8 +1408,9 @@ func (s *Supervisor) Reload(ctx context.Context) error {
 		return fmt.Errorf("reload: build generation failed: %w", err)
 	}
 
-	// Swap to new generation — new requests go to newGen from this point.
-	s.active.Store(newGen)
+	// Apply the latest supervisor-owned runtime state and swap under the same short
+	// fence used by hot updates. The generation build above remains off-lock.
+	s.activateGeneration(newGen)
 	// The new Proxy hydrates persisted cooldowns independently; re-stamp its
 	// display projection after the generation becomes active.
 	s.requestCurrentRoutedRestamp()
@@ -1518,16 +1562,8 @@ func (s *Supervisor) buildGeneration() (*generation, error) {
 	p.SetRoutingRailHealth(func() (string, int64) { return s.railHealthFor("routing_override") })
 	p.SlowRequestMs = int64(s.cfg.Log.SlowRequestMs)
 	p.VerySlowRequestMs = int64(s.cfg.Log.VerySlowRequestMs)
-	if b := s.transport.Load(); b != nil && b.rt != nil {
-		p.SetTransport(b.rt)
-	}
-	// Escape hatch (2026-07-19): a reload must inherit the member's opt-in state,
-	// so it doesn't silently revert to coexist mid-emergency. Unconditional store
-	// (default false is a no-op) — same inheritance pattern as transport above.
-	p.SetOAuthEgressOverride(s.oauthEgressOverride.Load())
-	if s.broker != nil {
-		p.SetBroker(s.broker)
-	}
+	// Supervisor-owned runtime state is applied atomically with active.Store by
+	// activateGeneration. Reading it here would recreate the stale-build window.
 	// Phase 2 Stage 3: wire the token-quota gate from the per-process snapshot +
 	// counter (both supervisor-scoped so the counter survives 5s syncs/reloads).
 	// nil-safe + flag-gated inside the enforcer — a no-op when PROXY_QUOTA_ENABLED
