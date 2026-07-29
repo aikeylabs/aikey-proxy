@@ -17,8 +17,9 @@
 //  2. BODY REPLAY: every attempt forwards a fresh clone of the ORIGINAL request
 //     (headers + body); per-attempt mutations (oauthInject persona headers,
 //     upstream URL rewrite, context stashes) never leak into the next attempt.
-//  3. FAILED-ACCOUNT EXCLUSION: each failed account joins a per-request failed
-//     set merged into the resolver's skip set — never re-pick what just failed.
+//  3. FAILED-ACCOUNT/PATH EXCLUSION: account-attributed HTTP failures join the
+//     per-request account set, while no-response transport failures join the
+//     path set — never redial the same failed path through a different account.
 //     (401/evidence-429 also mark the shared cooldown store via ModifyResponse,
 //     which future requests see; 529/5xx cross-REQUEST cooldown is the separate
 //     P0-B work — within THIS request the failed set alone is sufficient.)
@@ -26,9 +27,9 @@
 // Where we deliberately EXCEED sub2api: their transport-level failures (no HTTP
 // response at all) are written to the client as a dead-end 502 with no failover
 // (their gateway_service.go:5048-5072 gap). Here httputil.ReverseProxy's
-// ErrorHandler synthesizes a 502 through the SAME capture writer, so a
-// connection failure / pre-response timeout fails over exactly like an upstream
-// 5xx.
+// ErrorHandler synthesizes a non-quota 503 through the SAME capture writer. The
+// outer loop retries only a candidate with a different Provider path; another
+// account on the same dead path is skipped without dialing.
 //
 // Scope (stage 1): oauth-group routes only — the only routes with alternate
 // accounts to fail over TO. Direct-bind/single-credential routes keep the
@@ -66,8 +67,9 @@ const (
 //     evidence-LESS 429 (suspected WAF/business rejection) is about the REQUEST,
 //     not the account — switching cannot help and only burns more personas, so
 //     it passes through;
-//   - >=500 (incl. 529 overload and the ReverseProxy-synthesized 502 for
-//     transport errors): upstream/account-side failure worth one try elsewhere.
+//   - >=500 (incl. 529 overload and the ReverseProxy-synthesized 503 for
+//     transport errors): upstream/account- or path-side failure worth one try
+//     elsewhere; the caller separates account exclusion from path exclusion.
 func failoverEligibleResponse(status int, h http.Header) bool {
 	// The scheduling engine already selected this account. If its configured
 	// egress cannot be constructed locally, no upstream request happened and no
@@ -110,6 +112,10 @@ type groupFailoverWriter struct {
 	capturing bool
 	status    int
 	buf       bytes.Buffer
+	// failedPathKey is private metadata from ReverseProxy.ErrorHandler. It never
+	// becomes an upstream or client header; the outer group loop uses it to avoid
+	// dialing the same failed network path through another account.
+	failedPathKey string
 }
 
 func newGroupFailoverWriter(dst http.ResponseWriter, allowCapture bool) *groupFailoverWriter {
@@ -170,6 +176,10 @@ func (fw *groupFailoverWriter) Unwrap() http.ResponseWriter { return fw.dst }
 // captured reports whether this attempt's response was deferred for a retry
 // decision.
 func (fw *groupFailoverWriter) capturedResponse() bool { return fw.capturing }
+
+func (fw *groupFailoverWriter) markProviderPathFailure(pathKey string) {
+	fw.failedPathKey = pathKey
+}
 
 // flushCaptured writes the deferred response to the client verbatim — used when
 // the failover budget or the candidate set is exhausted and the last upstream

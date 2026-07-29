@@ -312,17 +312,33 @@ type SyncRailStatus struct {
 	LastError           string `json:"last_error,omitempty"`
 }
 
-// PoolRoutingHealth is the oauth-group account-routing health surface (N9). Built
-// by the cmd layer from the proxy's reactive cooldown state.
+// PoolRoutingHealth is the oauth-group account-and-path routing health surface.
+// Built by the cmd layer from account cooldown and Provider-path breaker state.
 type PoolRoutingHealth struct {
-	Enabled        bool            `json:"enabled"`
-	CooledAccounts []CooledAccount `json:"cooled_accounts,omitempty"`
+	Enabled        bool                 `json:"enabled"`
+	CooledAccounts []CooledAccount      `json:"cooled_accounts,omitempty"`
+	PathHealth     []ProviderPathHealth `json:"path_health,omitempty"`
 }
 
 // CooledAccount is one pool account currently routed around (401 / exhaustion).
 type CooledAccount struct {
 	AccountID       string `json:"account_id"`
 	CooldownSeconds int    `json:"cooldown_seconds"`
+}
+
+// ProviderPathHealth is one transient outbound path breaker. All identities are
+// hashed/fingerprinted; raw upstream and egress configuration never appear.
+type ProviderPathHealth struct {
+	PathID              string `json:"path_id"`
+	Provider            string `json:"provider"`
+	Protocol            string `json:"protocol"`
+	Transport           string `json:"transport"`
+	OriginFingerprint   string `json:"origin_fingerprint"`
+	EgressFingerprint   string `json:"egress_fingerprint,omitempty"`
+	State               string `json:"state"`
+	FailureClass        string `json:"failure_class"`
+	ConsecutiveFailures int    `json:"consecutive_failures"`
+	RetryAfterSeconds   int    `json:"retry_after_seconds,omitempty"`
 }
 
 // Status returns detailed proxy status.

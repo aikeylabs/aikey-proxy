@@ -267,6 +267,10 @@ type Supervisor struct {
 	// re-applies it to every new generation's proxy. Default false → coexist
 	// unchanged. Set via SetOAuthEgressOverride (from the /admin toggle).
 	oauthEgressOverride atomic.Bool
+	// pathHealth is supervisor-scoped live path reachability. Every generation
+	// receives this same pointer, so a reload cannot erase an open breaker or its
+	// recovery opportunity and hot network/egress changes can wake it immediately.
+	pathHealth *proxy.ProviderPathHealthManager
 	// ctx / cancel bound the lifetime of all detached upstream calls.
 	// Canceled in Shutdown() to stop any in-flight upstream requests.
 	ctx    context.Context
@@ -399,6 +403,7 @@ func New(cfg *config.Config, configPath, password, version string) (*Supervisor,
 		quotaSnapshot:            quota.NewSnapshot(),
 		quotaCounter:             quota.NewCounter(),
 		routingOverrides:         proxy.NewRoutingOverrideCache(),
+		pathHealth:               proxy.NewProviderPathHealthManager(),
 		teamCred:                 &teamCredentialSource{},
 		currentRoutedRestampKick: make(chan struct{}, 1),
 	}
@@ -471,7 +476,9 @@ func New(cfg *config.Config, configPath, password, version string) (*Supervisor,
 	// without waiting for a failure. Dependency-free (net.Interfaces fingerprint).
 	// Isolated + cheap: a 20s poll; a panic here must never touch the data path.
 	// See netmon.go / selfheal.go.
-	observability.GoSafe("supervisor.net_change_monitor", observability.Isolated, func() { runNetChangeMonitor(s.ctx) })
+	observability.GoSafe("supervisor.net_change_monitor", observability.Isolated, func() {
+		runNetChangeMonitor(s.ctx, s.pathHealth.NotifyInputsChanged)
+	})
 
 	// Cluster mode (V3c): register this node with the hub name service + heartbeat
 	// so clients discover it via /cluster/resolve. Inert for non-cluster proxies —
@@ -651,12 +658,13 @@ func (s *Supervisor) startQuotaHeartbeat() {
 }
 
 // generationRuntimeTarget is the complete supervisor-owned runtime state that a
-// Proxy generation must inherit at activation. Keeping the three setters behind
+// Proxy generation must inherit at activation. Keeping every setter behind
 // one interface makes omission visible in the activation regression test.
 type generationRuntimeTarget interface {
 	SetTransport(http.RoundTripper)
 	SetOAuthEgressOverride(bool)
 	SetBroker(proxy.OAuthBroker)
+	SetProviderPathHealthManager(*proxy.ProviderPathHealthManager)
 }
 
 // applyRuntimeState installs the latest supervisor-owned runtime state on target.
@@ -669,6 +677,7 @@ func (s *Supervisor) applyRuntimeState(target generationRuntimeTarget) {
 	target.SetTransport(transport)
 	target.SetOAuthEgressOverride(s.oauthEgressOverride.Load())
 	target.SetBroker(s.broker)
+	target.SetProviderPathHealthManager(s.pathHealth)
 }
 
 // activateGeneration is the only active-generation swap path. A concurrent hot
@@ -701,6 +710,9 @@ func (s *Supervisor) SetTransport(t http.RoundTripper) {
 	if gen := s.active.Load(); gen != nil {
 		gen.proxy.SetTransport(t)
 	}
+	if s.pathHealth != nil {
+		s.pathHealth.NotifyInputsChanged()
+	}
 }
 
 // SetOAuthEgressOverride flips the opt-in escape hatch (2026-07-19) across all
@@ -710,9 +722,12 @@ func (s *Supervisor) SetTransport(t http.RoundTripper) {
 func (s *Supervisor) SetOAuthEgressOverride(on bool) {
 	s.runtimeStateMu.Lock()
 	defer s.runtimeStateMu.Unlock()
-	s.oauthEgressOverride.Store(on)
+	changed := s.oauthEgressOverride.Swap(on) != on
 	if gen := s.active.Load(); gen != nil {
 		gen.proxy.SetOAuthEgressOverride(on)
+	}
+	if changed && s.pathHealth != nil {
+		s.pathHealth.NotifyInputsChanged()
 	}
 }
 
@@ -1100,6 +1115,12 @@ func (s *Supervisor) AppHealthSnapshot() []apppipe.AppHealth {
 // admin /status pool-routing health surface (N9).
 func (s *Supervisor) PoolCooldownSnapshot() map[string]int {
 	return s.active.Load().proxy.PoolCooldownSnapshot()
+}
+
+// ProviderPathHealthSnapshot returns the shared OAuth-group outbound-path
+// breaker state for /status. Unlike account cooldowns it survives Proxy reloads.
+func (s *Supervisor) ProviderPathHealthSnapshot() []proxy.ProviderPathHealth {
+	return s.pathHealth.Snapshot()
 }
 
 // ReporterMetrics returns usage reporter counters from the active generation.

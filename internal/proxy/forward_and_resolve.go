@@ -26,6 +26,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"log/slog"
 	"net/http"
@@ -376,6 +377,11 @@ func (p *Proxy) serveRoute(w http.ResponseWriter, r *http.Request, route *vkeys.
 	if route != nil {
 		route.ProviderCode = truthfulProviderCode(route.BaseURL, route.ProviderCode)
 	}
+	currentOverride := p.oauthEgressOverride.Load()
+	pathDecision := providerPathDecision{overrideOn: currentOverride}
+	if route != nil && route.OauthGroupID != "" {
+		pathDecision = providerPathDecisionForRequest(r.Context(), route, currentOverride)
+	}
 	// Phase 2 quota gate — UNIVERSAL chokepoint (Stage 3 + D-U8/P7). serveRoute is
 	// the single funnel EVERY real route passes through (Tier1 token, OAuth,
 	// active-sentinel, app pipeline, default binding; serveRouteWithObserver
@@ -513,7 +519,7 @@ func (p *Proxy) serveRoute(w http.ResponseWriter, r *http.Request, route *vkeys.
 	// (applied per-account egress, or fell to node/direct) so any request is
 	// traceable, not just the egress ones. Never logs the spec verbatim — only
 	// its fingerprint (a mihomo fragment carries socks5 credentials).
-	egApplied, egEngine, egFingerprint := egressAttribution(route.EgressProxyURL, p.oauthEgressOverride.Load())
+	egApplied, egEngine, egFingerprint := egressAttribution(route.EgressProxyURL, pathDecision.overrideOn)
 	logger.Info("egress attribution",
 		"event.name", observability.EventProxyEgressRequestAttribution,
 		"account_id", route.AccountID,
@@ -649,6 +655,11 @@ func (p *Proxy) serveRoute(w http.ResponseWriter, r *http.Request, route *vkeys.
 			}
 		},
 		ModifyResponse: func(resp *http.Response) error {
+			// Any HTTP response proves this outbound path is reachable. Account and
+			// provider semantics (401/429/5xx) are classified below, independently.
+			if route.OauthGroupID != "" {
+				p.pathHealth.NoteHTTPResponse(pathDecision.path)
+			}
 			// P1 error-origin (20260719): tag relayed error responses so a client
 			// can tell WHO produced the error. First-writer-wins: if a deeper aikey
 			// hop (worker/ingress) already set X-Aikey-Error-Origin, keep it (that's
@@ -1069,30 +1080,35 @@ func (p *Proxy) serveRoute(w http.ResponseWriter, r *http.Request, route *vkeys.
 		ErrorHandler: func(w http.ResponseWriter, r *http.Request, err error) {
 			p.errors.Add(1)
 			latencyMs := time.Since(startTime).Milliseconds()
-			// P0-B (2026-07-19): transport-level failures (dial refused, TLS
-			// failure, pre-response timeout, egress hop down) never reach
-			// ModifyResponse, so they were invisible to the pool health path —
-			// sticky binding kept sending every next request into the dead lane.
-			// Count them toward the account's CONSECUTIVE server-error streak
-			// (same threshold as generic 5xx; one blip cools nobody). The 502/503
-			// written below flows through N9's first-byte gate, so group routes
-			// ALSO retry this request on another account. context.Canceled is the
-			// CLIENT hanging up (streaming keeps the client context) — not the
-			// account's fault, never counted.
 			var egErr *EgressDialError
 			isEgressDialFailure := errors.As(err, &egErr)
-			if route.OauthGroupID != "" && route.AccountID != "" && !errors.Is(err, context.Canceled) {
-				state := PoolAccountRouteState{Status: poolRouteUpstreamUnavailable}
-				if isEgressDialFailure {
-					state.ErrorCode = observability.ErrCodeAccountEgressProxy
-				}
-				if _, cooled := p.poolCooldown.noteServerErrorWithState(route.AccountID, state); cooled {
-					logger.Warn("pool account cooled down after repeated transport errors",
-						"event.name", observability.EventProxyGroupAccountCooldown,
+			if route.OauthGroupID != "" {
+				path := pathDecision.path
+				if errors.Is(err, context.Canceled) {
+					p.pathHealth.NoteProbeCanceled(path)
+				} else {
+					failureClass := pathFailureTransport
+					if isEgressDialFailure {
+						failureClass = pathFailureEgressDial
+					}
+					health := p.pathHealth.NoteTransportFailure(path, failureClass)
+					if health.RetryAfterSeconds > 0 {
+						w.Header().Set("Retry-After", fmt.Sprintf("%d", health.RetryAfterSeconds))
+					}
+					if marker, ok := w.(interface{ markProviderPathFailure(string) }); ok {
+						marker.markProviderPathFailure(path.Key)
+					}
+					logger.Warn("oauth-group provider path transport failure",
+						"event.name", observability.EventProxyGroupProviderPathState,
 						"oauth_group_id", route.OauthGroupID,
-						"account_id", route.AccountID,
-						"error.message", err.Error(),
-						"streak_threshold", serverErrStreakThreshold)
+						"path_id", health.PathID,
+						"provider", health.Provider,
+						"transport", health.Transport,
+						"state", health.State,
+						"failure_class", health.FailureClass,
+						"consecutive_failures", health.ConsecutiveFailures,
+						"retry_after_seconds", health.RetryAfterSeconds,
+					)
 				}
 			}
 			// Per-account egress dial failure (a socks5 hop refused, or a
@@ -1110,6 +1126,18 @@ func (p *Proxy) serveRoute(w http.ResponseWriter, r *http.Request, route *vkeys.
 				writeJSONError(w, http.StatusServiceUnavailable, "server_error", observability.ErrCodeAccountEgressProxy,
 					accountEgressErrorMessage(route,
 						"its configured egress upstream is unreachable. Run `aikey doctor` and check this account's egress setting."))
+				return
+			}
+			if route.OauthGroupID != "" {
+				logger.Error("oauth-group upstream path unavailable",
+					"event.name", observability.EventProxyRequestUpstreamError,
+					"error.code", observability.ErrCodeGroupUpstreamUnavailable,
+					"error.message", err.Error(),
+					"latency_ms", latencyMs,
+				)
+				writeJSONError(w, http.StatusServiceUnavailable, "server_error",
+					observability.ErrCodeGroupUpstreamUnavailable,
+					groupDegradeMessage(observability.ErrCodeGroupUpstreamUnavailable))
 				return
 			}
 			logger.Error("upstream error",

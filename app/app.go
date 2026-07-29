@@ -419,6 +419,15 @@ func Run() {
 		for id, secs := range sup.PoolCooldownSnapshot() {
 			h.CooledAccounts = append(h.CooledAccounts, admin.CooledAccount{AccountID: id, CooldownSeconds: secs})
 		}
+		for _, path := range sup.ProviderPathHealthSnapshot() {
+			h.PathHealth = append(h.PathHealth, admin.ProviderPathHealth{
+				PathID: path.PathID, Provider: path.Provider, Protocol: path.Protocol,
+				Transport: path.Transport, OriginFingerprint: path.OriginFingerprint,
+				EgressFingerprint: path.EgressFingerprint, State: path.State,
+				FailureClass: path.FailureClass, ConsecutiveFailures: path.ConsecutiveFailures,
+				RetryAfterSeconds: path.RetryAfterSeconds,
+			})
+		}
 		return h
 	}
 	// SyncRail health (2026-07-03): per-rail control-plane sync state for /status

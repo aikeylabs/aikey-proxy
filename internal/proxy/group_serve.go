@@ -20,6 +20,7 @@ package proxy
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -95,7 +96,10 @@ func (p *Proxy) handleOauthGroupRoute(
 	// shared cooldown store already learns 401/evidence-429 via ModifyResponse,
 	// but a 529/5xx attempt must also never be re-picked within this request.
 	failed := map[string]bool{}
+	failedPaths := map[string]bool{}
 	var lastCaptured *groupFailoverWriter
+	var lastBlockedPath *ProviderPathHealth
+	upstreamAttempts := 0
 
 	// P1-C: the skip set is MODEL-AWARE — an account cooled only for a premium
 	// tier (Fable weekly window) is skipped for that tier's requests and stays
@@ -103,7 +107,7 @@ func (p *Proxy) handleOauthGroupRoute(
 	reqModel := extractModelLazy(reqBody)
 
 	override := p.routingOverrides.lookup(route.SeatID, route.OauthGroupID)
-	for attempt := 0; ; attempt++ {
+	for {
 		// baseSkip is durable routing state (whole-account/model-tier cooldown).
 		// Keep it separate from this request's failed attempts: a needs_login account
 		// selected after baseSkip is actionable and must become the visible route;
@@ -129,7 +133,7 @@ func (p *Proxy) handleOauthGroupRoute(
 			//    durable cooldown set alone. If it appears only after merging a transient
 			//    request-local failure, preserve that captured upstream error instead.
 			if isGE && ge.Code == groupErrLoginRequired {
-				actionable := lastCaptured == nil
+				actionable := lastCaptured == nil && lastBlockedPath == nil
 				if !actionable {
 					_, baseErr := resolveGroupCredential(route, p.groupKey.DerivedKey(), nowUnix, baseSkip, override)
 					if baseGE, ok := baseErr.(*groupResolveError); ok && baseGE.Code == groupErrLoginRequired && baseGE.Account == ge.Account {
@@ -138,8 +142,12 @@ func (p *Proxy) handleOauthGroupRoute(
 				}
 				if actionable {
 					p.respondLoginRequired(w, logger, route, ge.Account)
-				} else {
+				} else if lastCaptured != nil {
 					lastCaptured.flushCaptured()
+				} else if lastBlockedPath != nil {
+					p.respondProviderPathUnavailable(w, logger, route, *lastBlockedPath)
+				} else {
+					p.degradeGroup(w, logger, route, ge.Code, groupDegradeMessage(ge.Code))
 				}
 				return
 			}
@@ -165,7 +173,12 @@ func (p *Proxy) handleOauthGroupRoute(
 				lastCaptured.flushCaptured()
 				return
 			}
-			// A durable 5xx/transport cooldown is not quota exhaustion. The
+			if lastBlockedPath != nil {
+				p.respondProviderPathUnavailable(w, logger, route, *lastBlockedPath)
+				return
+			}
+			// A durable HTTP 5xx cooldown (or legacy persisted transport cooldown)
+			// is not quota exhaustion. The
 			// resolver intentionally consumes a bool skip set, so recover the
 			// reason from the cooldown store before the generic 429 mapping. Do
 			// this only when this request has no concrete upstream response to
@@ -184,25 +197,36 @@ func (p *Proxy) handleOauthGroupRoute(
 			p.degradeGroup(w, logger, route, code, groupDegradeMessage(code))
 			return
 		}
-		done := p.serveGroupAttempt(w, baseReq, reqBody, route, res, inboundBearer, startTime, logger, traceID,
-			attempt, failed, &lastCaptured)
-		if done {
+		result := p.serveGroupAttempt(w, baseReq, reqBody, route, res, inboundBearer, startTime, logger, traceID,
+			upstreamAttempts, failed, failedPaths, &lastCaptured)
+		if result.attempted {
+			upstreamAttempts++
+		}
+		if result.blockedPath != nil {
+			lastBlockedPath = result.blockedPath
+		}
+		if result.done {
 			return
 		}
 	}
 }
 
-// serveGroupAttempt forwards ONE candidate attempt of a group request. Returns
-// true when a response reached (or was flushed to) the client; false when the
-// attempt's upstream failure was captured behind the first-byte gate and the
-// caller should retry on the next candidate (res.AccountID has been added to
-// the failed set).
+type groupAttemptResult struct {
+	done        bool
+	attempted   bool
+	blockedPath *ProviderPathHealth
+}
+
+// serveGroupAttempt evaluates ONE candidate and reports whether it reached the
+// upstream, completed the client response, or was blocked by path health. A
+// captured upstream failure adds the account/path to the request-local skip set
+// so the caller can resolve the next useful candidate.
 func (p *Proxy) serveGroupAttempt(
 	w http.ResponseWriter, baseReq *http.Request, reqBody []byte,
 	route *vkeys.ResolvedRoute, res *groupResolution, inboundBearer string,
 	startTime time.Time, logger *slog.Logger, traceID string,
-	attempt int, failed map[string]bool, lastCaptured **groupFailoverWriter,
-) bool {
+	attempt int, failed map[string]bool, failedPaths map[string]bool, lastCaptured **groupFailoverWriter,
+) groupAttemptResult {
 	// fresh clone per attempt: pristine headers + replayed body + inherited
 	// context stashes (route/model extraction ride the context, not the body).
 	r := baseReq.Clone(baseReq.Context())
@@ -265,7 +289,7 @@ func (p *Proxy) serveGroupAttempt(
 		if !oauthCodeOK {
 			writeJSONError(w, http.StatusBadGateway, "server_error", observability.ErrCodeProviderError,
 				"OAuth account has no supported provider persona for provider="+canonicalCode+" protocol_type="+protocolType)
-			return true
+			return groupAttemptResult{done: true}
 		}
 		// Dialect gate (2026-07-13): codex OAuth serves ONLY the Responses API.
 		// Without this, a /chat/completions client's path got appended to
@@ -280,7 +304,7 @@ func (p *Proxy) serveGroupAttempt(
 			)
 			writeJSONError(w, http.StatusBadRequest, "invalid_request_error",
 				observability.ErrCodeOAuthResponsesOnly, reason)
-			return true
+			return groupAttemptResult{done: true}
 		}
 		// B2 guard (2026-07-17, verify-first 红灯实证 group_serve_verify_b2_test.go):
 		// an anthropic OAuth account whose material lacks ExternalID (the OAuth
@@ -297,7 +321,7 @@ func (p *Proxy) serveGroupAttempt(
 		// use it — only the anthropic family needs the uuid.
 		if oauthCode == "anthropic" && res.OAuth != nil && res.OAuth.ExternalID == "" {
 			p.respondLoginRequired(w, logger, route, res.AccountID)
-			return true
+			return groupAttemptResult{done: true}
 		}
 		// Per-provider OAuth upstream (base URL + any provider setup like codex's
 		// deferred model capture) via the shared resolver — same source as the
@@ -312,7 +336,7 @@ func (p *Proxy) serveGroupAttempt(
 			)
 			writeJSONError(w, http.StatusBadGateway, "server_error", observability.ErrCodeProviderError,
 				"Mock Provider account has no runtime base URL")
-			return true
+			return groupAttemptResult{done: true}
 		}
 		resolvedBase := res.BaseURL
 		if strings.TrimSpace(resolvedBase) == "" {
@@ -342,8 +366,36 @@ func (p *Proxy) serveGroupAttempt(
 		)
 		writeJSONError(w, http.StatusBadGateway, "server_error", observability.ErrCodeProviderError,
 			"Unknown provider protocol: "+adapterKey)
-		return true
+		return groupAttemptResult{done: true}
 	}
+
+	// The group-level route intentionally leaves ProviderCode empty; path health
+	// needs the resolved account provider before deriving its non-secret key.
+	rc.ProviderCode = canonicalCode
+	overrideOn := p.oauthEgressOverride.Load()
+	path := providerPathForRoute(&rc, overrideOn)
+	if failedPaths[path.Key] {
+		failed[res.AccountID] = true
+		return groupAttemptResult{}
+	}
+	if permit := p.pathHealth.Permit(path); !permit.Allowed {
+		failed[res.AccountID] = true
+		failedPaths[path.Key] = true
+		health := permit.Health
+		logger.Warn("oauth-group provider path is backing off",
+			"event.name", observability.EventProxyGroupProviderPathState,
+			"oauth_group_id", rc.OauthGroupID,
+			"path_id", health.PathID,
+			"provider", health.Provider,
+			"transport", health.Transport,
+			"state", health.State,
+			"retry_after_seconds", health.RetryAfterSeconds,
+		)
+		return groupAttemptResult{blockedPath: &health}
+	}
+	r = r.WithContext(context.WithValue(r.Context(), ctxKeyProviderPathDecision, providerPathDecision{
+		path: path, overrideOn: overrideOn,
+	}))
 
 	// N9 #8: audit a fallback — the seat's primary account was unusable (cooled /
 	// exhausted / expired / no material) so we routed to a different candidate.
@@ -373,21 +425,26 @@ func (p *Proxy) serveGroupAttempt(
 	// usage (protocol-agnostic) still reports. Found by the OAuth-pool E2E
 	// (2026-06-26). Set it to the resolved canonical provider now that the base URL
 	// is fixed, so the observer's ProtocolFamily fallback fires.
-	rc.ProviderCode = canonicalCode
-
 	// N9 first-byte gate: forward through the capture writer. A failover-eligible
 	// upstream failure (401 / evidence-429 / >=500 incl. the ReverseProxy-
-	// synthesized 502 for transport errors) is DEFERRED — nothing reaches the
+	// synthesized 503 for group transport errors) is DEFERRED — nothing reaches the
 	// client — and we signal the caller to retry on the next candidate. Capture is
 	// disabled on the last permitted attempt so its outcome streams straight
 	// through (no pointless buffering when no retry can follow).
 	fw := newGroupFailoverWriter(w, attempt < groupFailoverMaxSwitches)
 	p.serveRouteWithObserver(fw, r, &rc, prov, realKey, inboundBearer, startTime, logger,
 		observer.StreamUserChat, traceID)
+	// No-op after an HTTP response (the entry is already closed) or transport
+	// failure (it is suspect/open). This only releases a half-open slot when a
+	// local pre-forward guard answered without testing the network path.
+	p.pathHealth.NoteProbeCanceled(path)
 	if !fw.capturedResponse() {
-		return true // streamed to the client (success, non-eligible error, or final attempt)
+		return groupAttemptResult{done: true, attempted: true} // streamed to the client
 	}
 	failed[res.AccountID] = true
+	if fw.failedPathKey != "" {
+		failedPaths[fw.failedPathKey] = true
+	}
 	*lastCaptured = fw
 	logger.Warn("oauth-group in-request failover: retrying on next candidate",
 		"event.name", observability.EventProxyGroupRequestFailover,
@@ -396,7 +453,20 @@ func (p *Proxy) serveGroupAttempt(
 		"failed_status", fw.status,
 		"attempt", attempt+1,
 	)
-	return false
+	return groupAttemptResult{attempted: true}
+}
+
+func (p *Proxy) respondProviderPathUnavailable(
+	w http.ResponseWriter, logger *slog.Logger, route *vkeys.ResolvedRoute, health ProviderPathHealth,
+) {
+	code := observability.ErrCodeGroupUpstreamUnavailable
+	if health.Transport != "node" || health.FailureClass == pathFailureEgressDial {
+		code = observability.ErrCodeAccountEgressProxy
+	}
+	if health.RetryAfterSeconds > 0 {
+		w.Header().Set("Retry-After", fmt.Sprintf("%d", health.RetryAfterSeconds))
+	}
+	p.degradeGroup(w, logger, route, code, groupDegradeMessage(code))
 }
 
 // groupDegradeMessage maps a resolver failure code to an actionable, end-user

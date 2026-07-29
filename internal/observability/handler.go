@@ -151,6 +151,9 @@ const (
 	// client saw nothing of the failed attempt). One event per switch, carrying
 	// from/to account + the failed status.
 	EventProxyGroupRequestFailover = "proxy.group.request_failover"
+	// EventProxyGroupProviderPathState records path-scoped transport breaker
+	// changes. It never carries raw base URLs or egress specifications.
+	EventProxyGroupProviderPathState = "proxy.group.provider_path_state"
 	// EventProxyGroupModelTierCooldown (P1-C): a premium-model window (e.g. the
 	// Fable 7d_oi weekly window) exhausted — the account is cooled for THAT model
 	// tier only and keeps serving every other model. Also used for the

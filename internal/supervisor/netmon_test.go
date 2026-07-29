@@ -4,6 +4,8 @@ import (
 	"context"
 	"testing"
 	"time"
+
+	"github.com/AiKeyLabs/aikey-proxy/internal/proxy"
 )
 
 func TestChangeDetector(t *testing.T) {
@@ -74,5 +76,21 @@ func TestInterfaceFingerprint_StableAndBounded(t *testing.T) {
 	// Loopback must be excluded — it is never a routing change signal.
 	if a == "127.0.0.1" || a == "::1" {
 		t.Fatalf("fingerprint leaked loopback: %q", a)
+	}
+}
+
+func TestNetworkChangeImmediatelyReopensProviderPathForHalfOpenProbe(t *testing.T) {
+	m := proxy.NewProviderPathHealthManager()
+	path := proxy.ProviderPath{Key: "path-a", Provider: "anthropic", Protocol: "anthropic", Transport: "node"}
+	m.NoteTransportFailure(path, "transport")
+	_ = m.Permit(path)
+	m.NoteTransportFailure(path, "transport")
+	if permit := m.Permit(path); permit.Allowed {
+		t.Fatalf("path must be backing off before network change, got %+v", permit)
+	}
+
+	handleNetworkChange("old-network", "new-network", m.NotifyInputsChanged)
+	if permit := m.Permit(path); !permit.Allowed || !permit.Probe {
+		t.Fatalf("network change callback must immediately admit a half-open probe, got %+v", permit)
 	}
 }

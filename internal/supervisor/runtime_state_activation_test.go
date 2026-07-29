@@ -12,9 +12,10 @@ import (
 // installed through one activation path. A new setting added to Supervisor must
 // join this contract or a reload can silently reactivate an older value.
 type runtimeStateRecorder struct {
-	transport http.RoundTripper
-	override  bool
-	broker    proxy.OAuthBroker
+	transport  http.RoundTripper
+	override   bool
+	broker     proxy.OAuthBroker
+	pathHealth *proxy.ProviderPathHealthManager
 }
 
 func (r *runtimeStateRecorder) SetTransport(transport http.RoundTripper) {
@@ -27,6 +28,10 @@ func (r *runtimeStateRecorder) SetOAuthEgressOverride(enabled bool) {
 
 func (r *runtimeStateRecorder) SetBroker(broker proxy.OAuthBroker) {
 	r.broker = broker
+}
+
+func (r *runtimeStateRecorder) SetProviderPathHealthManager(m *proxy.ProviderPathHealthManager) {
+	r.pathHealth = m
 }
 
 type runtimeStateRoundTripper struct{ id string }
@@ -48,7 +53,7 @@ func (*runtimeStateBroker) GetAccountStatus(context.Context, string) (string, er
 }
 
 func TestApplyRuntimeStateIncludesEveryReloadSensitiveSetting(t *testing.T) {
-	s := &Supervisor{}
+	s := &Supervisor{pathHealth: proxy.NewProviderPathHealthManager()}
 	wantTransport := &runtimeStateRoundTripper{id: "latest"}
 	wantBroker := &runtimeStateBroker{id: "latest"}
 	s.transport.Store(&transportBox{rt: wantTransport})
@@ -66,6 +71,27 @@ func TestApplyRuntimeStateIncludesEveryReloadSensitiveSetting(t *testing.T) {
 	}
 	if got.broker != wantBroker {
 		t.Fatalf("broker = %p, want latest %p", got.broker, wantBroker)
+	}
+	if got.pathHealth != s.pathHealth {
+		t.Fatalf("path health manager = %p, want shared %p", got.pathHealth, s.pathHealth)
+	}
+}
+
+func TestActivateGenerationPreservesProviderPathHealthAcrossReload(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	m := proxy.NewProviderPathHealthManager()
+	path := proxy.ProviderPath{Key: "path-a", Provider: "anthropic", Protocol: "anthropic", Transport: "node"}
+	m.NoteTransportFailure(path, "transport")
+
+	s := &Supervisor{pathHealth: m}
+	newGen := &generation{proxy: proxy.New(nil, nil, nil, nil, ctx)}
+	s.activateGeneration(newGen)
+
+	got := newGen.proxy.ProviderPathHealthSnapshot()
+	if len(got) != 1 || got[0].Provider != "anthropic" || got[0].State != "suspect" {
+		t.Fatalf("reloaded generation lost shared path health: %+v", got)
 	}
 }
 
@@ -111,5 +137,22 @@ func TestActivateGenerationSerializesWithRuntimeHotUpdate(t *testing.T) {
 	}
 	if !active.proxy.OAuthEgressOverride() {
 		t.Fatal("activating generation lost the concurrent OAuth egress override hot update")
+	}
+}
+
+func TestSetTransportImmediatelyReopensProviderPathForHalfOpenProbe(t *testing.T) {
+	m := proxy.NewProviderPathHealthManager()
+	path := proxy.ProviderPath{Key: "path-a", Provider: "openai", Protocol: "openai_compatible", Transport: "node"}
+	m.NoteTransportFailure(path, "transport")
+	_ = m.Permit(path)
+	m.NoteTransportFailure(path, "transport")
+	if permit := m.Permit(path); permit.Allowed {
+		t.Fatalf("path must be backing off before transport update, got %+v", permit)
+	}
+
+	s := &Supervisor{pathHealth: m}
+	s.SetTransport(&runtimeStateRoundTripper{id: "new-egress"})
+	if permit := m.Permit(path); !permit.Allowed || !permit.Probe {
+		t.Fatalf("transport hot update must immediately admit a half-open probe, got %+v", permit)
 	}
 }

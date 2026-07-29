@@ -20,11 +20,25 @@ func TestStatusResponse_PoolRoutingSerialization(t *testing.T) {
 	b, _ = json.Marshal(statusResponse{Status: "ok", PoolRouting: &PoolRoutingHealth{
 		Enabled:        true,
 		CooledAccounts: []CooledAccount{{AccountID: "acc-1", CooldownSeconds: 42}},
+		PathHealth: []ProviderPathHealth{{
+			PathID: "deadbeef1234", Provider: "anthropic", Protocol: "anthropic",
+			Transport: "mihomo", EgressFingerprint: "f00baa123456", State: "open",
+			FailureClass: "egress_dial", ConsecutiveFailures: 2, RetryAfterSeconds: 1,
+		}},
 	}})
 	s := string(b)
-	for _, want := range []string{`"pool_routing"`, `"enabled":true`, `"account_id":"acc-1"`, `"cooldown_seconds":42`} {
+	for _, want := range []string{
+		`"pool_routing"`, `"enabled":true`, `"account_id":"acc-1"`, `"cooldown_seconds":42`,
+		`"path_health"`, `"path_id":"deadbeef1234"`, `"transport":"mihomo"`,
+		`"egress_fingerprint":"f00baa123456"`, `"retry_after_seconds":1`,
+	} {
 		if !strings.Contains(s, want) {
 			t.Fatalf("status missing %s: %s", want, s)
+		}
+	}
+	for _, secret := range []string{"egress_proxy_url", "base_url", "token", "secret"} {
+		if strings.Contains(s, secret) {
+			t.Fatalf("status must not expose %q: %s", secret, s)
 		}
 	}
 

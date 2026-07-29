@@ -9,7 +9,7 @@ package proxy
 //
 // Unlike the per-feature fences (group_failover_test / oauth_pool_cooldown_test
 // / oauth_pool_model_tier_test), this suite proves the features COMPOSE: N9
-// failover + B1 429 discrimination + P0-B 529/5xx/transport cooling + P1-C
+// failover + B1 429 discrimination + P0-B 529/HTTP-5xx cooling + P1-C
 // model-tier scoping all acting on ONE pool across a sequence of requests, with
 // client-visible outcome AND internal cooldown state asserted at every step.
 //

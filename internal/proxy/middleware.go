@@ -66,6 +66,11 @@ const (
 	// usage event / pricing use the effective model (audit 双口径 I2 / P4.1),
 	// while RequestedModel keeps the client model. Absent → no mapping.
 	ctxKeyMappedEffectiveModel
+	// ctxKeyProviderPathDecision pins the exact OAuth-group outbound path and
+	// override decision admitted by the path breaker. A concurrent Settings
+	// change may affect the next request, but must not make one in-flight request
+	// report success/failure against a different path than it actually used.
+	ctxKeyProviderPathDecision
 )
 
 // traceFromContext retrieves the request's TraceContext. Returns the zero value
