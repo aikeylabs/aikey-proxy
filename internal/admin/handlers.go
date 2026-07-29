@@ -983,7 +983,17 @@ type ProbePingResponse struct {
 // ProbePing handles POST /admin/probe/ping.
 //
 // Measures reachability + latency from the proxy's network context to the
-// upstream provider. Two modes:
+// upstream provider.
+//
+// Mode 0 (preferred since 2026-07-29): when the LIVE forwarding transport is
+// wired (LiveUpstreamTransportFn), HTTP HEAD rides it for EVERY upstream mode
+// — the probe then measures the exact route real traffic takes (explicit
+// config > process env > OS system proxy via the sysproxy watcher > engine
+// spec, hot-swapped). The modes below are the FALLBACK chain for handlers
+// wired without it (tests / older wiring); their config→env-only resolution
+// misses the watcher level, which produced the "ping red, forwarding green"
+// false negative (bugfix 2026-07-29-probe-ping-sysproxy-split.md). Fallback
+// modes:
 //
 //  1. No upstream proxy configured (neither config.upstream_proxy.url nor
 //     HTTPS_PROXY / HTTP_PROXY / ALL_PROXY env var): raw TCP connect to
@@ -1053,7 +1063,23 @@ func (h *Handler) ProbePing(w http.ResponseWriter, r *http.Request) {
 	// bad network more than the signal is worth.
 	const probeTimeout = 3 * time.Second
 
-	// Resolve upstream proxy for THIS specific target. Precedence:
+	// Probe route resolution — SINGLE SOURCE OF TRUTH with the data plane
+	// (2026-07-29): prefer the LIVE forwarding transport for EVERY upstream
+	// mode, not only engine specs. The live transport is
+	// buildTransport(config-spec, sysproxy-watcher) — explicit config >
+	// process env > OS system proxy (registry / scutil), hot-swapped on
+	// change — i.e. the exact route real traffic takes right now.
+	//
+	// Why: the config→env-only resolution below MISSES the watcher level.
+	// On a box where the OS-detected system proxy is alive but a stale
+	// $HTTPS_PROXY points at a dead address (Win10 VM incident, bugfix
+	// 2026-07-29-probe-ping-sysproxy-split.md), ping went red and
+	// short-circuited API/Chat while real forwarding was green — the same
+	// false-negative class the mode-2 comment below was written against,
+	// fixed then only for the config/env levels.
+	//
+	// The chain below is KEPT as fallback for handlers wired without the
+	// live transport (tests / older wiring). Precedence there:
 	//   1. config.upstream_proxy.url — explicit config wins.
 	//   2. HTTPS_PROXY / HTTP_PROXY env via Go's ProxyFromEnvironment —
 	//      honors NO_PROXY automatically, so targets like 127.0.0.1 or
@@ -1061,6 +1087,11 @@ func (h *Handler) ProbePing(w http.ResponseWriter, r *http.Request) {
 	//      has `https_proxy=...` set (the 2026-04-21 test-flake scenario
 	//      from the user's Clash-configured shell).
 	//   3. Neither → direct TCP.
+	var liveRT http.RoundTripper
+	if h.LiveUpstreamTransportFn != nil {
+		liveRT = h.LiveUpstreamTransportFn()
+	}
+
 	proxyURL := ""
 	if h.cfg != nil && h.cfg.UpstreamProxy.URL != "" {
 		proxyURL = h.cfg.UpstreamProxy.URL
@@ -1077,6 +1108,34 @@ func (h *Handler) ProbePing(w http.ResponseWriter, r *http.Request) {
 	start := time.Now()
 	var err error
 	switch {
+	case liveRT != nil:
+		// The route real traffic takes RIGHT NOW (config / env / OS system
+		// proxy / engine spec — all already resolved inside the live
+		// transport, loopback+NO_PROXY bypass included). Any HTTP response
+		// from the target — 2xx/4xx alike — proves reachability; a
+		// transport-level error is the failure signal. Errors are scrubbed
+		// exactly like the engine fallback below: a dial error can quote
+		// spec internals (credentials included), so raw text stays in
+		// local Debug logs only.
+		err = httpHeadViaTransport(baseURL, liveRT, probeTimeout)
+		if err != nil {
+			logger.Debug("probe ping: live transport HEAD failed",
+				"provider", req.Provider,
+				"host", host,
+				"error.message", err.Error(),
+			)
+			reason := classifyNetErrorKnown(err)
+			if reason == "" {
+				reason = "upstream route dial failed; run Settings → Upstream proxy → Test for the detailed reason"
+			}
+			logger.Warn("probe ping failed via live upstream transport",
+				"event.name", observability.EventProxyEgressPingEngineDialFailed,
+				"provider", req.Provider,
+				"host", host,
+				"error.class", reason,
+			)
+			err = errors.New(reason)
+		}
 	case proxyURL == "":
 		// Direct TCP connect — fastest path, accurate RTT measurement.
 		var conn net.Conn
@@ -1085,23 +1144,13 @@ func (h *Handler) ProbePing(w http.ResponseWriter, r *http.Request) {
 			conn.Close()
 		}
 	case egress.IsEngineSpec(proxyURL):
-		// Engine spec (socks5 chain / mihomo fragment) — mode 3. Prefer the
-		// LIVE forwarding transport (already built at startup / hot-swap):
-		// ping then measures the exact runtime route with no per-call engine
-		// build (a fragment build takes seconds — over the CLI's 4s budget).
-		// Fallback: one-shot egress.TestDial through the same engine registry
+		// Engine spec (socks5 chain / mihomo fragment) — mode 3, reachable
+		// only when the live transport is absent (tests / older wiring):
+		// one-shot egress.TestDial through the same engine registry
 		// (mirrors egresstest.go's branching; single source of truth). Any
 		// HTTP response from the target — 2xx/4xx alike — proves
 		// reachability, same semantics as httpHeadViaProxy below.
-		var liveRT http.RoundTripper
-		if h.LiveUpstreamTransportFn != nil {
-			liveRT = h.LiveUpstreamTransportFn()
-		}
-		if liveRT != nil {
-			err = httpHeadViaTransport(baseURL, liveRT, probeTimeout)
-		} else {
-			_, err = egress.TestDial(r.Context(), proxyURL, baseURL, probeTimeout)
-		}
+		_, err = egress.TestDial(r.Context(), proxyURL, baseURL, probeTimeout)
 		if err != nil {
 			// Never echo the raw engine error to the caller: BuildDialer /
 			// yaml errors can quote the spec verbatim, credentials included.
