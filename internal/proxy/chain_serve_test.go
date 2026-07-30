@@ -661,3 +661,68 @@ func TestChain_PerAttemptTimeoutOnlyAppliesWhenTheOrgConfiguredOne(t *testing.T)
 		}
 	})
 }
+
+// ── The chain is not capped at three hops ──────────────────────────────────
+//
+// 🔴 The PRD's vocabulary — "P1 / F1 / F2" — reads like a limit, and the account
+// axis really does cap at `groupFailoverMaxSwitches = 3`. Neither applies here:
+// that constant governs a different axis with a different cost per attempt (one
+// more persona exposed per switch), while a binding chain's length is chosen by
+// the administrator out of the providers they have registered.
+//
+// The only real bound is I29 — one provider per group — so a chain can be as long
+// as the organization has distinct providers.
+func TestChain_WalksMoreThanThreeHops(t *testing.T) {
+	p := setupTestProxy(t, "http://unused.invalid")
+	mk := func(code, host string, priority int64) *vkeys.ResolvedRoute {
+		return &vkeys.ResolvedRoute{
+			VirtualKeyID: "vk-long", Provider: "anthropic", ProtocolType: "anthropic",
+			ProviderCode: code, RouteSource: "team",
+			BaseURL: "https://" + host, PlaintextKey: "key-" + code, BindingID: "b-" + code,
+			Priority: priority, RouteGroupID: "rg-long", RouteGroupName: "long",
+		}
+	}
+	hops := []*vkeys.ResolvedRoute{
+		mk("anthropic", "hop1.invalid", 1),
+		mk("zhipu", "hop2.invalid", 2),
+		mk("gateway-hk", "hop3.invalid", 3),
+		mk("gateway-sg", "hop4.invalid", 4),
+		mk("gateway-jp", "hop5.invalid", 5),
+	}
+	container := *hops[0]
+	container.Bindings = hops
+	container.BaseURL = ""
+	container.PlaintextKey = ""
+	p.registry.Merge(map[string]*vkeys.ResolvedRoute{"aikey_team_chaintest": &container})
+
+	cap := &chainCapture{statusByHost: map[string]int{
+		// Everything fails except the LAST hop, so passing requires walking all five.
+		"hop1.invalid": 503, "hop2.invalid": 503, "hop3.invalid": 503, "hop4.invalid": 503,
+	}}
+	p.SetTransport(cap)
+
+	req, w := chainReq()
+	p.Handle(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%s — a five-hop chain whose last hop is healthy must succeed",
+			w.Code, w.Body.String())
+	}
+	got := cap.dialled()
+	want := []string{"hop1.invalid", "hop2.invalid", "hop3.invalid", "hop4.invalid", "hop5.invalid"}
+	if len(got) != len(want) {
+		t.Fatalf("dialled %v, want all five in order.\n"+
+			"A cap here would silently stop trying upstreams the administrator "+
+			"deliberately configured — and the request would fail with every "+
+			"later hop untouched and no indication that they were skipped", got)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("hop %d was %s, want %s (order: %v)", i, got[i], want[i], got)
+		}
+	}
+	// The switch header names the hop that finally served, not the third one.
+	if hdr := w.Header().Get(observability.HeaderUpstreamFallback); !strings.Contains(hdr, "attempt=5") {
+		t.Errorf("X-Aikey-Fallback=%q, want attempt=5", hdr)
+	}
+}
