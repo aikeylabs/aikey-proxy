@@ -541,6 +541,27 @@ func (p *Proxy) handleAppPipeline(w http.ResponseWriter, r *http.Request, appCtx
 		p.observerRegistry.NotifyStart(r.Context(), observer.StreamAppPipeline, obsReqCtx)
 	}
 
+	// 🔴 Task 2.0b / F-19 · D-5: the candidate loop hangs HERE for the App
+	// pipeline. An App-routed team VK with a route group configured would
+	// otherwise show 「配了但没生效」 on the App surface — a chain the administrator
+	// can see in the console and that never runs — which is the precise failure
+	// this whole change exists to remove.
+	//
+	// appChain returns nil for every request that has no chain (a personal alias,
+	// an OAuth account whose failover the ACCOUNT axis already owns, a team VK
+	// with no group, or an app pinned to one member). Those fall through to the
+	// single-shot call below, byte for byte as before. See chain_app.go for why
+	// the app's own pin row — not the default profile's — is the one consulted.
+	if chain := p.appChain(appResolvedRoute, binding, protocolType, logger); chain != nil &&
+		(chain.canFailover() || (chain.grouped && len(chain.candidates) == 1)) {
+		p.serveManagedChain(w, r, chain, inboundBearer, startTime, logger, traceID, observer.StreamAppPipeline)
+		if obsReqCtx != nil {
+			latency := int(time.Since(startTime).Milliseconds())
+			p.observerRegistry.NotifyEnd(r.Context(), obsReqCtx, latency)
+		}
+		return
+	}
+
 	p.serveRoute(w, r, appResolvedRoute, prov, cred.RealKey, inboundBearer, startTime, logger)
 
 	if obsReqCtx != nil {

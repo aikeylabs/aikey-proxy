@@ -51,6 +51,7 @@ import (
 	"strings"
 
 	"github.com/AiKeyLabs/aikey-proxy/internal/observability"
+	"github.com/AiKeyLabs/aikey-proxy/internal/vault"
 	"github.com/AiKeyLabs/aikey-proxy/internal/vkeys"
 )
 
@@ -98,7 +99,34 @@ func (c *candidateChain) exhaustedCode() string {
 // It supersedes selectTokenBinding, which returned "the one binding" and errored
 // on anything else. Callers that only want the primary keep working by taking
 // chain.primary().
+//
+// The pin it honours is the one in the DEFAULT profile — the row `aikey use`
+// writes. Entries serving a NON-default profile (the App pipeline, whose profile
+// is `app:<slug>`) must not read this row, so they resolve their own and call
+// chainFrom directly. See chain_app.go.
 func (p *Proxy) selectTokenChain(route *vkeys.ResolvedRoute, clientRoute, requestedProtocol string, logger *slog.Logger) (*candidateChain, error) {
+	var pin *vault.ProviderBinding
+	if p.activeReader != nil && clientRoute != "" {
+		if binding, err := p.activeReader.GetProviderBinding(clientRoute); err == nil {
+			pin = binding
+		}
+	}
+	return p.chainFrom(route, pin, requestedProtocol, logger)
+}
+
+// chainFrom is the ONE chain-selection implementation. `pin` is the local
+// pin row that applies to this request's profile, or nil when the caller's
+// profile has none.
+//
+// 🔴 Why the pin arrives as a parameter instead of being looked up in here: the
+// App pipeline routes under profile `app:<slug>`, and reading the default
+// profile's row for it would apply one user's `aikey use` decision to every app
+// on the machine. Making the caller supply its own pin row keeps a SINGLE
+// selection engine — 🚫 the alternative (a second, app-flavoured copy of this
+// function) is how the two would come to disagree about what a pin means, and
+// the disagreement would surface as "failover works on one surface and not the
+// other" with nothing in the logs to explain it.
+func (p *Proxy) chainFrom(route *vkeys.ResolvedRoute, pin *vault.ProviderBinding, requestedProtocol string, logger *slog.Logger) (*candidateChain, error) {
 	if route == nil {
 		return nil, fmt.Errorf("no route")
 	}
@@ -122,81 +150,80 @@ func (p *Proxy) selectTokenChain(route *vkeys.ResolvedRoute, clientRoute, reques
 	// (I8) and creating a second source of truth for ordering (I7) at the same
 	// time. A pin either restricts the chain to one hop or it does nothing to the
 	// order.
-	if p.activeReader != nil && clientRoute != "" {
-		if binding, err := p.activeReader.GetProviderBinding(clientRoute); err == nil && binding != nil &&
-			(binding.KeySourceType == "team" || binding.KeySourceType == "managed_virtual_key") &&
-			binding.KeySourceRef == route.VirtualKeyID {
+	if pin != nil &&
+		(pin.KeySourceType == "team" || pin.KeySourceType == "managed_virtual_key") &&
+		pin.KeySourceRef == route.VirtualKeyID {
+		binding := pin
 
-			switch DerivePinScope(binding.RouteGroupID, binding.ProviderCode) {
-			case PinScopeMember:
-				for _, candidate := range route.Bindings {
-					if strings.EqualFold(candidate.ProviderCode, binding.ProviderCode) &&
-						(binding.ProtocolType == "" || strings.EqualFold(candidate.ProtocolType, binding.ProtocolType)) {
-						pick := *candidate
-						return &candidateChain{
-							candidates: []*vkeys.ResolvedRoute{&pick},
-							pinned:     true,
-							grouped:    candidate.RouteGroupID != "",
-							groupID:    candidate.RouteGroupID,
-							groupName:  candidate.RouteGroupName,
-						}, nil
-					}
+		switch DerivePinScope(binding.RouteGroupID, binding.ProviderCode) {
+		case PinScopeMember:
+			for _, candidate := range route.Bindings {
+				if strings.EqualFold(candidate.ProviderCode, binding.ProviderCode) &&
+					(binding.ProtocolType == "" || strings.EqualFold(candidate.ProtocolType, binding.ProtocolType)) {
+					pick := *candidate
+					return &candidateChain{
+						candidates: []*vkeys.ResolvedRoute{&pick},
+						pinned:     true,
+						grouped:    candidate.RouteGroupID != "",
+						groupID:    candidate.RouteGroupID,
+						groupName:  candidate.RouteGroupName,
+					}, nil
 				}
-				// 🔴 The pinned hop is no longer in the group (0b.8c). Fall back to
-				// pinning the GROUP and say so. The two outcomes forbidden here are
-				// "the pin silently evaporates" and "we keep routing at an upstream
-				// the administrator already removed"; both leave the user with a
-				// belief about their traffic that is no longer true.
-				if logger != nil {
-					logger.Warn("pinned upstream is no longer in the route group; falling back to the whole chain",
-						"event.name", observability.EventProxyRouteFallback,
-						"virtual_key_id", route.VirtualKeyID,
-						"pinned_provider", binding.ProviderCode,
-						"route_group_id", binding.RouteGroupID,
-					)
-				}
-			case PinScopeLegacy:
-				// 🔴 A row written by `aikey use` BEFORE route groups existed, and this
-				// branch is the one most likely to be got wrong.
-				//
-				// The literal reading of the three-state table — "no group id, so treat
-				// it as a pin to that exact binding" — would suppress failover for
-				// every developer who has ever run `aikey use`, which is very nearly
-				// all of them. The administrator's chain would be configured, visible
-				// in the console, and inert. That is the precise 「配了但没生效」 failure
-				// this whole change exists to remove, reintroduced by the upgrade
-				// itself.
-				//
-				// What the user actually expressed, at a time when chains did not
-				// exist, was "serve this client route from THIS KEY" — not "only ever
-				// use this one vendor". So:
-				//
-				//	the matched binding belongs to a group → pin the GROUP (fall
-				//	  through; the chain below applies, and the administrator's
-				//	  fallback works).
-				//	it belongs to no group               → keep the exact binding,
-				//	  single shot. Byte-identical to before, and there is no chain to
-				//	  fail over to anyway.
-				//
-				// 🔴 Restricting to ONE vendor stays reserved for an explicit
-				// `aikey use --only`, which is required to print the consequence at
-				// the moment it happens (D-1③ / F-16④).
-				for _, candidate := range route.Bindings {
-					if strings.EqualFold(candidate.ProviderCode, binding.ProviderCode) &&
-						(binding.ProtocolType == "" || strings.EqualFold(candidate.ProtocolType, binding.ProtocolType)) {
-						if candidate.RouteGroupID != "" {
-							break // grouped → the whole chain applies
-						}
-						pick := *candidate
-						return &candidateChain{
-							candidates: []*vkeys.ResolvedRoute{&pick},
-							pinned:     true,
-						}, nil
-					}
-				}
-			case PinScopeGroup:
-				// The default. Nothing to restrict — the whole chain below applies.
 			}
+			// 🔴 The pinned hop is no longer in the group (0b.8c). Fall back to
+			// pinning the GROUP and say so. The two outcomes forbidden here are
+			// "the pin silently evaporates" and "we keep routing at an upstream
+			// the administrator already removed"; both leave the user with a
+			// belief about their traffic that is no longer true.
+			if logger != nil {
+				logger.Warn("pinned upstream is no longer in the route group; falling back to the whole chain",
+					"event.name", observability.EventProxyRouteFallback,
+					"virtual_key_id", route.VirtualKeyID,
+					"pinned_provider", binding.ProviderCode,
+					"route_group_id", binding.RouteGroupID,
+				)
+			}
+		case PinScopeLegacy:
+			// 🔴 A row written by `aikey use` BEFORE route groups existed, and this
+			// branch is the one most likely to be got wrong.
+			//
+			// The literal reading of the three-state table — "no group id, so treat
+			// it as a pin to that exact binding" — would suppress failover for
+			// every developer who has ever run `aikey use`, which is very nearly
+			// all of them. The administrator's chain would be configured, visible
+			// in the console, and inert. That is the precise 「配了但没生效」 failure
+			// this whole change exists to remove, reintroduced by the upgrade
+			// itself.
+			//
+			// What the user actually expressed, at a time when chains did not
+			// exist, was "serve this client route from THIS KEY" — not "only ever
+			// use this one vendor". So:
+			//
+			//	the matched binding belongs to a group → pin the GROUP (fall
+			//	  through; the chain below applies, and the administrator's
+			//	  fallback works).
+			//	it belongs to no group               → keep the exact binding,
+			//	  single shot. Byte-identical to before, and there is no chain to
+			//	  fail over to anyway.
+			//
+			// 🔴 Restricting to ONE vendor stays reserved for an explicit
+			// `aikey use --only`, which is required to print the consequence at
+			// the moment it happens (D-1③ / F-16④).
+			for _, candidate := range route.Bindings {
+				if strings.EqualFold(candidate.ProviderCode, binding.ProviderCode) &&
+					(binding.ProtocolType == "" || strings.EqualFold(candidate.ProtocolType, binding.ProtocolType)) {
+					if candidate.RouteGroupID != "" {
+						break // grouped → the whole chain applies
+					}
+					pick := *candidate
+					return &candidateChain{
+						candidates: []*vkeys.ResolvedRoute{&pick},
+						pinned:     true,
+					}, nil
+				}
+			}
+		case PinScopeGroup:
+			// The default. Nothing to restrict — the whole chain below applies.
 		}
 	}
 
