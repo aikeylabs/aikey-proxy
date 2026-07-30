@@ -437,7 +437,13 @@ func Run() {
 	// OK/STALE/OFFLINE state arrives for free under control_plane_sync — this adds
 	// the half that state cannot express: WHERE the number in force came from.
 	if fp := sup.FallbackPolicyCache(); fp != nil {
-		adminHandler.UpstreamFallbackFn = func() any { return fp.Health() }
+		// 🔴 Task 3.4 / 4.5b: the live cooldown view rides the SAME block as the
+		// thresholds. An administrator seeing the bill land on the fallback vendor
+		// needs to tell "the primary is cooling" from "somebody changed the
+		// configuration" — without this they go looking in the wrong place.
+		adminHandler.UpstreamFallbackFn = func() any {
+			return fp.HealthWithCooling(sup.BindingCooldownSnapshot())
+		}
 	}
 	adminHandler.SyncHealthFn = func() map[string]admin.SyncRailStatus {
 		snap := sup.ControlPlaneSyncSnapshot()

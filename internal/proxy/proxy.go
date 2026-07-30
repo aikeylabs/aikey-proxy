@@ -115,6 +115,16 @@ type Proxy struct {
 	// until its cooldown lapses. Always non-nil (set in New); the request path
 	// only consults it for group routes.
 	poolCooldown *poolCooldownStore
+	// bindingCooldown is the BINDING axis's equivalent (P0a upstream fallback,
+	// task 2.13). 🔴 A separate store, never a shared map: binding ids and
+	// account ids are unrelated id spaces, so one collision would make two
+	// unrelated decisions contaminate each other with a symptom — an upstream
+	// mysteriously skipped — that points nowhere near the cause. Always non-nil.
+	bindingCooldown *bindingCooldownStore
+	// chainActivity decides when to come back to the primary upstream (task
+	// 2.19). Process-local by design (I23): derived numbers may travel, live
+	// state may not.
+	chainActivity *chainActivityStore
 	// pathHealth owns transient outbound-path reachability independently of
 	// account health. Supervisor replaces the per-Proxy default with one shared
 	// instance so network recovery state survives generation reloads.
@@ -330,6 +340,8 @@ func New(v VaultGetter, reg *vkeys.Registry, prov *provider.Registry, coll *even
 		UpstreamTimeout:    defaultUpstreamTimeout,
 		appHealthCache:     apppipe.NewHealthCache(),
 		poolCooldown:       newPoolCooldownStore(),
+		bindingCooldown:    newBindingCooldownStore(),
+		chainActivity:      newChainActivityStore(),
 		pathHealth:         NewProviderPathHealthManager(),
 		poolObservedResets: newPoolResetStore(),
 		groupLoginState:    newGroupLoginStateStore(),
@@ -645,3 +657,13 @@ func (p *Proxy) TotalRequests() int64 { return p.requests.Load() }
 
 // TotalErrors returns the total number of error responses.
 func (p *Proxy) TotalErrors() int64 { return p.errors.Load() }
+
+// BindingCooldownSnapshot exposes the binding-axis cooldown state for /status
+// (task 3.4). Read-only: 🔴 a GET status endpoint must never mutate, and there is
+// deliberately no clear-cooldown entry point at all (see PolicyRailHealth).
+func (p *Proxy) BindingCooldownSnapshot() map[string]int {
+	if p == nil || p.bindingCooldown == nil {
+		return nil
+	}
+	return p.bindingCooldown.snapshot(time.Now())
+}

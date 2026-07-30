@@ -9,6 +9,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/AiKeyLabs/pkg/fallbackpolicy"
 )
@@ -246,7 +247,7 @@ func TestNoZeroCollapsingPatternsInPolicyCode(t *testing.T) {
 // ── 1b.8: derived numbers may travel; living state may not ──────────────────
 func TestSessionGapIsObservableAsADerivedNumber(t *testing.T) {
 	before := SessionGapObservations()
-	ObserveSessionGap()
+	ObserveSessionGap(90 * time.Second)
 	if SessionGapObservations() != before+1 {
 		t.Error("the inter-arrival gap was not recorded. It is the ONLY calibration data that " +
 			"exists for the five defaults F-9b labels as placeholders — refusing to emit it would " +

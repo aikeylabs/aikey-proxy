@@ -397,22 +397,22 @@ func (s *Supervisor) VaultReader() *vault.Reader {
 func New(cfg *config.Config, configPath, password, version string) (*Supervisor, error) {
 	ctx, cancel := context.WithCancel(context.Background())
 	s := &Supervisor{
-		cfg:                      cfg,
-		configPath:               configPath,
-		password:                 password,
-		version:                  version,
-		startedAt:                time.Now(),
-		ctx:                      ctx,
-		cancel:                   cancel,
-		quotaEnabled:             quotaEnabledFromEnv(),
-		quotaSnapshot:            quota.NewSnapshot(),
-		quotaCounter:             quota.NewCounter(),
-		routingOverrides:         proxy.NewRoutingOverrideCache(),
+		cfg:              cfg,
+		configPath:       configPath,
+		password:         password,
+		version:          version,
+		startedAt:        time.Now(),
+		ctx:              ctx,
+		cancel:           cancel,
+		quotaEnabled:     quotaEnabledFromEnv(),
+		quotaSnapshot:    quota.NewSnapshot(),
+		quotaCounter:     quota.NewCounter(),
+		routingOverrides: proxy.NewRoutingOverrideCache(),
 		// P0a task 1b.4/1b.7. Seeded with the ONE local-yaml layer that already
 		// existed (`providers.<name>.timeout`); the other four thresholds
 		// deliberately have no local knob — see LocalOverrides for why widening it
 		// would recreate the four-source base_url drift.
-		fallbackPolicy: proxy.NewFallbackPolicyCache(localAttemptTimeoutMs(cfg)),
+		fallbackPolicy:           proxy.NewFallbackPolicyCache(localAttemptTimeoutMs(cfg)),
 		pathHealth:               proxy.NewProviderPathHealthManager(),
 		teamCred:                 &teamCredentialSource{},
 		currentRoutedRestampKick: make(chan struct{}, 1),
@@ -2058,4 +2058,14 @@ func signalReportingAuth(
 	return masterURL, func(ctx context.Context) (string, error) {
 		return teamCred.bearer(ctx, vaultReader, masterURL)
 	}
+}
+
+// BindingCooldownSnapshot exposes the active generation's binding-axis cooldown
+// state for /status (task 3.4).
+func (s *Supervisor) BindingCooldownSnapshot() map[string]int {
+	gen := s.active.Load()
+	if gen == nil || gen.proxy == nil {
+		return nil
+	}
+	return gen.proxy.BindingCooldownSnapshot()
 }

@@ -283,6 +283,28 @@ type ManagedKey struct {
 	// RoutingConfig: the group's routing knobs JSON (exhaustion_signals/util_cap/
 	// ratios), structural-synced; the resolver reads it for classification.
 	RoutingConfig string
+	// ── Primary/fallback chain (P0a upstream fallback, tasks 1.2b / 2.0) ──────
+	//
+	// Priority is this binding's position in its (virtual_key, protocol) chain:
+	// 1 = primary, ascending. FallbackRole ("primary" | "fallback") is DERIVED
+	// from the order upstream (I19) and carried only for display — 🚫 ordering
+	// decisions must read Priority.
+	//
+	// 🔴 A row from a vault that predates the column patch reads Priority=1 /
+	// FallbackRole="primary", which is exactly the pre-upgrade behavior: one
+	// primary, no fallbacks. The absence of the columns must never become
+	// Priority=0, because 0 sorts BEFORE a real primary.
+	Priority     int64
+	FallbackRole string
+	// RouteGroupID / RouteGroupName record which org-level template this
+	// binding was generated from. Empty = a legacy row written before route
+	// groups existed, which is a DIFFERENT state from "a group with one member"
+	// and must stay distinguishable: no group → single-shot, the historical
+	// behavior; one-member group → an administrator built a chain and probably
+	// believes it has redundancy.
+	RouteGroupID   string
+	RouteGroupName string
+
 	// MyAssignmentOverride: the engine's persisted seat→account routing assignment
 	// for THIS VK's (seat, group) — {"account_id","blocked","routing_version",
 	// "synced_at"} JSON, written by the routing_override SyncRail after each
@@ -316,13 +338,25 @@ type ManagedKey struct {
 // different master password or corrupted data) so a single bad entry does not
 // block the proxy from starting.
 func (r *Reader) GetActiveManagedKeys() ([]ManagedKey, error) {
-	// Try the group-aware query first (reads the oauth_group columns added by
-	// N0/N6). Fall back to the legacy query on error — an older vault that lacks
-	// those columns must still load its direct-bind keys, never lose all keys
-	// over a missing column. Mirrors the CLI's column-cascade (storage_platform.rs).
-	keys, err := r.queryManagedKeys(true)
+	// Column cascade, widest first. Each tier drops the newest column group, so a
+	// vault that has not run the corresponding CLI migration still loads every key
+	// it can express instead of losing all of them to one missing column.
+	//
+	// 🔴 The proxy does not own the vault schema. It starts independently of the
+	// CLI, so reading a vault whose column patch has not run yet is a NORMAL state,
+	// not a corrupted one — and the failure mode of getting it wrong is total: the
+	// query errors, every team key disappears, and the user sees "invalid virtual
+	// key" on a correctly configured machine.
+	//
+	//	chain  → priority / fallback_role / route_group_id / route_group_name (task 1.2b)
+	//	group  → oauth_group_id and friends (N0/N6)
+	//	legacy → neither
+	keys, err := r.queryManagedKeys(true, true)
 	if err != nil {
-		keys, err = r.queryManagedKeys(false)
+		keys, err = r.queryManagedKeys(true, false)
+	}
+	if err != nil {
+		keys, err = r.queryManagedKeys(false, false)
 		if err != nil {
 			// Table missing on very old vaults — treat as empty, not an error.
 			return nil, nil //nolint:nilerr // missing table → empty result, not a failure
@@ -337,7 +371,15 @@ func (r *Reader) GetActiveManagedKeys() ([]ManagedKey, error) {
 // 2026-05-09 alias surfacing: COALESCE(local_alias, alias) — the cache has two
 // alias-like columns (`alias` server-canonical NOT NULL, `local_alias` nullable
 // per-client rename overlay). Use local_alias when set, fall back to alias.
-func (r *Reader) queryManagedKeys(withGroup bool) ([]ManagedKey, error) {
+func (r *Reader) queryManagedKeys(withGroup, withChain bool) ([]ManagedKey, error) {
+	// Chain columns (task 1.2b). COALESCE at the SQL layer would be wrong here:
+	// the scan targets are nullable on purpose so "column present but NULL" and
+	// "column absent" both land on the same explicit default below, where the
+	// reason is written down.
+	chainCols := ""
+	if withChain {
+		chainCols = ", priority, fallback_role, route_group_id, route_group_name"
+	}
 	groupCols := ""
 	// Direct-bind keys require provider_key_ciphertext; group VKs have NONE
 	// (material rides group_runtime), so when reading group columns we also admit
@@ -352,7 +394,7 @@ func (r *Reader) queryManagedKeys(withGroup bool) ([]ManagedKey, error) {
 		       provider_code, protocol_type, base_url,
 		       provider_key_nonce, provider_key_ciphertext, provider_base_urls,
 		       org_id, seat_id, credential_id, credential_revision,
-		       virtual_key_revision, owner_account_id` + groupCols + `
+		       virtual_key_revision, owner_account_id` + groupCols + chainCols + `
 		FROM managed_virtual_keys_cache
 		WHERE key_status = 'active'
 		  AND ` + targetFilter + `
@@ -373,11 +415,16 @@ func (r *Reader) queryManagedKeys(withGroup bool) ([]ManagedKey, error) {
 		var orgID, seatID, credID, credRev, vkRev string
 		var ownerAccountID *string
 		var oauthGroupID, groupAccounts, groupRuntime, routingConfig, myAssignmentOverride *string // group cols (nullable)
+		var priority *int64                                                                        // chain cols (nullable / absent)
+		var fallbackRole, routeGroupID, routeGroupName *string
 
 		dest := []any{&vkID, &localAlias, &provCode, &protType, &baseURL, &nonce, &ciphertext, &providerBaseURLsJSON,
 			&orgID, &seatID, &credID, &credRev, &vkRev, &ownerAccountID}
 		if withGroup {
 			dest = append(dest, &oauthGroupID, &groupAccounts, &groupRuntime, &routingConfig, &myAssignmentOverride)
+		}
+		if withChain {
+			dest = append(dest, &priority, &fallbackRole, &routeGroupID, &routeGroupName)
 		}
 		if err := rows.Scan(dest...); err != nil {
 			slog.Warn("managed key: scan error, skipping", "error", err)
@@ -417,7 +464,24 @@ func (r *Reader) queryManagedKeys(withGroup bool) ([]ManagedKey, error) {
 		if providerBaseURLsJSON != nil && *providerBaseURLsJSON != "" {
 			_ = json.Unmarshal([]byte(*providerBaseURLsJSON), &providerBaseURLs)
 		}
+		// 🔴 Absent or NULL priority becomes 1, NOT 0. A pre-patch vault row is a
+		// primary with no fallbacks — that is what it meant before the column
+		// existed. Letting it default to 0 would sort it AHEAD of a genuine
+		// priority-1 primary, which silently reorders an administrator's chain on
+		// exactly the machines that have not finished upgrading.
+		effPriority := int64(1)
+		if priority != nil && *priority > 0 {
+			effPriority = *priority
+		}
+		effRole := derefStr(fallbackRole)
+		if effRole == "" {
+			effRole = "primary"
+		}
 		keys = append(keys, ManagedKey{
+			Priority:             effPriority,
+			FallbackRole:         effRole,
+			RouteGroupID:         derefStr(routeGroupID),
+			RouteGroupName:       derefStr(routeGroupName),
 			VirtualKeyID:         vkID,
 			LocalAlias:           derefStr(localAlias),
 			ProviderCode:         provCode,
@@ -974,6 +1038,15 @@ type ProviderBinding struct {
 	ProtocolType  string
 	KeySourceType string
 	KeySourceRef  string // alias (personal) / virtual_key_id (team) / provider_account_id (oauth)
+	// RouteGroupID is the route group a local `aikey use` pin points at (task
+	// 1.2b / 0b.8c). Together with ProviderCode it DERIVES the pin scope — see
+	// internal/proxy/pin_scope.go for the three-state table.
+	//
+	// 🔴 Empty here is not "pinned to nothing": it marks a row written before
+	// route groups existed, which keeps its pre-upgrade behavior. That is why
+	// the legacy case keys on THIS column and not on ProviderCode, which has
+	// always been `NOT NULL DEFAULT ''` and so has a legal empty value.
+	RouteGroupID string
 }
 
 // GetProviderBinding reads the current provider binding for the given
@@ -1000,14 +1073,29 @@ func (r *Reader) GetProviderBinding(providerCode string) (*ProviderBinding, erro
 func (r *Reader) GetProviderBindingWithScope(profileID, clientRoute string) (*ProviderBinding, error) {
 	var providerCode, protocolType, sourceType, sourceRef string
 	var err error
+	// route_group_id is the newest column (task 1.2b) and is read separately from
+	// the binding_provider_code/protocol_type pair, because the two patches ship
+	// in different CLI versions and a proxy may legitimately meet a vault that has
+	// one and not the other.
+	var routeGroupID string
 	if hasColumn(r.db, "user_profile_provider_bindings", "binding_provider_code") &&
 		hasColumn(r.db, "user_profile_provider_bindings", "protocol_type") {
-		err = r.db.QueryRow(
-			`SELECT binding_provider_code, protocol_type, key_source_type, key_source_ref
-			   FROM user_profile_provider_bindings
-			  WHERE profile_id = ? AND provider_code = ?`,
-			profileID, clientRoute,
-		).Scan(&providerCode, &protocolType, &sourceType, &sourceRef)
+		if hasColumn(r.db, "user_profile_provider_bindings", "route_group_id") {
+			err = r.db.QueryRow(
+				`SELECT binding_provider_code, protocol_type, key_source_type, key_source_ref,
+				        COALESCE(route_group_id, '')
+				   FROM user_profile_provider_bindings
+				  WHERE profile_id = ? AND provider_code = ?`,
+				profileID, clientRoute,
+			).Scan(&providerCode, &protocolType, &sourceType, &sourceRef, &routeGroupID)
+		} else {
+			err = r.db.QueryRow(
+				`SELECT binding_provider_code, protocol_type, key_source_type, key_source_ref
+				   FROM user_profile_provider_bindings
+				  WHERE profile_id = ? AND provider_code = ?`,
+				profileID, clientRoute,
+			).Scan(&providerCode, &protocolType, &sourceType, &sourceRef)
+		}
 	} else {
 		providerCode = clientRoute
 		err = r.db.QueryRow(
@@ -1033,6 +1121,7 @@ func (r *Reader) GetProviderBindingWithScope(profileID, clientRoute string) (*Pr
 		ProtocolType:  protocolType,
 		KeySourceType: sourceType,
 		KeySourceRef:  sourceRef,
+		RouteGroupID:  routeGroupID,
 	}, nil
 }
 

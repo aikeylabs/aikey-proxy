@@ -82,6 +82,18 @@ const (
 	HeaderAttrFallbackAttempt = "attempt"
 )
 
+// FormatFallbackHeader builds the frozen `X-Aikey-Fallback` value.
+//
+// One formatter so the three attributes are always spelled and ordered the same
+// way. 🔴 `to` is a PROVIDER CODE — passing a base_url here would broadcast a
+// customer's internal topology to every client holding a key, which task 0.4
+// rules out at the security level, not the tidiness level.
+func FormatFallbackHeader(providerCode, reason string, attempt int) string {
+	return HeaderAttrFallbackTo + "=" + providerCode + "; " +
+		HeaderAttrFallbackReason + "=" + reason + "; " +
+		HeaderAttrFallbackAttempt + "=" + itoa(attempt)
+}
+
 // ---- Usage-event field names (task 0.5) ----
 
 // 🚫 NO MODEL-NAME FIELD IN THIS SET (task 0.5). This change does not switch

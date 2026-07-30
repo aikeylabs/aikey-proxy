@@ -107,6 +107,17 @@ type groupFailoverWriter struct {
 	dst          http.ResponseWriter
 	header       http.Header
 	allowCapture bool
+	// eligible decides whether a response may be deferred. nil = the account
+	// axis's `failoverEligibleResponse`, unchanged.
+	//
+	// 🔴 The binding axis (upstream fallback) needs ONE extra reason to defer —
+	// a hop whose model map rejects the requested model must be skipped rather
+	// than answered (task 2.30). That reason is supplied here instead of being
+	// added to `failoverEligibleResponse`, because task 2.5 forbids widening the
+	// shared predicate: it also governs the account axis, and changing it would
+	// alter released behavior for oauth-group routing that has nothing to do
+	// with this change.
+	eligible func(int, http.Header) bool
 
 	decided   bool
 	capturing bool
@@ -130,7 +141,11 @@ func (fw *groupFailoverWriter) WriteHeader(status int) {
 	}
 	fw.decided = true
 	fw.status = status
-	if fw.allowCapture && failoverEligibleResponse(status, fw.header) {
+	eligible := fw.eligible
+	if eligible == nil {
+		eligible = failoverEligibleResponse
+	}
+	if fw.allowCapture && eligible(status, fw.header) {
 		fw.capturing = true
 		return // defer — the caller decides retry vs flush
 	}

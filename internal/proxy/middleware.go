@@ -2,7 +2,6 @@ package proxy
 
 import (
 	"context"
-	"fmt"
 	"net/http"
 	"net/url"
 	"os"
@@ -185,39 +184,6 @@ func isProviderCompatible(route *vkeys.ResolvedRoute, canonicalCode, requestedPr
 		}
 	}
 	return false
-}
-
-// selectTokenBinding resolves a multi-binding managed token before any route
-// field is consumed. The active client-route binding is authoritative when it
-// points at this VK; otherwise a unique requested-protocol candidate is safe.
-func (p *Proxy) selectTokenBinding(route *vkeys.ResolvedRoute, clientRoute, requestedProtocol string) (*vkeys.ResolvedRoute, error) {
-	if route == nil || len(route.Bindings) == 0 {
-		return route, nil
-	}
-	if p.activeReader != nil && clientRoute != "" {
-		if binding, err := p.activeReader.GetProviderBinding(clientRoute); err == nil && binding != nil &&
-			(binding.KeySourceType == "team" || binding.KeySourceType == "managed_virtual_key") &&
-			binding.KeySourceRef == route.VirtualKeyID {
-			for _, candidate := range route.Bindings {
-				if strings.EqualFold(candidate.ProviderCode, binding.ProviderCode) &&
-					(binding.ProtocolType == "" || strings.EqualFold(candidate.ProtocolType, binding.ProtocolType)) {
-					copy := *candidate
-					return &copy, nil
-				}
-			}
-		}
-	}
-	var candidates []*vkeys.ResolvedRoute
-	for _, candidate := range route.Bindings {
-		if requestedProtocol == "" || strings.EqualFold(candidate.ProtocolType, requestedProtocol) {
-			candidates = append(candidates, candidate)
-		}
-	}
-	if len(candidates) == 1 {
-		copy := *candidates[0]
-		return &copy, nil
-	}
-	return nil, fmt.Errorf("managed token has %d bindings for protocol %q; select an exact client-route binding with `aikey use`", len(candidates), requestedProtocol)
 }
 
 func requestProtocolFromPath(path string) string {
