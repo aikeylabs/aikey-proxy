@@ -136,8 +136,30 @@ func TestNoPinScopeColumnAnywhere(t *testing.T) {
 			if readErr != nil {
 				return nil
 			}
-			if strings.Contains(string(b), "pin_scope") {
-				hits = append(hits, path)
+			// 🔴 Match the column being DECLARED, not merely named.
+			//
+			// Two earlier drafts of this fence were too broad and flagged, in
+			// turn, the migration file's comment explaining why there is no such
+			// column, and a Rust test asserting its ABSENCE. Both are exactly the
+			// kind of writing this change wants to encourage, so a fence that
+			// punishes them is worse than useless — it teaches people to stop
+			// documenting the decision.
+			//
+			// The hazard is narrow and concrete: a DDL statement that CREATES the
+			// column. Match only that shape.
+			for _, line := range strings.Split(string(b), "\n") {
+				code := strings.TrimSpace(line)
+				if !strings.Contains(code, "pin_scope") {
+					continue
+				}
+				declaresColumn := strings.Contains(code, "ADD COLUMN pin_scope") ||
+					strings.Contains(code, "pin_scope TEXT") ||
+					strings.Contains(code, "pin_scope INTEGER") ||
+					strings.Contains(code, "pin_scope VARCHAR")
+				if declaresColumn {
+					hits = append(hits, path+": "+code)
+					break
+				}
 			}
 			return nil
 		})

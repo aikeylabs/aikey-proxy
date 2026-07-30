@@ -859,7 +859,25 @@ func (r *Reader) GetTeamKeyByID(virtualKeyID, targetProviderCode, protocolType s
 	// route's KeyAlias surfaces in WAL `key_label` and statusline receipt.
 	// Hot path (binding-driven team-key fetch) — without this column, the
 	// receipt falls back to the vk_id tail.
-	err := r.db.QueryRow(`
+	// 🔴 Task 1.4 — order by the administrator's PRIORITY, not by whatever
+	// order the rows happen to come back in.
+	//
+	// This used to read `ORDER BY provider_code ASC`, which was harmless while a
+	// virtual key had one binding per protocol. With primary/fallback chains it
+	// is not: for a two-hop chain it picks whichever provider sorts first
+	// alphabetically, so an admin whose primary is `zhipu` and whose fallback is
+	// `anthropic` would silently get the FALLBACK on this path. provider_code is
+	// kept as a deterministic tiebreak — SQLite promises nothing without a full
+	// ORDER BY, and an implicit order is the classic silent bug: correct today,
+	// wrong after some unrelated change, and never logged.
+	//
+	// 🔴 Two-tier because the PROXY DOES NOT OWN THE VAULT SCHEMA. The CLI
+	// migration adds `priority`, and the proxy can legitimately read a vault
+	// before that has run (it starts independently). Without the fallback,
+	// `ORDER BY priority` fails the whole lookup with "no such column" and the
+	// team key becomes unavailable — turning an ordering improvement into an
+	// outage on exactly the machines that have not upgraded yet.
+	const teamKeyCols = `
 		SELECT provider_code, protocol_type, base_url,
 		       COALESCE(NULLIF(local_alias, ''), alias) AS effective_alias,
 		       provider_key_nonce, provider_key_ciphertext, provider_base_urls,
@@ -868,13 +886,23 @@ func (r *Reader) GetTeamKeyByID(virtualKeyID, targetProviderCode, protocolType s
 		WHERE virtual_key_id = ?
 		  AND key_status = 'active'
 		  AND provider_key_ciphertext IS NOT NULL
-		  `+providerFilter+protocolFilter+`
-		ORDER BY provider_code ASC, protocol_type ASC
+		  `
+	scanTeamKey := func(orderBy string) error {
+		return r.db.QueryRow(teamKeyCols+providerFilter+protocolFilter+orderBy+`
 		LIMIT 1
 	`, args...).Scan(
-		&provCode, &protType, &baseURL, &effectiveAlias, &nonce, &ciphertext, &providerBaseURLsJSON,
-		&orgID, &seatID, &ownerAccountID,
-	)
+			&provCode, &protType, &baseURL, &effectiveAlias, &nonce, &ciphertext, &providerBaseURLsJSON,
+			&orgID, &seatID, &ownerAccountID,
+		)
+	}
+	err := scanTeamKey(`
+		ORDER BY priority ASC, provider_code ASC, protocol_type ASC`)
+	if err != nil && strings.Contains(err.Error(), "no such column") {
+		// Pre-migration vault: fall back to the historical ordering. Behavior is
+		// identical to before this change, which is the point.
+		err = scanTeamKey(`
+		ORDER BY provider_code ASC, protocol_type ASC`)
+	}
 	if err == sql.ErrNoRows {
 		return nil, nil
 	}

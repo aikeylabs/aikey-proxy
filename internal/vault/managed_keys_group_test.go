@@ -199,3 +199,125 @@ func TestGetTeamKeyByID_MultiBindingSelectsByProvider(t *testing.T) {
 		t.Errorf("empty target must resolve a deterministic primary, got provider=%q", primary.ProviderCode)
 	}
 }
+
+// TestGetTeamKeyByID_PicksPrimaryNotAlphabeticallyFirst — task 1.4.
+//
+// When no provider is requested, this path returns ONE binding. Before route
+// groups that was harmless: a virtual key had one binding per protocol, so any
+// deterministic order gave the same answer. With primary/fallback chains it is
+// not harmless — `ORDER BY provider_code ASC` picks whichever vendor sorts first
+// alphabetically, so an admin whose primary is `zhipu` and whose fallback is
+// `anthropic` would silently be served the FALLBACK.
+//
+// The fixture is built that way on purpose: alphabetical order and priority order
+// disagree, so only reading `priority` produces the right answer.
+//
+// 能红: revert the ORDER BY to `provider_code ASC, protocol_type ASC` → this
+// returns the anthropic fallback and fails.
+func TestGetTeamKeyByID_PicksPrimaryNotAlphabeticallyFirst(t *testing.T) {
+	db, err := sql.Open("sqlite", ":memory:")
+	if err != nil {
+		t.Fatalf("open sqlite: %v", err)
+	}
+	t.Cleanup(func() { db.Close() })
+	if _, err := db.Exec(`CREATE TABLE managed_virtual_keys_cache (
+		virtual_key_id TEXT NOT NULL, alias TEXT NOT NULL, local_alias TEXT,
+		provider_code TEXT NOT NULL DEFAULT '', protocol_type TEXT NOT NULL DEFAULT 'openai_compatible',
+		base_url TEXT, provider_key_nonce BLOB, provider_key_ciphertext BLOB, provider_base_urls TEXT,
+		org_id TEXT, seat_id TEXT, credential_id TEXT, credential_revision TEXT,
+		virtual_key_revision TEXT, owner_account_id TEXT, key_status TEXT, local_state TEXT,
+		priority INTEGER NOT NULL DEFAULT 1, fallback_role TEXT NOT NULL DEFAULT 'primary',
+		PRIMARY KEY (virtual_key_id, protocol_type, provider_code))`); err != nil {
+		t.Fatalf("create table: %v", err)
+	}
+	key := make([]byte, 32)
+	for i := range key {
+		key[i] = byte(i + 11)
+	}
+	r := &Reader{db: db, derivedKey: key}
+	insert := func(prov, base, plaintext string, priority int, role string) {
+		nonce, ct, encErr := Encrypt(r.derivedKey, []byte(plaintext))
+		if encErr != nil {
+			t.Fatalf("encrypt: %v", encErr)
+		}
+		if _, err := db.Exec(`INSERT INTO managed_virtual_keys_cache
+			(virtual_key_id, alias, provider_code, protocol_type, base_url,
+			 provider_key_nonce, provider_key_ciphertext, org_id, seat_id,
+			 credential_id, credential_revision, virtual_key_revision, owner_account_id,
+			 key_status, priority, fallback_role)
+			VALUES ('vk-chain', 'chain', ?, 'anthropic', ?, ?, ?, 'org', 'seat',
+			        'cred', 'r', 'vr', 'acct', 'active', ?, ?)`,
+			prov, base, nonce, ct, priority, role); err != nil {
+			t.Fatalf("insert %s binding: %v", prov, err)
+		}
+	}
+	// 🔴 zhipu is the PRIMARY but sorts AFTER anthropic alphabetically.
+	insert("zhipu", "https://open.bigmodel.cn/api/anthropic", "sk-primary-glm", 1, "primary")
+	insert("anthropic", "https://api.anthropic.com", "sk-fallback-official", 2, "fallback")
+
+	got, err := r.GetTeamKeyByID("vk-chain", "", "anthropic")
+	if err != nil || got == nil {
+		t.Fatalf("GetTeamKeyByID: %v / %v", got, err)
+	}
+	if got.ProviderCode != "zhipu" || got.PlaintextKey != "sk-primary-glm" {
+		t.Errorf("selected provider=%q key=%q, want zhipu / sk-primary-glm.\n"+
+			"Alphabetical ordering returns the anthropic FALLBACK here — which means every request "+
+			"on this path would go to the admin's second choice, succeed, and never be noticed.",
+			got.ProviderCode, got.PlaintextKey)
+	}
+}
+
+// TestGetTeamKeyByID_PreMigrationVaultStillResolves — the other half of task 1.4.
+//
+// The PROXY DOES NOT OWN THE VAULT SCHEMA: the CLI migration adds `priority`, and
+// the proxy can read a vault before that has run. Without a fallback tier,
+// `ORDER BY priority` fails with "no such column" and the team key becomes
+// unavailable — an ordering improvement turned into an outage on exactly the
+// machines that have not upgraded yet.
+//
+// 能红: delete the "no such column" retry in GetTeamKeyByID.
+func TestGetTeamKeyByID_PreMigrationVaultStillResolves(t *testing.T) {
+	db, err := sql.Open("sqlite", ":memory:")
+	if err != nil {
+		t.Fatalf("open sqlite: %v", err)
+	}
+	t.Cleanup(func() { db.Close() })
+	// No priority / fallback_role columns — a vault the CLI has not migrated.
+	if _, err := db.Exec(`CREATE TABLE managed_virtual_keys_cache (
+		virtual_key_id TEXT NOT NULL, alias TEXT NOT NULL, local_alias TEXT,
+		provider_code TEXT NOT NULL DEFAULT '', protocol_type TEXT NOT NULL DEFAULT 'openai_compatible',
+		base_url TEXT, provider_key_nonce BLOB, provider_key_ciphertext BLOB, provider_base_urls TEXT,
+		org_id TEXT, seat_id TEXT, credential_id TEXT, credential_revision TEXT,
+		virtual_key_revision TEXT, owner_account_id TEXT, key_status TEXT, local_state TEXT,
+		PRIMARY KEY (virtual_key_id, protocol_type, provider_code))`); err != nil {
+		t.Fatalf("create table: %v", err)
+	}
+	key := make([]byte, 32)
+	for i := range key {
+		key[i] = byte(i + 13)
+	}
+	r := &Reader{db: db, derivedKey: key}
+	nonce, ct, encErr := Encrypt(r.derivedKey, []byte("sk-legacy"))
+	if encErr != nil {
+		t.Fatalf("encrypt: %v", encErr)
+	}
+	if _, err := db.Exec(`INSERT INTO managed_virtual_keys_cache
+		(virtual_key_id, alias, provider_code, protocol_type, base_url,
+		 provider_key_nonce, provider_key_ciphertext, org_id, seat_id,
+		 credential_id, credential_revision, virtual_key_revision, owner_account_id, key_status)
+		VALUES ('vk-old', 'old', 'anthropic', 'anthropic', 'https://api.anthropic.com',
+		        ?, ?, 'org', 'seat', 'cred', 'r', 'vr', 'acct', 'active')`,
+		nonce, ct); err != nil {
+		t.Fatalf("insert legacy binding: %v", err)
+	}
+
+	got, err := r.GetTeamKeyByID("vk-old", "", "anthropic")
+	if err != nil || got == nil {
+		t.Fatalf("a pre-migration vault must still resolve, got %v / %v.\n"+
+			"Ordering by a column the vault does not have yet fails the whole lookup, so the "+
+			"team key disappears on un-upgraded machines.", got, err)
+	}
+	if got.PlaintextKey != "sk-legacy" {
+		t.Errorf("key = %q, want sk-legacy", got.PlaintextKey)
+	}
+}
