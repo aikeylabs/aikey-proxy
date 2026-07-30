@@ -62,4 +62,32 @@ type UsageEvent struct {
 	OutputTokens   int    `json:"output_tokens"`
 	InputTokens    int    `json:"input_tokens"`
 	IsStreaming    bool   `json:"is_streaming"`
+	// ── Upstream fallback attribution (P0a, tasks 0.5 / 3.2 / 3.3 / 3.11) ────
+	//
+	// 🔴 ServedProvider is the provider that ACTUALLY produced this response, and
+	// COST IS ATTRIBUTED TO IT (task 3.3). Charging the primary for a call the
+	// fallback served is the most likely silent error in this whole change: the
+	// request succeeded, so the user has no reason to check, and the ledger is
+	// wrong in a direction nobody notices until an invoice is disputed.
+	ServedProvider string `json:"served_provider,omitempty"`
+	// ServedBindingID is the binding row that produced the response.
+	ServedBindingID string `json:"served_binding_id,omitempty"`
+	// FallbackReason is the frozen error code that caused the switch INTO this
+	// hop. Empty on the first attempt — there was nothing to switch away from.
+	FallbackReason string `json:"fallback_reason,omitempty"`
+	// FallbackAttempt is the 1-based hop index that produced this response.
+	//
+	// 🔴 Task 3.11: these four are read from the request that made THIS attempt,
+	// never from a `route` variable visible outside the candidate loop. Reading
+	// the outer variable compiles and passes every single-hop test, because on a
+	// single hop the two are identical — it is wrong only when a switch actually
+	// happened, which is the exact case these fields exist to report. Riding the
+	// per-attempt request context makes the correct reading the only reachable
+	// one.
+	FallbackAttempt int `json:"fallback_attempt,omitempty"`
+	// 🚫 NO MODEL-NAME FIELD IN THIS SET (task 0.5). This change does not switch
+	// model tiers, and a model field here would be read as evidence that it does.
+	// The upstream-side name does vary per hop (task 2.29), but that is the same
+	// model spelled two ways by two vendors, carried by the existing mapping
+	// machinery — not a tier change this event should advertise.
 }

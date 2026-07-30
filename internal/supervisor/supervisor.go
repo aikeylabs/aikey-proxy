@@ -2069,3 +2069,12 @@ func (s *Supervisor) BindingCooldownSnapshot() map[string]int {
 	}
 	return gen.proxy.BindingCooldownSnapshot()
 }
+
+// FallbackSwitches is the active generation's upstream-switch counter (task 3.6).
+func (s *Supervisor) FallbackSwitches() int64 {
+	gen := s.active.Load()
+	if gen == nil || gen.proxy == nil {
+		return 0
+	}
+	return gen.proxy.FallbackSwitches()
+}

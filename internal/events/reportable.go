@@ -39,18 +39,31 @@ type ReportableEvent struct {
 	//      cache_read values on the wire (DB column `cached_input_tokens`
 	//      is the legacy storage name; collector struct tag now bridges
 	//      the two). See bugfix 2026-04-29-cached-tokens-wire-mismatch.md.
-	CacheReadInputTokens  *int64            `json:"cache_read_input_tokens,omitempty"`
-	SourceSeq             *int64            `json:"source_seq,omitempty"`
-	TotalTokens           *int64            `json:"total_tokens,omitempty"`
-	OutputTokens          *int64            `json:"output_tokens,omitempty"`
-	InputTokens           *int64            `json:"input_tokens,omitempty"`
-	FinishedAt            *aikeytime.Millis `json:"finished_at,omitempty"`
-	StartedAt             *aikeytime.Millis `json:"started_at,omitempty"`
-	CredentialFingerprint string            `json:"credential_fingerprint,omitempty"` // SHA-256 of credential_id+revision
-	RequestID             string            `json:"request_id,omitempty"`
-	ResolvedProvider      string            `json:"resolved_provider,omitempty"` // post-binding provider_code (anthropic / openai / kimi_code / ...)
-	ProxyConfigVersion    string            `json:"proxy_config_version,omitempty"`
-	ClientVersion         string            `json:"client_version,omitempty"`
+	CacheReadInputTokens *int64            `json:"cache_read_input_tokens,omitempty"`
+	SourceSeq            *int64            `json:"source_seq,omitempty"`
+	TotalTokens          *int64            `json:"total_tokens,omitempty"`
+	OutputTokens         *int64            `json:"output_tokens,omitempty"`
+	InputTokens          *int64            `json:"input_tokens,omitempty"`
+	FinishedAt           *aikeytime.Millis `json:"finished_at,omitempty"`
+	StartedAt            *aikeytime.Millis `json:"started_at,omitempty"`
+	// ── Upstream fallback (P0a tasks 0.5 / 3.2 / 3.7) ────────────────────────
+	//
+	// 🔴 Only TWO new wire fields, not four. `served_provider` and
+	// `served_binding_id` are ALREADY on this event as `provider_code` and
+	// `binding_id`, because the candidate loop hands each hop its own route and
+	// this builder reads the route it was given. Adding duplicates would create a
+	// second answer to "who served this" that can drift from the first — and the
+	// reconciliation of the two would be nobody's job.
+	//
+	// FallbackAttempt is 1-based; 1 (the primary) is omitted from the wire since
+	// it is the overwhelming majority and carries no information.
+	FallbackReason        string `json:"fallback_reason,omitempty"`
+	FallbackAttempt       *int   `json:"fallback_attempt,omitempty"`
+	CredentialFingerprint string `json:"credential_fingerprint,omitempty"` // SHA-256 of credential_id+revision
+	RequestID             string `json:"request_id,omitempty"`
+	ResolvedProvider      string `json:"resolved_provider,omitempty"` // post-binding provider_code (anthropic / openai / kimi_code / ...)
+	ProxyConfigVersion    string `json:"proxy_config_version,omitempty"`
+	ClientVersion         string `json:"client_version,omitempty"`
 	// ownership (D3 naming)
 	OrgID     string `json:"org_id"`
 	AccountID string `json:"account_id,omitempty"`
@@ -338,6 +351,19 @@ func BuildReportableEvent(opts *ReportOpts) ReportableEvent {
 		CredentialRevision:    route.CredentialRevision,
 		RealKeyHash:           hashIfNotEmpty(opts.RealKey),
 		CredentialFingerprint: credFP,
+
+		FallbackReason: route.FallbackReason,
+		FallbackAttempt: func() *int {
+			// 🔴 Attempt 1 is omitted deliberately: it is the overwhelming
+			// majority of rows and says nothing. A field present on every row
+			// with the same value is one more column for a reader to learn to
+			// ignore — and then they ignore it on the row where it is a 2.
+			if route.FallbackAttempt > 1 {
+				v := route.FallbackAttempt
+				return &v
+			}
+			return nil
+		}(),
 
 		ProviderID:    route.ProviderID,
 		ProviderCode:  route.ProviderCode,

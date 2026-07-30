@@ -194,6 +194,23 @@ type ResolvedRoute struct {
 	// in the wrong direction.
 	RouteGroupID   string
 	RouteGroupName string
+	// ── Request-scoped hop attribution (P0a tasks 3.2 / 3.11) ─────────────
+	//
+	// 🔴 Set ONLY on the per-hop COPY the candidate loop makes, never on the
+	// registry's shared route. That is what makes the correct reading the only
+	// reachable one: the usage event and the upload event both read the route
+	// they were handed, and the loop hands each hop its own.
+	//
+	// The mistake this shape removes is reading a `route` variable that is
+	// visible OUTSIDE the loop. That compiles, and it passes every single-hop
+	// test because on one hop the two are identical — it is wrong only when a
+	// switch actually happened, which is the exact case these fields exist to
+	// report.
+	//
+	// FallbackAttempt is 1-based (1 = primary). FallbackReason is the frozen code
+	// that caused the switch INTO this hop, empty on the primary.
+	FallbackAttempt int
+	FallbackReason  string
 	// FollowUserActive flips the App pipeline's profile_id selection from
 	// "app:<slug>" (isolated mode, the default) to "default" (the user's
 	// own active profile). first-party only; see AppKind above for the

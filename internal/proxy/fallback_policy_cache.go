@@ -160,6 +160,12 @@ type PolicyRailHealth struct {
 	// outside: cooldowns last minutes, and an entry point would need permissions,
 	// auditing and concurrency handling for almost no benefit.
 	CoolingBindings map[string]int `json:"cooling_bindings,omitempty"`
+	// Switches is the number of upstream switches since start (task 3.6).
+	//
+	// 🔴 A COUNTER, not a rate. A rate has to pick a window, and whichever window
+	// is picked will be wrong for somebody; a monotonic counter lets the alerting
+	// system choose. It also survives a scrape being missed, which a rate does not.
+	Switches int64 `json:"switches_total"`
 	// SessionGapSamples / SessionGapMeanMs are DERIVED aggregates over the
 	// inter-arrival gaps used for switch-back (task 2.24).
 	//
@@ -187,11 +193,12 @@ func (c *FallbackPolicyCache) Health() PolicyRailHealth {
 // HealthWithCooling is Health plus the live cooldown view, which lives on the
 // Proxy rather than on this cache (configuration and judgement state are
 // deliberately separate — see the file doc).
-func (c *FallbackPolicyCache) HealthWithCooling(cooling map[string]int) PolicyRailHealth {
+func (c *FallbackPolicyCache) HealthWithCooling(cooling map[string]int, switches int64) PolicyRailHealth {
 	h := c.Health()
 	if len(cooling) > 0 {
 		h.CoolingBindings = cooling
 	}
+	h.Switches = switches
 	return h
 }
 

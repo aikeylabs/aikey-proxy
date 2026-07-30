@@ -121,6 +121,10 @@ type Proxy struct {
 	// unrelated decisions contaminate each other with a symptom — an upstream
 	// mysteriously skipped — that points nowhere near the cause. Always non-nil.
 	bindingCooldown *bindingCooldownStore
+	// fallbackSwitches counts actual switches to a next candidate, for /metrics
+	// and alerting (task 3.6). Counted at the moment a switch is DECIDED, so it
+	// stays comparable with the `proxy.route.fallback` event stream.
+	fallbackSwitches atomic.Int64
 	// chainActivity decides when to come back to the primary upstream (task
 	// 2.19). Process-local by design (I23): derived numbers may travel, live
 	// state may not.
@@ -666,4 +670,25 @@ func (p *Proxy) BindingCooldownSnapshot() map[string]int {
 		return nil
 	}
 	return p.bindingCooldown.snapshot(time.Now())
+}
+
+// FallbackSwitches is the number of upstream switches since start (task 3.6).
+func (p *Proxy) FallbackSwitches() int64 {
+	if p == nil {
+		return 0
+	}
+	return p.fallbackSwitches.Load()
+}
+
+// UpstreamFallbackHealth is the /status component for the chain (task 3.4).
+//
+// 🔴 A GET status endpoint is READ-ONLY. It also reports a state TRANSITION
+// surface rather than only a terminal one: a state machine that has died also
+// reports "ok" forever, so a health check that only ever shows the current label
+// cannot distinguish healthy from stopped.
+type UpstreamFallbackHealth struct {
+	Component       string         `json:"component"`
+	ChainsLoaded    int            `json:"chains_loaded"`
+	Switches        int64          `json:"switches_total"`
+	CoolingBindings map[string]int `json:"cooling_bindings,omitempty"`
 }

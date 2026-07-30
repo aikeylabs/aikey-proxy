@@ -230,6 +230,11 @@ func (p *Proxy) serveManagedChain(
 
 		// Per-hop copy — 🚫 never mutate the registry's shared route.
 		rc := *cand
+		// Stamp THIS hop's attribution on its own copy (task 3.11). Both the local
+		// usage event and the uploaded event read the route they are given, so the
+		// values can only ever describe the hop that produced the response.
+		rc.FallbackAttempt = i + 1
+		rc.FallbackReason = lastReason
 
 		// 🔴 Task 2.3: every hop uses ITS OWN address. The binding row carries the
 		// administrator's configured base_url; only when it has none does the
@@ -311,6 +316,7 @@ func (p *Proxy) serveManagedChain(
 		lastProvider = rc.ProviderCode
 
 		if i+1 < len(order) {
+			p.fallbackSwitches.Add(1)
 			logger.Warn("upstream fallback: switching to the next upstream",
 				"event.name", observability.EventProxyRouteFallback,
 				"virtual_key_id", key.virtualKeyID,

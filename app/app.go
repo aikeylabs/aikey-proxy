@@ -442,7 +442,7 @@ func Run() {
 		// needs to tell "the primary is cooling" from "somebody changed the
 		// configuration" — without this they go looking in the wrong place.
 		adminHandler.UpstreamFallbackFn = func() any {
-			return fp.HealthWithCooling(sup.BindingCooldownSnapshot())
+			return fp.HealthWithCooling(sup.BindingCooldownSnapshot(), sup.FallbackSwitches())
 		}
 	}
 	adminHandler.SyncHealthFn = func() map[string]admin.SyncRailStatus {
