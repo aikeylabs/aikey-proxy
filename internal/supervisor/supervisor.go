@@ -1069,8 +1069,17 @@ func (s *Supervisor) QuotaCounter() *quota.Counter { return s.quotaCounter }
 // crashing visibly. The nil-checked accessors elsewhere (EffectivePacks etc.)
 // differ because admin/test paths can call them before the first generation is
 // ready, where nil is a legitimate "not yet available" state.
+// 🔴 Task 1b.6 — this is the ONE place the fallback thresholds are snapshotted.
+// Every data-plane request enters here (the server mounts this handler on the
+// catch-all route), so taking the snapshot once at this point and passing it down
+// the context is what makes 「整条链共用一份快照」 structural rather than a habit
+// each future hop has to remember. A per-hop re-read would let a 10-second poll
+// landing mid-request give hops 1–2 one timeout and hop 3 another — identical
+// inputs, different behavior, and no log line explaining it. The source fence in
+// internal/proxy asserts SnapshotForRequest has exactly this one caller.
 func (s *Supervisor) Handler() http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		r = r.WithContext(proxy.WithFallbackPolicy(r.Context(), s.fallbackPolicy.SnapshotForRequest()))
 		s.active.Load().ServeHTTP(w, r)
 	})
 }

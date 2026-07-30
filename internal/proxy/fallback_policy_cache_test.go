@@ -4,6 +4,7 @@ package proxy
 // change `aliyun-aigw-p0-upstream-fallback`.
 
 import (
+	"encoding/json"
 	"os"
 	"path/filepath"
 	"strings"
@@ -280,6 +281,54 @@ func TestPolicyCacheHoldsNoLiveJudgementState(t *testing.T) {
 				"keeps it on the developer's machine. Derived numbers may travel to the control "+
 				"plane; living state may not, and a per-person 'was active at 14:03' timeline is "+
 				"exactly what must never exist", live)
+		}
+	}
+}
+
+// ── 🔴 The wire the CLI reads (task 1b.10) ──────────────────────────────────
+//
+// `aikey doctor` renders this block by field name, from another repository that
+// deploys on its own schedule. A rename here compiles, ships, and turns the
+// doctor check into five "—" rows with no error anywhere — the check would be
+// there, and empty, which reads as "nothing configured" rather than "I can no
+// longer see it".
+//
+// 能红: rename any JSON tag below.
+func TestHealthBlockJSONKeysAreTheOnesTheCLIReads(t *testing.T) {
+	c := NewFallbackPolicyCache(nil)
+	c.Store(&fallbackpolicy.Policy{UpstreamAttemptTimeoutMs: i64(5_000)}, 7)
+
+	raw, err := json.Marshal(c.Health())
+	if err != nil {
+		t.Fatalf("marshal health: %v", err)
+	}
+	var got map[string]any
+	if err := json.Unmarshal(raw, &got); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+
+	for _, key := range []string{"thresholds", "synced", "version", "last_success_at"} {
+		if _, ok := got[key]; !ok {
+			t.Errorf("health block lost %q. `aikey doctor` reads it by that exact name across a "+
+				"repo boundary; losing it produces an empty check, not an error", key)
+		}
+	}
+	thresholds, _ := got["thresholds"].(map[string]any)
+	for _, key := range []string{
+		"upstream_attempt_timeout_ms", "chain_total_budget_ms",
+		"binding_cooldown_ms", "idle_gap_ms", "max_stickiness_ms",
+	} {
+		entry, ok := thresholds[key].(map[string]any)
+		if !ok {
+			t.Errorf("thresholds lost %q", key)
+			continue
+		}
+		if _, ok := entry["value"]; !ok {
+			t.Errorf("%s lost its `value`", key)
+		}
+		if _, ok := entry["source"]; !ok {
+			t.Errorf("%s lost its `source` — which is the entire diagnostic content of the "+
+				"doctor row: an admin's 5s and a builtin 5s are otherwise identical", key)
 		}
 	}
 }
