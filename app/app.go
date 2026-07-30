@@ -433,6 +433,12 @@ func Run() {
 	// SyncRail health (2026-07-03): per-rail control-plane sync state for /status
 	// (health-signal-surface rule — the release E2E asserts this, not the UI).
 	// Empty map (no rail ever attempted — personal installs) → field omitted.
+	// P0a task 1b.9: the five thresholds with each value's source. The rail's own
+	// OK/STALE/OFFLINE state arrives for free under control_plane_sync — this adds
+	// the half that state cannot express: WHERE the number in force came from.
+	if fp := sup.FallbackPolicyCache(); fp != nil {
+		adminHandler.UpstreamFallbackFn = func() any { return fp.Health() }
+	}
 	adminHandler.SyncHealthFn = func() map[string]admin.SyncRailStatus {
 		snap := sup.ControlPlaneSyncSnapshot()
 		if len(snap) == 0 {

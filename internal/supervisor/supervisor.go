@@ -314,6 +314,11 @@ type Supervisor struct {
 	// pollRoutingOverrides; read on the group-route hot path to redirect a seat off
 	// an unhealthy account. nil-safe everywhere → empty means "use the local pick".
 	routingOverrides *proxy.RoutingOverrideCache
+	// fallbackPolicy is the upstream-fallback threshold cache (P0a, task 1b.4).
+	// Supervisor-scoped like routingOverrides so a generation reload never loses
+	// it — keep-last-known is the point: a control-plane blip must not re-time
+	// requests across the fleet.
+	fallbackPolicy *proxy.FallbackPolicyCache
 	// lastRoutingMismatchVersion throttles the proxy.routing_override.format_mismatch
 	// WARN (non-empty routes, zero matching a local (seat,group)) to once per
 	// routing_version — the 60s ticker would otherwise repeat it every cycle.
@@ -403,11 +408,18 @@ func New(cfg *config.Config, configPath, password, version string) (*Supervisor,
 		quotaSnapshot:            quota.NewSnapshot(),
 		quotaCounter:             quota.NewCounter(),
 		routingOverrides:         proxy.NewRoutingOverrideCache(),
+		// P0a task 1b.4/1b.7. Seeded with the ONE local-yaml layer that already
+		// existed (`providers.<name>.timeout`); the other four thresholds
+		// deliberately have no local knob — see LocalOverrides for why widening it
+		// would recreate the four-source base_url drift.
+		fallbackPolicy: proxy.NewFallbackPolicyCache(localAttemptTimeoutMs(cfg)),
 		pathHealth:               proxy.NewProviderPathHealthManager(),
 		teamCred:                 &teamCredentialSource{},
 		currentRoutedRestampKick: make(chan struct{}, 1),
 	}
-	s.railset = newRailSet(s.groupRuntimeRail(), s.routingOverrideRail())
+	// 🔴 A sixth FOLLOWER, not a sixth loop (task 1b.4). railSpec.interval is
+	// per-rail, so declaring 10s here leaves the other five untouched.
+	s.railset = newRailSet(s.groupRuntimeRail(), s.routingOverrideRail(), s.fallbackPolicyRail())
 	gen, err := s.buildGeneration()
 	if err != nil {
 		return nil, fmt.Errorf("initial generation failed: %w", err)
