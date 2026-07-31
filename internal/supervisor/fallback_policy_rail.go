@@ -85,9 +85,15 @@ var fallbackPolicyHTTPClient = httpx.NewSwappableDirect(10 * time.Second)
 // branching on edition.
 func (s *Supervisor) fallbackPolicyRail() railSpec {
 	return railSpec{
-		name:         "fallback_policy",
-		interval:     fallbackPolicyPollInterval,
-		needsTeamJWT: true,
+		name:     "fallback_policy",
+		interval: fallbackPolicyPollInterval,
+		// 🔴 A cluster worker has NO team JWT and never will: that credential is
+		// minted from a vault refresh token written by `aikey login`, and nobody
+		// logs in on a node. Requiring one made this rail fail every cycle on
+		// every worker, so all five thresholds resolved to `source: builtin` and
+		// an administrator's saved change reached nothing in the fleet. On a node
+		// the sync below authenticates with the node service token instead.
+		needsTeamJWT: !s.isClusterNode(),
 		gate: func(_ *generation) bool {
 			return s.fallbackPolicy != nil
 		},
@@ -153,7 +159,24 @@ func (s *Supervisor) syncFallbackPolicy(ctx context.Context, _ *generation, mast
 		return nil
 	}
 
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, masterURL+"/v1/fallback-policy", http.NoBody)
+	// Node vs seat. The representation is identical (same ETag, same body); only
+	// the surface and the credential differ, because the two callers can prove
+	// who they are in different ways.
+	url := masterURL + "/v1/fallback-policy"
+	if s.isClusterNode() {
+		orgID, ok := s.clusterOrgID()
+		if !ok {
+			// 🔴 Not an error: a node that has not yet pulled any key genuinely
+			// does not know its org. Counting it as a failure would make a
+			// still-provisioning worker report a broken sync rail. It keeps its
+			// builtin defaults and the next cycle retries.
+			return nil
+		}
+		url = masterURL + "/internal/org/" + orgID + "/fallback-policy"
+		bearer = s.cfg.Cluster.ServiceToken
+	}
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, http.NoBody)
 	if err != nil {
 		return fmt.Errorf("build fallback-policy request: %w", err)
 	}
@@ -259,4 +282,21 @@ func itoa64(n int64) string {
 		buf[i] = '-'
 	}
 	return string(buf[i:])
+}
+
+// isClusterNode reports whether this proxy is a cluster worker holding a node
+// service token — the only identity a worker can present to the control plane.
+func (s *Supervisor) isClusterNode() bool {
+	return s.cfg != nil && s.cfg.Cluster.Enabled && s.cfg.Cluster.ServiceToken != ""
+}
+
+// clusterOrgID reads the org this node serves from its own vault. See
+// vault.Reader.SoleOrgID for why it is derived rather than configured, and why
+// an ambiguous vault refuses instead of choosing.
+func (s *Supervisor) clusterOrgID() (string, bool) {
+	gen := s.active.Load()
+	if gen == nil || gen.vault == nil {
+		return "", false
+	}
+	return gen.vault.SoleOrgID()
 }
