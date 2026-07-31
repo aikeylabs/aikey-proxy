@@ -126,7 +126,7 @@ func (p *Proxy) serveManagedChain(
 	}
 
 	order := orderCandidates(chain.candidates, stick.stickTo, p.bindingCooldown, now)
-	primaryBindingID := chain.primary().BindingID
+	primaryBindingID := hopKey(chain.primary())
 
 	// Whole-chain budget (task 2.31). 🔴 Checked BEFORE each switch rather than
 	// enforced as a hard cancel: cutting an in-flight attempt would abort a
@@ -282,15 +282,15 @@ func (p *Proxy) serveManagedChain(
 
 		if !fw.capturedResponse() {
 			// Served (or a non-retryable answer the client must see verbatim).
-			p.bindingCooldown.noteSuccess(rc.BindingID)
-			p.chainActivity.noteServed(key, rc.BindingID, rc.BindingID == primaryBindingID || i == 0, time.Now())
+			p.bindingCooldown.noteSuccess(hopKey(&rc))
+			p.chainActivity.noteServed(key, hopKey(&rc), hopKey(&rc) == primaryBindingID || i == 0, time.Now())
 			return
 		}
 
 		// This hop did not serve.
 		skipped := chainSkipResponse(fw.status, fw.header)
 		if !skipped {
-			if until, cooled := p.bindingCooldown.note(rc.BindingID, fw.status, fw.header, policy.BindingCooldown, time.Now()); cooled {
+			if until, cooled := p.bindingCooldown.note(hopKey(&rc), fw.status, fw.header, policy.BindingCooldown, time.Now()); cooled {
 				logger.Info("upstream fallback: cooling a failed upstream",
 					"event.name", observability.EventProxyRouteFallback,
 					"provider", rc.ProviderCode,
@@ -395,11 +395,11 @@ func orderCandidates(candidates []*vkeys.ResolvedRoute, stickTo string, cooldown
 	for i, c := range candidates {
 		band := 1
 		if cooldown != nil {
-			if _, cooling := cooldown.cooling(c.BindingID, now); cooling {
+			if _, cooling := cooldown.cooling(hopKey(c), now); cooling {
 				band = 2
 			}
 		}
-		if stickTo != "" && c.BindingID == stickTo {
+		if stickTo != "" && hopKey(c) == stickTo {
 			band = 0
 		}
 		out = append(out, banded{route: c, band: band, idx: i})

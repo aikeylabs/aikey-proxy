@@ -311,3 +311,42 @@ func duplicatePriority(candidates []*vkeys.ResolvedRoute) (int64, bool) {
 	}
 	return 0, false
 }
+
+// hopKey is the identity cooldown and stickiness track a hop by.
+//
+// 🔴 It exists because `ResolvedRoute.BindingID` is EMPTY on every chain built
+// from the local vault cache — the field's own comment says so ("empty if not
+// available in local cache (schema gap)"), and nothing in this repo ever
+// populates it. That turned F-6 cooldown and F-7 switch-back into silent no-ops:
+// `note("")` recorded one entry under the empty key and `cooling("")` then
+// reported EVERY candidate as cooling, which bands them all equally and leaves
+// the original order untouched. A dead primary was therefore re-dialled on every
+// request, on staging, ~56s after failing — well inside the 5-minute builtin
+// cooldown.
+//
+// 🚫 Not fixed by keying on credential_id alone: one credential can back hops in
+// several virtual keys, so cooling it would pull an upstream out of OTHER
+// people's chains because of a failure in this one. The blast radius of a
+// cooldown is one binding, and (virtual key, credential) reproduces exactly that
+// without needing a column the vault does not have yet.
+//
+// The real binding id still belongs here when it arrives — carrying it through
+// the delivery wire into the cache is the proper fix, and it is what the event's
+// from_binding_id/to_binding_id fields (still empty, I4) are waiting on. This
+// keeps the RUNTIME correct meanwhile; it deliberately does not fake the
+// reported identity, because an invented binding id in the ledger would be worse
+// than an absent one.
+func hopKey(r *vkeys.ResolvedRoute) string {
+	if r == nil {
+		return ""
+	}
+	if r.BindingID != "" {
+		return r.BindingID
+	}
+	if r.CredentialID == "" && r.VirtualKeyID == "" {
+		// Nothing stable to key on. Return empty and let the caller treat it as
+		// "unknown identity" rather than inventing one that would collide.
+		return ""
+	}
+	return r.VirtualKeyID + "|" + r.CredentialID
+}
