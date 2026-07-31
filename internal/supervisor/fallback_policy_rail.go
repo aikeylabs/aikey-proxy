@@ -172,8 +172,16 @@ func (s *Supervisor) syncFallbackPolicy(ctx context.Context, _ *generation, mast
 			// builtin defaults and the next cycle retries.
 			return nil
 		}
+		if s.cfg.Cluster.ControlServiceToken == "" {
+			// No control-plane credential provisioned yet. Same posture as an
+			// unknown org: stay on builtin defaults rather than send a token the
+			// control plane will reject on every cycle.
+			return nil
+		}
 		url = masterURL + "/internal/org/" + orgID + "/fallback-policy"
-		bearer = s.cfg.Cluster.ServiceToken
+		// 🔴 The CONTROL token, not Cluster.ServiceToken — that one is the hub's,
+		// and the control plane answers it 401.
+		bearer = s.cfg.Cluster.ControlServiceToken
 	}
 
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, http.NoBody)
@@ -287,16 +295,21 @@ func itoa64(n int64) string {
 // isClusterNode reports whether this proxy is a cluster worker holding a node
 // service token — the only identity a worker can present to the control plane.
 func (s *Supervisor) isClusterNode() bool {
-	return s.cfg != nil && s.cfg.Cluster.Enabled && s.cfg.Cluster.ServiceToken != ""
+	return s.cfg != nil && s.cfg.Cluster.Enabled && s.cfg.Cluster.ControlServiceToken != ""
 }
 
-// clusterOrgID reads the org this node serves from its own vault. See
-// vault.Reader.SoleOrgID for why it is derived rather than configured, and why
-// an ambiguous vault refuses instead of choosing.
+// clusterOrgID is the organization this node serves, from configuration.
+//
+// 🔴 Deliberately NOT derived from the vault. The first attempt did exactly
+// that — a node serves one org, so read it off the cache — and a staging worker
+// disproved it: its cache held LIVE keys from two organizations (101 rows and
+// 3, the minority ones `synced_inactive`, not stale), so no filter makes the
+// answer unambiguous. Since this value selects whose thresholds the node
+// enforces, inferring it would mean governing one tenant's traffic with
+// another's numbers, and it would look correctly configured while doing so.
 func (s *Supervisor) clusterOrgID() (string, bool) {
-	gen := s.active.Load()
-	if gen == nil || gen.vault == nil {
+	if s.cfg == nil || s.cfg.Cluster.OrgID == "" {
 		return "", false
 	}
-	return gen.vault.SoleOrgID()
+	return s.cfg.Cluster.OrgID, true
 }

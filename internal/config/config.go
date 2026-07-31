@@ -82,6 +82,28 @@ type ClusterConfig struct {
 	// ServiceToken authenticates this node to the hub's gated /cluster/* endpoints
 	// (R1). Config-separate per edition: empty for non-cluster, set for cluster.
 	ServiceToken string `yaml:"service_token,omitempty"`
+	// ControlServiceToken authenticates this node to the control plane's
+	// svcAuth-gated /internal/* endpoints.
+	//
+	// 🔴 A SEPARATE secret from ServiceToken, which is the HUB token — the two are
+	// issued by different services and are not interchangeable. Sending the hub
+	// token to the control plane returns 401, which is exactly what a first
+	// attempt did on staging. Keeping one field for "the node's token" would have
+	// meant one of the two callers silently failing forever.
+	ControlServiceToken string `yaml:"control_service_token,omitempty"`
+	// OrgID is the organization this node serves. Written by cluster-install
+	// alongside ServiceToken; the policy rail needs it to address the org-scoped
+	// surface that a node service token can authenticate against.
+	//
+	// 🔴 It is CONFIGURED, not inferred from the vault, and that was a correction
+	// made against evidence: a staging worker's cache held live keys from TWO
+	// organizations (101 rows and 3, the minority ones not stale). Deriving the
+	// value would therefore have had to choose, and this value decides whose
+	// attempt timeout, cooldown and chain budget the node applies — i.e. whose
+	// traffic gets cut and when. Empty means the rail stays on builtin defaults,
+	// which is visible as `source: builtin`, instead of adopting a tenant's
+	// numbers by accident.
+	OrgID string `yaml:"org_id,omitempty"`
 	// Weight scales this node's share of the consistent-hash ring (≥1).
 	Weight  int  `yaml:"weight,omitempty"`
 	Enabled bool `yaml:"enabled"`
