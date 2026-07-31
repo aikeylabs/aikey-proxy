@@ -65,9 +65,11 @@ const (
 // (bugfix 2026-07-03-routing-override-rail-silent-stall.md). See
 // supervisor/railset.go.
 const (
-	EventProxySyncRailStale            = "proxy.sync.rail_stale"
-	EventProxySyncRailOffline          = "proxy.sync.rail_offline"
-	EventProxySyncRailRecovered        = "proxy.sync.rail_recovered"
+	EventProxySyncRailStale     = "proxy.sync.rail_stale"
+	EventProxySyncRailOffline   = "proxy.sync.rail_offline"
+	EventProxySyncRailRecovered = "proxy.sync.rail_recovered"
+	// #nosec G101 -- an event NAME, not a credential. The literal contains the
+	// word "credential" because that is what the event describes.
 	EventProxySyncCredentialRebuilt    = "proxy.sync.credential_rebuilt"
 	EventProxyGroupRuntimeChanged      = "proxy.group_runtime.changed"
 	EventProxyGroupRuntimeWriteFailed  = "proxy.group_runtime.write_failed"

@@ -255,6 +255,15 @@ func (p *Proxy) serveManagedChain(
 				"provider", rc.ProviderCode,
 				"binding_id", rc.BindingID,
 			)
+			// 🔴 This `continue` skips the cancelAttempt() below, so without this
+			// the per-attempt timeout context built for THIS hop is never released
+			// — a timer and its goroutine held until the timeout fires, once per
+			// skipped hop per request. Only reachable when the org has configured
+			// an attempt timeout, which is why it survived review: on the default
+			// path there is no cancel to leak.
+			if cancelAttempt != nil {
+				cancelAttempt()
+			}
 			continue
 		}
 
@@ -395,7 +404,7 @@ func orderCandidates(candidates []*vkeys.ResolvedRoute, stickTo string, cooldown
 	for i, c := range candidates {
 		band := 1
 		if cooldown != nil {
-			if _, cooling := cooldown.cooling(hopKey(c), now); cooling {
+			if cooling := cooldown.cooling(hopKey(c), now); cooling {
 				band = 2
 			}
 		}
@@ -455,9 +464,9 @@ func httpStatusReason(status int) string {
 
 // truncateForLog bounds a relayed upstream body in a log line.
 func truncateForLog(s string) string {
-	const max = 512
-	if len(s) <= max {
+	const limit = 512
+	if len(s) <= limit {
 		return s
 	}
-	return s[:max] + "…(truncated)"
+	return s[:limit] + "…(truncated)"
 }

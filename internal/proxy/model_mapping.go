@@ -135,7 +135,7 @@ func applyModelMapping(baseURL, requestedModel string, body []byte) modelMapping
 //     of one chain, tripping I4 (a switch must be attributable).
 //
 // So the question is no longer "what vendor owns this address" but
-// **"does the DECLARED provider recognise this address?"**, and the two cases
+// **"does the DECLARED provider recognize this address?"**, and the two cases
 // separate on whether we have any address knowledge about the declared code:
 //
 //	declared code IS in the route table  → we know which addresses it owns. An

@@ -91,15 +91,15 @@ func (s *bindingCooldownStore) note(bindingID string, status int, header http.He
 	if cfg.Value == 0 {
 		return time.Time{}, false
 	}
-	max := time.Duration(cfg.Value) * time.Millisecond
+	maxCool := time.Duration(cfg.Value) * time.Millisecond
 
 	// Reuse the account axis's evidence-based duration when the upstream supplied
 	// one (Retry-After, a reset epoch). It is better information than our default
 	// — but it is bounded by the administrator's configured maximum, which is the
 	// ceiling protection the account axis already found it needed.
-	d := max
+	d := maxCool
 	if until, ok := cooldownDecision(&http.Response{StatusCode: status, Header: header}, now); ok {
-		if evidence := until.Sub(now); evidence > 0 && evidence < max {
+		if evidence := until.Sub(now); evidence > 0 && evidence < maxCool {
 			d = evidence
 		}
 	}
@@ -124,18 +124,24 @@ func (s *bindingCooldownStore) noteSuccess(bindingID string) {
 	delete(s.until, bindingID)
 }
 
-// cooling reports whether this binding is currently cooled, and until when.
-func (s *bindingCooldownStore) cooling(bindingID string, now time.Time) (time.Time, bool) {
+// cooling reports whether this binding is currently cooled.
+//
+// It deliberately does NOT return the deadline: no caller ever used it, and
+// `snapshot` already exposes remaining seconds for the surfaces that display
+// one. An unused second result is a standing invitation to start trusting it.
+//
+// 🔴 The empty-id guard is load-bearing. A hop whose identity is unknown must
+// read as NOT cooling — treating it as cooled would put every such hop in the
+// same bucket, which is exactly how cooldown became a silent no-op before
+// hopKey existed.
+func (s *bindingCooldownStore) cooling(bindingID string, now time.Time) bool {
 	if bindingID == "" {
-		return time.Time{}, false
+		return false
 	}
 	s.mu.RLock()
 	until, ok := s.until[bindingID]
 	s.mu.RUnlock()
-	if !ok || !until.After(now) {
-		return time.Time{}, false
-	}
-	return until, true
+	return ok && until.After(now)
 }
 
 // snapshot returns the currently-cooling bindings with their remaining seconds,

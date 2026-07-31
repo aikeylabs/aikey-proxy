@@ -43,7 +43,7 @@ import (
 )
 
 // mixedChain registers a two-hop chain across two DIFFERENT vendors, in the
-// given order, with real base URLs the provider table recognises.
+// given order, with real base URLs the provider table recognizes.
 func mixedChain(t *testing.T, first, second struct{ code, baseURL, bindingID string }) (*Proxy, *chainCapture) {
 	t.Helper()
 	p := setupTestProxy(t, "http://unused.invalid")
@@ -130,15 +130,15 @@ func TestChainMapping_RejectingHopIsSkippedRatherThanAnswered(t *testing.T) {
 	if w.Code != http.StatusOK {
 		t.Fatalf("status=%d body=%s, want the next hop to have served it", w.Code, w.Body.String())
 	}
-	dialled := cap.dialled()
-	if len(dialled) != 1 || dialled[0] != "api.anthropic.com" {
-		t.Fatalf("dialled %v, want only the vendor: GLM must be skipped WITHOUT a round trip, "+
-			"since we already know its map rejects the name", dialled)
+	dialed := cap.dialed()
+	if len(dialed) != 1 || dialed[0] != "api.anthropic.com" {
+		t.Fatalf("dialed %v, want only the vendor: GLM must be skipped WITHOUT a round trip, "+
+			"since we already know its map rejects the name", dialed)
 	}
 	// 🔴 And the skipped hop must NOT be cooled: it is healthy, it simply does not
 	// speak this model. Cooling it would make an unrelated later request skip a
 	// working upstream.
-	if _, cooling := p.bindingCooldown.cooling("b-glm", time.Now()); cooling {
+	if cooling := p.bindingCooldown.cooling("b-glm", time.Now()); cooling {
 		t.Error("a model-map rejection cooled the upstream. The hop is healthy — it just " +
 			"does not speak this model — so a later request for a model it DOES speak " +
 			"would skip a working upstream for no reason")

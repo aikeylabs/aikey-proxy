@@ -44,7 +44,7 @@ func (t *detachedTransport) RoundTrip(req *http.Request) (*http.Response, error)
 	//
 	// The smaller of the two wins. 🚫 Never the larger: each bound exists for its
 	// own reason (this one caps a detached call, that one caps an attempt), so
-	// honouring only one silently discards the other.
+	// honoring only one silently discards the other.
 	limit := t.maxTimeout
 	if attempt, ok := attemptTimeoutFromContext(req.Context()); ok && attempt > 0 && attempt < limit {
 		limit = attempt

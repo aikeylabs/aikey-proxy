@@ -100,7 +100,7 @@ func (c *candidateChain) exhaustedCode() string {
 // on anything else. Callers that only want the primary keep working by taking
 // chain.primary().
 //
-// The pin it honours is the one in the DEFAULT profile — the row `aikey use`
+// The pin it honors is the one in the DEFAULT profile — the row `aikey use`
 // writes. Entries serving a NON-default profile (the App pipeline, whose profile
 // is `app:<slug>`) must not read this row, so they resolve their own and call
 // chainFrom directly. See chain_app.go.
@@ -122,7 +122,7 @@ func (p *Proxy) selectTokenChain(route *vkeys.ResolvedRoute, clientRoute, reques
 // App pipeline routes under profile `app:<slug>`, and reading the default
 // profile's row for it would apply one user's `aikey use` decision to every app
 // on the machine. Making the caller supply its own pin row keeps a SINGLE
-// selection engine — 🚫 the alternative (a second, app-flavoured copy of this
+// selection engine — 🚫 the alternative (a second, app-flavored copy of this
 // function) is how the two would come to disagree about what a pin means, and
 // the disagreement would surface as "failover works on one surface and not the
 // other" with nothing in the logs to explain it.
@@ -131,7 +131,7 @@ func (p *Proxy) chainFrom(route *vkeys.ResolvedRoute, pin *vault.ProviderBinding
 		return nil, fmt.Errorf("no route")
 	}
 	// No sibling bindings: single-shot, exactly as before. `grouped` follows the
-	// route's own group id so a one-member group is still recognised as a chain
+	// route's own group id so a one-member group is still recognized as a chain
 	// the administrator built.
 	if len(route.Bindings) == 0 {
 		return &candidateChain{
@@ -320,7 +320,7 @@ func duplicatePriority(candidates []*vkeys.ResolvedRoute) (int64, bool) {
 // populates it. That turned F-6 cooldown and F-7 switch-back into silent no-ops:
 // `note("")` recorded one entry under the empty key and `cooling("")` then
 // reported EVERY candidate as cooling, which bands them all equally and leaves
-// the original order untouched. A dead primary was therefore re-dialled on every
+// the original order untouched. A dead primary was therefore re-dialed on every
 // request, on staging, ~56s after failing — well inside the 5-minute builtin
 // cooldown.
 //

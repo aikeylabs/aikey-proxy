@@ -178,7 +178,7 @@ type ResolvedRoute struct {
 	// 🔴 FallbackRole is DISPLAY ONLY (I19). It is derived from the order
 	// upstream, and ordering decisions here must read Priority: two
 	// independently-writable fields can always be made to contradict each other
-	// ("first in line, labelled F1"), and a reader has no way to tell which one
+	// ("first in line, labeled F1"), and a reader has no way to tell which one
 	// the runtime obeyed.
 	Priority     int64
 	FallbackRole string

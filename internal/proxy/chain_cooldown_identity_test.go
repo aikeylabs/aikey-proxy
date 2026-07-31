@@ -8,7 +8,7 @@ package proxy
 // stickiness keyed on it directly, so `note("")` wrote one entry under the empty
 // key and `cooling("")` then reported EVERY candidate as cooling. Banding them
 // all the same leaves the original order intact, so the feature degraded to a
-// no-op instead of failing: on staging a dead primary was re-dialled ~56s after
+// no-op instead of failing: on staging a dead primary was re-dialed ~56s after
 // failing, well inside the 5-minute builtin cooldown.
 //
 // 🚫 Asserting "cooldown works" with a populated BindingID would have passed
@@ -64,7 +64,7 @@ func TestHopKey_DistinguishesHopsWhenBindingIDIsAbsent(t *testing.T) {
 
 // The end-to-end property: a hop that just failed must be DEPRIORITISED on the
 // next request. This is what the operator sees — the dead primary stops being
-// dialled first — and it is what silently did not happen.
+// dialed first — and it is what silently did not happen.
 func TestCooldown_DeprioritisesAFailedHopWithNoBindingID(t *testing.T) {
 	store := newBindingCooldownStore()
 	now := time.Now()
@@ -78,10 +78,10 @@ func TestCooldown_DeprioritisesAFailedHopWithNoBindingID(t *testing.T) {
 		t.Fatal("a 5xx on a hop must start a cooldown; without one the chain re-dials a dead " +
 			"upstream on every request")
 	}
-	if _, cooling := store.cooling(hopKey(primary), now.Add(time.Second)); !cooling {
+	if cooling := store.cooling(hopKey(primary), now.Add(time.Second)); !cooling {
 		t.Fatal("the failed hop must read as cooling immediately after")
 	}
-	if _, cooling := store.cooling(hopKey(fallback), now.Add(time.Second)); cooling {
+	if cooling := store.cooling(hopKey(fallback), now.Add(time.Second)); cooling {
 		t.Fatal("the healthy fallback must NOT be cooling — that was the collapse: one empty " +
 			"key made every candidate look cooled at once")
 	}
@@ -92,6 +92,6 @@ func TestCooldown_DeprioritisesAFailedHopWithNoBindingID(t *testing.T) {
 	}
 	if ordered[0] != fallback {
 		t.Errorf("the cooled primary must not be tried first on the next request; got the " +
-			"primary again, which is precisely the observed staging behaviour")
+			"primary again, which is precisely the observed staging behavior")
 	}
 }

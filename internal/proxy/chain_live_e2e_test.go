@@ -100,6 +100,8 @@ func TestChain_LiveEndToEndOverRealSockets(t *testing.T) {
 	t.Logf("proxy                   : %s", proxySrv.URL)
 
 	// ── A real external client ─────────────────────────────────────────────
+	// #nosec G204 -- the binary and every argument are test-local constants;
+	// nothing here crosses a trust boundary.
 	out, err := exec.Command("curl", "-sS", "-D", "-", "-o", "/tmp/aikey_live_body.json",
 		"-H", "Content-Type: application/json",
 		"-H", "Authorization: Bearer aikey_team_live",

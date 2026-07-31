@@ -66,7 +66,10 @@ func appChainFixture(t *testing.T) (*Proxy, *vkeys.ResolvedRoute) {
 	return p, appRoute
 }
 
-func appPin(routeGroupID, providerCode string) *vault.ProviderBinding {
+// routeGroupID is fixed: every App-pipeline fence pins within the same group,
+// and a parameter that only ever takes one value hides that from the reader.
+func appPin(providerCode string) *vault.ProviderBinding {
+	const routeGroupID = "rg-app"
 	return &vault.ProviderBinding{
 		ClientRoute:   "anthropic",
 		ProviderCode:  providerCode,
@@ -85,7 +88,7 @@ func appPin(routeGroupID, providerCode string) *vault.ProviderBinding {
 func TestAppChain_GroupedTeamVKGetsTheChain(t *testing.T) {
 	p, appRoute := appChainFixture(t)
 
-	chain := p.appChain(appRoute, appPin("rg-app", ""), "anthropic", nil)
+	chain := p.appChain(appRoute, appPin(""), "anthropic", nil)
 	if chain == nil {
 		t.Fatal("an App-routed team VK with a route group got no chain — this is exactly the " +
 			"「配了但没生效」 failure F-19 was decided to prevent")
@@ -116,7 +119,7 @@ func TestAppChain_GroupedTeamVKGetsTheChain(t *testing.T) {
 func TestAppChain_HopsKeepEveryAppScopedField(t *testing.T) {
 	p, appRoute := appChainFixture(t)
 
-	chain := p.appChain(appRoute, appPin("rg-app", ""), "anthropic", nil)
+	chain := p.appChain(appRoute, appPin(""), "anthropic", nil)
 	if chain == nil {
 		t.Fatal("no chain")
 	}
@@ -157,12 +160,12 @@ func TestAppChain_HopsKeepEveryAppScopedField(t *testing.T) {
 // ── An explicit member pin still means "only this one" on the App surface ────
 //
 // D-1③ / F-16④ decided that pinning one hop disables failover and must be said
-// out loud. Honouring that on the CLI and ignoring it here would give the same
+// out loud. Honoring that on the CLI and ignoring it here would give the same
 // pin two meanings depending on which surface reads it.
 func TestAppChain_MemberPinSuppressesFailover(t *testing.T) {
 	p, appRoute := appChainFixture(t)
 
-	chain := p.appChain(appRoute, appPin("rg-app", "zhipu"), "anthropic", nil)
+	chain := p.appChain(appRoute, appPin("zhipu"), "anthropic", nil)
 	if chain == nil {
 		t.Fatal("no chain")
 	}
@@ -192,7 +195,7 @@ func TestAppChain_UsesTheAppsOwnPinNotTheDefaultProfile(t *testing.T) {
 	p, appRoute := appChainFixture(t)
 
 	// The app's own row pins the GROUP → failover applies.
-	chain := p.appChain(appRoute, appPin("rg-app", ""), "anthropic", nil)
+	chain := p.appChain(appRoute, appPin(""), "anthropic", nil)
 	if chain == nil || !chain.canFailover() {
 		t.Fatal("the app's own group-scoped pin did not produce a walkable chain")
 	}
@@ -200,9 +203,9 @@ func TestAppChain_UsesTheAppsOwnPinNotTheDefaultProfile(t *testing.T) {
 	// A member-scoped app row restricts it. Same registry, same team VK — the
 	// ONLY input that changed is the app's row, which proves the decision is
 	// taken from the row the caller supplies.
-	pinned := p.appChain(appRoute, appPin("rg-app", "zhipu"), "anthropic", nil)
+	pinned := p.appChain(appRoute, appPin("zhipu"), "anthropic", nil)
 	if pinned == nil || pinned.canFailover() {
-		t.Fatal("the app's own member-scoped pin was not honoured")
+		t.Fatal("the app's own member-scoped pin was not honored")
 	}
 }
 
@@ -246,7 +249,7 @@ func TestAppChain_SourcesWithoutAChainReturnNil(t *testing.T) {
 		})
 	}
 
-	if got := p.appChain(nil, appPin("rg-app", ""), "anthropic", nil); got != nil {
+	if got := p.appChain(nil, appPin(""), "anthropic", nil); got != nil {
 		t.Error("a nil app route produced a chain")
 	}
 	if got := p.appChain(appRoute, nil, "anthropic", nil); got != nil {

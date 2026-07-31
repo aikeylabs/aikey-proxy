@@ -238,7 +238,7 @@ func SessionGapObservations() int64 { return sessionGapObserved.Load() }
 
 // SessionGapStats returns (count, mean milliseconds) for the health surface.
 // Mean is 0 until at least one gap has been observed.
-func SessionGapStats() (int64, int64) {
+func SessionGapStats() (count, meanMs int64) {
 	n := sessionGapObserved.Load()
 	if n == 0 {
 		return 0, 0

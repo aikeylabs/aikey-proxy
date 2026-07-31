@@ -157,7 +157,7 @@ func TestChain_EveryAttemptIsObservedNotJustTheLast(t *testing.T) {
 	rec.waitForEnds(t, 2)
 	starts, _ := rec.snapshot()
 	if len(starts) != 2 {
-		t.Fatalf("observed %d attempts (%v), want 2 — one per hop actually dialled", len(starts), starts)
+		t.Fatalf("observed %d attempts (%v), want 2 — one per hop actually dialed", len(starts), starts)
 	}
 	if starts[0] != "anthropic" || starts[1] != "mock" {
 		t.Fatalf("observed order = %v, want [anthropic mock] — the order the chain was walked in", starts)

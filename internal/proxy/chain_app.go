@@ -34,7 +34,7 @@ package proxy
 //
 // 🚫 Also rejected: hooking the loop unconditionally, ignoring the app's pin
 // row. That would let failover override an explicit pin on one surface while
-// honouring it on the other, and D-1③/F-16④ already decided that an explicit
+// honoring it on the other, and D-1③/F-16④ already decided that an explicit
 // pin means "only this one, and say so out loud".
 //
 // # 🔴 Why the hop overlay exists instead of walking the team route directly

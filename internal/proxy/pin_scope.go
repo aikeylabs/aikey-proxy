@@ -56,7 +56,12 @@ func (p PinScope) String() string {
 		return "group"
 	case PinScopeMember:
 		return "member"
+	case PinScopeLegacy:
+		return "legacy"
 	default:
+		// A scope added later without a String() arm must not silently print as
+		// "legacy" — that is the value meaning "no scope recorded", and merging a
+		// new state into it is the three-state collapse 0b.8c forbids.
 		return "legacy"
 	}
 }

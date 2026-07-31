@@ -128,7 +128,7 @@ const (
 // code is what stops the two surfaces from drifting into different promises.
 //
 // `attempts` is the number of upstreams actually tried (used by EXHAUSTED).
-func FallbackMessage(code string, lang string, attempts int) string {
+func FallbackMessage(code, lang string, attempts int) string {
 	zh := lang == "zh" || lang == "zh-CN" || lang == "zh-Hans"
 	switch code {
 	case ErrCodeUpstreamFallbackExhausted:

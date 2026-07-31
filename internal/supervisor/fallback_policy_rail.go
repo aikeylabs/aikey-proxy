@@ -40,7 +40,7 @@
 // # 🔴 Non-secret material only (task 1b.5)
 //
 // This rail carries five integers. Upstream ADDRESSES and key ciphertext keep
-// travelling on the delivery snapshot, where the encryption boundary already
+// traveling on the delivery snapshot, where the encryption boundary already
 // lives. The response is asserted secret-free on arrival — not because five int64
 // pointers can hold a key today, but so that stays true when somebody later adds
 // "just one string field". The door is one-way: once a secret has gone out over a

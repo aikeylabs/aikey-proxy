@@ -4,7 +4,7 @@ package proxy
 // (openspec change `aliyun-aigw-p0-upstream-fallback`, P2).
 //
 // Every test drives ONE client request through Handle and asserts what the
-// CLIENT saw plus which upstream ADDRESSES were dialled — the two things that
+// CLIENT saw plus which upstream ADDRESSES were dialed — the two things that
 // distinguish a working chain from one that merely compiles.
 
 import (
@@ -58,7 +58,7 @@ func (c *chainCapture) RoundTrip(req *http.Request) (*http.Response, error) {
 	c.models = append(c.models, model)
 
 	if d, ok := c.delayByHost[host]; ok && d > 0 {
-		// Honour the request context, exactly as a real RoundTripper does — a fake
+		// Honor the request context, exactly as a real RoundTripper does — a fake
 		// that ignores cancellation would make every timeout fence pass whether or
 		// not the timeout is actually wired.
 		select {
@@ -86,7 +86,7 @@ func (c *chainCapture) RoundTrip(req *http.Request) (*http.Response, error) {
 	}, nil
 }
 
-func (c *chainCapture) dialled() []string {
+func (c *chainCapture) dialed() []string {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	return append([]string(nil), c.hosts...)
@@ -167,8 +167,8 @@ func TestChain_ConfiguredChainDoesNotReturn409(t *testing.T) {
 	if w.Code != http.StatusOK {
 		t.Fatalf("status=%d body=%s", w.Code, w.Body.String())
 	}
-	if got := cap.dialled(); len(got) != 1 || got[0] != "primary.invalid" {
-		t.Fatalf("dialled %v, want exactly the primary — a healthy chain must not touch the fallback", got)
+	if got := cap.dialed(); len(got) != 1 || got[0] != "primary.invalid" {
+		t.Fatalf("dialed %v, want exactly the primary — a healthy chain must not touch the fallback", got)
 	}
 }
 
@@ -183,9 +183,9 @@ func TestChain_PrimaryFailsOverToFallbackWithItsOwnAddressAndKey(t *testing.T) {
 		t.Fatalf("client saw %d %s; a chain that switches must present ONE successful response",
 			w.Code, w.Body.String())
 	}
-	got := cap.dialled()
+	got := cap.dialed()
 	if len(got) != 2 || got[0] != "primary.invalid" || got[1] != "fallback.invalid" {
-		t.Fatalf("dialled %v, want [primary.invalid fallback.invalid] in the administrator's order", got)
+		t.Fatalf("dialed %v, want [primary.invalid fallback.invalid] in the administrator's order", got)
 	}
 	if cap.keys[1] != "key-fallback" {
 		t.Errorf("second hop presented %q, want the FALLBACK's own key.\n"+
@@ -218,10 +218,10 @@ func TestChain_TotalAttemptsAreAdditiveNotMultiplicative(t *testing.T) {
 	req, w := chainReq()
 	p.Handle(w, req)
 
-	if n := len(cap.dialled()); n != 2 {
+	if n := len(cap.dialed()); n != 2 {
 		t.Fatalf("made %d upstream attempts for a 2-hop chain, want exactly 2 (%v).\n"+
 			"More than the chain length means attempts are multiplying somewhere",
-			n, cap.dialled())
+			n, cap.dialed())
 	}
 	if w.Code == http.StatusOK {
 		t.Fatal("every hop failed but the client saw 200")
@@ -328,9 +328,9 @@ func TestChain_FailedUpstreamIsSkippedOnTheNextRequest(t *testing.T) {
 	if w.Code != http.StatusOK {
 		t.Fatalf("second request: %d %s", w.Code, w.Body.String())
 	}
-	got := cap.dialled()
+	got := cap.dialed()
 	if len(got) != 1 || got[0] != "fallback.invalid" {
-		t.Fatalf("second request dialled %v, want only the fallback.\n"+
+		t.Fatalf("second request dialed %v, want only the fallback.\n"+
 			"Without cooling, a forty-minute outage means every single request waits out "+
 			"the dead primary first — the user experiences 'why is everything so slow "+
 			"today', and the slowness is ours", got)
@@ -346,7 +346,7 @@ func TestChain_EvidenceLess429DoesNotCoolTheUpstream(t *testing.T) {
 	p.Handle(w, req)
 	_ = w
 
-	if _, cooling := p.bindingCooldown.cooling("b-primary", time.Now()); cooling {
+	if cooling := p.bindingCooldown.cooling("b-primary", time.Now()); cooling {
 		t.Fatal("a 429 with no rate-limit evidence cooled the upstream.\n" +
 			"That shape is a content-policy or WAF rejection caused by ONE user's prompt; " +
 			"punishing the upstream for it pushes the whole organization onto the fallback " +
@@ -361,13 +361,13 @@ func TestChain_CooldownDoesNotSurviveARestart(t *testing.T) {
 	req, w := chainReq()
 	p.Handle(w, req)
 	_ = w
-	if _, cooling := p.bindingCooldown.cooling("b-primary", time.Now()); !cooling {
+	if cooling := p.bindingCooldown.cooling("b-primary", time.Now()); !cooling {
 		t.Fatal("a failed upstream was not cooled at all")
 	}
 
 	// A restart is a fresh store, by construction — there is no file to read.
 	fresh := newBindingCooldownStore()
-	if _, cooling := fresh.cooling("b-primary", time.Now()); cooling {
+	if cooling := fresh.cooling("b-primary", time.Now()); cooling {
 		t.Fatal("cooldown survived a restart. A cooldown records a judgement that EXPIRES; " +
 			"a restart usually means time has passed, so reading the old judgement back can " +
 			"route around an upstream that has already recovered")
@@ -389,7 +389,7 @@ func TestChain_AllCandidatesCoolingStillTriesThemInOrder(t *testing.T) {
 		t.Fatalf("every candidate cooling produced %d %s; refusing to serve would be an "+
 			"outage we invented ourselves", w.Code, w.Body.String())
 	}
-	if got := cap.dialled(); len(got) == 0 {
+	if got := cap.dialed(); len(got) == 0 {
 		t.Fatal("no upstream was attempted at all")
 	}
 }
@@ -415,7 +415,7 @@ func TestChain_NeverBorrowsAnotherVirtualKeysUpstream(t *testing.T) {
 	p.Handle(w, req)
 	_ = w
 
-	for _, host := range cap.dialled() {
+	for _, host := range cap.dialed() {
 		if host == "someone-else.invalid" {
 			t.Fatal("the chain borrowed another virtual key's upstream. The request would " +
 				"SUCCEED, bill a different team, and grant a channel this key never had — " +
@@ -445,9 +445,9 @@ func TestChain_StickyWhileAConversationIsInProgress(t *testing.T) {
 	req, w = chainReq()
 	p.Handle(w, req)
 
-	got := cap.dialled()
+	got := cap.dialed()
 	if len(got) != 1 || got[0] != "fallback.invalid" {
-		t.Fatalf("mid-conversation request dialled %v, want the upstream already serving it.\n"+
+		t.Fatalf("mid-conversation request dialed %v, want the upstream already serving it.\n"+
 			"The same model name can behave subtly differently at different vendors — that "+
 			"difference is the entire reason the confidence check exists — so switching "+
 			"mid-conversation makes the model's behavior jump under the user", got)
@@ -474,7 +474,7 @@ func TestChain_NeverSendsASyntheticProbe(t *testing.T) {
 				"request replayed, never one we invented", i, m)
 		}
 	}
-	if n := len(cap.dialled()); n != 2 {
+	if n := len(cap.dialed()); n != 2 {
 		t.Fatalf("made %d upstream calls for a 2-hop chain; anything extra is a probe", n)
 	}
 }
@@ -485,7 +485,7 @@ func TestChain_BudgetExceededIsItsOwnCode(t *testing.T) {
 	cap.statusByHost["primary.invalid"] = 503
 	// The first hop alone outlives the whole-chain budget, so by the time it
 	// returns there is no room to start a second. 🔴 The loop must DECLINE to
-	// start one, not cut one already in flight: cancelling mid-attempt would
+	// start one, not cut one already in flight: canceling mid-attempt would
 	// abort a request that may be about to succeed.
 	cap.delayByHost = map[string]time.Duration{"primary.invalid": 30 * time.Millisecond}
 
@@ -531,8 +531,8 @@ func TestChain_HonoursTheHopOrderFromPriorityNotInsertionOrder(t *testing.T) {
 	if w.Code != http.StatusOK {
 		t.Fatalf("status=%d body=%s", w.Code, w.Body.String())
 	}
-	if got := cap.dialled(); len(got) != 1 || got[0] != "first.invalid" {
-		t.Fatalf("dialled %v, want the priority-1 hop first regardless of registration order", got)
+	if got := cap.dialed(); len(got) != 1 || got[0] != "first.invalid" {
+		t.Fatalf("dialed %v, want the priority-1 hop first regardless of registration order", got)
 	}
 }
 
@@ -570,8 +570,8 @@ func TestChain_LegacyUsePinStillFailsOver(t *testing.T) {
 	if w.Code != http.StatusOK {
 		t.Fatalf("status=%d body=%s", w.Code, w.Body.String())
 	}
-	if got := cap.dialled(); len(got) != 2 {
-		t.Fatalf("dialled %v, want both hops.\n"+
+	if got := cap.dialed(); len(got) != 2 {
+		t.Fatalf("dialed %v, want both hops.\n"+
 			"A pin written before route groups existed said 'serve this client route from "+
 			"THIS KEY', not 'only ever use this one vendor' — that second meaning is "+
 			"reserved for an explicit `aikey use --only`, which has to print the "+
@@ -595,8 +595,8 @@ func TestChain_ExplicitMemberPinHasNoFailover(t *testing.T) {
 	req, w := chainReq()
 	p.Handle(w, req)
 
-	if got := cap.dialled(); len(got) != 1 || got[0] != "primary.invalid" {
-		t.Fatalf("dialled %v, want only the pinned hop", got)
+	if got := cap.dialed(); len(got) != 1 || got[0] != "primary.invalid" {
+		t.Fatalf("dialed %v, want only the pinned hop", got)
 	}
 	if w.Code == http.StatusOK {
 		t.Error("the pinned hop failed but the client saw success")
@@ -605,7 +605,7 @@ func TestChain_ExplicitMemberPinHasNoFailover(t *testing.T) {
 
 // ── The per-attempt timeout: applied only when the ORGANIZATION set one ────
 //
-// 🔴 The contract's original default (120000, labelled "today's value") was
+// 🔴 The contract's original default (120000, labeled "today's value") was
 // disproved during P1b: there is NO per-attempt upstream timeout today.
 // `providers.<name>.timeout` is filled in by applyDefaults and read by nothing;
 // streaming is unbounded and non-streaming is capped at ten minutes only after
@@ -628,8 +628,8 @@ func TestChain_PerAttemptTimeoutOnlyAppliesWhenTheOrgConfiguredOne(t *testing.T)
 				"anything; a slow but healthy upstream has to be allowed to finish",
 				w.Code, w.Body.String())
 		}
-		if got := cap.dialled(); len(got) != 1 {
-			t.Errorf("dialled %v, want only the primary — nothing should have timed out", got)
+		if got := cap.dialed(); len(got) != 1 {
+			t.Errorf("dialed %v, want only the primary — nothing should have timed out", got)
 		}
 	})
 
@@ -651,8 +651,8 @@ func TestChain_PerAttemptTimeoutOnlyAppliesWhenTheOrgConfiguredOne(t *testing.T)
 			t.Fatalf("status=%d body=%s, want the fallback to have served it",
 				w.Code, w.Body.String())
 		}
-		if got := cap.dialled(); len(got) != 2 {
-			t.Fatalf("dialled %v, want both hops — the configured cap must actually cut "+
+		if got := cap.dialed(); len(got) != 2 {
+			t.Fatalf("dialed %v, want both hops — the configured cap must actually cut "+
 				"the slow one. A threshold that can be set, stored and displayed but "+
 				"never takes effect is the commonest shape of a fake delivery", got)
 		}
@@ -708,10 +708,10 @@ func TestChain_WalksMoreThanThreeHops(t *testing.T) {
 		t.Fatalf("status=%d body=%s — a five-hop chain whose last hop is healthy must succeed",
 			w.Code, w.Body.String())
 	}
-	got := cap.dialled()
+	got := cap.dialed()
 	want := []string{"hop1.invalid", "hop2.invalid", "hop3.invalid", "hop4.invalid", "hop5.invalid"}
 	if len(got) != len(want) {
-		t.Fatalf("dialled %v, want all five in order.\n"+
+		t.Fatalf("dialed %v, want all five in order.\n"+
 			"A cap here would silently stop trying upstreams the administrator "+
 			"deliberately configured — and the request would fail with every "+
 			"later hop untouched and no indication that they were skipped", got)

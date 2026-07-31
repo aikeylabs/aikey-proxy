@@ -121,7 +121,15 @@ func (c *RoutingOverrideCache) Removed(seatID, groupID string) bool {
 	if v == nil {
 		return false
 	}
-	return v.(map[string]bool)[routeKey(seatID, groupID)]
+	m, ok := v.(map[string]bool)
+	if !ok {
+		// An atomic holding an unexpected type means a writer changed shape
+		// without this reader. Report "not removed" rather than panicking: the
+		// override is an optimisation on top of routing, and crashing here would
+		// take routing down for every key to protect a hint.
+		return false
+	}
+	return m[routeKey(seatID, groupID)]
 }
 
 // Stored reports whether anything has ever been Stored. The poll uses it to
@@ -177,7 +185,15 @@ func (c *RoutingOverrideCache) Blocked(seatID, groupID string) bool {
 	if v == nil {
 		return false
 	}
-	return v.(map[string]bool)[routeKey(seatID, groupID)]
+	m, ok := v.(map[string]bool)
+	if !ok {
+		// An atomic holding an unexpected type means a writer changed shape
+		// without this reader. Report "not removed" rather than panicking: the
+		// override is an optimisation on top of routing, and crashing here would
+		// take routing down for every key to protect a hint.
+		return false
+	}
+	return m[routeKey(seatID, groupID)]
 }
 
 // SetRoutingOverrides injects the shared, supervisor-owned routing-override cache
