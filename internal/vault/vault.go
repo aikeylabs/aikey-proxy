@@ -304,6 +304,16 @@ type ManagedKey struct {
 	// believes it has redundancy.
 	RouteGroupID   string
 	RouteGroupName string
+	// BindingID is the control plane's id for THIS hop, carried on the delivery
+	// wire and (since 2026-07-31) stored in the cache.
+	//
+	// 🔴 Empty means UNKNOWN, never "no hop". Cooldown, stickiness and the
+	// fallback event's from/to_binding_id key on a hop's identity; while this was
+	// absent they all keyed on "", which collapsed every candidate into one
+	// cooldown entry and made the feature a silent no-op rather than a failure.
+	// A vault written before the column reports empty and hopKey() derives a
+	// substitute — 🚫 do not invent an id here, this value reaches the ledger.
+	BindingID string
 
 	// MyAssignmentOverride: the engine's persisted seat→account routing assignment
 	// for THIS VK's (seat, group) — {"account_id","blocked","routing_version",
@@ -380,6 +390,19 @@ func (r *Reader) queryManagedKeys(withGroup, withChain bool) ([]ManagedKey, erro
 	if withChain {
 		chainCols = ", priority, fallback_role, route_group_id, route_group_name"
 	}
+	// 🔴 binding_id is probed INDEPENDENTLY rather than folded into chainCols.
+	// Appending it there would mean a vault that has the chain columns but not
+	// this one fails the chain query and falls through to the GROUP tier, which
+	// projects priority 1 / 'primary' / no group — every configured chain
+	// silently collapses to a single hop, i.e. failover switches off during a
+	// rolling upgrade, to gain one identifier. A separate probe cannot do that:
+	// worst case the column is absent and BindingID stays empty, exactly as
+	// before. Pinned by TestManagedKeys_MissingBindingIDColumnCostsNothingElse.
+	bindingCols := ""
+	withBinding := hasColumn(r.db, "managed_virtual_keys_cache", "binding_id")
+	if withBinding {
+		bindingCols = ", binding_id"
+	}
 	groupCols := ""
 	// Direct-bind keys require provider_key_ciphertext; group VKs have NONE
 	// (material rides group_runtime), so when reading group columns we also admit
@@ -394,7 +417,7 @@ func (r *Reader) queryManagedKeys(withGroup, withChain bool) ([]ManagedKey, erro
 		       provider_code, protocol_type, base_url,
 		       provider_key_nonce, provider_key_ciphertext, provider_base_urls,
 		       org_id, seat_id, credential_id, credential_revision,
-		       virtual_key_revision, owner_account_id` + groupCols + chainCols + `
+		       virtual_key_revision, owner_account_id` + groupCols + chainCols + bindingCols + `
 		FROM managed_virtual_keys_cache
 		WHERE key_status = 'active'
 		  AND ` + targetFilter + `
@@ -417,6 +440,7 @@ func (r *Reader) queryManagedKeys(withGroup, withChain bool) ([]ManagedKey, erro
 		var oauthGroupID, groupAccounts, groupRuntime, routingConfig, myAssignmentOverride *string // group cols (nullable)
 		var priority *int64                                                                        // chain cols (nullable / absent)
 		var fallbackRole, routeGroupID, routeGroupName *string
+		var bindingID *string // present only once the CLI has patched the column
 
 		dest := []any{&vkID, &localAlias, &provCode, &protType, &baseURL, &nonce, &ciphertext, &providerBaseURLsJSON,
 			&orgID, &seatID, &credID, &credRev, &vkRev, &ownerAccountID}
@@ -425,6 +449,9 @@ func (r *Reader) queryManagedKeys(withGroup, withChain bool) ([]ManagedKey, erro
 		}
 		if withChain {
 			dest = append(dest, &priority, &fallbackRole, &routeGroupID, &routeGroupName)
+		}
+		if withBinding {
+			dest = append(dest, &bindingID)
 		}
 		if err := rows.Scan(dest...); err != nil {
 			slog.Warn("managed key: scan error, skipping", "error", err)
@@ -482,6 +509,7 @@ func (r *Reader) queryManagedKeys(withGroup, withChain bool) ([]ManagedKey, erro
 			FallbackRole:         effRole,
 			RouteGroupID:         derefStr(routeGroupID),
 			RouteGroupName:       derefStr(routeGroupName),
+			BindingID:            derefStr(bindingID),
 			VirtualKeyID:         vkID,
 			LocalAlias:           derefStr(localAlias),
 			ProviderCode:         provCode,

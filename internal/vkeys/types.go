@@ -85,7 +85,12 @@ type ResolvedRoute struct {
 	AccountID          string
 	SeatID             string
 	OAuthIdentity      string // Email or display name (OAuth only, for audit/usage reporting)
-	BindingID          string // empty if not available in local cache (schema gap)
+	// BindingID is the control plane's id for this hop, carried on the delivery
+	// wire and stored in the cache since 2026-07-31. Empty means the vault
+	// predates the column — hopKey() derives a substitute for cooldown and
+	// stickiness, but this field is what reaches the ledger, so it stays empty
+	// rather than being filled with a guess.
+	BindingID          string
 	ProviderID         string // empty if not available in local cache (schema gap)
 	VirtualKeyID       string
 	ProtocolType       string

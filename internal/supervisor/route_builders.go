@@ -63,6 +63,10 @@ func managedKeyToRoute(mk *vault.ManagedKey) *vkeys.ResolvedRoute {
 		FallbackRole:   mk.FallbackRole,
 		RouteGroupID:   mk.RouteGroupID,
 		RouteGroupName: mk.RouteGroupName,
+		// The hop's identity. Empty on a vault written before the column patch —
+		// hopKey() then derives one so cooldown and stickiness still work, but the
+		// LEDGER keeps reporting empty rather than a synthesised id.
+		BindingID: mk.BindingID,
 		// Oauth-group fields (N7c): empty for direct-bind VKs (PlaintextKey set,
 		// existing path unchanged); populated for group VKs (PlaintextKey empty,
 		// resolver picks an account from GroupRuntime). See dispatch N8.
