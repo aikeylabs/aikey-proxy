@@ -167,6 +167,26 @@ type RequestContext struct {
 	// usage (seat-keyed UI) attributed correctly. Empty for personal keys
 	// and legacy vault rows that pre-date seat stamping.
 	SeatID string
+	// ChainAttempt is this attempt's 1-based position in the upstream-fallback
+	// chain (route.FallbackAttempt): 1 = the primary hop, 2 = the first
+	// fallback, and so on. 0 means the request was not served through a chain
+	// at all — a direct bind, where "which attempt" is not a question.
+	//
+	// 🔴 Why observers need it, stated plainly: the registry fans out to
+	// observers on DETACHED goroutines, so notification ARRIVAL order carries
+	// no information about the order the chain was actually walked. Two hops
+	// race, and roughly half the time they land reversed. Without this field an
+	// observer can see that two upstreams were dialed but cannot say which one
+	// was tried first — so it cannot tell "primary healthy" from "primary down,
+	// served by the fallback", which is the exact distinction the detector's
+	// health surface exists to report.
+	//
+	// It is deliberately NOT derived from StartedAt: every hop of one chain is
+	// stamped with the SAME startTime (it is the request's start, passed into
+	// the loop from outside), so timestamps cannot order attempts either. This
+	// field is the only ordering key, and it comes from the product's own
+	// per-hop route copy rather than from scheduling.
+	ChainAttempt int
 	// Stream is the SPEC §1.4.1 stream name this request emits under
 	// (StreamUserChat / StreamAppPipeline / StreamProbe). Set by the
 	// Registry on the way into NotifyStart so observers can read it

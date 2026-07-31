@@ -419,7 +419,11 @@ func Run() {
 		for id, secs := range sup.PoolCooldownSnapshot() {
 			h.CooledAccounts = append(h.CooledAccounts, admin.CooledAccount{AccountID: id, CooldownSeconds: secs})
 		}
-		for _, path := range sup.ProviderPathHealthSnapshot() {
+		// Indexed, not ranged by value: ProviderPathHealth is 144 bytes and the
+		// loop body only reads it.
+		snap := sup.ProviderPathHealthSnapshot()
+		for i := range snap {
+			path := &snap[i]
 			h.PathHealth = append(h.PathHealth, admin.ProviderPathHealth{
 				PathID: path.PathID, Provider: path.Provider, Protocol: path.Protocol,
 				Transport: path.Transport, OriginFingerprint: path.OriginFingerprint,

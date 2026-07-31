@@ -33,6 +33,7 @@ import (
 	"context"
 	"log/slog"
 	"net/http"
+	"sort"
 	"sync"
 	"testing"
 	"time"
@@ -49,14 +50,72 @@ import (
 // attempts apart.
 type chainObserverRecorder struct {
 	mu        sync.Mutex
-	startedOn []string // ProviderID per OnRequestStart, in order
-	endedOn   []string // ProviderID per OnRequestEnd, in order
+	startedOn []string // ProviderID per OnRequestStart, in ARRIVAL order
+	// startAttempt is the ChainAttempt ordinal parallel to startedOn. Arrival
+	// order is a detached-goroutine race; this is what actually orders the walk
+	// (see walkOrder).
+	startAttempt []int
+	endedOn      []string // ProviderID per OnRequestEnd, in arrival order
 }
 
 func (r *chainObserverRecorder) OnRequestStart(_ context.Context, req *observer.RequestContext) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	r.startedOn = append(r.startedOn, req.ProviderID)
+	r.startAttempt = append(r.startAttempt, req.ChainAttempt)
+}
+
+// walkOrder returns the providers ordered by the chain ordinal the PRODUCT
+// stamped on each attempt, not by the order notifications happened to arrive.
+//
+// 🔴 This distinction is the whole reason the method exists. The registry fans
+// observers out on detached goroutines, so `startedOn` is in arrival order,
+// which for a two-hop chain is a coin flip. Asserting on it made
+// TestChain_EveryAttemptIsObservedNotJustTheLast fail ~50% of runs ON BASELINE
+// — with no product defect — for as long as the fence had existed. A first 6/6
+// pass made the flake look newly introduced; only a 12-run baseline showed it
+// had never been reliably green.
+//
+// 🚫 Do NOT "fix" a future flake here by sorting on StartedAt: every hop of one
+// chain carries the SAME startTime (chain_serve passes the request's start into
+// the loop from outside), so that would restore the coin flip while looking
+// principled. ChainAttempt is the only real ordering key.
+func (r *chainObserverRecorder) walkOrder(t *testing.T) []string {
+	t.Helper()
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	type hop struct {
+		provider string
+		attempt  int
+	}
+	hops := make([]hop, 0, len(r.startedOn))
+	seen := map[int]string{}
+	for i, p := range r.startedOn {
+		a := r.startAttempt[i]
+		// A zero ordinal means the attempt did not come through the chain path
+		// at all. Silently sorting those into position would recreate exactly
+		// the ambiguity this method removes, so it is a hard failure.
+		if a == 0 {
+			t.Fatalf("attempt %d (provider %q) has ChainAttempt=0 — it was not stamped by the "+
+				"chain, so walk order cannot be established. Either the hop bypassed chain_serve "+
+				"or RequestContext.ChainAttempt stopped being populated in forward_and_resolve.",
+				i, p)
+		}
+		if prev, dup := seen[a]; dup {
+			t.Fatalf("two attempts share ChainAttempt=%d (%q and %q) — the ordinal is no longer "+
+				"unique per hop, so it can no longer order the walk.", a, prev, p)
+		}
+		seen[a] = p
+		hops = append(hops, hop{provider: p, attempt: a})
+	}
+	sort.Slice(hops, func(i, j int) bool { return hops[i].attempt < hops[j].attempt })
+
+	out := make([]string, 0, len(hops))
+	for _, h := range hops {
+		out = append(out, h.provider)
+	}
+	return out
 }
 
 func (r *chainObserverRecorder) OnSSEEvent(context.Context, *observer.RequestContext, string, []byte) {
@@ -159,8 +218,14 @@ func TestChain_EveryAttemptIsObservedNotJustTheLast(t *testing.T) {
 	if len(starts) != 2 {
 		t.Fatalf("observed %d attempts (%v), want 2 — one per hop actually dialed", len(starts), starts)
 	}
-	if starts[0] != "anthropic" || starts[1] != "mock" {
-		t.Fatalf("observed order = %v, want [anthropic mock] — the order the chain was walked in", starts)
+	// Order by the chain's own per-hop ordinal. 🚫 Never assert on `starts`
+	// directly: that is notification-arrival order off detached goroutines, and
+	// asserting on it is what made this fence ~50% flaky on baseline.
+	walked := rec.walkOrder(t)
+	if walked[0] != "anthropic" || walked[1] != "mock" {
+		t.Fatalf("chain walk order = %v, want [anthropic mock] — the order the chain was walked in.\n"+
+			"(arrival order was %v; if these differ that is expected and fine — arrival is racy)",
+			walked, starts)
 	}
 }
 

@@ -118,6 +118,11 @@ func (p *Proxy) serveRouteWithObserver(
 			SessionID:      resolveSessionID(r, route.ProtocolType, route.ProviderCode),
 			TraceID:        traceID,
 			StartedAt:      startTime,
+			// The chain stamps each hop's own route copy with its 1-based
+			// ordinal (chain_serve.go: rc.FallbackAttempt = i + 1), so this
+			// needs no new plumbing — it is read off the route we were handed.
+			// 0 on the direct-bind path, which is correct: no chain, no ordinal.
+			ChainAttempt: route.FallbackAttempt,
 			// Multi-tenant attribution — mirror the usage path's single-source
 			// rule (events/reportable.go) so the conversation-audit observer and
 			// usage events agree on who a turn belongs to.

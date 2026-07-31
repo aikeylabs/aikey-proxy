@@ -30,6 +30,27 @@ linters-settings:
     check-type-assertions: true
   govet:
     enable-all: true
+    disable:
+      # fieldalignment — WAIVED DELIBERATELY (2026-07-31), not unexamined debt.
+      #
+      # It flagged 17 structs, all of the same shape: fields carrying multi-line
+      # rationale comments, grouped so that related fields (and the incident each
+      # one records) read together. Satisfying it means reordering by pointer
+      # width, which splits those groups — e.g. FallbackPolicyCache would separate
+      # `synced` from the comment explaining why "never pulled" and "pulled and
+      # empty" are different states.
+      #
+      # The trade is explicit: 8–32 bytes of GC scan per struct, against the
+      # comments that explain why the fields exist. These are config caches and
+      # health surfaces allocated a handful of times per process, not per request,
+      # so the saving is unmeasurable. In this codebase the per-field commentary
+      # is the primary defense against re-introducing solved bugs, so it wins.
+      #
+      # 🚫 Do NOT re-enable this and "just reorder" — that is the change this
+      # waiver exists to prevent. If a struct ever becomes genuinely hot enough
+      # for layout to matter, reorder THAT struct and keep the comments attached
+      # to their fields.
+      - fieldalignment
   gosec:
     excludes:
       - G104  # Allow unhandled errors in deferred Close() calls
@@ -38,6 +59,19 @@ linters-settings:
       - diagnostic
       - style
       - performance
+    disabled-checks:
+      # hugeParam — WAIVED (2026-07-31). All five hits pass an all-string value
+      # struct (ProviderPath, the effective-policy struct, a health snapshot)
+      # into a method that only reads it. Passing them by pointer would save a
+      # ~100-byte copy on paths that run once per request at most, and would buy
+      # that with ALIASING into ProviderPathHealthManager — a mutex-guarded map
+      # shared across request goroutines. A stored pointer the caller still owns
+      # is exactly the bug class this manager is built to avoid; value semantics
+      # make it unrepresentable. Not worth trading for a copy this size.
+      #
+      # rangeValCopy stays ENABLED — that one has no such tension and was fixed
+      # (app.go: index instead of copy) rather than waived.
+      - hugeParam
   misspell:
     locale: US
 
@@ -51,3 +85,20 @@ issues:
     - path: _test\.go
       linters:
         - errcheck
+    # gosec in test files (2026-07-31). The findings are all G202 "SQL string
+    # concatenation" in vault tests that build fixture SQL from constants in the
+    # test itself. There is no untrusted input in a table-driven test, so the
+    # rule reports a shape without a threat. Kept ON for non-test code, where
+    # concatenated SQL is exactly what we want to hear about.
+    - path: _test\.go
+      linters:
+        - gosec
+    # govet/shadow in test files (2026-07-31). Nearly every hit is a second
+    # `err :=` inside a subtest closure, where shadowing is the idiomatic and
+    # SAFER form — the inner err is meant to be local. Excluded by TEXT rather
+    # than by disabling shadow wholesale, so shadowing in production code (where
+    # it has actually hidden bugs here) still fails the gate.
+    - path: _test\.go
+      text: "^shadow:"
+      linters:
+        - govet
