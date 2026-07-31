@@ -54,6 +54,19 @@ type EgressState struct {
 	// config fragment, aligned with the master per-account editor) when true; a
 	// single-URL input when false (open-source degrades to the original mode).
 	MultiProtocol bool `json:"multi_protocol"`
+	// NodeEgressRefused: this node has an upstream_proxy spec configured that it
+	// could NOT build, so every external request is being refused
+	// (NODE_EGRESS_ENGINE_UNAVAILABLE) rather than dialed direct. Readable without
+	// sending traffic — an idle node with a broken spec must not look healthy.
+	NodeEgressRefused bool `json:"node_egress_refused,omitempty"`
+	// NodeEgressError: why the spec could not be built. Present only when
+	// NodeEgressRefused. 🚫 Never contains the spec verbatim — a mihomo fragment
+	// carries socks5 credentials; NodeEgressSpecFingerprint identifies it instead.
+	NodeEgressError string `json:"node_egress_error,omitempty"`
+	// NodeEgressSpecFingerprint: hex(sha256(spec))[:12] of the offending spec,
+	// matching the per-request egress attribution fingerprint so a health reading
+	// and a request log can be tied to the same spec.
+	NodeEgressSpecFingerprint string `json:"node_egress_spec_fingerprint,omitempty"`
 }
 
 // UpstreamProxyGet serves GET /admin/upstream-proxy — the live egress proxy URL the

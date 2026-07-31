@@ -1133,6 +1133,27 @@ func (p *Proxy) serveRoute(w http.ResponseWriter, r *http.Request, route *vkeys.
 						"its configured egress upstream is unreachable. Run `aikey doctor` and check this account's egress setting."))
 				return
 			}
+			// Node-level egress that could not be BUILT (as opposed to a built
+			// chain that would not connect). Nothing was dialed and nothing left
+			// this node, so this is a local capability/config fault — never an
+			// upstream one. Reported as its own code so the chain axis (and the
+			// account axis, via failoverEligibleResponse) can refuse to blame
+			// upstreams for it.
+			var nodeEgErr *NodeEgressUnavailableError
+			if errors.As(err, &nodeEgErr) {
+				logger.Error("node egress unavailable — request refused rather than sent direct",
+					"event.name", observability.EventProxyRequestUpstreamError,
+					"error.code", observability.ErrCodeNodeEgressEngine,
+					"error.message", err.Error(),
+					"latency_ms", latencyMs,
+				)
+				w.Header().Set(HeaderAikeyErrorSource, observability.ErrCodeNodeEgressEngine)
+				writeJSONError(w, http.StatusServiceUnavailable, "server_error", observability.ErrCodeNodeEgressEngine,
+					"This node's configured egress proxy could not be started, so the request was refused "+
+						"instead of being sent out the node's own address. Fix the node's upstream_proxy setting, "+
+						"or install the enterprise package if the spec is a multi-protocol fragment.")
+				return
+			}
 			if route.OauthGroupID != "" {
 				logger.Error("oauth-group upstream path unavailable",
 					"event.name", observability.EventProxyRequestUpstreamError,

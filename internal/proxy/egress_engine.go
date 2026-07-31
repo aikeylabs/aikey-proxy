@@ -198,6 +198,48 @@ type EgressDialError struct{ err error }
 func (e *EgressDialError) Error() string { return "egress connect fail: " + e.err.Error() }
 func (e *EgressDialError) Unwrap() error { return e.err }
 
+// NodeEgressUnavailableError tags a NODE-level `upstream_proxy` spec that this
+// build could not construct at all. Distinct from EgressDialError, which means a
+// built chain failed to connect: this one never had a chain.
+//
+// The distinction is the actionable part. "egress connect fail" sends an operator
+// to the exit node; this one sends them to the spec and to which binary is
+// installed — most often an OSS aikey-proxy on a node configured with a mihomo
+// fragment (see observability.ErrCodeNodeEgressEngine).
+type NodeEgressUnavailableError struct{ err error }
+
+func (e *NodeEgressUnavailableError) Error() string {
+	return "node egress unavailable: " + e.err.Error()
+}
+func (e *NodeEgressUnavailableError) Unwrap() error { return e.err }
+
+// RefusingTransport is the transport installed when the node's configured egress
+// spec cannot be built. Every request to an EXTERNAL destination fails with
+// *NodeEgressUnavailableError instead of dialing direct.
+//
+// 🔴 Internal destinations (loopback / NO_PROXY) still dial direct, via the same
+// sysproxy.NoProxyBypass predicate every other layer uses. Those targets were
+// never going to traverse the egress, so refusing them would take out the node's
+// own health and admin surfaces to punish a fault they are not subject to — and
+// it is exactly those surfaces an operator needs in order to fix this.
+func RefusingTransport(buildErr error) *http.Transport {
+	bypass := egressBypass()
+	directDial := (&net.Dialer{Timeout: 30 * time.Second, KeepAlive: 30 * time.Second}).DialContext
+	return &http.Transport{
+		DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
+			if host, _, herr := net.SplitHostPort(addr); herr == nil && bypass(host) {
+				return directDial(ctx, network, addr)
+			}
+			return nil, &NodeEgressUnavailableError{err: buildErr}
+		},
+		ForceAttemptHTTP2:   false,
+		MaxIdleConns:        100,
+		MaxIdleConnsPerHost: 100,
+		IdleConnTimeout:     90 * time.Second,
+		TLSHandshakeTimeout: 10 * time.Second,
+	}
+}
+
 // dialerToTransport wraps an egress dialer into the outbound http.Transport used
 // for per-account egress — shared by all engines so their transports are tuned
 // identically (HTTP/1.1 for widest proxy compat, generous idle pool; only the
@@ -217,6 +259,19 @@ func (e *EgressDialError) Unwrap() error { return e.err }
 // as a stand-in for a public upstream, can disable the always-on loopback bypass
 // that would otherwise short-circuit them. Production always uses the real one.
 var egressBypass = sysproxy.NoProxyBypass
+
+// SetEgressBypassForTest swaps the bypass predicate and returns a restore func.
+//
+// Exported (in an internal/ package) for ONE reason: the app-level fence for the
+// refusing transport has to prove that an EXTERNAL dial is refused, and every
+// hermetic test target is loopback — which the bypass sends direct by design. A
+// fence that could not disable the bypass would be dialing the exception it is
+// not testing, and would pass no matter what the external path did.
+func SetEgressBypassForTest(pred func(string) bool) (restore func()) {
+	prev := egressBypass
+	egressBypass = func() func(string) bool { return pred }
+	return func() { egressBypass = prev }
+}
 
 func dialerToTransport(d xproxy.Dialer) *http.Transport {
 	dial := dialerDialContext(d)
