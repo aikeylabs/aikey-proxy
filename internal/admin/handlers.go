@@ -82,6 +82,14 @@ type Handler struct {
 	// PoolHealthFn returns oauth-group routing health for /status (N9). nil → the
 	// pool_routing field is omitted (non-pool deployments unchanged).
 	PoolHealthFn func() *PoolRoutingHealth
+	// UpstreamFallbackFn supplies the five resolved thresholds (each carrying its
+	// source) for /status. nil → the block is omitted, which is the honest answer
+	// on a build where the capability is not wired.
+	//
+	// Typed `any` to keep internal/admin free of a dependency on the policy
+	// package — the same layering posture ResponseTransform and ObserverRegistry
+	// already use in vkeys.
+	UpstreamFallbackFn func() any
 	// SyncHealthFn supplies the SyncRail per-rail health map for /status. Nil or
 	// an empty map → the control_plane_sync field is omitted.
 	SyncHealthFn func() map[string]SyncRailStatus
@@ -301,6 +309,16 @@ type statusResponse struct {
 	// Release-checklist E2E and `aikey statusline` read this to assert the
 	// master-sync pipeline is alive (health-signal-surface rule).
 	ControlPlaneSync map[string]SyncRailStatus `json:"control_plane_sync,omitempty"`
+	// UpstreamFallback reports the five thresholds with each value's SOURCE
+	// (P0a task 1b.9). Omitted when the capability is not wired.
+	//
+	// 🔴 The source is the load-bearing half. The rail's own state already
+	// appears under control_plane_sync["fallback_policy"]; what that cannot tell
+	// an operator is whether the number in force came from the console, a local
+	// yaml, or the compiled-in default. Private-deployment debugging opens with
+	// "I set it to 10 seconds in the console" — without a source, the next two
+	// hours are mutual disbelief.
+	UpstreamFallback any `json:"upstream_fallback,omitempty"`
 }
 
 // SyncRailStatus mirrors supervisor.RailSyncStatus for the /status wire (built
@@ -365,6 +383,10 @@ func (h *Handler) Status(w http.ResponseWriter, r *http.Request) {
 	if h.SyncHealthFn != nil {
 		syncHealth = h.SyncHealthFn()
 	}
+	var upstreamFallback any
+	if h.UpstreamFallbackFn != nil {
+		upstreamFallback = h.UpstreamFallbackFn()
+	}
 
 	writeJSON(w, http.StatusOK, statusResponse{
 		Status:           "ok",
@@ -378,6 +400,7 @@ func (h *Handler) Status(w http.ResponseWriter, r *http.Request) {
 		TotalErrs:        totalErrs,
 		PoolRouting:      poolRouting,
 		ControlPlaneSync: syncHealth,
+		UpstreamFallback: upstreamFallback,
 	})
 }
 

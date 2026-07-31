@@ -71,6 +71,22 @@ type rateLimitSample struct {
 	CredentialID string `json:"credential_id"`
 	Count        int    `json:"count"`
 	WindowSecs   int    `json:"window_secs"`
+	// FallbackCount is how many of Count arrived while this credential was being
+	// tried as a FALLBACK hop rather than as the primary (F-12b = C, task 3.12).
+	//
+	// 🔴 Why marked rather than dropped, and why not silently merged. Upstream
+	// fallback makes one client request touch several credentials, so a single
+	// user request can now raise the risk score of two or three of them at once.
+	// Those refusals are real — the vendors did reject us — so suppressing them
+	// would hide genuine evidence. But they are also CORRELATED in a way the
+	// allocation engine's model does not assume: they all came from one request,
+	// not from independent traffic. Marking lets the engine decide; merging them
+	// in unmarked silently changes what its risk numbers mean.
+	//
+	// 🚫 This is not an implementation detail to slide past — it feeds account-pool
+	// scheduling, and a scheduler acting on a distribution that quietly changed
+	// shape is very hard to debug from the outside.
+	FallbackCount int `json:"fallback_count,omitempty"`
 }
 
 type signalReporter struct {
@@ -79,8 +95,11 @@ type signalReporter struct {
 	client    *httpx.SwappableClient                    // control-plane: rebuilt on host network change (self-heal registry)
 	in        chan signalSample
 	revokedIn chan revokedSample
-	rlMu      sync.Mutex     // guards rlCounts
+	rlMu      sync.Mutex     // guards rlCounts and rlFallback
 	rlCounts  map[string]int // per-credential 429/403 tally, reset each flush
+	// rlFallback is the subset of rlCounts that arrived on a FALLBACK hop
+	// (F-12b). Reset on the same flush, so the two always describe one window.
+	rlFallback map[string]int
 	// in-flight concurrency tracking. inflCur is the LIVE count (inc on forward
 	// start, dec on completion — persists across windows so a request spanning a
 	// flush keeps being counted); inflPeak is the max inflCur seen this window,
@@ -174,6 +193,11 @@ func (r *signalReporter) enqueueRevoked(credentialID, reason string) {
 // the live credential set. Lazy-inits the map so a directly-constructed reporter
 // (tests, future call sites) can't nil-panic.
 func (r *signalReporter) incrRateLimit(credentialID string) {
+	r.incrRateLimitHop(credentialID, false)
+}
+
+// incrRateLimitHop is incrRateLimit with the fallback marking (F-12b = C).
+func (r *signalReporter) incrRateLimitHop(credentialID string, duringFallback bool) {
 	if r == nil || credentialID == "" {
 		return
 	}
@@ -182,6 +206,12 @@ func (r *signalReporter) incrRateLimit(credentialID string) {
 		r.rlCounts = make(map[string]int)
 	}
 	r.rlCounts[credentialID]++
+	if duringFallback {
+		if r.rlFallback == nil {
+			r.rlFallback = make(map[string]int)
+		}
+		r.rlFallback[credentialID]++
+	}
 	r.rlMu.Unlock()
 }
 
@@ -198,12 +228,15 @@ func (r *signalReporter) snapshotRateLimits() []rateLimitSample {
 	out := make([]rateLimitSample, 0, len(r.rlCounts))
 	for id, n := range r.rlCounts {
 		out = append(out, rateLimitSample{
-			CredentialID: id,
-			Count:        n,
-			WindowSecs:   int(signalFlushInterval / time.Second),
+			CredentialID:  id,
+			Count:         n,
+			FallbackCount: r.rlFallback[id],
+			WindowSecs:    int(signalFlushInterval / time.Second),
 		})
 	}
 	r.rlCounts = make(map[string]int) // reset the window
+	r.rlFallback = nil                // 🔴 reset TOGETHER — a fallback tally that
+	// outlived its window would attribute this window's refusals to the last one
 	return out
 }
 

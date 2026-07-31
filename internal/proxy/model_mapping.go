@@ -6,6 +6,7 @@ import (
 	"io"
 	"log/slog"
 	"net/http"
+	"strings"
 	"time"
 
 	"github.com/AiKeyLabs/aikey-proxy/internal/provider"
@@ -115,11 +116,64 @@ func applyModelMapping(baseURL, requestedModel string, body []byte) modelMapping
 // declared code unchanged when the base_url is empty or its host isn't in the
 // route table (third-party gateways), so the fix is a no-op for everything
 // except genuine cross-provider endpoints.
+//
+// # D-4 (2026-07-29): correct a MISLABEL, do not overrule a DECLARATION
+//
+// openspec change `aliyun-aigw-p0-upstream-fallback`, task 0b.7b.
+//
+// This function's original job is to fix a MISTAKE: a binding that says
+// `anthropic` while actually calling GLM. It used to do that by overwriting the
+// declared code whenever the address resolved to any known vendor — which was
+// fine until route groups introduced "want a second address for one brand? then
+// register it as a SECOND PROVIDER" (rev6).
+//
+// That made the old rule wrong. An org that deliberately registers
+// `zhipu-coding` pointing at GLM's coding endpoint had its code silently
+// collapsed back to `zhipu`, which:
+//   - erased the reason to register separately at all (R18's claimed benefit);
+//   - made `X-Aikey-Fallback: to=` report the SAME name for two different hops
+//     of one chain, tripping I4 (a switch must be attributable).
+//
+// So the question is no longer "what vendor owns this address" but
+// **"does the DECLARED provider recognise this address?"**, and the two cases
+// separate on whether we have any address knowledge about the declared code:
+//
+//	declared code IS in the route table  → we know which addresses it owns. An
+//	  address belonging to a different known vendor is therefore a genuine
+//	  MISLABEL. Correct it. (`anthropic` + open.bigmodel.cn → `zhipu`.)
+//
+//	declared code is NOT in the route table → it is an org-registered provider.
+//	  That is a DECLARATION, not a typo, and we hold no address knowledge that
+//	  could contradict it. Trust it. (`zhipu-coding` stays `zhipu-coding`.)
+//
+// 🔴 Attribution and mapping deliberately key on DIFFERENT things, and that is
+// correct rather than sloppy:
+//   - ATTRIBUTION (usage-event `provider`, `X-Aikey-Fallback`'s `to=`) follows
+//     the DECLARATION — money and responsibility must stay separable.
+//   - MODEL MAPPING (`applyModelMapping` below) follows the ADDRESS — two
+//     packages of one brand answer to the same model names, so they should share
+//     one mapping table.
+//
+// ⚠️ This changes behavior shipped by the model-mapping release, so it carries a
+// co-sign requirement (F-18 / D-4). The mislabel regression case is pinned in
+// provider_compat_test.go: breaking it must turn that test red.
 func truthfulProviderCode(baseURL, declared string) string {
 	if baseURL == "" {
 		return declared
 	}
-	if pr, ok := provider.Routes().LookupByBaseURL(baseURL); ok && pr.Provider != "" {
+	pr, ok := provider.Routes().LookupByBaseURL(baseURL)
+	if !ok || pr.Provider == "" {
+		// Unknown host (third-party gateway). Unchanged from before.
+		return declared
+	}
+	if strings.EqualFold(pr.Provider, declared) {
+		return declared // already agree — nothing to correct
+	}
+	// The address belongs to a different KNOWN vendor than the one declared.
+	// Only overrule the declaration when we actually have address knowledge
+	// about the declared code; otherwise it is an org registration we cannot
+	// second-guess.
+	if _, declaredIsKnown := provider.Routes().ByProvider(provider.CanonicalCode(declared)); declaredIsKnown {
 		return pr.Provider
 	}
 	return declared

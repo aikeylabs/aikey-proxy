@@ -169,6 +169,48 @@ type ResolvedRoute struct {
 	ProtocolFamily string
 	KeyAlias       string   // vault entry alias for real key (static config keys)
 	AllowedModels  []string // nil means allow all
+	// ── Primary/fallback chain (P0a upstream fallback, task 2.0) ──────────
+	//
+	// Priority is this binding's position within its (VirtualKeyID,
+	// ProtocolType) chain — 1 = primary, ascending. The candidate sequence is
+	// built by sorting on it.
+	//
+	// 🔴 FallbackRole is DISPLAY ONLY (I19). It is derived from the order
+	// upstream, and ordering decisions here must read Priority: two
+	// independently-writable fields can always be made to contradict each other
+	// ("first in line, labelled F1"), and a reader has no way to tell which one
+	// the runtime obeyed.
+	Priority     int64
+	FallbackRole string
+	// RouteGroupID / RouteGroupName name the org-level template this binding was
+	// generated from.
+	//
+	// 🔴 Empty is NOT "a chain of one". No group at all means a row written
+	// before route groups existed → single-shot, byte-identical to the
+	// pre-upgrade behavior. A group with one member means an administrator built
+	// a chain and most likely believes it is redundant — so its failure gets
+	// UPSTREAM_FALLBACK_UNCONFIGURED, pointing at the thing they need to fix.
+	// Collapsing the two into one error would send half of the people who see it
+	// in the wrong direction.
+	RouteGroupID   string
+	RouteGroupName string
+	// ── Request-scoped hop attribution (P0a tasks 3.2 / 3.11) ─────────────
+	//
+	// 🔴 Set ONLY on the per-hop COPY the candidate loop makes, never on the
+	// registry's shared route. That is what makes the correct reading the only
+	// reachable one: the usage event and the upload event both read the route
+	// they were handed, and the loop hands each hop its own.
+	//
+	// The mistake this shape removes is reading a `route` variable that is
+	// visible OUTSIDE the loop. That compiles, and it passes every single-hop
+	// test because on one hop the two are identical — it is wrong only when a
+	// switch actually happened, which is the exact case these fields exist to
+	// report.
+	//
+	// FallbackAttempt is 1-based (1 = primary). FallbackReason is the frozen code
+	// that caused the switch INTO this hop, empty on the primary.
+	FallbackAttempt int
+	FallbackReason  string
 	// FollowUserActive flips the App pipeline's profile_id selection from
 	// "app:<slug>" (isolated mode, the default) to "default" (the user's
 	// own active profile). first-party only; see AppKind above for the

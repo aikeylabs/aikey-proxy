@@ -541,6 +541,27 @@ func (p *Proxy) handleAppPipeline(w http.ResponseWriter, r *http.Request, appCtx
 		p.observerRegistry.NotifyStart(r.Context(), observer.StreamAppPipeline, obsReqCtx)
 	}
 
+	// 🔴 Task 2.0b / F-19 · D-5: the candidate loop hangs HERE for the App
+	// pipeline. An App-routed team VK with a route group configured would
+	// otherwise show 「配了但没生效」 on the App surface — a chain the administrator
+	// can see in the console and that never runs — which is the precise failure
+	// this whole change exists to remove.
+	//
+	// appChain returns nil for every request that has no chain (a personal alias,
+	// an OAuth account whose failover the ACCOUNT axis already owns, a team VK
+	// with no group, or an app pinned to one member). Those fall through to the
+	// single-shot call below, byte for byte as before. See chain_app.go for why
+	// the app's own pin row — not the default profile's — is the one consulted.
+	if chain := p.appChain(appResolvedRoute, binding, protocolType, logger); chain != nil &&
+		(chain.canFailover() || (chain.grouped && len(chain.candidates) == 1)) {
+		p.serveManagedChain(w, r, chain, inboundBearer, startTime, logger, traceID, observer.StreamAppPipeline)
+		if obsReqCtx != nil {
+			latency := int(time.Since(startTime).Milliseconds())
+			p.observerRegistry.NotifyEnd(r.Context(), obsReqCtx, latency)
+		}
+		return
+	}
+
 	p.serveRoute(w, r, appResolvedRoute, prov, cred.RealKey, inboundBearer, startTime, logger)
 
 	if obsReqCtx != nil {
@@ -981,13 +1002,19 @@ func (p *Proxy) handlePathPrefixRoute(w http.ResponseWriter, r *http.Request, pr
 				"Route token not found in registry. Run 'aikey route' to see available tokens.")
 			return
 		}
-		var selectErr error
-		route, selectErr = p.selectTokenBinding(route, canonicalCode, protocolType)
+		// 🔴 Task 2.0b / 2.28. This entry serves the SAME thing as the legacy
+		// `/v1/...` dispatch — a team VK's direct-bind credential — and only
+		// differs in the URL shape the client used. Wiring the chain into one and
+		// not the other would make failover depend on whether a client sends
+		// `/v1/messages` or `/anthropic/v1/messages`, and nobody debugging "it
+		// failed over for them but not for me" would think to suspect that.
+		chain, selectErr := p.selectTokenChain(route, canonicalCode, protocolType, logger)
 		if selectErr != nil {
 			p.errors.Add(1)
 			writeJSONError(w, http.StatusConflict, "invalid_request_error", "PROVIDER_ROUTE_AMBIGUOUS", selectErr.Error())
 			return
 		}
+		route = chain.primary()
 		if route.ProtocolType != "" {
 			protocolType = route.ProtocolType
 		}
@@ -1167,6 +1194,20 @@ func (p *Proxy) handlePathPrefixRoute(w http.ResponseWriter, r *http.Request, pr
 			tokenRoute.BaseURL, r = resolveOAuthUpstream(
 				canonicalCode, protocolType, tokenRoute.BaseURL, r)
 			oauthInject(r, cred, canonicalCode)
+		}
+
+		// 🔴 Task 2.0b: the candidate loop hangs HERE, not at the end of this
+		// function — the Tier-1 branch returns on its own. This entry serves the
+		// same thing as the legacy `/v1/...` dispatch (a team VK's direct-bind
+		// credential) and differs only in the URL shape the client used, so wiring
+		// one and not the other would make failover depend on whether a client
+		// sends `/v1/messages` or `/anthropic/v1/messages`.
+		//
+		// A chain that cannot fail over falls straight through to the single-shot
+		// call below, byte-identical to before.
+		if chain.canFailover() || (chain.grouped && len(chain.candidates) == 1) {
+			p.serveManagedChain(w, r, chain, rawAuthValue, startTime, logger, traceID, observer.StreamUserChat)
+			return
 		}
 
 		// SPEC §1.4.1 user_chat — see serveRouteWithObserver docstring.

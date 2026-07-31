@@ -433,6 +433,18 @@ func Run() {
 	// SyncRail health (2026-07-03): per-rail control-plane sync state for /status
 	// (health-signal-surface rule — the release E2E asserts this, not the UI).
 	// Empty map (no rail ever attempted — personal installs) → field omitted.
+	// P0a task 1b.9: the five thresholds with each value's source. The rail's own
+	// OK/STALE/OFFLINE state arrives for free under control_plane_sync — this adds
+	// the half that state cannot express: WHERE the number in force came from.
+	if fp := sup.FallbackPolicyCache(); fp != nil {
+		// 🔴 Task 3.4 / 4.5b: the live cooldown view rides the SAME block as the
+		// thresholds. An administrator seeing the bill land on the fallback vendor
+		// needs to tell "the primary is cooling" from "somebody changed the
+		// configuration" — without this they go looking in the wrong place.
+		adminHandler.UpstreamFallbackFn = func() any {
+			return fp.HealthWithCooling(sup.BindingCooldownSnapshot(), sup.FallbackSwitches())
+		}
+	}
 	adminHandler.SyncHealthFn = func() map[string]admin.SyncRailStatus {
 		snap := sup.ControlPlaneSyncSnapshot()
 		if len(snap) == 0 {

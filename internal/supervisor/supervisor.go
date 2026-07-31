@@ -314,6 +314,11 @@ type Supervisor struct {
 	// pollRoutingOverrides; read on the group-route hot path to redirect a seat off
 	// an unhealthy account. nil-safe everywhere → empty means "use the local pick".
 	routingOverrides *proxy.RoutingOverrideCache
+	// fallbackPolicy is the upstream-fallback threshold cache (P0a, task 1b.4).
+	// Supervisor-scoped like routingOverrides so a generation reload never loses
+	// it — keep-last-known is the point: a control-plane blip must not re-time
+	// requests across the fleet.
+	fallbackPolicy *proxy.FallbackPolicyCache
 	// lastRoutingMismatchVersion throttles the proxy.routing_override.format_mismatch
 	// WARN (non-empty routes, zero matching a local (seat,group)) to once per
 	// routing_version — the 60s ticker would otherwise repeat it every cycle.
@@ -392,22 +397,29 @@ func (s *Supervisor) VaultReader() *vault.Reader {
 func New(cfg *config.Config, configPath, password, version string) (*Supervisor, error) {
 	ctx, cancel := context.WithCancel(context.Background())
 	s := &Supervisor{
-		cfg:                      cfg,
-		configPath:               configPath,
-		password:                 password,
-		version:                  version,
-		startedAt:                time.Now(),
-		ctx:                      ctx,
-		cancel:                   cancel,
-		quotaEnabled:             quotaEnabledFromEnv(),
-		quotaSnapshot:            quota.NewSnapshot(),
-		quotaCounter:             quota.NewCounter(),
-		routingOverrides:         proxy.NewRoutingOverrideCache(),
+		cfg:              cfg,
+		configPath:       configPath,
+		password:         password,
+		version:          version,
+		startedAt:        time.Now(),
+		ctx:              ctx,
+		cancel:           cancel,
+		quotaEnabled:     quotaEnabledFromEnv(),
+		quotaSnapshot:    quota.NewSnapshot(),
+		quotaCounter:     quota.NewCounter(),
+		routingOverrides: proxy.NewRoutingOverrideCache(),
+		// P0a task 1b.4/1b.7. Seeded with the ONE local-yaml layer that already
+		// existed (`providers.<name>.timeout`); the other four thresholds
+		// deliberately have no local knob — see LocalOverrides for why widening it
+		// would recreate the four-source base_url drift.
+		fallbackPolicy:           proxy.NewFallbackPolicyCache(localAttemptTimeoutMs(cfg)),
 		pathHealth:               proxy.NewProviderPathHealthManager(),
 		teamCred:                 &teamCredentialSource{},
 		currentRoutedRestampKick: make(chan struct{}, 1),
 	}
-	s.railset = newRailSet(s.groupRuntimeRail(), s.routingOverrideRail())
+	// 🔴 A sixth FOLLOWER, not a sixth loop (task 1b.4). railSpec.interval is
+	// per-rail, so declaring 10s here leaves the other five untouched.
+	s.railset = newRailSet(s.groupRuntimeRail(), s.routingOverrideRail(), s.fallbackPolicyRail())
 	gen, err := s.buildGeneration()
 	if err != nil {
 		return nil, fmt.Errorf("initial generation failed: %w", err)
@@ -1057,8 +1069,17 @@ func (s *Supervisor) QuotaCounter() *quota.Counter { return s.quotaCounter }
 // crashing visibly. The nil-checked accessors elsewhere (EffectivePacks etc.)
 // differ because admin/test paths can call them before the first generation is
 // ready, where nil is a legitimate "not yet available" state.
+// 🔴 Task 1b.6 — this is the ONE place the fallback thresholds are snapshotted.
+// Every data-plane request enters here (the server mounts this handler on the
+// catch-all route), so taking the snapshot once at this point and passing it down
+// the context is what makes 「整条链共用一份快照」 structural rather than a habit
+// each future hop has to remember. A per-hop re-read would let a 10-second poll
+// landing mid-request give hops 1–2 one timeout and hop 3 another — identical
+// inputs, different behavior, and no log line explaining it. The source fence in
+// internal/proxy asserts SnapshotForRequest has exactly this one caller.
 func (s *Supervisor) Handler() http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		r = r.WithContext(proxy.WithFallbackPolicy(r.Context(), s.fallbackPolicy.SnapshotForRequest()))
 		s.active.Load().ServeHTTP(w, r)
 	})
 }
@@ -2037,4 +2058,23 @@ func signalReportingAuth(
 	return masterURL, func(ctx context.Context) (string, error) {
 		return teamCred.bearer(ctx, vaultReader, masterURL)
 	}
+}
+
+// BindingCooldownSnapshot exposes the active generation's binding-axis cooldown
+// state for /status (task 3.4).
+func (s *Supervisor) BindingCooldownSnapshot() map[string]int {
+	gen := s.active.Load()
+	if gen == nil || gen.proxy == nil {
+		return nil
+	}
+	return gen.proxy.BindingCooldownSnapshot()
+}
+
+// FallbackSwitches is the active generation's upstream-switch counter (task 3.6).
+func (s *Supervisor) FallbackSwitches() int64 {
+	gen := s.active.Load()
+	if gen == nil || gen.proxy == nil {
+		return 0
+	}
+	return gen.proxy.FallbackSwitches()
 }

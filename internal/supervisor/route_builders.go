@@ -3,6 +3,7 @@ package supervisor
 import (
 	"errors"
 	"log/slog"
+	"sort"
 
 	providerreg "github.com/AiKeyLabs/aikey-proxy/internal/provider"
 	"github.com/AiKeyLabs/aikey-proxy/internal/vault"
@@ -56,6 +57,12 @@ func managedKeyToRoute(mk *vault.ManagedKey) *vkeys.ResolvedRoute {
 		CredentialRevision: mk.CredentialRevision,
 		VirtualKeyRevision: mk.VirtualKeyRevision,
 		RouteSource:        "team",
+		// Primary/fallback chain (task 2.0). Carried from the vault row so the
+		// candidate sequence can be ordered without a second lookup.
+		Priority:       mk.Priority,
+		FallbackRole:   mk.FallbackRole,
+		RouteGroupID:   mk.RouteGroupID,
+		RouteGroupName: mk.RouteGroupName,
 		// Oauth-group fields (N7c): empty for direct-bind VKs (PlaintextKey set,
 		// existing path unchanged); populated for group VKs (PlaintextKey empty,
 		// resolver picks an account from GroupRuntime). See dispatch N8.
@@ -86,6 +93,29 @@ func buildManagedRoutes(keys []vault.ManagedKey) map[string]*vkeys.ResolvedRoute
 	}
 	out := make(map[string]*vkeys.ResolvedRoute, len(grouped))
 	for token, bindings := range grouped {
+		// 🔴 Order the bindings by the administrator's priority ONCE, here, so
+		// every consumer of Bindings sees the chain in the order it was
+		// configured (task 1.4 / 2.0).
+		//
+		// 🚫 Never rely on the order rows came back in. SQLite promises nothing
+		// without a full ORDER BY, and an implicit order is the classic silent
+		// bug: correct today, wrong after an unrelated change, and never logged.
+		// The vault query does order by priority, but this is the point where the
+		// slice is BUILT, and a future second caller must not have to know that.
+		//
+		// Ties break on provider then protocol purely for determinism. A real tie
+		// (two members at the same priority) is genuine ambiguity, and the
+		// selection layer says so rather than picking silently.
+		sort.SliceStable(bindings, func(i, j int) bool {
+			a, b := bindings[i], bindings[j]
+			if a.Priority != b.Priority {
+				return a.Priority < b.Priority
+			}
+			if a.ProviderCode != b.ProviderCode {
+				return a.ProviderCode < b.ProviderCode
+			}
+			return a.ProtocolType < b.ProtocolType
+		})
 		if len(bindings) == 1 {
 			out[token] = bindings[0]
 			continue

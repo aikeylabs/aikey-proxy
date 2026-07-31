@@ -33,7 +33,23 @@ func (t *detachedTransport) RoundTrip(req *http.Request) (*http.Response, error)
 	// NON-streaming pool requests. WithoutCancel keeps the values while dropping the
 	// client's Done; AfterFunc re-ties cancellation to proxy shutdown (unchanged
 	// lifetime: proxy shutdown OR maxTimeout OR body close).
-	ctx, cancel := context.WithTimeout(context.WithoutCancel(req.Context()), t.maxTimeout)
+	// 🔴 The per-attempt cap survives the detach (P0a task 2.31 / F-11).
+	//
+	// Detaching exists so a CLIENT disconnect cannot abort an upstream call that is
+	// still producing a response. The organization's per-attempt limit is not the
+	// client's cancellation — it is OUR cap, and dropping it here would make a
+	// configured timeout settable, storable and displayable while never taking
+	// effect: the commonest shape of a fake delivery, and the one thing the
+	// "what you see is what executes" rule exists to prevent.
+	//
+	// The smaller of the two wins. 🚫 Never the larger: each bound exists for its
+	// own reason (this one caps a detached call, that one caps an attempt), so
+	// honouring only one silently discards the other.
+	limit := t.maxTimeout
+	if attempt, ok := attemptTimeoutFromContext(req.Context()); ok && attempt > 0 && attempt < limit {
+		limit = attempt
+	}
+	ctx, cancel := context.WithTimeout(context.WithoutCancel(req.Context()), limit)
 	stopOnShutdown := context.AfterFunc(t.proxyCtx, cancel)
 	cancelAll := func() { stopOnShutdown(); cancel() }
 	req = req.WithContext(ctx)
@@ -60,4 +76,17 @@ type cancelOnClose struct {
 func (c *cancelOnClose) Close() error {
 	c.cancel()
 	return c.ReadCloser.Close()
+}
+
+// attemptTimeoutCtxKey carries one attempt's deadline through the detach.
+type attemptTimeoutCtxKey struct{}
+
+// withAttemptTimeout stamps the per-attempt cap for this upstream call.
+func withAttemptTimeout(ctx context.Context, d time.Duration) context.Context {
+	return context.WithValue(ctx, attemptTimeoutCtxKey{}, d)
+}
+
+func attemptTimeoutFromContext(ctx context.Context) (time.Duration, bool) {
+	d, ok := ctx.Value(attemptTimeoutCtxKey{}).(time.Duration)
+	return d, ok
 }

@@ -100,6 +100,15 @@ func (p *Proxy) buildBaseEvent(req *http.Request, resp *http.Response, startTime
 	// (claude-opus-4-8). Without this, both collapse to the client model and
 	// the ledger mis-prices. The effective model is stashed on the request
 	// context by applyModelMappingToRequest.
+	// 🔴 Upstream-fallback attribution (tasks 3.2 / 3.3 / 3.11). `route` here is
+	// the PER-HOP copy the candidate loop passed in, so served_provider and
+	// served_binding_id describe the hop that actually produced this response —
+	// and cost, which prices off Provider, lands on the vendor that did the work
+	// rather than on the one that was tried first.
+	ev.ServedProvider = provider
+	ev.ServedBindingID = route.BindingID
+	ev.FallbackAttempt = route.FallbackAttempt
+	ev.FallbackReason = route.FallbackReason
 	if eff, ok := req.Context().Value(ctxKeyMappedEffectiveModel).(string); ok && eff != "" {
 		ev.Model = eff
 	}
@@ -209,7 +218,15 @@ func (p *Proxy) recordEvent(req *http.Request, resp *http.Response, startTime ti
 	// short map lock, reset every flush bounds it); an empty CredentialID (no route)
 	// is dropped inside.
 	if resp.StatusCode == http.StatusTooManyRequests || resp.StatusCode == http.StatusForbidden {
-		p.signalReporter.incrRateLimit(route.CredentialID)
+		// 🔴 F-12b = C: fed, but MARKED. Upstream fallback makes one client request
+		// touch several credentials, so one user request can now raise the risk
+		// score of two or three at once. Those refusals are real evidence and must
+		// not be suppressed — but they are correlated in a way the allocation
+		// engine's model does not assume (one request, not independent traffic).
+		// Marking lets the engine decide; folding them in unmarked would silently
+		// change what its risk numbers mean, and a scheduler acting on a
+		// distribution that quietly changed shape is very hard to debug.
+		p.signalReporter.incrRateLimitHop(route.CredentialID, route.FallbackAttempt > 1)
 	}
 	p.collector.Record(&ev)
 	// Error responses are treated as interrupted — the client never got a

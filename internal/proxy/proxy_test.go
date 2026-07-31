@@ -501,50 +501,94 @@ type mockActiveVault struct {
 	personalBaseURL string
 }
 
-func TestSelectTokenBinding_UsesClientRouteToChooseExactMockBinding(t *testing.T) {
+func TestSelectTokenChain_UsesClientRouteToChooseExactMockBinding(t *testing.T) {
 	anthropic := &vkeys.ResolvedRoute{
 		VirtualKeyID: "vk-mock", ProviderCode: "mock", ProtocolType: "anthropic", CredentialID: "cred-a",
+		Priority: 1, RouteGroupID: "rg-1",
 	}
 	openai := &vkeys.ResolvedRoute{
 		VirtualKeyID: "vk-mock", ProviderCode: "mock", ProtocolType: "openai_compatible", CredentialID: "cred-o",
+		Priority: 1, RouteGroupID: "rg-1",
 	}
 	container := &vkeys.ResolvedRoute{VirtualKeyID: "vk-mock", Bindings: []*vkeys.ResolvedRoute{anthropic, openai}}
 	reader := &mockActiveVault{providerBindings: map[string]*vault.ProviderBinding{
 		"anthropic": {
 			ClientRoute: "anthropic", ProviderCode: "mock", ProtocolType: "anthropic",
 			KeySourceType: "managed_virtual_key", KeySourceRef: "vk-mock",
+			RouteGroupID: "rg-1",
 		},
 	}}
 	p := &Proxy{activeReader: reader}
 
-	got, err := p.selectTokenBinding(container, "anthropic", "anthropic")
+	chain, err := p.selectTokenChain(container, "anthropic", "anthropic", nil)
 	if err != nil {
-		t.Fatalf("selectTokenBinding: %v", err)
+		t.Fatalf("selectTokenChain: %v", err)
 	}
+	got := chain.primary()
 	if got.ProviderCode != "mock" || got.ProtocolType != "anthropic" || got.CredentialID != "cred-a" {
 		t.Fatalf("selected %+v, want exact mock+anthropic binding", got)
 	}
+	// A member pin names one hop, so there is nothing to fail over TO — and the
+	// CLI is required to say so at the moment the user pins (D-1③/F-16④).
+	if chain.canFailover() {
+		t.Error("a member pin still reports failover; pinning one hop removes it by decision")
+	}
 
-	got, err = p.selectTokenBinding(container, "openai", "openai_compatible")
+	chain, err = p.selectTokenChain(container, "openai", "openai_compatible", nil)
 	if err != nil {
 		t.Fatalf("unique protocol fallback: %v", err)
 	}
-	if got.CredentialID != "cred-o" {
-		t.Fatalf("selected credential=%q, want cred-o", got.CredentialID)
+	if chain.primary().CredentialID != "cred-o" {
+		t.Fatalf("selected credential=%q, want cred-o", chain.primary().CredentialID)
 	}
 }
 
-func TestSelectTokenBinding_RejectsAmbiguousSameProtocolBindings(t *testing.T) {
+// 🔻 This test used to assert the OPPOSITE: that two bindings sharing a protocol
+// must 409 until `aikey use` disambiguated them. Task 2.28 overturns that — two
+// bindings under one (virtual key, protocol) is the literal SHAPE OF A CHAIN, so
+// the old behavior rejected the exact configuration this change exists to serve,
+// on a path where the administrator had done everything right.
+//
+// What survives is the narrowed case: a chain that genuinely cannot be ORDERED.
+func TestSelectTokenChain_MultipleBindingsAreAChainNotAnError(t *testing.T) {
 	container := &vkeys.ResolvedRoute{
-		VirtualKeyID: "vk-ambiguous",
+		VirtualKeyID: "vk-chain",
 		Bindings: []*vkeys.ResolvedRoute{
-			{VirtualKeyID: "vk-ambiguous", ProviderCode: "openai", ProtocolType: "openai_compatible"},
-			{VirtualKeyID: "vk-ambiguous", ProviderCode: "mock", ProtocolType: "openai_compatible"},
+			{VirtualKeyID: "vk-chain", ProviderCode: "openai", ProtocolType: "openai_compatible", Priority: 1, RouteGroupID: "rg-2", BindingID: "b1"},
+			{VirtualKeyID: "vk-chain", ProviderCode: "mock", ProtocolType: "openai_compatible", Priority: 2, RouteGroupID: "rg-2", BindingID: "b2"},
 		},
 	}
 	p := &Proxy{}
-	if _, err := p.selectTokenBinding(container, "openai", "openai_compatible"); err == nil {
-		t.Fatal("ambiguous same-protocol token must fail until aikey use selects an exact binding")
+	chain, err := p.selectTokenChain(container, "openai", "openai_compatible", nil)
+	if err != nil {
+		t.Fatalf("a configured primary/fallback chain was rejected: %v.\n"+
+			"That 409 lands on a CORRECTLY configured path, and its wording ('ambiguous') "+
+			"sends the administrator back to re-check configuration that was right all along", err)
+	}
+	if len(chain.candidates) != 2 || !chain.canFailover() {
+		t.Fatalf("chain has %d candidates, failover=%v; want 2 and true", len(chain.candidates), chain.canFailover())
+	}
+	if chain.primary().ProviderCode != "openai" {
+		t.Errorf("primary is %q, want the priority-1 hop 'openai'", chain.primary().ProviderCode)
+	}
+}
+
+// The narrowed ambiguity: two members at the SAME priority cannot be ordered, so
+// there is no chain to walk. Unreachable from the console (a unique index forbids
+// it), which is why the runtime treats it as inconsistent DATA rather than as the
+// user's mistake.
+func TestSelectTokenChain_EqualPrioritiesIsTheOnlyRemainingAmbiguity(t *testing.T) {
+	container := &vkeys.ResolvedRoute{
+		VirtualKeyID: "vk-dup",
+		Bindings: []*vkeys.ResolvedRoute{
+			{VirtualKeyID: "vk-dup", ProviderCode: "openai", ProtocolType: "openai_compatible", Priority: 1, RouteGroupID: "rg-3"},
+			{VirtualKeyID: "vk-dup", ProviderCode: "mock", ProtocolType: "openai_compatible", Priority: 1, RouteGroupID: "rg-3"},
+		},
+	}
+	p := &Proxy{}
+	if _, err := p.selectTokenChain(container, "openai", "openai_compatible", nil); err == nil {
+		t.Fatal("two members at the same priority produced a chain; the order is undefined, " +
+			"so picking one silently would make the served upstream depend on map iteration")
 	}
 }
 

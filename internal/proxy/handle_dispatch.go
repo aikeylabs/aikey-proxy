@@ -210,13 +210,19 @@ func (p *Proxy) Handle(w http.ResponseWriter, r *http.Request) {
 	} else if requestedProtocol == "openai_compatible" {
 		clientRoute = "openai"
 	}
-	var selectErr error
-	route, selectErr = p.selectTokenBinding(route, clientRoute, requestedProtocol)
+	// 🔴 Task 2.28: multiple bindings under one (virtual key, protocol) is the
+	// SHAPE OF A CHAIN, not an error. This used to 409 PROVIDER_ROUTE_AMBIGUOUS —
+	// on a correctly configured path — so an administrator who set up a
+	// primary/fallback pair got a conflict on their employee's very first
+	// request, and the word "ambiguous" sent them back to re-check configuration
+	// that was right all along.
+	chain, selectErr := p.selectTokenChain(route, clientRoute, requestedProtocol, logger)
 	if selectErr != nil {
 		p.errors.Add(1)
 		writeJSONError(w, http.StatusConflict, "invalid_request_error", "PROVIDER_ROUTE_AMBIGUOUS", selectErr.Error())
 		return
 	}
+	route = chain.primary()
 
 	// Enrich logger with route context (no secrets).
 	logger = logger.With(
@@ -322,6 +328,21 @@ func (p *Proxy) Handle(w http.ResponseWriter, r *http.Request) {
 		)
 		writeJSONError(w, http.StatusBadGateway, "server_error", "PROVIDER_ERROR",
 			"Unknown provider protocol: "+adapterKey)
+		return
+	}
+
+	// 🔴 Task 2.0b: the candidate loop hangs HERE and on handlePathPrefixRoute —
+	// the two entries that serve a team VK's direct-bind credential. Wiring only
+	// one of them would make failover depend on the URL SHAPE the client happens
+	// to use (`/v1/messages` vs `/anthropic/v1/messages`), and nobody debugging
+	// "it failed over for me but not for them" would think to suspect the path
+	// prefix.
+	//
+	// A chain that cannot fail over falls through to the single-shot call below,
+	// byte-identical to the pre-upgrade behavior. That is what keeps this change
+	// inert for every installation that never configured a route group.
+	if chain.canFailover() || (chain.grouped && len(chain.candidates) == 1) {
+		p.serveManagedChain(w, r, chain, token, startTime, logger, tc.TraceID, observer.StreamUserChat)
 		return
 	}
 
