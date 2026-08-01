@@ -726,3 +726,74 @@ func TestChain_WalksMoreThanThreeHops(t *testing.T) {
 		t.Errorf("X-Aikey-Fallback=%q, want attempt=5", hdr)
 	}
 }
+
+// ── 6.3 / task 2.8: a FALLBACK hop whose credential is gone is skipped ──────
+//
+// 🔴 This lives here as a unit fence because staging CANNOT construct it. Making
+// a chain's fallback credential revoked means revoking a credential an active
+// binding references, and the control plane refuses exactly that with 409
+// BIZ_CRED_HAS_ACTIVE_REFS — the open defect where revoking a virtual key leaves
+// its bindings active. One defect blocks both a supported admin operation and
+// the live regression test for a different requirement.
+//
+// 🔴 It is deliberately the SECOND hop. The primary's key is resolved on the
+// dispatch path (`route = chain.primary()` in handle_dispatch.go, then the vault
+// lookup) BEFORE the chain loop runs, so an unusable PRIMARY returns 503
+// SECRET_NOT_CONFIGURED instead of stepping over. Measured while writing this.
+// The requirement here is about a revoked FALLBACK, which is what the chain
+// loop's resolveChainKey skip actually governs.
+//
+// Two claims, and the second is the easy one to lose: the hop is skipped WITHOUT
+// being dialled. It consumed no upstream round-trip, so a request must never go
+// out with no key — the vendor's 401 would then be recorded as an upstream
+// failure belonging to that provider.
+func TestChain_AFallbackHopWithNoUsableCredentialIsSkipped(t *testing.T) {
+	p := setupTestProxy(t, "http://unused.invalid")
+	mk := func(code, host, key, alias, bindingID string, prio int64) *vkeys.ResolvedRoute {
+		return &vkeys.ResolvedRoute{
+			VirtualKeyID: "vk-chain", Provider: "anthropic", ProtocolType: "anthropic",
+			ProviderCode: code, RouteSource: "team",
+			BaseURL: "https://" + host, PlaintextKey: key, KeyAlias: alias,
+			BindingID: bindingID, CredentialID: "cred-" + bindingID,
+			Priority: prio, RouteGroupID: "rg-1", RouteGroupName: "main",
+		}
+	}
+	first := mk("anthropic", "primary.invalid", "key-primary", "", "b-primary", 1)
+	// The revoked one: no plaintext, and a vault alias that is not there.
+	second := mk("mock", "revoked.invalid", "", "gone-from-vault", "b-revoked", 2)
+	third := mk("zhipu", "third.invalid", "key-third", "", "b-third", 3)
+
+	container := *first
+	container.Bindings = []*vkeys.ResolvedRoute{first, second, third}
+	container.BaseURL, container.ProviderCode, container.ProtocolType = "", "", ""
+	p.registry.Merge(map[string]*vkeys.ResolvedRoute{"aikey_team_chaintest": &container})
+
+	cap := &chainCapture{statusByHost: map[string]int{"primary.invalid": 503},
+		headerByHost: map[string]http.Header{}, bodyByHost: map[string]string{}}
+	p.SetTransport(cap)
+
+	req, w := chainReq()
+	p.Handle(w, req)
+
+	dialed := cap.dialed()
+	for _, host := range dialed {
+		if strings.Contains(host, "revoked.invalid") {
+			t.Errorf("the revoked hop was DIALLED (%v). A credential that cannot be resolved "+
+				"must never reach the network: the request would go out with no key, and the "+
+				"vendor's 401 would be recorded as an upstream failure belonging to that provider",
+				dialed)
+		}
+	}
+	if len(dialed) != 2 {
+		t.Fatalf("dialled %v, want exactly 2 (primary, then third) — the revoked hop must be "+
+			"stepped over without consuming a round-trip", dialed)
+	}
+	if !strings.Contains(dialed[len(dialed)-1], "third.invalid") {
+		t.Errorf("the chain ended on %q, want the hop AFTER the revoked one — a skip must "+
+			"continue the chain, not end it", dialed[len(dialed)-1])
+	}
+	if w.Code != http.StatusOK {
+		t.Errorf("client got %d, want 200: a chain with a usable hop after the revoked one "+
+			"still has an answer", w.Code)
+	}
+}
