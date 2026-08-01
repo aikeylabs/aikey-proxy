@@ -354,11 +354,27 @@ func BuildReportableEvent(opts *ReportOpts) ReportableEvent {
 
 		FallbackReason: route.FallbackReason,
 		FallbackAttempt: func() *int {
-			// 🔴 Attempt 1 is omitted deliberately: it is the overwhelming
-			// majority of rows and says nothing. A field present on every row
-			// with the same value is one more column for a reader to learn to
-			// ignore — and then they ignore it on the row where it is a 2.
-			if route.FallbackAttempt > 1 {
+			// 🔴 Omit only when NO chain was walked (value 0). chain_serve.go's
+			// `rc.FallbackAttempt = i + 1` is the ONLY writer, so 0 means
+			// single-shot and 1 means "a chain was walked and this is its
+			// primary hop". Those are different facts and must stay different
+			// on the wire.
+			//
+			// This previously omitted 1 as well, on the reasoning that it "is
+			// the overwhelming majority of rows and says nothing". True of
+			// single-shot traffic, false of a chain — and the two share the
+			// column. The consequence (staging, 2026-07-31, real run): a chain
+			// whose primary got a real 401 and failed over recorded
+			// {NULL, 2} instead of {1, 2}, so the failed primary's audit row
+			// was indistinguishable from a row written before the field
+			// existed. The projector documents NULL as exactly that ("written
+			// before this field existed"), and warns that conflating it with a
+			// measured 1 makes the two "indistinguishable forever" — so the
+			// producer was manufacturing the ambiguity the consumer forbids.
+			//
+			// 🚫 This is NOT a backfill: historical NULLs keep meaning
+			// unmeasured. It only stops NEW chain walks from writing one.
+			if route.FallbackAttempt > 0 {
 				v := route.FallbackAttempt
 				return &v
 			}

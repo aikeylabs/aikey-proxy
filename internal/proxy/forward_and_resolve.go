@@ -118,6 +118,11 @@ func (p *Proxy) serveRouteWithObserver(
 			SessionID:      resolveSessionID(r, route.ProtocolType, route.ProviderCode),
 			TraceID:        traceID,
 			StartedAt:      startTime,
+			// The chain stamps each hop's own route copy with its 1-based
+			// ordinal (chain_serve.go: rc.FallbackAttempt = i + 1), so this
+			// needs no new plumbing — it is read off the route we were handed.
+			// 0 on the direct-bind path, which is correct: no chain, no ordinal.
+			ChainAttempt: route.FallbackAttempt,
 			// Multi-tenant attribution — mirror the usage path's single-source
 			// rule (events/reportable.go) so the conversation-audit observer and
 			// usage events agree on who a turn belongs to.
@@ -938,6 +943,27 @@ func (p *Proxy) serveRoute(w http.ResponseWriter, r *http.Request, route *vkeys.
 
 				// Rebuffer with the FINAL body (post-translation if engaged,
 				// otherwise unchanged from upstream).
+				//
+				// 🔴 The Content-Length HEADER has to go with it, and it is a
+				// SEPARATE thing from resp.ContentLength — ReverseProxy copies the
+				// header map to the client verbatim, so setting the field while
+				// leaving a stale header advertises the UPSTREAM's byte count for a
+				// body we just rewrote.
+				//
+				// The translation branch above already deletes it, with a comment
+				// naming this exact symptom. `restoreResponseModel` is the second
+				// writer of `body` and did not, so any response whose model was
+				// mapped came back to the client TRUNCATED: found against a real
+				// vendor as `HTTP 200`, `Content-Length: 327`, and zero bytes of
+				// body (curl exit 18). It could not be found against an httptest
+				// upstream, because there the fake echoes the client's own model
+				// name and the restore is a no-op that changes no lengths.
+				//
+				// Deleting unconditionally rather than "when the length changed" is
+				// deliberate: net/http recomputes it from the buffered body, so the
+				// header cannot disagree with what is actually written, and there is
+				// no branch left for a third writer of `body` to forget.
+				resp.Header.Del("Content-Length")
 				resp.Body = io.NopCloser(bytes.NewReader(body))
 				resp.ContentLength = int64(len(body))
 
@@ -1126,6 +1152,27 @@ func (p *Proxy) serveRoute(w http.ResponseWriter, r *http.Request, route *vkeys.
 				writeJSONError(w, http.StatusServiceUnavailable, "server_error", observability.ErrCodeAccountEgressProxy,
 					accountEgressErrorMessage(route,
 						"its configured egress upstream is unreachable. Run `aikey doctor` and check this account's egress setting."))
+				return
+			}
+			// Node-level egress that could not be BUILT (as opposed to a built
+			// chain that would not connect). Nothing was dialed and nothing left
+			// this node, so this is a local capability/config fault — never an
+			// upstream one. Reported as its own code so the chain axis (and the
+			// account axis, via failoverEligibleResponse) can refuse to blame
+			// upstreams for it.
+			var nodeEgErr *NodeEgressUnavailableError
+			if errors.As(err, &nodeEgErr) {
+				logger.Error("node egress unavailable — request refused rather than sent direct",
+					"event.name", observability.EventProxyRequestUpstreamError,
+					"error.code", observability.ErrCodeNodeEgressEngine,
+					"error.message", err.Error(),
+					"latency_ms", latencyMs,
+				)
+				w.Header().Set(HeaderAikeyErrorSource, observability.ErrCodeNodeEgressEngine)
+				writeJSONError(w, http.StatusServiceUnavailable, "server_error", observability.ErrCodeNodeEgressEngine,
+					"This node's configured egress proxy could not be started, so the request was refused "+
+						"instead of being sent out the node's own address. Fix the node's upstream_proxy setting, "+
+						"or install the enterprise package if the spec is a multi-protocol fragment.")
 				return
 			}
 			if route.OauthGroupID != "" {

@@ -242,6 +242,27 @@ const (
 	// local configuration/capability failure, not an account-health signal, so
 	// oauth-group in-request failover must not route around it.
 	ErrCodeAccountEgressEngine = "ACCOUNT_EGRESS_ENGINE_UNAVAILABLE"
+	// ErrCodeNodeEgressEngine is ErrCodeAccountEgressEngine one layer out: the
+	// NODE-level `upstream_proxy` spec could not be constructed by this build, so
+	// this node has no usable egress at all. 503, and the request is REFUSED.
+	//
+	// 🔴 Why refusing beats degrading (decided 2026-07-31). The node egress exists
+	// to make the upstream see a PARTICULAR exit. Dialing direct when the spec
+	// fails is not a reduced service, it is a different one — the request leaves
+	// from the node's own datacenter IP, which is the outcome the egress was
+	// configured to prevent. Worse, it is invisible: the client gets 200, the
+	// console stays green, and the only trace is a WARN nobody reads.
+	//
+	// The realistic trigger is not a typo. It is an OSS-built `aikey-proxy`
+	// reaching a node that has a mihomo FRAGMENT configured — exactly the
+	// enterprise-egress build failure that `make-cluster-offline-package.sh`
+	// downgrades to a WARN. Under the old behavior that shipping defect had no
+	// runtime symptom. Under this one it is the first thing anybody sees.
+	//
+	// This matches pkg/egress's own stated contract ("fails LOUDLY … never
+	// silently, never out the wrong IP") and the per-account path, which has
+	// refused since 2026-07-16. The node path was the last one still degrading.
+	ErrCodeNodeEgressEngine = "NODE_EGRESS_ENGINE_UNAVAILABLE"
 )
 
 // ---- HealthSnapshot ----

@@ -79,6 +79,15 @@ func failoverEligibleResponse(status int, h http.Header) bool {
 	if h.Get(HeaderAikeyErrorSource) == observability.ErrCodeAccountEgressEngine {
 		return false
 	}
+	// Same reasoning one layer out: the NODE's egress could not be built, so no
+	// upstream request happened on ANY candidate and none can. Retrying would walk
+	// the whole chain to collect identical local failures, and — worse — would put
+	// every binding in the administrator's chain into cooldown for a fault that is
+	// this node's, not theirs. The next request would then find a chain that looks
+	// unhealthy end to end because one node has a bad spec.
+	if h.Get(HeaderAikeyErrorSource) == observability.ErrCodeNodeEgressEngine {
+		return false
+	}
 	switch {
 	case status == http.StatusUnauthorized:
 		return true

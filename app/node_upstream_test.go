@@ -6,14 +6,20 @@ package app
 // multi-protocol FRAGMENT (ss/vmess/trojan/… or a proxy-group) needs the enterprise
 // mihomo engine. This is the open-source build (no mihomo blank-import), so
 // MultiProtocolAvailable() is false → chains are accepted + build; fragments are
-// rejected at write time and degrade to direct at build time.
+// rejected at write time and REFUSED at build time (2026-07-31: they used to
+// degrade to a direct dial — see observability.ErrCodeNodeEgressEngine).
 //
 // (This test previously asserted chains were rejected on OSS — that was the M7
 // over-degradation bug, corrected on convergence; see the requirements spec.)
 
 import (
+	"context"
+	"errors"
 	"net/http"
 	"testing"
+
+	"github.com/AiKeyLabs/aikey-proxy/internal/proxy"
+	"github.com/AiKeyLabs/pkg/egress"
 )
 
 func TestValidateNodeUpstream_OSS(t *testing.T) {
@@ -54,29 +60,39 @@ func TestValidateNodeUpstream_OSS(t *testing.T) {
 	}
 }
 
-func TestBuildTransport_FragmentDegradesToDirect_OSS(t *testing.T) {
-	// Pin proxy env empty so "degrade to env/system" resolves to a clean direct.
+// Renamed from TestBuildTransport_FragmentDegradesToDirect_OSS (2026-07-31). The
+// old name described the behavior this change removed, and — worse — the old body
+// kept PASSING against the new code: it asserted `tr.Proxy` resolves to nil, and
+// the refusing transport routes through DialContext, so Proxy is nil there too.
+// A fence that cannot tell "direct" from "refused" was never fencing the leak.
+func TestBuildTransport_FragmentRefusedOnOSSBuild(t *testing.T) {
 	for _, k := range []string{"HTTP_PROXY", "http_proxy", "HTTPS_PROXY", "https_proxy", "ALL_PROXY", "all_proxy"} {
 		t.Setenv(k, "")
 	}
 
-	// A multi-protocol FRAGMENT in a build without the engine degrades to
-	// env/system (here direct — env pinned empty), never trying to build it.
+	// A multi-protocol FRAGMENT in a build without the engine cannot be honored.
+	// It must REFUSE external traffic, not send it out the node's own address.
 	tr, closer := buildTransport("proxies:\n  - name: x\n    type: ss\n    server: h\n    port: 8002\n    cipher: rc4-md5", nil)
 	if closer != nil {
-		t.Fatal("degrade path must not return a closer")
+		t.Fatal("the refusal path owns no background state and must not return a closer")
 	}
 	if tr == nil {
-		t.Fatal("degrade path must still return a usable transport")
+		t.Fatal("buildTransport must still return a transport — callers install it unconditionally")
 	}
-	if tr.Proxy != nil {
-		req, _ := http.NewRequest(http.MethodGet, "https://api.anthropic.com/", nil)
-		if u, _ := tr.Proxy(req); u != nil {
-			t.Fatalf("degraded transport must be direct (env pinned empty), got proxy=%v", u)
-		}
+	if egress.MultiProtocolAvailable() {
+		t.Skip("enterprise build: this fragment builds, so there is no refusal to assert here")
+	}
+	restore := proxy.SetEgressBypassForTest(func(string) bool { return false })
+	defer restore()
+	tr, _ = buildTransport("proxies:\n  - name: x\n    type: ss\n    server: h\n    port: 8002\n    cipher: rc4-md5", nil)
+	_, err := tr.DialContext(context.Background(), "tcp", "api.anthropic.com:443")
+	var nodeErr *proxy.NodeEgressUnavailableError
+	if !errors.As(err, &nodeErr) {
+		t.Fatalf("an unhonorable fragment must refuse the dial with *NodeEgressUnavailableError; got %T: %v.\n"+
+			"A nil error here means the node fell back to a direct dial and the upstream saw the node's own IP.", err, err)
 	}
 
-	// A socks5 CHAIN is NOT degraded — the built-in engine builds it on OSS. It
+	// A socks5 CHAIN is NOT refused — the built-in engine builds it on OSS. It
 	// returns a real engine transport (no closer for a plain chain; not the direct
 	// fallback). Actual chain dialing is proven by the built-in engine's own tests
 	// (internal/proxy TestAccountEgressTransport_TwoHopChainOrder, same BuildDialer).

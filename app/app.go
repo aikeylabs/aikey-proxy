@@ -2,6 +2,8 @@ package app
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"flag"
 	"fmt"
@@ -419,7 +421,11 @@ func Run() {
 		for id, secs := range sup.PoolCooldownSnapshot() {
 			h.CooledAccounts = append(h.CooledAccounts, admin.CooledAccount{AccountID: id, CooldownSeconds: secs})
 		}
-		for _, path := range sup.ProviderPathHealthSnapshot() {
+		// Indexed, not ranged by value: ProviderPathHealth is 144 bytes and the
+		// loop body only reads it.
+		snap := sup.ProviderPathHealthSnapshot()
+		for i := range snap {
+			path := &snap[i]
 			h.PathHealth = append(h.PathHealth, admin.ProviderPathHealth{
 				PathID: path.PathID, Provider: path.Provider, Protocol: path.Protocol,
 				Transport: path.Transport, OriginFingerprint: path.OriginFingerprint,
@@ -838,6 +844,12 @@ func egressState(explicit string, watcher *sysproxy.Watcher) admin.EgressState {
 		SystemHTTPS:      snap.HTTPS,
 		SystemSOCKS:      snap.SOCKS,
 	}
+	if fault := nodeEgressBuildErr.Load(); fault != nil {
+		st.NodeEgressRefused = true
+		st.NodeEgressError = fault.Err
+		sum := sha256.Sum256([]byte(fault.Spec))
+		st.NodeEgressSpecFingerprint = hex.EncodeToString(sum[:])[:12]
+	}
 	if explicit != "" {
 		st.EffectiveSource, st.EffectiveURL = "explicit", explicit
 		return st
@@ -994,21 +1006,58 @@ func egressSelfCheckEcho() string {
 	return "https://api.ipify.org"
 }
 
-// buildTransport builds the egress transport for the LIVE request path, falling
-// back to env/system proxy whenever the spec can't be honored. The fallback is
-// deliberate there: a request in flight should degrade rather than fail hard.
+// buildTransport builds the egress transport for the LIVE request path. When the
+// spec cannot be honored it installs a REFUSING transport — external requests
+// fail with *proxy.NodeEgressUnavailableError; they are not dialed direct.
 //
-// It must NOT be used to TEST a candidate spec — see buildTransportStrict.
+// 🔴 This used to degrade to env/system proxy, on the reasoning that "a request in
+// flight should degrade rather than fail hard". That reasoning does not survive
+// contact with what a node egress is FOR. The egress determines which IP the
+// upstream sees; going direct does not deliver a worse version of that, it
+// delivers the one outcome it was configured to prevent, and it does so with a
+// 200 and a green console. See observability.ErrCodeNodeEgressEngine for the full
+// argument and for the shipping defect (an OSS proxy on a fragment-configured
+// node) this makes visible.
+//
+// Both this and buildTransportStrict now refuse; they still differ, and the
+// difference is why buildTransportStrict stays a separate function: strict
+// returns the error to its CALLER (the Test-connectivity probe needs to display
+// it and must not dial), while this one has no caller to return to and must hand
+// back a live transport, so it carries the refusal into every dial instead.
 func buildTransport(proxyURL string, sysProxy func(*http.Request) (*url.URL, error)) (*http.Transport, io.Closer) {
 	t, closer, err := buildTransportStrict(proxyURL, sysProxy)
 	if err != nil {
-		// Same WARN text the hot path has always emitted, so log-based alerting
-		// and the operator runbooks keep matching.
-		slog.Warn("upstream_proxy engine spec failed to build, falling back to env/system proxy", "error", err)
-		return directTransport(sysProxy), nil
+		// ERROR, not WARN: this node is now serving nothing outbound. The old WARN
+		// text is deliberately gone — it said "falling back", which is no longer
+		// true, and an alert rule still matching on it would be reporting a
+		// behavior that does not happen any more.
+		slog.Error("upstream_proxy spec failed to build — refusing external requests, NOT dialing direct",
+			"error", err,
+			"error.code", observability.ErrCodeNodeEgressEngine,
+			"hint", "a mihomo fragment on an OSS aikey-proxy build is the usual cause; check `go version -m` for metacubex/mihomo")
+		nodeEgressBuildErr.Store(&nodeEgressFault{Spec: strings.TrimSpace(proxyURL), Err: err.Error()})
+		return proxy.RefusingTransport(err), nil
 	}
+	nodeEgressBuildErr.Store((*nodeEgressFault)(nil))
 	return t, closer
 }
+
+// nodeEgressFault is the last node-upstream build failure, or nil when the
+// current spec built cleanly.
+//
+// 🔴 It exists so the fault is readable WITHOUT sending a request. Fail-closed
+// makes every forwarded request say NODE_EGRESS_ENGINE_UNAVAILABLE, but an
+// operator watching a node that is merely idle would see nothing at all, and the
+// release gate (task 6.10) requires health to be assertable from an endpoint
+// rather than inferred from traffic. The spec is reported as a FINGERPRINT, never
+// verbatim — a mihomo fragment carries socks5 credentials (same rule as
+// egressAttribution).
+type nodeEgressFault struct {
+	Spec string
+	Err  string
+}
+
+var nodeEgressBuildErr atomic.Pointer[nodeEgressFault]
 
 // directTransport is the "no egress spec" transport: env/system proxy only.
 func directTransport(sysProxy func(*http.Request) (*url.URL, error)) *http.Transport {

@@ -2,16 +2,50 @@ package provider
 
 import (
 	"strings"
+	"sync/atomic"
 
 	"github.com/AiKeyLabs/pkg/providerregistry"
 	"github.com/AiKeyLabs/pkg/providerroutes"
 )
 
+// routesOverride is nil in every production build. See OverrideRoutesForTest.
+var routesOverride atomic.Pointer[providerroutes.Table]
+
 // Routes returns the process-wide provider routing table — a thin
 // re-export of pkg/providerroutes.Default() so callers in this package
 // don't need to import the leaf package directly.
 func Routes() *providerroutes.Table {
+	if t := routesOverride.Load(); t != nil {
+		return t
+	}
 	return providerroutes.Default()
+}
+
+// OverrideRoutesForTest swaps the routing table and returns a restore func.
+//
+// # 🔴 Why production code carries a test seam
+//
+// The table is keyed by HOST, and the embedded yaml only knows real vendor
+// hosts. So anything that depends on a request being MAPPED — model mapping and
+// the response-side model restoration it implies — simply does not engage
+// against an `httptest` server on 127.0.0.1, and every test of that behaviour
+// silently exercises the passthrough path instead.
+//
+// That is not hypothetical. The response-truncation defect
+// (response_content_length_test.go) lives entirely inside the mapped path, and
+// the first attempt to fence it with a plain httptest upstream PASSED WITHOUT
+// THE FIX — green because no mapping occurred, i.e. green for the wrong reason.
+// A seam that lets a test name its own host is what makes the difference between
+// a fence and a decoration.
+//
+// 🚫 Not for production wiring. Nothing outside _test.go may call this: the
+// table is a build-time asset whose digest is the provenance stamp the
+// diagnostics endpoint reports, and a runtime override would make that stamp a
+// lie about what is actually routing traffic.
+func OverrideRoutesForTest(t *providerroutes.Table) (restore func()) {
+	prev := routesOverride.Load()
+	routesOverride.Store(t)
+	return func() { routesOverride.Store(prev) }
 }
 
 // CanonicalCode normalizes the provider aliases accepted at client-facing

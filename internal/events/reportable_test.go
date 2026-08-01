@@ -472,3 +472,50 @@ func TestBuildReportableEvent_PreservesRequestAndTraceCorrelation(t *testing.T) 
 			ev.RequestID, ev.TraceID)
 	}
 }
+
+// TestBuildReportableEvent_FallbackAttemptDistinguishesChainFromSingleShot pins
+// the 2026-07-31 correction. Three values, three DIFFERENT meanings, and the
+// middle one used to be erased:
+//
+//	0 (single-shot, no chain walked) → omitted  → NULL in the warehouse
+//	1 (a chain WAS walked, primary)  → emitted  → 1
+//	2 (a chain was walked, hop 2)    → emitted  → 2
+//
+// Attempt 1 was previously omitted too, as "the overwhelming majority, says
+// nothing". That holds for single-shot traffic and not for a chain, and the two
+// share one column — so a real staging run with a failing primary recorded
+// {NULL, 2}: the failed hop's audit row was byte-identical to a row written
+// before the field existed. The projector documents NULL as exactly that and
+// warns the two would be "indistinguishable forever", so the producer was
+// manufacturing the ambiguity the consumer forbids.
+//
+// 能红: restore `route.FallbackAttempt > 1` in reportable.go → the chain-primary
+// case below reports nil and fails.
+func TestBuildReportableEvent_FallbackAttemptDistinguishesChainFromSingleShot(t *testing.T) {
+	build := func(attempt int) *int {
+		return BuildReportableEvent(&ReportOpts{
+			EventID:    "evt-fb",
+			Route:      &vkeys.ResolvedRoute{VirtualKeyID: "vk-1", ProviderCode: "anthropic", FallbackAttempt: attempt},
+			Model:      "claude-sonnet-4-5",
+			StatusCode: 200,
+		}).FallbackAttempt
+	}
+
+	if got := build(0); got != nil {
+		t.Errorf("single-shot must omit fallback_attempt, got %d — a value on every row is one\n"+
+			"more column readers learn to ignore, and then they ignore the row where it is a 2", *got)
+	}
+	got1 := build(1)
+	if got1 == nil {
+		t.Fatal("a chain's PRIMARY hop must report attempt=1.\n" +
+			"nil here writes the same NULL the projector reserves for 'before this field existed',\n" +
+			"so 'the primary was tried and failed' becomes indistinguishable from 'we have no record'.")
+	}
+	if *got1 != 1 {
+		t.Errorf("chain primary attempt = %d, want 1", *got1)
+	}
+	got2 := build(2)
+	if got2 == nil || *got2 != 2 {
+		t.Errorf("chain hop 2 attempt = %v, want 2", got2)
+	}
+}

@@ -1,20 +1,26 @@
 package app
 
 import (
+	"context"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"strings"
 	"sync/atomic"
 	"testing"
 
+	"github.com/AiKeyLabs/aikey-proxy/internal/proxy"
 	"github.com/AiKeyLabs/pkg/egress"
 )
 
-// The two functions encode OPPOSITE policies on purpose. These fences exist so a
-// future "let's just have one" refactor has to confront the reason:
+// Both functions now REFUSE an unbuildable spec. They stay separate because they
+// refuse in different shapes, and each shape is load-bearing:
 //
-//	buildTransport       live path — degrade rather than fail a request in flight
-//	buildTransportStrict test path — a test must exercise what it was handed
+//	buildTransportStrict  returns the error to its caller — the Test-connectivity
+//	                      probe must display it and must not dial anything.
+//	buildTransport        has no caller to return to, so it returns a live
+//	                      transport that carries the refusal into every external
+//	                      dial (proxy.RefusingTransport).
 //
 // Collapsing them reintroduces the 2026-07-24 bug: a malformed fragment fell back
 // to the machine's system proxy and the "Test connectivity" button reported that
@@ -84,15 +90,81 @@ func TestBuildTransportStrict_ParsePathErrorsIndependently(t *testing.T) {
 	}
 }
 
-func TestBuildTransport_StillFallsBackOnLivePath(t *testing.T) {
-	// The live path deliberately keeps degrading: an in-flight request should not
-	// hard-fail because a stored spec went bad.
+// TestBuildTransport_RefusesExternalDialsOnLivePath is the fence for the
+// 2026-07-31 decision. It replaces TestBuildTransport_StillFallsBackOnLivePath,
+// which asserted the OPPOSITE and passed for as long as the leak existed.
+//
+// The assertion is on a real dial, not on the returned type: "it returned some
+// transport" is what the old test checked, and a degrading transport satisfies
+// that just as well as a refusing one. The only way to tell them apart is to
+// point one at a live server and see whether the server is reached.
+//
+//	refusing (correct) → error, and the server records ZERO hits
+//	degrading (bug)    → 200, and the request went out the node's own IP
+func TestBuildTransport_RefusesExternalDialsOnLivePath(t *testing.T) {
+	var hits int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		atomic.AddInt32(&hits, 1)
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer srv.Close()
+
 	tr, closer := buildTransport(malformedFragment, nil)
 	if closer != nil {
 		defer closer.Close()
 	}
 	if tr == nil {
-		t.Fatal("buildTransport must always return a usable transport (fallback is the live-path contract)")
+		t.Fatal("buildTransport must still return a non-nil transport — callers install it unconditionally")
+	}
+
+	// httptest serves on 127.0.0.1, which the NO_PROXY/loopback bypass sends
+	// DIRECT by design (internal targets never traverse the egress). Disable that
+	// bypass for this test so the dial takes the external path we mean to fence.
+	restore := proxy.SetEgressBypassForTest(func(string) bool { return false })
+	defer restore()
+	tr2, closer2 := buildTransport(malformedFragment, nil)
+	if closer2 != nil {
+		defer closer2.Close()
+	}
+
+	req, _ := http.NewRequestWithContext(context.Background(), http.MethodGet, srv.URL, http.NoBody)
+	resp, err := (&http.Client{Transport: tr2}).Do(req)
+	if err == nil {
+		resp.Body.Close()
+		t.Fatalf("an unbuildable node egress served HTTP %d — the request left this machine "+
+			"without the configured egress, which is the leak this fence exists to stop", resp.StatusCode)
+	}
+	var nodeErr *proxy.NodeEgressUnavailableError
+	if !errors.As(err, &nodeErr) {
+		t.Errorf("want *proxy.NodeEgressUnavailableError so the forward path can report "+
+			"NODE_EGRESS_ENGINE_UNAVAILABLE; got %T: %v", err, err)
+	}
+	if n := atomic.LoadInt32(&hits); n != 0 {
+		t.Errorf("target received %d request(s) — traffic escaped through the degrade path", n)
+	}
+}
+
+// TestBuildTransport_InternalTargetsStillReachable pins the deliberate exception:
+// refusing everything would take out the node's own health/admin surfaces, which
+// are precisely what an operator needs to diagnose the bad spec.
+func TestBuildTransport_InternalTargetsStillReachable(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer srv.Close()
+
+	tr, closer := buildTransport(malformedFragment, nil)
+	if closer != nil {
+		defer closer.Close()
+	}
+	req, _ := http.NewRequestWithContext(context.Background(), http.MethodGet, srv.URL, http.NoBody)
+	resp, err := (&http.Client{Transport: tr}).Do(req) // 127.0.0.1 → bypassed
+	if err != nil {
+		t.Fatalf("a loopback target must still be reachable with a broken egress spec: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Errorf("status = %d, want 200", resp.StatusCode)
 	}
 }
 
