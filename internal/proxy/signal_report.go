@@ -523,11 +523,46 @@ func parseCodexInt(raw string) int {
 // ponytail: narrow keyword/shape match on purpose to avoid false-positive
 // quarantines; widen the term list here if other hard-ban phrasings show up.
 func isHardRevoked(statusCode int, errType, errMsg string) bool {
-	if statusCode != http.StatusUnauthorized {
+	if !hardRevocationStatus(statusCode) {
 		return false
 	}
 	blob := strings.ToLower(errType + " " + errMsg)
 	return strings.Contains(blob, "revoked") ||
 		strings.Contains(blob, "token_invalidated") ||
 		strings.Contains(blob, `"detail":"unauthorized"`)
+}
+
+// hardRevocationStatus reports whether a status code can CARRY a hard-revocation
+// marker. It does not decide anything on its own — the marker list above still
+// has to match.
+//
+// # 🔴 O23: why 403 was added, and what this deliberately does NOT claim
+//
+// The gate used to be `statusCode != 401 → false`, which made 403 structurally
+// unreachable: an operator who KNEW the exact phrasing of a ban still had no way
+// to express it, because the status check ran first. That is a different problem
+// from "we picked the wrong keywords", and it is the half that can be fixed
+// without evidence we do not have.
+//
+// 🚫 No keyword was added. The three markers are unchanged and were each paid for
+// with an observed body. Extending them to 403 does not widen what counts as a
+// hard revocation — it only stops the status code from vetoing a marker that is
+// unambiguous wherever it appears. A 403 whose body says "OAuth token has been
+// revoked" is a revocation by any reading; a 403 from a content filter, a region
+// block or an org policy says none of those things and still does not match.
+//
+// 🔴 This does NOT close the plan-expiry case, and must not be reported as
+// closing it. The premise that an expired plan or a ban surfaces as 403 comes
+// from a 阶段7 requirements note with no captured artifact behind it. Sampling on
+// 2026-08-01 across three real vendors produced SIX failures and ZERO 403s
+// (Anthropic bad key → 401; Anthropic no-access model → 404; Anthropic admin
+// endpoint → 401; GLM bad key → 401; GLM unknown model → 400; DeepSeek bad key →
+// 401). Until a real 403 body exists to read, writing a rule for its wording
+// would be inventing the evidence.
+//
+// `expired` / 402 are deliberately absent: an expiry is recoverable, and
+// quarantining a recoverable account removes a working upstream from the pool —
+// worse than the retry loop this is meant to stop.
+func hardRevocationStatus(statusCode int) bool {
+	return statusCode == http.StatusUnauthorized || statusCode == http.StatusForbidden
 }
