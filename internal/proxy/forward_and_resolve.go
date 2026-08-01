@@ -943,6 +943,27 @@ func (p *Proxy) serveRoute(w http.ResponseWriter, r *http.Request, route *vkeys.
 
 				// Rebuffer with the FINAL body (post-translation if engaged,
 				// otherwise unchanged from upstream).
+				//
+				// 🔴 The Content-Length HEADER has to go with it, and it is a
+				// SEPARATE thing from resp.ContentLength — ReverseProxy copies the
+				// header map to the client verbatim, so setting the field while
+				// leaving a stale header advertises the UPSTREAM's byte count for a
+				// body we just rewrote.
+				//
+				// The translation branch above already deletes it, with a comment
+				// naming this exact symptom. `restoreResponseModel` is the second
+				// writer of `body` and did not, so any response whose model was
+				// mapped came back to the client TRUNCATED: found against a real
+				// vendor as `HTTP 200`, `Content-Length: 327`, and zero bytes of
+				// body (curl exit 18). It could not be found against an httptest
+				// upstream, because there the fake echoes the client's own model
+				// name and the restore is a no-op that changes no lengths.
+				//
+				// Deleting unconditionally rather than "when the length changed" is
+				// deliberate: net/http recomputes it from the buffered body, so the
+				// header cannot disagree with what is actually written, and there is
+				// no branch left for a third writer of `body` to forget.
+				resp.Header.Del("Content-Length")
 				resp.Body = io.NopCloser(bytes.NewReader(body))
 				resp.ContentLength = int64(len(body))
 
