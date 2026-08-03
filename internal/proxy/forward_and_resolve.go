@@ -40,6 +40,7 @@ import (
 	"github.com/AiKeyLabs/aikey-proxy/internal/vault"
 	"github.com/AiKeyLabs/aikey-proxy/internal/vkeys"
 	"github.com/AiKeyLabs/aikey-proxy/pkg/observer"
+	"github.com/AiKeyLabs/pkg/providerroutes"
 )
 
 // serveRouteWithObserver wraps p.serveRoute with NotifyStart/End for the
@@ -565,10 +566,26 @@ func (p *Proxy) serveRoute(w http.ResponseWriter, r *http.Request, route *vkeys.
 	// host absent from provider_routes) is the degraded path — third-party
 	// gateways with an explicit base_url still flow, but it must NOT be silent.
 	// WARN so "UI shows one upstream, proxy forwards another" is observable.
+	//
+	// R-9 (2026-08-02, provider-credential-cascade) adds the sibling branch: the
+	// host IS known, a row DID match, and yet part of the stored path is being
+	// thrown away. P1j only covered the host-miss half, so this half stayed
+	// completely silent — LookupByBaseURL returns ok=true, so the WARN above
+	// never fires while an Anthropic body is posted to an OpenAI endpoint.
+	//
+	// 🚫 Log only. Neither branch changes where the request goes.
 	if route.BaseURL != "" && realKey != "__oauth__" {
-		if _, known := provider.Routes().LookupByBaseURL(route.BaseURL); !known {
+		if matched, known := provider.Routes().LookupByBaseURL(route.BaseURL); !known {
 			logger.Warn("upstream host not in provider_routes — using degraded literal-prepend stitch",
 				"event.name", "proxy.route.not_found", "base_url", route.BaseURL, "provider_code", route.ProviderCode)
+		} else if _, discarded := provider.Routes().PathDiscarded(route.BaseURL); discarded {
+			logger.Warn("stored base_url carries a path this build's provider_routes does not know — the extra segments are being DISCARDED, so the request may be reshaped for the wrong upstream face. Most likely cause: this worker is running an older build than the control plane.",
+				"event.name", "proxy.route.path_discarded",
+				"stored_base_url", route.BaseURL,
+				"matched_row", matched.Host+matched.PathPrefix,
+				"effective_upstream", providerroutes.EffectiveUpstream(matched),
+				"provider_code", route.ProviderCode,
+			)
 		}
 	}
 
