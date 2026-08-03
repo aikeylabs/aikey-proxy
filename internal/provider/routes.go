@@ -103,8 +103,26 @@ func ProtocolFamily(providerCode, protocolHint string) (string, bool) {
 		return route.Protocol, true
 	}
 	protocols := Routes().ProtocolsForProvider(providerCode)
-	if len(protocols) != 1 {
-		return "", false
+	if len(protocols) == 1 {
+		return protocols[0], true
 	}
-	return protocols[0], true
+	// 2026-08-02 (provider-credential-cascade): a provider having exactly one
+	// protocol used to be the ONLY way a protocol-less credential could resolve.
+	// Giving deepseek / moonshot / qwen / doubao / minimax their anthropic faces
+	// falsified that premise for five providers at once, so every legacy
+	// credential on them would have begun answering
+	// `502 Unknown provider protocol: `. (zhipu had been multi-protocol since
+	// 2026-05 and was already failing exactly this way — unnoticed, because
+	// nothing compared the two eras.)
+	//
+	// LegacyProtocolForProvider answers the narrower, still-truthful question:
+	// which face did this provider serve on its BARE HOST, i.e. the one a
+	// credential predating the protocol axis must have been created against.
+	// It is not row order — a second face always arrives with an explicit
+	// path_prefix, so it cannot move this answer.
+	//
+	// Still fail-closed when even that is ambiguous (mock has no bare-host row):
+	// a provider with no protocol-less era should surface the bug rather than
+	// have one guessed for it.
+	return Routes().LegacyProtocolForProvider(providerCode)
 }
