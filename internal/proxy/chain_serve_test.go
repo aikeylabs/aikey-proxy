@@ -744,7 +744,7 @@ func TestChain_WalksMoreThanThreeHops(t *testing.T) {
 // loop's resolveChainKey skip actually governs.
 //
 // Two claims, and the second is the easy one to lose: the hop is skipped WITHOUT
-// being dialled. It consumed no upstream round-trip, so a request must never go
+// being dialed. It consumed no upstream round-trip, so a request must never go
 // out with no key — the vendor's 401 would then be recorded as an upstream
 // failure belonging to that provider.
 func TestChain_AFallbackHopWithNoUsableCredentialIsSkipped(t *testing.T) {
@@ -778,14 +778,14 @@ func TestChain_AFallbackHopWithNoUsableCredentialIsSkipped(t *testing.T) {
 	dialed := cap.dialed()
 	for _, host := range dialed {
 		if strings.Contains(host, "revoked.invalid") {
-			t.Errorf("the revoked hop was DIALLED (%v). A credential that cannot be resolved "+
+			t.Errorf("the revoked hop was DIALED (%v). A credential that cannot be resolved "+
 				"must never reach the network: the request would go out with no key, and the "+
 				"vendor's 401 would be recorded as an upstream failure belonging to that provider",
 				dialed)
 		}
 	}
 	if len(dialed) != 2 {
-		t.Fatalf("dialled %v, want exactly 2 (primary, then third) — the revoked hop must be "+
+		t.Fatalf("dialed %v, want exactly 2 (primary, then third) — the revoked hop must be "+
 			"stepped over without consuming a round-trip", dialed)
 	}
 	if !strings.Contains(dialed[len(dialed)-1], "third.invalid") {
