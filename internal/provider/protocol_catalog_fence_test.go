@@ -180,3 +180,58 @@ func TestFence_LegacyCredentialsSurviveASecondProtocolFace(t *testing.T) {
 	}
 	t.Logf("%d provider(s) resolve a protocol-less credential", checked)
 }
+
+// I-2 (task P4.2 / test-plan T-21): the URL the dialog SHOWS must be the URL the
+// proxy EXECUTES.
+//
+// # Why ok=true is not the assertion
+//
+// The tempting check is "LookupByBaseURL finds a row". It finds one for almost
+// anything: a host's catch-all row matches every path. deepseek's two URLs both
+// resolve — but if `/anthropic` were mistyped as `/anthropic-api`, the anthropic
+// URL would quietly land on the OpenAI fallback row. ok=true, wrong protocol,
+// no error anywhere, and an Anthropic-shaped body posted to an OpenAI endpoint.
+//
+// So this asserts WHICH row: same protocol, same provider, for every single
+// (provider, protocol) pair the credential dialog can offer.
+func TestFence_I2_ShownURLResolvesToTheRowThatProducedIt(t *testing.T) {
+	tbl := providerroutes.Default()
+	reg := providerregistry.Default()
+
+	checked := 0
+	for _, r := range tbl.All() {
+		e, known := reg.Lookup(r.Provider)
+		if !known || !e.Picker {
+			continue // not offerable in the dialog
+		}
+		// Every endpoint the dialog can put in the box for this pair.
+		for _, row := range tbl.All() {
+			if !strings.EqualFold(row.Provider, r.Provider) || !strings.EqualFold(row.Protocol, r.Protocol) {
+				continue
+			}
+			url := providerroutes.EffectiveUpstream(row)
+			hit, ok := tbl.LookupByBaseURL(url)
+			if !ok {
+				t.Errorf("%s × %s: the dialog would show %q, which resolves to NO row — the proxy would fall back to a degraded literal-prepend stitch",
+					row.Provider, row.Protocol, url)
+				continue
+			}
+			checked++
+			if !strings.EqualFold(hit.Protocol, row.Protocol) {
+				t.Errorf("🔴 SHOWN ≠ EXECUTED for %q:\n  the dialog offers it as protocol %s (provider %s)\n  the proxy resolves it to protocol %s (provider %s, row %s%s)\n  → the request body would be rewritten for the wrong wire format",
+					url, row.Protocol, row.Provider, hit.Protocol, hit.Provider, hit.Host, hit.PathPrefix)
+			}
+			if !strings.EqualFold(hit.Provider, row.Provider) {
+				t.Errorf("provider mismatch for %q: dialog says %s, proxy resolves %s", url, row.Provider, hit.Provider)
+			}
+			// And the protocol it resolves to must be one this binary can forward.
+			if _, err := NewRegistry().Get(hit.Protocol); err != nil {
+				t.Errorf("%q resolves to protocol %q which has no adapter: %v", url, hit.Protocol, err)
+			}
+		}
+	}
+	if checked == 0 {
+		t.Fatal("no offerable endpoint checked — anti-vacuous assertion")
+	}
+	t.Logf("%d offerable endpoint(s) resolve to the row that produced them", checked)
+}

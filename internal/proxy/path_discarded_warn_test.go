@@ -29,10 +29,15 @@ package proxy
 
 import (
 	"bytes"
+	"encoding/json"
+	"fmt"
 	"io"
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -205,4 +210,208 @@ func TestFence_R9_NoWarnWhenNothingIsDiscarded(t *testing.T) {
 			}
 		})
 	}
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// P4.7 / test-plan T-33 — the mixed-version manifest, driven through the real
+// forwarding path rather than computed.
+// ─────────────────────────────────────────────────────────────────────────────
+
+// manifestRow mirrors pkg/providerroutes/testdata/mixed_version_affected_rows.json.
+type manifestRow struct {
+	Provider      string `json:"provider"`
+	Protocol      string `json:"protocol"`
+	StoredURL     string `json:"stored_base_url"`
+	ClientPath    string `json:"client_path"`
+	OldUpstream   string `json:"old_proxy_upstream"`
+	NewUpstream   string `json:"new_proxy_upstream"`
+	OldRouteKnown bool   `json:"old_route_known"`
+}
+
+// TestMixedVersion_ManifestDescribesWhatTheProxyActuallyDoes closes the gap
+// between "we computed a difference" and "a request goes there".
+//
+// TestFence_I11 in pkg/providerroutes compares the two tables through Stitch.
+// This drives a REAL request through serveRoute — adapter selection, rewrite,
+// reverse proxy, the lot — against an httptest upstream that records the path it
+// was actually asked for, and checks it against the same manifest.
+//
+// 🔴 Why the distinction is not pedantic: the manifest is what the release notes
+// quote, and what an operator uses to decide which credentials to re-point during
+// a staggered rollout. "Stitch would compute X" and "the proxy sends X" have been
+// different things before — the response-truncation defect lived entirely in the
+// gap between a computed value and a delivered one.
+//
+// The upstream host is rewritten to a local server per row, because the table is
+// host-keyed and a test cannot dial api.deepseek.com. The PATH — the thing every
+// assertion is about — is untouched.
+func TestMixedVersion_ManifestDescribesWhatTheProxyActuallyDoes(t *testing.T) {
+	blob, err := os.ReadFile(filepath.Join("..", "..", "..", "pkg", "providerroutes", "testdata", "mixed_version_affected_rows.json"))
+	if err != nil {
+		t.Fatalf("read mixed-version manifest: %v\n"+
+			"  This test FAILS rather than skips: the manifest is what the release notes quote, "+
+			"and an unchecked manifest is worse than none.", err)
+	}
+	var rows []manifestRow
+	if err := json.Unmarshal(blob, &rows); err != nil {
+		t.Fatalf("parse manifest: %v", err)
+	}
+	if len(rows) == 0 {
+		t.Fatal("manifest is empty — anti-vacuous assertion")
+	}
+
+	silent, loud := 0, 0
+	for _, row := range rows {
+		row := row
+		t.Run(row.Provider+"/"+row.Protocol+row.PathPrefixSuffix(), func(t *testing.T) {
+			stored, err := url.Parse(row.StoredURL)
+			if err != nil {
+				t.Fatalf("manifest stored_base_url does not parse: %v", err)
+			}
+			oldUp, err := url.Parse(row.OldUpstream)
+			if err != nil {
+				t.Fatalf("manifest old_proxy_upstream does not parse: %v", err)
+			}
+
+			var seen []string
+			upstream := fenceUpstream(t, &seen)
+			hostPort := strings.TrimPrefix(upstream.URL, "http://")
+
+			// Rebuild the PRE-CASCADE table with this row's vendor host swapped for
+			// the local one, so the same host-keyed matching happens.
+			installOldTableWithHost(t, stored.Host, hostPort)
+
+			logs := serveOnceCapturingLogsAt(t, "http://"+hostPort+stored.Path, upstream.URL, row.ClientPath, row.Protocol)
+
+			if len(seen) == 0 {
+				t.Fatalf("the upstream was never called — nothing about forwarding was proved")
+			}
+			got := seen[len(seen)-1]
+			if got != oldUp.Path {
+				t.Errorf("🔴 the manifest is WRONG for %s.\n"+
+					"  it says an un-upgraded worker sends this to %q\n"+
+					"  the proxy actually sent it to        %q\n"+
+					"  Operators use this table to decide which credentials to re-point mid-rollout.",
+					row.StoredURL, oldUp.Path, got)
+			}
+
+			// And the shape classification must match what actually gets logged.
+			hasNotFound := strings.Contains(logs, "proxy.route.not_found")
+			hasDiscarded := strings.Contains(logs, "proxy.route.path_discarded")
+			if row.OldRouteKnown {
+				silent++
+				// Shape A: the host WAS known, so the pre-existing miss WARN cannot fire.
+				// Before R-9 this produced no log line at all; that silence is the defect.
+				if hasNotFound {
+					t.Errorf("manifest classifies this as shape A (host known, path discarded) but the proxy logged proxy.route.not_found — the classification is wrong")
+				}
+				if !hasDiscarded {
+					t.Errorf("shape A row produced NO proxy.route.path_discarded WARN. Pre-R-9 this failure was completely silent; the WARN is the entire mitigation.\n  logs:\n%s", logs)
+				}
+			} else {
+				loud++
+				// Shape B: brand-new host, degraded literal-prepend, duplicate version segment.
+				if !hasNotFound {
+					t.Errorf("manifest classifies this as shape B (unknown host) but no proxy.route.not_found WARN fired.\n  logs:\n%s", logs)
+				}
+				if !strings.Contains(got, doubledVersion(stored.Path)) && strings.Count(got, "/v1") < 2 && strings.Count(got, "/v4") < 2 && strings.Count(got, "/v2") < 2 && strings.Count(got, "/v3") < 2 {
+					t.Logf("note: %s produced %q — no duplicated version segment, which is fine but worth reading", row.StoredURL, got)
+				}
+			}
+		})
+	}
+	t.Logf("replayed %d manifest row(s) through the real forwarding path: %d shape A (silent), %d shape B (loud)", len(rows), silent, loud)
+}
+
+// PathPrefixSuffix keeps subtest names unique when one provider appears twice.
+func (m manifestRow) PathPrefixSuffix() string {
+	u, err := url.Parse(m.StoredURL)
+	if err != nil || u.Path == "" {
+		return ""
+	}
+	return strings.ReplaceAll(u.Path, "/", "_")
+}
+
+func doubledVersion(p string) string {
+	for _, v := range []string{"/v1", "/v2", "/v3", "/v4"} {
+		if strings.HasSuffix(p, v) {
+			return v + v
+		}
+	}
+	return "//"
+}
+
+// installOldTableWithHost rebuilds the PRE-CASCADE table from the frozen
+// baseline fixture, swapping one vendor host for a local one.
+//
+// 🔴 Built from the fixture, not hand-written: a hand-written "old table" would
+// drift from what the previous release actually embedded, and this test's whole
+// claim is about what a real older binary does.
+func installOldTableWithHost(t *testing.T, vendorHost, localHostPort string) {
+	t.Helper()
+	blob, err := os.ReadFile(filepath.Join("..", "..", "..", "pkg", "providerroutes", "testdata", "baseline_routes_pre_cascade.json"))
+	if err != nil {
+		t.Fatalf("read pre-cascade baseline: %v", err)
+	}
+	var entries []struct {
+		Host       string `json:"host"`
+		PathPrefix string `json:"path_prefix"`
+		Protocol   string `json:"protocol"`
+		Provider   string `json:"provider"`
+		BaseURL    string `json:"base_url"`
+		Version    string `json:"version"`
+	}
+	if err := json.Unmarshal(blob, &entries); err != nil {
+		t.Fatalf("parse baseline: %v", err)
+	}
+	var b strings.Builder
+	b.WriteString("provider_routes:\n")
+	for _, e := range entries {
+		host := e.Host
+		base := e.BaseURL
+		if strings.EqualFold(host, vendorHost) {
+			host = localHostPort
+		}
+		// Rewrite the base_url's host too, keeping its path.
+		if u, err := url.Parse(base); err == nil && strings.EqualFold(u.Host, vendorHost) {
+			u.Scheme = "http"
+			u.Host = localHostPort
+			base = u.String()
+		}
+		fmt.Fprintf(&b, "  - { host: %q, path_prefix: %q, protocol: %s, provider: %s, base_url: %q, version: %q }\n",
+			host, e.PathPrefix, e.Protocol, e.Provider, base, e.Version)
+	}
+	installTable(t, b.String())
+}
+
+// serveOnceCapturingLogsAt is serveOnceCapturingLogs with an explicit client
+// path and protocol, so each manifest row is replayed the way its own client
+// would send it.
+func serveOnceCapturingLogsAt(t *testing.T, storedBaseURL, upstreamURL, clientPath, protocol string) string {
+	t.Helper()
+	p := setupTestProxyWithStore(t, upstreamURL, &capturingEventStore{})
+	adapter := protocol
+	if adapter == "" {
+		adapter = "openai_compatible"
+	}
+	prov, err := provider.NewRegistry().Get(adapter)
+	if err != nil {
+		t.Fatalf("get %s adapter: %v", adapter, err)
+	}
+	route := &vkeys.ResolvedRoute{
+		VirtualKeyID: "vk-mv", Provider: adapter, ProtocolType: protocol,
+		ProviderCode: "fencevendor", RouteSource: "team",
+		BaseURL: storedBaseURL, PlaintextKey: "k",
+		BindingID: "b-mv", CredentialID: "c-mv",
+		Priority: 1, FallbackRole: "primary",
+	}
+	var logBuf bytes.Buffer
+	logger := slog.New(slog.NewTextHandler(&logBuf, &slog.HandlerOptions{Level: slog.LevelWarn}))
+
+	body := `{"model":"m","max_tokens":8,"messages":[{"role":"user","content":"hi"}]}`
+	r := httptest.NewRequest(http.MethodPost, clientPath, strings.NewReader(body))
+	r.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+	p.serveRoute(w, r, route, prov, "k", "", time.Now(), logger)
+	return logBuf.String()
 }
