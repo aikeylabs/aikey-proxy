@@ -27,15 +27,15 @@ import (
 // the adapter exists, the PR goes red with the reason.
 //
 // 🚫 There is deliberately NO hand-written exclusion list. The console's
-// protocol catalogue is DERIVED — protocols of route rows whose provider is
+// protocol catalog is DERIVED — protocols of route rows whose provider is
 // picker-visible in provider_registry.yaml — so hiding google (R-8:
-// `picker: false`) removes `gemini` from the catalogue automatically. A
+// `picker: false`) removes `gemini` from the catalog automatically. A
 // hard-coded "except gemini" here would be a second source of truth that keeps
 // passing after somebody flips google back to picker: true.
 func TestFence_I7_EveryOfferedProtocolHasAnAdapter(t *testing.T) {
 	catalog := consoleProtocolCatalog(t)
 	if len(catalog) == 0 {
-		t.Fatal("derived protocol catalogue is EMPTY — anti-vacuous assertion; an empty catalogue would make this fence pass by asserting nothing")
+		t.Fatal("derived protocol catalog is EMPTY — anti-vacuous assertion; an empty catalog would make this fence pass by asserting nothing")
 	}
 
 	reg := NewRegistry()
@@ -67,7 +67,7 @@ func TestFence_I7_GeminiIsStillOutOfReach(t *testing.T) {
 	}
 	for _, protocol := range consoleProtocolCatalog(t) {
 		if protocol == "gemini" {
-			t.Error("`gemini` is back in the console's protocol catalogue while this binary still has no gemini adapter.\n" +
+			t.Error("`gemini` is back in the console's protocol catalog while this binary still has no gemini adapter.\n" +
 				"  Every credential created through that option 502s on its first request, and `probeGoogle`\n" +
 				"  does not go through the Registry, so the connectivity probe will show GREEN while\n" +
 				"  forwarding 502s — a lying green light is worse than no green light.\n" +
