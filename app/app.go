@@ -633,7 +633,12 @@ func Run() {
 	if poolHandler != nil {
 		extraRegistrars = append(extraRegistrars, poolHandler)
 	}
-	srv := server.New(ln, dataHandler, adminHandler, extraRegistrars...)
+	// Control-plane gate. The token is the cluster's control service token, which
+	// cluster-install already writes into this node's config; a non-cluster
+	// (Personal/Trial) install leaves it empty, which is correct — those editions
+	// only ever reach /admin/* over loopback, and remote access should be refused.
+	srv := server.New(ln, dataHandler, adminHandler,
+		server.AdminGate{Token: cfg.Cluster.ControlServiceToken}, extraRegistrars...)
 
 	// Fatal: server.Serve is the process's reason for being. If it dies the
 	// proxy cannot serve requests, so exit(2) and let the OS supervisor
