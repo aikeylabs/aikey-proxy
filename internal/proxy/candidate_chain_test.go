@@ -16,6 +16,7 @@ package proxy
 // notice. Either the fence catches it or nothing does.
 
 import (
+	"strings"
 	"testing"
 
 	"github.com/AiKeyLabs/aikey-proxy/internal/vkeys"
@@ -131,5 +132,147 @@ func TestChainFrom_OrdersByPriorityRegardlessOfInputOrder(t *testing.T) {
 			"Serving the fallback first is invisible: the call succeeds, the bill goes to\n"+
 			"the wrong vendor, and the console still shows the configured order.",
 			chain.candidates[0].ProviderCode)
+	}
+}
+
+// poolRoute builds one row of an OAuth account pool's projection: no route
+// group, priority defaulted to 1 by the vault reader, group identity in
+// OauthGroupID. `accounts` empty models the stale pre-P1e row.
+func poolRoute(vkID, groupID, provider, accounts string) *vkeys.ResolvedRoute {
+	return &vkeys.ResolvedRoute{
+		VirtualKeyID:  vkID,
+		ProviderCode:  provider,
+		ProtocolType:  "anthropic",
+		Priority:      1,
+		FallbackRole:  "primary",
+		OauthGroupID:  groupID,
+		GroupAccounts: accounts,
+		BaseURL:       "https://api.anthropic.com",
+	}
+}
+
+// TestChainFrom_PoolRowsAreNotARouteGroupAmbiguity is the staging outage of
+// 2026-08-03: every OAuth account pool answered 409 PROVIDER_ROUTE_AMBIGUOUS.
+//
+// The shape is exactly what the node vault held — one pool VK, two cache rows at
+// the defaulted priority 1, no route group, differing only in provider_code
+// (a pre-P1e row with none, the live row with "anthropic"). The route-group
+// uniqueness invariant does not reach these rows and never did.
+//
+// 能红: drop the `RouteGroupID == ""` skip in duplicatePriority and this returns
+// the 409 again.
+func TestChainFrom_PoolRowsAreNotARouteGroupAmbiguity(t *testing.T) {
+	p := &Proxy{}
+	r := poolRoute("vk-pool", "grp-1", "anthropic", `[{"account_id":"a1"}]`)
+	r.Bindings = []*vkeys.ResolvedRoute{
+		// Sorted order as buildManagedRoutes hands it over: equal priority breaks
+		// on provider code, so the EMPTY provider — the stale row — comes first.
+		poolRoute("vk-pool", "grp-1", "", "[]"),
+		poolRoute("vk-pool", "grp-1", "anthropic", `[{"account_id":"a1"}]`),
+	}
+
+	chain, err := p.chainFrom(r, nil, "anthropic", nil)
+	if err != nil {
+		t.Fatalf("pool VK refused with %v.\n"+
+			"  Two pool rows at priority 1 is legal by construction: nothing constrains\n"+
+			"  priority outside a route group, and the vault reader defaults it to 1.\n"+
+			"  Refusing here takes the whole pool offline on data the control plane\n"+
+			"  cannot even express as an ordering.", err)
+	}
+	if len(chain.candidates) != 1 {
+		t.Fatalf("pool expanded to %d hops, want 1.\n"+
+			"  A pool is ONE routing destination — which account serves is the assignment\n"+
+			"  engine's decision, made on quota and seat rank the chain cannot see.\n"+
+			"  Failing over between its rows would silently overrule that allocation.",
+			len(chain.candidates))
+	}
+	if got := chain.candidates[0].ProviderCode; got != "anthropic" {
+		t.Errorf("pool hop provider = %q, want anthropic.\n"+
+			"  The stale row sorts FIRST (empty provider < \"anthropic\"), so taking\n"+
+			"  candidates[0] picks the row with no provider and no accounts. That does\n"+
+			"  not 409 — it fails deeper in, as GROUP_NO_CANDIDATES, further from the cause.",
+			got)
+	}
+	if chain.canFailover() {
+		t.Error("canFailover() on a single pool: a request may now try the pool twice")
+	}
+}
+
+// TestChainFrom_RouteGroupAmbiguityStillRefuses pins the narrowing to what it
+// narrowed. 2.27b is still in force for the rows it was written about.
+//
+// 能红: skip grouped candidates too (e.g. by dropping the group key from the seen
+// map) and the refusal disappears — the chain would then serve in an order
+// nobody authored.
+func TestChainFrom_RouteGroupAmbiguityStillRefuses(t *testing.T) {
+	p := &Proxy{}
+	r := route("vk-rg", "anthropic", 1)
+	clash := route("vk-rg", "zhipu", 1) // same RouteGroupID (rg-vk-rg), same priority
+	r.Bindings = []*vkeys.ResolvedRoute{r, clash}
+
+	_, err := p.chainFrom(r, nil, "anthropic", nil)
+	if err == nil {
+		t.Fatal("two route group members at priority 1 were accepted — the chain has no " +
+			"defined order, so which upstream serves is whatever the sort happened to do")
+	}
+	// C: the message must name the group it is talking about. "the route group"
+	// alone is not an instruction when a key sits in more than one.
+	if !strings.Contains(err.Error(), "rg-vk-rg") {
+		t.Errorf("error does not name the offending route group: %q", err.Error())
+	}
+}
+
+// TestDuplicatePriority_GroupedAndUngroupedDoNotClash: a route group member and
+// an ungrouped row sharing a priority are not in the same ordering at all, so
+// this is not a conflict to report.
+//
+// 能红: make duplicatePriority compare priorities in one flat bucket (the shape
+// before this change) and it reports a clash between two unrelated rows.
+func TestDuplicatePriority_GroupedAndUngroupedDoNotClash(t *testing.T) {
+	grouped := route("vk-mix", "anthropic", 1) // RouteGroupID rg-vk-mix
+	loose := poolRoute("vk-mix", "grp-9", "zhipu", `[{"account_id":"a1"}]`)
+	if dup, ambiguous := duplicatePriority([]*vkeys.ResolvedRoute{grouped, loose}); ambiguous {
+		t.Errorf("reported a clash at priority %d between a route group member and a row "+
+			"that is in no route group — they are not ordered against each other", dup)
+	}
+	// And two members of DIFFERENT groups at the same priority are likewise fine.
+	other := route("vk-mix2", "zhipu", 1) // RouteGroupID rg-vk-mix2
+	if dup, ambiguous := duplicatePriority([]*vkeys.ResolvedRoute{grouped, other}); ambiguous {
+		t.Errorf("reported a clash at priority %d across two different route groups", dup)
+	}
+}
+
+// TestChainFrom_UngroupedSiblingsAtOnePriorityAreNotAmbiguous covers the OTHER
+// way ungrouped rows reach the ambiguity check — two ordinary bindings under one
+// virtual key with no route group between them, which is every multi-provider key
+// written before route groups existed. The vault reader defaults both to priority
+// 1, so before this change they refused too.
+//
+// 🔴 Separate from the pool fence on purpose: the pool never reaches
+// duplicatePriority at all (collapseOauthGroups runs first and leaves one hop),
+// so the pool test passes with or without the skip. This is the case that pins it.
+//
+// 能红: give duplicatePriority one flat priority map again — the shape before
+// 2026-08-03 — and this refuses.
+func TestChainFrom_UngroupedSiblingsAtOnePriorityAreNotAmbiguous(t *testing.T) {
+	p := &Proxy{}
+	legacy := func(provider string) *vkeys.ResolvedRoute {
+		r := route("vk-legacy", provider, 1)
+		r.RouteGroupID = "" // pre-route-group row
+		return r
+	}
+	r := legacy("anthropic")
+	r.Bindings = []*vkeys.ResolvedRoute{legacy("anthropic"), legacy("zhipu")}
+
+	chain, err := p.chainFrom(r, nil, "anthropic", nil)
+	if err != nil {
+		t.Fatalf("two ungrouped bindings at the defaulted priority 1 were refused: %v\n"+
+			"  Nothing authored that priority — the vault reader supplies 1 when the\n"+
+			"  column is absent — so there is no administrator order here to be unreadable.", err)
+	}
+	if chain.grouped {
+		t.Error("chain reports grouped=true with no route group id; " +
+			"exhaustedCode() would then hand back UPSTREAM_FALLBACK_UNCONFIGURED and tell " +
+			"the user to go fix a route group that does not exist")
 	}
 }
