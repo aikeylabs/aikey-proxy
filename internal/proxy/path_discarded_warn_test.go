@@ -148,7 +148,7 @@ func TestFence_R9_PathDiscardedWarnFiresOnTheSilentMisroute(t *testing.T) {
 }
 
 // TestFence_R9_ForwardingIsUnchanged is P1d.3: R-9 adds a log line and nothing
-// else. If the WARN had come with a behaviour change, the mitigation would have
+// else. If the WARN had come with a behavior change, the mitigation would have
 // become a second, unreviewed routing decision.
 func TestFence_R9_ForwardingIsUnchanged(t *testing.T) {
 	var seen []string
@@ -161,7 +161,7 @@ func TestFence_R9_ForwardingIsUnchanged(t *testing.T) {
 	if len(seen) == 0 {
 		t.Fatal("upstream was never called — the request did not get forwarded at all, so this test proves nothing about forwarding")
 	}
-	// The old (discarding) behaviour: /anthropic dropped, version re-attached.
+	// The old (discarding) behavior: /anthropic dropped, version re-attached.
 	if got := seen[len(seen)-1]; got != "/v1/messages" {
 		t.Errorf("forwarding CHANGED: upstream received %q, expected the unchanged discarding result %q.\n"+
 			"  R-9 was signed off as log-only. Changing where requests go would make an\n"+
@@ -245,6 +245,23 @@ type manifestRow struct {
 // The upstream host is rewritten to a local server per row, because the table is
 // host-keyed and a test cannot dial api.deepseek.com. The PATH — the thing every
 // assertion is about — is untouched.
+// stitchAlgorithmChangedRows lists the manifest rows where the CURRENT binary
+// and a deployed alpha.15 worker legitimately DISAGREE, because the stitch
+// algorithm changed on 2026-08-03 (see the long note at the assertion below).
+//
+// Key = manifest stored_base_url, value = the path THIS binary now produces.
+// Only rows whose old-table row declares a version other than /v1 can appear
+// here; every other row is unaffected and is still held to the manifest.
+//
+// 🚫 Do not add a row here to make a red test green. A new entry means the
+// stitch changed again — go confirm what a field worker actually does first.
+var stitchAlgorithmChangedRows = map[string]string{
+	// old ark row: base /api/v3, version /v3. Client sends /v1/... — byte-equality
+	// used to leave it in place (field alpha.15: /api/v3/v1/...), the fix strips it.
+	"https://ark.cn-beijing.volces.com/api/coding/v1": "/api/v3/messages",
+	"https://ark.cn-beijing.volces.com/api/coding/v3": "/api/v3/chat/completions",
+}
+
 func TestMixedVersion_ManifestDescribesWhatTheProxyActuallyDoes(t *testing.T) {
 	blob, err := os.ReadFile(filepath.Join("..", "..", "..", "pkg", "providerroutes", "testdata", "mixed_version_affected_rows.json"))
 	if err != nil {
@@ -287,7 +304,33 @@ func TestMixedVersion_ManifestDescribesWhatTheProxyActuallyDoes(t *testing.T) {
 				t.Fatalf("the upstream was never called — nothing about forwarding was proved")
 			}
 			got := seen[len(seen)-1]
-			if got != oldUp.Path {
+			// 🔴 What this replay can and cannot stand in for.
+			//
+			// It runs the CURRENT binary against the frozen OLD table. That is a
+			// faithful model of an un-upgraded worker only while the stitch
+			// ALGORITHM is unchanged — the deployed old worker runs the old table
+			// AND the old code.
+			//
+			// On 2026-08-03 the algorithm did change: the client's version segment
+			// is now stripped whenever it is version-shaped, not only when it is
+			// byte-equal to the row's own version (pkg/providerroutes/stitch.go).
+			// For rows whose old-table row declares a version that is NOT the /v1
+			// every SDK sends, this replay now produces the FIXED path while a real
+			// alpha.15 worker in the field still produces the doubled one.
+			//
+			// The manifest records the FIELD behavior — it is the release-note
+			// source and was verified against a real alpha.15 worker on staging
+			// (2026-08-03). So for these rows the replay must not "correct" it;
+			// silently trusting the replay here would publish a URL no deployed
+			// worker emits.
+			if want, changed := stitchAlgorithmChangedRows[row.StoredURL]; changed {
+				if got != want {
+					t.Errorf("row %s is on the stitch-algorithm-change list, so the CURRENT binary "+
+						"is expected to send it to %q, but it sent %q.\n"+
+						"  (the manifest's %q remains what a real un-upgraded alpha.15 worker does)",
+						row.StoredURL, want, got, oldUp.Path)
+				}
+			} else if got != oldUp.Path {
 				t.Errorf("🔴 the manifest is WRONG for %s.\n"+
 					"  it says an un-upgraded worker sends this to %q\n"+
 					"  the proxy actually sent it to        %q\n"+
