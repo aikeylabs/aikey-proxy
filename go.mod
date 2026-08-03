@@ -9,6 +9,7 @@ require (
 	github.com/AiKeyLabs/pkg/aikeytime v0.0.0
 	github.com/AiKeyLabs/pkg/buildinfo v0.0.0
 	github.com/AiKeyLabs/pkg/fallbackpolicy v0.0.0
+	github.com/AiKeyLabs/pkg/httpdirect v0.0.0
 	github.com/AiKeyLabs/pkg/providerregistry v0.0.0
 	github.com/AiKeyLabs/pkg/providerroutes v0.0.0
 	github.com/AiKeyLabs/pkg/seatassign v0.0.0
@@ -78,3 +79,5 @@ require (
 replace github.com/AiKeyLabs/pkg/routingwire => ../pkg/routingwire
 
 replace github.com/AiKeyLabs/pkg/egress => ../pkg/egress
+
+replace github.com/AiKeyLabs/pkg/httpdirect => ../pkg/httpdirect

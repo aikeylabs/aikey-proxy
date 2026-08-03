@@ -41,6 +41,25 @@ type Config struct {
 	Observers     map[string]map[string]any `yaml:"observers,omitempty"`
 	Vault         VaultConfig               `yaml:"vault"`
 	UpstreamProxy UpstreamProxyConfig       `yaml:"upstream_proxy"`
+	// ControlPlaneProxy is the ESCAPE HATCH for reaching the aikey control
+	// plane (team master / collector / hub) through an explicit proxy.
+	//
+	// Empty (the default, and what every deployment shipped so far wants) means
+	// control-plane calls dial DIRECT, deliberately ignoring HTTP_PROXY /
+	// HTTPS_PROXY / ALL_PROXY — that env proxy is the user's AI egress and
+	// generally cannot reach an internal LAN control plane (see pkg/httpdirect
+	// for the full rationale and the 2026-06-30 incident it fixed).
+	//
+	// "Always direct-reachable" is an assumption about the CUSTOMER's network,
+	// not a law, so 2026-08-03 made it configurable rather than compiled in: a
+	// site whose master is only reachable across a corporate proxy sets this
+	// (http/https/socks5 with host:port) instead of needing a new build.
+	//
+	// 🚫 NOT the same as UpstreamProxy above: that one is the AI egress. Setting
+	// this does NOT route model traffic, and setting UpstreamProxy does NOT
+	// route control-plane traffic. Two lanes, two settings, on purpose — the
+	// control plane must stay reachable when the egress lane is down.
+	ControlPlaneProxy string `yaml:"control_plane_proxy,omitempty"`
 	// ConsoleURL is the base URL of THIS machine's local AiKey console
 	// (aikey-local-server web, e.g. "http://127.0.0.1:8090"). Used to assemble
 	// user-facing login links in structured errors (OAUTH_GROUP_MEMBER_LOGIN_

@@ -32,6 +32,7 @@ import (
 	"github.com/AiKeyLabs/aikey-proxy/internal/sysproxy"
 	"github.com/AiKeyLabs/aikey-proxy/internal/vault"
 	"github.com/AiKeyLabs/aikey-proxy/internal/vkeys"
+	"github.com/AiKeyLabs/pkg/httpdirect"
 
 	broker "github.com/AiKeyLabs/aikey-auth-broker"
 	"github.com/AiKeyLabs/pkg/aikeycompat"
@@ -193,6 +194,23 @@ func Run() {
 		"listen", cfg.Listen.Addr(),
 		"vault", cfg.Vault.Path,
 	)
+
+	// 2b. Control-plane egress (2026-08-03). Default direct; an operator can
+	// point control-plane traffic at an explicit proxy for a site whose master
+	// is only reachable across one. A bad value FAILS the boot rather than
+	// degrading to direct: silently ignoring it would look identical to a
+	// working config right up to the day the proxy is actually needed.
+	if err := httpdirect.SetProxyOverride(cfg.ControlPlaneProxy); err != nil {
+		slog.Error("invalid control_plane_proxy — refusing to start",
+			"error", err, "value", cfg.ControlPlaneProxy)
+		os.Exit(1)
+	}
+	if via := httpdirect.ProxyOverride(); via != "" {
+		slog.Info("control-plane traffic routed through an explicit proxy",
+			"event.name", observability.EventProxyConfigLoaded,
+			"control_plane_proxy", via,
+		)
+	}
 
 	// 3. Get master password.
 	password, err := getVaultPassword()
