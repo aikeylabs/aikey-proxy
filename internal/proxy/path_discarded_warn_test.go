@@ -415,3 +415,109 @@ func serveOnceCapturingLogsAt(t *testing.T, storedBaseURL, upstreamURL, clientPa
 	p.serveRoute(w, r, route, prov, "k", "", time.Now(), logger)
 	return logBuf.String()
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// P4.4 layer L4 (test-plan T-30) — "did the request REALLY go there?"
+// ─────────────────────────────────────────────────────────────────────────────
+
+// TestL4_NewRowsRouteToTheAddressTheConsoleShowed is the layer that a created
+// credential, a green list page and a correct database row all fail to prove.
+//
+// L1 (row exists), L2 (columns carry the right values) and L3 (provider_code is
+// canonical) are covered in aikey-control-master's cascade matrix against the
+// real schema. None of them touches a request. D-3's whole shape was a
+// credential that was created successfully, stored correctly, displayed
+// correctly — and could never route, because the failure happened in a different
+// process at a different time.
+//
+// So this sends a real request per new row and asserts the path the upstream was
+// actually asked for.
+//
+// 🔴 The upstream is a local mock, which the test plan chose deliberately: it
+// verifies "we stitched the URL correctly and picked the right wire adapter",
+// which is what this change is responsible for. It does NOT verify that the
+// vendor accepts the request. Those are different claims and the acceptance
+// report keeps them apart — E1/E2 against a real DeepSeek key remain outstanding.
+func TestL4_NewRowsRouteToTheAddressTheConsoleShowed(t *testing.T) {
+	// Exactly what the dialog auto-fills for each of these selections, and the
+	// path the upstream must therefore see.
+	cases := []struct {
+		name       string
+		storedPath string // the path half of the URL the console displayed
+		protocol   string
+		clientPath string
+		wantPath   string
+		why        string
+	}{
+		{
+			name: "deepseek · anthropic (the change's headline)", storedPath: "/anthropic/v1",
+			protocol: "anthropic", clientPath: "/v1/messages", wantPath: "/anthropic/v1/messages",
+			why: "the new second face. If /anthropic were dropped, an Anthropic body would reach the OpenAI endpoint",
+		},
+		{
+			name: "deepseek · openai_compatible (the pre-existing face)", storedPath: "/v1",
+			protocol: "openai_compatible", clientPath: "/v1/chat/completions", wantPath: "/v1/chat/completions",
+			why: "the same provider's original face must be untouched by its new sibling",
+		},
+		{
+			name: "qwen · anthropic (deepest prefix in the table)", storedPath: "/api/v2/apps/claude-code-proxy/v1",
+			protocol: "anthropic", clientPath: "/v1/messages", wantPath: "/api/v2/apps/claude-code-proxy/v1/messages",
+			why: "five path segments; a prefix-matching mistake here is invisible in the console",
+		},
+		{
+			name: "doubao · anthropic (/api/coding, sibling of /api/coding/v3)", storedPath: "/api/coding/v1",
+			protocol: "anthropic", clientPath: "/v1/messages", wantPath: "/api/coding/v1/messages",
+			why: "the Coding Plan anthropic endpoint, which must not be swallowed by its openai sibling",
+		},
+		{
+			name: "minimax · anthropic (multi-endpoint, default row)", storedPath: "/anthropic/v1",
+			protocol: "anthropic", clientPath: "/v1/messages", wantPath: "/anthropic/v1/messages",
+			why: "the endpoint sub-select's default must route like any other row",
+		},
+		{
+			name: "github_models · openai_compatible (no version segment)", storedPath: "/inference",
+			protocol: "openai_compatible", clientPath: "/chat/completions", wantPath: "/inference/chat/completions",
+			why: "version is empty here; appending one would invent an address that does not exist",
+		},
+	}
+
+	for _, c := range cases {
+		c := c
+		t.Run(c.name, func(t *testing.T) {
+			var seen []string
+			upstream := fenceUpstream(t, &seen)
+			hostPort := strings.TrimPrefix(upstream.URL, "http://")
+
+			// The CURRENT table, with this row's vendor host swapped for the local
+			// one — same host-keyed matching, same stitch, local socket.
+			base := "http://" + hostPort + c.storedPath
+			version := ""
+			for _, v := range []string{"/v1", "/v3", "/v4", "/v2"} {
+				if strings.HasSuffix(c.storedPath, v) {
+					version = v
+					break
+				}
+			}
+			prefix := strings.TrimSuffix(c.storedPath, version)
+			installTable(t, "provider_routes:\n"+
+				fmt.Sprintf("  - { host: %q, path_prefix: %q, protocol: %s, provider: l4vendor, base_url: %q, version: %q }\n",
+					hostPort, prefix, c.protocol, "http://"+hostPort+prefix, version))
+
+			logs := serveOnceCapturingLogsAt(t, base, upstream.URL, c.clientPath, c.protocol)
+
+			if len(seen) == 0 {
+				t.Fatalf("the upstream was never called — 'the credential exists and looks right' is exactly the evidence L4 exists to reject")
+			}
+			if got := seen[len(seen)-1]; got != c.wantPath {
+				t.Errorf("🔴 the console showed an address ending %q, the proxy sent the request to %q (want %q).\n  %s",
+					c.storedPath, got, c.wantPath, c.why)
+			}
+			// A correct route must be a QUIET one: neither degradation WARN belongs here.
+			for _, noise := range []string{"proxy.route.not_found", "proxy.route.path_discarded"} {
+				if strings.Contains(logs, noise) {
+					t.Errorf("a correctly-routed request logged %s — the row is in the table, nothing should be degraded or discarded.\n  logs:\n%s", noise, logs)
+				}
+			}
+		})
+	}
+}
