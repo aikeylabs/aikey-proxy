@@ -44,7 +44,7 @@ func TestIsHardRevoked_StatusAndMarkerMustBothAgree(t *testing.T) {
 		{"403 token_invalidated", http.StatusForbidden, "token_invalidated", "", true,
 			"same marker, same meaning, different status"},
 
-		// ── Unchanged: 401 behaviour ───────────────────────────────────────
+		// ── Unchanged: 401 behavior  ───────────────────────────────────────
 		{"401 saying revoked", http.StatusUnauthorized, "", `{"error":{"message":"OAuth token has been revoked"}}`, true, ""},
 		{"401 detail unauthorized", http.StatusUnauthorized, "", `{"detail":"Unauthorized"}`, true, ""},
 

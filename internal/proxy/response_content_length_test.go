@@ -120,7 +120,7 @@ func TestResponse_BodyIsNotTruncatedWhenTheModelNameIsRestored(t *testing.T) {
 	proxySrv := httptest.NewServer(http.HandlerFunc(p.Handle))
 	defer proxySrv.Close()
 
-	req, err := http.NewRequest(http.MethodPost, proxySrv.URL+"/v1/messages",
+	req, err := http.NewRequestWithContext(t.Context(), http.MethodPost, proxySrv.URL+"/v1/messages",
 		strings.NewReader(`{"model":"claude-sonnet-4-5","max_tokens":16,"messages":[{"role":"user","content":"hi"}]}`))
 	if err != nil {
 		t.Fatalf("build request: %v", err)
@@ -202,7 +202,7 @@ func TestResponse_BodyIsNotTruncatedAfterAFallbackSwitch(t *testing.T) {
 	proxySrv := httptest.NewServer(http.HandlerFunc(p.Handle))
 	defer proxySrv.Close()
 
-	req, _ := http.NewRequest(http.MethodPost, proxySrv.URL+"/v1/messages",
+	req, _ := http.NewRequestWithContext(t.Context(), http.MethodPost, proxySrv.URL+"/v1/messages",
 		strings.NewReader(`{"model":"claude-sonnet-4-5","max_tokens":16,"messages":[{"role":"user","content":"hi"}]}`))
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Authorization", "Bearer aikey_team_cl2")

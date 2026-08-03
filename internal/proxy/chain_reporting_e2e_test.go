@@ -8,7 +8,7 @@ package proxy
 // `capturingEventStore`, which the proxy hands events to directly. That proves
 // what the proxy DECIDED. It does not prove anything about what it SENDS: the
 // upload path (events.Reporter → WAL → batch → HTTP POST
-// `/v1/usage-events:batch`) is a different pipeline with its own serialisation,
+// `/v1/usage-events:batch`) is a different pipeline with its own serialization,
 // its own batching, and its own field set, and up to now the events reaching a
 // collector in testing had been posted BY HAND. Hand-posting a payload proves
 // the collector accepts that payload; it says nothing about whether the proxy
@@ -180,7 +180,7 @@ func TestChain_ProxyUploadsBothHopsToACollector(t *testing.T) {
 	proxySrv := httptest.NewServer(http.HandlerFunc(p.Handle))
 	defer proxySrv.Close()
 
-	req, _ := http.NewRequest(http.MethodPost, proxySrv.URL+"/v1/messages",
+	req, _ := http.NewRequestWithContext(t.Context(), http.MethodPost, proxySrv.URL+"/v1/messages",
 		strings.NewReader(`{"model":"claude-sonnet-4-5","max_tokens":16,"messages":[{"role":"user","content":"hi"}]}`))
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Authorization", "Bearer aikey_team_rep")

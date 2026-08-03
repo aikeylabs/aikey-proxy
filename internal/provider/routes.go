@@ -28,7 +28,7 @@ func Routes() *providerroutes.Table {
 // The table is keyed by HOST, and the embedded yaml only knows real vendor
 // hosts. So anything that depends on a request being MAPPED — model mapping and
 // the response-side model restoration it implies — simply does not engage
-// against an `httptest` server on 127.0.0.1, and every test of that behaviour
+// against an `httptest` server on 127.0.0.1, and every test of that behavior
 // silently exercises the passthrough path instead.
 //
 // That is not hypothetical. The response-truncation defect
