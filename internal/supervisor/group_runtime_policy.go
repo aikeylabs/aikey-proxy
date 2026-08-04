@@ -26,6 +26,7 @@ import (
 	"io"
 	"log/slog"
 	"net/http"
+	"runtime"
 	"sort"
 	"time"
 
@@ -297,10 +298,19 @@ func fetchGroupRuntime(ctx context.Context, masterURL, bearer string, observedRe
 		// self-restart. Non-net-change errors (master 5xx, timeout) don't touch
 		// the healer — they aren't a routing-stale symptom.
 		if isNetChangeDialErr(err) {
-			if d := controlPlaneHeal.onPollNetChange(masterURL); d == restartSkipBreaker {
+			switch d := controlPlaneHeal.onPollNetChange(masterURL); d {
+			case restartSkipBreaker:
 				slog.Error("control-plane stuck reaching master after network change; restart budget exhausted — manual `aikey proxy restart` may be needed",
 					"event.name", observability.EventProxyControlPlaneRestartExhausted, "error", err.Error())
-			} else {
+			case restartSkipUnsupervised:
+				// Tier1 ran; Tier3 is deliberately not available on this
+				// platform (nothing would relaunch us — see
+				// selfRestartIsSupervised). Say so plainly rather than
+				// letting the "client rebuilt" line imply we recovered.
+				slog.Error("control-plane still stuck reaching master after a client rebuild, and this platform does not relaunch an exited proxy — run `aikey proxy restart`",
+					"event.name", observability.EventProxyControlPlaneRestartExhausted,
+					"goos", runtime.GOOS, "error", err.Error())
+			default:
 				slog.Warn("control-plane client rebuilt after network-change dial error",
 					"event.name", observability.EventProxyControlPlaneClientRebuilt, "caller", "group_runtime_poll",
 					"error", err.Error())

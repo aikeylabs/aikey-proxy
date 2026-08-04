@@ -32,6 +32,7 @@ import (
 	"errors"
 	"net"
 	"net/http"
+	"runtime"
 	"strings"
 	"sync"
 	"syscall"
@@ -40,17 +41,78 @@ import (
 	"github.com/AiKeyLabs/aikey-proxy/internal/httpx"
 )
 
-// isNetChangeDialErr reports whether err is a routing-layer dial failure of the
-// kind a host network change produces — "no route to host" (EHOSTUNREACH),
-// "network is unreachable" (ENETUNREACH), or "network is down" (ENETDOWN). These
-// are the errno's the kernel returns when a long-running process's routing/source
-// state has gone stale relative to the current interfaces.
+// Winsock error codes for the routing-layer failures a host network change
+// produces on Windows. These are NOT reachable through the stdlib's
+// syscall.EHOSTUNREACH / ENETUNREACH / ENETDOWN: on Windows those three are
+// SYNTHETIC constants (syscall/zerrors_windows.go defines them as
+// APPLICATION_ERROR offsets so that portable Go code still compiles), and the
+// Windows socket stack never returns them. A real failed connect() surfaces as
+// syscall.Errno holding the raw WSA value below, which equals none of them —
+// which is exactly why the pre-2026-08-04 classifier could not fire on Windows
+// at all (see the doc on isNetChangeDialErr).
 //
-// WHY string-match as well as errors.Is: syscall errno constants are defined
-// per-GOOS (Windows uses WSAE* values), so a portable classifier can't rely on
-// errors.Is(err, syscall.EHOSTUNREACH) alone on every platform. We check the
-// unix errno's where they exist (cheap, exact) AND fall back to the stable
-// error-string tails Go formats them into, which are identical across platforms.
+// Declared here as plain numbers rather than pulling in
+// golang.org/x/sys/windows: these are frozen Winsock ABI values documented by
+// Microsoft (WSAENETDOWN/WSAENETUNREACH/WSAEHOSTUNREACH), and a whole extra
+// dependency for three integers is a worse trade than a comment that names
+// them.
+const (
+	wsaeNetDown     = syscall.Errno(10050) // WSAENETDOWN
+	wsaeNetUnreach  = syscall.Errno(10051) // WSAENETUNREACH
+	wsaeHostUnreach = syscall.Errno(10065) // WSAEHOSTUNREACH
+)
+
+// isNetChangeErrnoFor reports whether err carries a routing-layer errno for the
+// given GOOS. Split out (and parameterised on goos rather than reading
+// runtime.GOOS directly) so the Windows branch is exercisable from a test on
+// any host — the Windows-only bug this function exists to fix was invisible
+// precisely because nothing could test the Windows path off Windows.
+func isNetChangeErrnoFor(goos string, err error) bool {
+	// Unix errno's. On Windows these are the synthetic constants described
+	// above; keeping the check unconditional is harmless (nothing produces
+	// them there) and keeps the Unix path byte-for-byte what it was.
+	if errors.Is(err, syscall.EHOSTUNREACH) ||
+		errors.Is(err, syscall.ENETUNREACH) ||
+		errors.Is(err, syscall.ENETDOWN) {
+		return true
+	}
+	if goos != "windows" {
+		return false
+	}
+	// Windows: compare the raw WSA value. Guarded by goos because these
+	// numbers mean unrelated things in the Unix errno space.
+	var errno syscall.Errno
+	if errors.As(err, &errno) {
+		switch errno {
+		case wsaeNetDown, wsaeNetUnreach, wsaeHostUnreach:
+			return true
+		}
+	}
+	return false
+}
+
+// isNetChangeDialErr reports whether err is a routing-layer dial failure of the
+// kind a host network change produces — "no route to host" (EHOSTUNREACH /
+// WSAEHOSTUNREACH), "network is unreachable" (ENETUNREACH / WSAENETUNREACH), or
+// "network is down" (ENETDOWN / WSAENETDOWN). These are the errno's the kernel
+// returns when a long-running process's routing/source state has gone stale
+// relative to the current interfaces.
+//
+// WHY errno-first, string-second (corrected 2026-08-04): the previous version
+// claimed the error-string tails Go formats these into were "identical across
+// platforms". They are not. Windows renders them via FormatMessage as "A socket
+// operation was attempted to an unreachable host/network" and "A socket
+// operation encountered a dead network" — matching none of the Unix tails — and
+// errors.Is against the stdlib constants fails there too (see the WSA block
+// above). The net effect was that Tier1 client-rebuild and Tier3 self-restart
+// were unreachable on Windows, the platform most of the field reports come
+// from. Both halves are now platform-aware.
+//
+// The errno comparison is the load-bearing one; the string fallback is a
+// best-effort backstop only. It cannot be relied on for Windows in particular,
+// because FormatMessage returns LOCALISED text — a Chinese or German Windows
+// yields a message none of these substrings match. Anything that must work
+// off-English has to come from the numeric path.
 func isNetChangeDialErr(err error) bool {
 	if err == nil {
 		return false
@@ -62,16 +124,33 @@ func isNetChangeDialErr(err error) bool {
 	if errors.As(err, &opErr) && opErr.Op != "dial" {
 		return false
 	}
-	if errors.Is(err, syscall.EHOSTUNREACH) ||
-		errors.Is(err, syscall.ENETUNREACH) ||
-		errors.Is(err, syscall.ENETDOWN) {
+	if isNetChangeErrnoFor(runtime.GOOS, err) {
 		return true
 	}
 	s := strings.ToLower(err.Error())
-	return strings.Contains(s, "no route to host") ||
-		strings.Contains(s, "network is unreachable") ||
-		strings.Contains(s, "host is unreachable") ||
-		strings.Contains(s, "network is down")
+	return containsAny(s,
+		// Unix / Go-formatted tails.
+		"no route to host",
+		"network is unreachable",
+		"host is unreachable",
+		"network is down",
+		// Windows FormatMessage texts (English only — see the doc above).
+		// Matched on their distinctive tails so the leading "A socket
+		// operation..." boilerplate can't drift the match.
+		"unreachable host",
+		"unreachable network",
+		"dead network",
+	)
+}
+
+// containsAny reports whether s contains any of the given substrings.
+func containsAny(s string, subs ...string) bool {
+	for _, sub := range subs {
+		if strings.Contains(s, sub) {
+			return true
+		}
+	}
+	return false
 }
 
 // controlPlaneHealer holds the cooldown + circuit-breaker state that decides
@@ -104,15 +183,21 @@ type controlPlaneHealer struct {
 	now   func() time.Time
 	exit  func(code int)
 	probe func(masterURL string) bool // "is master reachable from a FRESH client?"
+
+	// supervised: does exiting non-zero actually get us relaunched here?
+	// False on Windows — see selfRestartIsSupervised. Injected (not read
+	// from runtime.GOOS inline) so both answers are testable on any host.
+	supervised bool
 }
 
 func newControlPlaneHealer() *controlPlaneHealer {
 	return &controlPlaneHealer{
-		threshold: 3, // ~3 poll cycles (~3 min) stuck before we consider a restart
-		cooldown:  2 * time.Minute,
-		window:    30 * time.Minute,
-		budget:    4,
-		now:       time.Now,
+		threshold:  3, // ~3 poll cycles (~3 min) stuck before we consider a restart
+		cooldown:   2 * time.Minute,
+		window:     30 * time.Minute,
+		budget:     4,
+		supervised: selfRestartIsSupervised(runtime.GOOS),
+		now:        time.Now,
 		// Production: request a GRACEFUL restart — main() runs the same
 		// srv.Shutdown + sup.Shutdown drain path as SIGTERM, then exits non-zero
 		// so launchd KeepAlive{SuccessfulExit:false} / systemd Restart=on-failure
@@ -156,11 +241,32 @@ func (h *controlPlaneHealer) onPollOK() {
 	h.mu.Unlock()
 }
 
+// selfRestartIsSupervised reports whether exiting non-zero will actually get
+// this process relaunched on the given GOOS.
+//
+// Tier3's entire premise is "exit and let the service manager bring us back":
+// launchd `KeepAlive{SuccessfulExit:false}` and systemd `Restart=on-failure`
+// both do exactly that. **Windows has no equivalent in our install.** The proxy
+// is normally spawned detached by `aikey proxy start`, which exits immediately
+// and supervises nothing; the installer's `AikeyProxy` ScheduledTask relaunches
+// at most 3 times and, in its own words, "with RestartCount exhausted it stays
+// dead". So on Windows an exit(75) is not a restart — it is an outage.
+//
+// This mattered the moment isNetChangeDialErr was fixed (2026-08-04). While the
+// classifier could never fire on Windows, Tier3 was unreachable there and the
+// missing supervisor was harmless. Making the classifier work would otherwise
+// have ARMED a suicide path on the one platform that cannot recover from it —
+// trading a self-healer that did nothing for one that ends the session. Tier1
+// (rebuild the client in-process) is the part that actually clears the stale
+// transport in the reference design, and it still runs everywhere.
+func selfRestartIsSupervised(goos string) bool { return goos != "windows" }
+
 // onPollNetChange handles a routing-layer poll failure: it always rebuilds the
 // shared client (Tier1), and once we've failed `threshold` consecutive poll
 // cycles it escalates — but ONLY if a FRESH client can reach master (proving the
-// staleness is ours, not a real outage) AND the cooldown/budget allow — by
-// exiting non-zero so the service manager relaunches a clean process (Tier3).
+// staleness is ours, not a real outage), the platform actually relaunches an
+// exited process, AND the cooldown/budget allow — by exiting non-zero so the
+// service manager relaunches a clean process (Tier3).
 // Returns the decision (for logging + tests); callers log with their vocabulary.
 func (h *controlPlaneHealer) onPollNetChange(masterURL string) restartDecision {
 	httpx.RebuildAllControlPlane() // Tier1: always cheap + safe
@@ -175,6 +281,11 @@ func (h *controlPlaneHealer) onPollNetChange(masterURL string) restartDecision {
 	// reaching master means we're the stale one → a restart will clear it.
 	if !h.probe(masterURL) {
 		return restartSkipCooldown // genuine outage — never restart into a dead net
+	}
+	// Tier3 gate: would exiting actually bring us back? On an unsupervised
+	// platform it would not, so we stop at Tier1 and let the caller say so.
+	if !h.supervised {
+		return restartSkipUnsupervised
 	}
 	d := h.shouldRestart()
 	if d == restartNow {
@@ -192,6 +303,11 @@ const (
 	restartSkipCooldown restartDecision = iota // too soon since the last restart
 	restartSkipBreaker                         // budget exhausted — stop restarting, log loudly
 	restartNow                                 // clear to restart
+	// restartSkipUnsupervised: this platform does not relaunch an exited
+	// process, so exiting would be an outage rather than a heal. Tier1 has
+	// already run; the caller should log that manual intervention may be
+	// needed instead of pretending a restart happened.
+	restartSkipUnsupervised
 )
 
 // shouldRestart records the intent and returns whether a restart is warranted
