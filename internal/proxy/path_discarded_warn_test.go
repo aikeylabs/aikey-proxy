@@ -517,10 +517,24 @@ func TestL4_NewRowsRouteToTheAddressTheConsoleShowed(t *testing.T) {
 			protocol: "anthropic", clientPath: "/v1/messages", wantPath: "/anthropic/v1/messages",
 			why: "the endpoint sub-select's default must route like any other row",
 		},
+		// 🔴 2026-08-03: this slot used to be github_models (`/inference`, no
+		// version segment). That vendor retired its API — both candidate paths
+		// answer 410 github_models_retirement_brownout — and the row is gone
+		// from the table, so the case now covers the unversioned shape through
+		// the row that is still real.
 		{
-			name: "github_models · openai_compatible (no version segment)", storedPath: "/inference",
-			protocol: "openai_compatible", clientPath: "/chat/completions", wantPath: "/inference/chat/completions",
-			why: "version is empty here; appending one would invent an address that does not exist",
+			name: "perplexity · openai_compatible (no version segment, client sends one)", storedPath: "",
+			protocol: "openai_compatible", clientPath: "/v1/chat/completions", wantPath: "/chat/completions",
+			why: "version is empty here; appending one would invent an address that does not exist, " +
+				"and FORWARDING the client's own /v1 invents one too — perplexity answers 401 on " +
+				"/chat/completions and 404 on /v1/chat/completions. This is the L4 half of the " +
+				"unconditional-strip fix: computing the right URL and sending the request there " +
+				"are different claims",
+		},
+		{
+			name: "perplexity · openai_compatible (no version segment, client omits one)", storedPath: "",
+			protocol: "openai_compatible", clientPath: "/chat/completions", wantPath: "/chat/completions",
+			why: "the other real client shape must land in the same place — one rule, no special case",
 		},
 	}
 
