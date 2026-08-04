@@ -134,6 +134,66 @@ func TestAttribution_CostFollowsTheServingUpstream(t *testing.T) {
 	}
 }
 
+// 🔴 The same invariant for `request_id` — and this is the one that actually
+// counts, because it is the key the shipped measure dedups on.
+//
+// Task 3.10 was written against `trace_id`, and the fence below pins that. But
+// `trace_id` is never projected into `usage_fact_dwd`: Order 11060 carried
+// ODS `request_id` instead and built `usage_reporting_fact.client_request_count`
+// on it (one row per request_id gets 1, its siblings get 0). So the dashboard's
+// 「请求数」 is a request_id dedup, and until 2026-08-04 nothing asserted that
+// request_id survives a hop.
+//
+// Both ids come from the same TraceContext today, created once at the HTTP entry
+// and inherited by every clone — which is exactly why this is worth pinning
+// rather than assuming: they are correct by a shared implementation detail, not
+// by anything that fails when it changes. Give the hops distinct request_ids and
+// every attempt row becomes its own "client request": the count silently
+// inflates by the number of upstreams we tried, and nothing anywhere goes red.
+func TestAttribution_EveryHopSharesOneRequestID(t *testing.T) {
+	store := &capturingEventStore{}
+	p, cap := twoHopChainWithStore(t, store)
+	cap.statusByHost["primary.invalid"] = 503
+
+	req, w := chainReq()
+	p.Handle(w, req)
+	_ = w
+
+	evs := store.recorded()
+	if len(evs) < 2 {
+		t.Fatalf("recorded %d events for a request that touched two upstreams, want 2", len(evs))
+	}
+	first := evs[0].RequestID
+	if first == "" {
+		t.Fatal("no request id on the usage event — client_request_count falls back to " +
+			"the stored request_count per row, so an empty id counts every attempt as its own request")
+	}
+	for i, ev := range evs {
+		if ev.RequestID != first {
+			t.Fatalf("hop %d has request_id %q, hop 0 has %q.\n"+
+				"usage_reporting_fact.client_request_count marks ONE row per request_id as the "+
+				"client request; distinct ids per hop make each attempt its own request and the "+
+				"reported request count comes out N× too high for every failover. The dashboard "+
+				"does not break — it just quietly bills the story wrong", i, ev.RequestID, first)
+		}
+	}
+
+	// And it must not be shared with a DIFFERENT request: an id that never varies
+	// (a constant, a zero value) would satisfy the loop above while collapsing
+	// every request in the org into one.
+	req2, w2 := chainReq()
+	p.Handle(w2, req2)
+	_ = w2
+	later := store.recorded()
+	if len(later) <= len(evs) {
+		t.Fatalf("second request recorded no events (%d then %d)", len(evs), len(later))
+	}
+	if later[len(later)-1].RequestID == first {
+		t.Error("a second, independent client request reused the first one's request_id — " +
+			"the sharing above would then be vacuous, and the whole org would count as one request")
+	}
+}
+
 // 🔴 3.10 / I25: one client request is one `trace_id`, however many hops it took.
 //
 // The risk is concrete: replaying the request body with a fresh trace context
