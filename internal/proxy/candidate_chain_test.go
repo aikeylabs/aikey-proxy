@@ -276,3 +276,42 @@ func TestChainFrom_UngroupedSiblingsAtOnePriorityAreNotAmbiguous(t *testing.T) {
 			"the user to go fix a route group that does not exist")
 	}
 }
+
+// Failover must stay an authored decision. Ungrouped siblings carry a defaulted
+// priority, so a chain built from them has no order anybody chose — trying the
+// second one on the first one's failure would silently route to an upstream the
+// administrator never ranked, and it would SUCCEED, so nothing would surface it.
+// 能红 (2026-08-03 review finding): drop `c.grouped` from canFailover and this
+// fires.
+func TestCanFailover_RequiresAnAuthoredGroupOrder(t *testing.T) {
+	ungrouped := &candidateChain{
+		candidates: []*vkeys.ResolvedRoute{
+			{ProviderCode: "anthropic", Priority: 1},
+			{ProviderCode: "zhipu", Priority: 1},
+		},
+		grouped: false,
+	}
+	if ungrouped.canFailover() {
+		t.Error("ungrouped siblings must stay single-shot: no administrator ordered them")
+	}
+
+	grouped := &candidateChain{
+		candidates: []*vkeys.ResolvedRoute{
+			{ProviderCode: "anthropic", Priority: 1, RouteGroupID: "rg-1"},
+			{ProviderCode: "zhipu", Priority: 2, RouteGroupID: "rg-1"},
+		},
+		grouped: true,
+	}
+	if !grouped.canFailover() {
+		t.Error("a real group chain must still fail over — that is the feature")
+	}
+
+	pinned := &candidateChain{
+		candidates: grouped.candidates,
+		grouped:    true,
+		pinned:     true,
+	}
+	if pinned.canFailover() {
+		t.Error("`aikey use` pinning must keep disabling failover (D-1③/F-16④)")
+	}
+}

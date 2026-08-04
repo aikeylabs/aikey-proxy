@@ -1249,6 +1249,47 @@ func (s *Supervisor) HealthSnapshot() observability.HealthSnapshot {
 	return snap
 }
 
+// ResolveUpstreamForSourceRef answers "which upstream would the DATA PLANE dial
+// for this credential?" — the question /admin/probe/ping must ask before it can
+// honestly claim to have tested that credential.
+//
+// 🔴 It resolves through proxy.ResolvePersonalUpstreamBase, the SAME function the
+// forwarding path calls. That sharing is the point, not an optimisation: the
+// probe used to guess the upstream from the provider code, so an entry with its
+// own base_url (a self-hosted gateway, an OAuth ingress) was tested against a
+// public host it never talks to. The verdict then tracked the wrong host in both
+// directions — red while the real gateway was healthy, and GREEN while it was
+// down. requirements/2026-07-18 §上游地址单一解析 「展示=执行」.
+//
+// Scope today is PERSONAL vault aliases — the shape `aikey test <alias>` sends
+// for a personal entry. Team / OAuth references resolve elsewhere (delivered
+// bindings, broker) and are NOT handled here yet; they return an error, which
+// the caller surfaces rather than papers over, so the gap stays visible instead
+// of silently degrading to the old guess.
+func (s *Supervisor) ResolveUpstreamForSourceRef(sourceRef, protocolHint string) (string, error) {
+	if strings.TrimSpace(sourceRef) == "" {
+		return "", fmt.Errorf("empty source_ref")
+	}
+	gen := s.active.Load()
+	if gen == nil || gen.vault == nil {
+		return "", fmt.Errorf("vault not available")
+	}
+	// The plaintext key is deliberately discarded: a reachability probe needs an
+	// ADDRESS, never a credential. This reader is the only one that exposes the
+	// entry's base_url, so the decryption is unavoidable here — keeping the value
+	// unnamed makes it impossible to leak into a log line or a response by a
+	// later edit.
+	_, entryProviderCode, entryBaseURL, err := gen.vault.GetPersonalKeyByAlias(sourceRef)
+	if err != nil {
+		return "", fmt.Errorf("resolve personal alias %q: %w", sourceRef, err)
+	}
+	base := proxy.ResolvePersonalUpstreamBase(entryBaseURL, entryProviderCode, protocolHint)
+	if base == "" {
+		return "", fmt.Errorf("no upstream address on file for %q", sourceRef)
+	}
+	return base, nil
+}
+
 // GetKeyCheckTargets resolves the active key's decrypted credentials for each
 // provider it supports. Used by GET /health/keys to probe key validity.
 // Returns nil (no error) when no key is active.

@@ -44,6 +44,18 @@ type Handler struct {
 	// Injected by the Supervisor. Used by GET /health/keys.
 	KeyChecksFn func() ([]KeyCheckTarget, error)
 
+	// ResolveUpstreamFn answers "which upstream would the DATA PLANE use for
+	// this credential?" for ProbePingRequest.SourceRef. Wired by the proxy,
+	// which owns the vault reader; it delegates to the same resolver the
+	// forwarding path calls, so probe and traffic cannot disagree
+	// (requirements/2026-07-18 §上游地址单一解析).
+	//
+	// Returns ("", err) when the reference cannot be resolved. 🔴 The caller
+	// must FAIL rather than fall back to a provider default: a silent fallback
+	// is precisely the bug this field exists to remove, and 「回落路径必须配告警」.
+	// Nil = not wired (older wiring / tests) → SourceRef is ignored.
+	ResolveUpstreamFn func(sourceRef, protocolHint string) (string, error)
+
 	// ReporterMetricsFn returns usage reporter counters (nil = reporter disabled).
 	ReporterMetricsFn func() *events.ReporterMetrics
 	// CollectorMetricsFn returns async collector counters — notably usage
@@ -989,9 +1001,30 @@ func providerBaseURLForProtocol(code, protocolType string) string {
 // ----------------------------------------------------------------------------
 
 // ProbePingRequest is the POST body for /admin/probe/ping.
+// probeResolveErrText renders a resolver error for the WARN line. A nil error
+// still deserves a reason: ResolveUpstreamFn may legitimately return ("", nil)
+// for "known credential, no upstream on file", and logging an empty
+// error.message there would make the two cases indistinguishable in the log —
+// exactly the ambiguity 「失败要显眼」 is about.
+func probeResolveErrText(err error) string {
+	if err == nil {
+		return "resolver returned an empty upstream"
+	}
+	return err.Error()
+}
+
 type ProbePingRequest struct {
 	Provider string `json:"provider"`           // canonical code: "anthropic", "openai", "kimi", ...
 	BaseURL  string `json:"base_url,omitempty"` // optional override; empty → default for provider
+	// SourceRef names the CREDENTIAL whose upstream should be probed — the same
+	// identifier the data plane resolves (a personal vault alias today).
+	//
+	// 🔴 Added 2026-08-03 as an OPTIONAL field, not a new endpoint, so an older
+	// CLI keeps its exact behaviour (careful-api-creation). When set, the proxy
+	// resolves the upstream with the SAME function the forwarding path uses
+	// instead of letting the caller guess it from `Provider` — see
+	// ResolveUpstreamFn and requirements/2026-07-18 §上游地址单一解析.
+	SourceRef string `json:"source_ref,omitempty"`
 }
 
 // ProbePingResponse is what the CLI reads back. `OK` is true iff the TCP
@@ -1001,6 +1034,13 @@ type ProbePingResponse struct {
 	Error     string `json:"error,omitempty"`
 	LatencyMs int64  `json:"latency_ms"`
 	OK        bool   `json:"ok"`
+	// ResolvedUpstream is the address actually dialled, echoed back so the
+	// caller can DISPLAY what was tested. 「展示=执行」 (requirements 2026-07-18
+	// §2) is unverifiable by a user who cannot see which address the probe
+	// chose — the old response named only the host, so a probe that silently
+	// substituted the public provider host looked identical to one that hit the
+	// entry's real gateway. Empty when the caller supplied the target itself.
+	ResolvedUpstream string `json:"resolved_upstream,omitempty"`
 }
 
 // ProbePing handles POST /admin/probe/ping.
@@ -1059,9 +1099,44 @@ func (h *Handler) ProbePing(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Resolve target host:port. Override wins; otherwise fall back to the
-	// well-known default URL for the provider code.
+	// Resolve target host:port.
+	//
+	// Precedence (2026-08-03): source_ref → explicit base_url → provider default.
+	//
+	// 🔴 source_ref FIRST, and it is authoritative. It names a credential, and
+	// only the proxy can say which upstream that credential actually talks to
+	// (the entry's own base_url overlays the route row). Letting the caller's
+	// `base_url` win here would re-open the exact split this field closes: the
+	// CLI would once again be a second source of truth for an address it cannot
+	// see. See requirements/2026-07-18 §上游地址单一解析.
 	baseURL := req.BaseURL
+	var resolvedUpstream string
+	if req.SourceRef != "" && h.ResolveUpstreamFn != nil {
+		resolved, rerr := h.ResolveUpstreamFn(req.SourceRef, req.Provider)
+		if rerr != nil || strings.TrimSpace(resolved) == "" {
+			// 🔴 FAIL LOUDLY. The predecessor of this branch guessed the public
+			// provider host whenever it had nothing better, which produced a
+			// verdict uncorrelated with the credential under test — green when
+			// the real upstream was down, red when it was fine. An unresolvable
+			// reference is a real defect (missing entry, corrupt row); reporting
+			// it is the whole point. 「回落路径必须配告警，🚫 不静默」.
+			logger.Warn("probe ping: cannot resolve the upstream for this credential — refusing to probe a guessed address",
+				"event.name", observability.EventProxyProbeUpstreamUnresolved,
+				"error.code", "PROBE_UPSTREAM_UNRESOLVED",
+				"source_ref", req.SourceRef,
+				"provider", req.Provider,
+				"error.message", probeResolveErrText(rerr),
+			)
+			writeJSON(w, http.StatusOK, ProbePingResponse{
+				OK: false,
+				Error: "cannot resolve the upstream address for '" + req.SourceRef +
+					"'. The credential may be missing from the vault, or the proxy may not have it loaded — run `aikey list` to confirm it exists, then `aikey proxy restart`.",
+			})
+			return
+		}
+		baseURL = resolved
+		resolvedUpstream = resolved
+	}
 	if baseURL == "" {
 		baseURL = providerDefaultBaseURL(req.Provider)
 	}
@@ -1212,18 +1287,20 @@ func (h *Handler) ProbePing(w http.ResponseWriter, r *http.Request) {
 			"error.message", err.Error(),
 		)
 		writeJSON(w, http.StatusOK, ProbePingResponse{
-			OK:        false,
-			LatencyMs: latency,
-			Host:      host,
-			Error:     classifyNetError(err),
+			OK:               false,
+			LatencyMs:        latency,
+			Host:             host,
+			Error:            classifyNetError(err),
+			ResolvedUpstream: resolvedUpstream,
 		})
 		return
 	}
 
 	writeJSON(w, http.StatusOK, ProbePingResponse{
-		OK:        true,
-		LatencyMs: latency,
-		Host:      host,
+		OK:               true,
+		LatencyMs:        latency,
+		Host:             host,
+		ResolvedUpstream: resolvedUpstream,
 	})
 }
 

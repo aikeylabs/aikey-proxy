@@ -475,3 +475,142 @@ func TestExtractHostPort(t *testing.T) {
 		}
 	}
 }
+
+// ── source_ref: the probe must test the CREDENTIAL's upstream ───────────────
+//
+// 2026-08-03. Before this, ProbePing resolved its target from `provider` alone:
+// a personal entry carrying its own base_url (self-hosted gateway, OAuth
+// ingress) was probed against the provider's PUBLIC host, which it never talks
+// to. The verdict then tracked the wrong host in both directions — red while
+// the real gateway was healthy, and GREEN while it was down. A green row for an
+// upstream that is unreachable is the more dangerous half.
+
+// The resolver's answer must WIN over a caller-supplied base_url. If the
+// caller's value could override it, the CLI would remain a second source of
+// truth for an address only the proxy can see — the split this field closes.
+func TestProbePing_SourceRefResolutionBeatsCallerSuppliedBaseURL(t *testing.T) {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	defer ln.Close()
+	go func() {
+		for {
+			c, aerr := ln.Accept()
+			if aerr != nil {
+				return
+			}
+			c.Close()
+		}
+	}()
+	real := "http://" + ln.Addr().String()
+
+	h := newHandlerForTest(&config.Config{})
+	var askedFor string
+	h.ResolveUpstreamFn = func(sourceRef, protocolHint string) (string, error) {
+		askedFor = sourceRef
+		return real, nil
+	}
+
+	// The caller names a DEAD address; only the resolver knows the live one.
+	body, _ := json.Marshal(ProbePingRequest{
+		Provider:  "anthropic",
+		BaseURL:   "http://127.0.0.1:1/dead",
+		SourceRef: "my-gateway-key",
+	})
+	rr := httptest.NewRecorder()
+	h.ProbePing(rr, httptest.NewRequest(http.MethodPost, "/admin/probe/ping", bytes.NewReader(body)))
+
+	var resp ProbePingResponse
+	if derr := json.NewDecoder(rr.Body).Decode(&resp); derr != nil {
+		t.Fatalf("decode: %v", derr)
+	}
+	if askedFor != "my-gateway-key" {
+		t.Errorf("resolver was not consulted for the credential (asked for %q)", askedFor)
+	}
+	if !resp.OK {
+		t.Errorf("probe used the caller's dead base_url instead of the resolved upstream: %+v", resp)
+	}
+	if resp.ResolvedUpstream != real {
+		t.Errorf("resolved_upstream not echoed back (%q != %q) — the caller cannot then DISPLAY "+
+			"the address that was tested, which is what 展示=执行 requires", resp.ResolvedUpstream, real)
+	}
+}
+
+// 🔴 An unresolvable reference must FAIL, never silently degrade to the
+// provider default. That degradation is the original defect: it produced a
+// verdict uncorrelated with the credential under test.
+func TestProbePing_UnresolvableSourceRefRefusesInsteadOfGuessing(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		fn   func(string, string) (string, error)
+	}{
+		{"error", func(string, string) (string, error) { return "", errors.New("not in vault") }},
+		{"empty", func(string, string) (string, error) { return "", nil }},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			h := newHandlerForTest(&config.Config{})
+			h.ResolveUpstreamFn = tc.fn
+
+			body, _ := json.Marshal(ProbePingRequest{Provider: "anthropic", SourceRef: "ghost"})
+			rr := httptest.NewRecorder()
+			h.ProbePing(rr, httptest.NewRequest(http.MethodPost, "/admin/probe/ping", bytes.NewReader(body)))
+
+			var resp ProbePingResponse
+			if derr := json.NewDecoder(rr.Body).Decode(&resp); derr != nil {
+				t.Fatalf("decode: %v", derr)
+			}
+			if resp.OK {
+				t.Fatal("probe reported OK for a credential whose upstream could not be resolved")
+			}
+			// Must not have fallen back to the public provider host.
+			if strings.Contains(resp.Host, "anthropic.com") || strings.Contains(resp.ResolvedUpstream, "anthropic.com") {
+				t.Errorf("fell back to the provider's public host (host=%q resolved=%q). A green/red "+
+					"verdict about api.anthropic.com says nothing about this credential's gateway",
+					resp.Host, resp.ResolvedUpstream)
+			}
+			if resp.Error == "" {
+				t.Error("refusal carried no explanation; 失败要显眼 requires an actionable reason")
+			}
+		})
+	}
+}
+
+// Backward compatibility: an older CLI sends no source_ref and must keep its
+// exact previous behaviour (the field is additive, not a migration).
+func TestProbePing_WithoutSourceRefBehaviourIsUnchanged(t *testing.T) {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	defer ln.Close()
+	go func() {
+		for {
+			c, aerr := ln.Accept()
+			if aerr != nil {
+				return
+			}
+			c.Close()
+		}
+	}()
+
+	h := newHandlerForTest(&config.Config{})
+	h.ResolveUpstreamFn = func(string, string) (string, error) {
+		t.Error("resolver consulted although the caller sent no source_ref")
+		return "", errors.New("must not be called")
+	}
+	body, _ := json.Marshal(ProbePingRequest{Provider: "anthropic", BaseURL: "http://" + ln.Addr().String()})
+	rr := httptest.NewRecorder()
+	h.ProbePing(rr, httptest.NewRequest(http.MethodPost, "/admin/probe/ping", bytes.NewReader(body)))
+
+	var resp ProbePingResponse
+	if derr := json.NewDecoder(rr.Body).Decode(&resp); derr != nil {
+		t.Fatalf("decode: %v", derr)
+	}
+	if !resp.OK {
+		t.Errorf("legacy caller path regressed: %+v", resp)
+	}
+	if resp.ResolvedUpstream != "" {
+		t.Errorf("resolved_upstream must stay empty when the caller supplied the target, got %q", resp.ResolvedUpstream)
+	}
+}

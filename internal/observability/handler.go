@@ -49,6 +49,17 @@ const (
 	// mihomo fragment). The raw engine error is logged at Debug only — it can
 	// quote the spec verbatim, credentials included (bugfix 2026-07-19).
 	EventProxyEgressPingEngineDialFailed = "proxy.egress.ping_engine_dial_failed"
+	// EventProxyProbeUpstreamUnresolved: /admin/probe/ping was asked to test a
+	// named credential (source_ref) but could not resolve which upstream that
+	// credential talks to, so it REFUSED to probe rather than substitute a
+	// guess (2026-08-03).
+	//
+	// Why this is WARN and not a silent default: the predecessor behaviour fell
+	// back to the provider's public host, which made the probe's verdict
+	// uncorrelated with the credential under test — green when the real gateway
+	// was down, red when it was fine. requirements/2026-07-18 §上游地址单一解析
+	// 「回落路径必须配告警，🚫 不静默」.
+	EventProxyProbeUpstreamUnresolved = "proxy.probe.upstream_unresolved"
 	// EventProxyEgressRequestAttribution: per-request egress traceability
 	// (2026-07-19). One Info line per forwarded request carrying trace_id +
 	// account_id + oauth_identity + egress_applied/engine/fingerprint, so a real

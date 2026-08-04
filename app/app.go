@@ -201,8 +201,11 @@ func Run() {
 	// degrading to direct: silently ignoring it would look identical to a
 	// working config right up to the day the proxy is actually needed.
 	if err := httpdirect.SetProxyOverride(cfg.ControlPlaneProxy); err != nil {
+		// 🔴 Redacted, never raw: a proxy spec legitimately carries credentials,
+		// and this is the one path where the value is printed. The scheme/host
+		// survive redaction, which is all an operator needs to spot the typo.
 		slog.Error("invalid control_plane_proxy — refusing to start",
-			"error", err, "value", cfg.ControlPlaneProxy)
+			"error", err, "value", httpdirect.Redact(cfg.ControlPlaneProxy))
 		os.Exit(1)
 	}
 	if via := httpdirect.ProxyOverride(); via != "" {
@@ -421,6 +424,7 @@ func Run() {
 	adminHandler.TotalErrorsFn = sup.TotalErrors
 	adminHandler.ReloadFn = sup.Reload
 	adminHandler.KeyChecksFn = sup.GetKeyCheckTargets
+	adminHandler.ResolveUpstreamFn = sup.ResolveUpstreamForSourceRef
 	adminHandler.ReporterMetricsFn = sup.ReporterMetrics
 	adminHandler.CollectorMetricsFn = sup.CollectorMetrics
 	adminHandler.ReplayDeadLetterFn = sup.ReplayDeadLetter

@@ -1361,17 +1361,14 @@ func (p *Proxy) handlePathPrefixRoute(w http.ResponseWriter, r *http.Request, pr
 		}
 
 		// Derive baseURL: entry's custom URL > entry's stored provider default >
-		// path-prefix canonical default. The last rung matters for personal
-		// keys that are bound to multiple providers (one alias, several
-		// provider_code rows via the bindings table) — path prefix
-		// disambiguates at probe time.
-		resolvedBase := entryBaseURL
-		if resolvedBase == "" && entryProviderCode != "" {
-			resolvedBase = providerDefaultBaseURL(entryProviderCode)
-		}
-		if resolvedBase == "" {
-			resolvedBase = providerDefaultBaseURL(canonicalCode)
-		}
+		// path-prefix canonical default.
+		//
+		// 🔴 2026-08-03 — this used to be inline here, which meant the FORWARDING
+		// path was the only code that could compute it. The connectivity probe
+		// therefore guessed the upstream from the provider code and tested an
+		// address this entry never talks to. Sharing one function is what makes
+		// 「展示=执行」 (requirements 2026-07-18) checkable rather than aspirational.
+		resolvedBase := ResolvePersonalUpstreamBase(entryBaseURL, entryProviderCode, canonicalCode)
 
 		prov, err := p.providers.Get(protocolType)
 		if err != nil {
@@ -1548,14 +1545,18 @@ func (p *Proxy) handlePathPrefixRoute(w http.ResponseWriter, r *http.Request, pr
 					realKey = plaintext
 					virtualKeyID = "personal:" + cfg.KeyRef
 					keyAlias = cfg.KeyRef
-					switch {
-					case entryBaseURL != "":
-						baseURL = entryBaseURL
-					case pcode != "":
-						baseURL = providerDefaultBaseURL(pcode)
-					default:
-						baseURL = providerDefaultBaseURL(canonicalCode)
-					}
+					// 🔴 2026-08-03 — was a second, hand-written copy of the same
+					// precedence ladder, and the copies had DRIFTED: this switch
+					// stopped at `case pcode != ""`, so an entry naming a provider
+					// with no route row produced an EMPTY upstream, while the
+					// sentinel path fell through to the path-derived provider and
+					// resolved fine. Same key, same vault — `aikey test` green,
+					// real traffic broken (or the reverse).
+					//
+					// Found by the 「展示=执行」 fence added with the shared resolver,
+					// which is the point of writing that fence as a structural scan
+					// rather than a value comparison.
+					baseURL = ResolvePersonalUpstreamBase(entryBaseURL, pcode, canonicalCode)
 				}
 			}
 		}

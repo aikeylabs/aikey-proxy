@@ -95,7 +95,19 @@ type candidateChain struct {
 func (c *candidateChain) primary() *vkeys.ResolvedRoute { return c.candidates[0] }
 
 // canFailover reports whether this request may try a second upstream.
-func (c *candidateChain) canFailover() bool { return !c.pinned && len(c.candidates) > 1 }
+//
+// 🔴 `grouped` is part of the condition, not decoration (2026-08-03 review).
+// Failover is an ADMINISTRATOR'S ordering decision, and a route group is the
+// only place that order is authored. Ungrouped siblings reach the chain with a
+// DEFAULTED priority (the vault reader supplies 1 for an absent column), so
+// "more than one candidate" there means nothing was ever ordered — switching
+// vendors on that basis would move a request to an upstream nobody chose, and
+// the caller would see a success, so nothing would report it. The struct doc on
+// `grouped` already promised single-shot for those rows; the count-only check
+// silently broke that promise.
+func (c *candidateChain) canFailover() bool {
+	return !c.pinned && c.grouped && len(c.candidates) > 1
+}
 
 // exhaustedCode names the terminal error for a chain whose candidates all failed.
 //
