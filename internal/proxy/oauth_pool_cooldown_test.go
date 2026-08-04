@@ -69,6 +69,27 @@ func TestCooldownDecision_Classification(t *testing.T) {
 			poolCooldown429NoReset, until, ok)
 	}
 
+	// A temporary aggregate rate-limit is NOT evidence that either quota window
+	// is exhausted. The aggregate reset can point hours ahead even while both
+	// concrete windows remain allowed and below 100%; using it here strands a
+	// healthy account. Honor the provider's short Retry-After instead.
+	temporaryWithFarAggregateReset := http.Header{
+		"Anthropic-Ratelimit-Unified-Status":         {"rate_limited"},
+		"Anthropic-Ratelimit-Unified-Reset":          {strconv.FormatInt(now.Add(3*time.Hour).Unix(), 10)},
+		"Anthropic-Ratelimit-Unified-5h-Status":      {"allowed"},
+		"Anthropic-Ratelimit-Unified-5h-Utilization": {"0.42"},
+		"Anthropic-Ratelimit-Unified-7d-Status":      {"allowed"},
+		"Anthropic-Ratelimit-Unified-7d-Utilization": {"0.57"},
+		"Retry-After": {"2"},
+	}
+	if until, ok := cooldownDecision(resp(429, temporaryWithFarAggregateReset), now); !ok || until != now.Add(2*time.Second) {
+		t.Fatalf("temporary aggregate 429 must honor Retry-After instead of the far aggregate reset, got until=%v ok=%v", until, ok)
+	}
+	state := cooldownRouteState(resp(429, temporaryWithFarAggregateReset), now, now.Add(2*time.Second))
+	if state.Status != poolRouteRateLimited || state.RetryAt != now.Add(2*time.Second).Unix() {
+		t.Fatalf("temporary aggregate 429 must remain rate_limited with the short retry, got %+v", state)
+	}
+
 	// 429 WITHOUT any rate-limit signal = WAF business rejection → NOT the
 	// account's fault, do not cool it down.
 	if _, ok := cooldownDecision(resp(429, nil), now); ok {
@@ -265,6 +286,23 @@ func TestPoolCooldownStore_MarkAndExpire(t *testing.T) {
 	}
 	if len(s.m) != 0 {
 		t.Fatalf("lapsed entry must be pruned, map still has %d", len(s.m))
+	}
+}
+
+func TestPoolCooldownStore_EarliestRetryAfterSeconds(t *testing.T) {
+	t.Setenv("AIKEY_RUN_DIR", t.TempDir())
+	now := time.Unix(1_750_000_000, 500_000_000)
+	s := &poolCooldownStore{m: map[string]time.Time{}, now: func() time.Time { return now }}
+	s.mark("route-later", now.Add(5*time.Second))
+	s.mark("route-earlier", now.Add(1500*time.Millisecond))
+	s.mark("other-route", now.Add(time.Second))
+
+	seconds, ok := s.earliestRetryAfterSeconds(
+		map[string]bool{"route-later": true, "route-earlier": true},
+		map[string]bool{"route-later": true, "route-earlier": true, "other-route": true},
+	)
+	if !ok || seconds != 2 {
+		t.Fatalf("earliest route cooldown must round 1.5s up to 2s, got seconds=%d ok=%v", seconds, ok)
 	}
 }
 

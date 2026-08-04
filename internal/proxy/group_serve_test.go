@@ -648,6 +648,53 @@ func TestGroupServe_CooldownOn401(t *testing.T) {
 	}
 }
 
+// A sole Team OAuth account under a temporary provider throttle must tell the
+// client when it can retry, then re-enter routing automatically at the deadline.
+// This is the all-accounts-cooling path seen by Claude as GROUP_ALL_UNUSABLE.
+func TestGroupServe_TemporaryCooldownAdvertisesRetryAndAutoRecovers(t *testing.T) {
+	key := grKey()
+	refs := []vkeys.GroupAccountRef{{AccountID: "acc-1", ProviderCode: "anthropic"}}
+	mat := map[string]vkeys.GroupRuntimeAccount{
+		"acc-1": encMat(t, key, vkeys.GroupRuntimeAccount{
+			CredentialType: "oauth_account", ExpiresAt: 9_000_000_000, ExternalID: "uuid-1",
+		}, "tok-1"),
+	}
+	route := &vkeys.ResolvedRoute{
+		VirtualKeyID: "vk-grp", Provider: "anthropic", ProtocolType: "anthropic",
+		ProviderCode: "anthropic", RouteSource: "team",
+		SeatID: "seat-1", OauthGroupID: "grp-1",
+		GroupAccounts: mustJSON(t, refs), GroupRuntime: mustJSON(t, mat),
+	}
+	p, tr := setupGroupProxy(t, key, route)
+	now := time.Unix(1_750_000_000, 0)
+	p.poolCooldown.now = func() time.Time { return now }
+	p.poolCooldown.markWithState("acc-1", now.Add(2*time.Second), PoolAccountRouteState{
+		Status: poolRouteRateLimited, RetryAt: now.Add(2 * time.Second).Unix(),
+	})
+
+	req, blocked := groupReq(groupBody)
+	p.Handle(blocked, req)
+	if blocked.Code != http.StatusTooManyRequests || !strings.Contains(blocked.Body.String(), "GROUP_ALL_UNUSABLE") {
+		t.Fatalf("temporarily cooled sole account must yield GROUP_ALL_UNUSABLE 429, got %d: %s", blocked.Code, blocked.Body.String())
+	}
+	if got := blocked.Header().Get("Retry-After"); got != "2" {
+		t.Fatalf("all-cooldown 429 Retry-After=%q, want earliest recovery in 2 seconds", got)
+	}
+	if tr.calls != 0 {
+		t.Fatalf("cooling account must not reach upstream, calls=%d", tr.calls)
+	}
+
+	now = now.Add(3 * time.Second)
+	req, recovered := groupReq(groupBody)
+	p.Handle(recovered, req)
+	if recovered.Code != http.StatusOK {
+		t.Fatalf("account must re-enter automatically after cooldown, got %d: %s", recovered.Code, recovered.Body.String())
+	}
+	if tr.calls != 1 {
+		t.Fatalf("recovered request must reach upstream once, calls=%d", tr.calls)
+	}
+}
+
 // N8c discrimination: a WAF business-rejection 429 (no rate-limit signal) must
 // NOT cool the account down — it's the request persona, not the account.
 func TestGroupServe_NoCooldownOnWAF429(t *testing.T) {

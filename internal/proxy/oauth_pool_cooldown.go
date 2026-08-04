@@ -41,7 +41,8 @@ const (
 	// transient per-minute rate-limit class (R4: 限流→短退避, never the 5-min
 	// exhaustion treatment; over-cooling pulled a good account for 5min and
 	// scattered its cache). sub2api's analogous fallback is 5s; ours is a bit
-	// longer to avoid hammering. Structural default, tunable.
+	// longer to avoid hammering. Keep one code-level default until a product-level
+	// policy setting is explicitly introduced; provider Retry-After takes priority.
 	poolCooldown429NoReset = 30 * time.Second
 
 	// poolCooldown529Overload (P0-B, 2026-07-19): a 529 is the upstream's OWN
@@ -404,6 +405,38 @@ func (s *poolCooldownStore) skipSet() map[string]bool {
 	return out
 }
 
+// earliestRetryAfterSeconds returns the first active cooldown deadline among
+// the route accounts currently skipped by the resolver. Round up so the client
+// never retries in the final fractional second before the account is eligible.
+// Expiry cleanup remains owned by skipSet; stale entries are simply ignored.
+func (s *poolCooldownStore) earliestRetryAfterSeconds(routeIDs, skip map[string]bool) (int, bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	now := s.now()
+	var earliest time.Time
+	for id := range routeIDs {
+		if !skip[id] {
+			continue
+		}
+		until, ok := s.m[id]
+		if !ok || !now.Before(until) {
+			continue
+		}
+		if earliest.IsZero() || until.Before(earliest) {
+			earliest = until
+		}
+	}
+	if earliest.IsZero() {
+		return 0, false
+	}
+	remaining := earliest.Sub(now)
+	seconds := int((remaining + time.Second - 1) / time.Second)
+	if seconds < 1 {
+		seconds = 1
+	}
+	return seconds, true
+}
+
 // routeStateSnapshot returns the active whole-account display states. It uses
 // the same expiry test as skipSet, so the UI cannot claim an account is still
 // exhausted after routing has admitted it again. The returned map is detached.
@@ -530,10 +563,10 @@ func (s *poolCooldownStore) snapshot() map[string]int {
 
 // cooldownDecision classifies an upstream response: when the chosen pool account
 // should be cooled down, returns (avoid-until, true). 401 → broken account.
-// 429 with limit EVIDENCE → cool for the best reset we can read (codex window
-// reset → unified reset epoch → Retry-After → short no-reset fallback). 429
-// WITHOUT evidence (suspected WAF / business rejection) and everything else →
-// (_, false).
+// 429 with limit EVIDENCE → cool for the best reset we can read. A concrete
+// exhausted window uses its window reset; an aggregate temporary limit uses
+// Retry-After or the short fallback. 429 WITHOUT evidence (suspected WAF /
+// business rejection) and everything else → (_, false).
 func cooldownDecision(resp *http.Response, now time.Time) (time.Time, bool) {
 	switch resp.StatusCode {
 	case http.StatusUnauthorized:
@@ -549,16 +582,14 @@ func cooldownDecision(resp *http.Response, now time.Time) (time.Time, bool) {
 			return time.Time{}, false // suspected WAF / business rejection — not the account's fault
 		}
 		// Cooldown length comes from the reset EVIDENCE (sub2api-style, B1 fix
-		// 2026-07-19): codex window reset first (R37/D9), then the anthropic
-		// unified reset epoch of the exhausted window (closes the 0630-audit #18
-		// gap — the reactive path never consumed unified-reset), then Retry-After.
-		// Evidence of limiting but NO reset info anywhere = the transient
-		// per-minute class → SHORT cool (0630-audit #8 / E9 三分类: the flat 5-min
-		// default over-cooled a good account exactly like a 5h exhaustion).
+		// 2026-07-19): a concrete exhausted window may use its reset, while the
+		// aggregate `rate_limited` status alone is transient and must not inherit
+		// a representative reset that can be hours away. Evidence of limiting but
+		// no actionable reset uses the short fallback.
 		d := poolCooldown429NoReset
 		if cx := codexRateLimitReset(resp.Header); cx > 0 {
 			d = cx
-		} else if ar := anthropicUnifiedResetDuration(resp.Header, now); ar > 0 {
+		} else if ar := anthropicExhaustedWindowResetDuration(resp.Header, now); ar > 0 {
 			d = ar
 		} else if ra := retryAfterDuration(resp.Header); ra > 0 {
 			d = ra
@@ -590,7 +621,7 @@ func cooldownRouteState(resp *http.Response, now, cooldownUntil time.Time) PoolA
 			state.Status = poolRouteWindowExhausted
 			if d := codexRateLimitReset(resp.Header); d > 0 {
 				state.RetryAt = now.Add(d).Unix()
-			} else if d := anthropicUnifiedResetDuration(resp.Header, now); d > 0 {
+			} else if d := anthropicExhaustedWindowResetDuration(resp.Header, now); d > 0 {
 				state.RetryAt = now.Add(d).Unix()
 			}
 		}
@@ -604,10 +635,6 @@ func cooldownRouteState(resp *http.Response, now, cooldownUntil time.Time) PoolA
 // itself is a transient throttling hint, not proof that a quota window is full.
 // The Mock Provider and real upstreams expose 100%-used/status evidence here.
 func windowExhaustionEvidence(h http.Header) bool {
-	switch strings.ToLower(strings.TrimSpace(h.Get("anthropic-ratelimit-unified-status"))) {
-	case "exceeded", "exhausted":
-		return true
-	}
 	if anthropicWindowExhausted(h, "5h") || anthropicWindowExhausted(h, "7d") {
 		return true
 	}
@@ -668,35 +695,21 @@ func anthropicExhaustionEvidence(h http.Header) bool {
 	return false
 }
 
-// anthropicUnifiedResetDuration derives the cooldown from the unified reset
-// epochs of the EXHAUSTED window(s): the longest reset among windows at/over 1.0
-// utilization (same never-un-cool-into-a-full-window insight as codex D9), else
-// the aggregate unified-reset epoch. Returns 0 when no future epoch is readable
-// (caller falls back to Retry-After / the short no-reset cool).
-func anthropicUnifiedResetDuration(h http.Header, now time.Time) time.Duration {
-	epochAfter := func(key string) (time.Time, bool) {
-		if v := h.Get(key); v != "" {
-			if epoch, err := strconv.ParseInt(v, 10, 64); err == nil && epoch > 0 {
-				if t := time.Unix(epoch, 0); t.After(now) {
-					return t, true
-				}
-			}
-		}
-		return time.Time{}, false
-	}
+// anthropicExhaustedWindowResetDuration derives the cooldown only from concrete
+// exhausted 5h/7d windows. The aggregate unified reset is accepted solely as a
+// compatibility fallback for a window already proven exhausted; it must never
+// turn aggregate `rate_limited` telemetry into an hours-long account removal.
+// Returns 0 when no window is exhausted or no future reset is readable, so the
+// caller can honor Retry-After or use the short transient fallback.
+func anthropicExhaustedWindowResetDuration(h http.Header, now time.Time) time.Duration {
 	var best time.Time
-	if u, ok := parseUtil(h, hdrUtil5h); ok && u >= 1.0 {
-		if t, ok := epochAfter(hdrReset5h); ok && t.After(best) {
+	if anthropicWindowExhausted(h, "5h") {
+		if t := anthropicWindowResetTime(h, "5h", now); t.After(best) {
 			best = t
 		}
 	}
-	if u, ok := parseUtil(h, hdrUtil7d); ok && u >= 1.0 {
-		if t, ok := epochAfter(hdrReset7d); ok && t.After(best) {
-			best = t
-		}
-	}
-	if best.IsZero() {
-		if t, ok := epochAfter(hdrReset); ok {
+	if anthropicWindowExhausted(h, "7d") {
+		if t := anthropicWindowResetTime(h, "7d", now); t.After(best) {
 			best = t
 		}
 	}

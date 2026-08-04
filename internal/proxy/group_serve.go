@@ -26,6 +26,7 @@ import (
 	"io"
 	"log/slog"
 	"net/http"
+	"strconv"
 	"strings"
 	"time"
 
@@ -184,6 +185,7 @@ func (p *Proxy) handleOauthGroupRoute(
 			// this only when this request has no concrete upstream response to
 			// preserve verbatim.
 			if isGE && ge.Code == groupErrAllUnusable {
+				p.setGroupCooldownRetryAfter(w, route, baseSkip)
 				if code := p.groupUnavailableCooldownCode(route, baseSkip); code != "" {
 					p.degradeGroup(w, logger, route, code, groupDegradeMessage(code))
 					return
@@ -671,21 +673,7 @@ func (p *Proxy) groupUnavailableCooldownCode(route *vkeys.ResolvedRoute, skip ma
 	if route == nil || len(skip) == 0 {
 		return ""
 	}
-	ids := make(map[string]bool)
-	var refs []vkeys.GroupAccountRef
-	if json.Unmarshal([]byte(route.GroupAccounts), &refs) == nil {
-		for _, ref := range refs {
-			if ref.AccountID != "" {
-				ids[ref.AccountID] = true
-			}
-		}
-	}
-	var material map[string]vkeys.GroupRuntimeAccount
-	if json.Unmarshal([]byte(route.GroupRuntime), &material) == nil {
-		for id := range material {
-			ids[id] = true
-		}
-	}
+	ids := groupRouteAccountIDs(route)
 
 	states := p.poolCooldown.routeStateSnapshot()
 	hasUpstreamFailure := false
@@ -706,6 +694,41 @@ func (p *Proxy) groupUnavailableCooldownCode(route *vkeys.ResolvedRoute, skip ma
 		return observability.ErrCodeGroupUpstreamUnavailable
 	}
 	return ""
+}
+
+func groupRouteAccountIDs(route *vkeys.ResolvedRoute) map[string]bool {
+	ids := make(map[string]bool)
+	if route == nil {
+		return ids
+	}
+	var refs []vkeys.GroupAccountRef
+	if json.Unmarshal([]byte(route.GroupAccounts), &refs) == nil {
+		for _, ref := range refs {
+			if ref.AccountID != "" {
+				ids[ref.AccountID] = true
+			}
+		}
+	}
+	var material map[string]vkeys.GroupRuntimeAccount
+	if json.Unmarshal([]byte(route.GroupRuntime), &material) == nil {
+		for id := range material {
+			ids[id] = true
+		}
+	}
+	return ids
+}
+
+// setGroupCooldownRetryAfter exposes the earliest route-account recovery to the
+// client when resolution is blocked by durable cooldown state. It is advisory:
+// routing still relies exclusively on the cooldown store and its clock-based
+// lazy re-entry, so a missing/malformed route payload never blocks the response.
+func (p *Proxy) setGroupCooldownRetryAfter(w http.ResponseWriter, route *vkeys.ResolvedRoute, skip map[string]bool) {
+	if route == nil || len(skip) == 0 {
+		return
+	}
+	if seconds, ok := p.poolCooldown.earliestRetryAfterSeconds(groupRouteAccountIDs(route), skip); ok {
+		w.Header().Set("Retry-After", strconv.Itoa(seconds))
+	}
 }
 
 // degradeGroup fails a group request loudly (never silently routes it to a wrong
