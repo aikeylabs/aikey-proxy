@@ -81,10 +81,10 @@ type ResolvedRoute struct {
 	// Anchor fields for usage reporting.
 	// For team-managed keys: populated from ManagedKey metadata.
 	// For OAuth accounts: OAuthIdentity is the email/display name (for audit only).
-	OrgID              string
-	AccountID          string
-	SeatID             string
-	OAuthIdentity      string // Email or display name (OAuth only, for audit/usage reporting)
+	OrgID         string
+	AccountID     string
+	SeatID        string
+	OAuthIdentity string // Email or display name (OAuth only, for audit/usage reporting)
 	// BindingID is the control plane's id for this hop, carried on the delivery
 	// wire and stored in the cache since 2026-07-31. Empty means the vault
 	// predates the column — hopKey() derives a substitute for cooldown and
@@ -243,6 +243,11 @@ type ResolvedRoute struct {
 	// Held only in this per-request struct + in-memory material — never written
 	// to the proxy's config file.
 	EgressProxyURL string
+	// OAuthTokenFingerprint is request-scoped, in-memory-only metadata set after
+	// a group account is resolved. It lets the async hard-revoke signal identify
+	// the exact token version without retaining or transmitting plaintext. Never
+	// populate it on the shared registry route.
+	OAuthTokenFingerprint string
 }
 
 // IsModelAllowed checks if the given model is permitted by this route.

@@ -6,6 +6,8 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
+
+	"github.com/AiKeyLabs/aikey-proxy/internal/vkeys"
 )
 
 func resp(status int, header http.Header) *http.Response {
@@ -256,6 +258,44 @@ func TestPoolCooldownStore_Snapshot(t *testing.T) {
 	now = now.Add(2 * time.Minute)
 	if s.snapshot() != nil {
 		t.Fatal("lapsed cooldown must drop from the health snapshot")
+	}
+}
+
+func TestAuthFailureTombstone_IsolatedByGroupAndSeat(t *testing.T) {
+	t.Setenv("AIKEY_RUN_DIR", t.TempDir())
+	key := grKey()
+	accountID := "shared-pool-account"
+	store := newPoolCooldownStore()
+	store.markAuthFailedToken("group-1", "seat-a", accountID, oauthTokenFingerprint("seat-a-old-token"))
+
+	seatARuntime := mustJSON(t, map[string]vkeys.GroupRuntimeAccount{
+		accountID: encMat(t, key, vkeys.GroupRuntimeAccount{CredentialType: "oauth_account"}, "seat-a-old-token"),
+	})
+	seatBRuntime := mustJSON(t, map[string]vkeys.GroupRuntimeAccount{
+		accountID: encMat(t, key, vkeys.GroupRuntimeAccount{CredentialType: "oauth_account"}, "seat-b-healthy-token"),
+	})
+	if !store.authFailureSkipSet("group-1", "seat-a", seatARuntime, key)[accountID] {
+		t.Fatal("revoked member route was not blocked")
+	}
+	if store.authFailureSkipSet("group-1", "seat-b", seatBRuntime, key)[accountID] {
+		t.Fatal("one member's revoked token blocked another seat using the same pool account")
+	}
+	if store.authFailureSkipSet("group-2", "seat-a", seatARuntime, key)[accountID] {
+		t.Fatal("one group's revoked token blocked another group")
+	}
+	snapshot := store.authFailureSnapshot()
+	if len(snapshot) != 1 || snapshot[0].OAuthGroupID != "group-1" || snapshot[0].SeatID != "seat-a" || snapshot[0].AccountID != accountID {
+		t.Fatalf("auth failure health scope lost: %+v", snapshot)
+	}
+
+	seatANewRuntime := mustJSON(t, map[string]vkeys.GroupRuntimeAccount{
+		accountID: encMat(t, key, vkeys.GroupRuntimeAccount{CredentialType: "oauth_account"}, "seat-a-new-token"),
+	})
+	if store.authFailureSkipSet("group-1", "seat-a", seatANewRuntime, key)[accountID] {
+		t.Fatal("new token version inherited the old member tombstone")
+	}
+	if len(store.authFailureSnapshot()) != 0 {
+		t.Fatalf("new token version did not clear scoped tombstone: %+v", store.authFailureSnapshot())
 	}
 }
 

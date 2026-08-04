@@ -18,8 +18,11 @@ func TestStatusResponse_PoolRoutingSerialization(t *testing.T) {
 
 	// set → present with the cooled-account roster.
 	b, _ = json.Marshal(statusResponse{Status: "ok", PoolRouting: &PoolRoutingHealth{
-		Enabled:        true,
-		CooledAccounts: []CooledAccount{{AccountID: "acc-1", CooldownSeconds: 42}},
+		Enabled: true,
+		CooledAccounts: []CooledAccount{{
+			AccountID: "acc-1", OAuthGroupID: "group-1", SeatID: "seat-1",
+			CooldownSeconds: 42,
+		}},
 		PathHealth: []ProviderPathHealth{{
 			PathID: "deadbeef1234", Provider: "anthropic", Protocol: "anthropic",
 			Transport: "mihomo", EgressFingerprint: "f00baa123456", State: "open",
@@ -28,7 +31,8 @@ func TestStatusResponse_PoolRoutingSerialization(t *testing.T) {
 	}})
 	s := string(b)
 	for _, want := range []string{
-		`"pool_routing"`, `"enabled":true`, `"account_id":"acc-1"`, `"cooldown_seconds":42`,
+		`"pool_routing"`, `"enabled":true`, `"account_id":"acc-1"`, `"oauth_group_id":"group-1"`,
+		`"seat_id":"seat-1"`, `"cooldown_seconds":42`,
 		`"path_health"`, `"path_id":"deadbeef1234"`, `"transport":"mihomo"`,
 		`"egress_fingerprint":"f00baa123456"`, `"retry_after_seconds":1`,
 	} {

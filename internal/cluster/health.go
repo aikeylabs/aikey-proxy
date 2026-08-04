@@ -59,7 +59,7 @@ type RuntimeMetrics struct {
 //
 // metricsFn (nil ⇒ omit the upstream/reporting fields) supplies the Phase-4
 // runtime metrics; like canaryFn it is transparent transport — the hub grades.
-func NodeHealthSource(vaultPath, version string, startedAt time.Time, canaryFn func() any, metricsFn func() RuntimeMetrics) func() map[string]any {
+func NodeHealthSource(vaultPath, version string, startedAt time.Time, canaryFn func() any, metricsFn func() RuntimeMetrics, poolRoutingFn func() any) func() map[string]any {
 	dir := filepath.Dir(vaultPath)
 	statusPath := filepath.Join(dir, daemonStatusFileName)
 	var lastWarned string // last WARN'd error string, to de-duplicate logs
@@ -80,6 +80,11 @@ func NodeHealthSource(vaultPath, version string, startedAt time.Time, canaryFn f
 			proxy["report_terminal_fails"] = m.ReportTerminalFails
 		}
 		h := map[string]any{"proxy": proxy}
+		if poolRoutingFn != nil {
+			if routing := poolRoutingFn(); routing != nil {
+				h["pool_routing"] = routing
+			}
+		}
 		if canaryFn != nil {
 			if cr := canaryFn(); cr != nil {
 				h["canary"] = cr

@@ -541,7 +541,54 @@ func New(cfg *config.Config, configPath, password, version string) (*Supervisor,
 			}
 			return rm
 		}
-		reg.SetHealthSource(cluster.NodeHealthSource(s.cfg.Vault.Path, s.version, time.Now(), canaryFn, metricsFn))
+		poolRoutingFn := func() any {
+			if !vkeys.OauthGroupRoutingEnabled() {
+				return nil
+			}
+			type cooledAccount struct {
+				AccountID       string `json:"account_id"`
+				OAuthGroupID    string `json:"oauth_group_id,omitempty"`
+				SeatID          string `json:"seat_id,omitempty"`
+				CooldownSeconds int    `json:"cooldown_seconds"`
+				CooldownUntil   int64  `json:"cooldown_until"`
+				RouteStatus     string `json:"route_status,omitempty"`
+				RouteRetryAt    int64  `json:"route_retry_at,omitempty"`
+				ErrorCode       string `json:"error_code,omitempty"`
+			}
+			remaining := s.PoolCooldownSnapshot()
+			states := s.PoolRouteStateSnapshot()
+			accounts := make([]cooledAccount, 0, len(remaining))
+			now := time.Now().Unix()
+			for id, secs := range remaining {
+				item := cooledAccount{AccountID: id, CooldownSeconds: secs, CooldownUntil: now + int64(secs)}
+				if state, ok := states[id]; ok {
+					item.RouteStatus = state.Status
+					item.RouteRetryAt = state.RetryAt
+					item.ErrorCode = state.ErrorCode
+				}
+				accounts = append(accounts, item)
+			}
+			for _, state := range s.PoolAuthFailureSnapshot() {
+				accounts = append(accounts, cooledAccount{
+					AccountID: state.AccountID, OAuthGroupID: state.OAuthGroupID,
+					SeatID: state.SeatID, RouteStatus: "auth_failed",
+				})
+			}
+			sort.Slice(accounts, func(i, j int) bool {
+				if accounts[i].AccountID != accounts[j].AccountID {
+					return accounts[i].AccountID < accounts[j].AccountID
+				}
+				if accounts[i].OAuthGroupID != accounts[j].OAuthGroupID {
+					return accounts[i].OAuthGroupID < accounts[j].OAuthGroupID
+				}
+				return accounts[i].SeatID < accounts[j].SeatID
+			})
+			return struct {
+				Enabled        bool            `json:"enabled"`
+				CooledAccounts []cooledAccount `json:"cooled_accounts,omitempty"`
+			}{Enabled: true, CooledAccounts: accounts}
+		}
+		reg.SetHealthSource(cluster.NodeHealthSource(s.cfg.Vault.Path, s.version, time.Now(), canaryFn, metricsFn, poolRoutingFn))
 		observability.GoSafe("supervisor.cluster_registrar", observability.Isolated, func() { reg.Run(s.ctx) })
 		slog.Info("cluster mode enabled", "node_id", s.cfg.Cluster.NodeID, "hub", s.cfg.Cluster.HubURL)
 	}
@@ -1136,6 +1183,19 @@ func (s *Supervisor) AppHealthSnapshot() []apppipe.AppHealth {
 // admin /status pool-routing health surface (N9).
 func (s *Supervisor) PoolCooldownSnapshot() map[string]int {
 	return s.active.Load().proxy.PoolCooldownSnapshot()
+}
+
+// PoolRouteStateSnapshot exposes display-only reason/retry metadata for the
+// same whole-account cooldown set. Routing continues to read the cooldown store
+// directly; heartbeat and admin status are observers only.
+func (s *Supervisor) PoolRouteStateSnapshot() map[string]proxy.PoolAccountRouteState {
+	return s.active.Load().proxy.CooldownRouteStateSnapshot()
+}
+
+// PoolAuthFailureSnapshot exposes exact group+seat+account hard-revocation
+// states for health surfaces without widening the routing scope.
+func (s *Supervisor) PoolAuthFailureSnapshot() []proxy.PoolAuthFailureState {
+	return s.active.Load().proxy.AuthFailureRouteSnapshot()
 }
 
 // ProviderPathHealthSnapshot returns the shared OAuth-group outbound-path
@@ -1828,16 +1888,6 @@ func (s *Supervisor) buildGeneration() (*generation, error) {
 				loadedSeq = int64(seq)
 			}
 			p.SetReporter(reporter, fmt.Sprintf("proxy-%d", id), s.version, fmt.Sprintf("gen-%d", id), loadedSeq, vaultReader.GetLoggedInAccountID())
-			// I5: wire the allocation-engine signal reporter with the SAME live team
-			// account-JWT source as the group-runtime/routing rails. Do not gate this
-			// control-plane path on events.collector_credentials: current local/stage
-			// installs intentionally keep that legacy YAML bundle empty while the
-			// railSet authenticates from the vault refresh token. The old gate made
-			// 429 cooldowns local-only, so Master never updated its assignment ledger
-			// and the member could never be routed to/log into the replacement account.
-			if masterURL, bearer := signalReportingAuth(readControlPanelURL(), s.teamCred, vaultReader); bearer != nil {
-				p.EnableSignalReporting(masterURL, bearer)
-			}
 			slog.Info("usage reporter enabled", "collector_url", s.cfg.Events.CollectorURL)
 
 			// Start canary probe. As of 2026-04-17 diagnostics live on the
@@ -1879,6 +1929,18 @@ func (s *Supervisor) buildGeneration() (*generation, error) {
 				convAuditSink, slog.Default(),
 			)
 		}
+	}
+
+	// Allocation/account signal reporting is independent of usage reporting. A
+	// cluster worker commonly has no member JWT and may also have no collector
+	// destination; neither condition may suppress a hard-revoked member-token
+	// transition. Cluster uses the existing org-pinned service credential; other
+	// editions reuse the live team account JWT used by the group-runtime rails.
+	masterURL := readControlPanelURL()
+	if s.cfg.Cluster.Enabled && s.cfg.Cluster.OrgID != "" && s.cfg.Cluster.ControlServiceToken != "" {
+		p.EnableOrgSignalReporting(masterURL, s.cfg.Cluster.OrgID, s.cfg.Cluster.ControlServiceToken)
+	} else if masterURL, bearer := signalReportingAuth(masterURL, s.teamCred, vaultReader); bearer != nil {
+		p.EnableSignalReporting(masterURL, bearer)
 	}
 
 	// Only hand the WAL to the generation when nobody else closes it. If a

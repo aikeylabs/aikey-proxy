@@ -440,8 +440,21 @@ func Run() {
 			return nil
 		}
 		h := &admin.PoolRoutingHealth{Enabled: true}
+		states := sup.PoolRouteStateSnapshot()
 		for id, secs := range sup.PoolCooldownSnapshot() {
-			h.CooledAccounts = append(h.CooledAccounts, admin.CooledAccount{AccountID: id, CooldownSeconds: secs})
+			item := admin.CooledAccount{AccountID: id, CooldownSeconds: secs}
+			if state, ok := states[id]; ok {
+				item.RouteStatus = state.Status
+				item.RouteRetryAt = state.RetryAt
+				item.ErrorCode = state.ErrorCode
+			}
+			h.CooledAccounts = append(h.CooledAccounts, item)
+		}
+		for _, state := range sup.PoolAuthFailureSnapshot() {
+			h.CooledAccounts = append(h.CooledAccounts, admin.CooledAccount{
+				AccountID: state.AccountID, OAuthGroupID: state.OAuthGroupID,
+				SeatID: state.SeatID, RouteStatus: "auth_failed",
+			})
 		}
 		// Indexed, not ranged by value: ProviderPathHealth is 144 bytes and the
 		// loop body only reads it.

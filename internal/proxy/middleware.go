@@ -2,6 +2,7 @@ package proxy
 
 import (
 	"context"
+	"encoding/json"
 	"net/http"
 	"net/url"
 	"os"
@@ -532,6 +533,14 @@ func setErrorOrigin(h http.Header, code string) {
 
 // writeJSONError writes a JSON error response in OpenAI-compatible format.
 func writeJSONError(w http.ResponseWriter, statusCode int, errType, code, message string) {
+	writeJSONErrorDetails(w, statusCode, errType, code, message, nil)
+}
+
+// writeJSONErrorDetails extends the standard AiKey error object with optional,
+// display-safe machine fields. It is used only when the component that owns the
+// error also owns the facts (for example the pool cooldown deadline); callers
+// must not estimate runtime state from a database snapshot.
+func writeJSONErrorDetails(w http.ResponseWriter, statusCode int, errType, code, message string, details map[string]any) {
 	h := w.Header()
 	h.Set("Content-Type", "application/json")
 	// Mark every aikey-GENERATED error so callers can distinguish it from an
@@ -541,16 +550,16 @@ func writeJSONError(w http.ResponseWriter, statusCode int, errType, code, messag
 	// P1 error-origin: this component GENERATED the error → stamp origin + path.
 	setErrorOrigin(h, code)
 	w.WriteHeader(statusCode)
-	// Write error JSON inline to avoid encoding/json import for this simple case.
+	errObj := map[string]any{"message": message, "type": errType, "code": code}
+	for key, value := range details {
+		errObj[key] = value
+	}
 	// origin (top-level) mirrors the header so a client that reads only the body
-	// still learns who produced the error.
-	origin := escapeJSON(h.Get(HeaderAikeyErrorOrigin))
-	_, _ = w.Write([]byte(`{"error":{"message":"` + escapeJSON(message) + `","type":"` + errType + `","code":"` + code + `"},"origin":"` + origin + `"}`))
-}
-
-func escapeJSON(s string) string {
-	s = strings.ReplaceAll(s, `\`, `\\`)
-	s = strings.ReplaceAll(s, `"`, `\"`)
-	s = strings.ReplaceAll(s, "\n", `\n`)
-	return s
+	// still learns who produced the error. json.Marshal keeps future detail values
+	// correctly escaped instead of growing a second hand-written JSON encoder.
+	body, _ := json.Marshal(map[string]any{
+		"error":  errObj,
+		"origin": h.Get(HeaderAikeyErrorOrigin),
+	})
+	_, _ = w.Write(body)
 }

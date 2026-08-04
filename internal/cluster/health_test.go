@@ -43,7 +43,7 @@ func TestNodeHealthSource_ForwardsDaemonFixture(t *testing.T) {
 
 	vaultPath := writeVaultDirWith(t, string(raw))
 	started := time.Unix(1717990005, 0)
-	h := NodeHealthSource(vaultPath, "1.0.1-test", started, nil, nil)()
+	h := NodeHealthSource(vaultPath, "1.0.1-test", started, nil, nil, nil)()
 
 	got, ok := h["daemon"].(map[string]any)
 	if !ok {
@@ -70,7 +70,7 @@ func TestNodeHealthSource_ForwardsDaemonFixture(t *testing.T) {
 
 func TestNodeHealthSource_MissingFileOmitsDaemon(t *testing.T) {
 	vaultPath := writeVaultDirWith(t, "") // no status file: daemon not started yet
-	h := NodeHealthSource(vaultPath, "v", time.Unix(1, 0), nil, nil)()
+	h := NodeHealthSource(vaultPath, "v", time.Unix(1, 0), nil, nil, nil)()
 	if _, present := h["daemon"]; present {
 		t.Fatalf("daemon section must be absent when the status file is missing, got %#v", h["daemon"])
 	}
@@ -82,7 +82,7 @@ func TestNodeHealthSource_MissingFileOmitsDaemon(t *testing.T) {
 func TestNodeHealthSource_CorruptFileOmitsDaemonWithoutPanic(t *testing.T) {
 	for _, corrupt := range []string{"{half written", `"just a string"`, "[]", "null"} {
 		vaultPath := writeVaultDirWith(t, corrupt)
-		fn := NodeHealthSource(vaultPath, "v", time.Unix(1, 0), nil, nil)
+		fn := NodeHealthSource(vaultPath, "v", time.Unix(1, 0), nil, nil, nil)
 		h := fn()
 		if _, present := h["daemon"]; present {
 			t.Fatalf("daemon section must be absent for corrupt content %q", corrupt)
@@ -170,13 +170,13 @@ func TestNodeHealthSource_CanarySection(t *testing.T) {
 
 	withCanary := NodeHealthSource(vaultPath, "v", time.Unix(1, 0), func() any {
 		return map[string]any{"status": "failed", "failed_stage": "ingest", "consecutive_failures": 4}
-	}, nil)()
+	}, nil, nil)()
 	c, ok := withCanary["canary"].(map[string]any)
 	if !ok || c["status"] != "failed" {
 		t.Fatalf("canary section not forwarded: %#v", withCanary["canary"])
 	}
 
-	disabled := NodeHealthSource(vaultPath, "v", time.Unix(1, 0), func() any { return nil }, nil)()
+	disabled := NodeHealthSource(vaultPath, "v", time.Unix(1, 0), func() any { return nil }, nil, nil)()
 	if _, present := disabled["canary"]; present {
 		t.Fatalf("nil canary result must omit the section, got %#v", disabled["canary"])
 	}
@@ -192,7 +192,7 @@ func TestNodeHealthSource_RuntimeMetrics(t *testing.T) {
 			Requests: 1000, Errors: 150,
 			ReportConsecutiveFailures: 4, ReportLastUploadAgeS: 320, ReportTerminalFails: 2,
 		}
-	})()
+	}, nil)()
 	p := with["proxy"].(map[string]any)
 	if p["requests"] != int64(1000) || p["errors"] != int64(150) {
 		t.Fatalf("upstream counters not forwarded: %#v", p)
@@ -201,10 +201,32 @@ func TestNodeHealthSource_RuntimeMetrics(t *testing.T) {
 		t.Fatalf("reporting metrics not forwarded: %#v", p)
 	}
 
-	without := NodeHealthSource(vaultPath, "v", time.Unix(1, 0), nil, nil)()
+	without := NodeHealthSource(vaultPath, "v", time.Unix(1, 0), nil, nil, nil)()
 	pw := without["proxy"].(map[string]any)
 	if _, present := pw["requests"]; present {
 		t.Fatalf("nil metricsFn must omit runtime metric fields, got %#v", pw)
+	}
+}
+
+func TestNodeHealthSource_PoolRoutingSection(t *testing.T) {
+	vaultPath := writeVaultDirWith(t, "")
+	health := NodeHealthSource(vaultPath, "v", time.Unix(1, 0), nil, nil, func() any {
+		return map[string]any{
+			"enabled": true,
+			"cooled_accounts": []map[string]any{{
+				"account_id": "acc-1", "cooldown_seconds": 24,
+				"cooldown_until": int64(100), "route_status": "rate_limited",
+			}},
+		}
+	})()
+	routing, ok := health["pool_routing"].(map[string]any)
+	if !ok || routing["enabled"] != true {
+		t.Fatalf("pool routing section not forwarded: %#v", health["pool_routing"])
+	}
+
+	without := NodeHealthSource(vaultPath, "v", time.Unix(1, 0), nil, nil, func() any { return nil })()
+	if _, present := without["pool_routing"]; present {
+		t.Fatalf("nil pool routing result must omit the section: %#v", without)
 	}
 }
 

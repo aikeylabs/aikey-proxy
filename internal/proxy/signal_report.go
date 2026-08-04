@@ -6,12 +6,15 @@ import (
 	"encoding/json"
 	"log/slog"
 	"net/http"
+	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"sync"
 	"time"
 
 	"github.com/AiKeyLabs/aikey-proxy/internal/httpx"
+	"github.com/AiKeyLabs/aikey-proxy/internal/observability"
 )
 
 // ponytail: flush cadence doubles as the rate-limit count window — one constant
@@ -49,14 +52,25 @@ type concurrencySample struct {
 	Peak         int    `json:"peak"`
 }
 
-// revokedSample flags a credential whose OAuth token the upstream hard-revoked
-// (401 "OAuth token has been revoked") — master quarantines the account so the
-// allocation engine stops picking it. Same best-effort, fault-isolated delivery
-// as signalSample (see file header); a dropped flag just delays quarantine until
-// the next 401 re-emits it, so loss is self-healing.
+// revokedSample is retained only for wire compatibility tests and rolling
+// upgrades. Current request handling never emits this credential-global shape:
+// Master cannot safely map it to one member token and therefore ignores it.
 type revokedSample struct {
 	CredentialID string `json:"credential_id"`
 	Reason       string `json:"reason"`
+}
+
+// authFailureSample identifies the exact member-token route that the upstream
+// rejected as permanently revoked. Unlike revokedSample, this is NOT a global
+// provider-credential ban: credential_id may have healthy tokens for other
+// seats. Master resolves Agent seats to their parent seat before demoting only
+// oauth_member_token(credential_id, seat_id).
+type authFailureSample struct {
+	CredentialID     string `json:"credential_id"`
+	OAuthGroupID     string `json:"oauth_group_id"`
+	SeatID           string `json:"seat_id"`
+	TokenFingerprint string `json:"token_fingerprint"`
+	Reason           string `json:"reason"`
 }
 
 // rateLimitSample reports how many 429/403 responses a credential drew in the
@@ -95,8 +109,14 @@ type signalReporter struct {
 	client    *httpx.SwappableClient                    // control-plane: rebuilt on host network change (self-heal registry)
 	in        chan signalSample
 	revokedIn chan revokedSample
-	rlMu      sync.Mutex     // guards rlCounts and rlFallback
-	rlCounts  map[string]int // per-credential 429/403 tally, reset each flush
+	authMu    sync.Mutex
+	// authFailures is a durable, deduplicated outbox. A hard revocation is not a
+	// trend sample: if its first upload fails, local token blocking prevents
+	// another upstream 401, so dropping it would leave Master falsely logged_in.
+	authFailures map[string]authFailureSample
+	authWake     chan struct{}
+	rlMu         sync.Mutex     // guards rlCounts and rlFallback
+	rlCounts     map[string]int // per-credential 429/403 tally, reset each flush
 	// rlFallback is the subset of rlCounts that arrived on a FALLBACK hop
 	// (F-12b). Reset on the same flush, so the two always describe one window.
 	rlFallback map[string]int
@@ -124,22 +144,38 @@ type signalReporter struct {
 // newSignalReporter returns nil (feature off) unless both a control URL and an
 // auth bearer are configured. On success it starts the background upload loop.
 func newSignalReporter(controlURL string, bearer func(context.Context) (string, error), logger *slog.Logger) *signalReporter {
-	if controlURL == "" || bearer == nil {
+	if controlURL == "" {
+		return nil
+	}
+	return newSignalReporterEndpoint(strings.TrimRight(controlURL, "/")+"/accounts/me/signals", bearer, logger)
+}
+
+func newSignalReporterEndpoint(endpoint string, bearer func(context.Context) (string, error), logger *slog.Logger) *signalReporter {
+	if endpoint == "" || bearer == nil {
 		return nil
 	}
 	r := &signalReporter{
-		url:       strings.TrimRight(controlURL, "/") + "/accounts/me/signals",
-		bearer:    bearer,
-		client:    httpx.NewSwappableDirect(10 * time.Second),
-		in:        make(chan signalSample, 256),
-		revokedIn: make(chan revokedSample, 64),
-		rlCounts:  make(map[string]int),
-		inflCur:   make(map[string]int),
-		inflPeak:  make(map[string]int),
-		logger:    logger,
-		stop:      make(chan struct{}),
+		url:          endpoint,
+		bearer:       bearer,
+		client:       httpx.NewSwappableDirect(10 * time.Second),
+		in:           make(chan signalSample, 256),
+		revokedIn:    make(chan revokedSample, 64),
+		authFailures: make(map[string]authFailureSample),
+		authWake:     make(chan struct{}, 1),
+		rlCounts:     make(map[string]int),
+		inflCur:      make(map[string]int),
+		inflPeak:     make(map[string]int),
+		logger:       logger,
+		stop:         make(chan struct{}),
 	}
+	r.hydrateAuthFailures()
 	go r.loop()
+	if len(r.snapshotAuthFailures()) > 0 {
+		select {
+		case r.authWake <- struct{}{}:
+		default:
+		}
+	}
 	return r
 }
 
@@ -167,11 +203,8 @@ func (r *signalReporter) enqueue(credentialID string, ts int64, util5h float64, 
 	}
 }
 
-// enqueueRevoked is the revoked-feed sibling of enqueue: a non-blocking,
-// best-effort hand-off from the forward path's 401 detection. Same MAIN-LINK
-// safety contract — nil receiver / empty id are dropped silently and a full
-// buffer drops rather than blocks (a hard-ban 401s many in-flight requests at
-// once, so the queue can fill; a dropped flag self-heals on the next 401).
+// enqueueRevoked exists only for rolling-wire compatibility tests. Production
+// hard-revocation detection uses enqueueAuthFailure with route and token version.
 func (r *signalReporter) enqueueRevoked(credentialID, reason string) {
 	if r == nil || credentialID == "" {
 		return
@@ -182,6 +215,133 @@ func (r *signalReporter) enqueueRevoked(credentialID, reason string) {
 	select {
 	case r.revokedIn <- revokedSample{CredentialID: credentialID, Reason: reason}:
 	default: // buffer full → drop (best-effort; never block forwarding)
+	}
+}
+
+const signalAuthFailureFilename = "signal-auth-failures.json"
+
+func authFailureKey(s authFailureSample) string {
+	return s.CredentialID + "|" + s.OAuthGroupID + "|" + s.SeatID
+}
+
+func signalAuthFailurePath() (string, error) {
+	cooldownPath, err := poolCooldownPath()
+	if err != nil {
+		return "", err
+	}
+	return filepath.Join(filepath.Dir(cooldownPath), signalAuthFailureFilename), nil
+}
+
+// enqueueAuthFailure performs no network work on the request path. It makes one
+// rare, bounded local state-file write so a Proxy crash cannot lose the only
+// hard-revocation observation; network delivery always happens in loop().
+func (r *signalReporter) enqueueAuthFailure(credentialID, oauthGroupID, seatID, tokenFingerprint, reason string) {
+	if r == nil || credentialID == "" || oauthGroupID == "" || seatID == "" || tokenFingerprint == "" {
+		return
+	}
+	if reason == "" {
+		reason = "token_revoked"
+	}
+	sample := authFailureSample{
+		CredentialID: credentialID, OAuthGroupID: oauthGroupID, SeatID: seatID,
+		TokenFingerprint: tokenFingerprint, Reason: reason,
+	}
+	r.authMu.Lock()
+	if r.authFailures == nil {
+		r.authFailures = make(map[string]authFailureSample)
+	}
+	r.authFailures[authFailureKey(sample)] = sample
+	r.persistAuthFailuresLocked()
+	r.authMu.Unlock()
+	if r.authWake != nil {
+		select {
+		case r.authWake <- struct{}{}:
+		default:
+		}
+	}
+}
+
+func (r *signalReporter) snapshotAuthFailures() []authFailureSample {
+	if r == nil {
+		return nil
+	}
+	r.authMu.Lock()
+	defer r.authMu.Unlock()
+	out := make([]authFailureSample, 0, len(r.authFailures))
+	for _, sample := range r.authFailures {
+		out = append(out, sample)
+	}
+	return out
+}
+
+func (r *signalReporter) acknowledgeAuthFailures(sent []authFailureSample) {
+	if len(sent) == 0 {
+		return
+	}
+	r.authMu.Lock()
+	for _, sample := range sent {
+		key := authFailureKey(sample)
+		if r.authFailures[key] == sample {
+			delete(r.authFailures, key)
+		}
+	}
+	r.persistAuthFailuresLocked()
+	r.authMu.Unlock()
+}
+
+func (r *signalReporter) hydrateAuthFailures() {
+	path, err := signalAuthFailurePath()
+	if err != nil {
+		return
+	}
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		return
+	}
+	var body struct {
+		Failures []authFailureSample `json:"auth_failures"`
+	}
+	if err := json.Unmarshal(raw, &body); err != nil {
+		r.logger.Warn("auth-failure signal outbox is unreadable; starting empty",
+			"event.name", observability.EventProxySignalAuthFailureStateInvalid, "error", err)
+		return
+	}
+	for _, sample := range body.Failures {
+		if sample.CredentialID != "" && sample.OAuthGroupID != "" && sample.SeatID != "" && sample.TokenFingerprint != "" {
+			r.authFailures[authFailureKey(sample)] = sample
+		}
+	}
+}
+
+func (r *signalReporter) persistAuthFailuresLocked() {
+	path, err := signalAuthFailurePath()
+	if err != nil {
+		return
+	}
+	if len(r.authFailures) == 0 {
+		if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
+			r.logger.Warn("auth-failure signal outbox remove failed",
+				"event.name", observability.EventProxySignalAuthFailureStateWriteFailed, "error", err)
+		}
+		return
+	}
+	failures := make([]authFailureSample, 0, len(r.authFailures))
+	for _, sample := range r.authFailures {
+		failures = append(failures, sample)
+	}
+	data, err := json.Marshal(map[string]any{"auth_failures": failures})
+	if err == nil {
+		err = os.MkdirAll(filepath.Dir(path), 0o700)
+	}
+	if err == nil {
+		tmp := path + ".tmp"
+		if err = os.WriteFile(tmp, data, 0o600); err == nil {
+			err = os.Rename(tmp, path)
+		}
+	}
+	if err != nil {
+		r.logger.Warn("auth-failure signal outbox write failed",
+			"event.name", observability.EventProxySignalAuthFailureStateWriteFailed, "error", err)
 	}
 }
 
@@ -313,10 +473,22 @@ func (r *signalReporter) loop() {
 	// window_secs / peak stay accurate even when a util/revoked burst forces an
 	// early flush.
 	flush := func(rl []rateLimitSample, conc []concurrencySample) {
-		if len(batch) == 0 && len(revoked) == 0 && len(rl) == 0 && len(conc) == 0 {
+		authFailures := r.snapshotAuthFailures()
+		if len(batch) == 0 && len(revoked) == 0 && len(authFailures) == 0 && len(rl) == 0 && len(conc) == 0 {
 			return
 		}
-		r.post(batch, revoked, rl, conc)
+		// Trend samples remain best-effort and are sent separately from durable
+		// auth failures. A rejected exact route must stay in the outbox without
+		// causing successful utilization samples to be replayed and duplicated.
+		if len(batch) > 0 || len(revoked) > 0 || len(rl) > 0 || len(conc) > 0 {
+			r.postAll(batch, revoked, nil, rl, conc)
+		}
+		for _, failure := range authFailures {
+			one := []authFailureSample{failure}
+			if r.postAll(nil, nil, one, nil, nil) {
+				r.acknowledgeAuthFailures(one)
+			}
+		}
 		batch = batch[:0]
 		revoked = revoked[:0]
 	}
@@ -336,6 +508,8 @@ func (r *signalReporter) loop() {
 			if revoked = append(revoked, rv); len(revoked) >= 64 {
 				flush(nil, nil)
 			}
+		case <-r.authWake:
+			flush(nil, nil)
 		case <-ticker.C:
 			flush(r.snapshotRateLimits(), r.snapshotConcurrency())
 		case <-r.stop:
@@ -347,16 +521,23 @@ func (r *signalReporter) loop() {
 	}
 }
 
-func (r *signalReporter) post(samples []signalSample, revoked []revokedSample, rateLimits []rateLimitSample, concurrency []concurrencySample) {
+func (r *signalReporter) post(samples []signalSample, revoked []revokedSample, rateLimits []rateLimitSample, concurrency []concurrencySample) bool {
+	return r.postAll(samples, revoked, r.snapshotAuthFailures(), rateLimits, concurrency)
+}
+
+func (r *signalReporter) postAll(samples []signalSample, revoked []revokedSample, authFailures []authFailureSample, rateLimits []rateLimitSample, concurrency []concurrencySample) bool {
 	// All arrays are optional: marshal only the non-empty ones so an all-samples,
 	// all-revoked, all-rate_limits, or all-concurrency flush still posts a valid
 	// body the master can decode.
-	payload := make(map[string]any, 4)
+	payload := make(map[string]any, 5)
 	if len(samples) > 0 {
 		payload["samples"] = samples
 	}
 	if len(revoked) > 0 {
 		payload["revoked"] = revoked
+	}
+	if len(authFailures) > 0 {
+		payload["auth_failures"] = authFailures
 	}
 	if len(rateLimits) > 0 {
 		payload["rate_limits"] = rateLimits
@@ -365,37 +546,39 @@ func (r *signalReporter) post(samples []signalSample, revoked []revokedSample, r
 		payload["concurrency"] = concurrency
 	}
 	if len(payload) == 0 {
-		return
+		return true
 	}
 	body, err := json.Marshal(payload)
 	if err != nil {
-		return
+		return false
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 	tok, err := r.bearer(ctx)
 	if err != nil {
 		r.logger.Warn("signal report bearer unavailable",
-			"event.name", "proxy.signal.bearer_failed", "error", err)
-		return
+			"event.name", observability.EventProxySignalBearerFailed, "error", err)
+		return false
 	}
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, r.url, bytes.NewReader(body))
 	if err != nil {
-		return
+		return false
 	}
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Authorization", "Bearer "+tok)
 	resp, err := r.client.Get().Do(req)
 	if err != nil {
 		r.logger.Warn("signal report upload failed",
-			"event.name", "proxy.signal.upload_failed", "error", err)
-		return
+			"event.name", observability.EventProxySignalUploadFailed, "error", err)
+		return false
 	}
 	_ = resp.Body.Close()
 	if resp.StatusCode >= 300 {
 		r.logger.Warn("signal report rejected",
-			"event.name", "proxy.signal.upload_rejected", "status", resp.StatusCode)
+			"event.name", observability.EventProxySignalUploadRejected, "status", resp.StatusCode)
+		return false
 	}
+	return true
 }
 
 // parseUnifiedUtil5h reads the anthropic-ratelimit-unified-5h-utilization header

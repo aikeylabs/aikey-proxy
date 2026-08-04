@@ -16,6 +16,16 @@ const (
 	EventProxyListenerBound  = "proxy.listener.bound"
 )
 
+// Signal uplink events. The data plane remains non-blocking; these names make
+// durable auth-failure outbox and best-effort trend upload failures queryable.
+const (
+	EventProxySignalAuthFailureStateInvalid     = "proxy.signal.auth_failure_state_invalid"
+	EventProxySignalAuthFailureStateWriteFailed = "proxy.signal.auth_failure_state_write_failed"
+	EventProxySignalBearerFailed                = "proxy.signal.bearer_failed"
+	EventProxySignalUploadFailed                = "proxy.signal.upload_failed"
+	EventProxySignalUploadRejected              = "proxy.signal.upload_rejected"
+)
+
 // Reload and generation lifecycle events.
 const (
 	EventProxyReloadStarted          = "proxy.reload.started"

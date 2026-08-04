@@ -81,6 +81,97 @@ func TestGroupFailover_5xxRetriesOnNextAccount(t *testing.T) {
 	}
 }
 
+func TestGroupFailover_HardRevokedMemberFallsBackAndReloginRecoversImmediately(t *testing.T) {
+	p, tr, tokToAcct := twoAccountPool(t)
+	primary, primaryToken := probePrimary(t, p, tr, tokToAcct)
+	revokedBody := `{"error":{"type":"authentication_error","message":"OAuth access token has been revoked."}}`
+	tr.statusByAuth = map[string]int{"Bearer " + primaryToken: http.StatusUnauthorized}
+	tr.bodyByAuth = map[string]string{"Bearer " + primaryToken: revokedBody}
+
+	req, w := groupReq(groupBody)
+	p.Handle(w, req)
+	if w.Code != http.StatusOK || tr.calls != 2 {
+		t.Fatalf("healthy pool member must hide revoked member failure: status=%d calls=%d body=%s", w.Code, tr.calls, w.Body)
+	}
+	authStates := p.AuthFailureRouteSnapshot()
+	if len(authStates) != 1 || authStates[0].OAuthGroupID != "grp-1" || authStates[0].SeatID != "seat-1" || authStates[0].AccountID != primary {
+		t.Fatalf("hard revoke must be an exact non-timed member auth failure, got %+v", authStates)
+	}
+
+	// The same token is blocked before upstream on the next request.
+	tr.calls = 0
+	req, w = groupReq(groupBody)
+	p.Handle(w, req)
+	if w.Code != http.StatusOK || tr.calls != 1 {
+		t.Fatalf("warm revoked token retried upstream: status=%d calls=%d body=%s", w.Code, tr.calls, w.Body)
+	}
+
+	// Master delivers a new token after re-login. Force the former primary so the
+	// test proves fingerprint change clears the tombstone immediately.
+	key := grKey()
+	refs := []vkeys.GroupAccountRef{
+		{AccountID: "acc-1", ProviderCode: "anthropic"},
+		{AccountID: "acc-2", ProviderCode: "anthropic"},
+	}
+	mat := map[string]vkeys.GroupRuntimeAccount{
+		"acc-1": encMat(t, key, vkeys.GroupRuntimeAccount{CredentialType: "oauth_account", ExpiresAt: 9_000_000_000, ExternalID: "uuid-1"}, "tok-1"),
+		"acc-2": encMat(t, key, vkeys.GroupRuntimeAccount{CredentialType: "oauth_account", ExpiresAt: 9_000_000_000, ExternalID: "uuid-2"}, "tok-2"),
+	}
+	newToken := "tok-relogin"
+	entry := mat[primary]
+	mat[primary] = encMat(t, key, entry, newToken)
+	route := &vkeys.ResolvedRoute{
+		VirtualKeyID: "vk-grp", Provider: "anthropic", ProtocolType: "anthropic",
+		ProviderCode: "anthropic", RouteSource: "team", SeatID: "seat-1", OauthGroupID: "grp-1",
+		GroupAccounts: mustJSON(t, refs), GroupRuntime: mustJSON(t, mat),
+	}
+	p.registry.Merge(map[string]*vkeys.ResolvedRoute{"aikey_team_grouptest": route})
+	overrides := NewRoutingOverrideCache()
+	overrides.StoreAll(1, map[string]string{routeKey("seat-1", "grp-1"): primary}, nil)
+	p.SetRoutingOverrides(overrides)
+	tr.statusByAuth = nil
+	tr.bodyByAuth = nil
+	tr.calls = 0
+	req, w = groupReq(groupBody)
+	p.Handle(w, req)
+	if w.Code != http.StatusOK || tr.calls != 1 || tr.auth != "Bearer "+newToken {
+		t.Fatalf("re-login did not restore former member immediately: status=%d calls=%d auth=%q body=%s", w.Code, tr.calls, tr.auth, w.Body)
+	}
+	if len(p.AuthFailureRouteSnapshot()) != 0 {
+		t.Fatalf("new token must clear old auth-failure projection")
+	}
+}
+
+func TestGroupFailover_OnlyHardRevokedMemberReturnsLoginRequiredWithoutRetryingToken(t *testing.T) {
+	key := grKey()
+	refs := []vkeys.GroupAccountRef{{AccountID: "acc-revoked", ProviderCode: "anthropic", Identity: "member@example.com"}}
+	mat := map[string]vkeys.GroupRuntimeAccount{
+		"acc-revoked": encMat(t, key, vkeys.GroupRuntimeAccount{
+			CredentialType: "oauth_account", ExpiresAt: 9_000_000_000, ExternalID: "uuid-revoked",
+		}, "tok-revoked"),
+	}
+	route := &vkeys.ResolvedRoute{
+		VirtualKeyID: "vk-grp", Provider: "anthropic", ProtocolType: "anthropic",
+		ProviderCode: "anthropic", RouteSource: "team", SeatID: "seat-1", OauthGroupID: "grp-1",
+		GroupAccounts: mustJSON(t, refs), GroupRuntime: mustJSON(t, mat),
+	}
+	p, tr := setupGroupProxy(t, key, route)
+	tr.status = http.StatusUnauthorized
+	tr.bodyByAuth = map[string]string{"Bearer tok-revoked": `{"error":{"type":"authentication_error","message":"OAuth access token has been revoked."}}`}
+
+	req, w := groupReq(groupBody)
+	p.Handle(w, req)
+	if w.Code != http.StatusUnauthorized || !strings.Contains(w.Body.String(), groupErrLoginRequired) || tr.calls != 1 {
+		t.Fatalf("first hard revoke must become login required: status=%d calls=%d body=%s", w.Code, tr.calls, w.Body)
+	}
+	tr.calls = 0
+	req, w = groupReq(groupBody)
+	p.Handle(w, req)
+	if w.Code != http.StatusUnauthorized || !strings.Contains(w.Body.String(), groupErrLoginRequired) || tr.calls != 0 {
+		t.Fatalf("warm revoked token reached upstream again: status=%d calls=%d body=%s", w.Code, tr.calls, w.Body)
+	}
+}
+
 // Every upstream attempt belongs to one logical client request. The provider,
 // usage ledger and proxy logs must therefore receive one stable request id even
 // when the pool switches A→B before the first client-visible byte.

@@ -754,6 +754,11 @@ func (p *Proxy) serveRoute(w http.ResponseWriter, r *http.Request, route *vkeys.
 						"account_id", route.AccountID,
 						"tier", tierKey,
 						"until", tierUntil.Unix())
+				} else if resp.StatusCode == http.StatusUnauthorized {
+					// A group OAuth 401 belongs to this member token, not to the
+					// shared pool account globally. group_serve reads the buffered body
+					// and records a group+seat+account+fingerprint tombstone when it is
+					// a hard revoke. Do not create an account-wide timed cooldown here.
 				} else if until, ok := cooldownDecision(resp, nowT); ok {
 					p.poolCooldown.markWithState(route.AccountID, until, cooldownRouteState(resp, nowT, until))
 					logger.Warn("pool account cooled down after upstream failure",

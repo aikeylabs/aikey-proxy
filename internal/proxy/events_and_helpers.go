@@ -199,14 +199,15 @@ func (p *Proxy) recordEvent(req *http.Request, resp *http.Response, startTime ti
 	if isAikeyProbe(req) {
 		return
 	}
-	// Revoked-feed emit (best-effort, OFF the hot path, mirrors the I5 util
-	// enqueue in buildBaseEvent): a hard-revoked OAuth token (401 "OAuth token
-	// has been revoked") means this credential can't serve again until re-auth,
-	// so flag master to quarantine the account in the allocation engine. We do
-	// NOT alter the 401 — it still flows to the client unchanged. enqueueRevoked
-	// is nil-safe (reporter off → no-op) and non-blocking (full buffer drops).
+	// Member-token auth-failure emit: a hard-revoked OAuth token belongs to the
+	// selected (credential, group, seat) route, not to the provider credential
+	// globally. Master resolves Agent seats to their parent and demotes exactly
+	// that oauth_member_token row to auth_failed; other members' tokens remain
+	// routable. The reporter persists this signal until accepted because local
+	// exact-token blocking prevents an endless 401 re-emission loop.
 	if isHardRevoked(resp.StatusCode, errType, errMsg) {
-		p.signalReporter.enqueueRevoked(route.CredentialID, "revoked")
+		p.signalReporter.enqueueAuthFailure(
+			route.CredentialID, route.OauthGroupID, route.SeatID, route.OAuthTokenFingerprint, "token_revoked")
 	}
 	// Rate-limit-feed emit (best-effort, OFF the hot path, mirrors the revoked
 	// hook above): the proxy sees every upstream 429 (rate limit) / 403 (forbidden);

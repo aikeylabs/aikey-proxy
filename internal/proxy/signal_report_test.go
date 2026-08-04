@@ -7,9 +7,13 @@ import (
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"sync"
 	"sync/atomic"
 	"testing"
+	"time"
+
+	"github.com/AiKeyLabs/aikey-proxy/internal/httpx"
 )
 
 // signal_report_test.go — covers the I5 emit path's pure + best-effort pieces.
@@ -203,6 +207,111 @@ func TestSignalPostSendsRevoked(t *testing.T) {
 	}
 	if len(decoded.Revoked) != 1 || decoded.Revoked[0] != (revokedSample{CredentialID: "c2", Reason: "revoked"}) {
 		t.Fatalf("decoded revoked = %+v, want one {c2,revoked}", decoded.Revoked)
+	}
+}
+
+func TestAuthFailureSignalIsVersionedDurableAndRetriedUntilAccepted(t *testing.T) {
+	t.Setenv("AIKEY_RUN_DIR", t.TempDir())
+	var hits atomic.Int32
+	var bodies [][]byte
+	var bodiesMu sync.Mutex
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+		body, _ := io.ReadAll(req.Body)
+		bodiesMu.Lock()
+		bodies = append(bodies, body)
+		bodiesMu.Unlock()
+		if hits.Add(1) == 1 {
+			w.WriteHeader(http.StatusServiceUnavailable)
+			return
+		}
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer srv.Close()
+
+	r := &signalReporter{
+		url: srv.URL, bearer: func(context.Context) (string, error) { return "svc-token", nil },
+		client: httpx.NewSwappableDirect(time.Second), authFailures: make(map[string]authFailureSample),
+		authWake: make(chan struct{}, 1), logger: slog.Default(),
+	}
+	// Missing token version is unsafe: a delayed signal could invalidate a new
+	// re-login, so it must not enter the outbox.
+	r.enqueueAuthFailure("c1", "g1", "s1", "", "token_revoked")
+	if len(r.snapshotAuthFailures()) != 0 {
+		t.Fatal("unversioned auth failure entered outbox")
+	}
+	r.enqueueAuthFailure("c1", "g1", "s1", "fingerprint-1", "token_revoked")
+	pending := r.snapshotAuthFailures()
+	if len(pending) != 1 || pending[0].TokenFingerprint != "fingerprint-1" {
+		t.Fatalf("versioned auth failure not queued: %+v", pending)
+	}
+	path, err := signalAuthFailurePath()
+	if err != nil {
+		t.Fatalf("outbox path: %v", err)
+	}
+	if _, err := os.Stat(path); err != nil {
+		t.Fatalf("durable outbox missing: %v", err)
+	}
+
+	if r.postAll(nil, nil, pending, nil, nil) {
+		t.Fatal("503 upload reported success")
+	}
+	if len(r.snapshotAuthFailures()) != 1 {
+		t.Fatal("failed upload dropped durable auth failure")
+	}
+	if !r.postAll(nil, nil, pending, nil, nil) {
+		t.Fatal("retry upload did not succeed")
+	}
+	r.acknowledgeAuthFailures(pending)
+	if len(r.snapshotAuthFailures()) != 0 {
+		t.Fatal("accepted upload remained pending")
+	}
+	if _, err := os.Stat(path); !os.IsNotExist(err) {
+		t.Fatalf("empty outbox file was not removed: %v", err)
+	}
+
+	bodiesMu.Lock()
+	defer bodiesMu.Unlock()
+	if len(bodies) != 2 {
+		t.Fatalf("upload attempts=%d, want 2", len(bodies))
+	}
+	var decoded struct {
+		AuthFailures []authFailureSample `json:"auth_failures"`
+	}
+	if err := json.Unmarshal(bodies[1], &decoded); err != nil || len(decoded.AuthFailures) != 1 {
+		t.Fatalf("auth failure wire body invalid: err=%v body=%s", err, bodies[1])
+	}
+	if got := decoded.AuthFailures[0]; got.CredentialID != "c1" || got.OAuthGroupID != "g1" || got.SeatID != "s1" || got.TokenFingerprint != "fingerprint-1" {
+		t.Fatalf("auth failure route/version lost on wire: %+v", got)
+	}
+}
+
+func TestAuthFailureOutboxHydratesOnlyVersionedEntries(t *testing.T) {
+	t.Setenv("AIKEY_RUN_DIR", t.TempDir())
+	writer := &signalReporter{authFailures: make(map[string]authFailureSample), authWake: make(chan struct{}, 1), logger: slog.Default()}
+	writer.enqueueAuthFailure("c1", "g1", "s1", "fp-1", "token_revoked")
+
+	reader := &signalReporter{authFailures: make(map[string]authFailureSample), logger: slog.Default()}
+	reader.hydrateAuthFailures()
+	got := reader.snapshotAuthFailures()
+	if len(got) != 1 || got[0].TokenFingerprint != "fp-1" {
+		t.Fatalf("durable auth failure did not hydrate: %+v", got)
+	}
+}
+
+func TestEnableOrgSignalReporting_UsesClusterServiceEndpointAndToken(t *testing.T) {
+	t.Setenv("AIKEY_RUN_DIR", t.TempDir())
+	p := &Proxy{}
+	p.EnableOrgSignalReporting("https://control.example.test/", "org/cluster", "svc-token")
+	defer p.StopSignalReporting()
+	if p.signalReporter == nil {
+		t.Fatal("cluster signal reporter was not wired")
+	}
+	if got, want := p.signalReporter.url, "https://control.example.test/internal/org/org%2Fcluster/signals"; got != want {
+		t.Fatalf("cluster signal endpoint=%q want %q", got, want)
+	}
+	token, err := p.signalReporter.bearer(context.Background())
+	if err != nil || token != "svc-token" {
+		t.Fatalf("cluster service credential lost: token=%q err=%v", token, err)
 	}
 }
 

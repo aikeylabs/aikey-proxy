@@ -15,17 +15,21 @@
 package proxy
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"log/slog"
 	"net/http"
 	"os"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
 	"time"
 
 	"github.com/AiKeyLabs/aikey-proxy/internal/observability"
+	"github.com/AiKeyLabs/aikey-proxy/internal/vkeys"
 )
 
 const (
@@ -106,13 +110,40 @@ type poolCooldownStore struct {
 	// model maps into that tier (skipSetFor); every other model keeps serving —
 	// a Fable weekly-window exhaustion must not block Sonnet traffic.
 	tierM map[string]time.Time
+	// authFailedTokens is a route-member + token-version tombstone, not a timed
+	// cooldown. The key includes group, seat and account: one Cluster Worker can
+	// serve several members of the same pool, whose tokens must remain isolated.
+	// Keeping only a SHA-256 fingerprint lets the resolver reject the exact bad
+	// token across requests/restarts without storing or logging token material.
+	authFailedTokens map[string]string
 }
 
 func tierCooldownKey(accountID, tierKey string) string { return accountID + "|" + tierKey }
 
+func authFailureRouteKey(oauthGroupID, seatID, accountID string) string {
+	return oauthGroupID + "|" + seatID + "|" + accountID
+}
+
+func parseAuthFailureRouteKey(key string) (PoolAuthFailureState, bool) {
+	parts := strings.SplitN(key, "|", 3)
+	if len(parts) != 3 || parts[0] == "" || parts[1] == "" || parts[2] == "" {
+		return PoolAuthFailureState{}, false
+	}
+	return PoolAuthFailureState{OAuthGroupID: parts[0], SeatID: parts[1], AccountID: parts[2]}, true
+}
+
+// PoolAuthFailureState is one member-scoped hard-revocation projection. A
+// zero-time auth failure is intentionally separate from whole-account cooldowns.
+type PoolAuthFailureState struct {
+	OAuthGroupID string `json:"oauth_group_id"`
+	SeatID       string `json:"seat_id"`
+	AccountID    string `json:"account_id"`
+}
+
 func newPoolCooldownStore() *poolCooldownStore {
 	s := &poolCooldownStore{m: make(map[string]time.Time), now: time.Now,
-		meta: make(map[string]PoolAccountRouteState), serverErrStreak: make(map[string]int), tierM: make(map[string]time.Time)}
+		meta: make(map[string]PoolAccountRouteState), serverErrStreak: make(map[string]int), tierM: make(map[string]time.Time),
+		authFailedTokens: make(map[string]string)}
 	// Cross-restart persistence (2026-07-04 self-heal, §S4): without it a proxy
 	// restart forgot every cooldown and could immediately route traffic back
 	// onto an account that just 401'd / rate-limited. STRICTLY an enhancement,
@@ -152,6 +183,9 @@ type poolCooldownFileBody struct {
 	// The authoritative avoid-until remains Accounts; old files without this map
 	// continue to route correctly and simply render no explanatory status.
 	AccountStates map[string]PoolAccountRouteState `json:"account_states,omitempty"`
+	// AuthFailedTokens maps "oauthGroupID|seatID|accountID" to the fingerprint
+	// of the exact OAuth access token rejected as hard-revoked.
+	AuthFailedTokens map[string]string `json:"auth_failed_tokens,omitempty"`
 }
 
 func poolCooldownPath() (string, error) {
@@ -203,6 +237,13 @@ func (s *poolCooldownStore) hydrateFromFile() {
 			loaded++
 		}
 	}
+	for routeKey, fingerprint := range body.AuthFailedTokens {
+		if _, ok := parseAuthFailureRouteKey(routeKey); !ok || fingerprint == "" {
+			continue
+		}
+		s.authFailedTokens[routeKey] = fingerprint
+		loaded++
+	}
 	if loaded > 0 {
 		slog.Info("pool cooldowns hydrated from state file (survive restart)",
 			"event.name", observability.EventProxyGroupAccountCooldown, "accounts", loaded)
@@ -233,7 +274,7 @@ func (s *poolCooldownStore) persistLocked() {
 			tierAccounts[key] = until.Unix()
 		}
 	}
-	if len(accounts) == 0 && len(tierAccounts) == 0 {
+	if len(accounts) == 0 && len(tierAccounts) == 0 && len(s.authFailedTokens) == 0 {
 		if rmErr := os.Remove(path); rmErr != nil && !os.IsNotExist(rmErr) {
 			slog.Warn("pool cooldown state file remove failed",
 				"event.name", observability.EventProxyGroupAccountCooldown, "error", rmErr.Error())
@@ -250,7 +291,11 @@ func (s *poolCooldownStore) persistLocked() {
 				states[id] = state
 			}
 		}
-		data, mErr := json.Marshal(poolCooldownFileBody{Accounts: accounts, AccountStates: states, TierAccounts: tierAccounts, WrittenAt: time.Now().UnixMilli()})
+		authFailedTokens := make(map[string]string, len(s.authFailedTokens))
+		for id, fingerprint := range s.authFailedTokens {
+			authFailedTokens[id] = fingerprint
+		}
+		data, mErr := json.Marshal(poolCooldownFileBody{Accounts: accounts, AccountStates: states, TierAccounts: tierAccounts, AuthFailedTokens: authFailedTokens, WrittenAt: time.Now().UnixMilli()})
 		if mErr != nil {
 			return mErr
 		}
@@ -264,6 +309,140 @@ func (s *poolCooldownStore) persistLocked() {
 		slog.Warn("pool cooldown state file write failed — cooldowns won't survive a restart",
 			"event.name", observability.EventProxyGroupAccountCooldown, "error", err.Error())
 	}
+}
+
+// oauthTokenFingerprint returns a non-reversible identifier for one delivered
+// token version. It is safe to persist, unlike the token itself.
+func oauthTokenFingerprint(token string) string {
+	if token == "" {
+		return ""
+	}
+	sum := sha256.Sum256([]byte(token))
+	return hex.EncodeToString(sum[:])
+}
+
+// markAuthFailedToken replaces the generic timed 401 cooldown with a durable
+// token-version tombstone. Waiting cannot repair a revoked token; only delivery
+// of a different token version should re-admit the account.
+func (s *poolCooldownStore) markAuthFailedToken(oauthGroupID, seatID, accountID, fingerprint string) {
+	if oauthGroupID == "" || seatID == "" || accountID == "" || fingerprint == "" {
+		return
+	}
+	routeKey := authFailureRouteKey(oauthGroupID, seatID, accountID)
+	s.mu.Lock()
+	if s.authFailedTokens == nil {
+		s.authFailedTokens = make(map[string]string)
+	}
+	changed := s.authFailedTokens[routeKey] != fingerprint
+	s.authFailedTokens[routeKey] = fingerprint
+	if changed {
+		s.persistLocked()
+	}
+	hook := s.onAccountSetChanged
+	s.mu.Unlock()
+	if changed && hook != nil {
+		hook()
+	}
+}
+
+// authFailureSkipSet compares persisted hard-revoke tombstones with the latest
+// delivered group material. The same token is skipped; needs_login material is
+// left to the resolver so it can emit the actionable login prompt; a newly
+// delivered token clears the tombstone immediately and is eligible now.
+func (s *poolCooldownStore) authFailureSkipSet(oauthGroupID, seatID, groupRuntime string, derivedKey []byte) map[string]bool {
+	prefix := oauthGroupID + "|" + seatID + "|"
+	s.mu.Lock()
+	known := make(map[string]string)
+	for routeKey, fingerprint := range s.authFailedTokens {
+		if strings.HasPrefix(routeKey, prefix) {
+			known[routeKey] = fingerprint
+		}
+	}
+	s.mu.Unlock()
+	if len(known) == 0 || groupRuntime == "" {
+		return nil
+	}
+	var material map[string]vkeys.GroupRuntimeAccount
+	if err := json.Unmarshal([]byte(groupRuntime), &material); err != nil {
+		return nil
+	}
+	var skip map[string]bool
+	cleared := false
+	for routeKey, rejectedFingerprint := range known {
+		routeState, ok := parseAuthFailureRouteKey(routeKey)
+		if !ok {
+			continue
+		}
+		mat, ok := material[routeState.AccountID]
+		if !ok || mat.NeedsLogin {
+			continue
+		}
+		token, err := decryptGroupSecret(derivedKey, mat)
+		if err != nil || token == "" {
+			continue
+		}
+		currentFingerprint := oauthTokenFingerprint(token)
+		if currentFingerprint == rejectedFingerprint {
+			if skip == nil {
+				skip = make(map[string]bool)
+			}
+			skip[routeState.AccountID] = true
+			continue
+		}
+		s.mu.Lock()
+		if s.authFailedTokens[routeKey] == rejectedFingerprint {
+			delete(s.authFailedTokens, routeKey)
+			s.persistLocked()
+			cleared = true
+		}
+		s.mu.Unlock()
+	}
+	if cleared {
+		s.mu.Lock()
+		hook := s.onAccountSetChanged
+		s.mu.Unlock()
+		if hook != nil {
+			hook()
+		}
+	}
+	return skip
+}
+
+func (s *poolCooldownStore) authFailureSnapshot() []PoolAuthFailureState {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	out := make([]PoolAuthFailureState, 0, len(s.authFailedTokens))
+	for routeKey := range s.authFailedTokens {
+		if state, ok := parseAuthFailureRouteKey(routeKey); ok {
+			out = append(out, state)
+		}
+	}
+	sort.Slice(out, func(i, j int) bool {
+		if out[i].OAuthGroupID != out[j].OAuthGroupID {
+			return out[i].OAuthGroupID < out[j].OAuthGroupID
+		}
+		if out[i].SeatID != out[j].SeatID {
+			return out[i].SeatID < out[j].SeatID
+		}
+		return out[i].AccountID < out[j].AccountID
+	})
+	return out
+}
+
+func mergeAccountSkipSets(sets ...map[string]bool) map[string]bool {
+	var out map[string]bool
+	for _, set := range sets {
+		for id, skipped := range set {
+			if !skipped {
+				continue
+			}
+			if out == nil {
+				out = make(map[string]bool)
+			}
+			out[id] = true
+		}
+	}
+	return out
 }
 
 // noteServerError records one 5xx/transport failure for an account (P0-B) and
@@ -410,10 +589,19 @@ func (s *poolCooldownStore) skipSet() map[string]bool {
 // never retries in the final fractional second before the account is eligible.
 // Expiry cleanup remains owned by skipSet; stale entries are simply ignored.
 func (s *poolCooldownStore) earliestRetryAfterSeconds(routeIDs, skip map[string]bool) (int, bool) {
+	seconds, _, _, ok := s.earliestRetryAdvice(routeIDs, skip)
+	return seconds, ok
+}
+
+// earliestRetryAdvice returns the exact local routing deadline and display
+// classification for the first route account that will re-enter. The cooldown
+// deadline (not a database/window estimate) is authoritative for retry timing.
+func (s *poolCooldownStore) earliestRetryAdvice(routeIDs, skip map[string]bool) (seconds int, retryAt int64, reason string, ok bool) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	now := s.now()
 	var earliest time.Time
+	earliestID := ""
 	for id := range routeIDs {
 		if !skip[id] {
 			continue
@@ -424,17 +612,21 @@ func (s *poolCooldownStore) earliestRetryAfterSeconds(routeIDs, skip map[string]
 		}
 		if earliest.IsZero() || until.Before(earliest) {
 			earliest = until
+			earliestID = id
 		}
 	}
 	if earliest.IsZero() {
-		return 0, false
+		return 0, 0, "", false
 	}
 	remaining := earliest.Sub(now)
-	seconds := int((remaining + time.Second - 1) / time.Second)
+	seconds = int((remaining + time.Second - 1) / time.Second)
 	if seconds < 1 {
 		seconds = 1
 	}
-	return seconds, true
+	if state, exists := s.meta[earliestID]; exists {
+		reason = state.Status
+	}
+	return seconds, earliest.Unix(), reason, true
 }
 
 // routeStateSnapshot returns the active whole-account display states. It uses

@@ -353,7 +353,12 @@ type PoolRoutingHealth struct {
 // CooledAccount is one pool account currently routed around (401 / exhaustion).
 type CooledAccount struct {
 	AccountID       string `json:"account_id"`
+	OAuthGroupID    string `json:"oauth_group_id,omitempty"`
+	SeatID          string `json:"seat_id,omitempty"`
 	CooldownSeconds int    `json:"cooldown_seconds"`
+	RouteStatus     string `json:"route_status,omitempty"`
+	RouteRetryAt    int64  `json:"route_retry_at,omitempty"`
+	ErrorCode       string `json:"error_code,omitempty"`
 }
 
 // ProviderPathHealth is one transient outbound path breaker. All identities are

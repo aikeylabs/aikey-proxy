@@ -99,6 +99,7 @@ func (p *Proxy) handleOauthGroupRoute(
 	failed := map[string]bool{}
 	failedPaths := map[string]bool{}
 	var lastCaptured *groupFailoverWriter
+	var lastAuthFailedAccount string
 	var lastBlockedPath *ProviderPathHealth
 	upstreamAttempts := 0
 
@@ -109,11 +110,16 @@ func (p *Proxy) handleOauthGroupRoute(
 
 	override := p.routingOverrides.lookup(route.SeatID, route.OauthGroupID)
 	for {
-		// baseSkip is durable routing state (whole-account/model-tier cooldown).
+		// baseSkip is durable routing state (whole-account/model-tier cooldown plus
+		// exact-token hard-revoke tombstones). A hard-revoked token is compared with
+		// current material on every request: the same token stays skipped, while a
+		// freshly delivered re-login token clears the tombstone immediately.
 		// Keep it separate from this request's failed attempts: a needs_login account
 		// selected after baseSkip is actionable and must become the visible route;
 		// one reached only because of a transient request-local 5xx is not.
-		baseSkip := p.poolCooldown.skipSetFor(reqModel)
+		timedSkip := p.poolCooldown.skipSetFor(reqModel)
+		authSkip := p.poolCooldown.authFailureSkipSet(route.OauthGroupID, route.SeatID, route.GroupRuntime, p.groupKey.DerivedKey())
+		baseSkip := mergeAccountSkipSets(timedSkip, authSkip)
 		skip := baseSkip
 		if len(failed) > 0 {
 			merged := make(map[string]bool, len(skip)+len(failed))
@@ -143,6 +149,8 @@ func (p *Proxy) handleOauthGroupRoute(
 				}
 				if actionable {
 					p.respondLoginRequired(w, logger, route, ge.Account)
+				} else if lastAuthFailedAccount != "" {
+					p.respondLoginRequired(w, logger, route, lastAuthFailedAccount)
 				} else if lastCaptured != nil {
 					lastCaptured.flushCaptured()
 				} else if lastBlockedPath != nil {
@@ -167,9 +175,23 @@ func (p *Proxy) handleOauthGroupRoute(
 					}
 				}
 			}
+			// A previous request may already have learned that the currently
+			// delivered token is hard-revoked. Resolve once without the auth tombstone
+			// (but with timed/model cooldowns) only to recover the routed account name;
+			// never forward that token again.
+			if isGE && ge.Code == groupErrAllUnusable && lastCaptured == nil && len(authSkip) > 0 {
+				if blocked, blockedErr := resolveGroupCredential(route, p.groupKey.DerivedKey(), nowUnix, timedSkip, override); blockedErr == nil && blocked != nil && authSkip[blocked.AccountID] {
+					p.respondLoginRequired(w, logger, route, blocked.AccountID)
+					return
+				}
+			}
 			// 3. Mid-failover candidate exhaustion (non-tier): the last upstream
 			//    error IS the final answer — flush it verbatim (transparent, never
 			//    invent a shape).
+			if lastAuthFailedAccount != "" {
+				p.respondLoginRequired(w, logger, route, lastAuthFailedAccount)
+				return
+			}
 			if lastCaptured != nil {
 				lastCaptured.flushCaptured()
 				return
@@ -185,9 +207,13 @@ func (p *Proxy) handleOauthGroupRoute(
 			// this only when this request has no concrete upstream response to
 			// preserve verbatim.
 			if isGE && ge.Code == groupErrAllUnusable {
-				p.setGroupCooldownRetryAfter(w, route, baseSkip)
+				advice := p.setGroupCooldownRetryAfter(w, route, baseSkip)
 				if code := p.groupUnavailableCooldownCode(route, baseSkip); code != "" {
 					p.degradeGroup(w, logger, route, code, groupDegradeMessage(code))
+					return
+				}
+				if advice != nil {
+					p.degradeGroupWithRetry(w, logger, route, ge.Code, advice)
 					return
 				}
 			}
@@ -207,6 +233,11 @@ func (p *Proxy) handleOauthGroupRoute(
 		if result.blockedPath != nil {
 			lastBlockedPath = result.blockedPath
 		}
+		if result.authFailedAccount != "" {
+			lastAuthFailedAccount = result.authFailedAccount
+		} else if result.attempted {
+			lastAuthFailedAccount = ""
+		}
 		if result.done {
 			return
 		}
@@ -214,9 +245,10 @@ func (p *Proxy) handleOauthGroupRoute(
 }
 
 type groupAttemptResult struct {
-	done        bool
-	attempted   bool
-	blockedPath *ProviderPathHealth
+	done              bool
+	attempted         bool
+	blockedPath       *ProviderPathHealth
+	authFailedAccount string
 }
 
 // serveGroupAttempt evaluates ONE candidate and reports whether it reached the
@@ -249,6 +281,9 @@ func (p *Proxy) serveGroupAttempt(
 	rc := *route
 	rc.AccountID = res.AccountID       // usage attribution → the account actually used
 	rc.CredentialID = res.CredentialID // I5 signal reporting keyed by credential_id (T2 uplink; empty group route.CredentialID was dropping all signals)
+	if res.OAuth != nil {
+		rc.OAuthTokenFingerprint = oauthTokenFingerprint(res.OAuth.AccessToken)
+	}
 	// Point-in-time audit identity (2026-07-01, usage-audit "selected account" display):
 	// the SELECTED pool account's email rides the usage event as oauth_identity
 	// (reportable.go reads route.OAuthIdentity → ODS → DWD → the master usage-audit
@@ -431,9 +466,10 @@ func (p *Proxy) serveGroupAttempt(
 	// upstream failure (401 / evidence-429 / >=500 incl. the ReverseProxy-
 	// synthesized 503 for group transport errors) is DEFERRED — nothing reaches the
 	// client — and we signal the caller to retry on the next candidate. Capture is
-	// disabled on the last permitted attempt so its outcome streams straight
-	// through (no pointless buffering when no retry can follow).
-	fw := newGroupFailoverWriter(w, attempt < groupFailoverMaxSwitches)
+	// remains captured even on the last permitted attempt: only the response body
+	// can distinguish a permanently revoked token from an ordinary 401. The last
+	// non-revocation failure is flushed verbatim immediately below.
+	fw := newGroupFailoverWriter(w, true)
 	p.serveRouteWithObserver(fw, r, &rc, prov, realKey, inboundBearer, startTime, logger,
 		observer.StreamUserChat, traceID)
 	// No-op after an HTTP response (the entry is already closed) or transport
@@ -442,6 +478,31 @@ func (p *Proxy) serveGroupAttempt(
 	p.pathHealth.NoteProbeCanceled(path)
 	if !fw.capturedResponse() {
 		return groupAttemptResult{done: true, attempted: true} // streamed to the client
+	}
+	errType, _ := parseUpstreamErrorEnvelope(fw.buf.Bytes())
+	hardRevoked := res.CredentialType == credTypeOAuth && res.OAuth != nil &&
+		isHardRevoked(fw.status, errType, string(fw.buf.Bytes()))
+	if hardRevoked {
+		p.poolCooldown.markAuthFailedToken(route.OauthGroupID, route.SeatID, res.AccountID, oauthTokenFingerprint(res.OAuth.AccessToken))
+	} else if fw.status == http.StatusUnauthorized {
+		// Preserve the released conservative behavior for an opaque 401 whose body
+		// does not prove hard revocation. The delayed classification is important:
+		// hard-revoked member tokens take the scoped branch above and can never
+		// create an account-wide cooldown, while unknown 401s retain their bounded
+		// five-minute retry window.
+		now := time.Now()
+		resp := &http.Response{StatusCode: fw.status, Header: fw.header}
+		if until, ok := cooldownDecision(resp, now); ok {
+			p.poolCooldown.markWithState(res.AccountID, until, cooldownRouteState(resp, now, until))
+		}
+	}
+	if attempt >= groupFailoverMaxSwitches {
+		if hardRevoked {
+			p.respondLoginRequired(w, logger, route, res.AccountID)
+		} else {
+			fw.flushCaptured()
+		}
+		return groupAttemptResult{done: true, attempted: true, authFailedAccount: authFailedAccount(hardRevoked, res.AccountID)}
 	}
 	failed[res.AccountID] = true
 	if fw.failedPathKey != "" {
@@ -455,7 +516,14 @@ func (p *Proxy) serveGroupAttempt(
 		"failed_status", fw.status,
 		"attempt", attempt+1,
 	)
-	return groupAttemptResult{attempted: true}
+	return groupAttemptResult{attempted: true, authFailedAccount: authFailedAccount(hardRevoked, res.AccountID)}
+}
+
+func authFailedAccount(hardRevoked bool, accountID string) string {
+	if hardRevoked {
+		return accountID
+	}
+	return ""
 }
 
 func (p *Proxy) respondProviderPathUnavailable(
@@ -722,13 +790,44 @@ func groupRouteAccountIDs(route *vkeys.ResolvedRoute) map[string]bool {
 // client when resolution is blocked by durable cooldown state. It is advisory:
 // routing still relies exclusively on the cooldown store and its clock-based
 // lazy re-entry, so a missing/malformed route payload never blocks the response.
-func (p *Proxy) setGroupCooldownRetryAfter(w http.ResponseWriter, route *vkeys.ResolvedRoute, skip map[string]bool) {
+type groupRetryAdvice struct {
+	Seconds int
+	RetryAt int64
+	Reason  string
+}
+
+func (p *Proxy) setGroupCooldownRetryAfter(w http.ResponseWriter, route *vkeys.ResolvedRoute, skip map[string]bool) *groupRetryAdvice {
 	if route == nil || len(skip) == 0 {
-		return
+		return nil
 	}
-	if seconds, ok := p.poolCooldown.earliestRetryAfterSeconds(groupRouteAccountIDs(route), skip); ok {
+	if seconds, retryAt, reason, ok := p.poolCooldown.earliestRetryAdvice(groupRouteAccountIDs(route), skip); ok {
 		w.Header().Set("Retry-After", strconv.Itoa(seconds))
+		return &groupRetryAdvice{Seconds: seconds, RetryAt: retryAt, Reason: reason}
 	}
+	return nil
+}
+
+func (p *Proxy) degradeGroupWithRetry(w http.ResponseWriter, logger *slog.Logger, route *vkeys.ResolvedRoute, code string, advice *groupRetryAdvice) {
+	p.errors.Add(1)
+	status, errType := groupDegradeStatus(code)
+	message := groupDegradeMessage(code)
+	if advice != nil {
+		message = fmt.Sprintf("All accounts in this credential-sharing group are currently unavailable. The earliest account will be retried in %d seconds.", advice.Seconds)
+	}
+	logger.Warn("group route degraded",
+		"event.name", observability.EventProxyGroupRouteDegraded,
+		"error.code", code,
+		"http.status", status,
+		"oauth_group_id", route.OauthGroupID,
+		"virtual_key_id", route.VirtualKeyID,
+		"retry_after_seconds", advice.Seconds,
+		"retry_reason", advice.Reason,
+	)
+	writeJSONErrorDetails(w, status, errType, code, message, map[string]any{
+		"retry_after_seconds": advice.Seconds,
+		"retry_at":            advice.RetryAt,
+		"retry_reason":        advice.Reason,
+	})
 }
 
 // degradeGroup fails a group request loudly (never silently routes it to a wrong

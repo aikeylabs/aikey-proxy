@@ -47,6 +47,7 @@ type outboundCapture struct {
 	// pool account can fail while another serves within the SAME request) and a
 	// round-trip counter (asserting how many upstream attempts a request made).
 	statusByAuth map[string]int
+	bodyByAuth   map[string]string
 	errByAuth    map[string]error
 	calls        int
 	requestIDs   []string
@@ -75,12 +76,15 @@ func (c *outboundCapture) RoundTrip(req *http.Request) (*http.Response, error) {
 	for k, v := range c.respHeader {
 		h[k] = v
 	}
+	body := `{"id":"msg","type":"message","content":[{"type":"text","text":"ok"}],"model":"c","stop_reason":"end_turn","usage":{"input_tokens":1,"output_tokens":1}}`
+	if override, ok := c.bodyByAuth[c.auth]; ok {
+		body = override
+	}
 	return &http.Response{
 		StatusCode: st,
 		Header:     h,
-		Body: io.NopCloser(strings.NewReader(
-			`{"id":"msg","type":"message","content":[{"type":"text","text":"ok"}],"model":"c","stop_reason":"end_turn","usage":{"input_tokens":1,"output_tokens":1}}`)),
-		Request: req,
+		Body:       io.NopCloser(strings.NewReader(body)),
+		Request:    req,
 	}, nil
 }
 
@@ -679,6 +683,23 @@ func TestGroupServe_TemporaryCooldownAdvertisesRetryAndAutoRecovers(t *testing.T
 	}
 	if got := blocked.Header().Get("Retry-After"); got != "2" {
 		t.Fatalf("all-cooldown 429 Retry-After=%q, want earliest recovery in 2 seconds", got)
+	}
+	var errorBody struct {
+		Error struct {
+			RetryAfterSeconds int    `json:"retry_after_seconds"`
+			RetryAt           int64  `json:"retry_at"`
+			RetryReason       string `json:"retry_reason"`
+			Message           string `json:"message"`
+		} `json:"error"`
+	}
+	if err := json.Unmarshal(blocked.Body.Bytes(), &errorBody); err != nil {
+		t.Fatalf("decode all-cooldown body: %v body=%s", err, blocked.Body.String())
+	}
+	if errorBody.Error.RetryAfterSeconds != 2 || errorBody.Error.RetryAt != now.Add(2*time.Second).Unix() || errorBody.Error.RetryReason != poolRouteRateLimited {
+		t.Fatalf("all-cooldown retry details = %+v", errorBody.Error)
+	}
+	if !strings.Contains(errorBody.Error.Message, "retried in 2 seconds") {
+		t.Fatalf("all-cooldown message must expose recovery delay: %q", errorBody.Error.Message)
 	}
 	if tr.calls != 0 {
 		t.Fatalf("cooling account must not reach upstream, calls=%d", tr.calls)

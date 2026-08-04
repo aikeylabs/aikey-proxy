@@ -4,6 +4,8 @@ import (
 	"context"
 	"log/slog"
 	"net/http"
+	"net/url"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -495,6 +497,13 @@ func (p *Proxy) CooldownRouteStateSnapshot() map[string]PoolAccountRouteState {
 	return p.poolCooldown.routeStateSnapshot()
 }
 
+// AuthFailureRouteSnapshot returns member-scoped hard-revocation state. It is
+// separate from whole-account cooldowns because one Cluster Worker can serve
+// several seats whose tokens for the same pool account differ.
+func (p *Proxy) AuthFailureRouteSnapshot() []PoolAuthFailureState {
+	return p.poolCooldown.authFailureSnapshot()
+}
+
 // SetPoolCooldownChangeHook installs a non-blocking wake-up hook for changes to
 // the whole-account cooldown set. The supervisor uses it to refresh the
 // display-only is_current_routed projection; routing itself reads poolCooldown
@@ -625,6 +634,21 @@ func (p *Proxy) SetReporter(r *events.Reporter, instanceID, clientVersion, confi
 // poll uses. nil controlURL/bearer → feature stays off (newSignalReporter returns nil).
 func (p *Proxy) EnableSignalReporting(controlURL string, bearer func(ctx context.Context) (string, error)) {
 	p.signalReporter = newSignalReporter(controlURL, bearer, slog.Default())
+}
+
+// EnableOrgSignalReporting is the Cluster-worker sibling of
+// EnableSignalReporting. A worker has no member refresh token, so it reports to
+// the org-scoped svcAuth endpoint with the already-configured control service
+// token. The token authenticates only the control hop and is never forwarded to
+// an LLM upstream.
+func (p *Proxy) EnableOrgSignalReporting(controlURL, orgID, serviceToken string) {
+	if controlURL == "" || orgID == "" || serviceToken == "" {
+		return
+	}
+	endpoint := strings.TrimRight(controlURL, "/") + "/internal/org/" + url.PathEscape(orgID) + "/signals"
+	p.signalReporter = newSignalReporterEndpoint(endpoint, func(context.Context) (string, error) {
+		return serviceToken, nil
+	}, slog.Default())
 }
 
 // StopSignalReporting stops the signal reporter's upload loop (idempotent,
