@@ -73,6 +73,15 @@ const fallbackPolicyPollInterval = 10 * time.Second
 // and reading it unbounded would let a misrouted response consume memory.
 const maxFallbackPolicyBody = 64 << 10
 
+// fallbackPolicyNodeHeader carries the polling node's cluster id so the control
+// plane can count MACHINES rather than accounts (see syncFallbackPolicy).
+//
+// 🚫 Not an identity claim and never used for authorization — the bearer token
+// already decided who may read this org's policy. This only splits an already-
+// authorized caller into the nodes it is made of, so the worst a wrong value can
+// do is miscount a display number for a tenant that could read it anyway.
+const fallbackPolicyNodeHeader = "X-Aikey-Node-Id"
+
 var fallbackPolicyHTTPClient = httpx.NewSwappableDirect(10 * time.Second)
 
 // fallbackPolicyRail declares the rail.
@@ -190,6 +199,21 @@ func (s *Supervisor) syncFallbackPolicy(ctx context.Context, _ *generation, mast
 	}
 	if bearer != "" {
 		req.Header.Set("Authorization", "Bearer "+bearer)
+	}
+	// Who is polling, for the console's rollout count (task 4.23).
+	//
+	// 🔴 Every worker in a cluster presents the SAME control_service_token, so
+	// the control plane cannot tell two nodes apart from the credential — it was
+	// counting distinct ACCOUNTS, which collapses an N-worker fleet to 1. A
+	// fully-synced 2-worker staging cluster reported "已下发到 1/18 台机器"
+	// (2026-08-04), i.e. the console said the policy had not rolled out while
+	// both nodes were serving it. Node id is the only thing that distinguishes
+	// them, and only the node knows it.
+	//
+	// Seat installs deliberately send nothing: there the account IS the machine,
+	// and the server keeps its existing per-account counting for them.
+	if s.isClusterNode() && s.cfg.Cluster.NodeID != "" {
+		req.Header.Set(fallbackPolicyNodeHeader, s.cfg.Cluster.NodeID)
 	}
 	// 🔴 The conditional request. Without this header the server must read and
 	// serialize the whole policy every 10 seconds for every seat.
