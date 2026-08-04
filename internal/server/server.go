@@ -32,7 +32,7 @@ type RouteRegistrar interface {
 	RegisterRoutes(mux *http.ServeMux)
 }
 
-func New(ln net.Listener, dataHandler http.Handler, adminHandler *admin.Handler, extraHandlers ...RouteRegistrar) *Server {
+func New(ln net.Listener, dataHandler http.Handler, adminHandler *admin.Handler, gate AdminGate, extraHandlers ...RouteRegistrar) *Server {
 	mux := http.NewServeMux()
 
 	// Data plane: catch-all — forwards every request not claimed by the admin routes
@@ -57,49 +57,49 @@ func New(ln net.Listener, dataHandler http.Handler, adminHandler *admin.Handler,
 	mux.HandleFunc("GET /health/keys", adminHandler.HealthKeys)
 	mux.HandleFunc("GET /status", adminHandler.Status)
 	mux.HandleFunc("GET /metrics", adminHandler.Metrics)
-	mux.HandleFunc("POST /admin/reload", adminHandler.Reload)
+	mux.HandleFunc("POST /admin/reload", gate.guard(adminHandler.Reload))
 	// Effective compliance packs (built-in + pulled) of the live filter child.
-	mux.HandleFunc("GET /admin/compliance/packs", adminHandler.CompliancePacks)
+	mux.HandleFunc("GET /admin/compliance/packs", gate.guard(adminHandler.CompliancePacks))
 	// Replay dead-letter usage events. Re-uses current reporter config
 	// (post-login JWT, current route URLs) so brief upstream errors
 	// (transient 401 / 5xx) don't permanently lose data. Operator
 	// triggers via `aikey proxy replay-dead-letter`. Idempotent: re-
 	// running is safe (entries that re-deliver are removed; entries
 	// still failing stay in the file for the next try).
-	mux.HandleFunc("POST /admin/replay-dead-letter", adminHandler.ReplayDeadLetter)
+	mux.HandleFunc("POST /admin/replay-dead-letter", gate.guard(adminHandler.ReplayDeadLetter))
 	// Connectivity probe endpoint — used by `aikey test` / `aikey doctor` /
 	// `aikey add` to measure reachability + latency from the proxy's network
 	// context to upstream providers. Respects config.upstream_proxy.url and
 	// standard HTTPS_PROXY / HTTP_PROXY / ALL_PROXY env vars — essential for
 	// the China-network deployment where direct TCP to upstream is blocked.
-	mux.HandleFunc("POST /admin/probe/ping", adminHandler.ProbePing)
+	mux.HandleFunc("POST /admin/probe/ping", gate.guard(adminHandler.ProbePing))
 
 	// Debug toggle for outbound upstream headers. 3-layer resolution
 	// (API > env AIKEY_PROXY_DEBUG_UPSTREAM_HEADERS > compile-time ldflags);
 	// see internal/proxy/debug_upstream.go for full semantics.
-	mux.HandleFunc("GET /admin/debug/upstream-headers", adminHandler.DebugUpstreamHeadersGet)
-	mux.HandleFunc("POST /admin/debug/upstream-headers", adminHandler.DebugUpstreamHeadersSet)
-	mux.HandleFunc("DELETE /admin/debug/upstream-headers", adminHandler.DebugUpstreamHeadersClear)
+	mux.HandleFunc("GET /admin/debug/upstream-headers", gate.guard(adminHandler.DebugUpstreamHeadersGet))
+	mux.HandleFunc("POST /admin/debug/upstream-headers", gate.guard(adminHandler.DebugUpstreamHeadersSet))
+	mux.HandleFunc("DELETE /admin/debug/upstream-headers", gate.guard(adminHandler.DebugUpstreamHeadersClear))
 
 	// In-memory "most recent call per app_slug" snapshot — drives the Web
 	// "Connected Apps" list Health column. Volatile (process memory only);
 	// see internal/proxy/apppipe/health.go for the rationale.
-	mux.HandleFunc("GET /admin/apps/health", adminHandler.AppHealth)
+	mux.HandleFunc("GET /admin/apps/health", gate.guard(adminHandler.AppHealth))
 
 	// Delivery-integrity audit (D2.5 / D3): local client state + client-confirmed
 	// reconciliation (re-send WAL-present gaps, confirm WAL-absent gaps lost).
-	mux.HandleFunc("GET /admin/audit/status", adminHandler.AuditStatus)
-	mux.HandleFunc("POST /admin/audit/reconcile", adminHandler.AuditReconcile)
+	mux.HandleFunc("GET /admin/audit/status", gate.guard(adminHandler.AuditStatus))
+	mux.HandleFunc("POST /admin/audit/reconcile", gate.guard(adminHandler.AuditReconcile))
 
 	// Egress (upstream) proxy config — read + hot-swap. Relayed by the local web
 	// "Settings → Upstream proxy" card (R25 出口收敛: egress lives on the proxy node).
-	mux.HandleFunc("GET /admin/upstream-proxy", adminHandler.UpstreamProxyGet)
-	mux.HandleFunc("PUT /admin/upstream-proxy", adminHandler.UpstreamProxySet)
+	mux.HandleFunc("GET /admin/upstream-proxy", gate.guard(adminHandler.UpstreamProxyGet))
+	mux.HandleFunc("PUT /admin/upstream-proxy", gate.guard(adminHandler.UpstreamProxySet))
 	// Escape hatch (2026-07-19): opt-in override that routes OAuth per-account
 	// egress traffic through the node upstream chain (Settings checkbox).
-	mux.HandleFunc("GET /admin/oauth-egress-override", adminHandler.OAuthEgressOverrideGet)
-	mux.HandleFunc("PUT /admin/oauth-egress-override", adminHandler.OAuthEgressOverrideSet)
-	mux.HandleFunc("POST /admin/upstream-proxy/probe", adminHandler.UpstreamProxyProbe)
+	mux.HandleFunc("GET /admin/oauth-egress-override", gate.guard(adminHandler.OAuthEgressOverrideGet))
+	mux.HandleFunc("PUT /admin/oauth-egress-override", gate.guard(adminHandler.OAuthEgressOverrideSet))
+	mux.HandleFunc("POST /admin/upstream-proxy/probe", gate.guard(adminHandler.UpstreamProxyProbe))
 	// Exit-IP identity probe for a candidate/current upstream spec (节点管理
 	// Nodes page test button, update 20260718). Distinct from probe above:
 	// probe asks "can this URL reach the provider", this asks "WHICH exit IP
@@ -107,11 +107,11 @@ func New(ln net.Listener, dataHandler http.Handler, adminHandler *admin.Handler,
 	// forwarding transport uses). Public face never sees it — worker nginx
 	// denies /admin/* (P3 方案C); the master console calls it over the
 	// cluster-internal network.
-	mux.HandleFunc("POST /admin/egress-test", adminHandler.EgressTest)
+	mux.HandleFunc("POST /admin/egress-test", gate.guard(adminHandler.EgressTest))
 
 	// Per-account egress connectivity self-check (§5.4): `aikey test` (presence)
 	// / `aikey doctor` (?dial=1) read this to verify each pool account's egress.
-	mux.HandleFunc("GET /admin/egress/selfcheck", adminHandler.EgressSelfCheck)
+	mux.HandleFunc("GET /admin/egress/selfcheck", gate.guard(adminHandler.EgressSelfCheck))
 
 	// Extra route registrars (e.g., OAuth broker handler)
 	for _, h := range extraHandlers {
