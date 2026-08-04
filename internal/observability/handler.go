@@ -156,6 +156,10 @@ const (
 	// fallback-worthy failure (401 broken / exhaustion-429), so it was cooled down
 	// and subsequent requests route around it.
 	EventProxyGroupAccountCooldown = "proxy.group.account_cooldown"
+	// EventProxyGroupRoutingConfigInvalid means the delivered pool policy could
+	// not be parsed. The data path falls back to the product default, but a WARN
+	// keeps control-plane drift visible and traceable.
+	EventProxyGroupRoutingConfigInvalid = "proxy.group.routing_config_invalid"
 	// EventProxyGroupAccountSwitched (N9 #8): the seat's rank-0 (primary) account
 	// was unusable (cooled / exhausted / expired / no material) so the request
 	// fell back to a different candidate — an auditable account switch.

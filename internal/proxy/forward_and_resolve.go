@@ -759,32 +759,36 @@ func (p *Proxy) serveRoute(w http.ResponseWriter, r *http.Request, route *vkeys.
 					// shared pool account globally. group_serve reads the buffered body
 					// and records a group+seat+account+fingerprint tombstone when it is
 					// a hard revoke. Do not create an account-wide timed cooldown here.
-				} else if until, ok := cooldownDecision(resp, nowT); ok {
-					p.poolCooldown.markWithState(route.AccountID, until, cooldownRouteState(resp, nowT, until))
-					logger.Warn("pool account cooled down after upstream failure",
-						"event.name", observability.EventProxyGroupAccountCooldown,
-						"oauth_group_id", route.OauthGroupID,
-						"account_id", route.AccountID,
-						"status", resp.StatusCode)
-				} else if resp.StatusCode >= 500 {
-					// P0-B (2026-07-19): generic 5xx cools only after CONSECUTIVE
-					// repeats — a single transient 502/503 must not pull a good
-					// account, but a persistently-broken one must stop eating one
-					// wasted in-request-failover attempt per request (N9 hides the
-					// failure from the CLIENT; this stops the WASTE).
-					if _, cooled := p.poolCooldown.noteServerError(route.AccountID); cooled {
-						// noteServerError marked the cooldown itself (atomic with the
-						// streak reset) — this is the observability side only.
-						logger.Warn("pool account cooled down after repeated server errors",
+				} else {
+					temporaryCooldown := groupTemporaryRateLimitCooldownForResponse(
+						resp.StatusCode, route.RoutingConfig, route.OauthGroupID, logger)
+					if until, ok := cooldownDecisionWithTemporaryFallback(resp, nowT, temporaryCooldown); ok {
+						p.poolCooldown.markWithState(route.AccountID, until, cooldownRouteState(resp, nowT, until))
+						logger.Warn("pool account cooled down after upstream failure",
 							"event.name", observability.EventProxyGroupAccountCooldown,
 							"oauth_group_id", route.OauthGroupID,
 							"account_id", route.AccountID,
-							"status", resp.StatusCode,
-							"streak_threshold", serverErrStreakThreshold)
+							"status", resp.StatusCode)
+					} else if resp.StatusCode >= 500 {
+						// P0-B (2026-07-19): generic 5xx cools only after CONSECUTIVE
+						// repeats — a single transient 502/503 must not pull a good
+						// account, but a persistently-broken one must stop eating one
+						// wasted in-request-failover attempt per request (N9 hides the
+						// failure from the CLIENT; this stops the WASTE).
+						if _, cooled := p.poolCooldown.noteServerError(route.AccountID); cooled {
+							// noteServerError marked the cooldown itself (atomic with the
+							// streak reset) — this is the observability side only.
+							logger.Warn("pool account cooled down after repeated server errors",
+								"event.name", observability.EventProxyGroupAccountCooldown,
+								"oauth_group_id", route.OauthGroupID,
+								"account_id", route.AccountID,
+								"status", resp.StatusCode,
+								"streak_threshold", serverErrStreakThreshold)
+						}
+					} else if resp.StatusCode < 400 {
+						// success proves the account serves → reset its 5xx streak.
+						p.poolCooldown.noteSuccess(route.AccountID)
 					}
-				} else if resp.StatusCode < 400 {
-					// success proves the account serves → reset its 5xx streak.
-					p.poolCooldown.noteSuccess(route.AccountID)
 				}
 				// N10 防封 pre-cut: on a successful response, if the account's utilization
 				// crossed its randomized cap, cool it down for this window so it

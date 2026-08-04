@@ -1,12 +1,16 @@
 package proxy
 
 import (
+	"bytes"
+	"log/slog"
 	"net/http"
 	"strconv"
+	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
 
+	"github.com/AiKeyLabs/aikey-proxy/internal/observability"
 	"github.com/AiKeyLabs/aikey-proxy/internal/vkeys"
 )
 
@@ -111,6 +115,84 @@ func TestCooldownDecision_Classification(t *testing.T) {
 	}
 	if _, ok := cooldownDecision(resp(500, nil), now); ok {
 		t.Fatal("500 must not cool down IMMEDIATELY (generic 5xx cools via the consecutive streak, P0-B)")
+	}
+}
+
+func TestCooldownDecision_TemporaryFallbackIsPoolConfigurable(t *testing.T) {
+	now := time.Unix(1_750_000_000, 0)
+	temporary := http.Header{"Anthropic-Ratelimit-Unified-Status": {"rate_limited"}}
+
+	if until, ok := cooldownDecisionWithTemporaryFallback(resp(429, temporary), now, 11*time.Second); !ok || until != now.Add(11*time.Second) {
+		t.Fatalf("temporary 429 must use the pool fallback, got until=%v ok=%v", until, ok)
+	}
+	withRetryAfter := temporary.Clone()
+	withRetryAfter.Set("Retry-After", "23")
+	if until, ok := cooldownDecisionWithTemporaryFallback(resp(429, withRetryAfter), now, 11*time.Second); !ok || until != now.Add(23*time.Second) {
+		t.Fatalf("Retry-After must override the pool fallback, got until=%v ok=%v", until, ok)
+	}
+	resetAt := now.Add(4 * time.Minute)
+	withWindowReset := temporary.Clone()
+	withWindowReset.Set("Anthropic-Ratelimit-Unified-5h-Status", "exhausted")
+	withWindowReset.Set("Anthropic-Ratelimit-Unified-5h-Reset", strconv.FormatInt(resetAt.Unix(), 10))
+	if until, ok := cooldownDecisionWithTemporaryFallback(resp(429, withWindowReset), now, 11*time.Second); !ok || until != resetAt {
+		t.Fatalf("exhausted-window reset must override the pool fallback, got until=%v ok=%v", until, ok)
+	}
+}
+
+func TestGroupTemporaryRateLimitCooldown(t *testing.T) {
+	for _, routingConfig := range []string{"", `{}`, `{"protocol":"anthropic"}`} {
+		got, err := groupTemporaryRateLimitCooldown(routingConfig)
+		if err != nil || got != 5*time.Second {
+			t.Fatalf("routing_config=%q: got=%v err=%v, want 5s", routingConfig, got, err)
+		}
+	}
+	got, err := groupTemporaryRateLimitCooldown(`{"protocol":"anthropic","temporary_rate_limit_cooldown_seconds":17}`)
+	if err != nil || got != 17*time.Second {
+		t.Fatalf("custom pool cooldown: got=%v err=%v, want 17s", got, err)
+	}
+	for _, routingConfig := range []string{
+		`{"temporary_rate_limit_cooldown_seconds":0}`,
+		`{"temporary_rate_limit_cooldown_seconds":3601}`,
+		`not-json`,
+	} {
+		got, err := groupTemporaryRateLimitCooldown(routingConfig)
+		if err == nil || got != poolCooldown429NoReset {
+			t.Fatalf("invalid routing_config=%q: got=%v err=%v, want default plus error", routingConfig, got, err)
+		}
+	}
+}
+
+func TestGroupTemporaryRateLimitCooldown_InvalidConfigWarnsOnlyOn429(t *testing.T) {
+	var logs bytes.Buffer
+	logger := slog.New(slog.NewTextHandler(&logs, nil))
+	got := groupTemporaryRateLimitCooldownForResponse(
+		http.StatusTooManyRequests,
+		`{"temporary_rate_limit_cooldown_seconds":0}`,
+		"group-test",
+		logger,
+	)
+	if got != poolCooldown429NoReset {
+		t.Fatalf("invalid policy fallback=%v, want %v", got, poolCooldown429NoReset)
+	}
+	for _, fragment := range []string{
+		observability.EventProxyGroupRoutingConfigInvalid,
+		"oauth_group_id=group-test",
+		"between 1 and 3600",
+	} {
+		if !strings.Contains(logs.String(), fragment) {
+			t.Fatalf("WARN log %q missing %q", logs.String(), fragment)
+		}
+	}
+
+	logs.Reset()
+	_ = groupTemporaryRateLimitCooldownForResponse(
+		http.StatusOK,
+		`{"temporary_rate_limit_cooldown_seconds":0}`,
+		"group-test",
+		logger,
+	)
+	if logs.Len() != 0 {
+		t.Fatalf("non-429 response must not parse or log the pool cooldown policy: %s", logs.String())
 	}
 }
 

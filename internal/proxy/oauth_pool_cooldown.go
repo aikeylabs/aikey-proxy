@@ -18,6 +18,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"fmt"
 	"log/slog"
 	"net/http"
 	"os"
@@ -40,14 +41,15 @@ const (
 	// poolCooldownMax caps a server-provided Retry-After so a hostile/huge value
 	// can't lock an account out for an unreasonable time.
 	poolCooldownMax = 1 * time.Hour
-	// poolCooldown429NoReset is the SHORT cool for a 429 that proves limiting
+	// poolCooldown429NoReset is the product default SHORT cool for a 429 that proves limiting
 	// (evidence present) but carries NO reset time from any source — the
 	// transient per-minute rate-limit class (R4: 限流→短退避, never the 5-min
 	// exhaustion treatment; over-cooling pulled a good account for 5min and
-	// scattered its cache). sub2api's analogous fallback is 5s; ours is a bit
-	// longer to avoid hammering. Keep one code-level default until a product-level
-	// policy setting is explicitly introduced; provider Retry-After takes priority.
-	poolCooldown429NoReset = 30 * time.Second
+	// scattered its cache). sub2api's analogous fallback is 5s. This code-level
+	// value is the rolling-upgrade default; each pool may override it through the
+	// existing routing_config rail. Provider recovery evidence takes priority.
+	poolCooldown429NoReset = 5 * time.Second
+	poolCooldown429Min     = 1 * time.Second
 
 	// poolCooldown529Overload (P0-B, 2026-07-19): a 529 is the upstream's OWN
 	// "this lane is overloaded" signal — semantically overload, NOT rate-limit,
@@ -760,6 +762,10 @@ func (s *poolCooldownStore) snapshot() map[string]int {
 // Retry-After or the short fallback. 429 WITHOUT evidence (suspected WAF /
 // business rejection) and everything else → (_, false).
 func cooldownDecision(resp *http.Response, now time.Time) (time.Time, bool) {
+	return cooldownDecisionWithTemporaryFallback(resp, now, poolCooldown429NoReset)
+}
+
+func cooldownDecisionWithTemporaryFallback(resp *http.Response, now time.Time, temporaryFallback time.Duration) (time.Time, bool) {
 	switch resp.StatusCode {
 	case http.StatusUnauthorized:
 		return now.Add(poolCooldownDefault), true
@@ -778,7 +784,10 @@ func cooldownDecision(resp *http.Response, now time.Time) (time.Time, bool) {
 		// aggregate `rate_limited` status alone is transient and must not inherit
 		// a representative reset that can be hours away. Evidence of limiting but
 		// no actionable reset uses the short fallback.
-		d := poolCooldown429NoReset
+		if temporaryFallback < poolCooldown429Min || temporaryFallback > poolCooldownMax {
+			temporaryFallback = poolCooldown429NoReset
+		}
+		d := temporaryFallback
 		if cx := codexRateLimitReset(resp.Header); cx > 0 {
 			d = cx
 		} else if ar := anthropicExhaustedWindowResetDuration(resp.Header, now); ar > 0 {
@@ -793,6 +802,55 @@ func cooldownDecision(resp *http.Response, now time.Time) (time.Time, bool) {
 	default:
 		return time.Time{}, false
 	}
+}
+
+type groupCooldownPolicy struct {
+	TemporaryRateLimitCooldownSeconds *int `json:"temporary_rate_limit_cooldown_seconds"`
+}
+
+// groupTemporaryRateLimitCooldown reads the pool policy already carried on the
+// existing routing_config rail. Missing config keeps upgraded pools on the
+// product default. Invalid config returns an error so the request logger can
+// surface the fallback instead of silently hiding control-plane drift.
+func groupTemporaryRateLimitCooldown(routingConfig string) (time.Duration, error) {
+	raw := strings.TrimSpace(routingConfig)
+	if raw == "" {
+		return poolCooldown429NoReset, nil
+	}
+	var policy groupCooldownPolicy
+	if err := json.Unmarshal([]byte(raw), &policy); err != nil {
+		return poolCooldown429NoReset, err
+	}
+	if policy.TemporaryRateLimitCooldownSeconds == nil {
+		return poolCooldown429NoReset, nil
+	}
+	d := time.Duration(*policy.TemporaryRateLimitCooldownSeconds) * time.Second
+	if d < poolCooldown429Min || d > poolCooldownMax {
+		return poolCooldown429NoReset, fmt.Errorf("temporary_rate_limit_cooldown_seconds must be between 1 and 3600")
+	}
+	return d, nil
+}
+
+// groupTemporaryRateLimitCooldownForResponse keeps policy parsing and its WARN
+// on the one response class that consumes the setting. A malformed policy must
+// not spam successful requests and must not block the serving path.
+func groupTemporaryRateLimitCooldownForResponse(
+	status int,
+	routingConfig, oauthGroupID string,
+	logger *slog.Logger,
+) time.Duration {
+	if status != http.StatusTooManyRequests {
+		return poolCooldown429NoReset
+	}
+	d, err := groupTemporaryRateLimitCooldown(routingConfig)
+	if err == nil {
+		return d
+	}
+	logger.Warn("pool routing config is invalid; using temporary rate-limit cooldown default",
+		"event.name", observability.EventProxyGroupRoutingConfigInvalid,
+		"oauth_group_id", oauthGroupID,
+		"error", err.Error())
+	return d
 }
 
 // cooldownRouteState classifies the already-approved whole-account cooldown for

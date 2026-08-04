@@ -98,7 +98,12 @@ func (s *bindingCooldownStore) note(bindingID string, status int, header http.He
 	// — but it is bounded by the administrator's configured maximum, which is the
 	// ceiling protection the account axis already found it needed.
 	d := maxCool
-	if until, ok := cooldownDecision(&http.Response{StatusCode: status, Header: header}, now); ok {
+	// Binding failover has its own administrator-configured ceiling and is not an
+	// OAuth account-pool policy. Preserve its historical 30-second fallback while
+	// still reusing provider Retry-After and concrete reset evidence.
+	if until, ok := cooldownDecisionWithTemporaryFallback(
+		&http.Response{StatusCode: status, Header: header}, now, 30*time.Second,
+	); ok {
 		if evidence := until.Sub(now); evidence > 0 && evidence < maxCool {
 			d = evidence
 		}
