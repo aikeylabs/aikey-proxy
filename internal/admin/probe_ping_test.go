@@ -577,7 +577,7 @@ func TestProbePing_UnresolvableSourceRefRefusesInsteadOfGuessing(t *testing.T) {
 }
 
 // Backward compatibility: an older CLI sends no source_ref and must keep its
-// exact previous behaviour (the field is additive, not a migration).
+// exact previous behavior (the field is additive, not a migration).
 func TestProbePing_WithoutSourceRefBehaviourIsUnchanged(t *testing.T) {
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {

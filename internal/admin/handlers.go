@@ -1025,7 +1025,7 @@ type ProbePingRequest struct {
 	// identifier the data plane resolves (a personal vault alias today).
 	//
 	// 🔴 Added 2026-08-03 as an OPTIONAL field, not a new endpoint, so an older
-	// CLI keeps its exact behaviour (careful-api-creation). When set, the proxy
+	// CLI keeps its exact behavior (careful-api-creation). When set, the proxy
 	// resolves the upstream with the SAME function the forwarding path uses
 	// instead of letting the caller guess it from `Provider` — see
 	// ResolveUpstreamFn and requirements/2026-07-18 §上游地址单一解析.
@@ -1039,7 +1039,7 @@ type ProbePingResponse struct {
 	Error     string `json:"error,omitempty"`
 	LatencyMs int64  `json:"latency_ms"`
 	OK        bool   `json:"ok"`
-	// ResolvedUpstream is the address actually dialled, echoed back so the
+	// ResolvedUpstream is the address actually dialed, echoed back so the
 	// caller can DISPLAY what was tested. 「展示=执行」 (requirements 2026-07-18
 	// §2) is unverifiable by a user who cannot see which address the probe
 	// chose — the old response named only the host, so a probe that silently
