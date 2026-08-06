@@ -85,8 +85,8 @@ func TestIsNetChangeErrnoFor_Windows(t *testing.T) {
 		{"WSAENETDOWN on windows", "windows", dialErr(wsaeNetDown), true},
 
 		// The guard: those numbers are unrelated errno's off Windows and
-		// must not be honoured there.
-		{"WSAEHOSTUNREACH on linux is not honoured", "linux", dialErr(wsaeHostUnreach), false},
+		// must not be honored there.
+		{"WSAEHOSTUNREACH on linux is not honored", "linux", dialErr(wsaeHostUnreach), false},
 
 		// Not every Winsock failure is a routing change. WSAECONNREFUSED
 		// means we reached the host and it said no — a fresh client or a

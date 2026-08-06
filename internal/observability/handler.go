@@ -64,7 +64,7 @@ const (
 	// credential talks to, so it REFUSED to probe rather than substitute a
 	// guess (2026-08-03).
 	//
-	// Why this is WARN and not a silent default: the predecessor behaviour fell
+	// Why this is WARN and not a silent default: the predecessor behavior fell
 	// back to the provider's public host, which made the probe's verdict
 	// uncorrelated with the credential under test — green when the real gateway
 	// was down, red when it was fine. requirements/2026-07-18 §上游地址单一解析

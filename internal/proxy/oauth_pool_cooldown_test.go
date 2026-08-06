@@ -14,6 +14,12 @@ import (
 	"github.com/AiKeyLabs/aikey-proxy/internal/vkeys"
 )
 
+// resp builds a synthetic response for the cooldown classifiers, which read only
+// StatusCode and Header. There is no Body and no transport ever produced this
+// value, so the bodyclose findings against call sites below are false positives —
+// suppressed individually rather than here, because bodyclose reports at the call
+// site and a directive on this function does not reach it. Note it fires on only
+// three of the ~a dozen resp() calls in this file, which is itself the tell.
 func resp(status int, header http.Header) *http.Response {
 	if header == nil {
 		header = http.Header{}
@@ -88,10 +94,10 @@ func TestCooldownDecision_Classification(t *testing.T) {
 		"Anthropic-Ratelimit-Unified-7d-Utilization": {"0.57"},
 		"Retry-After": {"2"},
 	}
-	if until, ok := cooldownDecision(resp(429, temporaryWithFarAggregateReset), now); !ok || until != now.Add(2*time.Second) {
+	if until, ok := cooldownDecision(resp(429, temporaryWithFarAggregateReset), now); !ok || until != now.Add(2*time.Second) { //nolint:bodyclose // synthetic response: no Body, no transport — nothing to close
 		t.Fatalf("temporary aggregate 429 must honor Retry-After instead of the far aggregate reset, got until=%v ok=%v", until, ok)
 	}
-	state := cooldownRouteState(resp(429, temporaryWithFarAggregateReset), now, now.Add(2*time.Second))
+	state := cooldownRouteState(resp(429, temporaryWithFarAggregateReset), now, now.Add(2*time.Second)) //nolint:bodyclose // synthetic response: no Body, no transport — nothing to close
 	if state.Status != poolRouteRateLimited || state.RetryAt != now.Add(2*time.Second).Unix() {
 		t.Fatalf("temporary aggregate 429 must remain rate_limited with the short retry, got %+v", state)
 	}
@@ -122,7 +128,7 @@ func TestCooldownDecision_TemporaryFallbackIsPoolConfigurable(t *testing.T) {
 	now := time.Unix(1_750_000_000, 0)
 	temporary := http.Header{"Anthropic-Ratelimit-Unified-Status": {"rate_limited"}}
 
-	if until, ok := cooldownDecisionWithTemporaryFallback(resp(429, temporary), now, 11*time.Second); !ok || until != now.Add(11*time.Second) {
+	if until, ok := cooldownDecisionWithTemporaryFallback(resp(429, temporary), now, 11*time.Second); !ok || until != now.Add(11*time.Second) { //nolint:bodyclose // synthetic response: no Body, no transport — nothing to close
 		t.Fatalf("temporary 429 must use the pool fallback, got until=%v ok=%v", until, ok)
 	}
 	withRetryAfter := temporary.Clone()

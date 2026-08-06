@@ -110,7 +110,7 @@ func isNetChangeErrnoFor(goos string, err error) bool {
 //
 // The errno comparison is the load-bearing one; the string fallback is a
 // best-effort backstop only. It cannot be relied on for Windows in particular,
-// because FormatMessage returns LOCALISED text — a Chinese or German Windows
+// because FormatMessage returns LOCALIZED text — a Chinese or German Windows
 // yields a message none of these substrings match. Anything that must work
 // off-English has to come from the numeric path.
 func isNetChangeDialErr(err error) bool {
