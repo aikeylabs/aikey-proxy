@@ -86,7 +86,7 @@ func TestRailSendsNoNodeHeaderOnASeatInstall(t *testing.T) {
 // A cluster node with no node_id configured must stay silent rather than send an
 // empty header: "" is not a machine name, and the server would have to decide
 // what an empty identity means. config.Validate already rejects this combination
-// at startup, so this pins the rail's own behaviour if it is ever reached.
+// at startup, so this pins the rail's own behavior if it is ever reached.
 func TestRailOmitsTheHeaderRatherThanSendingAnEmptyNodeID(t *testing.T) {
 	var present bool
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

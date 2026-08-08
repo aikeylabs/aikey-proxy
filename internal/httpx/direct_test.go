@@ -12,12 +12,12 @@ import (
 // its team-master writeback / collector upload through it → "context deadline
 // exceeded". 防退化.
 //
-// The assertion is BEHAVIOURAL (resolve a real target under a hostile env)
+// The assertion is BEHAVIORAL (resolve a real target under a hostile env)
 // rather than the old structural `Proxy == nil`. Since 2026-08-03 the transport
 // carries a proxy FUNC — that is what lets an operator opt into a control-plane
 // proxy (pkg/httpdirect.SetProxyOverride) — so "nil field" stopped being the
 // invariant while "does not route through the env proxy" still is. The
-// behavioural form is also strictly stronger: it would catch a regression to
+// behavioral form is also strictly stronger: it would catch a regression to
 // http.ProxyFromEnvironment, which the structural check could not.
 func TestNewDirectClient_NoProxy(t *testing.T) {
 	t.Setenv("HTTP_PROXY", "http://127.0.0.1:7890")
