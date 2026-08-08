@@ -967,6 +967,17 @@ func (p *Proxy) serveRoute(w http.ResponseWriter, r *http.Request, route *vkeys.
 				// wired in the streaming branch below.
 				body = restoreResponseModel(r.Context(), body)
 
+				// B3 placeholder restore (non-streaming leg): swap the request-side
+				// mask labels (e.g. "[地址#1(已隐藏)]") the LLM echoed back to the
+				// user's original text — the ONLY sanctioned response-direction
+				// rewrite (spec 2026-06-04 规则 2 唯一例外). Runs AFTER extraction
+				// and translation so tokens/usage and audit see the masked form;
+				// the restored originals exist only on the wire to the client.
+				// No-op nil check when this request built no restore mapping.
+				if maskRestoreFromContext(r.Context()) != nil {
+					body = restoreMaskedResponseBody(r.Context(), body, logger)
+				}
+
 				// Rebuffer with the FINAL body (post-translation if engaged,
 				// otherwise unchanged from upstream).
 				//
@@ -1125,7 +1136,14 @@ func (p *Proxy) serveRoute(w http.ResponseWriter, r *http.Request, route *vkeys.
 				if route.ObserverContext != nil {
 					obsReqCtx, _ = route.ObserverContext.(*observer.RequestContext)
 				}
-				resp.Body = newStreamDrainer(upstream, &baseEvent, prov, collector, p.proxyCtx, r.Context(), logger, cb, obsRegistry, obsReqCtx)
+				drained := newStreamDrainer(upstream, &baseEvent, prov, collector, p.proxyCtx, r.Context(), logger, cb, obsRegistry, obsReqCtx)
+				// B3 placeholder restore (streaming leg): wrapped OUTSIDE the
+				// drainer, client-facing side only — token extraction and the
+				// conversation-audit observer keep seeing the MASKED placeholders
+				// (mirrors the request side where audit sees the masked prompt);
+				// restored originals never flow toward collector/master. No-op
+				// pass-through (returns drained unchanged) without a mapping.
+				resp.Body = newSSEPlaceholderRestorer(drained, maskRestoreFromContext(r.Context()))
 			}
 			return nil
 		},

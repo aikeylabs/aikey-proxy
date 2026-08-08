@@ -66,6 +66,16 @@ const (
 	// usage event / pricing use the effective model (audit 双口径 I2 / P4.1),
 	// while RequestedModel keeps the client model. Absent → no mapping.
 	ctxKeyMappedEffectiveModel
+	// ctxKeyMaskRestore carries the per-request *maskRestore state (numbered
+	// placeholder → original text) built by applyInboundFilter when the inbound
+	// filter applied a RESTORABLE mask (v4 apphook contract, B3 2026-08-08).
+	// The response leg (non-streaming body + SSE restorer) reads it to swap
+	// placeholders back to the user's original text — the ONLY sanctioned
+	// response-direction rewrite (spec 2026-06-04 合规过滤方向 规则 2 唯一例外).
+	// 🚫 The mapping lives in THIS context value only: never persisted, never
+	// logged, dies with the request (B3 拍板 2026-08-06). Absent → response
+	// passes through untouched (zero cost).
+	ctxKeyMaskRestore
 	// ctxKeyProviderPathDecision pins the exact OAuth-group outbound path and
 	// override decision admitted by the path breaker. A concurrent Settings
 	// change may affect the next request, but must not make one in-flight request

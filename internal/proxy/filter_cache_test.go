@@ -158,25 +158,67 @@ func TestLRUMaskCache_SlidingRefreshesOnUse(t *testing.T) {
 	}
 }
 
-// scope 优先级:header > metadata.user_id > VK > global,且绝不返回空(防串桶)。
+// scope 优先级:已解析 sessionID > metadata.user_id > VK > global,且绝不返回空(防串桶)。
 func TestCacheScope_Priority(t *testing.T) {
 	withUID := map[string]any{"metadata": map[string]any{"user_id": "u1"}}
 
-	rHdr := httptest.NewRequest("POST", "/", http.NoBody)
-	rHdr.Header.Set("X-Claude-Code-Session-Id", "sess1")
-	if got := cacheScope(rHdr, withUID, "vk1"); got != "h:sess1" {
-		t.Errorf("header 应优先:got %s", got)
+	if got := cacheScope("sess1", withUID, "vk1"); got != "s:sess1" {
+		t.Errorf("session 应优先:got %s", got)
 	}
-
-	rNo := httptest.NewRequest("POST", "/", http.NoBody)
-	if got := cacheScope(rNo, withUID, "vk1"); got != "u:u1" {
+	if got := cacheScope("", withUID, "vk1"); got != "u:u1" {
 		t.Errorf("user_id 次之:got %s", got)
 	}
-	if got := cacheScope(rNo, map[string]any{}, "vk1"); got != "vk:vk1" {
+	if got := cacheScope("", map[string]any{}, "vk1"); got != "vk:vk1" {
 		t.Errorf("VK 兜底:got %s", got)
 	}
-	if got := cacheScope(rNo, map[string]any{}, ""); got != "global" {
+	if got := cacheScope("", map[string]any{}, ""); got != "global" {
 		t.Errorf("global 最后:got %s", got)
+	}
+}
+
+// 2026-08-08 跨 provider 会话作用域:scope 的会话来源必须是 sessionid fingerprint 表
+// (resolveSessionID),而不是"只认 X-Claude-Code-Session-Id"那条硬编码。逐 provider 断言
+// 修复前会退化成同一个桶的那几类客户端现在各自拿到会话级 scope。
+func TestCacheScope_CrossProviderSessionSources(t *testing.T) {
+	// 修复前:只有这一行(anthropic + Claude 专有 header)能进会话桶。
+	rClaude := httptest.NewRequest("POST", "/v1/messages", http.NoBody)
+	rClaude.Header.Set("X-Claude-Code-Session-Id", "claude-sess")
+	if got := cacheScope(resolveSessionID(rClaude, "anthropic", "anthropic"), nil, "vk1"); got != "s:claude-sess" {
+		t.Errorf("anthropic header 场景应与修复前同作用域,got %s want s:claude-sess", got)
+	}
+
+	// 修复前:kimi 的会话在 body(prompt_cache_key),header 取不到 → 落 vk:/global 共桶。
+	rKimi := httptest.NewRequest("POST", "/v1/chat/completions",
+		strings.NewReader(`{"model":"kimi-k2","prompt_cache_key":"kimi-sess","messages":[]}`))
+	if got := cacheScope(resolveSessionID(rKimi, "openai_compatible", "kimi_code"), nil, "vk1"); got != "s:kimi-sess" {
+		t.Errorf("kimi body 会话字段应进会话桶(修复前是 vk1 共桶),got %s", got)
+	}
+
+	// 同理 openai 的 conversation_id。
+	rOpenAI := httptest.NewRequest("POST", "/v1/responses",
+		strings.NewReader(`{"model":"gpt-x","conversation_id":"oai-sess"}`))
+	if got := cacheScope(resolveSessionID(rOpenAI, "openai", "openai"), nil, "vk1"); got != "s:oai-sess" {
+		t.Errorf("openai conversation_id 应进会话桶,got %s", got)
+	}
+
+	// 通用约定 header(cursor / cline / 第三方 Agent 走 common_fallback)。
+	rAgent := httptest.NewRequest("POST", "/v1/chat/completions", http.NoBody)
+	rAgent.Header.Set("X-Aikey-Session-Id", "agent-sess")
+	if got := cacheScope(resolveSessionID(rAgent, "openai_compatible", "some_new_provider"), nil, "vk1"); got != "s:agent-sess" {
+		t.Errorf("X-Aikey-Session-Id 通用兜底应进会话桶,got %s", got)
+	}
+
+	// 取不到任何会话来源 → fallback 链行为不变(user_id → vk → global)。
+	rNone := httptest.NewRequest("POST", "/v1/chat/completions", http.NoBody)
+	empty := resolveSessionID(rNone, "openai_compatible", "zhipu")
+	if empty != "" {
+		t.Fatalf("前提:无任何会话来源时 resolveSessionID 应为空,got %q", empty)
+	}
+	if got := cacheScope(empty, map[string]any{"metadata": map[string]any{"user_id": "u9"}}, "vk1"); got != "u:u9" {
+		t.Errorf("Extract 空 → fallback 链不变(user_id 优先于 vk),got %s", got)
+	}
+	if got := cacheScope(empty, nil, "vk1"); got != "vk:vk1" {
+		t.Errorf("Extract 空 + 无 user_id → vk 兜底,got %s", got)
 	}
 }
 

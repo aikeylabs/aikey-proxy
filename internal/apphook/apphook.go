@@ -101,10 +101,34 @@ type Response struct {
 	// forward to master, populated ONLY for team-routed requests (RouteClass=1).
 	// Empty for personal-routed (child uploaded locally) and non-Detect ops.
 	// (v2 protocol, update doc 20260603 §2.2/§3.2.)
-	Event           []byte
+	Event []byte
+	// Restorables (v4 protocol, 2026-08-08) describes placeholder tokens the app
+	// substituted into MutatedPayload that the proxy MAY renumber into
+	// per-request labels and restore back to the original text on the RESPONSE
+	// path. GENERIC contract — the proxy never learns what the token stands for
+	// business-wise (invariant #16 holds): it only sees "token T replaced these
+	// spans of the payload I sent". Empty for non-restorable masks.
+	Restorables     []RestorableMask
 	LatencyObserved time.Duration // measured by proxy, set by Hook.Detect not by child
 	Action          Action
 	Degraded        bool // true if child unreachable / timed out — proxy already fell back to Allow
+}
+
+// RestorableMask is one restorable placeholder token in a Mask verdict.
+// Occurrences of Token appear in MutatedPayload in the same order as Spans.
+type RestorableMask struct {
+	// Token is the literal placeholder string in MutatedPayload (one per span).
+	Token string
+	// NumberedPrefix/NumberedSuffix compose the per-request numbered label the
+	// proxy substitutes for the k-th token occurrence: prefix + N + suffix.
+	// Owned by the app (single source of truth with its mask policy).
+	NumberedPrefix string
+	NumberedSuffix string
+	// Spans are [start,end) byte offsets into the ORIGINAL Request.Payload the
+	// proxy sent — offsets only; the proxy slices the original text locally.
+	// The derived placeholder↔original mapping is per-request memory ONLY:
+	// never persisted, never logged (B3 拍板 2026-08-06).
+	Spans [][2]int
 }
 
 // Hook is the contract between aikey-proxy main loop and a first-party app.

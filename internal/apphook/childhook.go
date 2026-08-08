@@ -23,6 +23,7 @@ import (
 	"bufio"
 	"context"
 	"encoding/binary"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -61,7 +62,7 @@ func (c *ChildHookConfig) applyDefaults() {
 		c.Timeout = 1 * time.Millisecond
 	}
 	if c.ProtocolVersion == 0 {
-		c.ProtocolVersion = 3 // v3: request-id multiplexing (concurrent in-flight Detects)
+		c.ProtocolVersion = 4 // v4: restorable-mask metadata (B3 占位替换/响应还原)
 	}
 	if c.ReadyTimeout == 0 {
 		c.ReadyTimeout = 5 * time.Second
@@ -81,8 +82,22 @@ func (c *ChildHookConfig) applyDefaults() {
 // the reader goroutine via the pending map.
 type childResponse struct {
 	findings []byte // ActionMask → masked payload; ListPacks → JSON report; else per-op
+	maskmeta []byte // v4: restorable-mask JSON (offsets only); empty unless the mask is restorable
 	event    []byte // team-routed compliance event for the proxy to forward; empty otherwise
 	action   byte
+}
+
+// wireMaskMeta mirrors the detector's pipe.MaskMeta JSON contract (v4). Kept as
+// an unexported mirror because proxy and detector are separate modules that
+// ship in lockstep; the version byte fails loud on skew, and the fixture test
+// TestChildHook_V4MaskMetaDecode pins the field names byte-for-byte.
+type wireMaskMeta struct {
+	Restorables []struct {
+		Token          string   `json:"token"`
+		NumberedPrefix string   `json:"numbered_prefix"`
+		NumberedSuffix string   `json:"numbered_suffix"`
+		Spans          [][2]int `json:"spans"`
+	} `json:"restorables"`
 }
 
 // ChildHook is a generic Hook that delegates to a spawned child binary.
@@ -262,19 +277,9 @@ func (h *ChildHook) readLoop(r *bufio.Reader, gen uint64) {
 			}
 			return
 		}
-		// Response payload (v3): [req_id 4B][action 1B][findings_len 4B][findings][event]
-		if len(payload) < 9 {
+		reqID, resp, ok := decodeChildResponsePayload(payload)
+		if !ok {
 			continue // malformed; drop (a real desync surfaces as a read error next)
-		}
-		reqID := binary.LittleEndian.Uint32(payload[0:4])
-		flen := int(binary.LittleEndian.Uint32(payload[5:9]))
-		if 9+flen > len(payload) {
-			continue
-		}
-		resp := &childResponse{
-			action:   payload[4],
-			findings: payload[9 : 9+flen],
-			event:    payload[9+flen:],
 		}
 		h.pendingMu.Lock()
 		ch, ok := h.pending[reqID]
@@ -286,6 +291,34 @@ func (h *ChildHook) readLoop(r *bufio.Reader, gen uint64) {
 			ch <- resp // buffered (cap 1); never blocks even if the caller timed out
 		}
 	}
+}
+
+// decodeChildResponsePayload parses a v4 response payload:
+//
+//	[req_id 4B][action 1B][findings_len 4B][findings][maskmeta_len 4B][maskmeta][event]
+//
+// Mirrors the detector's pipe.EncodeResponse (lockstep, version byte enforced
+// by readFrame). ok=false on malformed lengths — the caller drops the frame.
+func decodeChildResponsePayload(payload []byte) (reqID uint32, resp *childResponse, ok bool) {
+	if len(payload) < 13 {
+		return 0, nil, false
+	}
+	reqID = binary.LittleEndian.Uint32(payload[0:4])
+	flen := int(binary.LittleEndian.Uint32(payload[5:9]))
+	if 9+flen+4 > len(payload) {
+		return 0, nil, false
+	}
+	moff := 9 + flen
+	mlen := int(binary.LittleEndian.Uint32(payload[moff : moff+4]))
+	if moff+4+mlen > len(payload) {
+		return 0, nil, false
+	}
+	return reqID, &childResponse{
+		action:   payload[4],
+		findings: payload[9:moff],
+		maskmeta: payload[moff+4 : moff+4+mlen],
+		event:    payload[moff+4+mlen:],
+	}, true
 }
 
 func (h *ChildHook) removePending(reqID uint32) {
@@ -445,6 +478,27 @@ func (h *ChildHook) Detect(ctx context.Context, req *Request) *Response {
 	}
 	if res.Action == ActionMask && len(resp.findings) > 0 {
 		res.MutatedPayload = resp.findings
+		// v4 restorable-mask metadata. Parse errors are fail-open in the SAFE
+		// direction: the mask itself stands, only response-side restore is lost.
+		// Loud (失败要显眼) but content-free — maskmeta describes masked spans, so
+		// even offsets stay out of the log line.
+		if len(resp.maskmeta) > 0 {
+			var meta wireMaskMeta
+			if err := json.Unmarshal(resp.maskmeta, &meta); err != nil {
+				slog.Warn("apphook: restorable-mask metadata unparseable; mask kept, restore disabled",
+					"event.name", "proxy.apphook.maskmeta_invalid",
+					"name", h.cfg.Name, "error", err, "meta_bytes", len(resp.maskmeta))
+			} else {
+				for _, r := range meta.Restorables {
+					res.Restorables = append(res.Restorables, RestorableMask{
+						Token:          r.Token,
+						NumberedPrefix: r.NumberedPrefix,
+						NumberedSuffix: r.NumberedSuffix,
+						Spans:          r.Spans,
+					})
+				}
+			}
+		}
 	}
 	if len(resp.event) > 0 {
 		res.Event = resp.event

@@ -65,10 +65,12 @@ func TestReq_NoCrossSessionReuse(t *testing.T) {
 	p := &Proxy{filterHook: hook}
 	p.SetFilterCacheEnabled(true, 5)
 
+	// 走生产同一条链:header → resolveSessionID(sessionid fingerprint 表) → scope=s:<sess>。
 	send := func(sess string) {
 		r := newReq(`{"messages":[{"role":"user","content":"same-content"}]}`)
-		r.Header.Set("X-Claude-Code-Session-Id", sess) // scope = h:<sess>
-		p.applyInboundFilter(httptest.NewRecorder(), r, "m", "personal", "", "", "", "", discardLogger())
+		r.Header.Set("X-Claude-Code-Session-Id", sess)
+		p.applyInboundFilter(httptest.NewRecorder(), r, "m", "personal", "", "", "",
+			resolveSessionID(r, "anthropic", "anthropic"), discardLogger())
 	}
 
 	send("sessA") // 首次 → 扫,called=1

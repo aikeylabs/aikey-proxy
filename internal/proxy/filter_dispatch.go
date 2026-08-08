@@ -74,6 +74,13 @@ func capRuneBoundary(s string, limit int) int {
 //
 // No-op + returns true when no hook is installed (the common default; zero
 // hot-path cost behind the nil check).
+//
+// sessionID (resolved by the caller via resolveSessionID → the sessionid
+// fingerprint table, so it works for every protocol/provider, not just Claude
+// Code) serves TWO purposes here: it stamps the team audit event's session_id
+// (deep-link to the conversation thread) AND it is the content cache's level-1
+// isolation scope (cacheScope). Both must stay the same value — a support
+// engineer correlating an audit event with cache behaviour relies on it.
 func (p *Proxy) applyInboundFilter(
 	w http.ResponseWriter,
 	r *http.Request,
@@ -198,15 +205,23 @@ func (p *Proxy) applyInboundFilter(
 		detectNanos int64
 		cacheHits   int // content-hash 缓存命中(复用判定、跳过 detector)
 		cacheMiss   int // content-hash 缓存未命中(真扫 + 回填)
+		// restoreState collects numbered-placeholder → original mappings for
+		// restorable masks (B3). Allocated lazily on the first restorable mask;
+		// stashed on the request context for the response leg. Memory-only,
+		// request-scoped, never logged/persisted (B3 拍板 2026-08-06).
+		restoreState *maskRestore
 	)
 
 	// content-hash 缓存(设计 §4):仅当缓存启用时才算 scope/detectorVer。缓存关闭
 	// (p.filterCache == nil)时下面循环根本不碰 hash → 不付 content-hash 代价(INV-6)。
 	// scope = 隔离桶(同会话历史复用、跨会话不串);detectorVer 进 key 让 detector
 	// 重启自动失效旧条目;per-entry TTL 兜底 in-place pack pull 的陈旧 clean 判定。
+	// scope 复用调用方已解析的 sessionID(serveRoute → resolveSessionID → sessionid
+	// fingerprint 表):Claude 专有 header 之外的 provider(kimi/codex/cursor/cline …)
+	// 现在也能拿到会话级隔离桶,不再降级到 vk/global 让多会话共桶。见 cacheScope 注释。
 	var cacheScopeKey, detectorVer string
 	if p.filterCache != nil {
-		cacheScopeKey = cacheScope(r, parsed, virtualKeyID)
+		cacheScopeKey = cacheScope(sessionID, parsed, virtualKeyID)
 		detectorVer = hook.Status().Version
 	}
 
@@ -228,8 +243,20 @@ func (p *Proxy) applyInboundFilter(
 		var ckey string
 		if p.filterCache != nil {
 			ckey = cacheKey(detectorVer, hashHead(head)) // level-2 key (scope is separate)
-			if v, ok := p.filterCache.Get(cacheScopeKey, ckey); ok {
-				resp = &apphook.Response{Action: v.action, MutatedPayload: []byte(v.maskedHead), Reason: v.reason}
+			// 读侧 block 守卫(用户拍板 2026-08-08,与写侧不入缓存配套):即便缓存里
+			// 残留了历史 block verdict(理论上写侧已不再写入;此处兜底进程内 pre-fix
+			// 污染 + 防写侧未来回归),也当作 miss、落到下方真扫按最新策略重判 —— block
+			// 是安全决策不复用陈旧拒绝。仅精确排除 ActionBlock,mask/warn/allow 命中路径
+			// 逐字不变(它们 action != ActionBlock,条件恒真)。
+			if v, ok := p.filterCache.Get(cacheScopeKey, ckey); ok && v.action != apphook.ActionBlock {
+				// Restorables replay from cache (offsets only): the hash-matched head
+				// is byte-identical, so the same spans slice the same originals.
+				// Event replays too (2026-08-08 审计缺口修复): a flagged piece resent
+				// every turn keeps producing its audit event instead of going silent
+				// after the first scan, and the detector's event_id makes the repeat
+				// idempotent at both ingest paths — see maskVerdict.event for why this
+				// reconciles a failed upload without double-counting a successful one.
+				resp = &apphook.Response{Action: v.action, MutatedPayload: []byte(v.maskedHead), Reason: v.reason, Restorables: v.restorables, Event: v.event}
 				cacheHits++
 			}
 		}
@@ -252,11 +279,33 @@ func (p *Proxy) applyInboundFilter(
 			detectNanos += time.Since(_t0).Nanoseconds()
 			// 只缓存"确定性"判定:degraded(超时/fail-open)与 nil 不缓存,否则会把
 			// "没扫成"误记成 allow、下轮命中缓存就放行(违反 INV-2)。
-			if p.filterCache != nil && resp != nil && !resp.Degraded {
+			//
+			// BLOCK 不入缓存(用户拍板 2026-08-08,安全边界修复):block(ActionBlock)是
+			// 安全关键决策,每次都必须按【最新策略/pack】重新走 detector 判定,绝不复用
+			// 缓存的陈旧拒绝。WHY:①缓存命中回放不调 detector(见上方 Get 分支),若把 block
+			// 入缓存,则管理员放宽策略或 in-place pack swap(childhook.go 不 bump
+			// detectorVersion,见 filter_cache.go PACK FRESHNESS/TTL 注释)后,陈旧 block
+			// 仍会持续 403,且 sliding TTL 命中续期近乎永久 —— 放宽后无法立即生效;②block
+			// 走拒绝路径不转发上游,缓存省下的那一次 detector 调用收益可忽略,ROI 为负。
+			// mask/warn/allow 缓存行为保持不变(它们转发上游,复用判定收益实在)。
+			// 隐患溯源:CN_ADDRESS 本身无 block 档,但其他 entity 的 HighRiskBlock
+			// (policy.go HighRiskBlock)已在用这条链 → 当前生产就有此隐患。
+			// 配套读侧守卫见上方 Get 分支(v.action != ActionBlock)。
+			if p.filterCache != nil && resp != nil && !resp.Degraded && resp.Action != apphook.ActionBlock {
+				// maskedHead is cached in the detector's NUMBERLESS token form —
+				// per-request numbering happens AFTER cache replay so numbers stay
+				// request-scoped (同请求内按出现顺序编号) instead of leaking a stale
+				// numbering across turns.
+				// event: cached so a cache HIT can re-emit the same audit event (see
+				// maskVerdict.event). Stored as handed over — never mutated in place
+				// (injectTenant/VirtualKey/Seat/Session all return fresh slices), so the
+				// async uploader and the cache can share the bytes read-only.
 				p.filterCache.Put(cacheScopeKey, ckey, maskVerdict{
-					action:     resp.Action,
-					maskedHead: string(resp.MutatedPayload),
-					reason:     resp.Reason,
+					action:      resp.Action,
+					maskedHead:  string(resp.MutatedPayload),
+					reason:      resp.Reason,
+					restorables: resp.Restorables,
+					event:       resp.Event,
 				})
 			}
 		}
@@ -273,6 +322,12 @@ func (p *Proxy) applyInboundFilter(
 		// (NOT user input): the detector runs on a client with no org context,
 		// and the master must not trust a client-self-reported tenant.
 		// (update doc 20260603 §2.1)
+		//
+		// Cache hits contribute here too (2026-08-08): the batch now carries one event
+		// per FLAGGED piece in the request, not just per freshly-scanned piece. Bounded
+		// by the request's user-message count (the same bound the scan loop pays), and a
+		// batch is capped at 2 MiB server-side (maxIntakeBody) ≈ thousands of events, so
+		// a realistic conversation stays orders of magnitude under it.
 		if routeClass == apphook.RouteClassTeam && len(resp.Event) > 0 {
 			// Stamp BOTH authoritative attribution fields the proxy resolved (the
 			// detector has neither): tenant_id = the VK's org, virtual_key_id = the
@@ -318,9 +373,21 @@ func (p *Proxy) applyInboundFilter(
 					"event.name", "proxy.filter.mask_empty")
 				continue
 			}
+			masked := string(m)
+			// B3 restorable masks: renumber the detector's numberless token into
+			// per-request labels ([地址#N(已隐藏)]) and record label→original in
+			// the request's restore state (consumed by the response leg). Runs for
+			// both fresh Detects and cache replays (numbering is request-scoped).
+			// Zero cost when the mask carries no restorables (the usual case).
+			if len(resp.Restorables) > 0 {
+				if restoreState == nil {
+					restoreState = newMaskRestore()
+				}
+				masked = renumberRestorables(head, masked, resp.Restorables, restoreState, logger)
+			}
 			// Masked head (the scanned first pipeInputCap bytes) + the untouched
 			// tail (forwarded raw, never scanned — same as the detector's own cap).
-			pieces[i].setText(string(m) + tail)
+			pieces[i].setText(masked + tail)
 			maskedCount++
 
 		case apphook.ActionWarn:
@@ -348,6 +415,17 @@ func (p *Proxy) applyInboundFilter(
 			degraded = true
 			selfDeg++
 		}
+	}
+
+	if restoreState != nil && len(restoreState.keys) > 0 {
+		// Hang the placeholder→original state on the request context so the
+		// response leg (non-streaming body restore + SSE restorer in serveRoute's
+		// ModifyResponse) can swap the labels back. Same in-place WithContext
+		// stash pattern as applyModelMappingToRequest — the caller keeps using
+		// this *http.Request, and serveRoute derives its forwarding context from
+		// r.Context() after this call. Absent for every request without a
+		// restorable mask → the response leg pays one nil ctx lookup.
+		*r = *r.WithContext(context.WithValue(r.Context(), ctxKeyMaskRestore, restoreState))
 	}
 
 	if degraded {
