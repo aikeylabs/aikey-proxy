@@ -91,10 +91,12 @@ const (
 	EventProxySyncRailRecovered = "proxy.sync.rail_recovered"
 	// #nosec G101 -- an event NAME, not a credential. The literal contains the
 	// word "credential" because that is what the event describes.
-	EventProxySyncCredentialRebuilt    = "proxy.sync.credential_rebuilt"
-	EventProxyGroupRuntimeChanged      = "proxy.group_runtime.changed"
-	EventProxyGroupRuntimeWriteFailed  = "proxy.group_runtime.write_failed"
-	EventProxyGroupRuntimeReloadFailed = "proxy.group_runtime.reload_failed"
+	EventProxySyncCredentialRebuilt          = "proxy.sync.credential_rebuilt"
+	EventProxyGroupRuntimeChanged            = "proxy.group_runtime.changed"
+	EventProxyGroupRuntimeWriteFailed        = "proxy.group_runtime.write_failed"
+	EventProxyGroupRuntimeReloadFailed       = "proxy.group_runtime.reload_failed"
+	EventProxyClusterVaultAssignmentsCorrupt = "proxy.routing_override.cluster_vault_corrupt"
+	EventProxyClusterVaultAssignmentsChanged = "proxy.routing_override.cluster_vault_changed"
 	// EventProxySyncHealthFileFailed: the statusline sync-health bypass file
 	// (~/.aikey/run/sync-health.json) could not be written/removed — the claude
 	// status bar may show a stale (or miss a fresh) sync warning.
@@ -217,13 +219,14 @@ const (
 // ---- Error code constants ----
 
 const (
-	ErrCodeTokenMissing          = "TOKEN_MISSING"
-	ErrCodeTokenInvalid          = "TOKEN_INVALID"
-	ErrCodePolicyModelForbidden  = "POLICY_MODEL_FORBIDDEN"
-	ErrCodeSecretNotConfigured   = "SECRET_NOT_CONFIGURED"
-	ErrCodeUpstreamError         = "UPSTREAM_ERROR"
-	ErrCodeProviderError         = "PROVIDER_ERROR"
-	ErrCodeUsageExtractionFailed = "USAGE_EXTRACTION_FAILED"
+	ErrCodeTokenMissing                   = "TOKEN_MISSING"
+	ErrCodeTokenInvalid                   = "TOKEN_INVALID"
+	ErrCodePolicyModelForbidden           = "POLICY_MODEL_FORBIDDEN"
+	ErrCodeSecretNotConfigured            = "SECRET_NOT_CONFIGURED"
+	ErrCodeUpstreamError                  = "UPSTREAM_ERROR"
+	ErrCodeProviderError                  = "PROVIDER_ERROR"
+	ErrCodeUsageExtractionFailed          = "USAGE_EXTRACTION_FAILED"
+	ErrCodeClusterVaultAssignmentsCorrupt = "CLUSTER_VAULT_ASSIGNMENTS_CORRUPT"
 	// Enterprise quota (Phase 2, design §5.5). Stage 3 wires the token code;
 	// USD + degraded-block are reserved for later stages ($ enforcement / §8).
 	ErrCodeQuotaExceededToken = "QUOTA_EXCEEDED_TOKEN"

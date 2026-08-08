@@ -314,6 +314,11 @@ type Supervisor struct {
 	// pollRoutingOverrides; read on the group-route hot path to redirect a seat off
 	// an unhealthy account. nil-safe everywhere → empty means "use the local pick".
 	routingOverrides *proxy.RoutingOverrideCache
+	// lastClusterRoutingSig tracks the complete daemon-managed assignment
+	// snapshot, including rows whose explicit pending state is persisted as an
+	// empty column. routing_version alone cannot observe such removals when a
+	// sibling route still carries the previous maximum version.
+	lastClusterRoutingSig atomic.Pointer[string]
 	// fallbackPolicy is the upstream-fallback threshold cache (P0a, task 1b.4).
 	// Supervisor-scoped like routingOverrides so a generation reload never loses
 	// it — keep-last-known is the point: a control-plane blip must not re-time
@@ -922,6 +927,12 @@ func (s *Supervisor) syncManagedKeys() {
 	managedKeys, err := gen.vault.GetActiveManagedKeys()
 	if err != nil {
 		slog.Warn("managed key sync: GetActiveManagedKeys failed", "error", err)
+	} else {
+		// Cluster daemon writes the allocation assignment into the same vault
+		// snapshot as group material. Refresh the supervisor-scoped hot-path cache
+		// on this existing change-seq cycle; rebuilding registry routes alone does
+		// not update RoutingOverrideCache.
+		s.refreshClusterRoutingOverrides(managedKeys)
 	}
 	for token, route := range buildManagedRoutes(managedKeys) {
 		allRoutes[token] = route

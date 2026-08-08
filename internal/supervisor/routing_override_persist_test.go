@@ -205,6 +205,119 @@ func TestHydrateRoutingOverrides_SkipsCorruptRow(t *testing.T) {
 	}
 }
 
+func TestRefreshClusterRoutingOverrides_ConvergesRunningWorkerAndClears(t *testing.T) {
+	cfg := &config.Config{}
+	cfg.Cluster.Enabled = true
+	s := &Supervisor{cfg: cfg, routingOverrides: proxy.NewRoutingOverrideCache()}
+
+	bound, _ := json.Marshal(persistedAssignment{AccountID: "acc-a", RoutingVersion: 41, SyncedAt: 90})
+	s.refreshClusterRoutingOverrides([]vault.ManagedKey{{
+		VirtualKeyID: "vk-a", SeatID: "seat-1", OauthGroupID: "grp-1",
+		MyAssignmentOverride: string(bound),
+	}})
+	if got := s.routingOverrides.Assignment("seat-1", "grp-1"); got != "acc-a" {
+		t.Fatalf("initial running Worker assignment = %q, want acc-a", got)
+	}
+
+	rebound, _ := json.Marshal(persistedAssignment{AccountID: "acc-b", RoutingVersion: 42, SyncedAt: 91})
+	s.refreshClusterRoutingOverrides([]vault.ManagedKey{{
+		VirtualKeyID: "vk-a", SeatID: "seat-1", OauthGroupID: "grp-1",
+		MyAssignmentOverride: string(rebound),
+	}})
+	if got := s.routingOverrides.Assignment("seat-1", "grp-1"); got != "acc-b" {
+		t.Fatalf("running Worker did not converge to daemon assignment: got %q want acc-b", got)
+	}
+
+	// Keep a sibling at version 42 while seat-1 becomes explicit pending. A
+	// max-version-only refresh would see 42 before and after, skip the snapshot,
+	// and retain stale acc-b indefinitely.
+	sibling, _ := json.Marshal(persistedAssignment{AccountID: "acc-sibling", RoutingVersion: 42, SyncedAt: 92})
+	// An explicit pending snapshot is stored as an empty column. Replacing from
+	// the complete Cluster vault snapshot must clear the old in-memory route.
+	s.refreshClusterRoutingOverrides([]vault.ManagedKey{
+		{
+			VirtualKeyID: "vk-a", SeatID: "seat-1", OauthGroupID: "grp-1",
+			MyAssignmentOverride: "",
+		},
+		{
+			VirtualKeyID: "vk-sibling", SeatID: "seat-2", OauthGroupID: "grp-1",
+			MyAssignmentOverride: string(sibling),
+		},
+	})
+	if got := s.routingOverrides.Assignment("seat-1", "grp-1"); got != "" {
+		t.Fatalf("explicit pending assignment retained stale route %q", got)
+	}
+	if got := s.routingOverrides.Assignment("seat-2", "grp-1"); got != "acc-sibling" {
+		t.Fatalf("explicit pending snapshot dropped sibling route %q", got)
+	}
+	if !s.routingOverrides.Stored() || s.routingOverrides.Version() != 42 {
+		t.Fatalf("explicit clear must apply despite unchanged max version: stored=%v version=%d",
+			s.routingOverrides.Stored(), s.routingOverrides.Version())
+	}
+}
+
+func TestRefreshClusterRoutingOverrides_CorruptSnapshotKeepsLastKnown(t *testing.T) {
+	cfg := &config.Config{}
+	cfg.Cluster.Enabled = true
+	s := &Supervisor{cfg: cfg, routingOverrides: proxy.NewRoutingOverrideCache()}
+	s.routingOverrides.StoreRoutes(41, []routingwire.RouteEntry{{
+		SeatID: "seat-1", GroupID: "grp-1", AccountID: "acc-last-known",
+	}})
+
+	s.refreshClusterRoutingOverrides([]vault.ManagedKey{{
+		VirtualKeyID: "vk-a", SeatID: "seat-1", OauthGroupID: "grp-1",
+		MyAssignmentOverride: "{not-json",
+	}})
+	if got := s.routingOverrides.Assignment("seat-1", "grp-1"); got != "acc-last-known" {
+		t.Fatalf("corrupt snapshot replaced last-known assignment with %q", got)
+	}
+	if s.routingOverrides.Version() != 41 {
+		t.Fatalf("corrupt snapshot changed routing version to %d", s.routingOverrides.Version())
+	}
+}
+
+func TestClusterRoutingSnapshotSignature_IgnoresSyncedAtButTracksPending(t *testing.T) {
+	first, _ := json.Marshal(persistedAssignment{
+		AccountID: "acc-a", RoutingVersion: 42, SyncedAt: 100,
+	})
+	later, _ := json.Marshal(persistedAssignment{
+		AccountID: "acc-a", RoutingVersion: 42, SyncedAt: 200,
+	})
+	base := []vault.ManagedKey{{
+		VirtualKeyID: "vk-a", SeatID: "seat-1", OauthGroupID: "grp-1",
+		MyAssignmentOverride: string(first),
+	}}
+	sameBusinessState := []vault.ManagedKey{{
+		VirtualKeyID: "vk-a", SeatID: "seat-1", OauthGroupID: "grp-1",
+		MyAssignmentOverride: string(later),
+	}}
+	if clusterRoutingSnapshotSignature(base) != clusterRoutingSnapshotSignature(sameBusinessState) {
+		t.Fatal("synced_at-only churn changed the Cluster routing snapshot signature")
+	}
+	pending := []vault.ManagedKey{{
+		VirtualKeyID: "vk-a", SeatID: "seat-1", OauthGroupID: "grp-1",
+		MyAssignmentOverride: "",
+	}}
+	if clusterRoutingSnapshotSignature(base) == clusterRoutingSnapshotSignature(pending) {
+		t.Fatal("explicit pending state must change the Cluster routing snapshot signature")
+	}
+
+	second, _ := json.Marshal(persistedAssignment{
+		AccountID: "acc-b", Blocked: true, RoutingVersion: 43, SyncedAt: 300,
+	})
+	duplicateKeyRows := []vault.ManagedKey{
+		base[0],
+		{
+			VirtualKeyID: "vk-b", SeatID: "seat-1", OauthGroupID: "grp-1",
+			MyAssignmentOverride: string(second),
+		},
+	}
+	reversed := []vault.ManagedKey{duplicateKeyRows[1], duplicateKeyRows[0]}
+	if clusterRoutingSnapshotSignature(duplicateKeyRows) != clusterRoutingSnapshotSignature(reversed) {
+		t.Fatal("managed-key input order changed the Cluster routing snapshot signature")
+	}
+}
+
 // Steady state writes nothing: persisting the same assignment at the same
 // version twice must not churn the vault (synced_at-only diffs are ignored).
 func TestPersistAssignmentOverrides_NoChurnOnSteadyState(t *testing.T) {

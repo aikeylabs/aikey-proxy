@@ -296,7 +296,7 @@ func resolveOAuthUpstream(canonicalCode, protocolType, existingBase string, r *h
 		// bypassed the hook and sent test traffic to the real provider edge.
 		// Production is unchanged: this branch is inert unless the explicit env
 		// value also passes the loopback / RFC 6761 .test safety gate.
-		if testBase, ok := anthropicTestBaseURL(canonicalCode, protocolType); ok {
+		if testBase, ok := oauthTestBaseURL(canonicalCode, protocolType); ok {
 			return testBase, r
 		}
 		if strings.TrimSpace(existingBase) != "" {
@@ -382,6 +382,26 @@ func anthropicTestBaseURL(canonicalCode, protocolType string) (string, bool) {
 		return "", false
 	}
 	return o, true
+}
+
+// oauthTestBaseURL is the single test-only upstream override used by real
+// binary OAuth E2Es. Every value is rejected unless it is plain HTTP on
+// loopback or the reserved .test TLD, so production traffic cannot be diverted
+// by an arbitrary environment value. Anthropic keeps its historical variable;
+// Kimi needs a separate endpoint because its OAuth wire contract is Chat
+// Completions rather than Codex Responses.
+func oauthTestBaseURL(canonicalCode, protocolType string) (string, bool) {
+	if base, ok := anthropicTestBaseURL(canonicalCode, protocolType); ok {
+		return base, true
+	}
+	if provider.CanonicalCode(canonicalCode) != "kimi_code" || provider.CanonicalProtocol(protocolType) != "openai_compatible" {
+		return "", false
+	}
+	base := strings.TrimRight(strings.TrimSpace(os.Getenv("AIKEY_PROXY_TEST_KIMI_BASE_URL")), "/")
+	if !testOnlyBaseURLAllowed(base) {
+		return "", false
+	}
+	return base, true
 }
 
 func providerDefaultBaseURL(providerCode string) string {

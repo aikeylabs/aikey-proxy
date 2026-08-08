@@ -22,14 +22,17 @@ package supervisor
 
 import (
 	"context"
+	"crypto/sha256"
 	"encoding/json"
 	"fmt"
 	"io"
 	"log/slog"
 	"net/http"
+	"sort"
 	"time"
 
 	"github.com/AiKeyLabs/aikey-proxy/internal/httpx"
+	"github.com/AiKeyLabs/aikey-proxy/internal/observability"
 	"github.com/AiKeyLabs/aikey-proxy/internal/vault"
 	"github.com/AiKeyLabs/pkg/routingwire"
 )
@@ -84,11 +87,27 @@ func (s *Supervisor) hydrateRoutingOverrides(gen *generation) {
 	if err != nil {
 		return // best-effort: the first pull populates the cache anyway
 	}
-	// Rebuild wire entries and ingest through StoreRoutes — the ONLY public key
-	// builder — so the (seat,group) cache-key encoding stays private to the
-	// proxy package (its file-doc contract).
-	var entries []routingwire.RouteEntry
-	var version int64
+	version, entries, corrupt := persistedRoutingEntries(mks)
+	if corrupt > 0 {
+		slog.Warn("startup routing assignments contain corrupt persisted rows; skipped corrupt rows",
+			"event.name", observability.EventProxyClusterVaultAssignmentsCorrupt,
+			"error.code", observability.ErrCodeClusterVaultAssignmentsCorrupt,
+			"corrupt_rows", corrupt)
+	}
+	if len(entries) == 0 {
+		return
+	}
+	s.routingOverrides.StoreRoutes(version, entries)
+	slog.Info("routing overrides hydrated from vault (last-known, pre-pull)",
+		"event.name", "proxy.routing_override.hydrated",
+		"routing_version", version, "entries", len(entries))
+}
+
+// persistedRoutingEntries decodes the shared my_assignment_override wire for a
+// complete managed-key snapshot. corrupt counts rows that could not be decoded;
+// startup hydration may skip them best-effort, while the live Cluster refresh
+// preserves its complete last-known cache rather than applying a partial map.
+func persistedRoutingEntries(mks []vault.ManagedKey) (version int64, entries []routingwire.RouteEntry, corrupt int) {
 	for i := range mks {
 		mk := mks[i]
 		if mk.OauthGroupID == "" || mk.SeatID == "" || mk.MyAssignmentOverride == "" {
@@ -96,7 +115,8 @@ func (s *Supervisor) hydrateRoutingOverrides(gen *generation) {
 		}
 		var pa persistedAssignment
 		if json.Unmarshal([]byte(mk.MyAssignmentOverride), &pa) != nil {
-			continue // corrupt row: skip it, never fail the hydrate
+			corrupt++
+			continue
 		}
 		if !pa.Blocked && !pa.Removed && pa.AccountID == "" {
 			continue
@@ -109,13 +129,104 @@ func (s *Supervisor) hydrateRoutingOverrides(gen *generation) {
 			version = pa.RoutingVersion
 		}
 	}
-	if len(entries) == 0 {
+	return version, entries, corrupt
+}
+
+// clusterRoutingSnapshotSignature fingerprints every local (seat, group)
+// assignment column, including an empty column. Empty is the daemon's explicit
+// pending/clear representation and therefore cannot be inferred from the max
+// routing_version carried only by non-empty rows.
+func clusterRoutingSnapshotSignature(mks []vault.ManagedKey) string {
+	type assignmentRow struct {
+		SeatID         string `json:"seat_id"`
+		GroupID        string `json:"group_id"`
+		State          string `json:"state"`
+		AccountID      string `json:"account_id,omitempty"`
+		Blocked        bool   `json:"blocked,omitempty"`
+		Removed        bool   `json:"removed,omitempty"`
+		RoutingVersion int64  `json:"routing_version,omitempty"`
+	}
+	rows := make([]assignmentRow, 0, len(mks))
+	for i := range mks {
+		mk := &mks[i]
+		if mk.OauthGroupID == "" || mk.SeatID == "" {
+			continue
+		}
+		row := assignmentRow{SeatID: mk.SeatID, GroupID: mk.OauthGroupID}
+		if mk.MyAssignmentOverride == "" {
+			row.State = "pending"
+		} else {
+			var assignment persistedAssignment
+			if err := json.Unmarshal([]byte(mk.MyAssignmentOverride), &assignment); err != nil {
+				// Corrupt snapshots are rejected by persistedRoutingEntries below and
+				// never commit this signature. A stable marker is sufficient here.
+				row.State = "corrupt"
+			} else {
+				row.State = "assigned"
+				row.AccountID = assignment.AccountID
+				row.Blocked = assignment.Blocked
+				row.Removed = assignment.Removed
+				row.RoutingVersion = assignment.RoutingVersion
+			}
+		}
+		rows = append(rows, row)
+	}
+	sort.Slice(rows, func(i, j int) bool {
+		if rows[i].SeatID != rows[j].SeatID {
+			return rows[i].SeatID < rows[j].SeatID
+		}
+		if rows[i].GroupID != rows[j].GroupID {
+			return rows[i].GroupID < rows[j].GroupID
+		}
+		if rows[i].State != rows[j].State {
+			return rows[i].State < rows[j].State
+		}
+		if rows[i].AccountID != rows[j].AccountID {
+			return rows[i].AccountID < rows[j].AccountID
+		}
+		if rows[i].Blocked != rows[j].Blocked {
+			return !rows[i].Blocked
+		}
+		if rows[i].Removed != rows[j].Removed {
+			return !rows[i].Removed
+		}
+		return rows[i].RoutingVersion < rows[j].RoutingVersion
+	})
+	raw, _ := json.Marshal(rows) // fixed primitive shape cannot fail
+	return fmt.Sprintf("%x", sha256.Sum256(raw))
+}
+
+// refreshClusterRoutingOverrides applies daemon-written assignment columns to
+// the running Worker's in-memory routing cache on the existing 5-second vault
+// change-seq loop. Cluster Workers cannot use the member-JWT routing rail; a
+// startup-only hydrate therefore leaves a running Worker on stale assignments
+// after the engine rebinds a seat. Non-cluster editions deliberately stay on
+// their existing network rail and never enter this path.
+func (s *Supervisor) refreshClusterRoutingOverrides(mks []vault.ManagedKey) {
+	if s.cfg == nil || !s.cfg.Cluster.Enabled || s.routingOverrides == nil {
 		return
 	}
-	s.routingOverrides.StoreRoutes(version, entries)
-	slog.Info("routing overrides hydrated from vault (last-known, pre-pull)",
-		"event.name", "proxy.routing_override.hydrated",
-		"routing_version", version, "entries", len(entries))
+	sig := clusterRoutingSnapshotSignature(mks)
+	if previous := s.lastClusterRoutingSig.Load(); previous != nil && *previous == sig {
+		return
+	}
+	version, entries, corrupt := persistedRoutingEntries(mks)
+	if corrupt > 0 {
+		slog.Warn("cluster routing assignments contain corrupt persisted rows; keeping last-known cache",
+			"event.name", observability.EventProxyClusterVaultAssignmentsCorrupt,
+			"error.code", observability.ErrCodeClusterVaultAssignmentsCorrupt,
+			"corrupt_rows", corrupt)
+		return
+	}
+	bound, blocked := s.routingOverrides.StoreRoutes(version, entries)
+	s.lastClusterRoutingSig.Store(&sig)
+	// Keep the display projection aligned with the hot-path cache. The helper is
+	// network-free and safely returns when no active generation exists (unit tests
+	// and early startup).
+	s.restampCurrentRouted()
+	slog.Info("cluster routing assignments refreshed from daemon-managed vault",
+		"event.name", observability.EventProxyClusterVaultAssignmentsChanged,
+		"routing_version", version, "route_entries", bound, "blocked_entries", blocked)
 }
 
 // persistAssignmentOverrides mirrors the freshly-stored cache into each group

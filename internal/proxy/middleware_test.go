@@ -184,6 +184,20 @@ func TestResolveOAuthUpstream_AnthropicTestOverrideWinsRuntimeDefault(t *testing
 	}
 }
 
+func TestResolveOAuthUpstream_KimiTestOverrideWinsRuntimeDefault(t *testing.T) {
+	t.Setenv("AIKEY_PROXY_TEST_KIMI_BASE_URL", "http://127.0.0.1:18081/kimi")
+	r := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(`{"model":"kimi-test"}`))
+
+	base, out := resolveOAuthUpstream("kimi_code", "openai_compatible", "https://api.kimi.com/coding/v1", r)
+
+	if base != "http://127.0.0.1:18081/kimi" {
+		t.Fatalf("Kimi test override lost to delivered runtime default: base=%q", base)
+	}
+	if out.URL.Path != "/v1/chat/completions" {
+		t.Fatalf("Kimi test override must preserve incoming path, got %q", out.URL.Path)
+	}
+}
+
 func TestTestOnlyBaseURLAllowed(t *testing.T) {
 	allowed := []string{
 		"http://127.0.0.1:8080",

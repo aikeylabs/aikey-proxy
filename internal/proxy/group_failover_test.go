@@ -319,6 +319,49 @@ func TestGroupPathHealth_DifferentEgressPathStillFailsOver(t *testing.T) {
 	}
 }
 
+// A malformed legacy/corrupt egress spec fails before any dial. That local
+// construction error is isolated to the selected account/path: another
+// logged-in account with a distinct path must still serve the same request.
+func TestGroupFailover_InvalidEgressConstructionIsolatedToAccount(t *testing.T) {
+	key := grKey()
+	refs := []vkeys.GroupAccountRef{
+		{AccountID: "acc-invalid-egress", ProviderCode: "mock", ProtocolType: "anthropic"},
+		{AccountID: "acc-direct", ProviderCode: "mock", ProtocolType: "anthropic"},
+	}
+	mat := map[string]vkeys.GroupRuntimeAccount{
+		"acc-invalid-egress": encMat(t, key, vkeys.GroupRuntimeAccount{
+			CredentialType: "oauth_account", ProviderCode: "mock", ProtocolType: "anthropic",
+			BaseURL: "http://provider.invalid", ExpiresAt: 9_000_000_000, ExternalID: "uuid-invalid",
+			EgressProxyURL: "unsupported-egress://127.0.0.1:1",
+		}, "tok-invalid"),
+		"acc-direct": encMat(t, key, vkeys.GroupRuntimeAccount{
+			CredentialType: "oauth_account", ProviderCode: "mock", ProtocolType: "anthropic",
+			BaseURL: "http://provider.invalid", ExpiresAt: 9_000_000_000, ExternalID: "uuid-direct",
+		}, "tok-direct"),
+	}
+	route := &vkeys.ResolvedRoute{
+		VirtualKeyID: "vk-grp", ProtocolType: "anthropic", RouteSource: "team",
+		SeatID: "seat-1", OauthGroupID: "grp-1",
+		GroupAccounts: mustJSON(t, refs), GroupRuntime: mustJSON(t, mat),
+	}
+	p, tr := setupGroupProxy(t, key, route)
+	cache := NewRoutingOverrideCache()
+	cache.StoreAll(1, map[string]string{routeKey("seat-1", "grp-1"): "acc-invalid-egress"}, nil)
+	p.SetRoutingOverrides(cache)
+
+	req, w := groupReq(groupBody)
+	p.Handle(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("healthy account must isolate invalid egress construction, got %d: %s", w.Code, w.Body.String())
+	}
+	if tr.calls != 1 || tr.auth != "Bearer tok-direct" {
+		t.Fatalf("only healthy fallback may reach provider, calls=%d auth=%q", tr.calls, tr.auth)
+	}
+	if len(p.poolCooldown.skipSet()) != 0 {
+		t.Fatalf("invalid egress construction must not become account quota cooldown: %v", p.poolCooldown.skipSet())
+	}
+}
+
 // When EVERY candidate fails, the client receives the LAST captured upstream
 // error verbatim (transparent — never an invented shape), after trying each
 // account exactly once.
@@ -742,7 +785,7 @@ func TestFailoverEligibleResponse(t *testing.T) {
 		{502, nil, true},
 		{529, nil, true},
 		{503, nil, true},
-		{503, localEngineFailure, false},
+		{503, localEngineFailure, true},
 		{200, nil, false},
 		{400, nil, false}, // request-shaped error: switching cannot help
 		{403, nil, false}, // may be permission/WAF; conservative no-switch this phase
