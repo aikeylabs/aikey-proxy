@@ -11,6 +11,7 @@ import (
 	"path/filepath"
 	"sync"
 
+	"github.com/AiKeyLabs/aikey-proxy/internal/observability"
 	"github.com/AiKeyLabs/pkg/aikeytime"
 	"github.com/AiKeyLabs/pkg/buildinfo"
 )
@@ -60,20 +61,53 @@ func readTruncated(r io.Reader, maxBytes int) string {
 	return string(buf[:n])
 }
 
+// Dead-letter lanes. One file, one replay pass, one admin endpoint — the lane
+// only decides how an entry is re-delivered.
+//
+// WHY a discriminator instead of a second file: the conservation machinery an
+// undelivered batch needs (append under a mutex, atomic tmp+rename rewrite,
+// auto-replay on recovery, manual POST /admin/replay-dead-letter, the
+// dead_letter_count an operator already watches) is lane-independent and
+// already exists. A parallel compliance_dead_letter.jsonl would fork all of it
+// and give operators a second queue to remember to drain.
+//
+// deadLetterKindUsage is the EMPTY string on purpose: every line written before
+// 2026-08-10 has no `kind` field at all, so it decodes as usage and replays
+// exactly as it did before. The on-disk format change is additive only.
+const (
+	deadLetterKindUsage      = ""
+	deadLetterKindCompliance = "compliance"
+)
+
 // deadLetterEntry is a single record in dead_letter.jsonl.
 // Contains full diagnostic context for remote troubleshooting.
 //
 // DeadAt is int64 Unix epoch milliseconds (UTC) — consistent with the
 // rest of the usage pipeline's timestamp format (bugfix 20260424).
 type deadLetterEntry struct {
+	// Kind selects the re-delivery lane; empty = usage (see the constants
+	// above — absent on every pre-2026-08-10 line, so it must stay the zero
+	// value forever).
+	Kind          string            `json:"kind,omitempty"`
 	ConfigHash    string            `json:"config_hash"`
-	Reason        string            `json:"reason"` // "terminal" or "exhausted"
+	Reason        string            `json:"reason"` // "terminal", "retryable" or "exhausted"
 	ErrorMsg      string            `json:"error_msg"`
 	ResponseBody  string            `json:"response_body"`
 	CollectorURL  string            `json:"collector_url"`
 	ProxyBuildID  string            `json:"proxy_build_id"`
-	EventIDs      []string          `json:"event_ids"`
-	Events        []ReportableEvent `json:"events"`
+	// RouteSource resolves the destination URL + credential at REPLAY time for
+	// lanes that carry opaque payloads. The usage lane reads it off Events[0]
+	// instead and leaves this empty.
+	RouteSource string   `json:"route_source,omitempty"`
+	EventIDs    []string `json:"event_ids"`
+	// Payloads holds already-serialized event JSON for lanes whose wire shape
+	// the proxy deliberately does not model. Compliance events are minted by
+	// the detector child and forwarded verbatim — the proxy only stamps
+	// attribution fields onto the JSON and never decodes the rest, so storing
+	// the exact bytes is both simplest and the only thing that survives a
+	// future detector-side field addition.
+	Payloads      []json.RawMessage `json:"payloads,omitempty"`
+	Events        []ReportableEvent `json:"events,omitempty"`
 	ErrorCode     int               `json:"error_code"`
 	DeadAt        aikeytime.Millis  `json:"dead_at"`
 	AttemptCount  int               `json:"attempt_count"`
@@ -93,23 +127,55 @@ func newDeadLetterWriter(walDir string) *deadLetterWriter {
 	}
 }
 
+// deadLetterCounts is the per-lane breakdown of what is waiting for replay.
+// Total is every line in the file regardless of lane — the number
+// `aikey audit status` has always printed.
+type deadLetterCounts struct {
+	Total             int
+	ComplianceEntries int
+	ComplianceEvents  int
+}
+
 // Count returns the number of dead-letter entries currently on disk (one JSON
 // object per line). Best-effort for `aikey audit status` (D2.5) — a read error
 // or absent file reports 0. Each line is one failed upload batch.
 func (w *deadLetterWriter) Count() int {
+	return w.counts().Total
+}
+
+// counts scans the file once and reports the per-lane breakdown. Called from
+// the admin status path only (not the upload hot path), so a full parse per
+// call is cheaper than keeping a second counter in sync with the file.
+//
+// Lines that do not parse still count toward Total: they are undelivered
+// records an operator must account for, and pretending they are not there is
+// exactly the silence this whole queue exists to remove.
+func (w *deadLetterWriter) counts() deadLetterCounts {
 	w.mu.Lock()
 	defer w.mu.Unlock()
+	var c deadLetterCounts
 	data, err := os.ReadFile(w.path)
 	if err != nil {
-		return 0
+		return c
 	}
-	n := 0
 	for _, line := range bytes.Split(data, []byte("\n")) {
-		if len(bytes.TrimSpace(line)) > 0 {
-			n++
+		if len(bytes.TrimSpace(line)) == 0 {
+			continue
+		}
+		c.Total++
+		var head struct {
+			Kind     string            `json:"kind"`
+			Payloads []json.RawMessage `json:"payloads"`
+		}
+		if err := json.Unmarshal(line, &head); err != nil {
+			continue
+		}
+		if head.Kind == deadLetterKindCompliance {
+			c.ComplianceEntries++
+			c.ComplianceEvents += len(head.Payloads)
 		}
 	}
-	return n
+	return c
 }
 
 func (w *deadLetterWriter) write(entry *deadLetterEntry) {
@@ -223,6 +289,25 @@ func (r *Reporter) ReplayDeadLetter(ctx context.Context) (ReplayDeadLetterResult
 			continue
 		}
 
+		// Honor context cancellation between entries (a long replay can be
+		// interrupted by SIGTERM during a graceful shutdown). Checked once here
+		// for BOTH lanes so neither can start a new upload past cancellation;
+		// the loop keeps draining so the remaining lines survive the rewrite.
+		select {
+		case <-ctx.Done():
+			keepLines = append(keepLines, line)
+			result.EntriesStillFailing++
+			result.EventsStillFailing += entry.deliverableCount()
+			result.LastError = "context canceled"
+			continue
+		default:
+		}
+
+		if entry.Kind == deadLetterKindCompliance {
+			r.replayComplianceEntry(ctx, &entry, line, &result, &keepLines)
+			continue
+		}
+
 		// Resolve URL + credential from current cfg, not entry.CollectorURL.
 		// Entry's URL was recorded at write time and may be stale (e.g.
 		// CLI re-logged in to a different control-url since then).
@@ -261,24 +346,6 @@ func (r *Reporter) ReplayDeadLetter(ctx context.Context) (ReplayDeadLetterResult
 		}
 
 		uploadURL := url + "/v1/usage-events:batch"
-		// Honor context cancellation between entries (long replay can be
-		// interrupted by SIGTERM during a graceful shutdown).
-		select {
-		case <-ctx.Done():
-			// Keep the rest of the file unread; rewrite preserves entries
-			// after this point as-is.
-			keepLines = append(keepLines, line)
-			// Note: we don't break here — we still want to flush
-			// keepLines before exit, so just count this as not-replayed
-			// and continue the loop. But ctx.Done means we should stop
-			// trying. Use a flag.
-			result.EntriesStillFailing++
-			result.EventsStillFailing += len(entry.Events)
-			result.LastError = "context canceled"
-			// Continue draining to keep remaining lines.
-			continue
-		default:
-		}
 
 		if _, upErr := r.doUpload(uploadURL, body, cred); upErr != nil {
 			result.EntriesStillFailing++
@@ -326,6 +393,70 @@ func (r *Reporter) ReplayDeadLetter(ctx context.Context) (ReplayDeadLetterResult
 		"still_failing", result.EntriesStillFailing,
 	)
 	return result, nil
+}
+
+// deliverableCount is how many individual events this entry carries, whichever
+// lane it belongs to. Used for the result's per-event tallies.
+func (e *deadLetterEntry) deliverableCount() int {
+	if e.Kind == deadLetterKindCompliance {
+		return len(e.Payloads)
+	}
+	return len(e.Events)
+}
+
+// replayComplianceEntry re-POSTs one conserved compliance batch through the
+// SAME code path the live upload uses (postComplianceEvents), so a replayed
+// batch cannot drift from a fresh one — envelope, endpoint, credential
+// resolution and error classification are all shared.
+//
+// The URL + credential come from the CURRENT config via RouteSource, not from
+// the entry's recorded collector_url: between the failure and the replay the
+// member may have re-logged in or the team route may have moved, and the whole
+// point of replay is to use today's destination.
+//
+// IDEMPOTENCE: safe to re-deliver a batch that partially or fully landed. The
+// master's IngestBatch does `INSERT INTO compliance_events … ON CONFLICT
+// (event_id) DO NOTHING` and skips findings for an event that already has them,
+// and the event_id is minted once by the detector child and carried verbatim in
+// the payload — so the id is stable across every replay attempt.
+//
+// On success the caller drops the line; on failure the line is kept verbatim
+// (never rewritten) so the original diagnostic context survives every pass.
+func (r *Reporter) replayComplianceEntry(
+	ctx context.Context,
+	entry *deadLetterEntry,
+	line []byte,
+	result *ReplayDeadLetterResult,
+	keepLines *[][]byte,
+) {
+	n := len(entry.Payloads)
+	payloads := make([][]byte, 0, n)
+	for _, p := range entry.Payloads {
+		payloads = append(payloads, p)
+	}
+
+	if upErr := r.postComplianceEvents(ctx, entry.RouteSource, payloads); upErr != nil {
+		result.EntriesStillFailing++
+		result.EventsStillFailing += n
+		result.LastError = fmt.Sprintf("compliance HTTP %d: %s", upErr.StatusCode, upErr.Error())
+		*keepLines = append(*keepLines, line)
+		slog.Info("dead_letter replay: compliance entry still failing, kept",
+			"event.name", observability.EventComplianceDeadLetterReplayed,
+			"event_ids", entry.EventIDs,
+			"route_source", entry.RouteSource,
+			"status", upErr.StatusCode,
+		)
+		return
+	}
+
+	result.EntriesReplayedOK++
+	result.EventsReplayedOK += n
+	slog.Info("dead_letter replay: compliance events re-delivered",
+		"event.name", observability.EventComplianceDeadLetterReplayed,
+		"event_ids", entry.EventIDs,
+		"route_source", entry.RouteSource,
+		"count", n,
+	)
 }
 
 // writeDeadLetter records a failed batch to dead_letter.jsonl with full diagnostic context.

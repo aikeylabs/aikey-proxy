@@ -13,7 +13,7 @@ import (
 // pipe right after — i.e. the meta query coexists with detection (serialized,
 // but each completes).
 func TestChildHook_ListPacks(t *testing.T) {
-	binary := findDetectorBinary(t)
+	binary := requireDetectorBinary(t)
 	h := NewChildHook(&ChildHookConfig{
 		Name:         "ai-compliance-detector-listpacks-test",
 		BinaryPath:   binary,

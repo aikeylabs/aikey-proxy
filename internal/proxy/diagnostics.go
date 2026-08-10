@@ -22,6 +22,7 @@ package proxy
 
 import (
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"sort"
 
@@ -60,9 +61,10 @@ type PipelineDiagnostics struct {
 	MaskRestore  MaskRestoreHealth  `json:"mask_restore"`
 }
 
-// MaskRestoreStatus is the 3-state compliance-placeholder fidelity verdict.
-// Same three string values as MappingStatus so every surface renders both
-// blocks with one switch.
+// MaskRestoreStatus is the compliance-placeholder fidelity verdict. The first
+// three values are the same strings as MappingStatus so every surface renders
+// both blocks with one switch; `insufficient_sample` is specific to this signal
+// because it is the only one with a sample floor.
 type MaskRestoreStatus string
 
 const (
@@ -71,6 +73,13 @@ const (
 	MaskRestoreInactive MaskRestoreStatus = "inactive"
 	// MaskRestoreOK: placeholders are coming back and being restored.
 	MaskRestoreOK MaskRestoreStatus = "ok"
+	// MaskRestoreInsufficientSample: placeholders HAVE been issued, but too few
+	// to judge the ratio. Distinct from `ok` on purpose — this state used to be
+	// folded into it, so a proxy at 0% fidelity on a sample of one reported
+	// "placeholders are being returned and restored", contradicting its own
+	// numbers (2026-08-10). Distinct from `inactive` too: inactive means the
+	// feature never ran, this means it ran and the verdict is pending.
+	MaskRestoreInsufficientSample MaskRestoreStatus = "insufficient_sample"
 	// MaskRestoreDegraded: enough placeholders have been issued to judge, and
 	// the models are returning too few of them intact — i.e. users are seeing
 	// `{{ADDR_1}}` instead of their own text. NOT an error path: the request
@@ -80,7 +89,8 @@ const (
 
 const (
 	// maskFidelityMinSample: below this many issued placeholders the ratio is
-	// noise (one unlucky answer would read as 0%), so the verdict stays `ok`.
+	// noise (one unlucky answer would read as 0%), so the verdict is withheld
+	// as MaskRestoreInsufficientSample rather than asserted as `ok`.
 	maskFidelityMinSample = 20
 	// maskFidelityDegradedPct: the L3 defenses (template-syntax placeholder +
 	// tolerant matching) are designed to make near-100% the normal reading; a
@@ -107,10 +117,17 @@ type MaskRestoreHealth struct {
 	// scanned. An operator (or the release E2E) must be able to READ that from
 	// outside the process, not infer it from a startup log line
 	// (health-signal-surface). Counts + this list answer "is mask/restore whole?".
-	ScanRoles   []string `json:"scan_roles"`
-	Issued      int64    `json:"placeholders_issued"`
-	Restored    int64    `json:"placeholders_restored"`
-	FidelityPct int      `json:"fidelity_pct"`
+	ScanRoles []string `json:"scan_roles"`
+	// ToolBlockScan is the effective rung for agent tool traffic
+	// (off|audit — see toolBlockScanMode). It sits next to ScanRoles for the
+	// same reason: it is scan SCOPE, and an operator who turned it off has
+	// changed what compliance can see. A rung that only exists in a startup log
+	// line is not externally readable (health-signal-surface), and a silently
+	// off lane makes every downstream audit assertion vacuously green.
+	ToolBlockScan string `json:"tool_block_scan"`
+	Issued        int64  `json:"placeholders_issued"`
+	Restored      int64  `json:"placeholders_restored"`
+	FidelityPct   int    `json:"fidelity_pct"`
 }
 
 // maskRestoreHealth is the ONE function every surface consults for placeholder
@@ -118,20 +135,43 @@ type MaskRestoreHealth struct {
 func (p *Proxy) maskRestoreHealth() MaskRestoreHealth {
 	issued := p.maskFidelity.issued.Load()
 	restored := p.maskFidelity.restored.Load()
-	h := MaskRestoreHealth{Issued: issued, Restored: restored, ScanRoles: p.filterScanRoles.list()}
+	h := MaskRestoreHealth{
+		Issued:        issued,
+		Restored:      restored,
+		ScanRoles:     p.filterScanRoles.list(),
+		ToolBlockScan: ToolBlockScanMode(),
+	}
 	if issued <= 0 {
 		h.Status = MaskRestoreInactive
 		h.Reason = "No compliance mask placeholder has been issued by this proxy."
 		return h
 	}
 	h.FidelityPct = int(restored * 100 / issued)
-	if issued >= maskFidelityMinSample && h.FidelityPct < maskFidelityDegradedPct {
-		h.Status = MaskRestoreDegraded
-		h.Reason = "Models are returning too few mask placeholders intact — users are seeing placeholders instead of their own text."
+	if issued >= maskFidelityMinSample {
+		if h.FidelityPct < maskFidelityDegradedPct {
+			h.Status = MaskRestoreDegraded
+			h.Reason = "Models are returning too few mask placeholders intact — users are seeing placeholders instead of their own text."
+			return h
+		}
+		h.Status = MaskRestoreOK
+		h.Reason = "Mask placeholders are being returned by the models and restored."
 		return h
 	}
-	h.Status = MaskRestoreOK
-	h.Reason = "Mask placeholders are being returned by the models and restored."
+
+	// Below the sample floor the ratio is noise, so no verdict is available —
+	// and "no verdict" must not be dressed up as a healthy one.
+	//
+	// It used to fall through to MaskRestoreOK: with issued=1 / restored=0 the
+	// endpoint reported status=ok and the sentence "Mask placeholders are being
+	// returned by the models and restored." at 0% fidelity — a health signal
+	// stating the exact opposite of its own measurement (observed 2026-08-10
+	// while building the pipe-wire E2E). A reader who trusts it stops looking,
+	// which is the whole failure mode a health surface exists to prevent.
+	// Reporting the counters plus "not enough data" keeps the number visible
+	// and the claim honest.
+	h.Status = MaskRestoreInsufficientSample
+	h.Reason = fmt.Sprintf("Only %d placeholder(s) issued — below the %d-sample floor, so fidelity (%d%%) is not yet a verdict.",
+		issued, maskFidelityMinSample, h.FidelityPct)
 	return h
 }
 

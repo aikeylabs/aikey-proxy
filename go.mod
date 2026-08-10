@@ -51,6 +51,7 @@ replace github.com/aikeylabs/ai-degrade-detector/proxy-plugin/rhythm => ../ai-de
 
 require (
 	github.com/AiKeyLabs/pkg/egress v0.0.0
+	github.com/AiKeyLabs/pkg/pipewire v0.0.0
 	github.com/AiKeyLabs/pkg/routingwire v0.0.0
 	github.com/andybalholm/brotli v1.2.0 // indirect
 	github.com/dustin/go-humanize v1.0.1 // indirect
@@ -81,3 +82,5 @@ replace github.com/AiKeyLabs/pkg/routingwire => ../pkg/routingwire
 replace github.com/AiKeyLabs/pkg/egress => ../pkg/egress
 
 replace github.com/AiKeyLabs/pkg/httpdirect => ../pkg/httpdirect
+
+replace github.com/AiKeyLabs/pkg/pipewire => ../pkg/pipewire

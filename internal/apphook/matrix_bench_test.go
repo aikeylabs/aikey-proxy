@@ -33,7 +33,7 @@ func TestComplianceLatencyMatrix(t *testing.T) {
 	if raceEnabled {
 		t.Skip("latency meaningless under -race")
 	}
-	binary := findDetectorBinary(t)
+	binary := requireDetectorBinary(t)
 	h := NewChildHook(&ChildHookConfig{
 		Name:         "ai-compliance-detector-matrix",
 		BinaryPath:   binary,

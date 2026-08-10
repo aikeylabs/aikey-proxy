@@ -630,6 +630,51 @@ var reasoningBlockTypes = map[string]bool{
 	"reasoning":         true,
 }
 
+// restoreSkipBlockTypes is the set of block `type` values restore walks PAST
+// whole. It is DERIVED, not hand-written, from one rule:
+//
+//	🔴 Never write an original into a channel the request leg cannot MASK.
+//
+// The spec (2026-06-04 关键不变量) states this as "新增任何还原通道前，必须先确认
+// 该通道在请求侧可扫". "可扫" was the right test while scanning and masking were
+// the same thing. Since 2026-08-10 (方案②) they are not: agent tool blocks ARE
+// scanned, but at ceilingAudit — findings are recorded and the bytes are
+// forwarded untouched. So a placeholder the model echoes inside a `tool_use`
+// argument, restored to plaintext, would come back next turn in a block that
+// gets an audit event and no mask — i.e. the S3 thinking chain again, one rung
+// louder but just as leaky. The operative test is therefore "可 mask", and both
+// exclusion families fall out of it automatically:
+//
+//   - reasoning blocks — not in blockScanPolicy at all → not scannable → not
+//     maskable (their `signature` is verified upstream; see the note above);
+//   - tool_result / tool_use — in the policy, but ceiling < ceilingFull.
+//
+// Because the set is derived from blockScanPolicy, the two legs cannot drift:
+// raising a row to ceilingFull re-opens restore for it in the same edit, and
+// opening a new audit-only block type closes restore for it in the same edit.
+// Fenced by TestRestoreSkip_DerivedFromBlockScanPolicy.
+//
+// Built lazily (sync.OnceValue) because blockScanPolicy is populated in init()
+// — see the note there — and package-var initializers run before init().
+var restoreSkipBlockTypes = sync.OnceValue(func() map[string]bool {
+	return buildRestoreSkipBlockTypes(reasoningBlockTypes, blockScanPolicy)
+})
+
+func buildRestoreSkipBlockTypes(reasoning map[string]bool, policy map[string]blockScanRule) map[string]bool {
+	skip := make(map[string]bool, len(reasoning)+len(policy))
+	for t, on := range reasoning {
+		if on {
+			skip[t] = true
+		}
+	}
+	for t, rule := range policy {
+		if rule.ceiling != ceilingFull {
+			skip[t] = true
+		}
+	}
+	return skip
+}
+
 // reasoningTextFields lists reasoning channels that are a SIBLING FIELD of the
 // answer rather than a typed block, so reasoningBlockTypes cannot catch them:
 // OpenAI-compatible chat-completions bodies put the chain of thought in
@@ -652,10 +697,16 @@ func restoreJSONStrings(v any, st *maskRestore) (any, bool) {
 		}
 		return t, false
 	case map[string]any:
-		// S3: reasoning blocks are skipped WHOLE, and the decision is made on
-		// the block's JSON `type` — structure, never "does this text look like
-		// a thinking block", which would both miss and over-match.
-		if ty, _ := t["type"].(string); reasoningBlockTypes[ty] {
+		// S3 + 方案②: blocks the request leg cannot MASK are skipped WHOLE, and the
+		// decision is made on the block's JSON `type` — structure, never "does this
+		// text look like a thinking block", which would both miss and over-match.
+		// The set is derived from blockScanPolicy; see restoreSkipBlockTypes.
+		//
+		// Deny-list, deliberately not an allow-list: this walker also traverses
+		// nodes that are not content blocks at all — including the response ROOT,
+		// which carries `"type":"message"`. An allow-list keyed on `type` would
+		// skip the entire body.
+		if ty, _ := t["type"].(string); restoreSkipBlockTypes()[ty] {
 			return t, false
 		}
 		changed := false

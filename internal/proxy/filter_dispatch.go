@@ -218,6 +218,7 @@ func (p *Proxy) applyInboundFilter(
 
 	var (
 		maskedCount int
+		cappedCount int // verdicts downgraded by the piece's action ceiling (方案②)
 		degraded    bool
 		nilResp     int // detector unreachable (pipe dead) — resp == nil
 		selfDeg     int // detector returned Degraded=true (it ran but couldn't decide)
@@ -333,6 +334,31 @@ func (p *Proxy) applyInboundFilter(
 			nilResp++
 			continue
 		}
+
+		// ── ACTION CEILING (方案② 2026-08-10) ────────────────────────────────
+		// The piece's ceiling comes from the SAME table row that made its block
+		// type scannable at all (blockScanPolicy, filter_content.go). Tool blocks
+		// are scanned so their findings are RECORDED, and capped so the 216
+		// gitleaks-derived `block` rules can never fire on an agent's file reads.
+		// Everything else keeps ceilingFull, i.e. byte-identical behaviour.
+		//
+		// 🔴 The clamp is applied HERE, after the cache, on purpose: the cache
+		// stores the detector's RAW verdict keyed on content, and the ceiling is a
+		// property of the PIECE, not of the text. The same string appearing once in
+		// prose and once in a tool_result must mask in the first place and only
+		// audit in the second — which only works if the cached value is uncapped
+		// and the cap is re-applied per piece.
+		action, capped := pieces[i].ceiling.clamp(resp.Action)
+		if capped {
+			cappedCount++
+			// 失败要显眼 (inverted): this is the one line that says "we found
+			// something in a tool payload and deliberately let it through". Counts
+			// and the verdict name only — never content.
+			logger.Info("filter: verdict capped to audit by block-type ceiling; content forwarded UNCHANGED",
+				"event.name", observability.EventProxyFilterActionCapped,
+				"detector_action", resp.Action.String(), "ceiling", pieces[i].ceiling.String())
+		}
+
 		// Team-routed only: collect the event the detector handed back for the
 		// proxy to forward to master (the deferred upload sends them). Guard on
 		// routeClass so the proxy stays self-consistent even if a child ever
@@ -376,10 +402,22 @@ func (p *Proxy) applyInboundFilter(
 			// matched nothing ever since. trace_id is the real join key, and it
 			// is stamped HERE (per-piece loop) so all N events a single turn
 			// produces carry the SAME value → N:1 events-to-turn.
-			teamEvents = append(teamEvents, injectTraceID(injectSession(injectSeat(injectVirtualKey(injectTenant(resp.Event, orgID), virtualKeyID), seatID), sessionID), traceID))
+			//
+			// action_taken: rewritten to the CAPPED verdict when the ceiling
+			// downgraded it. The detector decided "mask"; the proxy did not mask.
+			// Leaving the detector's word in the record would tell the compliance
+			// dashboard the content was redacted when it went out verbatim — a
+			// false-safety signal, which is the exact failure mode this whole area
+			// keeps producing. The event still exists (that is the point of 方案②);
+			// only its verdict is corrected to what actually happened.
+			ev := injectTraceID(injectSession(injectSeat(injectVirtualKey(injectTenant(resp.Event, orgID), virtualKeyID), seatID), sessionID), traceID)
+			if capped {
+				ev = injectActionTaken(ev, pieces[i].ceiling.String())
+			}
+			teamEvents = append(teamEvents, ev)
 		}
 
-		switch resp.Action {
+		switch action {
 		case apphook.ActionBlock:
 			// Refuse the whole request — one content piece contained content the
 			// policy blocks (e.g. full private key, batch customer data). Restore
@@ -398,6 +436,18 @@ func (p *Proxy) applyInboundFilter(
 			return false
 
 		case apphook.ActionMask:
+			if pieces[i].setText == nil {
+				// Defensive: a piece with no write-back target reached a Mask verdict.
+				// Structurally unreachable — the only unwritable piece (the joined
+				// tool_use.input blob) is pinned to an audit ceiling that clamps Mask
+				// away above. If this fires, someone raised that ceiling without
+				// splitting the join, and the correct outcome is "forward unchanged +
+				// say so loudly", never a silent partial mask.
+				logger.Warn("filter: Mask verdict on a piece with no write-back target; content forwarded UNCHANGED",
+					"event.name", observability.EventProxyFilterMaskUnwritablePiece,
+					"ceiling", pieces[i].ceiling.String())
+				continue
+			}
 			m := resp.MutatedPayload
 			if len(m) == 0 {
 				// Mask verdict but no payload — leave this piece unchanged.
@@ -485,7 +535,8 @@ func (p *Proxy) applyInboundFilter(
 	// this is the steady-state trace for end-to-end debugging without a rebuild.
 	logger.Debug("filter: decision",
 		"event.name", "proxy.filter.decision",
-		"pieces", len(pieces), "masked", maskedCount, "degraded", degraded,
+		"pieces", len(pieces), "masked", maskedCount, "capped", cappedCount,
+		"degraded", degraded,
 		"detect_ms", detectNanos/1e6, "body_bytes", len(bodyBytes),
 		"incremental", incremental, "route_class", routeClass,
 		"cache_hits", cacheHits, "cache_miss", cacheMiss)
@@ -673,6 +724,49 @@ func injectTraceID(eventJSON []byte, traceID string) []byte {
 		return eventJSON
 	}
 	m["trace_id"] = q
+	out, err := json.Marshal(m)
+	if err != nil {
+		return eventJSON
+	}
+	return out
+}
+
+// injectActionTaken rewrites the team event JSON's `action_taken` to the verdict
+// the proxy ACTUALLY applied, used when a block-type action ceiling downgraded
+// the detector's decision (方案② 2026-08-10, filter_content.go actionCeiling).
+//
+// WHY the proxy overwrites a field the detector authored: the detector decides
+// on CONTENT and has no idea which block the piece came from — the route class
+// is the only context that crosses the pipe. The ceiling is a proxy-side policy,
+// so the proxy is the only party that can keep the audit record truthful. An
+// event that says `mask` while the bytes went upstream verbatim is worse than no
+// event: it is the "虚假安全感" this whole scan-scope investigation started from.
+//
+// 🔴 KNOWN GAP — PERSONAL/LOCAL ROUTE IS NOT COVERED. On a personal route the
+// detector uploads its own event straight to the local self-view intake
+// (AIKEY_COMPLIANCE_LOCAL_INTAKE, cmd/detector/main.go emitEvent) and the proxy
+// never touches those bytes. So a Personal/Trial self-view can still show
+// `action_taken=mask` for a capped tool-block finding. Closing that needs the
+// ceiling to cross the pipe so the detector caps at source — a wire-contract
+// change, deliberately not taken here. Tracked in
+// workflow/CI/bugfix/2026-08-10-compliance-tool-result-scan-scope.md §5.5.
+//
+// Fail-safe like the other injectors: any parse/marshal error returns the
+// original event unchanged (a malformed event the master rejects is louder than
+// one silently dropped here).
+func injectActionTaken(eventJSON []byte, action string) []byte {
+	if action == "" {
+		return eventJSON
+	}
+	var m map[string]json.RawMessage
+	if err := json.Unmarshal(eventJSON, &m); err != nil {
+		return eventJSON
+	}
+	q, err := json.Marshal(action)
+	if err != nil {
+		return eventJSON
+	}
+	m["action_taken"] = q
 	out, err := json.Marshal(m)
 	if err != nil {
 		return eventJSON

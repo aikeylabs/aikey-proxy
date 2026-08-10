@@ -57,11 +57,55 @@ const (
 	filterReadyTimeoutMsEnv = "AIKEY_PROXY_FILTER_READY_TIMEOUT_MS"
 )
 
-// filterDefaultTimeout is the per-Detect deadline when no override is set.
-// Chosen to comfortably cover Engine.Detect (AC scan + CRF NER + planner) on a
-// realistic prompt while still bounding the hot path. Fail-open on overrun
-// (§6 #11) means a too-low value silently disables masking, so we err generous.
-const filterDefaultTimeout = 80 * time.Millisecond
+// ─────────────────────────────────────────────────────────────────────────────
+// Per-Detect deadline — MUST stay above the detector's own lane budget
+// ─────────────────────────────────────────────────────────────────────────────
+//
+// WHAT this deadline is for: it is a DEGRADE THRESHOLD, not latency control
+// (requirements 2026-06-13 form2-compliance-detector-worker-sizing: "per-Detect
+// 超时…是 degrade 阈值，不缩短延迟"). Overrun does not make the request faster —
+// it makes it UNSCANNED: the hook returns Degraded → fail-open → nothing is
+// masked, and 'degraded' verdicts are deliberately not cached, so the same piece
+// is rescanned and re-times-out every single turn.
+//
+// 🔴 WHY IT MOVED FROM 80ms (2026-08-10): 80ms was set on 2026-06-01 in the
+// first compliance commit and never revisited. On 2026-08-08 the detector gained
+// ENGINE-LEVEL tiered lane deadlines (用户拍板, the single source of truth for
+// all four lanes: inputs ≤16KB → 100ms, larger → 1s). That made the proxy's
+// budget STRICTER than the engine's own — the proxy gave up at 80ms on work the
+// engine was still allowed to spend 100ms on, so the tier the user actually
+// decided could never be reached and its only observable effect was the
+// degrade/fail-open path above. A budget that expires before the thing it is
+// budgeting for is not a safety margin; it is a silent masking-off switch.
+//
+// THE RULE, now fenced (TestFilterTimeout_ExceedsDetectorLaneBudget): the proxy
+// must always time out AFTER the detector, so the detector's own deadline is the
+// one that fires and the proxy's is reserved for the case the detector cannot
+// answer at all (hung child, desynced pipe). Both properties are kept: the value
+// is finite, so a wedged detector still degrades within ~1 request's latency.
+//
+// WHY the small tier is the only one that counts: the proxy never hands the
+// detector more than pipeInputCap (16KB) per piece, and the tier is chosen on
+// the pre-truncation input size — so from this process the ≥16KB / 1s tier is
+// structurally unreachable. Budgeting for 1s would only slow down the hung-child
+// case for no coverage gain.
+const (
+	// detectorLaneDeadlineSmall MIRRORS ai-compliance-detector's laneDeadlineSmall
+	// (internal/compliance/engine.go). It cannot be imported — separate module,
+	// and the detector is a spawned child, not a library — so the mirror is
+	// verified against the detector's source by
+	// TestFilterTimeout_MirrorsDetectorLaneDeadline whenever both repos are in
+	// the same tree (always, in this monorepo / in CI).
+	detectorLaneDeadlineSmall = 100 * time.Millisecond
+	// detectorIPCMargin covers what the lane deadline does NOT: the framed pipe
+	// round-trip, the child's req-id demux, action policy + planner after the
+	// lanes finish, and goroutine scheduling on a loaded 2-core box. Generous on
+	// purpose — the cost of being too small is "masking silently off", the cost of
+	// being too large is a few tens of ms on the rare pathological request.
+	detectorIPCMargin = 50 * time.Millisecond
+	// filterDefaultTimeout is the per-Detect deadline when no override is set.
+	filterDefaultTimeout = detectorLaneDeadlineSmall + detectorIPCMargin
+)
 
 // filterDefaultReadyTimeout is how long the supervisor waits for the detector
 // child to signal ready at spawn. The apphook default is 5s, but the detector
@@ -229,6 +273,18 @@ func (s *Supervisor) installFilterHook(p *proxy.Proxy, vaultReader *vault.Reader
 			"event.name", "proxy.filter_scan_roles_invalid",
 			"rejected", rejectedRoles, "applied", scanRoles)
 	}
+	// 工具块扫描档位(方案② 开关, 2026-08-10): 默认 audit = tool_result/tool_use 被
+	// 扫描但动作封顶到"只记账"。off = 该策略行整体不生效(完全不抽取、不进 detector),
+	// 给"慢机冷启动的额外 detector 往返不可接受"的现场使用。档位与动作上限同一字段,
+	// 无法只开扫描不封顶 —— 见 filter_content.go toolBlockScanMode。
+	toolBlocks, toolBlocksOK := proxy.SetToolBlockScanMode(filterToolBlockMode())
+	if !toolBlocksOK {
+		// 失败要显眼:拼错的档位不能静默按默认跑 —— 运维以为关掉了、实际还在扫,
+		// 或反过来以为开着、实际漏扫,两个方向都必须看得见。
+		slog.Warn("supervisor: unrecognized "+filterToolBlocksEnv+" value ignored",
+			"event.name", "proxy.filter_tool_blocks_invalid",
+			"raw", os.Getenv(filterToolBlocksEnv), "applied", toolBlocks)
+	}
 	slog.Info("supervisor: compliance filter hook active",
 		"event.name", "proxy.filter_hook_active",
 		"binary", binPath,
@@ -237,7 +293,8 @@ func (s *Supervisor) installFilterHook(p *proxy.Proxy, vaultReader *vault.Reader
 		"incremental_scan", incremental,
 		"content_hash_cache", cacheOn,
 		"content_hash_cache_window", cacheWindow,
-		"scan_roles", scanRoles)
+		"scan_roles", scanRoles,
+		"tool_block_scan", toolBlocks)
 	return pool
 }
 
@@ -342,6 +399,11 @@ func appBinaryFileName(slug string) string {
 
 // filterTimeout resolves the per-Detect deadline: env override (ms) if a valid
 // positive integer, else filterDefaultTimeout.
+//
+// An override BELOW the detector's own lane budget is honoured (operators own
+// their boxes) but WARNed, because its practical effect is not "faster" but
+// "silently unmasked" — see the filterDefaultTimeout note. 日志规范: a value that
+// disables a safety control must never be accepted in silence.
 func filterTimeout() time.Duration {
 	raw := strings.TrimSpace(os.Getenv(filterTimeoutMsEnv))
 	if raw == "" {
@@ -353,7 +415,17 @@ func filterTimeout() time.Duration {
 			"event.name", "proxy.filter_timeout_invalid", "value", raw)
 		return filterDefaultTimeout
 	}
-	return time.Duration(ms) * time.Millisecond
+	d := time.Duration(ms) * time.Millisecond
+	if d <= detectorLaneDeadlineSmall {
+		slog.Warn("supervisor: "+filterTimeoutMsEnv+" is at or below the detector's own per-lane deadline; "+
+			"Detect will be cut short before the detector can finish, degrading to fail-open (nothing masked) "+
+			"instead of running faster. Raise it above the lane budget plus IPC margin.",
+			"event.name", "proxy.filter_timeout_below_detector_budget",
+			"configured_ms", ms,
+			"detector_lane_deadline_ms", detectorLaneDeadlineSmall.Milliseconds(),
+			"recommended_min_ms", filterDefaultTimeout.Milliseconds())
+	}
+	return d
 }
 
 // filterIncrementalScanEnv toggles latest-user-turn-only scanning. Opt-in
@@ -425,6 +497,30 @@ func filterScanRoles() []string {
 		return nil
 	}
 	return strings.Split(raw, ",")
+}
+
+// filterToolBlocksEnv sets the scan rung for agent tool traffic (tool_result /
+// tool_use): "audit" (default — scanned, every verdict capped to an event) or
+// "off" (the policy rows do not apply at all; nothing is extracted).
+//
+// WHY a knob (用户 2026-08-10, same request shape as the CN_ADDRESS lane switch):
+// opening tool blocks costs one extra detector round-trip per block on the
+// request hot path. That is absorbed by the content-hash cache in steady state,
+// but a cold start on a slow box pays it in full, and an operator for whom that
+// latency is unacceptable must be able to turn the SCOPE off without turning
+// compliance off. Narrowing is the dangerous direction here — off restores the
+// audit blind spot proven by aikey-test/auditeye/tool_result_scope_test.go
+// arms B/C — so it is opt-in, never the default, and the effective rung is
+// published on the diagnostics mask_restore block (`tool_block_scan`).
+//
+// Unrecognized values keep the DEFAULT rung and are WARNed: a typo must not
+// silently change what compliance can see, in either direction.
+const filterToolBlocksEnv = "AIKEY_PROXY_FILTER_TOOL_BLOCKS"
+
+// filterToolBlockMode returns the raw env rung. Empty/unset → "", which the
+// proxy reads as "use the default rung".
+func filterToolBlockMode() string {
+	return strings.TrimSpace(os.Getenv(filterToolBlocksEnv))
 }
 
 // filterCacheWindowEnv sets the per-session cache window (last-N piece verdicts;

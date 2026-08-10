@@ -105,6 +105,19 @@ const (
 	// after the upload pipe recovered (2026-07-04 self-heal) — carries
 	// scanned/replayed/still-failing counts, or the error when the pass failed.
 	EventReporterDeadLetterReplayed = "proxy.events.dead_letter_replayed"
+	// EventComplianceUploadDeadLettered: a team→master compliance upload failed
+	// and the batch was conserved in dead_letter.jsonl instead of being dropped
+	// (2026-08-10). Carries route_source / status / reason / count. The single
+	// most useful line when an audit trail looks short: it says the events
+	// exist, where they are, and why they have not landed yet.
+	EventComplianceUploadDeadLettered = "proxy.compliance.upload_dead_lettered"
+	// EventComplianceDeadLetterReplayed: one conserved compliance batch was
+	// re-attempted by a replay pass (automatic on recovery, or admin-triggered).
+	EventComplianceDeadLetterReplayed = "proxy.compliance.dead_letter_replayed"
+	// EventComplianceDeadLetterOverflow: the dead-letter file hit its size cap
+	// and a compliance batch was DROPPED. This is real audit loss, unlike every
+	// other event in this group — it is logged at ERROR for that reason.
+	EventComplianceDeadLetterOverflow = "proxy.compliance.dead_letter_overflow"
 )
 
 // Health events.
@@ -163,6 +176,19 @@ const (
 	// Both carry counts only; placeholder↔original content is never logged.
 	EventProxyFilterRestoreAlignMismatch  = "proxy.filter.restore_align_mismatch"
 	EventProxyFilterRestoreDuplicateToken = "proxy.filter.restore_duplicate_token"
+	// EventProxyFilterActionCapped: the detector returned mask/block for a piece
+	// whose block type is scanned for AUDIT ONLY (agent tool_result / tool_use;
+	// 方案② 2026-08-10), so the proxy recorded the finding and forwarded the
+	// content BYTE-UNCHANGED. This is the deliberate, decided behaviour — not a
+	// degrade — but it is logged per occurrence because "we saw sensitive content
+	// and let it through on purpose" must never be inferable only from silence.
+	// Counts + the verdict name only; never any content.
+	// EventProxyFilterMaskUnwritablePiece: a Mask verdict landed on a piece with
+	// no write-back target (the joined tool_use.input blob). Unreachable while its
+	// action ceiling forbids masking — it fires only if someone raised the ceiling
+	// without splitting the join, so it names a code defect, not a content event.
+	EventProxyFilterActionCapped        = "proxy.filter.action_capped"
+	EventProxyFilterMaskUnwritablePiece = "proxy.filter.mask_unwritable_piece"
 	// Oauth-group routing (N8). EventProxyGroupRouteResolved: a group VK request
 	// picked + injected a candidate account. EventProxyGroupRouteDegraded: no
 	// usable candidate (no material / all expired-exhausted / key unavailable) →

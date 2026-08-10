@@ -507,10 +507,17 @@ func TestMaskFidelity_IssuedVsRestored(t *testing.T) {
 	if h.FidelityPct != 50 {
 		t.Fatalf("fidelity_pct = %d, want 50", h.FidelityPct)
 	}
-	// Below the minimum sample the verdict must stay `ok` — two data points are
-	// not evidence that a model started rewriting placeholders.
-	if h.Status != MaskRestoreOK {
-		t.Fatalf("status = %q, want %q at sample size 2", h.Status, MaskRestoreOK)
+	// Below the minimum sample the verdict is WITHHELD: two data points are not
+	// evidence that a model started rewriting placeholders — but they are not
+	// evidence that everything is fine either. This used to assert `ok`, which
+	// made the endpoint print "placeholders are being returned and restored" at
+	// 50% (and at 0%, seen 2026-08-10) — a health signal contradicting its own
+	// counters. "Not enough data" is the honest third answer.
+	if h.Status != MaskRestoreInsufficientSample {
+		t.Fatalf("status = %q, want %q at sample size 2", h.Status, MaskRestoreInsufficientSample)
+	}
+	if !strings.Contains(h.Reason, "not yet a verdict") {
+		t.Fatalf("reason must say the verdict is pending, got %q", h.Reason)
 	}
 }
 
@@ -520,10 +527,27 @@ func TestMaskRestoreHealth_States(t *testing.T) {
 		t.Fatalf("no traffic must read inactive with a reason, got %+v", h)
 	}
 
+	// One issued, none restored: the feature RAN and the ratio is 0% — but one
+	// sample decides nothing. This must not read `inactive` (it ran) and must
+	// not read `ok` (0% is not health); it is the state where the endpoint says
+	// so. The `ok` reading here is what sent a real investigation down the wrong
+	// path on 2026-08-10.
+	p.maskFidelity.issued.Store(1)
+	if h := p.maskRestoreHealth(); h.Status != MaskRestoreInsufficientSample || h.FidelityPct != 0 {
+		t.Fatalf("issued=1 restored=0 must read insufficient_sample/0, got %+v", h)
+	}
+
+	// One below the floor is still withheld; the boundary is the floor itself.
+	p.maskFidelity.issued.Store(maskFidelityMinSample - 1)
+	p.maskFidelity.restored.Store(maskFidelityMinSample - 1)
+	if h := p.maskRestoreHealth(); h.Status != MaskRestoreInsufficientSample {
+		t.Fatalf("one sample below the floor must still withhold the verdict, got %+v", h)
+	}
+
 	p.maskFidelity.issued.Store(maskFidelityMinSample)
 	p.maskFidelity.restored.Store(maskFidelityMinSample)
 	if h := p.maskRestoreHealth(); h.Status != MaskRestoreOK || h.FidelityPct != 100 {
-		t.Fatalf("full fidelity must read ok/100, got %+v", h)
+		t.Fatalf("full fidelity AT the floor must read ok/100, got %+v", h)
 	}
 
 	p.maskFidelity.restored.Store(maskFidelityMinSample / 2) // 50%

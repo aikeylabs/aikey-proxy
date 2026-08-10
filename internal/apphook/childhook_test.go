@@ -3,8 +3,6 @@ package apphook
 import (
 	"context"
 	"fmt"
-	"path/filepath"
-	"runtime"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -18,7 +16,7 @@ import (
 // validates the proxy-side multiplex; Phase 2 makes the child concurrent.)
 func TestChildHook_ConcurrentDetect(t *testing.T) {
 	h := NewChildHook(&ChildHookConfig{
-		Name: "concurrent-test", BinaryPath: findDetectorBinary(t), BinaryArgs: detectorArgs(),
+		Name: "concurrent-test", BinaryPath: requireDetectorBinary(t), BinaryArgs: detectorArgs(),
 		Timeout: 2 * time.Second, ReadyTimeout: 5 * time.Second,
 	})
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
@@ -54,24 +52,14 @@ func TestChildHook_ConcurrentDetect(t *testing.T) {
 	}
 }
 
-// findDetectorBinary returns path to the ai-compliance-detector binary built
-// by `cd ai-compliance-detector && make build`. Test is skipped if binary
-// is missing — CI builds it explicitly.
-func findDetectorBinary(t *testing.T) string {
-	t.Helper()
-
-	// Walk up from internal/apphook → aikey-proxy → aikeylabs/ → ai-compliance-detector/bin/detector
-	_, file, _, _ := runtime.Caller(0)
-	apphookDir := filepath.Dir(file)                   // .../aikey-proxy/internal/apphook
-	proxyDir := filepath.Dir(filepath.Dir(apphookDir)) // .../aikey-proxy
-	aikeylabsDir := filepath.Dir(proxyDir)             // .../aikeylabs
-	binary := filepath.Join(aikeylabsDir, "ai-compliance-detector", "bin", "detector")
-
-	// Note: not stat-probing here — if the detector isn't built, the actual
-	// exec.Cmd reports a clearer error at run time. Keeping this function
-	// path-only avoids a useless extra stat call.
-	return binary
-}
+// requireDetectorBinary moved to detector_gate_test.go (BR-v1.0.5-26).
+//
+// It used to live here as `findDetectorBinary`: a path-only helper that never
+// checked anything, on the reasoning that "the exec.Cmd reports a clearer error
+// at run time". That error then landed in each caller's `t.Skipf` — and a
+// skipping test passes, so an unbuilt sibling repo made this entire IPC suite
+// disappear behind a green `ok`. The replacement classifies the failure and,
+// under AIKEY_REQUIRE_NO_TEST_SKIPS=1, refuses to skip at all.
 
 // detectorArgs returns the args to pass to the binary so it behaves like
 // Stage A (echo-only) for apphook tests. Stage B+ binary has a real engine
@@ -87,7 +75,7 @@ func detectorArgs() []string {
 // child, respawn a fresh one, and clear degraded.
 func TestChildHook_RestartRecovers(t *testing.T) {
 	h := NewChildHook(&ChildHookConfig{
-		Name: "recover-test", BinaryPath: findDetectorBinary(t), BinaryArgs: detectorArgs(),
+		Name: "recover-test", BinaryPath: requireDetectorBinary(t), BinaryArgs: detectorArgs(),
 		Timeout: 1 * time.Second, ReadyTimeout: 5 * time.Second,
 	})
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
@@ -123,7 +111,7 @@ func TestChildHook_RestartRecovers(t *testing.T) {
 // context.Background()+2s and stalled the first post-degrade Detect up to 2s.
 func TestChildHook_LazyRecoverOnDetect(t *testing.T) {
 	h := NewChildHook(&ChildHookConfig{
-		Name: "lazy-test", BinaryPath: findDetectorBinary(t), BinaryArgs: detectorArgs(),
+		Name: "lazy-test", BinaryPath: requireDetectorBinary(t), BinaryArgs: detectorArgs(),
 		Timeout: 1 * time.Second, ReadyTimeout: 5 * time.Second,
 	})
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
@@ -165,7 +153,7 @@ func TestChildHook_LazyRecoverOnDetect(t *testing.T) {
 }
 
 func TestChildHookEchoRoundtrip(t *testing.T) {
-	binary := findDetectorBinary(t)
+	binary := requireDetectorBinary(t)
 
 	h := NewChildHook(&ChildHookConfig{
 		Name:         "ai-compliance-detector-test",
