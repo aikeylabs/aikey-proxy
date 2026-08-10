@@ -114,6 +114,34 @@ func TestRenumberRestorables_InvalidSpansSkipped(t *testing.T) {
 	}
 }
 
+// Operator-authored labels may overlap. The combined scanner must pick the
+// longest token once and must not count the short token again inside it.
+func TestRenumberRestorables_MultipleOverlappingTokensUseOneCombinedScan(t *testing.T) {
+	const longOriginal = "long-secret"
+	const shortOriginal = "x"
+	head := longOriginal + " then " + shortOriginal
+	masked := "XX then X"
+	restorables := []apphook.RestorableMask{
+		{
+			Token: "X", NumberedPrefix: "[X#", NumberedSuffix: "]",
+			Spans: [][2]int{{len(longOriginal) + len(" then "), len(head)}},
+		},
+		{
+			Token: "XX", NumberedPrefix: "[XX#", NumberedSuffix: "]",
+			Spans: [][2]int{{0, len(longOriginal)}},
+		},
+	}
+
+	st := newMaskRestore()
+	got := renumberRestorables(head, masked, restorables, st, discardLogger())
+	if want := "[XX#1] then [X#2]"; got != want {
+		t.Fatalf("renumbered = %q, want %q", got, want)
+	}
+	if st.entries["[XX#1]"] != longOriginal || st.entries["[X#2]"] != shortOriginal {
+		t.Fatalf("mapping wrong: %v", st.entries)
+	}
+}
+
 // --- applyInboundFilter integration (stub detector, real dispatch path) ------
 
 // stubRestorableHook mimics the v4 detector: mask verdict + numberless token +
