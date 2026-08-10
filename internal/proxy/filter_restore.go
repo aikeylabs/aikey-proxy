@@ -51,13 +51,13 @@ import (
 	"encoding/json"
 	"log/slog"
 	"regexp"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
 
 	"github.com/AiKeyLabs/aikey-proxy/internal/apphook"
-	"github.com/AiKeyLabs/aikey-proxy/internal/observability"
 )
 
 // maskFidelity is the process-wide L3 保真率 counter pair (方案 §3.2 L3:
@@ -423,6 +423,13 @@ func renumberRestorables(head, masked string, restorables []apphook.RestorableMa
 		orig  string
 	}
 	var occs []occ
+	tokens := make([]string, 0, len(restorables))
+	for _, r := range restorables {
+		if r.Token != "" {
+			tokens = append(tokens, r.Token)
+		}
+	}
+	positionsByToken := scanTokenOccurrences(masked, tokens)
 	for _, r := range restorables {
 		if r.Token == "" || (r.NumberedPrefix == "" && r.NumberedSuffix == "") || len(r.Spans) == 0 {
 			continue
@@ -436,7 +443,7 @@ func renumberRestorables(head, masked string, restorables []apphook.RestorableMa
 			}
 			prevEnd = sp[1]
 		}
-		positions := tokenOccurrences(masked, r.Token)
+		positions := positionsByToken[r.Token]
 		if !valid || len(positions) != len(r.Spans) {
 			// Count mismatch: e.g. the user's own text contains the literal token,
 			// or spans drifted. Alignment is ambiguous → keep the numberless mask.
@@ -452,8 +459,8 @@ func renumberRestorables(head, masked string, restorables []apphook.RestorableMa
 	if len(occs) == 0 {
 		return masked
 	}
-	// Numbered in text order. With a single restorable (today) occs are already
-	// sorted; keep an insertion sort for the multi-restorable future.
+	// Numbered in text order. Each restorable contributes its own position list,
+	// so sort the merged list before allocating request-scoped numbers.
 	for i := 1; i < len(occs); i++ {
 		for j := i; j > 0 && occs[j-1].pos > occs[j].pos; j-- {
 			occs[j-1], occs[j] = occs[j], occs[j-1]
