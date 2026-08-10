@@ -19,6 +19,17 @@
 // exactly as on a fresh install (fail-open), and the embedded minimal set
 // detects the full addresses used here (verified empirically pre-B5).
 //
+// P2 (2026-08-08): the expected placeholders moved from the P1-retired
+// Chinese/full-width label to the shipped "{{ADDR_1}}" (方案 §3.1 — 短代码表 in the P1
+// 执行结论). This is a FORMAT expectation change, nothing else: the case still
+// asserts the same five things (raw address never leaves, both families get a
+// number, numbers follow occurrence order, ctx maps label→ORIGINAL, response
+// leg restores and stays valid JSON). The custom-label case deliberately keeps
+// the legacy `address_mask_label` override and its non-`{{}}` label — that is
+// the backward-compatibility path P1 preserved, and it is also the ONLY
+// coverage of the proxy's byte-exact (non-canonical) restore path over a real
+// child.
+//
 // Run: make filter-integration  (builds the detector first). Skips if binary
 // missing.
 package proxy
@@ -98,7 +109,7 @@ func TestFilterIntegration_AddressMaskLadderEndToEnd(t *testing.T) {
 	body := `{"model":"m","messages":[{"role":"user","content":"送到` + e2eAddr1 + `，发票寄` + e2eAddr2 + `，谢谢"}]}`
 	r := newReq(body)
 	r.Header.Set("X-Claude-Code-Session-Id", "integ-mask")
-	if !p.applyInboundFilter(httptest.NewRecorder(), r, "claude-3", "personal", "", "", "", "", discardLogger()) {
+	if !p.applyInboundFilter(httptest.NewRecorder(), r, "claude-3", "personal", "", "", "", "", "", discardLogger()) {
 		t.Fatal("mask request must proceed (mask ≠ block)")
 	}
 
@@ -107,10 +118,10 @@ func TestFilterIntegration_AddressMaskLadderEndToEnd(t *testing.T) {
 	if strings.Contains(forwarded, e2eAddr1) || strings.Contains(forwarded, e2eAddr2) {
 		t.Fatalf("raw address leaked to upstream body: %s", forwarded)
 	}
-	if !strings.Contains(forwarded, "[地址#1(已隐藏)]") || !strings.Contains(forwarded, "[地址#2(已隐藏)]") {
+	if !strings.Contains(forwarded, "{{ADDR_1}}") || !strings.Contains(forwarded, "{{ADDR_2}}") {
 		t.Fatalf("numbered labels missing (real detector mask/meta → proxy renumber broken): %s", forwarded)
 	}
-	if strings.Index(forwarded, "[地址#1(已隐藏)]") > strings.Index(forwarded, "[地址#2(已隐藏)]") {
+	if strings.Index(forwarded, "{{ADDR_1}}") > strings.Index(forwarded, "{{ADDR_2}}") {
 		t.Fatalf("labels out of occurrence order: %s", forwarded)
 	}
 
@@ -119,17 +130,17 @@ func TestFilterIntegration_AddressMaskLadderEndToEnd(t *testing.T) {
 	if st == nil {
 		t.Fatal("restore state missing from request context")
 	}
-	if st.entries["[地址#1(已隐藏)]"] != e2eAddr1 || st.entries["[地址#2(已隐藏)]"] != e2eAddr2 {
+	if st.entries["{{ADDR_1}}"] != e2eAddr1 || st.entries["{{ADDR_2}}"] != e2eAddr2 {
 		t.Fatalf("context mapping wrong: %v", st.entries)
 	}
 
 	// 响应侧 (non-streaming): the LLM echoes both placeholders → restored.
-	respBody := []byte(`{"id":"msg_1","content":[{"type":"text","text":"好的，主件送到[地址#1(已隐藏)]，发票寄[地址#2(已隐藏)]。"}],"usage":{"input_tokens":10,"output_tokens":20}}`)
+	respBody := []byte(`{"id":"msg_1","content":[{"type":"text","text":"好的，主件送到{{ADDR_1}}，发票寄{{ADDR_2}}。"}],"usage":{"input_tokens":10,"output_tokens":20}}`)
 	restored := string(restoreMaskedResponseBody(r.Context(), respBody, discardLogger()))
 	if !strings.Contains(restored, e2eAddr1) || !strings.Contains(restored, e2eAddr2) {
 		t.Fatalf("response restore failed: %s", restored)
 	}
-	if strings.Contains(restored, "[地址#") {
+	if strings.Contains(restored, "{{ADDR") {
 		t.Fatalf("placeholder left in restored response: %s", restored)
 	}
 	var parsed map[string]any
@@ -154,7 +165,7 @@ func TestFilterIntegration_AddressMaskCustomLabel(t *testing.T) {
 	body := `{"model":"m","messages":[{"role":"user","content":"寄到` + e2eAddr1 + `，多谢"}]}`
 	r := newReq(body)
 	r.Header.Set("X-Claude-Code-Session-Id", "integ-mask-label")
-	if !p.applyInboundFilter(httptest.NewRecorder(), r, "claude-3", "personal", "", "", "", "", discardLogger()) {
+	if !p.applyInboundFilter(httptest.NewRecorder(), r, "claude-3", "personal", "", "", "", "", "", discardLogger()) {
 		t.Fatal("mask request must proceed")
 	}
 	forwarded := readReqBody(t, r)
@@ -164,7 +175,7 @@ func TestFilterIntegration_AddressMaskCustomLabel(t *testing.T) {
 	if !strings.Contains(forwarded, "[ADDR#1-HIDDEN]") {
 		t.Fatalf("custom numbered label missing: %s", forwarded)
 	}
-	if strings.Contains(forwarded, "[地址#") || strings.Contains(forwarded, "[地址(已隐藏)]") {
+	if strings.Contains(forwarded, "{{ADDR_") || strings.Contains(forwarded, "{{ADDR}}") {
 		t.Fatalf("default label leaked despite custom override: %s", forwarded)
 	}
 

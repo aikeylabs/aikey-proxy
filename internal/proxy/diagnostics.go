@@ -10,6 +10,11 @@
 //     banner / aikey doctor / aikey test / ak use) can all answer "was a mapping
 //     configured but not taking effect?" from ONE function (mappingHealth), never
 //     an inlined marker string per caller (3.5 hard rule).
+//   - compliance mask-placeholder fidelity (P2, 方案 20260808 §3.2 L3): issued
+//     vs restored placeholder counts + a 3-state verdict. This is the only
+//     signal that surfaces "some model started rewriting our placeholders" —
+//     every such request still returns 200, so without an externally readable
+//     counter the degradation is invisible (health-signal-surface §H1).
 //
 // 🔴 GET-only + read-only (design P5-deletion note: status endpoints must not
 // mutate). Health signals must be externally readable (observability §H1/H2).
@@ -43,9 +48,91 @@ const (
 )
 
 // PipelineDiagnostics is the read-only payload of /v1/diagnostics/pipeline.
+//
+// MaskRestore was ADDED here rather than behind a new endpoint (慎重新建
+// API/接口协议): this endpoint already is the proxy's read-only "is the request
+// pipeline behaving?" surface, an additive field costs no new route, no new
+// auth posture and no new client contract, and the two blocks are read by the
+// same operator in the same breath.
 type PipelineDiagnostics struct {
 	Registry     RegistryProvenance `json:"registry"`
 	ModelMapping MappingHealth      `json:"model_mapping"`
+	MaskRestore  MaskRestoreHealth  `json:"mask_restore"`
+}
+
+// MaskRestoreStatus is the 3-state compliance-placeholder fidelity verdict.
+// Same three string values as MappingStatus so every surface renders both
+// blocks with one switch.
+type MaskRestoreStatus string
+
+const (
+	// MaskRestoreInactive: this process has never issued a mask placeholder —
+	// compliance masking is off, or no traffic hit a restorable entity.
+	MaskRestoreInactive MaskRestoreStatus = "inactive"
+	// MaskRestoreOK: placeholders are coming back and being restored.
+	MaskRestoreOK MaskRestoreStatus = "ok"
+	// MaskRestoreDegraded: enough placeholders have been issued to judge, and
+	// the models are returning too few of them intact — i.e. users are seeing
+	// `{{ADDR_1}}` instead of their own text. NOT an error path: the request
+	// succeeded, the mask worked, only the convenience half is failing.
+	MaskRestoreDegraded MaskRestoreStatus = "degraded"
+)
+
+const (
+	// maskFidelityMinSample: below this many issued placeholders the ratio is
+	// noise (one unlucky answer would read as 0%), so the verdict stays `ok`.
+	maskFidelityMinSample = 20
+	// maskFidelityDegradedPct: the L3 defenses (template-syntax placeholder +
+	// tolerant matching) are designed to make near-100% the normal reading; a
+	// sustained drop below this means some model started rewriting placeholders
+	// and the mask/restore feature is silently degrading for its users.
+	maskFidelityDegradedPct = 80
+)
+
+// MaskRestoreHealth is the externally-readable 保真率 signal (方案 20260808
+// §3.2 L3). Issued/Restored are cumulative for the process lifetime; the
+// verdict is derived, never latched — a model that starts behaving again pulls
+// the cumulative ratio back up (health-signal-surface: report the current
+// state, not a terminal one).
+//
+// Privacy: counts only. No label, no entity code, no length, no text — the
+// placeholder↔original mapping never leaves request memory (B3 拍板).
+type MaskRestoreHealth struct {
+	Status MaskRestoreStatus `json:"status"`
+	Reason string            `json:"reason"`
+	// ScanRoles is the effective inbound scan-role policy (方案 §3.4). It lives in
+	// THIS block — not a config dump — because restore and scan-scope are one
+	// safety property: restoration hands the plaintext back to the client, and it
+	// only stays out of the upstream on the next turn because `assistant` is
+	// scanned. An operator (or the release E2E) must be able to READ that from
+	// outside the process, not infer it from a startup log line
+	// (health-signal-surface). Counts + this list answer "is mask/restore whole?".
+	ScanRoles   []string `json:"scan_roles"`
+	Issued      int64    `json:"placeholders_issued"`
+	Restored    int64    `json:"placeholders_restored"`
+	FidelityPct int      `json:"fidelity_pct"`
+}
+
+// maskRestoreHealth is the ONE function every surface consults for placeholder
+// fidelity (same posture as mappingHealth). Pure read; safe to call concurrently.
+func (p *Proxy) maskRestoreHealth() MaskRestoreHealth {
+	issued := p.maskFidelity.issued.Load()
+	restored := p.maskFidelity.restored.Load()
+	h := MaskRestoreHealth{Issued: issued, Restored: restored, ScanRoles: p.filterScanRoles.list()}
+	if issued <= 0 {
+		h.Status = MaskRestoreInactive
+		h.Reason = "No compliance mask placeholder has been issued by this proxy."
+		return h
+	}
+	h.FidelityPct = int(restored * 100 / issued)
+	if issued >= maskFidelityMinSample && h.FidelityPct < maskFidelityDegradedPct {
+		h.Status = MaskRestoreDegraded
+		h.Reason = "Models are returning too few mask placeholders intact — users are seeing placeholders instead of their own text."
+		return h
+	}
+	h.Status = MaskRestoreOK
+	h.Reason = "Mask placeholders are being returned by the models and restored."
+	return h
 }
 
 // RegistryProvenance proves WHICH embedded registry is live (P7.14: the digest
@@ -130,6 +217,7 @@ func (p *Proxy) handleDiagnosticsPipeline(w http.ResponseWriter, r *http.Request
 			ProvidersWithModelMap: provs,
 		},
 		ModelMapping: p.mappingHealth(),
+		MaskRestore:  p.maskRestoreHealth(),
 	}
 
 	w.Header().Set("Content-Type", "application/json")

@@ -220,6 +220,15 @@ func (s *Supervisor) installFilterHook(p *proxy.Proxy, vaultReader *vault.Reader
 	cacheOn := filterCacheEnabled()
 	cacheWindow := filterCacheWindow()
 	p.SetFilterCacheEnabled(cacheOn, cacheWindow)
+	// 扫描角色策略(方案 §3.4):默认 user+assistant。assistant 必须在内 —— 响应侧
+	// 占位符还原把原文交回客户端,下一轮它以 assistant 身份重发(见 filter_content.go)。
+	scanRoles, rejectedRoles := p.SetFilterScanRoles(filterScanRoles())
+	if len(rejectedRoles) > 0 {
+		// 失败要显眼:不认识的角色名被丢弃,必须让运维看见,而不是静默按默认跑。
+		slog.Warn("supervisor: unrecognized "+filterScanRolesEnv+" entries ignored",
+			"event.name", "proxy.filter_scan_roles_invalid",
+			"rejected", rejectedRoles, "applied", scanRoles)
+	}
 	slog.Info("supervisor: compliance filter hook active",
 		"event.name", "proxy.filter_hook_active",
 		"binary", binPath,
@@ -227,7 +236,8 @@ func (s *Supervisor) installFilterHook(p *proxy.Proxy, vaultReader *vault.Reader
 		"timeout_ms", filterTimeout().Milliseconds(),
 		"incremental_scan", incremental,
 		"content_hash_cache", cacheOn,
-		"content_hash_cache_window", cacheWindow)
+		"content_hash_cache_window", cacheWindow,
+		"scan_roles", scanRoles)
 	return pool
 }
 
@@ -390,6 +400,31 @@ func complianceDisabledByOperator() bool {
 	default:
 		return false // default on (incl. unset / "on")
 	}
+}
+
+// filterScanRolesEnv overrides which chat message roles the inbound compliance
+// filter scans — comma-separated, e.g. "user,assistant,tool". Unset (the normal
+// case) → the proxy's default {user, assistant}.
+//
+// WHY a knob rather than a constant (方案 §3.4): the role set is the axis that
+// changed on both compliance incidents (2026-06-16 history leak, 2026-08-08
+// restore leak), and tool/function output is the next open question. An operator
+// facing a shape we have not shipped support for can widen the set without a
+// release. Narrowing is possible too but dangerous: dropping "assistant" reopens
+// the restore leak, which is why the E2E fence asserts it goes RED when removed.
+//
+// Unrecognized names are rejected + WARNed; an entry list with nothing valid in
+// it keeps the default (a typo must not silently disable scanning).
+const filterScanRolesEnv = "AIKEY_PROXY_FILTER_SCAN_ROLES"
+
+// filterScanRoles parses the comma-separated env override. Empty/unset → nil,
+// which the proxy reads as "use the default policy".
+func filterScanRoles() []string {
+	raw := strings.TrimSpace(os.Getenv(filterScanRolesEnv))
+	if raw == "" {
+		return nil
+	}
+	return strings.Split(raw, ",")
 }
 
 // filterCacheWindowEnv sets the per-session cache window (last-N piece verdicts;

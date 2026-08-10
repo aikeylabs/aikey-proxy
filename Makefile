@@ -32,7 +32,7 @@ export GOWORK
 # derive it from origin/HEAD or a new commit could silently baseline itself.
 LINT_BASE_REV ?= 9695facb96c1fefb8a2f8ba1f4b41823cf1efad6
 
-.PHONY: build test test-bugfix-provider-routing run install uninstall restart clean lint lint-full cross-compile sync-fingerprint sync-provider-registry sync-provider-data chaos-gap7 chaos-gap8 chaos filter-integration
+.PHONY: build test test-bugfix-provider-routing test-pathprefix-matrix run install uninstall restart clean lint lint-full cross-compile sync-fingerprint sync-provider-registry sync-provider-data chaos-gap7 chaos-gap8 chaos filter-integration
 
 # v4.3 (2026-05-01): aikey-cli/data/provider_fingerprint.yaml is the single
 # source of truth for provider routing. The pkg/providerroutes Go package
@@ -90,6 +90,21 @@ test-bugfix-provider-routing: ## regression: OAuth Stitch + App/Probe axes + hea
 	go test -v -count=1 ./internal/supervisor/ -run 'Test(OAuthTokenToRoute_SetsOAuthSource|BuildManagedRoutes_PreservesBothMockProtocolBindings)'
 	go test -v -count=1 ./internal/admin/ -run 'TestProbeKey_UsesProviderRouteStitchForEveryVersionShape'
 	go test -v -count=1 ./internal/proxy/ -run 'Test(StitchOAuthRequestURL_OneProviderTableRule|Fence_OAuthBinding|Fence_Tier1OAuthRouteStitchesVersionExactlyOnce|Fence_CodexOAuth|GroupServe_(OAuthAccountInjectsBearer|MockCodexOAuthUsesRuntimeRailAndFingerprintVersion|MockOAuthMissingBaseURLFailsClosed|EmptyRouteProviderUsesAccountProvider)|AppPipeline_PreservesProviderAndUsesProtocolAdapter|ProbePipeline_PreservesProviderAndUsesProtocolAdapter|NormalizeBindingForClientRouteKeepsIndependentAxes)'
+
+# Registry-derived path-prefix routing matrix (2026-08-08). Every picker:true
+# provider in provider_registry.yaml is driven through the REAL proxy handler and
+# the upstream path it produces is compared against the vendor's real endpoint —
+# i.e. it checks that `http://127.0.0.1:<port>/<proxy_path>` really is the drop-in
+# replacement for the vendor base_url that `aikey use` claims it is.
+#
+# BUILD-TAGGED ON PURPOSE: it is RED today (20 of 28 providers fail — D-1 prefix
+# not recognized × 15, D-2 upstream path doubled × 5), so it stays out of default
+# CI to avoid blocking unrelated work. The GREEN half of the same matrix —
+# TestPathPrefixMatrix_MatchesKnownDefectLedger — DOES run in default CI and holds
+# the anti-regression line. Evidence + fix options:
+# ../workflow/CI/bugfix/20260808-provider-path-prefix-routing-registry-drift.md
+test-pathprefix-matrix: ## matrix: every picker:true provider routes + stitches (RED — known defects D-1/D-2)
+	go test -count=1 -tags pathprefix_matrix -run TestPathPrefixMatrix_Strict -v ./internal/proxy/
 
 # Chaos experiments (缺口7/8) — build-tagged so they stay OUT of the normal
 # `test` suite. They drive the real newStreamDrainer / http.Server code paths

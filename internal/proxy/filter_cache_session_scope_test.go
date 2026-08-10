@@ -40,7 +40,7 @@ func TestFilterCache_KimiBodySessionScopesAndIsolates(t *testing.T) {
 			t.Fatalf("前提失败:kimi body 会话未被解析出来,got %q want %q", sess, session)
 		}
 		p.applyInboundFilter(httptest.NewRecorder(), r, "kimi-k2", "team", "org1", "vk1", "seat1",
-			sess, discardLogger())
+			sess, "", discardLogger())
 		return readReqBody(t, r)
 	}
 
@@ -76,7 +76,7 @@ func TestFilterCache_SessionScopeBeatsSharedVK(t *testing.T) {
 	send := func(sess string) {
 		r := newReq(`{"messages":[{"role":"user","content":"same text under one vk"}]}`)
 		p.applyInboundFilter(httptest.NewRecorder(), r, "m", "team", "org1", "shared-vk", "seat1",
-			sess, discardLogger())
+			sess, "", discardLogger())
 	}
 	send("sess-1")
 	send("sess-2")
@@ -108,7 +108,7 @@ func TestFilterCache_BodyReentrantAfterSessionExtraction(t *testing.T) {
 		t.Fatalf("前提:会话应从 body 解析出来,got %q", sess)
 	}
 	if !p.applyInboundFilter(httptest.NewRecorder(), r, "kimi-k2", "team", "org1", "vk1", "seat1",
-		sess, discardLogger()) {
+		sess, "", discardLogger()) {
 		t.Fatal("mask 判定不应拦截请求")
 	}
 	if h.called != 2 {
@@ -150,7 +150,7 @@ func TestFilterCache_BodyReentrantWhenSessionExtractionSkipped(t *testing.T) {
 		t.Fatalf("前提:超限 body 应放弃会话解析(返回空),got %q", sess)
 	}
 	if !p.applyInboundFilter(httptest.NewRecorder(), r, "kimi-k2", "team", "org1", "vk1", "seat1",
-		sess, discardLogger()) {
+		sess, "", discardLogger()) {
 		t.Fatal("不应拦截")
 	}
 	if h.called != 2 {

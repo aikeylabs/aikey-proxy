@@ -40,11 +40,11 @@ func TestReq_HistorySensitiveStaysMaskedAcrossTurns(t *testing.T) {
 
 	// 第1轮:用户发敏感词
 	r1 := newReq(`{"messages":[{"role":"user","content":"secret"}]}`)
-	p.applyInboundFilter(httptest.NewRecorder(), r1, "m", "personal", "", "", "", "", discardLogger())
+	p.applyInboundFilter(httptest.NewRecorder(), r1, "m", "personal", "", "", "", "", "", discardLogger())
 
 	// 第2轮:敏感词进历史,最新 turn 是普通追问
 	r2 := newReq(`{"messages":[{"role":"user","content":"secret"},{"role":"assistant","content":"ok"},{"role":"user","content":"more"}]}`)
-	p.applyInboundFilter(httptest.NewRecorder(), r2, "m", "personal", "", "", "", "", discardLogger())
+	p.applyInboundFilter(httptest.NewRecorder(), r2, "m", "personal", "", "", "", "", "", discardLogger())
 
 	body2 := readReqBody(t, r2)
 	if strings.Contains(body2, "secret") {
@@ -53,8 +53,10 @@ func TestReq_HistorySensitiveStaysMaskedAcrossTurns(t *testing.T) {
 	if !strings.Contains(body2, "[MASKED]") {
 		t.Error("需求①失败:历史敏感词应从缓存复用打码")
 	}
-	if hook.called != 2 { // secret 命中缓存复用;assistant"ok"不扫(返回内容);只扫 more
-		t.Errorf("需求①(性能侧):Detect 累计 %d, want 2(secret 命中缓存、assistant 不扫、只扫 more)", hook.called)
+	// secret 命中缓存复用;assistant "ok" 与新 user "more" 各首次扫一次
+	// (P4 起 assistant 纳入扫描 —— 还原后的原文会以 assistant 身份重发)。
+	if hook.called != 3 {
+		t.Errorf("需求①(性能侧):Detect 累计 %d, want 3(secret 命中缓存;assistant 'ok' 与 'more' 首次各扫一次)", hook.called)
 	}
 }
 
@@ -70,7 +72,7 @@ func TestReq_NoCrossSessionReuse(t *testing.T) {
 		r := newReq(`{"messages":[{"role":"user","content":"same-content"}]}`)
 		r.Header.Set("X-Claude-Code-Session-Id", sess)
 		p.applyInboundFilter(httptest.NewRecorder(), r, "m", "personal", "", "", "",
-			resolveSessionID(r, "anthropic", "anthropic"), discardLogger())
+			resolveSessionID(r, "anthropic", "anthropic"), "", discardLogger())
 	}
 
 	send("sessA") // 首次 → 扫,called=1
@@ -93,14 +95,14 @@ func TestReq_CompactionRescansSummary(t *testing.T) {
 
 	// 第1轮:原始敏感消息
 	r1 := newReq(`{"messages":[{"role":"user","content":"敏感原文X"}]}`)
-	p.applyInboundFilter(httptest.NewRecorder(), r1, "m", "personal", "", "", "", "", discardLogger())
+	p.applyInboundFilter(httptest.NewRecorder(), r1, "m", "personal", "", "", "", "", "", discardLogger())
 	if hook.called != 1 {
 		t.Fatalf("turn1 called %d, want 1", hook.called)
 	}
 
 	// 第2轮(compaction):历史被压成 summary(全新文本),原消息消失
 	r2 := newReq(`{"messages":[{"role":"user","content":"总结:用户提过敏感的事"}]}`)
-	p.applyInboundFilter(httptest.NewRecorder(), r2, "m", "personal", "", "", "", "", discardLogger())
+	p.applyInboundFilter(httptest.NewRecorder(), r2, "m", "personal", "", "", "", "", "", discardLogger())
 
 	if hook.called != 2 {
 		t.Errorf("需求③失败:compaction summary 没被重扫:called %d, want 2(summary 是新 hash 必 miss)", hook.called)

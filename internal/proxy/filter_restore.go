@@ -51,6 +51,7 @@ import (
 	"encoding/json"
 	"log/slog"
 	"regexp"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -85,7 +86,7 @@ var (
 	// the shipped `{{CODE_N}}` family, which is what makes it eligible for the
 	// tolerant response-leg matcher. Custom operator labels (e.g. `[ADDR#1-X]`)
 	// simply do not match and fall back to byte-exact restore.
-	canonicalLabelRe = regexp.MustCompile(`^\{\{([A-Za-z][A-Za-z0-9]*)_([0-9]{1,9})\}\}$`)
+	canonicalLabelRe = regexp.MustCompile(`^\{\{([A-Za-z][A-Za-z0-9]*)_(\d{1,9})\}\}$`)
 
 	// tolerantPlaceholderRe is the L3 matcher (方案 §3.2 L3). It accepts the
 	// cosmetic drift LLMs actually introduce, each variant bounded so the SSE
@@ -108,7 +109,7 @@ var (
 	// whether a trailing `{…` may still grow into one. Derived from the pattern
 	// above — keep the two in sync (fenced by TestMaskRestore_HoldbackTolerant*).
 	tolerantPlaceholderPrefixRe = regexp.MustCompile(
-		`^\{\{?[ \t]?["'` + "`" + `\x{201C}\x{2018}]?[ \t]?(?:[A-Za-z][A-Za-z0-9]*)?(?:[ \t]?_[ \t]?[0-9]{0,9}[ \t]?(?:["'` + "`" + `\x{201D}\x{2019}]?)[ \t]?\}?)?$`)
+		`^\{\{?[ \t]?["'` + "`" + `\x{201C}\x{2018}]?[ \t]?(?:[A-Za-z][A-Za-z0-9]*)?[ \t]?(?:_[ \t]?[0-9]{0,9}[ \t]?["'` + "`" + `\x{201D}\x{2019}]?[ \t]?\}?)?$`)
 )
 
 // tolerantHoldbackSlack is how many bytes a tolerant variant may exceed the
@@ -327,15 +328,18 @@ func (st *maskRestore) holdbackTolerant(s string) string {
 		window = len(s)
 	}
 	tail := s[len(s)-window:]
-	open := strings.LastIndexByte(tail, '{')
-	if open < 0 {
-		return ""
+	// EARLIEST viable `{` in the window, not the last one: `{{ad` must be held
+	// whole — starting at the second brace would emit the first one and the
+	// placeholder could never be re-assembled on the next frame.
+	for i := 0; i < len(tail); i++ {
+		if tail[i] != '{' {
+			continue
+		}
+		if tolerantPlaceholderPrefixRe.MatchString(tail[i:]) {
+			return tail[i:]
+		}
 	}
-	cand := tail[open:]
-	if !tolerantPlaceholderPrefixRe.MatchString(cand) {
-		return ""
-	}
-	return cand
+	return ""
 }
 
 // maskRestoreFromContext returns the request's restore state, or nil (the
@@ -417,16 +421,21 @@ func scanTokenOccurrences(s string, tokens []string) map[string][]int {
 // keeps its numberless token — the sensitive text stays masked, only the
 // response-side restore is lost. WARN carries counts only, never content.
 func renumberRestorables(head, masked string, restorables []apphook.RestorableMask, st *maskRestore, logger *slog.Logger) string {
+	usable, tokens := usableRestorables(restorables, logger)
+	if len(usable) == 0 {
+		return masked
+	}
+	positionsByToken := scanTokenOccurrences(masked, tokens)
+
 	type occ struct {
-		pos   int
-		token string
-		orig  string
+		pos      int
+		tokenLen int
+		prefix   string
+		suffix   string
+		orig     string
 	}
 	var occs []occ
-	for _, r := range restorables {
-		if r.Token == "" || (r.NumberedPrefix == "" && r.NumberedSuffix == "") || len(r.Spans) == 0 {
-			continue
-		}
+	for _, r := range usable {
 		valid := true
 		prevEnd := 0
 		for _, sp := range r.Spans {
@@ -436,62 +445,115 @@ func renumberRestorables(head, masked string, restorables []apphook.RestorableMa
 			}
 			prevEnd = sp[1]
 		}
-		positions := tokenOccurrences(masked, r.Token)
+		positions := positionsByToken[r.Token]
 		if !valid || len(positions) != len(r.Spans) {
 			// Count mismatch: e.g. the user's own text contains the literal token,
 			// or spans drifted. Alignment is ambiguous → keep the numberless mask.
 			logger.Warn("filter: restorable mask alignment mismatch; keeping numberless mask, restore skipped",
-				"event.name", "proxy.filter.restore_align_mismatch",
+				"event.name", observability.EventProxyFilterRestoreAlignMismatch,
 				"token_occurrences", len(positions), "spans", len(r.Spans), "spans_valid", valid)
 			continue
 		}
 		for i, pos := range positions {
-			occs = append(occs, occ{pos: pos, token: r.Token, orig: head[r.Spans[i][0]:r.Spans[i][1]]})
+			// prefix/suffix come from THIS restorable, not from a scan keyed on the
+			// token (the pre-P2 shape): with several families in one request a
+			// linear "first restorable whose Token matches" lookup hands family B
+			// family A's numbered form (串味).
+			occs = append(occs, occ{
+				pos: pos, tokenLen: len(r.Token),
+				prefix: r.NumberedPrefix, suffix: r.NumberedSuffix,
+				orig: head[r.Spans[i][0]:r.Spans[i][1]],
+			})
 		}
 	}
 	if len(occs) == 0 {
 		return masked
 	}
-	// Numbered in text order. With a single restorable (today) occs are already
-	// sorted; keep an insertion sort for the multi-restorable future.
+	// Numbered in text order — the numbers the user's forwarded prompt shows must
+	// run 1,2,3… left to right regardless of which family each one belongs to.
+	sort.SliceStable(occs, func(i, j int) bool { return occs[i].pos < occs[j].pos })
+	// Guard: merged occurrences must not overlap. scanTokenOccurrences already
+	// guarantees this (one pass, cursor advanced past each match); kept as the
+	// cheap invariant assertion for the day someone changes the scanner.
 	for i := 1; i < len(occs); i++ {
-		for j := i; j > 0 && occs[j-1].pos > occs[j].pos; j-- {
-			occs[j-1], occs[j] = occs[j], occs[j-1]
-		}
-	}
-	// Guard: merged occurrences must not overlap (impossible with one
-	// restorable; defensive for future multi-token metadata).
-	for i := 1; i < len(occs); i++ {
-		if occs[i].pos < occs[i-1].pos+len(occs[i-1].token) {
+		if occs[i].pos < occs[i-1].pos+occs[i-1].tokenLen {
 			logger.Warn("filter: restorable mask occurrences overlap; keeping numberless mask, restore skipped",
-				"event.name", "proxy.filter.restore_align_mismatch",
+				"event.name", observability.EventProxyFilterRestoreAlignMismatch,
 				"token_occurrences", len(occs), "spans", -1, "spans_valid", false)
 			return masked
 		}
 	}
 	// Rebuild left→right, allocating request-scoped numbers.
-	prefixSuffix := func(token string) (string, string) {
-		for _, r := range restorables {
-			if r.Token == token {
-				return r.NumberedPrefix, r.NumberedSuffix
-			}
-		}
-		return "", ""
-	}
 	var sb strings.Builder
 	sb.Grow(len(masked) + len(occs)*4)
 	last := 0
 	for _, o := range occs {
-		pre, suf := prefixSuffix(o.token)
-		label := pre + strconv.Itoa(st.nextN) + suf
+		label := o.prefix + strconv.Itoa(st.nextN) + o.suffix
 		st.nextN++
 		sb.WriteString(masked[last:o.pos])
 		sb.WriteString(label)
 		st.add(label, o.orig)
-		last = o.pos + len(o.token)
+		last = o.pos + o.tokenLen
 	}
 	sb.WriteString(masked[last:])
 	return sb.String()
+}
+
+// usableRestorables filters the child's metadata down to the families the
+// renumberer may act on, and returns their tokens for the occurrence scan.
+//
+// It enforces the P1 wire invariant "one token ⇒ exactly one Restorable"
+// (alias entities such as CN_PHONE/PHONE share a placeholder, so the detector
+// MERGES their spans into a single Restorable before sending). If that ever
+// breaks — an older child, a protocol skew, a regression in the grouping — the
+// consequence downstream is silent and severe: scanTokenOccurrences reports the
+// SAME occurrence list to both entries, so every occurrence is consumed twice
+// and the second family's numbers are written over the first family's spans,
+// handing the user someone else's original text on the response leg.
+//
+// 处置 = drop EVERY family sharing the duplicated token, keep the numberless
+// mask, WARN. WHY not fail the request (fail-loud in the hard sense): the
+// sensitive text is ALREADY masked at this point, so dropping restore costs the
+// user a placeholder they must read past — while failing the request would
+// break traffic over a detector-metadata defect, violating the fail-open
+// invariant (方案 §5.7 / §6 #11) that governs the whole filter chain. WHY not
+// keep the first and drop the rest: with two span lists and one occurrence
+// list, "which spans belong to which occurrences" is exactly the ambiguity that
+// makes the result wrong; there is no safe pick. The WARN is the loud part —
+// it names a wire-contract violation, not a content anomaly, so it carries
+// counts only.
+func usableRestorables(restorables []apphook.RestorableMask, logger *slog.Logger) (usable []apphook.RestorableMask, tokens []string) {
+	seen := make(map[string]int, len(restorables))
+	for _, r := range restorables {
+		if !restorableWellFormed(r) {
+			continue
+		}
+		seen[r.Token]++
+	}
+	usable = make([]apphook.RestorableMask, 0, len(restorables))
+	tokens = make([]string, 0, len(restorables))
+	dropped := 0
+	for _, r := range restorables {
+		if !restorableWellFormed(r) {
+			continue
+		}
+		if seen[r.Token] > 1 {
+			dropped++
+			continue
+		}
+		usable = append(usable, r)
+		tokens = append(tokens, r.Token)
+	}
+	if dropped > 0 {
+		logger.Warn("filter: detector sent several restorables for one placeholder token; restore skipped for them (wire contract: one token ⇒ one restorable)",
+			"event.name", observability.EventProxyFilterRestoreDuplicateToken,
+			"restorables", len(restorables), "dropped", dropped, "usable", len(usable))
+	}
+	return usable, tokens
+}
+
+func restorableWellFormed(r apphook.RestorableMask) bool {
+	return r.Token != "" && (r.NumberedPrefix != "" || r.NumberedSuffix != "") && len(r.Spans) > 0
 }
 
 // restoreMaskedResponseBody swaps numbered placeholders back to their original
@@ -533,6 +595,53 @@ func restoreMaskedResponseBody(ctx context.Context, body []byte, logger *slog.Lo
 	return bytes.TrimRight(out.Bytes(), "\n") // Encoder appends a newline
 }
 
+// reasoningBlockTypes lists the JSON `type` values of response blocks that carry
+// the model's INTERNAL reasoning instead of its answer. Restore skips such a
+// block WHOLE — see the leak chain below (S3, 用户拍板 2026-08-09).
+//
+// 🔴 WHY (the residual leak this cuts, bugfix 20260809-thinking-block-restore-leak):
+// the request leg deliberately does NOT scan `thinking` / `redacted_thinking`,
+// because those blocks carry a `signature` the Anthropic API verifies when the
+// client replays them — rewriting their text makes the upstream reject the
+// request outright (HTTP 400). Restore, however, was a whole-tree string
+// replace, so a placeholder the model echoed INSIDE its thinking was handed back
+// to the client as the ORIGINAL text; the client stores that in its history and
+// replays it next turn inside a thinking block — the one place the scanner may
+// not touch. From turn 2 on the sensitive original reached the upstream LLM in
+// plaintext, HTTP 200 all the way, with no signal anywhere.
+//
+// Keeping the placeholder inside reasoning blocks cuts the chain at ZERO
+// technical risk (nothing signed is rewritten) and is also the self-consistent
+// choice: what the client replays then matches byte-for-byte what the model
+// actually reasoned over last turn, rather than a doctored reasoning record.
+// The whole cost is cosmetic — a user who expands "thinking" sees `{{ADDR_1}}`.
+//
+// Members (structural `type` values, never a text heuristic):
+//   - thinking / redacted_thinking — Anthropic extended-thinking blocks.
+//   - reasoning — OpenAI Responses API reasoning items. Same echo-back shape:
+//     the item's `summary[].text` is plaintext and clients replay the item
+//     (with its `encrypted_content`) on the next turn for context preservation,
+//     while the inbound scanner only collects text / input_text / output_text
+//     parts (filter_content.go collectContentField) — so the identical chain
+//     exists on the Responses wire.
+var reasoningBlockTypes = map[string]bool{
+	"thinking":          true,
+	"redacted_thinking": true,
+	"reasoning":         true,
+}
+
+// reasoningTextFields lists reasoning channels that are a SIBLING FIELD of the
+// answer rather than a typed block, so reasoningBlockTypes cannot catch them:
+// OpenAI-compatible chat-completions bodies put the chain of thought in
+// `choices[].message.reasoning_content` next to `content` (DeepSeek-R1 shape,
+// adopted by Kimi and others). Excluded for the same reason and, additionally,
+// for leg parity: the streaming path never restored it either (sseTextFieldPath
+// only recognizes `choices.0.delta.content`), so restoring it non-streaming made
+// the same response differ between stream: true and stream: false.
+var reasoningTextFields = map[string]bool{
+	"reasoning_content": true,
+}
+
 // restoreJSONStrings walks a decoded JSON tree replacing placeholders inside
 // string values. Returns the (possibly shared) tree and whether anything changed.
 func restoreJSONStrings(v any, st *maskRestore) (any, bool) {
@@ -543,8 +652,17 @@ func restoreJSONStrings(v any, st *maskRestore) (any, bool) {
 		}
 		return t, false
 	case map[string]any:
+		// S3: reasoning blocks are skipped WHOLE, and the decision is made on
+		// the block's JSON `type` — structure, never "does this text look like
+		// a thinking block", which would both miss and over-match.
+		if ty, _ := t["type"].(string); reasoningBlockTypes[ty] {
+			return t, false
+		}
 		changed := false
 		for k, val := range t {
+			if reasoningTextFields[k] {
+				continue
+			}
 			nv, c := restoreJSONStrings(val, st)
 			if c {
 				t[k] = nv

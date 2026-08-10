@@ -208,22 +208,36 @@ func requestProtocolFromPath(path string) string {
 	}
 }
 
-// extractProviderFromPath checks if path starts with a known provider prefix
-// (e.g., "/anthropic/v1/messages") and returns the provider code and the
-// stripped path (e.g., "anthropic", "/v1/messages"). Returns ("", "") if no
-// prefix matched.
+// extractProviderFromPath checks if path starts with a client path-prefix the
+// registry declares (e.g. "/anthropic/v1/messages", "/groq/v1/chat/completions")
+// and returns the canonical provider code plus the path with that prefix
+// removed (e.g. "anthropic", "/v1/messages"). Returns ("", "") if nothing
+// matched — the caller then falls through to token-based routing.
+//
+// The prefix table is DERIVED from provider_registry.yaml; see
+// clientPathPrefixes in pathprefix_table.go for the derivation and for why a
+// hand-written list here was a production defect (bugfix
+// workflow/CI/bugfix/20260808-provider-path-prefix-routing-registry-drift.md).
 func extractProviderFromPath(path string) (providerCode, strippedPath string) {
-	// This is a client-route list, not a Provider list. In particular `mock`
-	// must never become a URL/client namespace: Mock credentials enter through
-	// `/anthropic` or `/openai` according to their exact stored protocol.
-	// Aliases remain for old active.env files.
-	// 2026-05-08 Kimi 双平台拆分: 加 'kimi_code' 作为 path-prefix 候选。'kimi' 保留
-	// 作为 deprecated path-prefix(老 shell hook 已写到用户 env,不能断流)。
-	known := []string{"anthropic", "claude", "openai", "google", "kimi_code", "kimi", "deepseek", "moonshot", "groq", "xai", "openrouter", "perplexity", "zhipu", "qwen", "doubao", "siliconflow"}
-	for _, code := range known {
-		prefix := "/" + code
-		if strings.HasPrefix(path, prefix+"/") || path == prefix {
-			return code, strings.TrimPrefix(path, prefix)
+	if len(path) < 2 || path[0] != '/' {
+		return "", ""
+	}
+	// Bucket by first path segment so the hot path is one map lookup plus a
+	// 1-4 element scan, regardless of how many providers the registry grows to.
+	seg := path[1:]
+	if i := strings.IndexByte(seg, '/'); i >= 0 {
+		seg = seg[:i]
+	}
+	// Candidates are pre-sorted LONGEST FIRST. Longest-prefix-wins is load
+	// bearing, not a tidiness preference: "/groq/v1/..." must be matched by the
+	// full proxy_path "groq/v1" and stripped whole. If the bare "groq" candidate
+	// won instead, the surplus "/v1" would be handed to providerroutes.Stitch as
+	// if the client had sent it — that is exactly defect D-2, where the vendor
+	// received its own base path twice and answered 404.
+	for _, c := range clientPathPrefixes().candidatesFor(seg) {
+		p := "/" + c.prefix
+		if path == p || strings.HasPrefix(path, p+"/") {
+			return c.code, path[len(p):]
 		}
 	}
 	return "", ""

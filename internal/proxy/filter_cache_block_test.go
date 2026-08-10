@@ -49,7 +49,7 @@ func TestFilterCache_BlockNotCached_SameContentRescans(t *testing.T) {
 
 	// 第1次:block → 403、不放行。
 	w1 := httptest.NewRecorder()
-	if proceed := p.applyInboundFilter(w1, newReq(body), "m", "personal", "", "", "", "", discardLogger()); proceed {
+	if proceed := p.applyInboundFilter(w1, newReq(body), "m", "personal", "", "", "", "", "", discardLogger()); proceed {
 		t.Fatal("turn1: block 必须不放行(proceed=false)")
 	}
 	if w1.Code != http.StatusForbidden {
@@ -61,7 +61,7 @@ func TestFilterCache_BlockNotCached_SameContentRescans(t *testing.T) {
 
 	// 第2次:同内容 → 必须再次走 detector(不是缓存直接 403)。
 	w2 := httptest.NewRecorder()
-	if proceed := p.applyInboundFilter(w2, newReq(body), "m", "personal", "", "", "", "", discardLogger()); proceed {
+	if proceed := p.applyInboundFilter(w2, newReq(body), "m", "personal", "", "", "", "", "", discardLogger()); proceed {
 		t.Fatal("turn2: block 仍必须不放行")
 	}
 	if w2.Code != http.StatusForbidden {
@@ -84,7 +84,7 @@ func TestFilterCache_BlockLeavesNoCacheEntry(t *testing.T) {
 	const content = "leak-me"
 	p.applyInboundFilter(httptest.NewRecorder(),
 		newReq(`{"messages":[{"role":"user","content":"`+content+`"}]}`),
-		"m", "personal", "", "", "", "", discardLogger())
+		"m", "personal", "", "", "", "", "", discardLogger())
 
 	smc, ok := p.filterCache.(*sessionMaskCache)
 	if !ok {
@@ -114,7 +114,7 @@ func TestFilterCache_ReadSideSkipsPollutedBlock(t *testing.T) {
 	// 同内容请求:读侧守卫应跳过陈旧 block → 真扫 → 按最新策略 Allow 放行。
 	w := httptest.NewRecorder()
 	proceed := p.applyInboundFilter(w, newReq(`{"messages":[{"role":"user","content":"`+content+`"}]}`),
-		"m", "personal", "", "", "", "", discardLogger())
+		"m", "personal", "", "", "", "", "", discardLogger())
 	if !proceed {
 		t.Fatal("读侧守卫失败:陈旧 block verdict 被回放,请求被 403(应重判为 Allow 放行)")
 	}
@@ -132,14 +132,14 @@ func TestFilterCache_EditedContentMask_Rescans(t *testing.T) {
 
 	p.applyInboundFilter(httptest.NewRecorder(),
 		newReq(`{"messages":[{"role":"user","content":"secret-A"}]}`),
-		"m", "personal", "", "", "", "", discardLogger())
+		"m", "personal", "", "", "", "", "", discardLogger())
 	if hook.called != 1 {
 		t.Fatalf("turn1: called %d, want 1", hook.called)
 	}
 	// 编辑内容(仍含 secret,仍会 mask,但 hash 变)→ 不命中 → 重扫。
 	p.applyInboundFilter(httptest.NewRecorder(),
 		newReq(`{"messages":[{"role":"user","content":"secret-B"}]}`),
-		"m", "personal", "", "", "", "", discardLogger())
+		"m", "personal", "", "", "", "", "", discardLogger())
 	if hook.called != 2 {
 		t.Errorf("编辑后 hash 变应重扫:called %d, want 2", hook.called)
 	}
@@ -153,13 +153,13 @@ func TestFilterCache_EditedContentBlock_Rescans(t *testing.T) {
 
 	w1 := httptest.NewRecorder()
 	p.applyInboundFilter(w1, newReq(`{"messages":[{"role":"user","content":"leak-A"}]}`),
-		"m", "personal", "", "", "", "", discardLogger())
+		"m", "personal", "", "", "", "", "", discardLogger())
 	if w1.Code != http.StatusForbidden || hook.called != 1 {
 		t.Fatalf("turn1: code=%d called=%d, want 403 & 1", w1.Code, hook.called)
 	}
 	w2 := httptest.NewRecorder()
 	p.applyInboundFilter(w2, newReq(`{"messages":[{"role":"user","content":"leak-B"}]}`),
-		"m", "personal", "", "", "", "", discardLogger())
+		"m", "personal", "", "", "", "", "", discardLogger())
 	if w2.Code != http.StatusForbidden || hook.called != 2 {
 		t.Errorf("turn2: 编辑后仍 block 且重扫:code=%d called=%d, want 403 & 2", w2.Code, hook.called)
 	}
@@ -174,7 +174,7 @@ func TestFilterCache_WarnStillCached(t *testing.T) {
 
 	const body = `{"messages":[{"role":"user","content":"borderline"}]}`
 	for i := 0; i < 2; i++ {
-		p.applyInboundFilter(httptest.NewRecorder(), newReq(body), "m", "personal", "", "", "", "", discardLogger())
+		p.applyInboundFilter(httptest.NewRecorder(), newReq(body), "m", "personal", "", "", "", "", "", discardLogger())
 	}
 	if hook.called != 1 {
 		t.Errorf("回归:warn 应仍被缓存,第2次应命中:called %d, want 1(block 修复不得误伤 warn)", hook.called)

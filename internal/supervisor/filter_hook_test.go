@@ -141,3 +141,74 @@ func TestReadControlPanelURL_ClusterEnvFallback(t *testing.T) {
 		t.Fatalf("cluster AIKEY_HUB_CONTROL_URL env not honored (trailing-slash-trimmed): got %q", got)
 	}
 }
+
+// TestFilterScanRoles_Env covers the P4 scan-role override (方案 §3.4). The
+// load-bearing case is `unset` → nil → the proxy's DEFAULT {user, assistant}:
+// a fleet that never sets this env must still scan assistant history, otherwise
+// the placeholder-restore leak (方案 §2.2) is open in production.
+func TestFilterScanRoles_Env(t *testing.T) {
+	cases := []struct {
+		name string
+		env  string
+		want []string
+	}{
+		{"unset_means_default", "", nil},
+		{"single", "user", []string{"user"}},
+		{"pair", "user,assistant", []string{"user", "assistant"}},
+		// Per-entry trimming/lowercasing is the proxy's job (newScanRoleSet); the
+		// env helper only trims the whole value and splits on commas.
+		{"spaces_and_case_passed_through", " User , ASSISTANT ", []string{"User ", " ASSISTANT"}},
+		{"extension_slot", "user,assistant,tool", []string{"user", "assistant", "tool"}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Setenv(filterScanRolesEnv, tc.env)
+			got := filterScanRoles()
+			if len(got) != len(tc.want) {
+				t.Fatalf("filterScanRoles()=%q want %q", got, tc.want)
+			}
+			for i := range got {
+				if got[i] != tc.want[i] {
+					t.Fatalf("filterScanRoles()=%q want %q", got, tc.want)
+				}
+			}
+		})
+	}
+}
+
+// The env → proxy round-trip: whatever the operator writes, the proxy must end
+// up with a policy that still includes assistant unless it was deliberately
+// removed — and an all-garbage value must fall back to the default, not to
+// "scan nothing".
+func TestFilterScanRoles_AppliedToProxy(t *testing.T) {
+	cases := []struct {
+		name        string
+		env         string
+		wantApplied []string
+		wantReject  int
+	}{
+		{"unset_default", "", []string{"assistant", "user"}, 0},
+		{"widened", "user,assistant,tool", []string{"assistant", "tool", "user"}, 0},
+		{"narrowed", "user", []string{"user"}, 0},
+		{"typo_is_reported_not_swallowed", "user,assistnat", []string{"user"}, 1},
+		{"all_garbage_falls_back_to_default", "nope,zzz", []string{"assistant", "user"}, 2},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Setenv(filterScanRolesEnv, tc.env)
+			p := &proxy.Proxy{}
+			applied, rejected := p.SetFilterScanRoles(filterScanRoles())
+			if len(rejected) != tc.wantReject {
+				t.Errorf("rejected=%q want %d entries", rejected, tc.wantReject)
+			}
+			if len(applied) != len(tc.wantApplied) {
+				t.Fatalf("applied=%q want %q", applied, tc.wantApplied)
+			}
+			for i := range applied {
+				if applied[i] != tc.wantApplied[i] {
+					t.Fatalf("applied=%q want %q", applied, tc.wantApplied)
+				}
+			}
+		})
+	}
+}

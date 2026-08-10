@@ -94,7 +94,7 @@ func TestFilterCache_TeamEventReplayedOnCacheHit(t *testing.T) {
 	send := func() {
 		r := newReq(`{"messages":[{"role":"user","content":"violating content"}]}`)
 		p.applyInboundFilter(httptest.NewRecorder(), r, "m", "team", "org-9", "vk-7", "seat-3",
-			"sess-42", discardLogger())
+			"sess-42", "", discardLogger())
 	}
 
 	// 第1轮:真扫(miss)→ 上报。
@@ -159,12 +159,12 @@ func TestFilterCache_CachedEventNotUploadedOnPersonalRoute(t *testing.T) {
 	body := `{"messages":[{"role":"user","content":"violating content"}]}`
 	// 先用团队路由把带事件的判定写进缓存(同一会话 scope)。
 	r1 := newReq(body)
-	p.applyInboundFilter(httptest.NewRecorder(), r1, "m", "team", "org-9", "vk-7", "seat-3", "sess-mix", discardLogger())
+	p.applyInboundFilter(httptest.NewRecorder(), r1, "m", "team", "org-9", "vk-7", "seat-3", "sess-mix", "", discardLogger())
 	waitEvents(t, sink, "团队路由首轮")
 
 	// 同会话同内容改走个人路由 → 命中缓存(含 event),但绝不能上报。
 	r2 := newReq(body)
-	p.applyInboundFilter(httptest.NewRecorder(), r2, "m", "personal", "", "", "", "sess-mix", discardLogger())
+	p.applyInboundFilter(httptest.NewRecorder(), r2, "m", "personal", "", "", "", "sess-mix", "", discardLogger())
 	select {
 	case evs := <-sink:
 		t.Fatalf("个人路由上报了团队事件(routeClass 守卫失效):%v", evs)
@@ -192,7 +192,7 @@ func TestFilterCache_BlockEventStillUploadedNotCached(t *testing.T) {
 	for turn := 1; turn <= 2; turn++ {
 		r := newReq(body)
 		if proceed := p.applyInboundFilter(httptest.NewRecorder(), r, "m", "team", "org-9", "vk-7", "seat-3",
-			"sess-blk", discardLogger()); proceed {
+			"sess-blk", "", discardLogger()); proceed {
 			t.Fatalf("第%d轮 block 必须拦截", turn)
 		}
 		evs := waitEvents(t, sink, fmt.Sprintf("block 第%d轮", turn))

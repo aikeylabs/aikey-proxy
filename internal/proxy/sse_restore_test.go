@@ -4,6 +4,13 @@ package proxy
 // Locks the 滑窗跨 chunk contract: placeholders split across TCP chunks AND
 // across SSE delta frames are restored; withheld text is flushed in order
 // before boundary events; placeholder-free streams pass through byte-identical.
+//
+// P2 (2026-08-08) updated the LABEL SPELLING ONLY, from the P1-retired
+// "{{ADDR_1}}" to the shipped "{{ADDR_1}}" (方案 §3.1). Split points were
+// re-cut so each case still severs the placeholder mid-token — the contract
+// under test (cross-frame holdback, in-order flush, byte-identical passthrough,
+// [DONE]/usage frames untouched, error replay) is unchanged. L3 tolerant
+// variants over the SSE path are fenced separately in filter_restore_l3_test.go.
 
 import (
 	"bytes"
@@ -117,14 +124,14 @@ func concatTextDeltas(t *testing.T, stream string) string {
 
 func TestSSERestore_PlaceholderWithinOneDelta(t *testing.T) {
 	orig := "北京市朝阳区建国路88号"
-	st := sseTestState(map[string]string{"[地址#1(已隐藏)]": orig})
-	in := anthropicTextFrame("好的，送到[地址#1(已隐藏)]没问题。") +
+	st := sseTestState(map[string]string{"{{ADDR_1}}": orig})
+	in := anthropicTextFrame("好的，送到{{ADDR_1}}没问题。") +
 		"event: content_block_stop\ndata: {\"type\":\"content_block_stop\",\"index\":0}\n\n"
 	out := drainAll(t, newSSEPlaceholderRestorer(&chunkReader{data: []byte(in), chunk: len(in)}, st))
 	if got := concatTextDeltas(t, out); got != "好的，送到"+orig+"没问题。" {
 		t.Fatalf("restored text = %q", got)
 	}
-	if strings.Contains(out, "[地址#") {
+	if strings.Contains(out, "{{ADDR") {
 		t.Fatalf("placeholder survived: %s", out)
 	}
 }
@@ -133,19 +140,17 @@ func TestSSERestore_PlaceholderWithinOneDelta(t *testing.T) {
 // LLM streams token-sized deltas) and the stream arrives in 3-byte TCP chunks.
 func TestSSERestore_PlaceholderSplitAcrossDeltasAndChunks(t *testing.T) {
 	orig := "上海市浦东新区世纪大道100号"
-	st := sseTestState(map[string]string{"[地址#1(已隐藏)]": orig})
-	in := anthropicTextFrame("寄到[地址#1(") +
-		anthropicTextFrame("已隐") +
-		anthropicTextFrame("藏)]即可") +
+	st := sseTestState(map[string]string{"{{ADDR_1}}": orig})
+	in := anthropicTextFrame("寄到{{AD") +
+		anthropicTextFrame("DR_") +
+		anthropicTextFrame("1}}即可") +
 		"event: message_delta\ndata: {\"type\":\"message_delta\",\"usage\":{\"output_tokens\":9}}\n\n"
 	out := drainAll(t, newSSEPlaceholderRestorer(&chunkReader{data: []byte(in), chunk: 3}, st))
 	if got := concatTextDeltas(t, out); got != "寄到"+orig+"即可" {
 		t.Fatalf("cross-frame restore failed, text = %q", got)
 	}
-	if strings.Contains(out, "[地址#") || strings.Contains(out, "已隐") && strings.Contains(out, "隐藏)]") {
-		if strings.Contains(out, "(已隐藏)]") {
-			t.Fatalf("placeholder fragments survived: %s", out)
-		}
+	if strings.Contains(out, "{{ADDR") || strings.Contains(out, "DR_1}}") {
+		t.Fatalf("placeholder fragments survived: %s", out)
 	}
 	// usage frame passes through untouched (token extraction unaffected).
 	if !strings.Contains(out, `"output_tokens":9`) {
@@ -156,11 +161,11 @@ func TestSSERestore_PlaceholderSplitAcrossDeltasAndChunks(t *testing.T) {
 // A prefix that never completes must be flushed BEFORE the boundary event as a
 // synthesized text frame — the client receives every byte, in order.
 func TestSSERestore_UnfinishedPrefixFlushedBeforeBoundary(t *testing.T) {
-	st := sseTestState(map[string]string{"[地址#1(已隐藏)]": "x"})
-	in := anthropicTextFrame("结尾是半个占位[地址#1(") +
+	st := sseTestState(map[string]string{"{{ADDR_1}}": "x"})
+	in := anthropicTextFrame("结尾是半个占位{{ADDR_") +
 		"event: content_block_stop\ndata: {\"type\":\"content_block_stop\",\"index\":0}\n\n"
 	out := drainAll(t, newSSEPlaceholderRestorer(&chunkReader{data: []byte(in), chunk: 7}, st))
-	if got := concatTextDeltas(t, out); got != "结尾是半个占位[地址#1(" {
+	if got := concatTextDeltas(t, out); got != "结尾是半个占位{{ADDR_" {
 		t.Fatalf("held text lost/dup: %q", got)
 	}
 	// Order: the flushed text frame must appear BEFORE content_block_stop.
@@ -174,7 +179,7 @@ func TestSSERestore_UnfinishedPrefixFlushedBeforeBoundary(t *testing.T) {
 // 无占位符时零改动直通: with a mapping present but nothing matching, the whole
 // stream must come out byte-identical (fast path skips re-encoding).
 func TestSSERestore_NoPlaceholderByteIdentical(t *testing.T) {
-	st := sseTestState(map[string]string{"[地址#1(已隐藏)]": "x"})
+	st := sseTestState(map[string]string{"{{ADDR_1}}": "x"})
 	in := "event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"model\":\"m\"}}\n\n" +
 		anthropicTextFrame("plain text answer") +
 		anthropicTextFrame("第二段，无敏感内容") +
@@ -202,9 +207,9 @@ func TestSSERestore_NilStateIdentity(t *testing.T) {
 // deltas, no event: lines.
 func TestSSERestore_OpenAIDeltaSplit(t *testing.T) {
 	orig := "广州市天河区体育西路5号"
-	st := sseTestState(map[string]string{"[地址#1(已隐藏)]": orig})
-	in := "data: {\"choices\":[{\"delta\":{\"content\":\"送[地址#1\"}}]}\n\n" +
-		"data: {\"choices\":[{\"delta\":{\"content\":\"(已隐藏)]吧\"}}]}\n\n" +
+	st := sseTestState(map[string]string{"{{ADDR_1}}": orig})
+	in := "data: {\"choices\":[{\"delta\":{\"content\":\"送{{ADDR\"}}]}\n\n" +
+		"data: {\"choices\":[{\"delta\":{\"content\":\"_1}}吧\"}}]}\n\n" +
 		"data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n" +
 		"data: [DONE]\n\n"
 	out := drainAll(t, newSSEPlaceholderRestorer(&chunkReader{data: []byte(in), chunk: 4}, st))
@@ -220,12 +225,12 @@ func TestSSERestore_OpenAIDeltaSplit(t *testing.T) {
 func TestSSERestore_MultiplePlaceholders(t *testing.T) {
 	a1, a2 := "地址一号", "地址二号"
 	st := sseTestState(map[string]string{
-		"[地址#1(已隐藏)]": a1,
-		"[地址#2(已隐藏)]": a2,
+		"{{ADDR_1}}": a1,
+		"{{ADDR_2}}": a2,
 	})
-	in := anthropicTextFrame("先送[地址#1(已隐") +
-		anthropicTextFrame("藏)]，再送[地") +
-		anthropicTextFrame("址#2(已隐藏)]。") +
+	in := anthropicTextFrame("先送{{ADDR_") +
+		anthropicTextFrame("1}}，再送{{AD") +
+		anthropicTextFrame("DR_2}}。") +
 		"data: [DONE]\n\n"
 	out := drainAll(t, newSSEPlaceholderRestorer(&chunkReader{data: []byte(in), chunk: 9}, st))
 	if got := concatTextDeltas(t, out); got != "先送"+a1+"，再送"+a2+"。" {
@@ -236,15 +241,15 @@ func TestSSERestore_MultiplePlaceholders(t *testing.T) {
 // Upstream error after partial data: pending carry + partial frame still reach
 // the client, then the error is replayed (drainer semantics preserved).
 func TestSSERestore_UpstreamErrorReplayedAfterFlush(t *testing.T) {
-	st := sseTestState(map[string]string{"[地址#1(已隐藏)]": "x"})
-	in := anthropicTextFrame("尾巴[地址#1(")
+	st := sseTestState(map[string]string{"{{ADDR_1}}": "x"})
+	in := anthropicTextFrame("尾巴{{ADDR_")
 	r := &errAfterReader{data: []byte(in)}
 	rc := newSSEPlaceholderRestorer(r, st)
 	b, err := io.ReadAll(rc)
 	if err == nil || err.Error() != "upstream broke" {
 		t.Fatalf("expected upstream error replay, got %v", err)
 	}
-	if got := concatTextDeltas(t, string(b)); got != "尾巴[地址#1(" {
+	if got := concatTextDeltas(t, string(b)); got != "尾巴{{ADDR_" {
 		t.Fatalf("held text lost on error: %q", got)
 	}
 }

@@ -20,7 +20,115 @@
 // JSON/Markdown (that is H9 / L2, the child's Replacement Planner).
 package proxy
 
-import "encoding/json"
+import (
+	"encoding/json"
+	"sort"
+	"strings"
+)
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Scan-role policy (P4, 方案 §3.4 "扫描范围扩展：assistant 消息纳入")
+// ─────────────────────────────────────────────────────────────────────────────
+//
+// WHY this is configuration and not a hard-coded skip list: which roles carry
+// user-originated content is a POLICY question that changed twice already —
+//   - 2026-06-16 (history leak): "only the latest user turn" → "every user turn";
+//   - 2026-08-08 (placeholder restore): "user only" → "user + assistant", because
+//     response-side restoration hands the CLIENT the plaintext back, so from the
+//     second turn on the same plaintext returns inside an ASSISTANT message. A
+//     skip list that excludes assistant makes masking a first-turn-only feature
+//     (方案 §2.2). Future protocol shapes (tool / function results) are the next
+//     candidate, so the axis gets a name and a knob instead of a third edit here.
+//
+// FAIL-SAFE (never silently under-scan): the policy is an allow-list over a
+// CLOSED universe of roles we can reason about. Anything OUTSIDE that universe —
+// an empty/missing role, or a role a future client invents — is ALWAYS scanned.
+// So a wire format we have never seen degrades toward over-scanning (a masked
+// benign string), never toward leaking. This preserves the pre-P4 behavior of
+// the deny-list exactly: with roles={user}, unknown roles were scanned too.
+
+// knownMessageRoles is the closed universe of chat roles the proxy recognizes,
+// across Anthropic + OpenAI-family (chat/Responses, Codex/Kimi) + OpenClaw.
+// A role in this set is scanned only if the policy lists it; a role NOT in this
+// set is always scanned (see scanRoleSet.scans).
+var knownMessageRoles = map[string]struct{}{
+	"user":      {},
+	"assistant": {},
+	"system":    {},
+	"developer": {}, // OpenAI's system-equivalent
+	"tool":      {},
+	"function":  {}, // OpenAI legacy tool output
+}
+
+// scanRoleSet is the configured set of roles the inbound compliance filter
+// scans. The zero value (nil) means "use defaultScanRoles" so a Proxy built
+// without explicit configuration behaves like a configured one.
+type scanRoleSet map[string]struct{}
+
+// defaultScanRoles — user + assistant (方案 §3.4).
+//
+//   - user: the human's own input, every turn (2026-06-16 history-leak fix).
+//   - assistant: model replies REPLAYED as history. They are not "the model's
+//     live response" (the inbound filter still never governs the response leg);
+//     they are text the client is sending upstream now, and after placeholder
+//     restoration that text is the user's plaintext.
+//
+// system/developer are deliberately absent: masking admin-authored instructions
+// corrupts the agent's directives. tool/function are absent pending a decision
+// on tool output (the knob makes that a config change, not a code change).
+var defaultScanRoles = scanRoleSet{"user": {}, "assistant": {}}
+
+// scans reports whether a message with this role must be handed to the detector.
+// nil receiver → the default policy.
+func (s scanRoleSet) scans(role string) bool {
+	r := strings.ToLower(strings.TrimSpace(role))
+	if _, known := knownMessageRoles[r]; !known {
+		return true // empty / unrecognized role → fail-safe scan
+	}
+	if s == nil {
+		s = defaultScanRoles
+	}
+	_, ok := s[r]
+	return ok
+}
+
+// list returns the configured roles sorted, for logging/diagnostics.
+func (s scanRoleSet) list() []string {
+	if s == nil {
+		s = defaultScanRoles
+	}
+	out := make([]string, 0, len(s))
+	for r := range s {
+		out = append(out, r)
+	}
+	sort.Strings(out)
+	return out
+}
+
+// newScanRoleSet builds a policy from raw configured role names. Names are
+// normalised (trim + lowercase) and validated against knownMessageRoles.
+//
+// Returns rejected names so the caller can WARN instead of silently dropping
+// them (日志规范: no silent fallback to a default). If NOTHING valid remains the
+// result is nil = default policy — an operator typo must not disable scanning.
+func newScanRoleSet(raw []string) (set scanRoleSet, rejected []string) {
+	set = scanRoleSet{}
+	for _, r := range raw {
+		n := strings.ToLower(strings.TrimSpace(r))
+		if n == "" {
+			continue
+		}
+		if _, known := knownMessageRoles[n]; !known {
+			rejected = append(rejected, r)
+			continue
+		}
+		set[n] = struct{}{}
+	}
+	if len(set) == 0 {
+		return nil, rejected // nil → default (fail-safe, never "scan nothing")
+	}
+	return set, rejected
+}
 
 // contentPiece is one maskable text value located in the request envelope,
 // paired with a setter that writes a replacement back into the parsed structure.
@@ -74,33 +182,35 @@ func extractFilterableContent(body []byte) (pieces []contentPiece, parsed map[st
 	return pieces, m, true
 }
 
-// extractUserContent extracts the maskable text of EVERY user-role message — the
-// user's own input across all turns (latest + history). This is the history-leak
-// fix's scan set (2026-06-16): the user's earlier sensitive input lives in a HISTORY
-// user message and must be re-masked every turn.
+// extractUserContent extracts the maskable text of every message whose role the
+// scan-role policy covers — by default user + assistant, across all turns
+// (latest + history). Two incidents shaped this scan set:
 //
-// It deliberately SKIPS:
-//   - the system prompt (admin-authored instructions, not user input — masking it
-//     would corrupt the agent's directives), and
-//   - assistant / tool messages (the model's own RESPONSES = "returned content";
-//     the inbound compliance filter governs user→LLM, it must NOT mask what the
-//     model returned — 用户明确要求 2026-06-16).
+//   - 2026-06-16 history leak: the user's earlier sensitive input lives in a
+//     HISTORY user message and must be re-masked every turn (scanning only the
+//     latest turn let it through unmasked from turn 2 on);
+//   - 2026-08-08 restore leak (方案 §2.2): response-side placeholder restoration
+//     returns the PLAINTEXT to the client, so from turn 2 on that plaintext is
+//     replayed inside an ASSISTANT message. Skipping assistant would make masking
+//     a first-turn-only feature. See scanRoleSet.
 //
-// Skipping system + assistant also slashes the piece count (a big agent prompt is
-// mostly system + history assistant turns), which is what kept the full scan within
-// the detector budget (no per-piece timeout / fail-open on a 22-piece prompt).
+// It still SKIPS the system prompt / OpenAI `instructions` unconditionally: those
+// are admin-authored directives, and masking them corrupts the agent (the policy
+// universe contains "system"/"developer" so an operator CAN opt in, but the
+// top-level `system` field is not a message and is never collected here).
 //
-// Fail-safe role handling: only EXPLICIT assistant/system/tool roles are skipped;
-// a "user" or missing/empty role is scanned (never silently under-scan real input).
-// ok=false only when the body is not a JSON object with a messages[] array → caller
-// falls back to forwarding unfiltered (same fail-open as before for non-chat bodies).
-func extractUserContent(body []byte) (pieces []contentPiece, parsed map[string]any, ok bool) {
+// Fail-safe role handling (scanRoleSet.scans): a missing/empty role, or a role
+// outside the known universe, is ALWAYS scanned — never silently under-scan real
+// input. ok=false only when the body is not a JSON object with a messages[] array
+// → caller falls back to forwarding unfiltered (same fail-open as before for
+// non-chat bodies).
+func extractUserContent(body []byte, roles scanRoleSet) (pieces []contentPiece, parsed map[string]any, ok bool) {
 	var m map[string]any
 	if err := json.Unmarshal(body, &m); err != nil {
 		return nil, nil, false
 	}
 	if msgs, isArr := m["messages"].([]any); isArr {
-		collectUserTurns(msgs, &pieces)
+		collectUserTurns(msgs, roles, &pieces)
 		return pieces, m, true
 	}
 	// OpenAI Responses API (codex, /v1/responses): the request carries no
@@ -122,27 +232,25 @@ func extractUserContent(body []byte) (pieces []contentPiece, parsed map[string]a
 		}
 		return pieces, m, true
 	case []any:
-		collectUserTurns(in, &pieces)
+		collectUserTurns(in, roles, &pieces)
 		return pieces, m, true
 	}
 	return nil, m, false
 }
 
 // collectUserTurns scans a chat-style item array (Anthropic/OpenAI messages[]
-// or Responses API input[]) for USER-role text, applying the single skip policy
-// (model responses / admin instructions / tool output are never user input).
-func collectUserTurns(items []any, out *[]contentPiece) {
+// or Responses API input[]) for the text of every message the scan-role policy
+// covers. Role handling lives entirely in scanRoleSet.scans (allow-list over a
+// closed universe + fail-safe scan for anything unknown), so adding a role is a
+// configuration change rather than an edit here.
+func collectUserTurns(items []any, roles scanRoleSet, out *[]contentPiece) {
 	for _, mi := range items {
 		msg, isObj := mi.(map[string]any)
 		if !isObj {
 			continue
 		}
-		switch role, _ := msg["role"].(string); role {
-		case "assistant", "system", "developer", "tool", "function":
-			// model RESPONSE (assistant) / admin instructions (system, OpenAI
-			// developer) / tool output (tool, OpenAI legacy function) — none are user
-			// input, so the inbound compliance filter must not scan/mask them. Covers
-			// Anthropic + OpenAI-family (Codex/Kimi) + OpenClaw roles uniformly.
+		role, _ := msg["role"].(string)
+		if !roles.scans(role) {
 			continue
 		}
 		collectContentField(msg, "content", out)
@@ -195,6 +303,19 @@ func extractLatestUserContent(body []byte) (pieces []contentPiece, parsed map[st
 // string ("content":"…") or an array of typed blocks ("content":[{"type":"text",
 // "text":"…"}, …]). Non-text blocks (image / tool_use / tool_result / …) and
 // null content are skipped — only natural-language text is sent to the hook.
+//
+// DELIBERATE EXCLUSIONS (documented so a future reader doesn't "fix" them):
+//   - Anthropic `thinking` / `redacted_thinking` blocks carry a `signature` the
+//     API verifies when the client replays them; rewriting their text would make
+//     the upstream reject the request outright. Fail-open beats a broken request.
+//     🔴 The other half of this rule lives on the RESPONSE leg: because these
+//     blocks can never be scanned here, restore must never write originals into
+//     them either — otherwise the plaintext comes back next turn through the one
+//     door that has no lock (S3, 2026-08-09). Enforced by reasoningBlockTypes in
+//     filter_restore.go; the two are one rule, change them together.
+//   - `tool_result` / `tool_use` blocks nest their payload under their own
+//     schema (not a flat `text` string); scanning them is a separate decision
+//     (the tool/function scan roles exist for it) and is out of P4's scope.
 func collectContentField(parent map[string]any, key string, out *[]contentPiece) {
 	switch v := parent[key].(type) {
 	case string:
@@ -211,11 +332,22 @@ func collectContentField(parent map[string]any, key string, out *[]contentPiece)
 				continue
 			}
 			// "text" = Anthropic/OpenAI chat content block; "input_text" = OpenAI
-			// Responses API user content part (codex). Both carry human text in
-			// the same `text` field. Non-text blocks (image / input_image /
-			// tool_use / output_text=model reply) are skipped.
+			// Responses API user content part (codex); "output_text" = the
+			// Responses API ASSISTANT content part, i.e. how a replayed model
+			// reply carries its text in input[].
+			//
+			// output_text was added by P4 (2026-08-08): the scan-role policy now
+			// covers assistant, but on the Responses wire an assistant item's text
+			// sits in output_text, so without this the assistant turn matched the
+			// role filter and then yielded ZERO pieces — the restore leak (方案
+			// §2.2) would have stayed open for codex/Responses clients while the
+			// Anthropic/chat shapes were fixed. Same wire-format class as the
+			// 2026-07-08 input_text incident.
+			//
+			// Non-text blocks (image / input_image / tool_use / tool_result /
+			// thinking) are skipped — see the exclusions note above.
 			switch t, _ := block["type"].(string); t {
-			case "text", "input_text":
+			case "text", "input_text", "output_text":
 			default:
 				continue
 			}

@@ -148,6 +148,21 @@ const (
 	// token quota floor backstops it and the server baseline catches up on
 	// re-sync. Recurring hits signal a stale summary needing a price re-sync.
 	EventProxyQuotaModelUnpriced = "proxy.quota.model_unpriced"
+	// Compliance restorable-mask chain (方案 20260808 占位符还原与全类型脱敏).
+	// EventProxyFilterRestoreAlignMismatch: the masked text and the detector's
+	// span metadata disagree for one placeholder family (user typed the literal
+	// token, spans drifted, occurrences overlap) — the mask is KEPT, only the
+	// response-side restore is dropped for that family.
+	// EventProxyFilterRestoreDuplicateToken: the detector sent more than one
+	// Restorable for the SAME placeholder token, breaking the "one token ⇒ one
+	// restorable" wire contract P1 established (alias entities must be merged
+	// child-side). Acting on it would renumber one family's occurrences with the
+	// other family's spans — a silent WRONG restore — so every family sharing
+	// the token is dropped. WARN, never a request failure: fail-open governs the
+	// whole filter chain, and the sensitive text stays masked either way.
+	// Both carry counts only; placeholder↔original content is never logged.
+	EventProxyFilterRestoreAlignMismatch  = "proxy.filter.restore_align_mismatch"
+	EventProxyFilterRestoreDuplicateToken = "proxy.filter.restore_duplicate_token"
 	// Oauth-group routing (N8). EventProxyGroupRouteResolved: a group VK request
 	// picked + injected a candidate account. EventProxyGroupRouteDegraded: no
 	// usable candidate (no material / all expired-exhausted / key unavailable) →

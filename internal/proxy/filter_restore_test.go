@@ -17,10 +17,17 @@ import (
 	"github.com/AiKeyLabs/aikey-proxy/internal/apphook"
 )
 
+// P1 (2026-08-08) replaced the Chinese/full-width label with the ASCII template
+// form `{{ADDR}}` / `{{ADDR_1}}` (方案 §3.1: LLMs translate "{{ADDR_1}}"
+// into English and lose it; `{{…}}` is Jinja/Handlebars syntax the models have a
+// strong "keep verbatim" prior for). The values below track planner.NewLabel on
+// the detector side — that is the ONLY thing that changed in these tests; every
+// assertion about span alignment, cross-piece numbering, cache replay, leak-free
+// forwarding and JSON fidelity is unchanged.
 const (
-	tAddrToken  = "[地址(已隐藏)]"
-	tAddrPrefix = "[地址#"
-	tAddrSuffix = "(已隐藏)]"
+	tAddrToken  = "{{ADDR}}"
+	tAddrPrefix = "{{ADDR_"
+	tAddrSuffix = "}}"
 )
 
 func addrRestorable(head string, addrs ...string) apphook.RestorableMask {
@@ -55,11 +62,11 @@ func TestRenumberRestorables_SequentialLabelsAndMapping(t *testing.T) {
 	st := newMaskRestore()
 	got := renumberRestorables(head, masked, []apphook.RestorableMask{addrRestorable(head, a1, a2)}, st, discardLogger())
 
-	want := "收货：[地址#1(已隐藏)]；备用：[地址#2(已隐藏)]"
+	want := "收货：{{ADDR_1}}；备用：{{ADDR_2}}"
 	if got != want {
 		t.Fatalf("renumbered = %q, want %q", got, want)
 	}
-	if st.entries["[地址#1(已隐藏)]"] != a1 || st.entries["[地址#2(已隐藏)]"] != a2 {
+	if st.entries["{{ADDR_1}}"] != a1 || st.entries["{{ADDR_2}}"] != a2 {
 		t.Fatalf("mapping wrong: %v", st.entries)
 	}
 }
@@ -72,10 +79,10 @@ func TestRenumberRestorables_ContinuesAcrossPieces(t *testing.T) {
 	h2 := "第二条：" + a2
 	out1 := renumberRestorables(h1, maskAddrs(h1, a1), []apphook.RestorableMask{addrRestorable(h1, a1)}, st, discardLogger())
 	out2 := renumberRestorables(h2, maskAddrs(h2, a2), []apphook.RestorableMask{addrRestorable(h2, a2)}, st, discardLogger())
-	if !strings.Contains(out1, "[地址#1(已隐藏)]") || !strings.Contains(out2, "[地址#2(已隐藏)]") {
+	if !strings.Contains(out1, "{{ADDR_1}}") || !strings.Contains(out2, "{{ADDR_2}}") {
 		t.Fatalf("cross-piece numbering broken: %q / %q", out1, out2)
 	}
-	if st.entries["[地址#2(已隐藏)]"] != a2 {
+	if st.entries["{{ADDR_2}}"] != a2 {
 		t.Fatalf("mapping wrong: %v", st.entries)
 	}
 }
@@ -145,7 +152,7 @@ func TestApplyInboundFilter_RestorableMaskEndToEnd(t *testing.T) {
 	r := newReq(body)
 	w := httptest.NewRecorder()
 
-	if proceed := p.applyInboundFilter(w, r, "m", "personal", "", "", "", "", discardLogger()); !proceed {
+	if proceed := p.applyInboundFilter(w, r, "m", "personal", "", "", "", "", "", discardLogger()); !proceed {
 		t.Fatal("expected proceed")
 	}
 	forwarded := readReqBody(t, r)
@@ -153,7 +160,7 @@ func TestApplyInboundFilter_RestorableMaskEndToEnd(t *testing.T) {
 	if strings.Contains(forwarded, a1) || strings.Contains(forwarded, a2) {
 		t.Fatalf("raw address leaked to upstream body: %s", forwarded)
 	}
-	if !strings.Contains(forwarded, "[地址#1(已隐藏)]") || !strings.Contains(forwarded, "[地址#2(已隐藏)]") {
+	if !strings.Contains(forwarded, "{{ADDR_1}}") || !strings.Contains(forwarded, "{{ADDR_2}}") {
 		t.Fatalf("numbered labels missing: %s", forwarded)
 	}
 	// Mapping hangs on the request context for the response leg.
@@ -161,15 +168,15 @@ func TestApplyInboundFilter_RestorableMaskEndToEnd(t *testing.T) {
 	if st == nil {
 		t.Fatal("restore state missing from request context")
 	}
-	if st.entries["[地址#1(已隐藏)]"] != a1 || st.entries["[地址#2(已隐藏)]"] != a2 {
+	if st.entries["{{ADDR_1}}"] != a1 || st.entries["{{ADDR_2}}"] != a2 {
 		t.Fatalf("context mapping wrong: %v", st.entries)
 	}
 
 	// 响应侧 (non-streaming): the LLM echoes both labels → restored to originals.
-	respBody := []byte(`{"id":"msg_1","content":[{"type":"text","text":"好的，会送到[地址#1(已隐藏)]，发票寄[地址#2(已隐藏)]。"}],"usage":{"input_tokens":10,"output_tokens":20}}`)
+	respBody := []byte(`{"id":"msg_1","content":[{"type":"text","text":"好的，会送到{{ADDR_1}}，发票寄{{ADDR_2}}。"}],"usage":{"input_tokens":10,"output_tokens":20}}`)
 	restored := restoreMaskedResponseBody(r.Context(), respBody, discardLogger())
 	s := string(restored)
-	if !strings.Contains(s, a1) || !strings.Contains(s, a2) || strings.Contains(s, "[地址#") {
+	if !strings.Contains(s, a1) || !strings.Contains(s, a2) || strings.Contains(s, "{{ADDR") {
 		t.Fatalf("response restore failed: %s", s)
 	}
 	var parsed map[string]any
@@ -191,24 +198,24 @@ func TestApplyInboundFilter_CacheReplayRebuildsMapping(t *testing.T) {
 	body := `{"model":"m","messages":[{"role":"user","content":"合同请寄` + a1 + `"}]}`
 
 	r1 := newReq(body)
-	if !p.applyInboundFilter(httptest.NewRecorder(), r1, "m", "personal", "", "", "", "", discardLogger()) {
+	if !p.applyInboundFilter(httptest.NewRecorder(), r1, "m", "personal", "", "", "", "", "", discardLogger()) {
 		t.Fatal("req1: expected proceed")
 	}
 	if hook.called != 1 {
 		t.Fatalf("req1 detector calls = %d, want 1", hook.called)
 	}
 	r2 := newReq(body)
-	if !p.applyInboundFilter(httptest.NewRecorder(), r2, "m", "personal", "", "", "", "", discardLogger()) {
+	if !p.applyInboundFilter(httptest.NewRecorder(), r2, "m", "personal", "", "", "", "", "", discardLogger()) {
 		t.Fatal("req2: expected proceed")
 	}
 	if hook.called != 1 {
 		t.Fatalf("req2 must be served from cache; detector calls = %d", hook.called)
 	}
-	if got := readReqBody(t, r2); !strings.Contains(got, "[地址#1(已隐藏)]") || strings.Contains(got, a1) {
+	if got := readReqBody(t, r2); !strings.Contains(got, "{{ADDR_1}}") || strings.Contains(got, a1) {
 		t.Fatalf("cache-replayed request not renumbered: %s", got)
 	}
 	st := maskRestoreFromContext(r2.Context())
-	if st == nil || st.entries["[地址#1(已隐藏)]"] != a1 {
+	if st == nil || st.entries["{{ADDR_1}}"] != a1 {
 		t.Fatalf("cache replay lost the mapping: %+v", st)
 	}
 }
@@ -226,8 +233,8 @@ func restoreStateCtx(labels map[string]string) context.Context {
 // A provider that \u-escapes CJK must still restore — decoding the JSON tree
 // (not raw byte replace) is what makes escaped placeholders reachable.
 func TestRestoreMaskedResponseBody_UnicodeEscapedPlaceholder(t *testing.T) {
-	ctx := restoreStateCtx(map[string]string{"[地址#1(已隐藏)]": "北京市海淀区中关村1号"})
-	body := []byte(`{"choices":[{"message":{"content":"地址是[地址#1(已隐藏)]"}}]}`)
+	ctx := restoreStateCtx(map[string]string{"{{ADDR_1}}": "北京市海淀区中关村1号"})
+	body := []byte(`{"choices":[{"message":{"content":"地址是{{ADDR_1}}"}}]}`)
 	got := string(restoreMaskedResponseBody(ctx, body, discardLogger()))
 	if !strings.Contains(got, "北京市海淀区中关村1号") {
 		t.Fatalf("escaped placeholder not restored: %s", got)
@@ -236,7 +243,7 @@ func TestRestoreMaskedResponseBody_UnicodeEscapedPlaceholder(t *testing.T) {
 
 // 无占位符时零改动直通 (non-streaming): the upstream bytes are forwarded verbatim.
 func TestRestoreMaskedResponseBody_NoPlaceholderPassthrough(t *testing.T) {
-	ctx := restoreStateCtx(map[string]string{"[地址#1(已隐藏)]": "x"})
+	ctx := restoreStateCtx(map[string]string{"{{ADDR_1}}": "x"})
 	body := []byte(`{"content":[{"type":"text","text":"plain answer"}],"n":1.25}`)
 	if got := restoreMaskedResponseBody(ctx, body, discardLogger()); string(got) != string(body) {
 		t.Fatalf("placeholder-free body must pass through byte-identical:\n got %s\nwant %s", got, body)
@@ -244,7 +251,7 @@ func TestRestoreMaskedResponseBody_NoPlaceholderPassthrough(t *testing.T) {
 }
 
 func TestRestoreMaskedResponseBody_NonJSONFailOpen(t *testing.T) {
-	ctx := restoreStateCtx(map[string]string{"[地址#1(已隐藏)]": "x"})
+	ctx := restoreStateCtx(map[string]string{"{{ADDR_1}}": "x"})
 	body := []byte("not json at all")
 	if got := restoreMaskedResponseBody(ctx, body, discardLogger()); string(got) != string(body) {
 		t.Fatalf("non-JSON body must be untouched: %s", got)
@@ -254,8 +261,8 @@ func TestRestoreMaskedResponseBody_NonJSONFailOpen(t *testing.T) {
 // Number fidelity: large ints / high-precision decimals must survive the
 // decode-walk-encode round trip (json.Number, not float64).
 func TestRestoreMaskedResponseBody_NumberFidelity(t *testing.T) {
-	ctx := restoreStateCtx(map[string]string{"[地址#1(已隐藏)]": "天津市和平区4号"})
-	body := []byte(`{"big":9007199254740993,"text":"[地址#1(已隐藏)]"}`)
+	ctx := restoreStateCtx(map[string]string{"{{ADDR_1}}": "天津市和平区4号"})
+	body := []byte(`{"big":9007199254740993,"text":"{{ADDR_1}}"}`)
 	got := string(restoreMaskedResponseBody(ctx, body, discardLogger()))
 	if !strings.Contains(got, "9007199254740993") {
 		t.Fatalf("int64 precision lost: %s", got)

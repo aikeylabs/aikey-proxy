@@ -251,6 +251,15 @@ type Proxy struct {
 	lastMapApplyNano atomic.Int64
 	lastMapMissNano  atomic.Int64
 	lastMapMiss      atomic.Pointer[mapMissRecord]
+	// maskFidelity is the compliance placeholder 保真率 signal (方案 20260808
+	// §3.2 L3): how many mask placeholders this process put into forwarded
+	// prompts vs how many came back from the models intact enough to restore.
+	// A falling ratio is the ONLY way to notice that some model started
+	// rewriting/dropping `{{ADDR_1}}`-style placeholders — the request itself
+	// succeeds either way, so nothing else in the system would report it.
+	// Read-only surface: /v1/diagnostics/pipeline (see maskRestoreHealth).
+	// Counts only — never a label, a code or any masked content.
+	maskFidelity     maskFidelity
 	loadedControlSeq int64 // vault change_seq loaded at generation build time
 	// Configurable slow-request thresholds (milliseconds).
 	SlowRequestMs     int64
@@ -291,6 +300,12 @@ type Proxy struct {
 	// it always full-scans (+ optional content-hash cache below). Field/setter/env
 	// retained only until the systemd units drop AIKEY_PROXY_FILTER_INCREMENTAL_SCAN.
 	filterIncremental bool
+	// filterScanRoles is the message-role allow-list the inbound filter scans
+	// (P4, 方案 §3.4). nil = defaultScanRoles ({user, assistant}) so a Proxy built
+	// without explicit configuration is already correct — the setter only exists
+	// for operators who need to widen (tool/function) or narrow it. See
+	// scanRoleSet in filter_content.go for the fail-safe semantics.
+	filterScanRoles scanRoleSet
 }
 
 // SetTransport sets a custom RoundTripper for outbound requests to AI providers.
@@ -570,6 +585,24 @@ func (p *Proxy) SetFilterHook(h apphook.Hook) {
 func (p *Proxy) SetFilterIncrementalScan(on bool) {
 	p.filterIncremental = on
 }
+
+// SetFilterScanRoles configures which message roles the inbound compliance
+// filter scans (方案 §3.4). Called once at generation build by the supervisor
+// from AIKEY_PROXY_FILTER_SCAN_ROLES; unset leaves the default {user, assistant}.
+//
+// Returns the roles actually applied plus the rejected (unrecognized) names so
+// the caller can WARN — an operator typo must be visible, not silently dropped
+// (日志规范). An input with no recognized role at all keeps the DEFAULT rather
+// than scanning nothing: a misconfiguration must never disable masking.
+func (p *Proxy) SetFilterScanRoles(roles []string) (applied, rejected []string) {
+	set, rejected := newScanRoleSet(roles)
+	p.filterScanRoles = set
+	return set.list(), rejected
+}
+
+// FilterScanRoles returns the effective scan-role policy (sorted), for status
+// reporting and diagnostics.
+func (p *Proxy) FilterScanRoles() []string { return p.filterScanRoles.list() }
 
 // SetFilterCache installs (or clears, with nil) the per-piece content-hash cache
 // used by the inbound filter. nil = cache OFF (dispatcher does no hashing →

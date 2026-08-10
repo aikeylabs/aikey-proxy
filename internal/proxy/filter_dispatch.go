@@ -81,6 +81,17 @@ func capRuneBoundary(s string, limit int) int {
 // (deep-link to the conversation thread) AND it is the content cache's level-1
 // isolation scope (cacheScope). Both must stay the same value — a support
 // engineer correlating an audit event with cache behaviour relies on it.
+//
+// traceID is THIS TURN's W3C trace id — the SAME value the conversation-audit
+// observer stores as conversation_records.event_id (both read it off the one
+// *observer.RequestContext the request built; see traceIDForAudit at the call
+// site). It is the only key that joins a compliance event back to the exact
+// conversation turn: the compliance event_id is minted independently inside the
+// detector child (newEventID(), its own CSPRNG) and joins NOTHING. Empty when
+// no observer context exists (no observers active) — then there is no
+// conversation record to join to either, so an empty key is the honest answer
+// rather than a freshly minted id that would join to nothing.
+// (2026-08-09 F1a cross-audit key, decision A.)
 func (p *Proxy) applyInboundFilter(
 	w http.ResponseWriter,
 	r *http.Request,
@@ -90,6 +101,7 @@ func (p *Proxy) applyInboundFilter(
 	virtualKeyID string,
 	seatID string,
 	sessionID string,
+	traceID string,
 	logger *slog.Logger,
 ) (proceed bool) {
 	hook := p.filterHook
@@ -170,7 +182,14 @@ func (p *Proxy) applyInboundFilter(
 	// 骤降到"用户那几条短消息",避免大 agent prompt 全量扫超时 fail-open(2026-06-16
 	// 活体:扫 22 片段→9 片段超时漏 + 4.8s 延迟)。
 	// AIKEY_PROXY_FILTER_INCREMENTAL_SCAN 废弃;content-hash 缓存见设计 §4(第二步)。
-	pieces, parsed, ok := extractUserContent(bodyBytes)
+	//
+	// 2026-08-08 P4(占位符还原方案 §3.4):"跳过 assistant"这条前提被**响应侧还原**
+	// 推翻 —— 还原发生在回客户端之前,客户端历史里存的是原文,下一轮该原文以 assistant
+	// 身份重发;跳过 assistant = 原文明文随历史回到上游,mask 只在首轮有效。所以扫描
+	// 角色改为**可配置的 scanRoleSet(默认 user+assistant)**;system 仍不扫(mask
+	// admin 指令会污染 agent)。片段数上升由 content-hash 缓存吸收 —— assistant 历史
+	// 跨轮逐字不变,命中率与 user 历史同级(实测见实施计划 P4 测量记录)。
+	pieces, parsed, ok := extractUserContent(bodyBytes, p.filterScanRoles)
 	incremental := false // 历史漏扫修复后恒为 false(不再切到 latest-turn-only)
 	if !ok || len(pieces) == 0 {
 		r.Body = io.NopCloser(bytes.NewReader(bodyBytes))
@@ -341,10 +360,23 @@ func (p *Proxy) applyInboundFilter(
 			// alias (2026-07-08, mirrors the conversation-audit seat fix).
 			// session_id: the conversation session (resolveSessionID, the SAME
 			// source the conversation-audit observer uses), so the compliance
-			// audit drawer can deep-link to the exact conversation turn for this
-			// flagged prompt — event_id joins the turn, session_id opens its
-			// thread (2026-07-08 cross-audit link, decision 2a).
-			teamEvents = append(teamEvents, injectSession(injectSeat(injectVirtualKey(injectTenant(resp.Event, orgID), virtualKeyID), seatID), sessionID))
+			// audit drawer can open the conversation THREAD this flagged prompt
+			// belongs to (2026-07-08 cross-audit link, decision 2a).
+			//
+			// trace_id: THIS TURN's trace id — the key that joins to the single
+			// conversation_records row for this turn.
+			//
+			// 🔴 Correction (2026-08-09, F1a): the comment that used to sit here
+			// claimed "event_id joins the turn". It never did. The compliance
+			// event_id is generated inside the detector CHILD PROCESS by its own
+			// newEventID() CSPRNG (cmd/detector/main.go), while a conversation
+			// turn's event_id is the proxy's W3C trace id. Two unrelated id
+			// spaces — so the audit page's `?event=` deep link, added 2026-07-08
+			// on the strength of that wrong comment, has been dead code that
+			// matched nothing ever since. trace_id is the real join key, and it
+			// is stamped HERE (per-piece loop) so all N events a single turn
+			// produces carry the SAME value → N:1 events-to-turn.
+			teamEvents = append(teamEvents, injectTraceID(injectSession(injectSeat(injectVirtualKey(injectTenant(resp.Event, orgID), virtualKeyID), seatID), sessionID), traceID))
 		}
 
 		switch resp.Action {
@@ -375,13 +407,18 @@ func (p *Proxy) applyInboundFilter(
 			}
 			masked := string(m)
 			// B3 restorable masks: renumber the detector's numberless token into
-			// per-request labels ([地址#N(已隐藏)]) and record label→original in
+			// per-request labels ({{ADDR_N}}) and record label→original in
 			// the request's restore state (consumed by the response leg). Runs for
 			// both fresh Detects and cache replays (numbering is request-scoped).
 			// Zero cost when the mask carries no restorables (the usual case).
 			if len(resp.Restorables) > 0 {
 				if restoreState == nil {
 					restoreState = newMaskRestore()
+					// Hand the state the process-wide fidelity counters so the
+					// request leg's "issued" and the response leg's "restored"
+					// land in ONE place without a per-request lifecycle hook
+					// (方案 §3.2 L3 保真率指标). Counts only.
+					restoreState.fid = &p.maskFidelity
 				}
 				masked = renumberRestorables(head, masked, resp.Restorables, restoreState, logger)
 			}
@@ -562,10 +599,15 @@ func injectSeat(eventJSON []byte, seatID string) []byte {
 
 // injectSession stamps the conversation session_id onto the team event JSON —
 // resolved by resolveSessionID, the SAME source the conversation-audit observer
-// uses, so the compliance audit drawer can deep-link to the exact conversation
-// thread (event_id joins the turn; session_id opens its thread). Empty session
-// (no session header — e.g. codex, which the conversation-audit UI keys by
-// event_id instead) → unchanged, same fail-safe as injectSeat. (2026-07-08.)
+// uses, so the compliance audit drawer can open the conversation THREAD a
+// flagged prompt belongs to. Empty session (no session header — e.g. codex,
+// which the conversation-audit UI keys by trace id instead) → unchanged, same
+// fail-safe as injectSeat. (2026-07-08.)
+//
+// 🔴 Correction (2026-08-09, F1a): this comment used to read "event_id joins
+// the turn; session_id opens its thread". The first half was never true — see
+// injectTraceID for why the compliance event_id joins nothing, and which field
+// actually does.
 func injectSession(eventJSON []byte, sessionID string) []byte {
 	if sessionID == "" {
 		return eventJSON
@@ -579,6 +621,58 @@ func injectSession(eventJSON []byte, sessionID string) []byte {
 		return eventJSON
 	}
 	m["session_id"] = q
+	out, err := json.Marshal(m)
+	if err != nil {
+		return eventJSON
+	}
+	return out
+}
+
+// injectTraceID stamps THIS TURN's W3C trace id onto the team event JSON. It is
+// the join key from a compliance event to the one conversation_records row for
+// the same turn, which is what lets the compliance-audit page show the prompt
+// as the user actually typed it (pre-mask) behind an "eye" control.
+//
+// WHY a new field instead of reusing event_id (the 2026-08-09 F1a decision):
+// the two id spaces are unrelated and always have been.
+//
+//   - compliance event_id — minted in the DETECTOR CHILD PROCESS by its own
+//     newEventID() CSPRNG. The proxy never sees it before the detector returns.
+//   - conversation event_id — the proxy's per-request W3C trace id, stored by
+//     the conversation-audit observer as ConversationRecord.EventID.
+//
+// So `compliance_events.event_id = conversation_records.event_id` matches
+// nothing, and the audit page's `?event=` deep link built on that assumption
+// has been dead since it shipped. trace_id is the key that actually joins.
+//
+// CARDINALITY: one turn produces N compliance events (one per flagged content
+// piece — the caller appends inside the per-piece loop) but exactly ONE
+// conversation record. All N share this trace id, so the relationship is N:1
+// and the join must be read in that direction.
+//
+// PRIVACY (DC5 / 方案 §6 不变量 #1 unaffected): this is a correlation id, not
+// content. No prompt text is added to the upload by this function, and the
+// original text still never leaves the user's box — the master stores the key
+// only, and the raw turn stays wherever conversation_records lives. The three
+// existing guards (content-free intake wire + DisallowUnknownFields at master,
+// the detector's local-only ContextSnippet, the proxy not persisting bodies)
+// all keep holding.
+//
+// Empty trace (no observer context on the route → no conversation record to
+// join to anyway) → unchanged, same fail-safe as injectSeat/injectSession.
+func injectTraceID(eventJSON []byte, traceID string) []byte {
+	if traceID == "" {
+		return eventJSON
+	}
+	var m map[string]json.RawMessage
+	if err := json.Unmarshal(eventJSON, &m); err != nil {
+		return eventJSON
+	}
+	q, err := json.Marshal(traceID)
+	if err != nil {
+		return eventJSON
+	}
+	m["trace_id"] = q
 	out, err := json.Marshal(m)
 	if err != nil {
 		return eventJSON

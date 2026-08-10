@@ -33,7 +33,7 @@ func TestFilterCache_PerfDetectCallReduction(t *testing.T) {
 			r := newReq(`{"messages":[` + strings.Join(parts, ",") + `]}`)
 			r.Header.Set("X-Claude-Code-Session-Id", "perf-sess") // 固定 session → 命中同一桶
 			p.applyInboundFilter(httptest.NewRecorder(), r, "m", "personal", "", "", "",
-				resolveSessionID(r, "anthropic", "anthropic"), discardLogger())
+				resolveSessionID(r, "anthropic", "anthropic"), "", discardLogger())
 		}
 		return hook.called
 	}
@@ -79,7 +79,7 @@ func TestFilterCache_LoopCoversAllNotJustTail(t *testing.T) {
 	r := newReq(`{"messages":[` + strings.Join(parts, ",") + `]}`)
 	r.Header.Set("X-Claude-Code-Session-Id", "loop-cover-sess")
 	p.applyInboundFilter(httptest.NewRecorder(), r, "m", "personal", "", "", "",
-		resolveSessionID(r, "anthropic", "anthropic"), discardLogger())
+		resolveSessionID(r, "anthropic", "anthropic"), "", discardLogger())
 
 	body := readReqBody(t, r)
 	if strings.Contains(body, "SECRET-at-the-very-first-turn") {
@@ -108,13 +108,13 @@ func BenchmarkFilterCache_FullStorageWarmTurn(b *testing.B) {
 	warm := newReq(body)
 	warm.Header.Set("X-Claude-Code-Session-Id", "bench-sess")
 	p.applyInboundFilter(httptest.NewRecorder(), warm, "m", "personal", "", "", "",
-		resolveSessionID(warm, "anthropic", "anthropic"), discardLogger())
+		resolveSessionID(warm, "anthropic", "anthropic"), "", discardLogger())
 
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
 		r := newReq(body)
 		r.Header.Set("X-Claude-Code-Session-Id", "bench-sess")
 		p.applyInboundFilter(httptest.NewRecorder(), r, "m", "personal", "", "", "",
-			resolveSessionID(r, "anthropic", "anthropic"), discardLogger())
+			resolveSessionID(r, "anthropic", "anthropic"), "", discardLogger())
 	}
 }

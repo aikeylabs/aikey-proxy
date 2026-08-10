@@ -1,6 +1,6 @@
 // sse_restore.go — B3 streaming placeholder restoration (SSE 滑窗跨 chunk 还原).
 //
-// Restores numbered mask placeholders (e.g. "[地址#1(已隐藏)]") back to the
+// Restores numbered mask placeholders (e.g. "{{ADDR_1}}") back to the
 // user's original text inside a streaming LLM response. This is the streaming
 // half of the ONLY sanctioned response-direction rewrite (spec 2026-06-04
 // 合规过滤方向 规则 2 唯一例外); the non-streaming half is
@@ -25,11 +25,13 @@
 //     is flushed FIRST as a synthesized text-delta frame cloned from the last
 //     text frame (same index/框架 → SSE 帧结构与事件顺序保持合法), so the
 //     client receives every byte in order before the boundary event.
-//   - Recognized text channels: Anthropic content_block_delta text/thinking
-//     deltas and OpenAI chat-completions choices.0.delta.content. Frames of any
+//   - Recognized text channels: Anthropic content_block_delta text_delta and
+//     OpenAI chat-completions choices.0.delta.content. Frames of any
 //     other shape pass through byte-verbatim (with a carry flush before them);
 //     placeholders split across frames of unrecognized shapes are NOT restored
 //     (fail-open: the client sees the placeholder — degraded, never corrupted).
+//     REASONING channels (Anthropic thinking_delta, and every OpenAI-side
+//     equivalent) are excluded ON PURPOSE — see sseTextFieldPath (S3).
 //
 // Placement: wrapped OUTSIDE the streamDrainer (client-facing side only), so
 // token extraction and the conversation-audit observer keep seeing the MASKED
@@ -268,19 +270,32 @@ func frameLineTerminator(line []byte) []byte {
 }
 
 // sseTextFieldPath recognizes the streamed text channel of a data payload.
-// Anthropic: content_block_delta text/thinking deltas. OpenAI chat completions:
+// Anthropic: content_block_delta text_delta. OpenAI chat completions:
 // choices.0.delta.content. Empty string = not a text frame (pass through; a
 // per-frame generic restore is deliberately NOT attempted for unknown shapes —
 // without a known channel there is no sound cross-frame holdback, and a
 // half-restored split placeholder is worse than an intact one).
+//
+// 🔴 `thinking_delta` is NOT a restore channel (S3, 用户拍板 2026-08-09) — it was
+// one until this change. Restoring the streamed thinking put the ORIGINAL text
+// into the client's history inside a `thinking` block, which the request leg may
+// never rewrite (its `signature` is verified upstream), so the next turn shipped
+// the sensitive original to the LLM in plaintext. Full reasoning, and the
+// non-streaming half of the same rule, live on reasoningBlockTypes in
+// filter_restore.go. Thinking frames now fall through as ordinary non-text
+// frames: pending carry is flushed before them and their bytes go out verbatim.
+//
+// The other reasoning channels need no case here because none was ever
+// recognized: Anthropic `signature_delta`, OpenAI Responses
+// `response.reasoning_summary_text.delta` (its payload `type` is not
+// content_block_delta and it has no choices[]), and chat-completions
+// `choices.0.delta.reasoning_content` (a sibling of the `content` field this
+// looks up) all already pass through untouched.
 func sseTextFieldPath(payload []byte) string {
 	switch gjson.GetBytes(payload, "type").String() {
 	case "content_block_delta":
-		switch gjson.GetBytes(payload, "delta.type").String() {
-		case "text_delta":
+		if gjson.GetBytes(payload, "delta.type").String() == "text_delta" {
 			return "delta.text"
-		case "thinking_delta":
-			return "delta.thinking"
 		}
 		return ""
 	}
