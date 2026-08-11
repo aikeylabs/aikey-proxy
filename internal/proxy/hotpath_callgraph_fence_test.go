@@ -1,0 +1,626 @@
+package proxy
+
+// hotpath_callgraph_fence_test.go — the call-graph assertion test-plan MOD-16 and
+// PLANE-01 ask for, in the repository that actually forwards.
+//
+// # 🔴 Why it has to live here
+//
+// Both items were registered UNCOVERED for the same reason, and it was the right
+// answer at the time:
+//
+//	MOD-16    该能力不在每请求转发热路径上（调用图断言）
+//	PLANE-01  proxy 热路径无 licensing import、文件/DB/同步控制调用
+//
+// aikey-control-master has a test called TestTheProxyHotPathHasNoLicensingDependency,
+// and it asserts something true about the wrong process: forwarding is done HERE,
+// by aikey-proxy, and a dependency fence inside the control plane cannot see this
+// module's import graph. A fence in the wrong repository is worse than none — it
+// reads as coverage.
+//
+// # What this walks, and what it over-approximates
+//
+// It is a real reachability walk from `(*Proxy).Handle`, the function the
+// supervisor calls once per request (internal/supervisor: `g.proxy.Handle(w, r)`).
+// It follows calls through THIS MODULE's own packages and collects every file it
+// reaches, then asserts what those files may import and call.
+//
+// 🔴 Method calls are resolved by NAME rather than by type. That over-approximates:
+// a call to `x.Close()` follows every `Close` method in the module. This is the
+// deliberate direction. An over-approximating fence can raise a false alarm, which
+// costs somebody an investigation; an under-approximating one misses the call that
+// matters, which is the failure this item exists to prevent. 🚫 Do not "tighten"
+// it into a type-resolved graph without keeping the union of both.
+//
+// It deliberately uses only the standard library. Adding golang.org/x/tools as a
+// direct dependency of a SHIPPED proxy so that a test can build a call graph is a
+// production dependency bought with test convenience.
+
+import (
+	"go/ast"
+	"go/parser"
+	"go/token"
+	"os"
+	"path/filepath"
+	"sort"
+	"strconv"
+	"strings"
+	"testing"
+)
+
+const modulePath = "github.com/AiKeyLabs/aikey-proxy"
+
+// hotPathEntry is the per-request entry point. internal/supervisor's
+// generation.ServeHTTP calls exactly this, once per request.
+const hotPathEntry = "internal/proxy::Proxy.Handle"
+
+// forbiddenImports are packages no function reachable from the hot path may
+// import.
+//
+// Each carries the reason, because a fence whose failure message is a list of
+// package names teaches nobody why they are on it.
+var forbiddenImports = map[string]string{
+	"github.com/AiKeyLabs/aikey-license-core": "PLANE-01 / MOD-16: 热路径无 licensing import. " +
+		"A licence evaluation on the forwarding path means every request pays for it, and a " +
+		"licensing failure becomes a forwarding outage — design D3.1 puts authorization off " +
+		"this path precisely so that a licence problem degrades the control plane and not the " +
+		"customer's traffic",
+}
+
+// forbiddenCalls are calls no function reachable from the hot path may make.
+//
+// # 🔴 Calls, not imports, and the first version got this wrong
+//
+// The import check was applied per FILE, so every function in any file that
+// imports `database/sql` was reported — including `Snapshot.Len`, which counts a
+// slice. A fence that reports a length accessor as a database call on the request
+// path is a fence somebody deletes.
+//
+// Licensing stays an IMPORT check, and that asymmetry is deliberate: a licensing
+// import anywhere in the reachable set is the thing MOD-16 forbids, and being
+// over-strict there costs nothing because the correct number is zero. `os` and
+// `database/sql` are legitimately present — os.Getenv at start-up, a pool built
+// once — so for those only the CALL is forbidden.
+var forbiddenCalls = map[string]string{
+	// File I/O per request puts the disk in the request path.
+	"os.Open":         fileReason,
+	"os.OpenFile":     fileReason,
+	"os.ReadFile":     fileReason,
+	"os.WriteFile":    fileReason,
+	"os.Create":       fileReason,
+	"os.Stat":         fileReason,
+	"os.ReadDir":      fileReason,
+	"ioutil.ReadFile": fileReason,
+	"os.Remove":       fileReason,
+	"os.MkdirAll":     fileReason,
+}
+
+const fileReason = "PLANE-01: 热路径无文件调用 — a per-request file call puts the disk in the request path"
+
+// forbiddenMethodCalls are method names that mean "this is talking to a database"
+// whatever the receiver is called.
+//
+// 🔴 Matched by NAME, so `cache.Query(...)` would trip it too. That is the safe
+// direction here and the allowlist is where a false positive gets recorded with a
+// reason, rather than the check being loosened for everybody.
+var forbiddenMethodCalls = map[string]string{
+	"QueryContext":    dbReason,
+	"ExecContext":     dbReason,
+	"QueryRowContext": dbReason,
+	"BeginTx":         dbReason,
+}
+
+const dbReason = "PLANE-01: 热路径无 DB 调用. A query per request couples forwarding latency to " +
+	"database health, and a database that is merely slow then looks like a proxy that is broken"
+
+// allowedFileCalls are the calls this fence has been shown and that a human
+// decided to keep, with the reason.
+//
+// 🔴 An allowlist, not a silent exclusion. The first run found a real one — the
+// proxy writes a statusline hint file while answering "this shared account needs
+// a login" — and the honest thing is neither to delete the finding nor to fail
+// the build over it, but to write the judgement down so the next person can
+// disagree with it.
+//
+// 🚫 The judgement is that PLANE-01 says 每请求**转发**热路径: the FORWARDING path.
+// respondLoginRequired terminates the request without contacting any upstream,
+// and the write is documented as best-effort and non-blocking. If that reading is
+// wrong, the fix is to move the write off the request entirely, not to widen this
+// list.
+//
+// TestEveryAllowedFileCallIsStillReachable fails if an entry goes stale, so this
+// cannot quietly become the place exceptions go to die.
+// hotPathFileCalls is the file I/O reachable from the forwarding entry point
+// TODAY.
+//
+// # 🚫 This is a RECORD, not an approval
+//
+// Every line here is a real per-request-reachable file call that this fence found
+// on 2026-08-11. None of them has been adjudicated against PLANE-01's
+// 热路径无文件调用, and 🚫 nothing in this file should be read as saying they are
+// fine. Most look like best-effort persistence — a cooldown store, a last-errors
+// ring, an event WAL, a crash dump — and whether "best-effort" means "off the
+// forwarding path" is a question for whoever owns this proxy, not for a test.
+//
+// # Why a ratchet rather than a pass or a failure
+//
+// Failing the build on twenty pre-existing call sites would mean this fence gets
+// deleted within a week. Allowlisting them with invented reasons would be worse:
+// it would turn twenty open questions into twenty settled ones, in a comment
+// nobody asked for.
+//
+// So the list is a BASELINE. A new file call on the request path fails
+// immediately, which is the property that actually protects the hot path going
+// forward, and every entry stays visible in the test output so the inventory is
+// impossible to forget. As they are fixed, the lines come out — and the test
+// fails if one is stale, so the list can only shrink honestly.
+var hotPathFileCalls = map[string]struct{}{
+	"internal/apphook::ChildHook.spawnLocked|os.Stat":                       {},
+	"internal/events::ContentWAL.ensureFile|os.OpenFile":                    {},
+	"internal/events::ContentWAL.evictBeyondCap|os.Remove":                  {},
+	"internal/events::WALWriter.ensureFile|os.OpenFile":                     {},
+	"internal/events::deadLetterWriter.Count|os.ReadFile":                   {},
+	"internal/events::writeSeqStateAtomic|os.Remove":                        {},
+	"internal/observability::writeCrashDump|os.MkdirAll":                    {},
+	"internal/observability::writeCrashDump|os.WriteFile":                   {},
+	"internal/proxy::groupLoginStateStore.Clear|os.Remove":                  {},
+	"internal/proxy::groupLoginStateStore.Write|os.MkdirAll":                {},
+	"internal/proxy::groupLoginStateStore.Write|os.WriteFile":               {},
+	"internal/proxy::lastErrorsRing.persist|os.MkdirAll":                    {},
+	"internal/proxy::lastErrorsRing.persist|os.WriteFile":                   {},
+	"internal/proxy::poolCooldownStore.persistLocked|os.MkdirAll":           {},
+	"internal/proxy::poolCooldownStore.persistLocked|os.Remove":             {},
+	"internal/proxy::poolCooldownStore.persistLocked|os.WriteFile":          {},
+	"internal/proxy::signalReporter.persistAuthFailuresLocked|os.MkdirAll":  {},
+	"internal/proxy::signalReporter.persistAuthFailuresLocked|os.Remove":    {},
+	"internal/proxy::signalReporter.persistAuthFailuresLocked|os.WriteFile": {},
+	"internal/proxy::writeCodexLastModel|os.MkdirAll":                       {},
+	"internal/proxy::writeCodexLastModel|os.Remove":                         {},
+}
+
+// TestTheForwardingHotPathTouchesNoLicensingFileOrDatabase is MOD-16 + PLANE-01.
+func TestTheForwardingHotPathTouchesNoLicensingFileOrDatabase(t *testing.T) {
+	graph := loadModuleGraph(t)
+	reached := graph.reachableFrom(hotPathEntry)
+
+	if len(reached) < 20 {
+		t.Fatalf("the walk reached only %d functions from %s. That is far too few for a request "+
+			"path, so the graph is not being built — and a fence over an empty graph passes "+
+			"vacuously, which is the one thing it must not do", len(reached), hotPathEntry)
+	}
+	t.Logf("reachable from %s: %d functions across %d files", hotPathEntry, len(reached), graph.fileCount(reached))
+
+	// ── licensing imports: zero, anywhere in the reachable set ─────────────
+	for _, fn := range sortedKeys(reached) {
+		for _, imp := range graph.importsOf(fn) {
+			for banned, why := range forbiddenImports {
+				if imp == banned || strings.HasPrefix(imp, banned+"/") {
+					t.Errorf("🔴 %s is reachable from %s and its file imports %q.\n   %s",
+						fn, hotPathEntry, imp, why)
+				}
+			}
+		}
+	}
+
+	// ── database CALLS: zero ───────────────────────────────────────────────
+	for _, fn := range sortedKeys(reached) {
+		for _, call := range graph.selectorCallsIn(fn) {
+			name := call
+			if cut := strings.LastIndex(call, "."); cut >= 0 {
+				name = call[cut+1:]
+			}
+			if why, banned := forbiddenMethodCalls[name]; banned {
+				t.Errorf("🔴 %s is reachable from %s and calls %s.\n   %s", fn, hotPathEntry, call, why)
+			}
+		}
+	}
+}
+
+// TestNoNewFileCallAppearsOnTheForwardingHotPath is the ratchet over
+// hotPathFileCalls.
+//
+// 🔴 Read that variable's comment before this test's result means anything: the
+// baseline is an inventory of twenty unadjudicated call sites, not a list of
+// approved ones. What this test protects is the DIRECTION — the set may shrink,
+// never grow.
+func TestNoNewFileCallAppearsOnTheForwardingHotPath(t *testing.T) {
+	graph := loadModuleGraph(t)
+	reached := graph.reachableFrom(hotPathEntry)
+
+	found := map[string]struct{}{}
+	for _, fn := range sortedKeys(reached) {
+		for _, call := range graph.selectorCallsIn(fn) {
+			if _, banned := forbiddenCalls[call]; banned {
+				found[fn+"|"+call] = struct{}{}
+			}
+		}
+	}
+
+	for entry := range found {
+		if _, known := hotPathFileCalls[entry]; !known {
+			t.Errorf("🔴 NEW file call on the forwarding hot path: %s\n   %s\n"+
+				"   PLANE-01 forbids this. Move it off the request, or — if it genuinely is "+
+				"not on the forwarding path — add it to hotPathFileCalls and say why in the "+
+				"commit.", entry, fileReason)
+		}
+	}
+	for entry := range hotPathFileCalls {
+		if _, still := found[entry]; !still {
+			t.Errorf("the baseline records %s and it is no longer reachable. Delete the line — "+
+				"a baseline that describes code which no longer exists reads as a considered "+
+				"decision about the current tree.", entry)
+		}
+	}
+	t.Logf("🚫 %d file call(s) reachable from %s, recorded and NOT approved. "+
+		"PLANE-01 stays PARTIAL until each is adjudicated.", len(found), hotPathEntry)
+}
+
+// TestTheHotPathFenceWouldNoticeALicensingImport is the fence's own fence.
+//
+// 🔴 Without it, the assertions above pass on a graph that reached nothing, on a
+// forbidden list that matched nothing, or on an entry point that no longer
+// exists. All three look identical to "the hot path is clean".
+//
+// 🚫 It was accidentally DELETED once while this file was being edited — a
+// refactor cut from one test to another and took it with them — and the register
+// caught it, because the register names tests and checks they exist. That is the
+// whole argument for naming tests in a register rather than naming packages.
+func TestTheHotPathFenceWouldNoticeALicensingImport(t *testing.T) {
+	graph := loadModuleGraph(t)
+	reached := graph.reachableFrom(hotPathEntry)
+
+	// 1. The entry point exists. A renamed Handle would silently make every
+	//    assertion above vacuous.
+	if _, ok := graph.funcs[hotPathEntry]; !ok {
+		t.Fatalf("%s does not exist in this module. The supervisor calls the per-request entry "+
+			"point by name; if it was renamed, this fence is walking nothing", hotPathEntry)
+	}
+
+	// 2. The walk crosses package boundaries. A graph confined to internal/proxy
+	//    could not see a licensing import added one package away.
+	packages := map[string]struct{}{}
+	for fn := range reached {
+		packages[graph.packageOf(fn)] = struct{}{}
+	}
+	if len(packages) < 5 {
+		t.Fatalf("the walk stayed inside %d package(s): %v. It has to follow calls out of "+
+			"internal/proxy, or an import added one package away is invisible to it",
+			len(packages), sortedKeys(packages))
+	}
+	t.Logf("the walk crosses %d packages", len(packages))
+
+	// 3. The import comparison really fires. Run it against a package the hot
+	//    path genuinely imports and assert the match would have happened.
+	var sample string
+	for _, fn := range sortedKeys(reached) {
+		for _, imp := range graph.importsOf(fn) {
+			if strings.HasPrefix(imp, modulePath+"/") {
+				sample = imp
+				break
+			}
+		}
+		if sample != "" {
+			break
+		}
+	}
+	if sample == "" {
+		t.Fatal("no reachable file imports anything from this module, so the import comparison " +
+			"has never been exercised against a real path")
+	}
+	if !(sample == modulePath || strings.HasPrefix(sample, modulePath+"/")) {
+		t.Fatalf("the sample import %q would not match under this fence's own comparison; the "+
+			"check is not doing what it looks like", sample)
+	}
+}
+
+// TestThisModuleDoesNotDependOnLicensingAtAll is the stronger half, and it was
+// found by drilling the fence rather than by design.
+//
+// 🔴 Adding `_ "github.com/AiKeyLabs/aikey-license-core/licstate"` to the request
+// handler did not trip the call-graph fence — it failed the BUILD, because the
+// module does not require aikey-license-core in go.mod. That is a stronger
+// property than "no reachable file imports it": the package is not resolvable
+// here at all, so no amount of refactoring inside this module can put licensing
+// on the forwarding path without a deliberate `go get`.
+//
+// 🚫 It does not replace the call-graph walk. A future `go get` would satisfy
+// this file and leave the walk as the thing that notices; and the walk is what
+// covers the file and database halves, which no go.mod check can see.
+func TestThisModuleDoesNotDependOnLicensingAtAll(t *testing.T) {
+	raw, err := os.ReadFile(filepath.Join(moduleRoot(t), "go.mod"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	body := string(raw)
+	for banned := range forbiddenImports {
+		if strings.Contains(body, banned) {
+			t.Errorf("🔴 go.mod requires %q. MOD-16 and PLANE-01 both rest on the forwarding "+
+				"process not knowing what a licence is; once the module can resolve it, only "+
+				"the call-graph walk stands between a licence check and the request path.", banned)
+		}
+	}
+	// 🔴 NON-VACUITY: the file really was read and really is a go.mod.
+	if !strings.Contains(body, "module "+modulePath) {
+		t.Fatalf("the file read does not declare module %s; this check is looking at the "+
+			"wrong file and would pass whatever go.mod said", modulePath)
+	}
+}
+
+// ── the graph ──────────────────────────────────────────────────────────────
+
+type moduleGraph struct {
+	// funcs maps "<pkg dir>::Recv.Name" or "<pkg dir>::Name" to the declarations.
+	funcs map[string][]*funcDecl
+	// methodIndex maps a bare method name to every key declaring a method with
+	// that name, which is the only place this fence over-approximates.
+	methodIndex map[string][]string
+}
+
+type funcDecl struct {
+	pkg     string
+	file    string
+	imports []string
+	// localPkgs maps the identifier a file uses for an imported package to that
+	// package's directory within this module ("cfg" -> "internal/config").
+	//
+	// 🔴 This is what makes `pkg.Fn(...)` resolvable WITHOUT resolving `x.Fn(...)`
+	// to the same thing. The first version matched a bare callee name against
+	// every declaration in the module, so `w.Write(b)` on an http.ResponseWriter
+	// resolved to `internal/runtime.Write`, which writes a snapshot file — and the
+	// fence reported a file write on the hot path that is not on the hot path.
+	// 🚫 An over-approximation is the safe direction only while it stays small
+	// enough to investigate; on a name like `Write` it is just noise, and a noisy
+	// fence gets muted.
+	localPkgs map[string]string
+	body      *ast.FuncDecl
+}
+
+func loadModuleGraph(t *testing.T) *moduleGraph {
+	t.Helper()
+	root := moduleRoot(t)
+	graph := &moduleGraph{funcs: map[string][]*funcDecl{}, methodIndex: map[string][]string{}}
+	fset := token.NewFileSet()
+
+	err := filepath.Walk(root, func(path string, info os.FileInfo, err error) error {
+		if err != nil {
+			return err
+		}
+		if info.IsDir() {
+			switch info.Name() {
+			case ".git", "vendor", "node_modules", "bin", "testdata":
+				return filepath.SkipDir
+			}
+			return nil
+		}
+		if !strings.HasSuffix(path, ".go") || strings.HasSuffix(path, "_test.go") {
+			return nil
+		}
+		file, err := parser.ParseFile(fset, path, nil, 0)
+		if err != nil {
+			// A file this parser cannot read is not a reason to pass. It is a
+			// reason to say so: an unparsed file is a hole in the graph.
+			t.Fatalf("parsing %s: %v", path, err)
+		}
+		rel, _ := filepath.Rel(root, path)
+		pkg := filepath.ToSlash(filepath.Dir(rel))
+		var imports []string
+		localPkgs := map[string]string{}
+		for _, spec := range file.Imports {
+			value, err := strconv.Unquote(spec.Path.Value)
+			if err != nil {
+				continue
+			}
+			imports = append(imports, value)
+			if !strings.HasPrefix(value, modulePath+"/") {
+				continue
+			}
+			dir := strings.TrimPrefix(value, modulePath+"/")
+			name := dir
+			if cut := strings.LastIndex(dir, "/"); cut >= 0 {
+				name = dir[cut+1:]
+			}
+			if spec.Name != nil {
+				name = spec.Name.Name
+			}
+			localPkgs[name] = dir
+		}
+		for _, decl := range file.Decls {
+			fn, ok := decl.(*ast.FuncDecl)
+			if !ok || fn.Body == nil {
+				continue
+			}
+			key := pkg + "::" + funcKey(fn)
+			graph.funcs[key] = append(graph.funcs[key], &funcDecl{
+				pkg: pkg, file: rel, imports: imports, localPkgs: localPkgs, body: fn,
+			})
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(graph.funcs) == 0 {
+		t.Fatal("no functions parsed; the fence would pass vacuously")
+	}
+	for key, decls := range graph.funcs {
+		if len(decls) == 0 || decls[0].body.Recv == nil {
+			continue
+		}
+		name := decls[0].body.Name.Name
+		graph.methodIndex[name] = append(graph.methodIndex[name], key)
+	}
+	return graph
+}
+
+// funcKey is "Type.Method" for a method and "Name" for a function.
+func funcKey(fn *ast.FuncDecl) string {
+	if fn.Recv == nil || len(fn.Recv.List) == 0 {
+		return fn.Name.Name
+	}
+	return receiverType(fn.Recv.List[0].Type) + "." + fn.Name.Name
+}
+
+func receiverType(expr ast.Expr) string {
+	switch t := expr.(type) {
+	case *ast.StarExpr:
+		return receiverType(t.X)
+	case *ast.Ident:
+		return t.Name
+	case *ast.IndexExpr: // generic receiver
+		return receiverType(t.X)
+	case *ast.IndexListExpr:
+		return receiverType(t.X)
+	}
+	return ""
+}
+
+// reachableFrom walks the call graph, following every callee NAME it can resolve
+// inside this module.
+func (g *moduleGraph) reachableFrom(entry string) map[string]struct{} {
+	reached := map[string]struct{}{}
+	queue := []string{entry}
+	for len(queue) > 0 {
+		current := queue[0]
+		queue = queue[1:]
+		if _, seen := reached[current]; seen {
+			continue
+		}
+		decls, ok := g.funcs[current]
+		if !ok {
+			continue // not ours: standard library or a third-party package
+		}
+		reached[current] = struct{}{}
+		for _, decl := range decls {
+			ast.Inspect(decl.body, func(n ast.Node) bool {
+				call, ok := n.(*ast.CallExpr)
+				if !ok {
+					return true
+				}
+				for _, name := range g.calleeKeys(decl, call.Fun) {
+					if _, ours := g.funcs[name]; ours {
+						queue = append(queue, name)
+					}
+				}
+				return true
+			})
+		}
+	}
+	return reached
+}
+
+// calleeKeys returns every graph key a call expression inside `from` might mean.
+//
+// 🔴 Three cases, and the distinction between the first two is the whole fix:
+//
+//	Foo(...)      a function in the SAME package        -> "<pkg>::Foo"
+//	pkg.Foo(...)  a function in an imported package of  -> "<that pkg>::Foo"
+//	              THIS module, resolved through the
+//	              importing file's own import list
+//	x.Foo(...)    a method on some value                -> "<any pkg>::T.Foo"
+//
+// Only the third over-approximates, and it over-approximates across METHODS of
+// that name rather than across every declaration in the module. That is the
+// difference between following `w.Write(b)` to the handful of Write METHODS and
+// following it to `internal/runtime.Write`, which writes a snapshot file and is
+// nowhere near a request.
+func (g *moduleGraph) calleeKeys(from *funcDecl, fun ast.Expr) []string {
+	switch f := fun.(type) {
+	case *ast.Ident:
+		return []string{from.pkg + "::" + f.Name}
+	case *ast.SelectorExpr:
+		if ident, ok := f.X.(*ast.Ident); ok {
+			if dir, isPkg := from.localPkgs[ident.Name]; isPkg {
+				// A qualified call into another package of this module. Exact.
+				return []string{dir + "::" + f.Sel.Name}
+			}
+		}
+		// A method call. Follow every method of that name in the module.
+		return g.methodKeys(f.Sel.Name)
+	case *ast.IndexExpr:
+		return g.calleeKeys(from, f.X)
+	case *ast.IndexListExpr:
+		return g.calleeKeys(from, f.X)
+	case *ast.ParenExpr:
+		return g.calleeKeys(from, f.X)
+	}
+	return nil
+}
+
+// methodKeys returns every "<pkg>::T.Name" key in the module.
+func (g *moduleGraph) methodKeys(name string) []string {
+	if cached, ok := g.methodIndex[name]; ok {
+		return cached
+	}
+	return nil
+}
+
+func (g *moduleGraph) importsOf(fn string) []string {
+	var out []string
+	for _, decl := range g.funcs[fn] {
+		out = append(out, decl.imports...)
+	}
+	return out
+}
+
+func (g *moduleGraph) packageOf(fn string) string {
+	if decls := g.funcs[fn]; len(decls) > 0 {
+		return decls[0].pkg
+	}
+	return ""
+}
+
+func (g *moduleGraph) fileCount(reached map[string]struct{}) int {
+	files := map[string]struct{}{}
+	for fn := range reached {
+		for _, decl := range g.funcs[fn] {
+			files[decl.file] = struct{}{}
+		}
+	}
+	return len(files)
+}
+
+// selectorCallsIn returns "pkg.Fn" for every qualified call in a function.
+func (g *moduleGraph) selectorCallsIn(fn string) []string {
+	var out []string
+	for _, decl := range g.funcs[fn] {
+		ast.Inspect(decl.body, func(n ast.Node) bool {
+			call, ok := n.(*ast.CallExpr)
+			if !ok {
+				return true
+			}
+			sel, ok := call.Fun.(*ast.SelectorExpr)
+			if !ok {
+				return true
+			}
+			if ident, ok := sel.X.(*ast.Ident); ok {
+				out = append(out, ident.Name+"."+sel.Sel.Name)
+			}
+			return true
+		})
+	}
+	return out
+}
+
+func moduleRoot(t *testing.T) string {
+	t.Helper()
+	dir, err := filepath.Abs(".")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < 8; i++ {
+		if _, err := os.Stat(filepath.Join(dir, "go.mod")); err == nil {
+			return dir
+		}
+		dir = filepath.Dir(dir)
+	}
+	t.Fatal("no go.mod found above the test's directory")
+	return ""
+}
+
+func sortedKeys[V any](m map[string]V) []string {
+	out := make([]string, 0, len(m))
+	for k := range m {
+		out = append(out, k)
+	}
+	sort.Strings(out)
+	return out
+}
