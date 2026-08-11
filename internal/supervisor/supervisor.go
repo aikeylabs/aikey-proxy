@@ -1737,6 +1737,15 @@ func (s *Supervisor) buildGeneration() (*generation, error) {
 
 	// Build the proxy handler with configured thresholds.
 	p := proxy.New(vaultReader, registry, providers, collector, s.ctx)
+	// Stamp the generation identity FIRST and unconditionally. Every runtime
+	// counter this Proxy exposes on /v1/diagnostics/pipeline is scoped to this
+	// generation — a reload swaps the *Proxy behind an unchanged PID, so the
+	// counters silently restart at zero. Publishing the ID is what lets an
+	// external reader notice the reset (health-signal-surface). It must not ride
+	// on SetReporter: that call is skipped entirely when neither a collector nor
+	// a WAL is configured, i.e. exactly the offline deployments that have the
+	// fewest other ways to see a reload.
+	p.SetGenerationID(int64(id))
 	// Inject the shared, supervisor-owned routing-override cache (I-side §6.5) so
 	// the group-route hot path can read the engine's seat→account redirects.
 	// Unconditional + nil-safe: an empty cache (no team cred / control URL / poll
@@ -1872,7 +1881,7 @@ func (s *Supervisor) buildGeneration() (*generation, error) {
 			if seq, err := vault.ReadConfigU64LE(s.cfg.Vault.Path, VaultChangeSeqKey); err == nil && seq <= math.MaxInt64 {
 				loadedSeq = int64(seq)
 			}
-			p.SetReporter(nil, fmt.Sprintf("proxy-%d", id), s.version, fmt.Sprintf("gen-%d", id), loadedSeq, vaultReader.GetLoggedInAccountID())
+			p.SetReporter(nil, fmt.Sprintf("proxy-%d", id), s.version, proxy.GenerationLabel(int64(id)), loadedSeq, vaultReader.GetLoggedInAccountID())
 		}
 	}
 
@@ -1938,7 +1947,7 @@ func (s *Supervisor) buildGeneration() (*generation, error) {
 			if seq, err := vault.ReadConfigU64LE(s.cfg.Vault.Path, VaultChangeSeqKey); err == nil && seq <= math.MaxInt64 {
 				loadedSeq = int64(seq)
 			}
-			p.SetReporter(reporter, fmt.Sprintf("proxy-%d", id), s.version, fmt.Sprintf("gen-%d", id), loadedSeq, vaultReader.GetLoggedInAccountID())
+			p.SetReporter(reporter, fmt.Sprintf("proxy-%d", id), s.version, proxy.GenerationLabel(int64(id)), loadedSeq, vaultReader.GetLoggedInAccountID())
 			slog.Info("usage reporter enabled", "collector_url", s.cfg.Events.CollectorURL)
 
 			// Start canary probe. As of 2026-04-17 diagnostics live on the

@@ -760,13 +760,20 @@ func injectSession(eventJSON []byte, sessionID string) []byte {
 // conversation record. All N share this trace id, so the relationship is N:1
 // and the join must be read in that direction.
 //
-// PRIVACY (DC5 / 方案 §6 不变量 #1 unaffected): this is a correlation id, not
-// content. No prompt text is added to the upload by this function, and the
-// original text still never leaves the user's box — the master stores the key
-// only, and the raw turn stays wherever conversation_records lives. The three
-// existing guards (content-free intake wire + DisallowUnknownFields at master,
-// the detector's local-only ContextSnippet, the proxy not persisting bodies)
-// all keep holding.
+// PRIVACY (DC5 / 方案 §6 不变量 #1 unaffected BY THIS FUNCTION): this is a
+// correlation id, not content. No prompt text is added to the upload here — the
+// master stores the key only, and the raw turn stays wherever
+// conversation_records lives.
+//
+// 🔴 2026-08-11 — the old text went on to claim "the original text still never
+// leaves the user's box" and listed three guards including "content-free intake
+// wire + DisallowUnknownFields at master" and "the detector's local-only
+// ContextSnippet". Those two guards are GONE by design: the intake wire declares
+// `context_snippet`, and ContextSnippet is no longer local-only (the detector's
+// gate is tiered — `PrivacyTier >= 3` on the team branch, seeded ON for a fresh
+// Team/Cluster install). What this function does is still content-free; the
+// system-wide claim it appealed to is not. The surviving system-wide statement
+// is 「原文不出**客户信任边界**」 — never onto an AiKey-operated server.
 //
 // Empty trace (no observer context on the route → no conversation record to
 // join to anyway) → unchanged, same fail-safe as injectSeat/injectSession.

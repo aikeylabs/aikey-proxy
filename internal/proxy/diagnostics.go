@@ -15,6 +15,11 @@
 //     signal that surfaces "some model started rewriting our placeholders" —
 //     every such request still returns 200, so without an externally readable
 //     counter the degradation is invisible (health-signal-surface §H1).
+//   - the generation ID these counters belong to. Every counter on this
+//     endpoint is GENERATION-scoped, not process-scoped: the proxy hot-reloads
+//     in-process, keeping its PID while replacing the *Proxy that owns the
+//     counters. Publishing the generation is what makes that reset externally
+//     observable instead of an invisible re-zeroing under a live PID.
 //
 // 🔴 GET-only + read-only (design P5-deletion note: status endpoints must not
 // mutate). Health signals must be externally readable (observability §H1/H2).
@@ -56,9 +61,30 @@ const (
 // auth posture and no new client contract, and the two blocks are read by the
 // same operator in the same breath.
 type PipelineDiagnostics struct {
-	Registry     RegistryProvenance `json:"registry"`
-	ModelMapping MappingHealth      `json:"model_mapping"`
-	MaskRestore  MaskRestoreHealth  `json:"mask_restore"`
+	Registry RegistryProvenance `json:"registry"`
+	// GenerationID scopes EVERY counter below it.
+	//
+	// The proxy hot-reloads in-process: `aikey` config/vault changes make the
+	// supervisor build a NEW generation (supervisor.buildGeneration → new
+	// *Proxy) and swap it in behind the same listener. The PID does not change,
+	// the process uptime does not reset — but `model_mapping.applied/rejected/
+	// passthrough_missing` and `mask_restore.placeholders_issued/restored` all
+	// restart at zero, because they live on the Proxy that was just replaced.
+	//
+	// Without this field an external reader (release E2E, ops probe, dashboard)
+	// has NO way to tell a fresh low number from a genuine cumulative one, so a
+	// reload between two polls silently invalidates any assertion built on the
+	// deltas — and it fails in the reassuring direction (counters look calm).
+	// Compare it across reads: same ID → the counters are comparable; changed ID
+	// → they were zeroed in between and the earlier sample must be discarded.
+	//
+	// Additive scalar rather than a new endpoint or a new nested object
+	// (慎重新建 API/接口协议): it annotates the numbers already served here.
+	// 0 = no supervisor wired this Proxy (unit tests / embedded use); real
+	// supervisor generations start at 1.
+	GenerationID int64             `json:"generation_id"`
+	ModelMapping MappingHealth     `json:"model_mapping"`
+	MaskRestore  MaskRestoreHealth `json:"mask_restore"`
 }
 
 // MaskRestoreStatus is the compliance-placeholder fidelity verdict. The first
@@ -100,10 +126,19 @@ const (
 )
 
 // MaskRestoreHealth is the externally-readable 保真率 signal (方案 20260808
-// §3.2 L3). Issued/Restored are cumulative for the process lifetime; the
-// verdict is derived, never latched — a model that starts behaving again pulls
-// the cumulative ratio back up (health-signal-surface: report the current
-// state, not a terminal one).
+// §3.2 L3).
+//
+// 🔴 Issued/Restored are cumulative for the GENERATION, not for the process
+// lifetime. This comment used to claim "process lifetime" and that was wrong:
+// the proxy hot-reloads in-process (supervisor.buildGeneration constructs a new
+// *Proxy behind the same PID and listener), and these counters live on the
+// Proxy, so a reload resets them to zero with no visible restart. Read them
+// together with PipelineDiagnostics.GenerationID — that ID is what tells a
+// caller whether two samples belong to the same counting epoch.
+//
+// The verdict is derived, never latched — a model that starts behaving again
+// pulls the ratio back up (health-signal-surface: report the current state, not
+// a terminal one).
 //
 // Privacy: counts only. No label, no entity code, no length, no text — the
 // placeholder↔original mapping never leaves request memory (B3 拍板).
@@ -256,6 +291,7 @@ func (p *Proxy) handleDiagnosticsPipeline(w http.ResponseWriter, r *http.Request
 			RouteRows:             tbl.Len(),
 			ProvidersWithModelMap: provs,
 		},
+		GenerationID: p.GenerationID(),
 		ModelMapping: p.mappingHealth(),
 		MaskRestore:  p.maskRestoreHealth(),
 	}
