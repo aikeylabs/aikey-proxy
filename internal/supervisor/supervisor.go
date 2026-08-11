@@ -369,6 +369,23 @@ type Supervisor struct {
 	// local filter_stages is NULL (master mandate); the user's local toggle still
 	// governs when this is false. Polled by pollComplianceMasterPolicy.
 	masterCompliance atomic.Bool
+	// masterPrivacyTier is the org-level compliance PRIVACY TIER polled from the
+	// same endpoint as masterCompliance (1 metadata / 2 + masked snippet / 3 +
+	// RAW snippet). It decides how much of this user's own text the detector may
+	// attach to the compliance events it uploads to the team server.
+	//
+	// 🔴 THIS IS THE ONLY WAY THAT DECISION CAN ARRIVE. There is deliberately no
+	// vault column, no config key and no env override by which the person whose
+	// prompts these are could raise it — the whole design rests on the
+	// authorisation being the ORGANISATION's, held on the org's own server. The
+	// value is passed to the detector as AIKEY_COMPLIANCE_PRIVACY_TIER at spawn
+	// (installFilterHook) and re-checked by the master at ingest.
+	//
+	// Default 1: the zero value of an Int64 clamps to metadata-only, so a node
+	// that has never reached its policy, or reached it and failed to parse it,
+	// sends no content. Unlike masterCompliance a change needs a Reload — the
+	// value is baked into a child process's environment at spawn.
+	masterPrivacyTier atomic.Int64
 	// Enterprise quota (Phase 2 Stage 2 — design §0.5/§5.2). Snapshot + counter
 	// live on the supervisor (not per-generation) so the counter accumulates
 	// continuously across 5s syncs and /admin/reload; the snapshot is gen-swapped
@@ -849,6 +866,25 @@ func computeFilterSig(vaultReader *vault.Reader) (string, bool) {
 	return strings.Join(parts, ","), true
 }
 
+// filterSigWithPrivacyTier appends the org privacy tier to the filter signature.
+//
+// WHY THE TIER HAS TO BE IN THE SIGNATURE: installFilterHook bakes the tier into
+// the detector child's ENVIRONMENT at spawn. A running child keeps whatever
+// value it was born with, forever. So an admin lowering the tier from 3 to 1
+// would change the server's policy, change what the server STORES (the master
+// strips on ingest), and change nothing about what employees' machines SEND —
+// raw text would keep travelling the network until something unrelated caused a
+// reload. Folding the tier in here makes the poller's Reload actually re-spawn.
+//
+// It is separate from computeFilterSig because that function only reads the
+// vault, while the tier lives on the supervisor. Same reason record_allow is
+// folded in there and not here.
+//
+// 能红 check: drop the tier term and TestFilterSig_ChangesWithPrivacyTier fails.
+func filterSigWithPrivacyTier(base string, tier int64) string {
+	return base + "|tier:" + strconv.FormatInt(tier, 10)
+}
+
 // syncManagedKeys checks the vault change_seq and, if it has advanced since
 // the active generation was built, merges current active managed keys into the
 // live registry.
@@ -893,7 +929,10 @@ func (s *Supervisor) syncManagedKeys() {
 	// writing the "cluster-compliance" app_record's filter_stages; without this
 	// check that only took effect on a manual /admin/reload (2026-06-05 E2E gap).
 	// Fault-isolated: a read error skips the check (never a reload storm).
-	if newSig, ok := computeFilterSig(gen.vault); ok {
+	if baseSig, ok := computeFilterSig(gen.vault); ok {
+		// Fold in the org privacy tier: it is baked into the detector child's env
+		// at spawn, so only a re-spawn can change what a running detector sends.
+		newSig := filterSigWithPrivacyTier(baseSig, s.masterPrivacyTier.Load())
 		if prev := s.lastFilterSig.Load(); prev == nil || *prev != newSig {
 			// R5: record the attempted signature BEFORE the reload so a
 			// persistently-failing Reload (e.g. transient build error) does NOT
@@ -1783,7 +1822,8 @@ func (s *Supervisor) buildGeneration() (*generation, error) {
 	filterHook := s.installFilterHook(p, vaultReader)
 	// Record the filter-app signature this generation was built with so
 	// syncManagedKeys can detect a later enable/disable and trigger a reload.
-	if sig, ok := computeFilterSig(vaultReader); ok {
+	if baseSig, ok := computeFilterSig(vaultReader); ok {
+		sig := filterSigWithPrivacyTier(baseSig, s.masterPrivacyTier.Load())
 		s.lastFilterSig.Store(&sig)
 	}
 

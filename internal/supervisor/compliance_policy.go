@@ -99,21 +99,34 @@ func (s *Supervisor) syncComplianceMasterPolicy(ctx context.Context) {
 	if masterURL == "" || orgID == "" {
 		return // no team / no org → no mandate; local toggle governs (Personal)
 	}
-	enabled, ok := fetchComplianceMasterPolicy(ctx, masterURL, orgID)
+	enabled, tier, ok := fetchComplianceMasterPolicy(ctx, masterURL, orgID)
 	if !ok {
 		return // unreachable → keep last known (don't flap on a transient miss)
 	}
 	// Persist for the web toggle + CLI guard. locked == enabled for now (master
 	// ON ⇒ user can't disable; master OFF ⇒ user free). Kept as two fields so a
 	// future "force-off + locked" variant doesn't change the wire shape.
-	policy := fmt.Sprintf(`{"enabled":%t,"locked":%t}`, enabled, enabled)
+	//
+	// privacy_tier rides along so the local console can SHOW what the org decided.
+	// 🔴 Writing it here does NOT make it settable locally: nothing reads this key
+	// back to decide anything — the detector env comes from the atomic below, and
+	// the master re-checks its own column at ingest. This value is for display.
+	policy := fmt.Sprintf(`{"enabled":%t,"locked":%t,"privacy_tier":%d}`, enabled, enabled, tier)
 	if s.cfg != nil {
 		_ = vault.WriteConfigString(s.cfg.Vault.Path, complianceMasterPolicyKey, policy)
 	}
-	// Re-evaluate spawn only when the mandate actually flips.
-	if s.masterCompliance.Swap(enabled) != enabled {
+	// The privacy tier is baked into the detector child's ENV at spawn, so a
+	// change only takes effect on a re-spawn. Store it BEFORE the reload decision
+	// below so the reload that follows picks up the new value; and treat a tier
+	// change as reload-worthy in its own right, because otherwise lowering the
+	// tier would change what the server stores while employees' machines kept
+	// sending raw text over the network until something else forced a reload.
+	tierChanged := s.masterPrivacyTier.Swap(int64(tier)) != int64(tier)
+	enabledChanged := s.masterCompliance.Swap(enabled) != enabled
+	if enabledChanged || tierChanged {
 		slog.Info("compliance master policy changed",
-			"event.name", "proxy.compliance.policy_changed", "enabled", enabled)
+			"event.name", "proxy.compliance.policy_changed",
+			"enabled", enabled, "privacy_tier", tier)
 		if err := s.Reload(ctx); err != nil {
 			slog.Warn("compliance policy reload failed",
 				"event.name", "proxy.compliance.policy_reload_failed", "error", err)
@@ -122,27 +135,53 @@ func (s *Supervisor) syncComplianceMasterPolicy(ctx context.Context) {
 }
 
 // fetchComplianceMasterPolicy GETs the PUBLIC tenant policy endpoint (no JWT,
-// mirrors the pack-pull). Returns (enabled, ok); ok=false on any error so the
-// caller keeps the last-known value.
-func fetchComplianceMasterPolicy(ctx context.Context, masterURL, orgID string) (enabled, ok bool) {
+// mirrors the pack-pull). Returns (enabled, privacyTier, ok); ok=false on any
+// error so the caller keeps the last-known value.
+//
+// 🔴 privacyTier is CLAMPED here, not merely decoded. It decides whether this
+// machine attaches its user's raw text to the events it uploads, so every input
+// that is not an understood rung must land on the safe one: a field the server
+// did not send (an older master) decodes to 0, and 0/negative/out-of-range all
+// clamp to 1 (metadata only). The failure direction is always "carry less".
+func fetchComplianceMasterPolicy(ctx context.Context, masterURL, orgID string) (enabled bool, privacyTier int, ok bool) {
 	u := masterURL + "/v1/compliance/policy?tenant=" + url.QueryEscape(orgID)
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u, http.NoBody)
 	if err != nil {
-		return false, false
+		return false, privacyTierMetadataOnly, false
 	}
 	resp, err := complianceHTTPClient.Get().Do(req)
 	if err != nil {
-		return false, false
+		return false, privacyTierMetadataOnly, false
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
-		return false, false
+		return false, privacyTierMetadataOnly, false
 	}
 	var body struct {
 		Enabled bool `json:"enabled"`
+		// Absent on a master older than 2026-08-11 ⇒ 0 ⇒ clamped to 1. An old
+		// server must never be read as permission.
+		PrivacyTier int `json:"privacy_tier"`
 	}
 	if err := json.NewDecoder(resp.Body).Decode(&body); err != nil {
-		return false, false
+		return false, privacyTierMetadataOnly, false
 	}
-	return body.Enabled, true
+	return body.Enabled, clampPrivacyTier(body.PrivacyTier), true
+}
+
+// Privacy tier ladder, mirrored from the control-master org domain. Named
+// constants so no caller writes a bare 3 — the number appears in the org
+// policy, on the wire, here, in the detector env and in the detector itself.
+const (
+	privacyTierMetadataOnly = 1 // findings + offsets only; no content leaves the box
+	privacyTierRawSnippet   = 3 // + the raw matched text and a small window
+)
+
+// clampPrivacyTier is the single normaliser on this side. See the note on
+// fetchComplianceMasterPolicy for why every unrecognised value must fail closed.
+func clampPrivacyTier(tier int) int {
+	if tier < privacyTierMetadataOnly || tier > privacyTierRawSnippet {
+		return privacyTierMetadataOnly
+	}
+	return tier
 }

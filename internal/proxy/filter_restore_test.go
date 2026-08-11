@@ -60,7 +60,7 @@ func TestRenumberRestorables_SequentialLabelsAndMapping(t *testing.T) {
 	head := "收货：" + a1 + "；备用：" + a2
 	masked := maskAddrs(head, a1, a2)
 	st := newMaskRestore()
-	got := renumberRestorables(head, masked, []apphook.RestorableMask{addrRestorable(head, a1, a2)}, st, discardLogger())
+	got, _ := renumberRestorables(head, masked, []apphook.RestorableMask{addrRestorable(head, a1, a2)}, st, discardLogger())
 
 	want := "收货：{{ADDR_1}}；备用：{{ADDR_2}}"
 	if got != want {
@@ -77,8 +77,8 @@ func TestRenumberRestorables_ContinuesAcrossPieces(t *testing.T) {
 	st := newMaskRestore()
 	h1 := "第一条：" + a1
 	h2 := "第二条：" + a2
-	out1 := renumberRestorables(h1, maskAddrs(h1, a1), []apphook.RestorableMask{addrRestorable(h1, a1)}, st, discardLogger())
-	out2 := renumberRestorables(h2, maskAddrs(h2, a2), []apphook.RestorableMask{addrRestorable(h2, a2)}, st, discardLogger())
+	out1, _ := renumberRestorables(h1, maskAddrs(h1, a1), []apphook.RestorableMask{addrRestorable(h1, a1)}, st, discardLogger())
+	out2, _ := renumberRestorables(h2, maskAddrs(h2, a2), []apphook.RestorableMask{addrRestorable(h2, a2)}, st, discardLogger())
 	if !strings.Contains(out1, "{{ADDR_1}}") || !strings.Contains(out2, "{{ADDR_2}}") {
 		t.Fatalf("cross-piece numbering broken: %q / %q", out1, out2)
 	}
@@ -94,7 +94,7 @@ func TestRenumberRestorables_CountMismatchKeepsNumberlessMask(t *testing.T) {
 	head := "我打的字面量 " + tAddrToken + " 和真实地址 " + a1
 	masked := strings.Replace(head, a1, tAddrToken, 1) // now TWO token occurrences, ONE span
 	st := newMaskRestore()
-	got := renumberRestorables(head, masked, []apphook.RestorableMask{addrRestorable(head, a1)}, st, discardLogger())
+	got, _ := renumberRestorables(head, masked, []apphook.RestorableMask{addrRestorable(head, a1)}, st, discardLogger())
 	if got != masked {
 		t.Fatalf("mismatch case must keep masked text unchanged: %q", got)
 	}
@@ -109,7 +109,7 @@ func TestRenumberRestorables_InvalidSpansSkipped(t *testing.T) {
 	st := newMaskRestore()
 	bad := apphook.RestorableMask{Token: tAddrToken, NumberedPrefix: tAddrPrefix, NumberedSuffix: tAddrSuffix,
 		Spans: [][2]int{{0, 999}}} // out of range
-	if got := renumberRestorables(head, masked, []apphook.RestorableMask{bad}, st, discardLogger()); got != masked || len(st.entries) != 0 {
+	if got, _ := renumberRestorables(head, masked, []apphook.RestorableMask{bad}, st, discardLogger()); got != masked || len(st.entries) != 0 {
 		t.Fatalf("invalid spans must be skipped: got %q entries %v", got, st.entries)
 	}
 }
@@ -133,7 +133,7 @@ func TestRenumberRestorables_MultipleOverlappingTokensUseOneCombinedScan(t *test
 	}
 
 	st := newMaskRestore()
-	got := renumberRestorables(head, masked, restorables, st, discardLogger())
+	got, _ := renumberRestorables(head, masked, restorables, st, discardLogger())
 	if want := "[XX#1] then [X#2]"; got != want {
 		t.Fatalf("renumbered = %q, want %q", got, want)
 	}

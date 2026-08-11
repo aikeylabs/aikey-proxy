@@ -373,6 +373,13 @@ func (p *Proxy) applyInboundFilter(
 		// by the request's user-message count (the same bound the scan loop pays), and a
 		// batch is capped at 2 MiB server-side (maxIntakeBody) ≈ thousands of events, so
 		// a realistic conversation stays orders of magnitude under it.
+		// Index of THIS piece's event in teamEvents, or -1 when the piece produced
+		// none. The Mask branch below uses it to backfill wire_label after the
+		// labels are allocated. WHY an index instead of moving the append below the
+		// switch: several branches `continue` out, and moving the append past them
+		// would silently drop audit events for exactly the pieces that most need
+		// one (an unwritable piece, an empty mask payload).
+		teamEventIdx := -1
 		if routeClass == apphook.RouteClassTeam && len(resp.Event) > 0 {
 			// Stamp BOTH authoritative attribution fields the proxy resolved (the
 			// detector has neither): tenant_id = the VK's org, virtual_key_id = the
@@ -415,6 +422,7 @@ func (p *Proxy) applyInboundFilter(
 				ev = injectActionTaken(ev, pieces[i].ceiling.String())
 			}
 			teamEvents = append(teamEvents, ev)
+			teamEventIdx = len(teamEvents) - 1
 		}
 
 		switch action {
@@ -461,6 +469,7 @@ func (p *Proxy) applyInboundFilter(
 			// the request's restore state (consumed by the response leg). Runs for
 			// both fresh Detects and cache replays (numbering is request-scoped).
 			// Zero cost when the mask carries no restorables (the usual case).
+			var spanLabels map[[2]int]string
 			if len(resp.Restorables) > 0 {
 				if restoreState == nil {
 					restoreState = newMaskRestore()
@@ -470,12 +479,24 @@ func (p *Proxy) applyInboundFilter(
 					// (方案 §3.2 L3 保真率指标). Counts only.
 					restoreState.fid = &p.maskFidelity
 				}
-				masked = renumberRestorables(head, masked, resp.Restorables, restoreState, logger)
+				masked, spanLabels = renumberRestorables(head, masked, resp.Restorables, restoreState, logger)
 			}
 			// Masked head (the scanned first pipeInputCap bytes) + the untouched
 			// tail (forwarded raw, never scanned — same as the detector's own cap).
 			pieces[i].setText(masked + tail)
 			maskedCount++
+			// Backfill the labels this piece just issued onto this piece's event, so
+			// the audit trail records what was actually SENT ({{PHONE_1}}) next to
+			// the detector's numberless snippet ({{PHONE}}). Done here, after the
+			// substitution, because the labels do not exist until now — and scoped to
+			// THIS piece, because the offsets are relative to this piece's head
+			// (方案 L §16.3). Cache replays pass through here identically: the numbers
+			// are re-allocated per request after replay, so the backfilled label is
+			// this request's, never a stale one from the turn that populated the
+			// cache entry.
+			if teamEventIdx >= 0 && len(spanLabels) > 0 {
+				teamEvents[teamEventIdx] = injectWireLabels(teamEvents[teamEventIdx], spanLabels)
+			}
 
 		case apphook.ActionWarn:
 			logger.Info("filter: content warned (passed through)",
@@ -767,6 +788,103 @@ func injectActionTaken(eventJSON []byte, action string) []byte {
 		return eventJSON
 	}
 	m["action_taken"] = q
+	out, err := json.Marshal(m)
+	if err != nil {
+		return eventJSON
+	}
+	return out
+}
+
+// injectWireLabels stamps, onto each finding of the team event JSON, the
+// numbered placeholder that finding's value was ACTUALLY forwarded upstream as
+// (`{{PHONE_1}}`) — the seventh member of the inject* family and, like the other
+// six, a fact the detector cannot know and the proxy just produced.
+//
+// WHY this exists: the snippet the detector records shows its NUMBERLESS token
+// (`{{PHONE}}`), because numbering is request-scoped and happens here, after the
+// detector has already built the event. A member reading their self-view was
+// therefore shown a string that was never sent, and two hits of the same entity
+// type in one prompt were indistinguishable. This closes that gap by carrying
+// the RESULT of the numbering rather than moving the rule (方案 L, update doc
+// 20260810-合规事件携带命中片段原文 §16.3; 方案 C — moving numbering into the
+// detector — was costed in §16.4 and declined).
+//
+// HOW the join works: spanLabels is keyed on [start,end) byte offsets into the
+// head this piece sent to the detector, and a finding's start_offset/end_offset
+// are offsets into that SAME payload in the SAME raw frame (the detector remaps
+// findings back to the raw frame before both the event and the mask metadata are
+// built). So this is an EQUAL JOIN on an offset pair — the proxy is not
+// re-deriving which entity is where, it is looking up an answer it already
+// computed. No parsing of the snippet, no regex, no re-application of any rule.
+//
+// 🔴 PER-PIECE ONLY. Offsets are relative to one piece's head, so piece #2's
+// span [10,21) is a completely different substring from piece #1's [10,21). The
+// caller must pass the map produced by THIS piece and apply it to THIS piece's
+// event. Applying a request-wide map would silently mislabel findings.
+//
+// 🔴 A FINDING WITH NO MATCH KEEPS AN EMPTY wire_label, AND THAT IS THE POINT.
+// Three important cases land there and all of them are correct:
+//   - the finding's policy action is `audit` (record it, forward the bytes
+//     unchanged) — e.g. CN_ADDRESS, whose shipped default is audit. It is in the
+//     event but never in the mask plan, so it has no span here. Its raw value
+//     went upstream verbatim, and naming a placeholder for it would tell the
+//     compliance dashboard the value was redacted when it was not — the same
+//     false-safety failure injectActionTaken exists to prevent one field over.
+//   - an action ceiling capped the piece: the Mask branch never runs, no labels
+//     are allocated, this function is never called for that piece.
+//   - one of the three restore degrade paths fired: the mask still applies, the
+//     numbering does not, and renumberRestorables returns a nil map.
+//
+// So "has a wire label" reads as "this value really did go out under this name",
+// and only that. Fenced by TestInjectWireLabels_AuditFindingStaysUnlabelled.
+//
+// Fail-safe like the other injectors: any parse/marshal problem returns the
+// original event unchanged — a wire label is an annotation, and losing it must
+// never cost the audit record itself.
+func injectWireLabels(eventJSON []byte, spanLabels map[[2]int]string) []byte {
+	if len(spanLabels) == 0 {
+		return eventJSON
+	}
+	var m map[string]json.RawMessage
+	if err := json.Unmarshal(eventJSON, &m); err != nil {
+		return eventJSON
+	}
+	raw, ok := m["findings"]
+	if !ok {
+		return eventJSON
+	}
+	var findings []map[string]json.RawMessage
+	if err := json.Unmarshal(raw, &findings); err != nil {
+		return eventJSON
+	}
+	stamped := 0
+	for _, f := range findings {
+		var start, end int
+		if err := json.Unmarshal(f["start_offset"], &start); err != nil {
+			continue
+		}
+		if err := json.Unmarshal(f["end_offset"], &end); err != nil {
+			continue
+		}
+		label, hit := spanLabels[[2]int{start, end}]
+		if !hit {
+			continue
+		}
+		q, err := json.Marshal(label)
+		if err != nil {
+			continue
+		}
+		f["wire_label"] = q
+		stamped++
+	}
+	if stamped == 0 {
+		return eventJSON
+	}
+	nf, err := json.Marshal(findings)
+	if err != nil {
+		return eventJSON
+	}
+	m["findings"] = nf
 	out, err := json.Marshal(m)
 	if err != nil {
 		return eventJSON

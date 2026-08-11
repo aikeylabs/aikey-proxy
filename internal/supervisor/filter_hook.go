@@ -191,7 +191,25 @@ func (s *Supervisor) installFilterHook(p *proxy.Proxy, vaultReader *vault.Reader
 	// The URL's single source is config.json controlPanelUrl (set by
 	// `aikey login --control-url`); the proxy is the conduit, the detector keeps
 	// NO copy. Empty (no team configured) → puller stays offline.
-	extraEnv := []string{recordAllowEnv, localIntakeEnv}
+	// Org compliance PRIVACY TIER → detector env. This is the ONLY channel by
+	// which the detector learns whether it may attach the raw matched text to the
+	// compliance events it hands back for upload (tier 3), and the value comes
+	// from the ORG's own control-master via pollComplianceMasterPolicy.
+	//
+	// 🔴 READ THE ATOMIC, NEVER THE ENVIRONMENT OR THE VAULT. There is
+	// deliberately no local override: the person whose prompts these are must not
+	// be able to authorise sending them, and an admin must not have to trust that
+	// every machine in the fleet was configured correctly. If this ever grows an
+	// `os.Getenv` fallback "for testing", that is the fence gone.
+	//
+	// The zero value is 0, which the detector's own parser clamps to tier 1, so a
+	// node that has never reached its policy sends nothing. A tier change forces
+	// a re-spawn through the filter signature (filterSigWithPrivacyTier) — a
+	// running child keeps the env it was born with.
+	privacyTierEnv := "AIKEY_COMPLIANCE_PRIVACY_TIER=" +
+		strconv.FormatInt(s.masterPrivacyTier.Load(), 10)
+
+	extraEnv := []string{recordAllowEnv, localIntakeEnv, privacyTierEnv}
 	// Resolve the pack-pull backend + tenant for the detector. Personal/Trial read
 	// the team URL from the CLI's config.json (no tenant scoping — one user, one
 	// view). A CLUSTER node has no CLI config.json; its control URL + org come from

@@ -420,10 +420,34 @@ func scanTokenOccurrences(s string, tokens []string) map[string][]int {
 // on any inconsistency (bad spans, token/span count mismatch) that restorable
 // keeps its numberless token — the sensitive text stays masked, only the
 // response-side restore is lost. WARN carries counts only, never content.
-func renumberRestorables(head, masked string, restorables []apphook.RestorableMask, st *maskRestore, logger *slog.Logger) string {
+//
+// It also returns spanLabels: the [start,end) span of each masked original in
+// HEAD → the label that span went upstream as. This is the ONLY output of the
+// numbering; nothing else in the proxy or the detector may derive a label. The
+// caller equal-joins it onto the compliance event's per-finding offsets, which
+// live in the same coordinate system (both the event's start/end_offset and the
+// detector's MaskMeta spans are raw-frame offsets into the very payload this
+// function receives as `head`). See injectWireLabels for why the join is per
+// PIECE and never across pieces.
+//
+// 🔴 The map is deliberately keyed on the span and NOT on the label: a label is
+// unique per request, but this map is consumed per piece, and building the
+// reverse direction would invite a "look up a finding by its label" call site —
+// exactly the ambiguity the three degrade paths below exist to avoid. A span
+// with no entry means "this text was not substituted by a placeholder of its
+// own", which is a meaningful answer, not a lookup failure.
+//
+// Privacy: keys are integer offsets and values are synthetic placeholder names.
+// No original text is in the returned map (the label→original table stays in
+// st, per-request memory only, never persisted/uploaded/logged).
+func renumberRestorables(head, masked string, restorables []apphook.RestorableMask, st *maskRestore, logger *slog.Logger) (string, map[[2]int]string) {
 	usable, tokens := usableRestorables(restorables, logger)
 	if len(usable) == 0 {
-		return masked
+		// Degrade path 3 (two families share one token) lands here when it drops
+		// everything: no labels are allocated, so no span gets one. The caller
+		// backfills nothing and the finding records "not placeholder-substituted",
+		// which is exactly what happened.
+		return masked, nil
 	}
 	positionsByToken := scanTokenOccurrences(masked, tokens)
 
@@ -433,6 +457,7 @@ func renumberRestorables(head, masked string, restorables []apphook.RestorableMa
 		prefix   string
 		suffix   string
 		orig     string
+		span     [2]int
 	}
 	var occs []occ
 	for _, r := range usable {
@@ -463,11 +488,13 @@ func renumberRestorables(head, masked string, restorables []apphook.RestorableMa
 				pos: pos, tokenLen: len(r.Token),
 				prefix: r.NumberedPrefix, suffix: r.NumberedSuffix,
 				orig: head[r.Spans[i][0]:r.Spans[i][1]],
+				span: r.Spans[i],
 			})
 		}
 	}
 	if len(occs) == 0 {
-		return masked
+		// Degrade path 1 (token occurrences ≠ span count) dropped every family.
+		return masked, nil
 	}
 	// Numbered in text order — the numbers the user's forwarded prompt shows must
 	// run 1,2,3… left to right regardless of which family each one belongs to.
@@ -480,12 +507,21 @@ func renumberRestorables(head, masked string, restorables []apphook.RestorableMa
 			logger.Warn("filter: restorable mask occurrences overlap; keeping numberless mask, restore skipped",
 				"event.name", observability.EventProxyFilterRestoreAlignMismatch,
 				"token_occurrences", len(occs), "spans", -1, "spans_valid", false)
-			return masked
+			// Degrade path 2 (merged occurrences overlap): the whole piece keeps the
+			// numberless mask, so no span has a label to report.
+			return masked, nil
 		}
 	}
 	// Rebuild left→right, allocating request-scoped numbers.
+	//
+	// 🔴 This is the ONE place in the entire system that composes a numbered
+	// label. Everything downstream — the response-leg restore table, the health
+	// counters, and the wire_label recorded on the compliance event — reads the
+	// labels produced HERE. Do not add a second composer anywhere (fenced by
+	// TestFilterRestore_SingleNumberingSource).
 	var sb strings.Builder
 	sb.Grow(len(masked) + len(occs)*4)
+	spanLabels := make(map[[2]int]string, len(occs))
 	last := 0
 	for _, o := range occs {
 		label := o.prefix + strconv.Itoa(st.nextN) + o.suffix
@@ -493,10 +529,11 @@ func renumberRestorables(head, masked string, restorables []apphook.RestorableMa
 		sb.WriteString(masked[last:o.pos])
 		sb.WriteString(label)
 		st.add(label, o.orig)
+		spanLabels[o.span] = label
 		last = o.pos + o.tokenLen
 	}
 	sb.WriteString(masked[last:])
-	return sb.String()
+	return sb.String(), spanLabels
 }
 
 // usableRestorables filters the child's metadata down to the families the

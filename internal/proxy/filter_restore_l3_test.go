@@ -80,7 +80,7 @@ func TestRenumberRestorables_MultiEntityNumberingAndRestore(t *testing.T) {
 	masked = maskValues(masked, "{{EMAIL}}", email)
 
 	st := newMaskRestore()
-	got := renumberRestorables(head, masked, []apphook.RestorableMask{
+	got, _ := renumberRestorables(head, masked, []apphook.RestorableMask{
 		canonicalRestorable(head, "ADDR", addr),
 		canonicalRestorable(head, "PHONE", phone),
 		canonicalRestorable(head, "EMAIL", email),
@@ -119,7 +119,7 @@ func TestRenumberRestorables_MultiEntityNumbersFollowTextOrder(t *testing.T) {
 
 	st := newMaskRestore()
 	// ADDR first on the wire even though its occurrence sits in the middle.
-	got := renumberRestorables(head, masked, []apphook.RestorableMask{
+	got, _ := renumberRestorables(head, masked, []apphook.RestorableMask{
 		canonicalRestorable(head, "ADDR", a1),
 		canonicalRestorable(head, "PHONE", p1, p2),
 	}, st, discardLogger())
@@ -153,7 +153,7 @@ func TestRenumberRestorables_SubstringTokenTrap(t *testing.T) {
 	masked := "甲<<A>>乙<<A>>丙<A>"
 
 	st := newMaskRestore()
-	got := renumberRestorables(head, masked, []apphook.RestorableMask{
+	got, _ := renumberRestorables(head, masked, []apphook.RestorableMask{
 		restorableFor(head, "<<A>>", "<<A#", ">>", v1, v2),
 		restorableFor(head, "<A>", "<A#", ">", v3),
 	}, st, discardLogger())
@@ -181,7 +181,7 @@ func TestRenumberRestorables_SubstringTokenTrapCountsAlign(t *testing.T) {
 	masked := "甲<<A>>乙<A>" // inner "<A>" also occurs inside "<<A>>" → 2 phantom-inclusive hits
 
 	st := newMaskRestore()
-	got := renumberRestorables(head, masked, []apphook.RestorableMask{
+	got, _ := renumberRestorables(head, masked, []apphook.RestorableMask{
 		restorableFor(head, "<<A>>", "<<A#", ">>", outer),
 		restorableFor(head, "<A>", "<A#", ">", inner),
 	}, st, discardLogger())
@@ -210,7 +210,7 @@ func TestRenumberRestorables_TokenLooksLikeAnotherNumberedForm(t *testing.T) {
 	masked := "甲{{A}}乙{{A_1}}"
 
 	st := newMaskRestore()
-	got := renumberRestorables(head, masked, []apphook.RestorableMask{
+	got, _ := renumberRestorables(head, masked, []apphook.RestorableMask{
 		restorableFor(head, "{{A}}", "{{A_", "}}", v1),
 		restorableFor(head, "{{A_1}}", "{{A_1_", "}}", v2),
 	}, st, discardLogger())
@@ -281,7 +281,7 @@ func TestRenumberRestorables_DuplicateTokenIsDroppedNotDoubleCounted(t *testing.
 
 	logger, buf := captureLogger()
 	st := newMaskRestore()
-	got := renumberRestorables(head, masked, []apphook.RestorableMask{
+	got, _ := renumberRestorables(head, masked, []apphook.RestorableMask{
 		restorableFor(head, "{{PHONE}}", "{{PHONE_", "}}", p1),
 		restorableFor(head, "{{PHONE}}", "{{CNPHONE_", "}}", p2),
 	}, st, logger)
@@ -311,7 +311,7 @@ func TestRenumberRestorables_DuplicateTokenDoesNotDisarmOtherFamilies(t *testing
 	masked := maskValues(maskValues(head, "{{ADDR}}", addr), "{{PHONE}}", p1, p2)
 
 	st := newMaskRestore()
-	got := renumberRestorables(head, masked, []apphook.RestorableMask{
+	got, _ := renumberRestorables(head, masked, []apphook.RestorableMask{
 		canonicalRestorable(head, "ADDR", addr),
 		restorableFor(head, "{{PHONE}}", "{{PHONE_", "}}", p1),
 		restorableFor(head, "{{PHONE}}", "{{CNPHONE_", "}}", p2),
