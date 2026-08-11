@@ -189,6 +189,16 @@ const (
 	// without splitting the join, so it names a code defect, not a content event.
 	EventProxyFilterActionCapped        = "proxy.filter.action_capped"
 	EventProxyFilterMaskUnwritablePiece = "proxy.filter.mask_unwritable_piece"
+	// EventProxyFilterProbeExcluded: a Probe-pipeline request (mode C,
+	// /probe/<alias>/v1/..., RouteSource "probe") reached the compliance entry
+	// point and was skipped WITHOUT entering the chain. Its payload is aikey's
+	// own fixed degrade-detection probe, not employee content: masking it would
+	// change the prompt the response fingerprint is measured against, and the
+	// resulting event would attribute aikey's text to the employee. DEBUG, one
+	// line per probe — it is the expected path, logged only so an operator
+	// debugging "why is there no compliance event for this request" can see the
+	// reason instead of inferring it from silence. Carries no content.
+	EventProxyFilterProbeExcluded = "proxy.filter.probe_excluded"
 	// Oauth-group routing (N8). EventProxyGroupRouteResolved: a group VK request
 	// picked + injected a candidate account. EventProxyGroupRouteDegraded: no
 	// usable candidate (no material / all expired-exhausted / key unavailable) →

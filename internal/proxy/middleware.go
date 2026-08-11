@@ -106,6 +106,33 @@ func isAikeyProbe(r *http.Request) bool {
 	return r != nil && r.Header.Get(headerAikeyProbe) == "1"
 }
 
+// routeSourceProbe is the ResolvedRoute.RouteSource stamped by
+// handleProbePipeline (mode C, /probe/<alias>/v1/...). It is the ONE name for
+// "this request came out of the Probe pipeline"; before it existed the concept
+// was a bare "probe" literal repeated at the producer and re-derived by hand at
+// every consumer, which is how the compliance exclusion below got lost.
+const routeSourceProbe = "probe"
+
+// isProbePipelineRoute reports whether a resolved route came from the Probe
+// pipeline. THE single exit for that question — consumers must call this rather
+// than compare RouteSource to a literal.
+//
+// Why it is not the same predicate as isAikeyProbe: the two describe different
+// trust levels and must not be merged.
+//
+//   - isProbePipelineRoute is derived SERVER-SIDE from the path the request
+//     arrived on (/probe/<alias>/...), after probepipe.Authenticate. The payload
+//     on that path is aikey's own fixed degrade-detection probe, and the pipeline
+//     can only resolve the caller's own PERSONAL aliases — it cannot reach a team
+//     virtual key at all.
+//   - isAikeyProbe is a CLIENT-SET header (X-Aikey-Probe: 1) that rides on any
+//     route including team virtual keys. It already suppresses usage accounting
+//     and quota; extending it to compliance would hand every employee a one-header
+//     DLP bypass on the team lane. Deliberately NOT done — 安全 > UX.
+func isProbePipelineRoute(routeSource string) bool {
+	return routeSource == routeSourceProbe
+}
+
 // extractVirtualKey extracts a token from the request that belongs to the
 // `aikey_*` namespace. Returns "" if the header is missing or the token is
 // not in the aikey namespace (native tokens like sk-... handled separately).

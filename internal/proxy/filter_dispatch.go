@@ -112,6 +112,44 @@ func (p *Proxy) applyInboundFilter(
 		return true
 	}
 
+	// 🔴 PROBE EXCLUSION — the Probe pipeline is never touched by compliance.
+	//
+	// WHY (two independent harms, either one sufficient):
+	//  1. Detection correctness. The degrade detector judges a model by the
+	//     response fingerprint (chunk count / ITT rhythm) of a FIXED prompt
+	//     (ai-degrade-detector shared/algorithms/rhythm.py CANONICAL_L3_PROBE).
+	//     Masking rewrites that prompt, so the model answers a different question
+	//     and every baseline comparison is invalid — with no symptom anywhere.
+	//  2. Content attribution. A masked probe emits a compliance event. Its
+	//     RouteSource is not "team", so the detector reports it on the personal
+	//     lane: on Personal/Trial that lane runs in LocalIntake mode and carries
+	//     the UN-REDACTED context_snippet unconditionally, which renders aikey's
+	//     own probe text on the member self-view as "the content YOU sent"; on
+	//     Production/Cluster the detector uploads the same event to
+	//     control-master, where it lands in the administrator's audit log. Both
+	//     are synthetic traffic polluting a record whose value is that every row
+	//     is a real person's real prompt.
+	//
+	// WHY HERE and not in handleProbePipeline: this is the compliance chain's
+	// entry point and its only gate. Excluding at the caller would leave the
+	// exclusion to be re-derived by every future caller — which is exactly the
+	// failure this fixes (serveRoute became the shared funnel for the probe/app
+	// pipelines on 2026-05-23, the filter was installed in it on 2026-06-01, and
+	// the spec written on 2026-06-04 recorded an exclusion that had never existed).
+	//
+	// SCOPE — deliberately RouteSource only, NOT the X-Aikey-Probe header. That
+	// header is client-set and rides on team virtual keys, so honouring it here
+	// would be a one-header DLP bypass. See isProbePipelineRoute.
+	//
+	// Fence: probe_pipeline_compliance_exclusion_fence_test.go.
+	// Spec: workflow/CI/requirements/2026-06-04-compliance-filter-direction-and-scope.md
+	if isProbePipelineRoute(routeSource) {
+		logger.Debug("filter: probe-pipeline request excluded from the compliance chain",
+			"event.name", observability.EventProxyFilterProbeExcluded,
+			"route_source", routeSource)
+		return true
+	}
+
 	// Route class decides where the compliance event goes: team keys → master
 	// (the detector returns the event and the proxy forwards it with the team
 	// credential), everything else → the detector's local self-view. Only the
