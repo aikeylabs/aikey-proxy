@@ -30,6 +30,7 @@ import (
 	"time"
 
 	"github.com/AiKeyLabs/aikey-proxy/internal/apphook"
+	"github.com/AiKeyLabs/aikey-proxy/internal/observability"
 	"github.com/AiKeyLabs/aikey-proxy/internal/proxy"
 	"github.com/AiKeyLabs/aikey-proxy/internal/vault"
 )
@@ -170,6 +171,16 @@ func (s *Supervisor) installFilterHook(p *proxy.Proxy, vaultReader *vault.Reader
 	if recordAllow {
 		recordAllowEnv = "AIKEY_COMPLIANCE_RECORD_ALLOW=1"
 	}
+	maxAction := "full"
+	if slug != "" {
+		if configured, err := vaultReader.GetFilterMaxAction(slug); err != nil {
+			slog.Warn("supervisor: read filter_max_action failed; preserving full enforcement",
+				"event.name", observability.EventProxyFilterMaxActionReadFailed, "slug", slug, "error", err)
+		} else {
+			maxAction = configured
+		}
+	}
+	maxActionEnv := "AIKEY_COMPLIANCE_FILTER_MAX_ACTION=" + maxAction
 
 	// Explicitly enable the detector's Personal/Trial local-intake path. Why an
 	// explicit flag instead of letting the detector self-decide: the detector
@@ -198,7 +209,7 @@ func (s *Supervisor) installFilterHook(p *proxy.Proxy, vaultReader *vault.Reader
 	//
 	// 🔴 READ THE ATOMIC, NEVER THE ENVIRONMENT OR THE VAULT. There is
 	// deliberately no local override: the person whose prompts these are must not
-	// be able to authorise sending them, and an admin must not have to trust that
+	// be able to authorize sending them, and an admin must not have to trust that
 	// every machine in the fleet was configured correctly. If this ever grows an
 	// `os.Getenv` fallback "for testing", that is the fence gone.
 	//
@@ -209,7 +220,7 @@ func (s *Supervisor) installFilterHook(p *proxy.Proxy, vaultReader *vault.Reader
 	privacyTierEnv := "AIKEY_COMPLIANCE_PRIVACY_TIER=" +
 		strconv.FormatInt(s.masterPrivacyTier.Load(), 10)
 
-	extraEnv := []string{recordAllowEnv, localIntakeEnv, privacyTierEnv}
+	extraEnv := []string{recordAllowEnv, maxActionEnv, localIntakeEnv, privacyTierEnv}
 	// Resolve the pack-pull backend + tenant for the detector. Personal/Trial read
 	// the team URL from the CLI's config.json (no tenant scoping — one user, one
 	// view). A CLUSTER node has no CLI config.json; its control URL + org come from
@@ -312,7 +323,8 @@ func (s *Supervisor) installFilterHook(p *proxy.Proxy, vaultReader *vault.Reader
 		"content_hash_cache", cacheOn,
 		"content_hash_cache_window", cacheWindow,
 		"scan_roles", scanRoles,
-		"tool_block_scan", toolBlocks)
+		"tool_block_scan", toolBlocks,
+		"filter_max_action", maxAction)
 	return pool
 }
 
@@ -418,7 +430,7 @@ func appBinaryFileName(slug string) string {
 // filterTimeout resolves the per-Detect deadline: env override (ms) if a valid
 // positive integer, else filterDefaultTimeout.
 //
-// An override BELOW the detector's own lane budget is honoured (operators own
+// An override BELOW the detector's own lane budget is honored (operators own
 // their boxes) but WARNed, because its practical effect is not "faster" but
 // "silently unmasked" — see the filterDefaultTimeout note. 日志规范: a value that
 // disables a safety control must never be accepted in silence.

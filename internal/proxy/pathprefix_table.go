@@ -148,7 +148,8 @@ func buildClientPathPrefixTable(entries []providerregistry.Entry) *clientPathPre
 		t.byFirstSegment[seg] = append(t.byFirstSegment[seg], clientPathPrefix{prefix: prefix, code: code})
 	}
 
-	for _, e := range entries {
+	for i := range entries {
+		e := &entries[i]
 		proxyPath := strings.Trim(strings.TrimSpace(e.ProxyPath), "/")
 		if proxyPath == "" {
 			// No client namespace at all — see the `mock` note in the file header.

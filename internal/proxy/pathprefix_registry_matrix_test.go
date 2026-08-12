@@ -21,7 +21,7 @@ package proxy
 // are what this file measures:
 //
 //	D-1  proxy/middleware.go extractProviderFromPath's `known[]` slice — the
-//	     list of path prefixes the proxy would even recognise. Hand-written,
+//	     list of path prefixes the proxy would even recognize. Hand-written,
 //	     16 entries against the registry's 28 picker:true providers, so 15 of
 //	     them were selectable in the CLI picker and completely unroutable.
 //	     FIXED: the prefix table is derived from provider_registry.yaml
@@ -136,7 +136,7 @@ func deriveMatrixCases(t *testing.T) []matrixCase {
 	reg := providerregistry.Default()
 	table := provider.Routes()
 
-	var cases []matrixCase
+	cases := make([]matrixCase, 0, len(reg.Entries()))
 	for _, e := range reg.Entries() {
 		if !e.Picker {
 			continue // picker:false (mock, google) is not offered in the CLI picker

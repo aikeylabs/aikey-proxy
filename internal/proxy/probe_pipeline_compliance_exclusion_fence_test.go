@@ -22,7 +22,7 @@ import (
 // 不过滤"). It was never true for the probe pipeline: the compliance dispatcher was
 // added to serveRoute on 2026-06-01 (ef816e0) and serveRoute is the single funnel
 // handleProbePipeline delegates to (added 2026-05-23, cd8c844). The spec was
-// written three days AFTER the behaviour it denies, and nothing machine-checkable
+// written three days AFTER the behavior it denies, and nothing machine-checkable
 // stood behind it, so it read as a guarantee for 10 weeks while probes were in
 // fact scanned, masked and turned into compliance events.
 //
@@ -51,6 +51,13 @@ import (
 // spyFilterHook is a minimal apphook.Hook that records every Detect call and
 // always masks, so "was the compliance chain entered?" and "was the payload
 // rewritten?" are both observable without the real detector binary.
+//
+// SHARED BY THREE MIRRORED FENCES ON PURPOSE — one spy, so they cannot drift:
+//   - this file                                     probe pipeline  → EXEMPT
+//   - app_pipeline_compliance_inclusion_fence_test.go  App pipeline → SCANNED
+//   - probe_raw_compliance_exclusion_fence_test.go   pre-save probe → EXEMPT
+//
+// Changing any one of them means reading the other two.
 type spyFilterHook struct {
 	mu       sync.Mutex
 	payloads [][]byte

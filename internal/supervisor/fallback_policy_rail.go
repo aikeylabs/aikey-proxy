@@ -85,7 +85,7 @@ const maxFallbackPolicyBody = 64 << 10
 const fallbackPolicyNodeHeader = "X-Aikey-Node-Id"
 
 const (
-	clusterControlServiceTokenEnv = "AIKEY_CONTROL_SERVICE_TOKEN"
+	clusterControlServiceTokenEnv = "AIKEY_CONTROL_SERVICE_TOKEN" // #nosec G101 -- environment variable name, never a credential value
 	clusterOrgIDEnv               = "AIKEY_HUB_ORG_ID"
 )
 

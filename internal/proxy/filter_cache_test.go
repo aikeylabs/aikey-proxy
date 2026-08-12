@@ -41,6 +41,10 @@ func TestFilterCache_HistoryReuse(t *testing.T) {
 	if hook.called != 5 { // +1(assistant y 首次) +1(C 首次);A/x/B 全命中
 		t.Errorf("turn3: Detect 累计 %d, want 5(A/x/B 命中缓存,只扫新增的 y 与 C)", hook.called)
 	}
+	performance := p.FilterPerformanceSnapshot()
+	if performance.Cold.Count != 1 || performance.Incremental.Count != 2 {
+		t.Fatalf("real requests were not split into cold/incremental lanes: %+v", performance)
+	}
 }
 
 // 缓存关闭(filterCache nil)→ 同内容每次都扫(无状态全量扫,INV-6)。

@@ -292,8 +292,7 @@ func frameLineTerminator(line []byte) []byte {
 // `choices.0.delta.reasoning_content` (a sibling of the `content` field this
 // looks up) all already pass through untouched.
 func sseTextFieldPath(payload []byte) string {
-	switch gjson.GetBytes(payload, "type").String() {
-	case "content_block_delta":
+	if gjson.GetBytes(payload, "type").String() == "content_block_delta" {
 		if gjson.GetBytes(payload, "delta.type").String() == "text_delta" {
 			return "delta.text"
 		}

@@ -186,7 +186,8 @@ e2e-gap7: ## e2e: gap7 streaming token-extraction fences + full-proxy live E2E
 # (0 extra detector calls). Builds the detector first; the Go test skips if it's missing.
 filter-integration: ## e2e: history-leak fix + cache via real detector (builds detector first)
 	$(MAKE) -C ../ai-compliance-detector build
-	go test -tags integration -count=1 -run 'TestFilterIntegration' -v ./internal/proxy/
+	cargo build --manifest-path ../aikey-cli/Cargo.toml --bin aikey
+	AIKEY_CLI_TEST_BIN="$(abspath ../aikey-cli/target/debug/aikey)" go test -tags integration -count=1 -run 'TestFilterIntegration' -v ./internal/proxy/ ./internal/supervisor/
 
 run: build
 	./bin/aikey-proxy --config bin/$(CONFIG)

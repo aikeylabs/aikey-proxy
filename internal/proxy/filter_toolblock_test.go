@@ -177,7 +177,7 @@ func TestBlockScanPolicy_UnwritablePiecesCannotBeMaskable(t *testing.T) {
 	}
 }
 
-// ── extraction behaviour ─────────────────────────────────────────────────────
+// ── extraction behavior ──────────────────────────────────────────────────────
 
 func piecesOf(t *testing.T, body string) []contentPiece {
 	t.Helper()
@@ -325,7 +325,7 @@ func TestCollectContentField_NestingIsDepthBounded(t *testing.T) {
 
 // ── end-to-end through the dispatcher ────────────────────────────────────────
 
-// TestActionCeiling_ToolBlockVerdictsNeverMaskOrBlock is the behavioural half of
+// TestActionCeiling_ToolBlockVerdictsNeverMaskOrBlock is the behavioral half of
 // the "same switch" fence: even with a detector that BLOCKS everything, a body
 // whose only findable content is a tool payload must be forwarded untouched.
 // The same detector applied to a prose block must still block — otherwise the

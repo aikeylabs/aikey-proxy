@@ -235,16 +235,13 @@ func signalAuthFailurePath() (string, error) {
 // enqueueAuthFailure performs no network work on the request path. It makes one
 // rare, bounded local state-file write so a Proxy crash cannot lose the only
 // hard-revocation observation; network delivery always happens in loop().
-func (r *signalReporter) enqueueAuthFailure(credentialID, oauthGroupID, seatID, tokenFingerprint, reason string) {
+func (r *signalReporter) enqueueAuthFailure(credentialID, oauthGroupID, seatID, tokenFingerprint string) {
 	if r == nil || credentialID == "" || oauthGroupID == "" || seatID == "" || tokenFingerprint == "" {
 		return
 	}
-	if reason == "" {
-		reason = "token_revoked"
-	}
 	sample := authFailureSample{
 		CredentialID: credentialID, OAuthGroupID: oauthGroupID, SeatID: seatID,
-		TokenFingerprint: tokenFingerprint, Reason: reason,
+		TokenFingerprint: tokenFingerprint, Reason: "token_revoked",
 	}
 	r.authMu.Lock()
 	if r.authFailures == nil {
@@ -319,9 +316,9 @@ func (r *signalReporter) persistAuthFailuresLocked() {
 		return
 	}
 	if len(r.authFailures) == 0 {
-		if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
+		if removeErr := os.Remove(path); removeErr != nil && !os.IsNotExist(removeErr) {
 			r.logger.Warn("auth-failure signal outbox remove failed",
-				"event.name", observability.EventProxySignalAuthFailureStateWriteFailed, "error", err)
+				"event.name", observability.EventProxySignalAuthFailureStateWriteFailed, "error", removeErr)
 		}
 		return
 	}
@@ -521,8 +518,8 @@ func (r *signalReporter) loop() {
 	}
 }
 
-func (r *signalReporter) post(samples []signalSample, revoked []revokedSample, rateLimits []rateLimitSample, concurrency []concurrencySample) bool {
-	return r.postAll(samples, revoked, r.snapshotAuthFailures(), rateLimits, concurrency)
+func (r *signalReporter) post(samples []signalSample, revoked []revokedSample, rateLimits []rateLimitSample, concurrency []concurrencySample) {
+	r.postAll(samples, revoked, r.snapshotAuthFailures(), rateLimits, concurrency)
 }
 
 func (r *signalReporter) postAll(samples []signalSample, revoked []revokedSample, authFailures []authFailureSample, rateLimits []rateLimitSample, concurrency []concurrencySample) bool {

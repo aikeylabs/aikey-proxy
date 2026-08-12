@@ -133,14 +133,14 @@ func TestCooldownDecision_TemporaryFallbackIsPoolConfigurable(t *testing.T) {
 	}
 	withRetryAfter := temporary.Clone()
 	withRetryAfter.Set("Retry-After", "23")
-	if until, ok := cooldownDecisionWithTemporaryFallback(resp(429, withRetryAfter), now, 11*time.Second); !ok || until != now.Add(23*time.Second) {
+	if until, ok := cooldownDecisionWithTemporaryFallback(resp(429, withRetryAfter), now, 11*time.Second); !ok || until != now.Add(23*time.Second) { //nolint:bodyclose // synthetic response: no Body, no transport — nothing to close
 		t.Fatalf("Retry-After must override the pool fallback, got until=%v ok=%v", until, ok)
 	}
 	resetAt := now.Add(4 * time.Minute)
 	withWindowReset := temporary.Clone()
 	withWindowReset.Set("Anthropic-Ratelimit-Unified-5h-Status", "exhausted")
 	withWindowReset.Set("Anthropic-Ratelimit-Unified-5h-Reset", strconv.FormatInt(resetAt.Unix(), 10))
-	if until, ok := cooldownDecisionWithTemporaryFallback(resp(429, withWindowReset), now, 11*time.Second); !ok || until != resetAt {
+	if until, ok := cooldownDecisionWithTemporaryFallback(resp(429, withWindowReset), now, 11*time.Second); !ok || until != resetAt { //nolint:bodyclose // synthetic response: no Body, no transport — nothing to close
 		t.Fatalf("exhausted-window reset must override the pool fallback, got until=%v ok=%v", until, ok)
 	}
 }

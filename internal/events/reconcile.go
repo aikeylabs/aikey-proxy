@@ -36,7 +36,7 @@ type AuditStatus struct {
 // DeadLetterEvents counts the individual events inside them.
 type ComplianceDeliveryStatus struct {
 	// LastFailureReason is the last upload error verbatim (status + response
-	// body excerpt). A version-skew rejection is recognisable here by the
+	// body excerpt). A version-skew rejection is recognizable here by the
 	// master's own "unknown field" text.
 	LastFailureReason string `json:"last_failure_reason,omitempty"`
 	// LastFailureAt is Unix epoch milliseconds (UTC), 0 when this process has

@@ -487,7 +487,7 @@ func (p *Proxy) serveGroupAttempt(
 	}
 	errType, _ := parseUpstreamErrorEnvelope(fw.buf.Bytes())
 	hardRevoked := res.CredentialType == credTypeOAuth && res.OAuth != nil &&
-		isHardRevoked(fw.status, errType, string(fw.buf.Bytes()))
+		isHardRevoked(fw.status, errType, fw.buf.String())
 	if hardRevoked {
 		p.poolCooldown.markAuthFailedToken(route.OauthGroupID, route.SeatID, res.AccountID, oauthTokenFingerprint(res.OAuth.AccessToken))
 	} else if fw.status == http.StatusUnauthorized {

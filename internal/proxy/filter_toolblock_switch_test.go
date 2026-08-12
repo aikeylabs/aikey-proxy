@@ -68,7 +68,7 @@ func TestToolBlockSwitch_OffExtractsNothingFromToolBlocks(t *testing.T) {
 	// The pre-2026-08-10 contract for a tool-only turn: nothing scannable, so the
 	// dispatcher takes its "no filterable content" branch.
 	if ok && len(pieces) == 0 {
-		t.Log("tool-only turn yielded zero pieces (pre-方案② behaviour) — correct")
+		t.Log("tool-only turn yielded zero pieces (before the audit-only design) — correct")
 	}
 }
 

@@ -78,7 +78,7 @@ func TestRestoreSkip_LiveSetCoversToolBlocks(t *testing.T) {
 	}
 }
 
-// TestRestoreBody_ToolUseArgumentKeepsPlaceholder is the behavioural half: an
+// TestRestoreBody_ToolUseArgumentKeepsPlaceholder is the behavioral half: an
 // end-to-end non-streaming response where the model echoed the placeholder into
 // BOTH its answer text and a tool_use argument.
 func TestRestoreBody_ToolUseArgumentKeepsPlaceholder(t *testing.T) {

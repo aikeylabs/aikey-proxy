@@ -314,7 +314,7 @@ func TestClientPathPrefixTable_DoesNotClaimReservedNamespaces(t *testing.T) {
 // TestClientPathPrefixTable_NoConflictingPrefixes asserts that no two providers
 // want the same prefix.
 //
-// buildClientPathPrefixTable resolves such a clash first-wins so behaviour stays
+// buildClientPathPrefixTable resolves such a clash first-wins so behavior stays
 // deterministic, but first-wins on a real clash is a SILENT MISROUTE: one
 // provider's traffic would be resolved with another's credential and base_url.
 // The registry's own invariants (unique codes, aliases that cannot collide) make

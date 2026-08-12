@@ -236,9 +236,10 @@ func (c actionCeiling) clamp(a apphook.Action) (effective apphook.Action, capped
 	switch a {
 	case apphook.ActionMask, apphook.ActionBlock:
 		return apphook.ActionAllow, true
-	default:
+	case apphook.ActionAllow, apphook.ActionWarn:
 		return a, false
 	}
+	return a, false
 }
 
 // String renders the ceiling for logs / audit records. Deliberately uses the

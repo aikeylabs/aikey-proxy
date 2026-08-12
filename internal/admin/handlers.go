@@ -112,6 +112,10 @@ type Handler struct {
 	// the handler maps that to `{available:false}`, never a 5xx. Drives the Web
 	// "effective packs" drawer on the self-view compliance page.
 	EffectivePacksFn func(ctx context.Context) ([]byte, error)
+	// FilterPerformanceFn exposes a bounded, content-free rolling latency
+	// distribution from the active Proxy generation. It is kept alongside the
+	// live detector report so rollout automation reads one health surface.
+	FilterPerformanceFn func() ComplianceFilterPerformance
 
 	// AuditStatusFn / ReconcileGapsFn drive `aikey audit` (D2.5 / D3): the local
 	// client delivery state, and the client-confirmed reconciliation pass
@@ -747,8 +751,25 @@ func (h *Handler) AppHealth(w http.ResponseWriter, r *http.Request) {
 // Web can distinguish "no compliance filter active" (available:false) from a
 // real report. report is the detector's {built_in,pulled,cursor} JSON verbatim.
 type CompliancePacksEnvelope struct {
-	Report    json.RawMessage `json:"report,omitempty"`
-	Available bool            `json:"available"`
+	Report      json.RawMessage              `json:"report,omitempty"`
+	Performance *ComplianceFilterPerformance `json:"performance,omitempty"`
+	Available   bool                         `json:"available"`
+}
+
+type ComplianceFilterLatencyLane struct {
+	Count            uint64  `json:"count"`
+	WindowSamples    int     `json:"window_samples"`
+	P50Ms            float64 `json:"p50_ms"`
+	P95Ms            float64 `json:"p95_ms"`
+	Under15MsPercent float64 `json:"under_15ms_percent"`
+}
+
+type ComplianceFilterPerformance struct {
+	WindowSize       int                         `json:"window_size"`
+	SamplesStartedAt string                      `json:"samples_started_at,omitempty"`
+	LastObservedAt   string                      `json:"last_observed_at,omitempty"`
+	Incremental      ComplianceFilterLatencyLane `json:"incremental"`
+	Cold             ComplianceFilterLatencyLane `json:"cold"`
 }
 
 // CompliancePacks returns the compliance packs currently effective in the LIVE
@@ -761,16 +782,21 @@ type CompliancePacksEnvelope struct {
 // a NORMAL state, not an error — returns {available:false} with 200 so the data
 // plane and the Web both treat it gracefully.
 func (h *Handler) CompliancePacks(w http.ResponseWriter, r *http.Request) {
+	var performance *ComplianceFilterPerformance
+	if h.FilterPerformanceFn != nil {
+		snapshot := h.FilterPerformanceFn()
+		performance = &snapshot
+	}
 	if h.EffectivePacksFn == nil {
-		writeJSON(w, http.StatusOK, CompliancePacksEnvelope{Available: false})
+		writeJSON(w, http.StatusOK, CompliancePacksEnvelope{Available: false, Performance: performance})
 		return
 	}
 	report, err := h.EffectivePacksFn(r.Context())
 	if err != nil || len(report) == 0 {
-		writeJSON(w, http.StatusOK, CompliancePacksEnvelope{Available: false})
+		writeJSON(w, http.StatusOK, CompliancePacksEnvelope{Available: false, Performance: performance})
 		return
 	}
-	writeJSON(w, http.StatusOK, CompliancePacksEnvelope{Available: true, Report: report})
+	writeJSON(w, http.StatusOK, CompliancePacksEnvelope{Available: true, Report: report, Performance: performance})
 }
 
 // HealthKeys tests whether the active key can authenticate to its provider(s)

@@ -3,11 +3,54 @@ package apphook
 import (
 	"context"
 	"fmt"
+	"os"
+	"path/filepath"
+	"runtime"
 	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
 )
+
+func TestChildHookShutdownClosesStdinForGracefulAuditFlush(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("shell child fixture is Unix-only")
+	}
+	tmp := t.TempDir()
+	marker := filepath.Join(tmp, "flushed")
+	child := filepath.Join(tmp, "child.sh")
+	script := `#!/bin/sh
+marker="$1"
+trap 'exit 99' INT TERM
+printf 'ready\n' >&2
+while IFS= read -r _line; do :; done
+printf 'flushed\n' > "$marker"
+`
+	if err := os.WriteFile(child, []byte(script), 0o700); err != nil {
+		t.Fatalf("write child fixture: %v", err)
+	}
+
+	h := NewChildHook(&ChildHookConfig{
+		Name:         "graceful-shutdown-test",
+		BinaryPath:   child,
+		BinaryArgs:   []string{marker},
+		// Match the package's other child fixtures. Two seconds flakes when
+		// release gates compile Rust and run Go race tests concurrently, before
+		// this tiny shell process gets scheduled at all.
+		ReadyTimeout: 5 * time.Second,
+	})
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if err := h.Start(ctx); err != nil {
+		t.Fatalf("start fixture: %v", err)
+	}
+	if err := h.Shutdown(ctx); err != nil {
+		t.Fatalf("shutdown fixture: %v", err)
+	}
+	if got, err := os.ReadFile(marker); err != nil || string(got) != "flushed\n" {
+		t.Fatalf("child did not observe stdin EOF and flush before exit: got=%q err=%v", got, err)
+	}
+}
 
 // TestChildHook_ConcurrentDetect — Phase 1 (v3 request-id multiplexing): many
 // goroutines fire Detect on ONE ChildHook at once. The async demux must match

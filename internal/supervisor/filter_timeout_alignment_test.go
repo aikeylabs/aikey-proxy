@@ -113,7 +113,7 @@ func TestFilterTimeout_EnvOverrideKeepsTheRelationship(t *testing.T) {
 	}
 	t.Setenv(filterTimeoutMsEnv, "1")
 	if got := filterTimeout(); got != time.Millisecond {
-		t.Fatalf("an explicit override must still be honoured (operators own their boxes); got %s", got)
+		t.Fatalf("an explicit override must still be honored (operators own their boxes); got %s", got)
 	}
 	t.Setenv(filterTimeoutMsEnv, "")
 	if got := filterTimeout(); got != filterDefaultTimeout {

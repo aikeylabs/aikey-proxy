@@ -532,7 +532,7 @@ func TestFilterIntegration_P4RestoreLeakThroughRealDetector(t *testing.T) {
 	// A restorable entity: the detector masks CN phone numbers to {{PHONE_N}} and
 	// the response leg swaps the original back — exactly the "既 mask 又还原" class
 	// that makes the assistant path a leak (方案 §2.2 触发条件).
-	const phone = "13812345678"
+	const phone = "13857492631"
 
 	send := func(roles []string, sess string) string {
 		p := &Proxy{}
@@ -600,13 +600,19 @@ func TestFilterIntegration_P4AssistantScanCost(t *testing.T) {
 	// path being priced. The assistant reply repeats it (that is what restoration
 	// puts in the client's history) and is padded to 1–4KB of prose.
 	filler := "这里是模型给出的详细说明与后续建议,包含背景梳理、执行步骤、风险提示以及可选方案的对比分析。"
+	phoneFor := func(s, turn int) string {
+		// Deterministic synthetic values keep this performance acceptance free of
+		// customer data while avoiding obvious sequences/repeated-digit examples.
+		tail := (246813579 + (s+1)*7919 + turn*104729) % 1_000_000_000
+		return fmt.Sprintf("1%d%09d", 3+(s*3+turn)%7, tail)
+	}
 	userMsg := func(s, turn int) string {
-		return fmt.Sprintf("会话%d 第%d轮:请帮我处理这条客户信息,联系电话 138%08d,处理完请总结要点。", s, turn, s*1000+turn)
+		return fmt.Sprintf("会话%d 第%d轮:请帮我处理这条客户信息,联系电话 %s,处理完请总结要点。", s, turn, phoneFor(s, turn))
 	}
 	assistantMsg := func(s, turn int) string {
 		want := 1024 * (1 + turn%4) // 1KB / 2KB / 3KB / 4KB
 		var b strings.Builder
-		fmt.Fprintf(&b, "好的。已记录会话%d 第%d轮的联系电话 138%08d,以下是处理结果:", s, turn, s*1000+turn)
+		fmt.Fprintf(&b, "好的。已记录会话%d 第%d轮的联系电话 %s,以下是处理结果:", s, turn, phoneFor(s, turn))
 		for b.Len() < want {
 			b.WriteString(filler)
 		}
@@ -615,8 +621,8 @@ func TestFilterIntegration_P4AssistantScanCost(t *testing.T) {
 	// The CN address recognizer (NER/CRF) is the most expensive lane, and it runs
 	// whether the verdict is audit or mask — so a separate run prices it.
 	addrUserMsg := func(s, turn int) string {
-		return fmt.Sprintf("会话%d 第%d轮:请把样品寄到北京市朝阳区建国路%d号院万达广场1号楼2单元301,联系电话 138%08d。",
-			s, turn, 80+turn, s*1000+turn)
+		return fmt.Sprintf("会话%d 第%d轮:请把样品寄到北京市朝阳区建国路%d号院万达广场1号楼2单元301,我的联系电话 %s。",
+			s, turn, 80+turn, phoneFor(s, turn))
 	}
 
 	type result struct {
@@ -627,6 +633,7 @@ func TestFilterIntegration_P4AssistantScanCost(t *testing.T) {
 		p50, p95    time.Duration
 		wall        time.Duration
 		leakedPlain int
+		blocked     int
 	}
 
 	run := func(label string, roles []string, user func(int, int) string) result {
@@ -640,6 +647,7 @@ func TestFilterIntegration_P4AssistantScanCost(t *testing.T) {
 
 		lat := make([]time.Duration, 0, sessions*turns)
 		leaked := 0
+		blocked := 0
 		t0 := time.Now()
 		for s := 0; s < sessions; s++ {
 			sess := fmt.Sprintf("%s-sess-%d", label, s)
@@ -650,15 +658,18 @@ func TestFilterIntegration_P4AssistantScanCost(t *testing.T) {
 				r := newReq(body)
 				r.Header.Set("X-Claude-Code-Session-Id", sess)
 				start := time.Now()
-				p.applyInboundFilter(httptest.NewRecorder(), r, "claude-3", "personal", "", "", "",
+				forwarded := p.applyInboundFilter(httptest.NewRecorder(), r, "claude-3", "personal", "", "", "",
 					resolveSessionID(r, "anthropic", "anthropic"), "", logger)
 				lat = append(lat, time.Since(start))
+				if !forwarded {
+					blocked++
+				}
 				// Leak check on the LAST turn only (cheap): no plaintext phone from
 				// an earlier assistant turn may survive in the forwarded body.
-				if turn == turns {
+				if forwarded && turn == turns {
 					out := readReqBody(t, r)
 					for k := 1; k < turns; k++ {
-						if strings.Contains(out, fmt.Sprintf("138%08d", s*1000+k)) {
+						if strings.Contains(out, phoneFor(s, k)) {
 							leaked++
 						}
 					}
@@ -671,7 +682,7 @@ func TestFilterIntegration_P4AssistantScanCost(t *testing.T) {
 			label: label, calls: counter.calls.Load(),
 			hits: stats.hits, miss: stats.miss, pieces: stats.pieces,
 			p50: pctl(lat, 50), p95: pctl(lat, 95), wall: time.Since(t0),
-			leakedPlain: leaked,
+			leakedPlain: leaked, blocked: blocked,
 		}
 	}
 
@@ -688,23 +699,23 @@ func TestFilterIntegration_P4AssistantScanCost(t *testing.T) {
 		run("P4 地址路(NER)", nil, addrUserMsg),
 	}
 
-	t.Logf("P4 多轮场景实测 —— %d 会话 × %d 轮,每轮全量重发历史,assistant 回复 1–4KB,真 detector + 生产缓存(window=1000)",
+	t.Logf("P4 multi-turn run: %d sessions x %d turns; each turn resends history, assistant replies are 1-4KB, real detector + production cache(window=1000)",
 		sessions, turns)
-	t.Logf("%-22s | %-8s | %-8s | %-9s | %-9s | %-10s | %-9s | %-9s | %s",
-		"策略", "片段数", "真扫次数", "缓存命中", "命中率", "S1 p50", "S1 p95", "总耗时", "assistant 原文泄漏")
+	t.Logf("%-22s | %-8s | %-8s | %-9s | %-9s | %-10s | %-9s | %-9s | %-8s | %s",
+		"policy", "pieces", "scans", "cache hits", "hit rate", "S1 p50", "S1 p95", "wall time", "blocked", "forwarded assistant leaks")
 	for _, r := range results {
 		hr := 0.0
 		if r.hits+r.miss > 0 {
 			hr = 100 * float64(r.hits) / float64(r.hits+r.miss)
 		}
-		t.Logf("%-22s | %-8d | %-8d | %-9d | %-8.1f%% | %-10v | %-9v | %-9v | %d",
+		t.Logf("%-22s | %-8d | %-8d | %-9d | %-8.1f%% | %-10v | %-9v | %-9v | %-8d | %d",
 			r.label, r.pieces, r.calls, r.hits, hr,
 			r.p50.Round(10*time.Microsecond), r.p95.Round(10*time.Microsecond),
-			r.wall.Round(time.Millisecond), r.leakedPlain)
+			r.wall.Round(time.Millisecond), r.blocked, r.leakedPlain)
 	}
 
 	base, p4 := results[0], results[1]
-	t.Logf("detector 调用增量:%d → %d(+%d,+%.0f%%);片段数增量:%d → %d(+%.0f%%)",
+	t.Logf("detector call delta: %d -> %d (+%d,+%.0f%%); piece delta: %d -> %d (+%.0f%%)",
 		base.calls, p4.calls, p4.calls-base.calls,
 		100*float64(p4.calls-base.calls)/float64(base.calls),
 		base.pieces, p4.pieces, 100*float64(p4.pieces-base.pieces)/float64(base.pieces))

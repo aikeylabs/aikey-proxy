@@ -65,7 +65,7 @@ func TestExtractLatestUserContent_SafetyFallbacks(t *testing.T) {
 	}
 }
 
-// TestExtractLatestUserContent_ToolResultNowYieldsPieces records the behaviour
+// TestExtractLatestUserContent_ToolResultNowYieldsPieces records the behavior
 // change above in the positive direction, so the swap in the table cannot be
 // mistaken for a test that was quietly weakened. Before 2026-08-10 a Claude Code
 // turn ending in a tool_result reduced to ZERO pieces here; that reduction was

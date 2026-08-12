@@ -440,6 +440,8 @@ func scanTokenOccurrences(s string, tokens []string) map[string][]int {
 // Privacy: keys are integer offsets and values are synthetic placeholder names.
 // No original text is in the returned map (the label→original table stays in
 // st, per-request memory only, never persisted/uploaded/logged).
+//
+//nolint:gocritic // unnamed results keep 20+ call sites readable; both values have distinct types and roles.
 func renumberRestorables(head, masked string, restorables []apphook.RestorableMask, st *maskRestore, logger *slog.Logger) (string, map[[2]int]string) {
 	usable, tokens := usableRestorables(restorables, logger)
 	if len(usable) == 0 {

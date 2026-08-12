@@ -56,19 +56,19 @@ func sseTestState(labels map[string]string) *maskRestore {
 }
 
 func anthropicTextFrame(text string) string {
-	b, _ := sjsonSetForTest(`{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":""}}`, "delta.text", text)
+	b := sjsonSetForTest(`{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":""}}`, text)
 	return "event: content_block_delta\ndata: " + b + "\n\n"
 }
 
 // sjsonSetForTest avoids importing sjson twice with helpers; simple manual set.
-func sjsonSetForTest(payload, path, text string) (string, error) {
+func sjsonSetForTest(payload, text string) string {
 	// tests only set delta.text — inline replace keeps the fixture readable.
 	const marker = `"text":""`
-	enc, _ := jsonMarshalString(text)
-	return strings.Replace(payload, marker, `"text":`+enc, 1), nil
+	enc := jsonMarshalString(text)
+	return strings.Replace(payload, marker, `"text":`+enc, 1)
 }
 
-func jsonMarshalString(s string) (string, error) {
+func jsonMarshalString(s string) string {
 	var sb strings.Builder
 	sb.WriteByte('"')
 	for _, r := range s {
@@ -84,7 +84,7 @@ func jsonMarshalString(s string) (string, error) {
 		}
 	}
 	sb.WriteByte('"')
-	return sb.String(), nil
+	return sb.String()
 }
 
 func drainAll(t *testing.T, rc io.ReadCloser) string {

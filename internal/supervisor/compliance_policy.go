@@ -178,7 +178,7 @@ const (
 )
 
 // clampPrivacyTier is the single normaliser on this side. See the note on
-// fetchComplianceMasterPolicy for why every unrecognised value must fail closed.
+// fetchComplianceMasterPolicy for why every unrecognized value must fail closed.
 func clampPrivacyTier(tier int) int {
 	if tier < privacyTierMetadataOnly || tier > privacyTierRawSnippet {
 		return privacyTierMetadataOnly

@@ -850,7 +850,7 @@ func computeFilterSig(vaultReader *vault.Reader) (string, bool) {
 		return "", false
 	}
 	sort.Strings(slugs)
-	// R9: fold each slug's filter_record_allow into the signature so a settings
+	// R9: fold each slug's filter_record_allow and filter_max_action into the signature so settings
 	// toggle (not just enable/disable) also triggers a reload — installFilterHook
 	// passes record_allow into the detector child's env, so a stale child would
 	// otherwise keep the old value until a manual reload. (filter_stages VALUE
@@ -861,9 +861,17 @@ func computeFilterSig(vaultReader *vault.Reader) (string, bool) {
 	parts := make([]string, 0, len(slugs))
 	for _, s := range slugs {
 		ra, _ := vaultReader.GetFilterRecordAllow(s)
-		parts = append(parts, fmt.Sprintf("%s:%t", s, ra))
+		maxAction, err := vaultReader.GetFilterMaxAction(s)
+		if err != nil {
+			maxAction = "invalid"
+		}
+		parts = append(parts, filterAppSignaturePart(s, ra, maxAction))
 	}
 	return strings.Join(parts, ","), true
+}
+
+func filterAppSignaturePart(slug string, recordAllow bool, maxAction string) string {
+	return fmt.Sprintf("%s:%t:%s", slug, recordAllow, maxAction)
 }
 
 // filterSigWithPrivacyTier appends the org privacy tier to the filter signature.
@@ -873,7 +881,7 @@ func computeFilterSig(vaultReader *vault.Reader) (string, bool) {
 // value it was born with, forever. So an admin lowering the tier from 3 to 1
 // would change the server's policy, change what the server STORES (the master
 // strips on ingest), and change nothing about what employees' machines SEND —
-// raw text would keep travelling the network until something unrelated caused a
+// raw text would keep traveling the network until something unrelated caused a
 // reload. Folding the tier in here makes the poller's Reload actually re-spawn.
 //
 // It is separate from computeFilterSig because that function only reads the
@@ -1213,6 +1221,16 @@ func (s *Supervisor) EffectivePacks(ctx context.Context) ([]byte, error) {
 		return nil, apphook.ErrPacksUnavailable
 	}
 	return g.filterHook.ListPacks(ctx)
+}
+
+// FilterPerformanceSnapshot returns the active generation's content-free
+// compliance latency window. Reload starts a fresh window by construction.
+func (s *Supervisor) FilterPerformanceSnapshot() proxy.FilterPerformanceSnapshot {
+	g := s.active.Load()
+	if g == nil || g.proxy == nil {
+		return proxy.FilterPerformanceSnapshot{}
+	}
+	return g.proxy.FilterPerformanceSnapshot()
 }
 
 // AppHealthSnapshot returns the active proxy generation's in-memory "most
@@ -1999,8 +2017,8 @@ func (s *Supervisor) buildGeneration() (*generation, error) {
 	masterURL := readControlPanelURL()
 	if s.cfg.Cluster.Enabled && s.cfg.Cluster.OrgID != "" && s.cfg.Cluster.ControlServiceToken != "" {
 		p.EnableOrgSignalReporting(masterURL, s.cfg.Cluster.OrgID, s.cfg.Cluster.ControlServiceToken)
-	} else if masterURL, bearer := signalReportingAuth(masterURL, s.teamCred, vaultReader); bearer != nil {
-		p.EnableSignalReporting(masterURL, bearer)
+	} else if signalURL, bearer := signalReportingAuth(masterURL, s.teamCred, vaultReader); bearer != nil {
+		p.EnableSignalReporting(signalURL, bearer)
 	}
 
 	// Only hand the WAL to the generation when nobody else closes it. If a

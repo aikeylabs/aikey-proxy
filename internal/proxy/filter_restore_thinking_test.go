@@ -123,7 +123,7 @@ func TestRestoreMaskedResponseBody_OpenAIReasoningChannelsKeepPlaceholder(t *tes
 // --- 流式:thinking_delta 退出还原通道 ----------------------------------------
 
 func anthropicThinkingFrame(text string) string {
-	enc, _ := jsonMarshalString(text)
+	enc := jsonMarshalString(text)
 	return "event: content_block_delta\ndata: " +
 		`{"type":"content_block_delta","index":0,"delta":{"type":"thinking_delta","thinking":` + enc + `}}` +
 		"\n\n"

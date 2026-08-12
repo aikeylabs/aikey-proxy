@@ -310,7 +310,7 @@ func fetchGroupRuntime(ctx context.Context, masterURL, bearer string, observedRe
 				slog.Error("control-plane still stuck reaching master after a client rebuild, and this platform does not relaunch an exited proxy — run `aikey proxy restart`",
 					"event.name", observability.EventProxyControlPlaneRestartExhausted,
 					"goos", runtime.GOOS, "error", err.Error())
-			default:
+			case restartSkipCooldown, restartNow:
 				slog.Warn("control-plane client rebuilt after network-change dial error",
 					"event.name", observability.EventProxyControlPlaneClientRebuilt, "caller", "group_runtime_poll",
 					"error", err.Error())

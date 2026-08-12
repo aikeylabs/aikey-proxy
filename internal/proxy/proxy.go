@@ -180,9 +180,13 @@ type Proxy struct {
 	// cache OFF (dispatcher skips the content-hash entirely → stateless full scan).
 	// Lives behind the hook==nil gate, so compliance OFF pays nothing (INV-6).
 	filterCache MaskCache
-	proxyCtx    context.Context   // canceled when the proxy shuts down
-	reporter    *events.Reporter  // usage reporting to collector-service (nil = disabled)
-	wal         *events.WALWriter // local JSONL WAL (shared with reporter when both set; sole writer when reporter is nil)
+	// filterPerformance is a bounded, content-free rolling latency window for
+	// the externally readable compliance health surface. It lives with the
+	// generation so a reload cannot mix samples from different detector builds.
+	filterPerformance filterPerformanceMetrics
+	proxyCtx          context.Context   // canceled when the proxy shuts down
+	reporter          *events.Reporter  // usage reporting to collector-service (nil = disabled)
+	wal               *events.WALWriter // local JSONL WAL (shared with reporter when both set; sole writer when reporter is nil)
 	// quota is the Phase 2 enterprise token-quota gate (Stage 3). nil-safe +
 	// flag-gated: when nil or disabled it is a pure no-op, so the request path is
 	// never blocked by quota machinery — only by an actual confirmed over-limit.
@@ -651,6 +655,12 @@ func (p *Proxy) SetFilterCacheEnabled(on bool, window int) {
 // Used by status reporting + tests.
 func (p *Proxy) FilterHook() apphook.Hook {
 	return p.filterHook
+}
+
+// FilterPerformanceSnapshot returns the current generation's bounded latency
+// distribution. It is safe during concurrent request processing.
+func (p *Proxy) FilterPerformanceSnapshot() FilterPerformanceSnapshot {
+	return p.filterPerformance.snapshot()
 }
 
 // SetObserverRegistry attaches the Phase 4 M2 plugin observer registry.

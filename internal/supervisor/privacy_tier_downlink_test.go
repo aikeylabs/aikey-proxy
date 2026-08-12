@@ -96,7 +96,7 @@ func TestFetchCompliancePolicy_TierFromServer(t *testing.T) {
 
 // TestPrivacyTier_HasNoLocalOverride is the fence that makes the whole design
 // mean something: on the machine whose text is at stake, there must be no way
-// to authorise sending it.
+// to authorize sending it.
 //
 // It scans this package's sources for the env var name and asserts the ONLY
 // occurrences are the one that WRITES the child's environment. A read here —
@@ -104,7 +104,7 @@ func TestFetchCompliancePolicy_TierFromServer(t *testing.T) {
 // we can test locally") — would let anyone with shell access on an employee
 // machine grant themselves tier 3.
 //
-// Written as a source scan rather than a behaviour test on purpose: the failure
+// Written as a source scan rather than a behavior test on purpose: the failure
 // it guards against is a line of code that does not exist yet, and no runtime
 // assertion can observe the absence of a future override.
 //

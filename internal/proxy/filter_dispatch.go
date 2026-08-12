@@ -80,7 +80,7 @@ func capRuneBoundary(s string, limit int) int {
 // Code) serves TWO purposes here: it stamps the team audit event's session_id
 // (deep-link to the conversation thread) AND it is the content cache's level-1
 // isolation scope (cacheScope). Both must stay the same value — a support
-// engineer correlating an audit event with cache behaviour relies on it.
+// engineer correlating an audit event with cache behavior relies on it.
 //
 // traceID is THIS TURN's W3C trace id — the SAME value the conversation-audit
 // observer stores as conversation_records.event_id (both read it off the one
@@ -138,7 +138,7 @@ func (p *Proxy) applyInboundFilter(
 	// the spec written on 2026-06-04 recorded an exclusion that had never existed).
 	//
 	// SCOPE — deliberately RouteSource only, NOT the X-Aikey-Probe header. That
-	// header is client-set and rides on team virtual keys, so honouring it here
+	// header is client-set and rides on team virtual keys, so honoring it here
 	// would be a one-header DLP bypass. See isProbePipelineRoute.
 	//
 	// Fence: probe_pipeline_compliance_exclusion_fence_test.go.
@@ -149,6 +149,7 @@ func (p *Proxy) applyInboundFilter(
 			"route_source", routeSource)
 		return true
 	}
+	filterStarted := time.Now()
 
 	// Route class decides where the compliance event goes: team keys → master
 	// (the detector returns the event and the proxy forwards it with the team
@@ -269,6 +270,13 @@ func (p *Proxy) applyInboundFilter(
 		// request-scoped, never logged/persisted (B3 拍板 2026-08-06).
 		restoreState *maskRestore
 	)
+	// Record every filterable request, including block/degraded early returns.
+	// A request with at least one cache hit is the steady-state incremental lane;
+	// zero hits is the cold lane. The metric is whole-filter wall time, so JSON
+	// parsing, hashing, IPC and policy application are all represented.
+	defer func() {
+		p.filterPerformance.observe(time.Since(filterStarted), cacheHits > 0)
+	}()
 
 	// content-hash 缓存(设计 §4):仅当缓存启用时才算 scope/detectorVer。缓存关闭
 	// (p.filterCache == nil)时下面循环根本不碰 hash → 不付 content-hash 代价(INV-6)。
@@ -378,7 +386,7 @@ func (p *Proxy) applyInboundFilter(
 		// type scannable at all (blockScanPolicy, filter_content.go). Tool blocks
 		// are scanned so their findings are RECORDED, and capped so the 216
 		// gitleaks-derived `block` rules can never fire on an agent's file reads.
-		// Everything else keeps ceilingFull, i.e. byte-identical behaviour.
+		// Everything else keeps ceilingFull, i.e. byte-identical behavior.
 		//
 		// 🔴 The clamp is applied HERE, after the cache, on purpose: the cache
 		// stores the detector's RAW verdict keyed on content, and the ceiling is a

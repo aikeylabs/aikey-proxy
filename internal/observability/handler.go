@@ -179,7 +179,7 @@ const (
 	// EventProxyFilterActionCapped: the detector returned mask/block for a piece
 	// whose block type is scanned for AUDIT ONLY (agent tool_result / tool_use;
 	// 方案② 2026-08-10), so the proxy recorded the finding and forwarded the
-	// content BYTE-UNCHANGED. This is the deliberate, decided behaviour — not a
+	// content BYTE-UNCHANGED. This is the deliberate, decided behavior — not a
 	// degrade — but it is logged per occurrence because "we saw sensitive content
 	// and let it through on purpose" must never be inferable only from silence.
 	// Counts + the verdict name only; never any content.
@@ -189,6 +189,10 @@ const (
 	// without splitting the join, so it names a code defect, not a content event.
 	EventProxyFilterActionCapped        = "proxy.filter.action_capped"
 	EventProxyFilterMaskUnwritablePiece = "proxy.filter.mask_unwritable_piece"
+	// EventProxyFilterMaxActionReadFailed means the operational enforcement
+	// ceiling could not be read from the Vault. The supervisor preserves the
+	// safer full ceiling and emits this stable event for external alerting.
+	EventProxyFilterMaxActionReadFailed = "proxy.filter.max_action_read_failed"
 	// EventProxyFilterProbeExcluded: a Probe-pipeline request (mode C,
 	// /probe/<alias>/v1/..., RouteSource "probe") reached the compliance entry
 	// point and was skipped WITHOUT entering the chain. Its payload is aikey's

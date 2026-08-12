@@ -34,6 +34,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"log/slog"
 	"math"
 	"os"
@@ -110,9 +111,10 @@ type wireMaskMeta = pipewire.MaskMeta
 
 // ChildHook is a generic Hook that delegates to a spawned child binary.
 type ChildHook struct {
-	cmd     *exec.Cmd
-	stdin   *bufio.Writer
-	pending map[uint32]chan *childResponse
+	cmd       *exec.Cmd
+	stdin     *bufio.Writer
+	stdinPipe io.WriteCloser
+	pending   map[uint32]chan *childResponse
 	// status is atomically swapped so Status() is wait-free.
 	status atomic.Pointer[Status]
 	cfg    ChildHookConfig
@@ -243,6 +245,7 @@ func (h *ChildHook) spawnLocked(ctx context.Context) error {
 		gen := h.gen.Add(1) // bump generation; the reader below is tied to it
 		h.writeMu.Lock()
 		h.stdin = bufio.NewWriterSize(stdin, 64*1024)
+		h.stdinPipe = stdin
 		h.writeMu.Unlock()
 		h.degraded.Store(false)
 		h.status.Store(&Status{
@@ -371,7 +374,11 @@ func (h *ChildHook) restart(ctx context.Context) error {
 		h.cmd = nil
 	}
 	h.writeMu.Lock()
-	h.stdin = nil // old reader will EOF and exit; writes fail until spawnLocked sets a fresh stdin
+	if h.stdinPipe != nil {
+		_ = h.stdinPipe.Close()
+	}
+	h.stdin = nil // writes fail until spawnLocked sets a fresh stdin
+	h.stdinPipe = nil
 	h.writeMu.Unlock()
 	old := h.status.Load()
 	h.status.Store(&Status{
@@ -555,16 +562,20 @@ func (h *ChildHook) Shutdown(ctx context.Context) error {
 		return nil
 	}
 	h.gen.Add(1) // invalidate the reader so its exit won't markDegraded over the shutdown
-	// Closing stdin triggers EOF in child's read loop → graceful exit.
+	// Closing the OS pipe (not merely forgetting the buffered writer) triggers
+	// EOF in the child's read loop. The detector uses that EOF to flush its
+	// compliance intake queue before exit. Sending SIGINT first skips Go's
+	// normal return path and can lose an already-applied Mask/Block audit event.
 	h.writeMu.Lock()
 	if h.stdin != nil {
 		_ = h.stdin.Flush()
 	}
-	h.stdin = nil
-	h.writeMu.Unlock()
-	if h.cmd.Process != nil {
-		_ = h.cmd.Process.Signal(os.Interrupt)
+	if h.stdinPipe != nil {
+		_ = h.stdinPipe.Close()
 	}
+	h.stdin = nil
+	h.stdinPipe = nil
+	h.writeMu.Unlock()
 
 	done := make(chan error, 1)
 	go func() { done <- h.cmd.Wait() }()

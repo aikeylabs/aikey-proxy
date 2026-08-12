@@ -36,14 +36,14 @@ import (
 //     aikey's own synthetic corpus into a compliance event attributed to the
 //     employee. Correctness constraint, not preference.
 //   - App (this file): MUST STAY SCANNED. 🔴 USER DECISION, 2026-08-11 — the code
-//     behaviour was right and the SPEC was wrong, so the SPEC was corrected to
+//     behavior was right and the SPEC was wrong, so the SPEC was corrected to
 //     match the code and the code was left alone. An /apps/ request carries real
 //     user content on its way to an external LLM, which is precisely what DLP
 //     exists to inspect; exempting it would widen the DLP gap by exactly the
 //     amount of traffic third-party and first-party apps carry. There is no
 //     probe-style correctness argument on this side to trade against it.
 //
-// WHY A FENCE AT ALL — the App rule survives today only as code behaviour with
+// WHY A FENCE AT ALL — the App rule survives today only as code behavior with
 // nothing pinning it. The spec's own closing rule ("any claim that some traffic
 // is NOT filtered must name a fence test") is written for exemptions, but the
 // failure mode is symmetric: the 2026-06-04 text says the App pipeline should be
@@ -67,15 +67,16 @@ import (
 // happen to match today's prompt; a rule-set change would turn such an assertion
 // green while the pipeline silently stopped being scanned. Same reasoning as the
 // probe fence, applied to the opposite verdict. Reuses spyFilterHook from
-// probe_pipeline_compliance_exclusion_fence_test.go on purpose: one spy, two
-// mirrored fences, so the pair cannot drift apart.
+// probe_pipeline_compliance_exclusion_fence_test.go on purpose: one spy, three
+// mirrored fences (the third is probe_raw_compliance_exclusion_fence_test.go,
+// added 2026-08-11 for the pre-save probe), so the set cannot drift apart.
 
 // appSensitivePrompt is prompt-shaped user content of the kind an integrated app
 // forwards on the user's behalf. Its literal text does not matter to the
 // assertions (the spy masks unconditionally); it is written this way so a reader
 // sees what class of content the App pipeline is carrying to an external LLM,
 // which is the whole reason the decision went the way it did.
-const appSensitivePrompt = "Summarise this customer record: contact 13812345678, follow up tomorrow."
+const appSensitivePrompt = "Summarize this customer record: contact 13812345678, follow up tomorrow."
 
 func TestAppPipeline_AlwaysEntersComplianceFilter(t *testing.T) {
 	cases := []struct {
