@@ -57,9 +57,9 @@ func TestChildHook_ListPacks(t *testing.T) {
 			t.Errorf("built-in kind: got %q", b.Kind)
 		}
 	}
-	if rep.ActionPolicy.BundleSHA256 != "1fa983ebb670967dd00a10e37b58217a2432761e68783633405952322bc2f01f" ||
+	if rep.ActionPolicy.BundleSHA256 != "9f09863b67c46a6b11fa1d11ddec73c1d78b4ee7f87f31865f31356a3c6fc807" ||
 		rep.ActionPolicy.CandidateBehaviorSHA256 != "da0553054ef45f1aa95aacddfcbbf7ae5c3933d662568aaf29e92c09ea2bd632" ||
-		rep.ActionPolicy.IntegrationBehaviorSHA256 != "1da55d2cc3130de7bea5cbf8dafdd1cffd46048e3f3d9e0eba7394c9a0df8d60" ||
+		rep.ActionPolicy.IntegrationBehaviorSHA256 != "0e53fdda615e02a916425991465983cb99a9301298fb24298b84ac3cf7892cf3" ||
 		rep.ActionPolicy.MaxAction != "full" || !rep.ActionPolicy.RiskAccepted || rep.ActionPolicy.QualityGatePassed {
 		t.Fatalf("active action policy is not externally readable: %+v", rep.ActionPolicy)
 	}
