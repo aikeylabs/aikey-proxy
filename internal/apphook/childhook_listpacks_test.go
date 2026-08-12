@@ -41,9 +41,11 @@ func TestChildHook_ListPacks(t *testing.T) {
 			BundleSHA256              string `json:"bundle_sha256"`
 			CandidateBehaviorSHA256   string `json:"candidate_behavior_sha256"`
 			IntegrationBehaviorSHA256 string `json:"integration_behavior_sha256"`
+			HistoryEvidenceSHA256     string `json:"history_evidence_sha256"`
 			MaxAction                 string `json:"max_action"`
 			RiskAccepted              bool   `json:"risk_accepted"`
 			QualityGatePassed         bool   `json:"quality_gate_passed"`
+			SpikeEquivalencePassed    bool   `json:"spike_equivalence_passed"`
 		} `json:"action_policy"`
 	}
 	if err := json.Unmarshal(report, &rep); err != nil {
@@ -57,10 +59,11 @@ func TestChildHook_ListPacks(t *testing.T) {
 			t.Errorf("built-in kind: got %q", b.Kind)
 		}
 	}
-	if rep.ActionPolicy.BundleSHA256 != "9f09863b67c46a6b11fa1d11ddec73c1d78b4ee7f87f31865f31356a3c6fc807" ||
+	if rep.ActionPolicy.BundleSHA256 != "57ea464eaef3fea58e60506439617a5782bf640bc894902e5bf8513f6a07fd6e" ||
 		rep.ActionPolicy.CandidateBehaviorSHA256 != "da0553054ef45f1aa95aacddfcbbf7ae5c3933d662568aaf29e92c09ea2bd632" ||
-		rep.ActionPolicy.IntegrationBehaviorSHA256 != "0e53fdda615e02a916425991465983cb99a9301298fb24298b84ac3cf7892cf3" ||
-		rep.ActionPolicy.MaxAction != "full" || !rep.ActionPolicy.RiskAccepted || rep.ActionPolicy.QualityGatePassed {
+		rep.ActionPolicy.IntegrationBehaviorSHA256 != "0649b62ee67905fdf59cb52b831c8c987817b7294601dd31b63216a0c918033d" ||
+		rep.ActionPolicy.HistoryEvidenceSHA256 != "68d8f134f80af7c31916e2a2e62651a667bee3a6463b61fc025e12f61408c4a3" ||
+		rep.ActionPolicy.MaxAction != "full" || !rep.ActionPolicy.RiskAccepted || rep.ActionPolicy.QualityGatePassed || !rep.ActionPolicy.SpikeEquivalencePassed {
 		t.Fatalf("active action policy is not externally readable: %+v", rep.ActionPolicy)
 	}
 
