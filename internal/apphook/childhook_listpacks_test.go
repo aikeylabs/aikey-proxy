@@ -38,16 +38,18 @@ func TestChildHook_ListPacks(t *testing.T) {
 		} `json:"built_in"`
 		Pulled       []json.RawMessage `json:"pulled"`
 		ActionPolicy struct {
-			BundleSHA256              string `json:"bundle_sha256"`
-			CandidateBehaviorSHA256   string `json:"candidate_behavior_sha256"`
-			IntegrationBehaviorSHA256 string `json:"integration_behavior_sha256"`
-			HistoryEvidenceSHA256     string `json:"history_evidence_sha256"`
-			MaxAction                 string `json:"max_action"`
-			RiskAccepted              bool   `json:"risk_accepted"`
-			QualityGatePassed         bool   `json:"quality_gate_passed"`
-			SpikeEquivalencePassed    bool   `json:"spike_equivalence_passed"`
-			SpikeBaselinePreserved    bool   `json:"spike_baseline_preserved"`
-			SafetyDeltaVerified       bool   `json:"safety_delta_verified"`
+			BundleSHA256              string            `json:"bundle_sha256"`
+			CandidateBehaviorSHA256   string            `json:"candidate_behavior_sha256"`
+			IntegrationBehaviorSHA256 string            `json:"integration_behavior_sha256"`
+			HistoryEvidenceSHA256     string            `json:"history_evidence_sha256"`
+			MaxAction                 string            `json:"max_action"`
+			RiskAccepted              bool              `json:"risk_accepted"`
+			QualityGatePassed         bool              `json:"quality_gate_passed"`
+			SpikeEquivalencePassed    bool              `json:"spike_equivalence_passed"`
+			SpikeBaselinePreserved    bool              `json:"spike_baseline_preserved"`
+			SafetyDeltaVerified       bool              `json:"safety_delta_verified"`
+			LaneActions               map[string]string `json:"lane_actions"`
+			LaneGradeCeilings         map[string]string `json:"lane_grade_ceilings"`
 		} `json:"action_policy"`
 	}
 	if err := json.Unmarshal(report, &rep); err != nil {
@@ -67,6 +69,11 @@ func TestChildHook_ListPacks(t *testing.T) {
 		rep.ActionPolicy.HistoryEvidenceSHA256 != "68d8f134f80af7c31916e2a2e62651a667bee3a6463b61fc025e12f61408c4a3" ||
 		rep.ActionPolicy.MaxAction != "full" || !rep.ActionPolicy.RiskAccepted || rep.ActionPolicy.QualityGatePassed || rep.ActionPolicy.SpikeEquivalencePassed || !rep.ActionPolicy.SpikeBaselinePreserved || !rep.ActionPolicy.SafetyDeltaVerified {
 		t.Fatalf("active action policy is not externally readable: %+v", rep.ActionPolicy)
+	}
+	if rep.ActionPolicy.LaneActions["CN_ADDRESS"] != "mask" ||
+		rep.ActionPolicy.LaneGradeCeilings["address.cn_address.tier_warn"] != "warn" ||
+		rep.ActionPolicy.LaneGradeCeilings["address.cn_address.tier_mask"] != "mask" {
+		t.Fatalf("tier-aware CN_ADDRESS runtime state is not externally readable: %+v", rep.ActionPolicy)
 	}
 
 	// Detect still works on the same pipe right after the meta query.
