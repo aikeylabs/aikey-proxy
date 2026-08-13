@@ -314,6 +314,11 @@ type Supervisor struct {
 	// pollRoutingOverrides; read on the group-route hot path to redirect a seat off
 	// an unhealthy account. nil-safe everywhere → empty means "use the local pick".
 	routingOverrides *proxy.RoutingOverrideCache
+	// lastClusterRoutingSig tracks the complete daemon-managed assignment
+	// snapshot, including rows whose explicit pending state is persisted as an
+	// empty column. routing_version alone cannot observe such removals when a
+	// sibling route still carries the previous maximum version.
+	lastClusterRoutingSig atomic.Pointer[string]
 	// fallbackPolicy is the upstream-fallback threshold cache (P0a, task 1b.4).
 	// Supervisor-scoped like routingOverrides so a generation reload never loses
 	// it — keep-last-known is the point: a control-plane blip must not re-time
@@ -364,6 +369,23 @@ type Supervisor struct {
 	// local filter_stages is NULL (master mandate); the user's local toggle still
 	// governs when this is false. Polled by pollComplianceMasterPolicy.
 	masterCompliance atomic.Bool
+	// masterPrivacyTier is the org-level compliance PRIVACY TIER polled from the
+	// same endpoint as masterCompliance (1 metadata / 2 + masked snippet / 3 +
+	// RAW snippet). It decides how much of this user's own text the detector may
+	// attach to the compliance events it uploads to the team server.
+	//
+	// 🔴 THIS IS THE ONLY WAY THAT DECISION CAN ARRIVE. There is deliberately no
+	// vault column, no config key and no env override by which the person whose
+	// prompts these are could raise it — the whole design rests on the
+	// authorisation being the ORGANISATION's, held on the org's own server. The
+	// value is passed to the detector as AIKEY_COMPLIANCE_PRIVACY_TIER at spawn
+	// (installFilterHook) and re-checked by the master at ingest.
+	//
+	// Default 1: the zero value of an Int64 clamps to metadata-only, so a node
+	// that has never reached its policy, or reached it and failed to parse it,
+	// sends no content. Unlike masterCompliance a change needs a Reload — the
+	// value is baked into a child process's environment at spawn.
+	masterPrivacyTier atomic.Int64
 	// Enterprise quota (Phase 2 Stage 2 — design §0.5/§5.2). Snapshot + counter
 	// live on the supervisor (not per-generation) so the counter accumulates
 	// continuously across 5s syncs and /admin/reload; the snapshot is gen-swapped
@@ -828,7 +850,7 @@ func computeFilterSig(vaultReader *vault.Reader) (string, bool) {
 		return "", false
 	}
 	sort.Strings(slugs)
-	// R9: fold each slug's filter_record_allow into the signature so a settings
+	// R9: fold each slug's filter_record_allow and filter_max_action into the signature so settings
 	// toggle (not just enable/disable) also triggers a reload — installFilterHook
 	// passes record_allow into the detector child's env, so a stale child would
 	// otherwise keep the old value until a manual reload. (filter_stages VALUE
@@ -839,9 +861,36 @@ func computeFilterSig(vaultReader *vault.Reader) (string, bool) {
 	parts := make([]string, 0, len(slugs))
 	for _, s := range slugs {
 		ra, _ := vaultReader.GetFilterRecordAllow(s)
-		parts = append(parts, fmt.Sprintf("%s:%t", s, ra))
+		maxAction, err := vaultReader.GetFilterMaxAction(s)
+		if err != nil {
+			maxAction = "invalid"
+		}
+		parts = append(parts, filterAppSignaturePart(s, ra, maxAction))
 	}
 	return strings.Join(parts, ","), true
+}
+
+func filterAppSignaturePart(slug string, recordAllow bool, maxAction string) string {
+	return fmt.Sprintf("%s:%t:%s", slug, recordAllow, maxAction)
+}
+
+// filterSigWithPrivacyTier appends the org privacy tier to the filter signature.
+//
+// WHY THE TIER HAS TO BE IN THE SIGNATURE: installFilterHook bakes the tier into
+// the detector child's ENVIRONMENT at spawn. A running child keeps whatever
+// value it was born with, forever. So an admin lowering the tier from 3 to 1
+// would change the server's policy, change what the server STORES (the master
+// strips on ingest), and change nothing about what employees' machines SEND —
+// raw text would keep traveling the network until something unrelated caused a
+// reload. Folding the tier in here makes the poller's Reload actually re-spawn.
+//
+// It is separate from computeFilterSig because that function only reads the
+// vault, while the tier lives on the supervisor. Same reason record_allow is
+// folded in there and not here.
+//
+// 能红 check: drop the tier term and TestFilterSig_ChangesWithPrivacyTier fails.
+func filterSigWithPrivacyTier(base string, tier int64) string {
+	return base + "|tier:" + strconv.FormatInt(tier, 10)
 }
 
 // syncManagedKeys checks the vault change_seq and, if it has advanced since
@@ -888,7 +937,10 @@ func (s *Supervisor) syncManagedKeys() {
 	// writing the "cluster-compliance" app_record's filter_stages; without this
 	// check that only took effect on a manual /admin/reload (2026-06-05 E2E gap).
 	// Fault-isolated: a read error skips the check (never a reload storm).
-	if newSig, ok := computeFilterSig(gen.vault); ok {
+	if baseSig, ok := computeFilterSig(gen.vault); ok {
+		// Fold in the org privacy tier: it is baked into the detector child's env
+		// at spawn, so only a re-spawn can change what a running detector sends.
+		newSig := filterSigWithPrivacyTier(baseSig, s.masterPrivacyTier.Load())
 		if prev := s.lastFilterSig.Load(); prev == nil || *prev != newSig {
 			// R5: record the attempted signature BEFORE the reload so a
 			// persistently-failing Reload (e.g. transient build error) does NOT
@@ -922,6 +974,12 @@ func (s *Supervisor) syncManagedKeys() {
 	managedKeys, err := gen.vault.GetActiveManagedKeys()
 	if err != nil {
 		slog.Warn("managed key sync: GetActiveManagedKeys failed", "error", err)
+	} else {
+		// Cluster daemon writes the allocation assignment into the same vault
+		// snapshot as group material. Refresh the supervisor-scoped hot-path cache
+		// on this existing change-seq cycle; rebuilding registry routes alone does
+		// not update RoutingOverrideCache.
+		s.refreshClusterRoutingOverrides(managedKeys)
 	}
 	for token, route := range buildManagedRoutes(managedKeys) {
 		allRoutes[token] = route
@@ -1163,6 +1221,16 @@ func (s *Supervisor) EffectivePacks(ctx context.Context) ([]byte, error) {
 		return nil, apphook.ErrPacksUnavailable
 	}
 	return g.filterHook.ListPacks(ctx)
+}
+
+// FilterPerformanceSnapshot returns the active generation's content-free
+// compliance latency window. Reload starts a fresh window by construction.
+func (s *Supervisor) FilterPerformanceSnapshot() proxy.FilterPerformanceSnapshot {
+	g := s.active.Load()
+	if g == nil || g.proxy == nil {
+		return proxy.FilterPerformanceSnapshot{}
+	}
+	return g.proxy.FilterPerformanceSnapshot()
 }
 
 // AppHealthSnapshot returns the active proxy generation's in-memory "most
@@ -1687,6 +1755,15 @@ func (s *Supervisor) buildGeneration() (*generation, error) {
 
 	// Build the proxy handler with configured thresholds.
 	p := proxy.New(vaultReader, registry, providers, collector, s.ctx)
+	// Stamp the generation identity FIRST and unconditionally. Every runtime
+	// counter this Proxy exposes on /v1/diagnostics/pipeline is scoped to this
+	// generation — a reload swaps the *Proxy behind an unchanged PID, so the
+	// counters silently restart at zero. Publishing the ID is what lets an
+	// external reader notice the reset (health-signal-surface). It must not ride
+	// on SetReporter: that call is skipped entirely when neither a collector nor
+	// a WAL is configured, i.e. exactly the offline deployments that have the
+	// fewest other ways to see a reload.
+	p.SetGenerationID(int64(id))
 	// Inject the shared, supervisor-owned routing-override cache (I-side §6.5) so
 	// the group-route hot path can read the engine's seat→account redirects.
 	// Unconditional + nil-safe: an empty cache (no team cred / control URL / poll
@@ -1772,7 +1849,8 @@ func (s *Supervisor) buildGeneration() (*generation, error) {
 	filterHook := s.installFilterHook(p, vaultReader)
 	// Record the filter-app signature this generation was built with so
 	// syncManagedKeys can detect a later enable/disable and trigger a reload.
-	if sig, ok := computeFilterSig(vaultReader); ok {
+	if baseSig, ok := computeFilterSig(vaultReader); ok {
+		sig := filterSigWithPrivacyTier(baseSig, s.masterPrivacyTier.Load())
 		s.lastFilterSig.Store(&sig)
 	}
 
@@ -1821,7 +1899,7 @@ func (s *Supervisor) buildGeneration() (*generation, error) {
 			if seq, err := vault.ReadConfigU64LE(s.cfg.Vault.Path, VaultChangeSeqKey); err == nil && seq <= math.MaxInt64 {
 				loadedSeq = int64(seq)
 			}
-			p.SetReporter(nil, fmt.Sprintf("proxy-%d", id), s.version, fmt.Sprintf("gen-%d", id), loadedSeq, vaultReader.GetLoggedInAccountID())
+			p.SetReporter(nil, fmt.Sprintf("proxy-%d", id), s.version, proxy.GenerationLabel(int64(id)), loadedSeq, vaultReader.GetLoggedInAccountID())
 		}
 	}
 
@@ -1887,7 +1965,7 @@ func (s *Supervisor) buildGeneration() (*generation, error) {
 			if seq, err := vault.ReadConfigU64LE(s.cfg.Vault.Path, VaultChangeSeqKey); err == nil && seq <= math.MaxInt64 {
 				loadedSeq = int64(seq)
 			}
-			p.SetReporter(reporter, fmt.Sprintf("proxy-%d", id), s.version, fmt.Sprintf("gen-%d", id), loadedSeq, vaultReader.GetLoggedInAccountID())
+			p.SetReporter(reporter, fmt.Sprintf("proxy-%d", id), s.version, proxy.GenerationLabel(int64(id)), loadedSeq, vaultReader.GetLoggedInAccountID())
 			slog.Info("usage reporter enabled", "collector_url", s.cfg.Events.CollectorURL)
 
 			// Start canary probe. As of 2026-04-17 diagnostics live on the
@@ -1939,8 +2017,8 @@ func (s *Supervisor) buildGeneration() (*generation, error) {
 	masterURL := readControlPanelURL()
 	if s.cfg.Cluster.Enabled && s.cfg.Cluster.OrgID != "" && s.cfg.Cluster.ControlServiceToken != "" {
 		p.EnableOrgSignalReporting(masterURL, s.cfg.Cluster.OrgID, s.cfg.Cluster.ControlServiceToken)
-	} else if masterURL, bearer := signalReportingAuth(masterURL, s.teamCred, vaultReader); bearer != nil {
-		p.EnableSignalReporting(masterURL, bearer)
+	} else if signalURL, bearer := signalReportingAuth(masterURL, s.teamCred, vaultReader); bearer != nil {
+		p.EnableSignalReporting(signalURL, bearer)
 	}
 
 	// Only hand the WAL to the generation when nobody else closes it. If a

@@ -83,9 +83,11 @@ func isNetChangeErrnoFor(goos string, err error) bool {
 	// numbers mean unrelated things in the Unix errno space.
 	var errno syscall.Errno
 	if errors.As(err, &errno) {
-		switch errno {
+		switch errno { //nolint:exhaustive // only three Windows routing errors are relevant; every other errno is deliberately non-matching.
 		case wsaeNetDown, wsaeNetUnreach, wsaeHostUnreach:
 			return true
+		default:
+			return false
 		}
 	}
 	return false

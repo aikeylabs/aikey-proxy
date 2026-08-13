@@ -54,6 +54,8 @@ import (
 	"io"
 	"log/slog"
 	"net/http"
+	"os"
+	"strings"
 	"time"
 
 	"github.com/AiKeyLabs/pkg/fallbackpolicy"
@@ -81,6 +83,11 @@ const maxFallbackPolicyBody = 64 << 10
 // authorized caller into the nodes it is made of, so the worst a wrong value can
 // do is miscount a display number for a tenant that could read it anyway.
 const fallbackPolicyNodeHeader = "X-Aikey-Node-Id"
+
+const (
+	clusterControlServiceTokenEnv = "AIKEY_CONTROL_SERVICE_TOKEN" // #nosec G101 -- environment variable name, never a credential value
+	clusterOrgIDEnv               = "AIKEY_HUB_ORG_ID"
+)
 
 var fallbackPolicyHTTPClient = httpx.NewSwappableDirect(10 * time.Second)
 
@@ -181,7 +188,8 @@ func (s *Supervisor) syncFallbackPolicy(ctx context.Context, _ *generation, mast
 			// builtin defaults and the next cycle retries.
 			return nil
 		}
-		if s.cfg.Cluster.ControlServiceToken == "" {
+		controlToken := s.clusterControlServiceToken()
+		if controlToken == "" {
 			// No control-plane credential provisioned yet. Same posture as an
 			// unknown org: stay on builtin defaults rather than send a token the
 			// control plane will reject on every cycle.
@@ -190,7 +198,7 @@ func (s *Supervisor) syncFallbackPolicy(ctx context.Context, _ *generation, mast
 		url = masterURL + "/internal/org/" + orgID + "/fallback-policy"
 		// 🔴 The CONTROL token, not Cluster.ServiceToken — that one is the hub's,
 		// and the control plane answers it 401.
-		bearer = s.cfg.Cluster.ControlServiceToken
+		bearer = controlToken
 	}
 
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, http.NoBody)
@@ -319,7 +327,21 @@ func itoa64(n int64) string {
 // isClusterNode reports whether this proxy is a cluster worker holding a node
 // service token — the only identity a worker can present to the control plane.
 func (s *Supervisor) isClusterNode() bool {
-	return s.cfg != nil && s.cfg.Cluster.Enabled && s.cfg.Cluster.ControlServiceToken != ""
+	return s.cfg != nil && s.cfg.Cluster.Enabled && s.clusterControlServiceToken() != ""
+}
+
+// clusterControlServiceToken resolves the same two configuration forms the
+// cluster node ships with. Production installers render the token into YAML;
+// the Docker/systemd node environment also exports it for the daemon. The env
+// fallback keeps policy sync alive during version skew where an older rendered
+// YAML lacks the newer field. The secret is never logged.
+func (s *Supervisor) clusterControlServiceToken() string {
+	if s != nil && s.cfg != nil {
+		if token := strings.TrimSpace(s.cfg.Cluster.ControlServiceToken); token != "" {
+			return token
+		}
+	}
+	return strings.TrimSpace(os.Getenv(clusterControlServiceTokenEnv))
 }
 
 // clusterOrgID is the organization this node serves, from configuration.
@@ -332,8 +354,14 @@ func (s *Supervisor) isClusterNode() bool {
 // enforces, inferring it would mean governing one tenant's traffic with
 // another's numbers, and it would look correctly configured while doing so.
 func (s *Supervisor) clusterOrgID() (string, bool) {
-	if s.cfg == nil || s.cfg.Cluster.OrgID == "" {
+	if s == nil || s.cfg == nil || !s.cfg.Cluster.Enabled {
 		return "", false
 	}
-	return s.cfg.Cluster.OrgID, true
+	orgID := strings.TrimSpace(s.cfg.Cluster.OrgID)
+	if orgID == "" {
+		// This environment value is already the authority used by the daemon and
+		// other org-scoped rails. It is configured state, not a vault inference.
+		orgID = strings.TrimSpace(os.Getenv(clusterOrgIDEnv))
+	}
+	return orgID, orgID != ""
 }

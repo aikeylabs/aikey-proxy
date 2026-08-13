@@ -1,6 +1,7 @@
 package httpx
 
 import (
+	"context"
 	"net/http"
 	"testing"
 	"time"
@@ -49,7 +50,7 @@ func TestNewDirectClient_DoesNotMutateDefaultTransport(t *testing.T) {
 	if !ok {
 		t.Skip("http.DefaultTransport is not *http.Transport")
 	}
-	req, _ := http.NewRequest(http.MethodGet, "https://example.com/", nil)
+	req, _ := http.NewRequestWithContext(context.Background(), http.MethodGet, "https://example.com/", nil)
 	t.Setenv("HTTPS_PROXY", "http://127.0.0.1:7890")
 	if dt.Proxy == nil {
 		t.Fatal("NewDirectClient mutated the shared http.DefaultTransport.Proxy — must clone, not modify the global")
@@ -68,7 +69,7 @@ func assertDirect(t *testing.T, when string, tr *http.Transport) {
 		t.Fatalf("%s: Transport.Proxy is nil — direct must be an explicit decision (the override is read there), not an accident", when)
 	}
 	for _, target := range []string{"https://master.internal:3000/v1/x", "http://10.0.0.9:8080/health"} {
-		req, _ := http.NewRequest(http.MethodGet, target, nil)
+		req, _ := http.NewRequestWithContext(context.Background(), http.MethodGet, target, nil)
 		u, err := tr.Proxy(req)
 		if err != nil {
 			t.Fatalf("%s: proxy lookup for %s errored: %v", when, target, err)

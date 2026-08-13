@@ -138,6 +138,14 @@ type Reporter struct {
 	nextUploadAttempt   time.Time
 	lastBusinessEventAt time.Time
 	lastUploadAt        time.Time
+	// compliance lane failure memory (guarded by mu), surfaced on
+	// /admin/audit/status. A dead-letter queue whose depth is visible but whose
+	// CAUSE is not is only a slower black hole: the operator can see events are
+	// stuck but cannot tell a version-skew 400 from an expired token from a
+	// network outage — three problems with three different fixes.
+	complianceLastFailureAt     aikeytime.Millis
+	complianceLastFailureReason string
+	complianceLastFailureCode   int
 	wal                 *WALWriter
 	done                chan struct{}
 	// delivery-integrity cursors (memory only; see type doc). Guarded by mu.

@@ -32,7 +32,46 @@ export GOWORK
 # derive it from origin/HEAD or a new commit could silently baseline itself.
 LINT_BASE_REV ?= 9695facb96c1fefb8a2f8ba1f4b41823cf1efad6
 
-.PHONY: build test test-bugfix-provider-routing run install uninstall restart clean lint lint-full cross-compile sync-fingerprint sync-provider-registry sync-provider-data chaos-gap7 chaos-gap8 chaos filter-integration
+# ─────────────────────────────────────────────────────────────────────────────
+# Sibling ai-compliance-detector — a TEST DEPENDENCY of this repo (BR-v1.0.5-26)
+# ─────────────────────────────────────────────────────────────────────────────
+#
+# WHAT was broken: 11 tests across internal/apphook (childhook_test,
+# childhook_sticky_test, childhook_bench_test, childhook_listpacks_test,
+# filterpool_test, matrix_bench_test) exec a PRE-BUILT
+# ../ai-compliance-detector/bin/detector and t.Skipf when it is unavailable.
+# Nothing in this Makefile built it, and release.sh's "Proxy test" fence only
+# echoes `tail -1` on success — so the entire IPC contract suite (concurrent
+# multiplexing / crash self-heal / sticky routing / listpacks / filterpool)
+# could vanish with a green release log. The 2026-08-10 audit came out all-PASS
+# only because bin/detector happened to exist from an unrelated build that
+# morning: luck, not a guarantee.
+#
+# WHY two distinct outcomes and not one blanket rule: "the repo is not cloned"
+# is an ENVIRONMENT FACT (OSS / partial checkouts — release.sh gates its own
+# detector fences on `[ -d "${ACD_DIR}/.git" ]` for exactly this reason), while
+# "the repo is here and does not build" is a DEFECT SIGNAL. Collapsing them is
+# what let a broken sibling read as `ok`. So:
+#   repo present → build it (build failure = red, at the make layer) + run the
+#                  tests in strict mode, where a detector skip is a hard failure
+#                  (nothing legitimate can skip: we just built the binary).
+#   repo absent  → loud NOTE, non-strict run; tests skip but say so on /dev/tty.
+#
+# Strict mode reuses the project-wide switch AIKEY_REQUIRE_NO_TEST_SKIPS
+# (workflow/CI/Makefile, aikey-control-master CI) — no new CI identifier. `?=`
+# means an explicit environment value always wins, so a developer can still run
+# `AIKEY_REQUIRE_NO_TEST_SKIPS=0 make test` with the sibling repo present.
+ACD_DIR     := $(abspath ../ai-compliance-detector)
+ACD_PRESENT := $(wildcard $(ACD_DIR)/.git)
+AIKEY_REQUIRE_NO_TEST_SKIPS ?= $(if $(ACD_PRESENT),1,0)
+
+# Single source for what `test` covers. ./cmd/aikey-proxy added 2026-07-08: the
+# egress system-proxy-switch integration tests (egress_integration_test.go) live
+# in package main because they drive the REAL buildTransport — internal/... alone
+# would skip them.
+PROXY_TEST_PKGS := ./internal/... ./cmd/aikey-proxy/
+
+.PHONY: build test test-bugfix-provider-routing test-pathprefix-matrix run install uninstall restart clean lint lint-full cross-compile sync-fingerprint sync-provider-registry sync-provider-data chaos-gap7 chaos-gap8 chaos filter-integration detector-sibling-build detector-sibling-absent-notice
 
 # v4.3 (2026-05-01): aikey-cli/data/provider_fingerprint.yaml is the single
 # source of truth for provider routing. The pkg/providerroutes Go package
@@ -77,8 +116,23 @@ build: sync-provider-data
 # ./cmd/aikey-proxy added 2026-07-08: the egress system-proxy-switch
 # integration tests (egress_integration_test.go) live in package main because
 # they drive the REAL buildTransport — internal/... alone would skip them.
-test:
-	go test -race -v ./internal/... ./cmd/aikey-proxy/
+test: $(if $(ACD_PRESENT),detector-sibling-build,detector-sibling-absent-notice)
+	AIKEY_REQUIRE_NO_TEST_SKIPS=$(AIKEY_REQUIRE_NO_TEST_SKIPS) go test -race -v $(PROXY_TEST_PKGS)
+
+# Build the sibling detector before `test`, exactly the way `filter-integration`
+# already does — a broken sibling repo then fails at the MAKE layer, before any
+# test gets the chance to skip.
+detector-sibling-build:
+	$(MAKE) -C $(ACD_DIR) build
+
+# Sibling repo not cloned: keep `make test` runnable (mirrors release.sh's own
+# `[ -d "${ACD_DIR}/.git" ]` gate) but say so loudly — a skipped IPC suite must
+# never look like a passing one.
+detector-sibling-absent-notice:
+	@printf '\033[33m[ NOTE ]\033[0m ai-compliance-detector not checked out at $(ACD_DIR) —\n'
+	@printf '         the internal/apphook IPC contract suite (concurrent multiplexing / crash\n'
+	@printf '         self-heal / sticky routing / listpacks / filterpool) will SKIP, NOT PASS.\n'
+	@printf '         Clone it next to aikey-proxy to cover that chain.\n'
 
 # Regression fence for the 2026-07-24 OAuth URL composer and the adjacent
 # Provider/Protocol consumer regressions. This target is the canonical entry
@@ -90,6 +144,21 @@ test-bugfix-provider-routing: ## regression: OAuth Stitch + App/Probe axes + hea
 	go test -v -count=1 ./internal/supervisor/ -run 'Test(OAuthTokenToRoute_SetsOAuthSource|BuildManagedRoutes_PreservesBothMockProtocolBindings)'
 	go test -v -count=1 ./internal/admin/ -run 'TestProbeKey_UsesProviderRouteStitchForEveryVersionShape'
 	go test -v -count=1 ./internal/proxy/ -run 'Test(StitchOAuthRequestURL_OneProviderTableRule|Fence_OAuthBinding|Fence_Tier1OAuthRouteStitchesVersionExactlyOnce|Fence_CodexOAuth|GroupServe_(OAuthAccountInjectsBearer|MockCodexOAuthUsesRuntimeRailAndFingerprintVersion|MockOAuthMissingBaseURLFailsClosed|EmptyRouteProviderUsesAccountProvider)|AppPipeline_PreservesProviderAndUsesProtocolAdapter|ProbePipeline_PreservesProviderAndUsesProtocolAdapter|NormalizeBindingForClientRouteKeepsIndependentAxes)'
+
+# Registry-derived path-prefix routing matrix (2026-08-08). Every picker:true
+# provider in provider_registry.yaml is driven through the REAL proxy handler and
+# the upstream path it produces is compared against the vendor's real endpoint —
+# i.e. it checks that `http://127.0.0.1:<port>/<proxy_path>` really is the drop-in
+# replacement for the vendor base_url that `aikey use` claims it is.
+#
+# BUILD-TAGGED ON PURPOSE: it is RED today (20 of 28 providers fail — D-1 prefix
+# not recognized × 15, D-2 upstream path doubled × 5), so it stays out of default
+# CI to avoid blocking unrelated work. The GREEN half of the same matrix —
+# TestPathPrefixMatrix_MatchesKnownDefectLedger — DOES run in default CI and holds
+# the anti-regression line. Evidence + fix options:
+# ../workflow/CI/bugfix/20260808-provider-path-prefix-routing-registry-drift.md
+test-pathprefix-matrix: ## matrix: every picker:true provider routes + stitches (RED — known defects D-1/D-2)
+	go test -count=1 -tags pathprefix_matrix -run TestPathPrefixMatrix_Strict -v ./internal/proxy/
 
 # Chaos experiments (缺口7/8) — build-tagged so they stay OUT of the normal
 # `test` suite. They drive the real newStreamDrainer / http.Server code paths
@@ -117,7 +186,8 @@ e2e-gap7: ## e2e: gap7 streaming token-extraction fences + full-proxy live E2E
 # (0 extra detector calls). Builds the detector first; the Go test skips if it's missing.
 filter-integration: ## e2e: history-leak fix + cache via real detector (builds detector first)
 	$(MAKE) -C ../ai-compliance-detector build
-	go test -tags integration -count=1 -run 'TestFilterIntegration' -v ./internal/proxy/
+	cargo build --manifest-path ../aikey-cli/Cargo.toml --bin aikey
+	AIKEY_CLI_TEST_BIN="$(abspath ../aikey-cli/target/debug/aikey)" go test -tags integration -count=1 -run 'TestFilterIntegration' -v ./internal/proxy/ ./internal/supervisor/
 
 run: build
 	./bin/aikey-proxy --config bin/$(CONFIG)

@@ -708,9 +708,12 @@ func (p *Proxy) handleProbePipeline(w http.ResponseWriter, r *http.Request, prob
 		return
 	}
 
-	// Stage 6: build the ResolvedRoute for serveRoute. RouteSource="probe"
+	// Stage 6: build the ResolvedRoute for serveRoute. RouteSource=routeSourceProbe
 	// distinguishes probe traffic from app/legacy in usage_event records;
 	// trust-local reads this to attribute probe events to the right pipeline.
+	// It is ALSO the compliance exclusion key — serveRoute's applyInboundFilter
+	// skips the whole chain for it (see isProbePipelineRoute). Renaming or
+	// dropping this value silently re-enables masking of the fixed probe prompt.
 	// P1d (design D-10, safe slice): path-aware protocol-family resolution
 	// (see the App-pipeline sibling comment above). Audit-only blast radius.
 	protocolType := binding.ProtocolType
@@ -737,7 +740,7 @@ func (p *Proxy) handleProbePipeline(w http.ResponseWriter, r *http.Request, prob
 		ProviderCode:     binding.ProviderCode,
 		ProtocolType:     protocolType,
 		ProtocolFamily:   protocolFamily,
-		RouteSource:      "probe",
+		RouteSource:      routeSourceProbe,
 		FollowUserActive: false, // Probe NEVER follows active — that's the whole point of mode C.
 	}
 	if cred.ManagedKey != nil {

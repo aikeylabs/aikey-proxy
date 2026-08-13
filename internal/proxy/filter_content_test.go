@@ -137,15 +137,16 @@ func TestExtractUserContent_ResponsesAPI(t *testing.T) {
 		ok   bool
 	}{
 		{
-			name: "responses_input_item_array_scans_user_skips_instructions_and_assistant",
+			name: "responses_input_item_array_scans_user_and_assistant_skips_instructions",
 			body: `{"model":"gpt-5-codex","instructions":"be a coding agent","input":[
 				{"type":"message","role":"user","content":[{"type":"input_text","text":"old turn"}]},
 				{"type":"message","role":"assistant","content":[{"type":"output_text","text":"model reply"}]},
 				{"type":"message","role":"user","content":[{"type":"input_text","text":"fuck"}]}
 			]}`,
-			// instructions (system-equivalent, admin) + assistant output must be
-			// skipped; both user turns scanned.
-			want: []string{"fuck", "old turn"},
+			// instructions (system-equivalent, admin) must be skipped; both user
+			// turns AND the replayed assistant turn are scanned (P4 方案 §3.4 —
+			// a restored plaintext comes back as an assistant output_text part).
+			want: []string{"fuck", "model reply", "old turn"},
 			ok:   true,
 		},
 		{
@@ -157,7 +158,7 @@ func TestExtractUserContent_ResponsesAPI(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			pieces, parsed, ok := extractUserContent([]byte(tc.body))
+			pieces, parsed, ok := extractUserContent([]byte(tc.body), nil)
 			if ok != tc.ok {
 				t.Fatalf("ok = %v, want %v", ok, tc.ok)
 			}
@@ -181,7 +182,7 @@ func TestExtractUserContent_ResponsesAPI(t *testing.T) {
 // so re-marshaling yields the masked request the upstream receives.
 func TestExtractUserContent_ResponsesAPI_MaskRoundTrip(t *testing.T) {
 	body := `{"model":"gpt-5-codex","input":[{"type":"message","role":"user","content":[{"type":"input_text","text":"fuck"}]}]}`
-	pieces, parsed, ok := extractUserContent([]byte(body))
+	pieces, parsed, ok := extractUserContent([]byte(body), nil)
 	if !ok || len(pieces) != 1 {
 		t.Fatalf("ok=%v pieces=%d, want ok + 1 piece", ok, len(pieces))
 	}

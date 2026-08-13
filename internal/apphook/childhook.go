@@ -5,6 +5,15 @@
 // logic about WHAT the child does belongs to the child itself (it's a separate
 // binary). proxy just spawns, pipes, and respects the contract.
 //
+// The wire format itself is NOT defined here. It lives in
+// github.com/AiKeyLabs/pkg/pipewire, imported by this repo AND by
+// ai-compliance-detector, so a protocol change breaks the build on both sides
+// instead of mis-parsing at runtime. Until 2026-08-10 this file carried its own
+// hand-written copy of the frame header, the response offsets, the op codes and
+// the MaskMeta JSON tags — five such copies existed across three repos and the
+// protocol drifted on two of its three bumps. Do not reintroduce a local copy:
+// add to pipewire and bump ProtocolVersion there.
+//
 // Concurrency model (v3, 2026-06-06 — the "A" half of 双进程+A):
 //   - One dedicated reader goroutine per spawn drains the child's stdout and
 //     demuxes each response to its waiting request by a 4-byte request-id.
@@ -22,7 +31,7 @@ package apphook
 import (
 	"bufio"
 	"context"
-	"encoding/binary"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -35,6 +44,7 @@ import (
 	"time"
 
 	"github.com/AiKeyLabs/pkg/aikeycompat"
+	"github.com/AiKeyLabs/pkg/pipewire"
 )
 
 // ChildHookConfig configures a ChildHook.
@@ -61,7 +71,10 @@ func (c *ChildHookConfig) applyDefaults() {
 		c.Timeout = 1 * time.Millisecond
 	}
 	if c.ProtocolVersion == 0 {
-		c.ProtocolVersion = 3 // v3: request-id multiplexing (concurrent in-flight Detects)
+		// Single source of truth — do NOT hand-write the number here. This used
+		// to be a literal `4` maintained in parallel with the detector's own
+		// constant, with nothing asserting the two matched.
+		c.ProtocolVersion = pipewire.ProtocolVersion
 	}
 	if c.ReadyTimeout == 0 {
 		c.ReadyTimeout = 5 * time.Second
@@ -81,15 +94,27 @@ func (c *ChildHookConfig) applyDefaults() {
 // the reader goroutine via the pending map.
 type childResponse struct {
 	findings []byte // ActionMask → masked payload; ListPacks → JSON report; else per-op
+	maskmeta []byte // v4: restorable-mask JSON (offsets only); empty unless the mask is restorable
 	event    []byte // team-routed compliance event for the proxy to forward; empty otherwise
 	action   byte
 }
 
+// wireMaskMeta is the detector's v4 restorable-mask JSON contract.
+//
+// It used to be a hand-retyped mirror of pipe.MaskMeta living in this file,
+// justified by "proxy and detector ship in lockstep". That justification was
+// wrong in a way the version byte cannot catch: the frame version guards the
+// BINARY layout, never the JSON field names inside MaskMeta, so a renamed tag
+// would have decoded to zero values silently. It is now an alias of the shared
+// type, which makes any change a compile error on both sides.
+type wireMaskMeta = pipewire.MaskMeta
+
 // ChildHook is a generic Hook that delegates to a spawned child binary.
 type ChildHook struct {
-	cmd     *exec.Cmd
-	stdin   *bufio.Writer
-	pending map[uint32]chan *childResponse
+	cmd       *exec.Cmd
+	stdin     *bufio.Writer
+	stdinPipe io.WriteCloser
+	pending   map[uint32]chan *childResponse
 	// status is atomically swapped so Status() is wait-free.
 	status atomic.Pointer[Status]
 	cfg    ChildHookConfig
@@ -220,6 +245,7 @@ func (h *ChildHook) spawnLocked(ctx context.Context) error {
 		gen := h.gen.Add(1) // bump generation; the reader below is tied to it
 		h.writeMu.Lock()
 		h.stdin = bufio.NewWriterSize(stdin, 64*1024)
+		h.stdinPipe = stdin
 		h.writeMu.Unlock()
 		h.degraded.Store(false)
 		h.status.Store(&Status{
@@ -262,19 +288,9 @@ func (h *ChildHook) readLoop(r *bufio.Reader, gen uint64) {
 			}
 			return
 		}
-		// Response payload (v3): [req_id 4B][action 1B][findings_len 4B][findings][event]
-		if len(payload) < 9 {
+		reqID, resp, ok := decodeChildResponsePayload(payload)
+		if !ok {
 			continue // malformed; drop (a real desync surfaces as a read error next)
-		}
-		reqID := binary.LittleEndian.Uint32(payload[0:4])
-		flen := int(binary.LittleEndian.Uint32(payload[5:9]))
-		if 9+flen > len(payload) {
-			continue
-		}
-		resp := &childResponse{
-			action:   payload[4],
-			findings: payload[9 : 9+flen],
-			event:    payload[9+flen:],
 		}
 		h.pendingMu.Lock()
 		ch, ok := h.pending[reqID]
@@ -286,6 +302,23 @@ func (h *ChildHook) readLoop(r *bufio.Reader, gen uint64) {
 			ch <- resp // buffered (cap 1); never blocks even if the caller timed out
 		}
 	}
+}
+
+// decodeChildResponsePayload adapts the shared wire decoder into this package's
+// internal childResponse. The layout itself is owned by pipewire.DecodeResponse
+// (the same function the detector encodes with), so the offsets cannot drift.
+// ok=false on malformed lengths — the caller drops the frame.
+func decodeChildResponsePayload(payload []byte) (reqID uint32, resp *childResponse, ok bool) {
+	decoded, err := pipewire.DecodeResponse(payload)
+	if err != nil {
+		return 0, nil, false
+	}
+	return decoded.ReqID, &childResponse{
+		action:   decoded.Action,
+		findings: decoded.Findings,
+		maskmeta: decoded.MaskMeta,
+		event:    decoded.Event,
+	}, true
 }
 
 func (h *ChildHook) removePending(reqID uint32) {
@@ -341,7 +374,11 @@ func (h *ChildHook) restart(ctx context.Context) error {
 		h.cmd = nil
 	}
 	h.writeMu.Lock()
-	h.stdin = nil // old reader will EOF and exit; writes fail until spawnLocked sets a fresh stdin
+	if h.stdinPipe != nil {
+		_ = h.stdinPipe.Close()
+	}
+	h.stdin = nil // writes fail until spawnLocked sets a fresh stdin
+	h.stdinPipe = nil
 	h.writeMu.Unlock()
 	old := h.status.Load()
 	h.status.Store(&Status{
@@ -400,12 +437,12 @@ func (h *ChildHook) roundtrip(ctx context.Context, op, routeClass byte, body []b
 	h.pending[reqID] = ch
 	h.pendingMu.Unlock()
 
-	// Request frame payload (v3): [op][route_class][req_id 4B][body]
-	payload := make([]byte, 6+len(body))
-	payload[0] = op
-	payload[1] = routeClass
-	binary.LittleEndian.PutUint32(payload[2:6], reqID)
-	copy(payload[6:], body)
+	payload := pipewire.EncodeRequest(&pipewire.Request{
+		Op:         op,
+		RouteClass: routeClass,
+		ReqID:      reqID,
+		Prompt:     string(body),
+	})
 	if err := h.writeFrame(payload); err != nil {
 		h.removePending(reqID)
 		h.markDegraded("write_failed: " + err.Error())
@@ -430,7 +467,7 @@ func (h *ChildHook) Detect(ctx context.Context, req *Request) *Response {
 	defer cancel()
 
 	start := time.Now()
-	resp, err := h.roundtrip(ctx, 1, req.RouteClass, req.Payload) // op=1 = Detect
+	resp, err := h.roundtrip(ctx, pipewire.OpDetect, req.RouteClass, req.Payload)
 	if err != nil {
 		reason := "child degraded"
 		if !errors.Is(err, errDegraded) {
@@ -445,6 +482,27 @@ func (h *ChildHook) Detect(ctx context.Context, req *Request) *Response {
 	}
 	if res.Action == ActionMask && len(resp.findings) > 0 {
 		res.MutatedPayload = resp.findings
+		// v4 restorable-mask metadata. Parse errors are fail-open in the SAFE
+		// direction: the mask itself stands, only response-side restore is lost.
+		// Loud (失败要显眼) but content-free — maskmeta describes masked spans, so
+		// even offsets stay out of the log line.
+		if len(resp.maskmeta) > 0 {
+			var meta wireMaskMeta
+			if err := json.Unmarshal(resp.maskmeta, &meta); err != nil {
+				slog.Warn("apphook: restorable-mask metadata unparseable; mask kept, restore disabled",
+					"event.name", "proxy.apphook.maskmeta_invalid",
+					"name", h.cfg.Name, "error", err, "meta_bytes", len(resp.maskmeta))
+			} else {
+				for _, r := range meta.Restorables {
+					res.Restorables = append(res.Restorables, RestorableMask{
+						Token:          r.Token,
+						NumberedPrefix: r.NumberedPrefix,
+						NumberedSuffix: r.NumberedSuffix,
+						Spans:          r.Spans,
+					})
+				}
+			}
+		}
 	}
 	if len(resp.event) > 0 {
 		res.Event = resp.event
@@ -476,7 +534,7 @@ func (h *ChildHook) ListPacks(ctx context.Context) ([]byte, error) {
 	ctx, cancel := context.WithTimeout(ctx, h.cfg.Timeout)
 	defer cancel()
 
-	resp, err := h.roundtrip(ctx, 4, 0, nil) // op=4 = ListPacks
+	resp, err := h.roundtrip(ctx, pipewire.OpListPacks, pipewire.RouteClassPersonal, nil)
 	if err != nil {
 		if errors.Is(err, errDegraded) {
 			return nil, ErrPacksUnavailable
@@ -504,16 +562,20 @@ func (h *ChildHook) Shutdown(ctx context.Context) error {
 		return nil
 	}
 	h.gen.Add(1) // invalidate the reader so its exit won't markDegraded over the shutdown
-	// Closing stdin triggers EOF in child's read loop → graceful exit.
+	// Closing the OS pipe (not merely forgetting the buffered writer) triggers
+	// EOF in the child's read loop. The detector uses that EOF to flush its
+	// compliance intake queue before exit. Sending SIGINT first skips Go's
+	// normal return path and can lose an already-applied Mask/Block audit event.
 	h.writeMu.Lock()
 	if h.stdin != nil {
 		_ = h.stdin.Flush()
 	}
-	h.stdin = nil
-	h.writeMu.Unlock()
-	if h.cmd.Process != nil {
-		_ = h.cmd.Process.Signal(os.Interrupt)
+	if h.stdinPipe != nil {
+		_ = h.stdinPipe.Close()
 	}
+	h.stdin = nil
+	h.stdinPipe = nil
+	h.writeMu.Unlock()
 
 	done := make(chan error, 1)
 	go func() { done <- h.cmd.Wait() }()
@@ -544,34 +606,26 @@ func (h *ChildHook) writeFrame(payload []byte) error {
 	if len(payload) > math.MaxUint32 {
 		return fmt.Errorf("payload too large for frame header: %d bytes", len(payload))
 	}
-	header := make([]byte, 5)
-	header[0] = h.cfg.ProtocolVersion
-	binary.LittleEndian.PutUint32(header[1:], uint32(len(payload))) //nolint:gosec // len(payload) bounded by the math.MaxUint32 guard above
-	if _, err := w.Write(header); err != nil {
-		return err
-	}
-	if _, err := w.Write(payload); err != nil {
+	// pipewire stamps the version we compiled against. cfg.ProtocolVersion is the
+	// version we EXPECT BACK from the child (checked in readFrame) — the two are
+	// the same value today, and separating them keeps "what we speak" owned by
+	// the shared contract rather than by a proxy-side config knob.
+	if _, err := w.Write(pipewire.EncodeFrame(payload)); err != nil {
 		return err
 	}
 	return w.Flush()
 }
 
-// readFrame reads [version][len][payload] from r (the reader goroutine's stdout).
+// readFrame reads [version][len][payload] from r (the reader goroutine's stdout)
+// and enforces the version byte — a child speaking a different protocol must
+// fail loud rather than have its bytes mis-parsed at the wrong offsets.
 func (h *ChildHook) readFrame(r *bufio.Reader) ([]byte, error) {
-	header := make([]byte, 5)
-	if _, err := io.ReadFull(r, header); err != nil {
+	version, payload, err := pipewire.ReadFrame(r)
+	if err != nil {
 		return nil, err
 	}
-	if header[0] != h.cfg.ProtocolVersion {
-		return nil, fmt.Errorf("protocol version mismatch: child=%d expected=%d", header[0], h.cfg.ProtocolVersion)
-	}
-	length := binary.LittleEndian.Uint32(header[1:])
-	if length > 65536 {
-		return nil, fmt.Errorf("frame too large: %d", length)
-	}
-	payload := make([]byte, length)
-	if _, err := io.ReadFull(r, payload); err != nil {
-		return nil, err
+	if version != h.cfg.ProtocolVersion {
+		return nil, fmt.Errorf("protocol version mismatch: child=%d expected=%d", version, h.cfg.ProtocolVersion)
 	}
 	return payload, nil
 }

@@ -74,6 +74,24 @@ func capRuneBoundary(s string, limit int) int {
 //
 // No-op + returns true when no hook is installed (the common default; zero
 // hot-path cost behind the nil check).
+//
+// sessionID (resolved by the caller via resolveSessionID → the sessionid
+// fingerprint table, so it works for every protocol/provider, not just Claude
+// Code) serves TWO purposes here: it stamps the team audit event's session_id
+// (deep-link to the conversation thread) AND it is the content cache's level-1
+// isolation scope (cacheScope). Both must stay the same value — a support
+// engineer correlating an audit event with cache behavior relies on it.
+//
+// traceID is THIS TURN's W3C trace id — the SAME value the conversation-audit
+// observer stores as conversation_records.event_id (both read it off the one
+// *observer.RequestContext the request built; see traceIDForAudit at the call
+// site). It is the only key that joins a compliance event back to the exact
+// conversation turn: the compliance event_id is minted independently inside the
+// detector child (newEventID(), its own CSPRNG) and joins NOTHING. Empty when
+// no observer context exists (no observers active) — then there is no
+// conversation record to join to either, so an empty key is the honest answer
+// rather than a freshly minted id that would join to nothing.
+// (2026-08-09 F1a cross-audit key, decision A.)
 func (p *Proxy) applyInboundFilter(
 	w http.ResponseWriter,
 	r *http.Request,
@@ -83,6 +101,7 @@ func (p *Proxy) applyInboundFilter(
 	virtualKeyID string,
 	seatID string,
 	sessionID string,
+	traceID string,
 	logger *slog.Logger,
 ) (proceed bool) {
 	hook := p.filterHook
@@ -92,6 +111,45 @@ func (p *Proxy) applyInboundFilter(
 	if r.Body == nil {
 		return true
 	}
+
+	// 🔴 PROBE EXCLUSION — the Probe pipeline is never touched by compliance.
+	//
+	// WHY (two independent harms, either one sufficient):
+	//  1. Detection correctness. The degrade detector judges a model by the
+	//     response fingerprint (chunk count / ITT rhythm) of a FIXED prompt
+	//     (ai-degrade-detector shared/algorithms/rhythm.py CANONICAL_L3_PROBE).
+	//     Masking rewrites that prompt, so the model answers a different question
+	//     and every baseline comparison is invalid — with no symptom anywhere.
+	//  2. Content attribution. A masked probe emits a compliance event. Its
+	//     RouteSource is not "team", so the detector reports it on the personal
+	//     lane: on Personal/Trial that lane runs in LocalIntake mode and carries
+	//     the UN-REDACTED context_snippet unconditionally, which renders aikey's
+	//     own probe text on the member self-view as "the content YOU sent"; on
+	//     Production/Cluster the detector uploads the same event to
+	//     control-master, where it lands in the administrator's audit log. Both
+	//     are synthetic traffic polluting a record whose value is that every row
+	//     is a real person's real prompt.
+	//
+	// WHY HERE and not in handleProbePipeline: this is the compliance chain's
+	// entry point and its only gate. Excluding at the caller would leave the
+	// exclusion to be re-derived by every future caller — which is exactly the
+	// failure this fixes (serveRoute became the shared funnel for the probe/app
+	// pipelines on 2026-05-23, the filter was installed in it on 2026-06-01, and
+	// the spec written on 2026-06-04 recorded an exclusion that had never existed).
+	//
+	// SCOPE — deliberately RouteSource only, NOT the X-Aikey-Probe header. That
+	// header is client-set and rides on team virtual keys, so honoring it here
+	// would be a one-header DLP bypass. See isProbePipelineRoute.
+	//
+	// Fence: probe_pipeline_compliance_exclusion_fence_test.go.
+	// Spec: workflow/CI/requirements/2026-06-04-compliance-filter-direction-and-scope.md
+	if isProbePipelineRoute(routeSource) {
+		logger.Debug("filter: probe-pipeline request excluded from the compliance chain",
+			"event.name", observability.EventProxyFilterProbeExcluded,
+			"route_source", routeSource)
+		return true
+	}
+	filterStarted := time.Now()
 
 	// Route class decides where the compliance event goes: team keys → master
 	// (the detector returns the event and the proxy forwards it with the team
@@ -163,7 +221,14 @@ func (p *Proxy) applyInboundFilter(
 	// 骤降到"用户那几条短消息",避免大 agent prompt 全量扫超时 fail-open(2026-06-16
 	// 活体:扫 22 片段→9 片段超时漏 + 4.8s 延迟)。
 	// AIKEY_PROXY_FILTER_INCREMENTAL_SCAN 废弃;content-hash 缓存见设计 §4(第二步)。
-	pieces, parsed, ok := extractUserContent(bodyBytes)
+	//
+	// 2026-08-08 P4(占位符还原方案 §3.4):"跳过 assistant"这条前提被**响应侧还原**
+	// 推翻 —— 还原发生在回客户端之前,客户端历史里存的是原文,下一轮该原文以 assistant
+	// 身份重发;跳过 assistant = 原文明文随历史回到上游,mask 只在首轮有效。所以扫描
+	// 角色改为**可配置的 scanRoleSet(默认 user+assistant)**;system 仍不扫(mask
+	// admin 指令会污染 agent)。片段数上升由 content-hash 缓存吸收 —— assistant 历史
+	// 跨轮逐字不变,命中率与 user 历史同级(实测见实施计划 P4 测量记录)。
+	pieces, parsed, ok := extractUserContent(bodyBytes, p.filterScanRoles)
 	incremental := false // 历史漏扫修复后恒为 false(不再切到 latest-turn-only)
 	if !ok || len(pieces) == 0 {
 		r.Body = io.NopCloser(bytes.NewReader(bodyBytes))
@@ -192,21 +257,37 @@ func (p *Proxy) applyInboundFilter(
 
 	var (
 		maskedCount int
+		cappedCount int // verdicts downgraded by the piece's action ceiling (方案②)
 		degraded    bool
 		nilResp     int // detector unreachable (pipe dead) — resp == nil
 		selfDeg     int // detector returned Degraded=true (it ran but couldn't decide)
 		detectNanos int64
 		cacheHits   int // content-hash 缓存命中(复用判定、跳过 detector)
 		cacheMiss   int // content-hash 缓存未命中(真扫 + 回填)
+		// restoreState collects numbered-placeholder → original mappings for
+		// restorable masks (B3). Allocated lazily on the first restorable mask;
+		// stashed on the request context for the response leg. Memory-only,
+		// request-scoped, never logged/persisted (B3 拍板 2026-08-06).
+		restoreState *maskRestore
 	)
+	// Record every filterable request, including block/degraded early returns.
+	// A request with at least one cache hit is the steady-state incremental lane;
+	// zero hits is the cold lane. The metric is whole-filter wall time, so JSON
+	// parsing, hashing, IPC and policy application are all represented.
+	defer func() {
+		p.filterPerformance.observe(time.Since(filterStarted), cacheHits > 0)
+	}()
 
 	// content-hash 缓存(设计 §4):仅当缓存启用时才算 scope/detectorVer。缓存关闭
 	// (p.filterCache == nil)时下面循环根本不碰 hash → 不付 content-hash 代价(INV-6)。
 	// scope = 隔离桶(同会话历史复用、跨会话不串);detectorVer 进 key 让 detector
 	// 重启自动失效旧条目;per-entry TTL 兜底 in-place pack pull 的陈旧 clean 判定。
+	// scope 复用调用方已解析的 sessionID(serveRoute → resolveSessionID → sessionid
+	// fingerprint 表):Claude 专有 header 之外的 provider(kimi/codex/cursor/cline …)
+	// 现在也能拿到会话级隔离桶,不再降级到 vk/global 让多会话共桶。见 cacheScope 注释。
 	var cacheScopeKey, detectorVer string
 	if p.filterCache != nil {
-		cacheScopeKey = cacheScope(r, parsed, virtualKeyID)
+		cacheScopeKey = cacheScope(sessionID, parsed, virtualKeyID)
 		detectorVer = hook.Status().Version
 	}
 
@@ -228,8 +309,20 @@ func (p *Proxy) applyInboundFilter(
 		var ckey string
 		if p.filterCache != nil {
 			ckey = cacheKey(detectorVer, hashHead(head)) // level-2 key (scope is separate)
-			if v, ok := p.filterCache.Get(cacheScopeKey, ckey); ok {
-				resp = &apphook.Response{Action: v.action, MutatedPayload: []byte(v.maskedHead), Reason: v.reason}
+			// 读侧 block 守卫(用户拍板 2026-08-08,与写侧不入缓存配套):即便缓存里
+			// 残留了历史 block verdict(理论上写侧已不再写入;此处兜底进程内 pre-fix
+			// 污染 + 防写侧未来回归),也当作 miss、落到下方真扫按最新策略重判 —— block
+			// 是安全决策不复用陈旧拒绝。仅精确排除 ActionBlock,mask/warn/allow 命中路径
+			// 逐字不变(它们 action != ActionBlock,条件恒真)。
+			if v, ok := p.filterCache.Get(cacheScopeKey, ckey); ok && v.action != apphook.ActionBlock {
+				// Restorables replay from cache (offsets only): the hash-matched head
+				// is byte-identical, so the same spans slice the same originals.
+				// Event replays too (2026-08-08 审计缺口修复): a flagged piece resent
+				// every turn keeps producing its audit event instead of going silent
+				// after the first scan, and the detector's event_id makes the repeat
+				// idempotent at both ingest paths — see maskVerdict.event for why this
+				// reconciles a failed upload without double-counting a successful one.
+				resp = &apphook.Response{Action: v.action, MutatedPayload: []byte(v.maskedHead), Reason: v.reason, Restorables: v.restorables, Event: v.event}
 				cacheHits++
 			}
 		}
@@ -252,11 +345,33 @@ func (p *Proxy) applyInboundFilter(
 			detectNanos += time.Since(_t0).Nanoseconds()
 			// 只缓存"确定性"判定:degraded(超时/fail-open)与 nil 不缓存,否则会把
 			// "没扫成"误记成 allow、下轮命中缓存就放行(违反 INV-2)。
-			if p.filterCache != nil && resp != nil && !resp.Degraded {
+			//
+			// BLOCK 不入缓存(用户拍板 2026-08-08,安全边界修复):block(ActionBlock)是
+			// 安全关键决策,每次都必须按【最新策略/pack】重新走 detector 判定,绝不复用
+			// 缓存的陈旧拒绝。WHY:①缓存命中回放不调 detector(见上方 Get 分支),若把 block
+			// 入缓存,则管理员放宽策略或 in-place pack swap(childhook.go 不 bump
+			// detectorVersion,见 filter_cache.go PACK FRESHNESS/TTL 注释)后,陈旧 block
+			// 仍会持续 403,且 sliding TTL 命中续期近乎永久 —— 放宽后无法立即生效;②block
+			// 走拒绝路径不转发上游,缓存省下的那一次 detector 调用收益可忽略,ROI 为负。
+			// mask/warn/allow 缓存行为保持不变(它们转发上游,复用判定收益实在)。
+			// 隐患溯源:CN_ADDRESS 本身无 block 档,但其他 entity 的 HighRiskBlock
+			// (policy.go HighRiskBlock)已在用这条链 → 当前生产就有此隐患。
+			// 配套读侧守卫见上方 Get 分支(v.action != ActionBlock)。
+			if p.filterCache != nil && resp != nil && !resp.Degraded && resp.Action != apphook.ActionBlock {
+				// maskedHead is cached in the detector's NUMBERLESS token form —
+				// per-request numbering happens AFTER cache replay so numbers stay
+				// request-scoped (同请求内按出现顺序编号) instead of leaking a stale
+				// numbering across turns.
+				// event: cached so a cache HIT can re-emit the same audit event (see
+				// maskVerdict.event). Stored as handed over — never mutated in place
+				// (injectTenant/VirtualKey/Seat/Session all return fresh slices), so the
+				// async uploader and the cache can share the bytes read-only.
 				p.filterCache.Put(cacheScopeKey, ckey, maskVerdict{
-					action:     resp.Action,
-					maskedHead: string(resp.MutatedPayload),
-					reason:     resp.Reason,
+					action:      resp.Action,
+					maskedHead:  string(resp.MutatedPayload),
+					reason:      resp.Reason,
+					restorables: resp.Restorables,
+					event:       resp.Event,
 				})
 			}
 		}
@@ -265,6 +380,31 @@ func (p *Proxy) applyInboundFilter(
 			nilResp++
 			continue
 		}
+
+		// ── ACTION CEILING (方案② 2026-08-10) ────────────────────────────────
+		// The piece's ceiling comes from the SAME table row that made its block
+		// type scannable at all (blockScanPolicy, filter_content.go). Tool blocks
+		// are scanned so their findings are RECORDED, and capped so the 216
+		// gitleaks-derived `block` rules can never fire on an agent's file reads.
+		// Everything else keeps ceilingFull, i.e. byte-identical behavior.
+		//
+		// 🔴 The clamp is applied HERE, after the cache, on purpose: the cache
+		// stores the detector's RAW verdict keyed on content, and the ceiling is a
+		// property of the PIECE, not of the text. The same string appearing once in
+		// prose and once in a tool_result must mask in the first place and only
+		// audit in the second — which only works if the cached value is uncapped
+		// and the cap is re-applied per piece.
+		action, capped := pieces[i].ceiling.clamp(resp.Action)
+		if capped {
+			cappedCount++
+			// 失败要显眼 (inverted): this is the one line that says "we found
+			// something in a tool payload and deliberately let it through". Counts
+			// and the verdict name only — never content.
+			logger.Info("filter: verdict capped to audit by block-type ceiling; content forwarded UNCHANGED",
+				"event.name", observability.EventProxyFilterActionCapped,
+				"detector_action", resp.Action.String(), "ceiling", pieces[i].ceiling.String())
+		}
+
 		// Team-routed only: collect the event the detector handed back for the
 		// proxy to forward to master (the deferred upload sends them). Guard on
 		// routeClass so the proxy stays self-consistent even if a child ever
@@ -273,6 +413,19 @@ func (p *Proxy) applyInboundFilter(
 		// (NOT user input): the detector runs on a client with no org context,
 		// and the master must not trust a client-self-reported tenant.
 		// (update doc 20260603 §2.1)
+		//
+		// Cache hits contribute here too (2026-08-08): the batch now carries one event
+		// per FLAGGED piece in the request, not just per freshly-scanned piece. Bounded
+		// by the request's user-message count (the same bound the scan loop pays), and a
+		// batch is capped at 2 MiB server-side (maxIntakeBody) ≈ thousands of events, so
+		// a realistic conversation stays orders of magnitude under it.
+		// Index of THIS piece's event in teamEvents, or -1 when the piece produced
+		// none. The Mask branch below uses it to backfill wire_label after the
+		// labels are allocated. WHY an index instead of moving the append below the
+		// switch: several branches `continue` out, and moving the append past them
+		// would silently drop audit events for exactly the pieces that most need
+		// one (an unwritable piece, an empty mask payload).
+		teamEventIdx := -1
 		if routeClass == apphook.RouteClassTeam && len(resp.Event) > 0 {
 			// Stamp BOTH authoritative attribution fields the proxy resolved (the
 			// detector has neither): tenant_id = the VK's org, virtual_key_id = the
@@ -286,13 +439,39 @@ func (p *Proxy) applyInboundFilter(
 			// alias (2026-07-08, mirrors the conversation-audit seat fix).
 			// session_id: the conversation session (resolveSessionID, the SAME
 			// source the conversation-audit observer uses), so the compliance
-			// audit drawer can deep-link to the exact conversation turn for this
-			// flagged prompt — event_id joins the turn, session_id opens its
-			// thread (2026-07-08 cross-audit link, decision 2a).
-			teamEvents = append(teamEvents, injectSession(injectSeat(injectVirtualKey(injectTenant(resp.Event, orgID), virtualKeyID), seatID), sessionID))
+			// audit drawer can open the conversation THREAD this flagged prompt
+			// belongs to (2026-07-08 cross-audit link, decision 2a).
+			//
+			// trace_id: THIS TURN's trace id — the key that joins to the single
+			// conversation_records row for this turn.
+			//
+			// 🔴 Correction (2026-08-09, F1a): the comment that used to sit here
+			// claimed "event_id joins the turn". It never did. The compliance
+			// event_id is generated inside the detector CHILD PROCESS by its own
+			// newEventID() CSPRNG (cmd/detector/main.go), while a conversation
+			// turn's event_id is the proxy's W3C trace id. Two unrelated id
+			// spaces — so the audit page's `?event=` deep link, added 2026-07-08
+			// on the strength of that wrong comment, has been dead code that
+			// matched nothing ever since. trace_id is the real join key, and it
+			// is stamped HERE (per-piece loop) so all N events a single turn
+			// produces carry the SAME value → N:1 events-to-turn.
+			//
+			// action_taken: rewritten to the CAPPED verdict when the ceiling
+			// downgraded it. The detector decided "mask"; the proxy did not mask.
+			// Leaving the detector's word in the record would tell the compliance
+			// dashboard the content was redacted when it went out verbatim — a
+			// false-safety signal, which is the exact failure mode this whole area
+			// keeps producing. The event still exists (that is the point of 方案②);
+			// only its verdict is corrected to what actually happened.
+			ev := injectTraceID(injectSession(injectSeat(injectVirtualKey(injectTenant(resp.Event, orgID), virtualKeyID), seatID), sessionID), traceID)
+			if capped {
+				ev = injectActionTaken(ev, pieces[i].ceiling.String())
+			}
+			teamEvents = append(teamEvents, ev)
+			teamEventIdx = len(teamEvents) - 1
 		}
 
-		switch resp.Action {
+		switch action {
 		case apphook.ActionBlock:
 			// Refuse the whole request — one content piece contained content the
 			// policy blocks (e.g. full private key, batch customer data). Restore
@@ -311,6 +490,18 @@ func (p *Proxy) applyInboundFilter(
 			return false
 
 		case apphook.ActionMask:
+			if pieces[i].setText == nil {
+				// Defensive: a piece with no write-back target reached a Mask verdict.
+				// Structurally unreachable — the only unwritable piece (the joined
+				// tool_use.input blob) is pinned to an audit ceiling that clamps Mask
+				// away above. If this fires, someone raised that ceiling without
+				// splitting the join, and the correct outcome is "forward unchanged +
+				// say so loudly", never a silent partial mask.
+				logger.Warn("filter: Mask verdict on a piece with no write-back target; content forwarded UNCHANGED",
+					"event.name", observability.EventProxyFilterMaskUnwritablePiece,
+					"ceiling", pieces[i].ceiling.String())
+				continue
+			}
 			m := resp.MutatedPayload
 			if len(m) == 0 {
 				// Mask verdict but no payload — leave this piece unchanged.
@@ -318,10 +509,40 @@ func (p *Proxy) applyInboundFilter(
 					"event.name", "proxy.filter.mask_empty")
 				continue
 			}
+			masked := string(m)
+			// B3 restorable masks: renumber the detector's numberless token into
+			// per-request labels ({{ADDR_N}}) and record label→original in
+			// the request's restore state (consumed by the response leg). Runs for
+			// both fresh Detects and cache replays (numbering is request-scoped).
+			// Zero cost when the mask carries no restorables (the usual case).
+			var spanLabels map[[2]int]string
+			if len(resp.Restorables) > 0 {
+				if restoreState == nil {
+					restoreState = newMaskRestore()
+					// Hand the state the process-wide fidelity counters so the
+					// request leg's "issued" and the response leg's "restored"
+					// land in ONE place without a per-request lifecycle hook
+					// (方案 §3.2 L3 保真率指标). Counts only.
+					restoreState.fid = &p.maskFidelity
+				}
+				masked, spanLabels = renumberRestorables(head, masked, resp.Restorables, restoreState, logger)
+			}
 			// Masked head (the scanned first pipeInputCap bytes) + the untouched
 			// tail (forwarded raw, never scanned — same as the detector's own cap).
-			pieces[i].setText(string(m) + tail)
+			pieces[i].setText(masked + tail)
 			maskedCount++
+			// Backfill the labels this piece just issued onto this piece's event, so
+			// the audit trail records what was actually SENT ({{PHONE_1}}) next to
+			// the detector's numberless snippet ({{PHONE}}). Done here, after the
+			// substitution, because the labels do not exist until now — and scoped to
+			// THIS piece, because the offsets are relative to this piece's head
+			// (方案 L §16.3). Cache replays pass through here identically: the numbers
+			// are re-allocated per request after replay, so the backfilled label is
+			// this request's, never a stale one from the turn that populated the
+			// cache entry.
+			if teamEventIdx >= 0 && len(spanLabels) > 0 {
+				teamEvents[teamEventIdx] = injectWireLabels(teamEvents[teamEventIdx], spanLabels)
+			}
 
 		case apphook.ActionWarn:
 			logger.Info("filter: content warned (passed through)",
@@ -350,6 +571,17 @@ func (p *Proxy) applyInboundFilter(
 		}
 	}
 
+	if restoreState != nil && len(restoreState.keys) > 0 {
+		// Hang the placeholder→original state on the request context so the
+		// response leg (non-streaming body restore + SSE restorer in serveRoute's
+		// ModifyResponse) can swap the labels back. Same in-place WithContext
+		// stash pattern as applyModelMappingToRequest — the caller keeps using
+		// this *http.Request, and serveRoute derives its forwarding context from
+		// r.Context() after this call. Absent for every request without a
+		// restorable mask → the response leg pays one nil ctx lookup.
+		*r = *r.WithContext(context.WithValue(r.Context(), ctxKeyMaskRestore, restoreState))
+	}
+
 	if degraded {
 		// Hook unavailable for one or more pieces — those passed through
 		// unfiltered. Surfaced so operators see degraded detection (失败要显眼);
@@ -370,7 +602,8 @@ func (p *Proxy) applyInboundFilter(
 	// this is the steady-state trace for end-to-end debugging without a rebuild.
 	logger.Debug("filter: decision",
 		"event.name", "proxy.filter.decision",
-		"pieces", len(pieces), "masked", maskedCount, "degraded", degraded,
+		"pieces", len(pieces), "masked", maskedCount, "capped", cappedCount,
+		"degraded", degraded,
 		"detect_ms", detectNanos/1e6, "body_bytes", len(bodyBytes),
 		"incremental", incremental, "route_class", routeClass,
 		"cache_hits", cacheHits, "cache_miss", cacheMiss)
@@ -484,10 +717,15 @@ func injectSeat(eventJSON []byte, seatID string) []byte {
 
 // injectSession stamps the conversation session_id onto the team event JSON —
 // resolved by resolveSessionID, the SAME source the conversation-audit observer
-// uses, so the compliance audit drawer can deep-link to the exact conversation
-// thread (event_id joins the turn; session_id opens its thread). Empty session
-// (no session header — e.g. codex, which the conversation-audit UI keys by
-// event_id instead) → unchanged, same fail-safe as injectSeat. (2026-07-08.)
+// uses, so the compliance audit drawer can open the conversation THREAD a
+// flagged prompt belongs to. Empty session (no session header — e.g. codex,
+// which the conversation-audit UI keys by trace id instead) → unchanged, same
+// fail-safe as injectSeat. (2026-07-08.)
+//
+// 🔴 Correction (2026-08-09, F1a): this comment used to read "event_id joins
+// the turn; session_id opens its thread". The first half was never true — see
+// injectTraceID for why the compliance event_id joins nothing, and which field
+// actually does.
 func injectSession(eventJSON []byte, sessionID string) []byte {
 	if sessionID == "" {
 		return eventJSON
@@ -501,6 +739,205 @@ func injectSession(eventJSON []byte, sessionID string) []byte {
 		return eventJSON
 	}
 	m["session_id"] = q
+	out, err := json.Marshal(m)
+	if err != nil {
+		return eventJSON
+	}
+	return out
+}
+
+// injectTraceID stamps THIS TURN's W3C trace id onto the team event JSON. It is
+// the join key from a compliance event to the one conversation_records row for
+// the same turn, which is what lets the compliance-audit page show the prompt
+// as the user actually typed it (pre-mask) behind an "eye" control.
+//
+// WHY a new field instead of reusing event_id (the 2026-08-09 F1a decision):
+// the two id spaces are unrelated and always have been.
+//
+//   - compliance event_id — minted in the DETECTOR CHILD PROCESS by its own
+//     newEventID() CSPRNG. The proxy never sees it before the detector returns.
+//   - conversation event_id — the proxy's per-request W3C trace id, stored by
+//     the conversation-audit observer as ConversationRecord.EventID.
+//
+// So `compliance_events.event_id = conversation_records.event_id` matches
+// nothing, and the audit page's `?event=` deep link built on that assumption
+// has been dead since it shipped. trace_id is the key that actually joins.
+//
+// CARDINALITY: one turn produces N compliance events (one per flagged content
+// piece — the caller appends inside the per-piece loop) but exactly ONE
+// conversation record. All N share this trace id, so the relationship is N:1
+// and the join must be read in that direction.
+//
+// PRIVACY (DC5 / 方案 §6 不变量 #1 unaffected BY THIS FUNCTION): this is a
+// correlation id, not content. No prompt text is added to the upload here — the
+// master stores the key only, and the raw turn stays wherever
+// conversation_records lives.
+//
+// 🔴 2026-08-11 — the old text went on to claim "the original text still never
+// leaves the user's box" and listed three guards including "content-free intake
+// wire + DisallowUnknownFields at master" and "the detector's local-only
+// ContextSnippet". Those two guards are GONE by design: the intake wire declares
+// `context_snippet`, and ContextSnippet is no longer local-only (the detector's
+// gate is tiered — `PrivacyTier >= 3` on the team branch, seeded ON for a fresh
+// Team/Cluster install). What this function does is still content-free; the
+// system-wide claim it appealed to is not. The surviving system-wide statement
+// is 「原文不出**客户信任边界**」 — never onto an AiKey-operated server.
+//
+// Empty trace (no observer context on the route → no conversation record to
+// join to anyway) → unchanged, same fail-safe as injectSeat/injectSession.
+func injectTraceID(eventJSON []byte, traceID string) []byte {
+	if traceID == "" {
+		return eventJSON
+	}
+	var m map[string]json.RawMessage
+	if err := json.Unmarshal(eventJSON, &m); err != nil {
+		return eventJSON
+	}
+	q, err := json.Marshal(traceID)
+	if err != nil {
+		return eventJSON
+	}
+	m["trace_id"] = q
+	out, err := json.Marshal(m)
+	if err != nil {
+		return eventJSON
+	}
+	return out
+}
+
+// injectActionTaken rewrites the team event JSON's `action_taken` to the verdict
+// the proxy ACTUALLY applied, used when a block-type action ceiling downgraded
+// the detector's decision (方案② 2026-08-10, filter_content.go actionCeiling).
+//
+// WHY the proxy overwrites a field the detector authored: the detector decides
+// on CONTENT and has no idea which block the piece came from — the route class
+// is the only context that crosses the pipe. The ceiling is a proxy-side policy,
+// so the proxy is the only party that can keep the audit record truthful. An
+// event that says `mask` while the bytes went upstream verbatim is worse than no
+// event: it is the "虚假安全感" this whole scan-scope investigation started from.
+//
+// 🔴 KNOWN GAP — PERSONAL/LOCAL ROUTE IS NOT COVERED. On a personal route the
+// detector uploads its own event straight to the local self-view intake
+// (AIKEY_COMPLIANCE_LOCAL_INTAKE, cmd/detector/main.go emitEvent) and the proxy
+// never touches those bytes. So a Personal/Trial self-view can still show
+// `action_taken=mask` for a capped tool-block finding. Closing that needs the
+// ceiling to cross the pipe so the detector caps at source — a wire-contract
+// change, deliberately not taken here. Tracked in
+// workflow/CI/bugfix/2026-08-10-compliance-tool-result-scan-scope.md §5.5.
+//
+// Fail-safe like the other injectors: any parse/marshal error returns the
+// original event unchanged (a malformed event the master rejects is louder than
+// one silently dropped here).
+func injectActionTaken(eventJSON []byte, action string) []byte {
+	if action == "" {
+		return eventJSON
+	}
+	var m map[string]json.RawMessage
+	if err := json.Unmarshal(eventJSON, &m); err != nil {
+		return eventJSON
+	}
+	q, err := json.Marshal(action)
+	if err != nil {
+		return eventJSON
+	}
+	m["action_taken"] = q
+	out, err := json.Marshal(m)
+	if err != nil {
+		return eventJSON
+	}
+	return out
+}
+
+// injectWireLabels stamps, onto each finding of the team event JSON, the
+// numbered placeholder that finding's value was ACTUALLY forwarded upstream as
+// (`{{PHONE_1}}`) — the seventh member of the inject* family and, like the other
+// six, a fact the detector cannot know and the proxy just produced.
+//
+// WHY this exists: the snippet the detector records shows its NUMBERLESS token
+// (`{{PHONE}}`), because numbering is request-scoped and happens here, after the
+// detector has already built the event. A member reading their self-view was
+// therefore shown a string that was never sent, and two hits of the same entity
+// type in one prompt were indistinguishable. This closes that gap by carrying
+// the RESULT of the numbering rather than moving the rule (方案 L, update doc
+// 20260810-合规事件携带命中片段原文 §16.3; 方案 C — moving numbering into the
+// detector — was costed in §16.4 and declined).
+//
+// HOW the join works: spanLabels is keyed on [start,end) byte offsets into the
+// head this piece sent to the detector, and a finding's start_offset/end_offset
+// are offsets into that SAME payload in the SAME raw frame (the detector remaps
+// findings back to the raw frame before both the event and the mask metadata are
+// built). So this is an EQUAL JOIN on an offset pair — the proxy is not
+// re-deriving which entity is where, it is looking up an answer it already
+// computed. No parsing of the snippet, no regex, no re-application of any rule.
+//
+// 🔴 PER-PIECE ONLY. Offsets are relative to one piece's head, so piece #2's
+// span [10,21) is a completely different substring from piece #1's [10,21). The
+// caller must pass the map produced by THIS piece and apply it to THIS piece's
+// event. Applying a request-wide map would silently mislabel findings.
+//
+// 🔴 A FINDING WITH NO MATCH KEEPS AN EMPTY wire_label, AND THAT IS THE POINT.
+// Three important cases land there and all of them are correct:
+//   - the finding's policy action is `audit` (record it, forward the bytes
+//     unchanged) — e.g. CN_ADDRESS, whose shipped default is audit. It is in the
+//     event but never in the mask plan, so it has no span here. Its raw value
+//     went upstream verbatim, and naming a placeholder for it would tell the
+//     compliance dashboard the value was redacted when it was not — the same
+//     false-safety failure injectActionTaken exists to prevent one field over.
+//   - an action ceiling capped the piece: the Mask branch never runs, no labels
+//     are allocated, this function is never called for that piece.
+//   - one of the three restore degrade paths fired: the mask still applies, the
+//     numbering does not, and renumberRestorables returns a nil map.
+//
+// So "has a wire label" reads as "this value really did go out under this name",
+// and only that. Fenced by TestInjectWireLabels_AuditFindingStaysUnlabelled.
+//
+// Fail-safe like the other injectors: any parse/marshal problem returns the
+// original event unchanged — a wire label is an annotation, and losing it must
+// never cost the audit record itself.
+func injectWireLabels(eventJSON []byte, spanLabels map[[2]int]string) []byte {
+	if len(spanLabels) == 0 {
+		return eventJSON
+	}
+	var m map[string]json.RawMessage
+	if err := json.Unmarshal(eventJSON, &m); err != nil {
+		return eventJSON
+	}
+	raw, ok := m["findings"]
+	if !ok {
+		return eventJSON
+	}
+	var findings []map[string]json.RawMessage
+	if err := json.Unmarshal(raw, &findings); err != nil {
+		return eventJSON
+	}
+	stamped := 0
+	for _, f := range findings {
+		var start, end int
+		if err := json.Unmarshal(f["start_offset"], &start); err != nil {
+			continue
+		}
+		if err := json.Unmarshal(f["end_offset"], &end); err != nil {
+			continue
+		}
+		label, hit := spanLabels[[2]int{start, end}]
+		if !hit {
+			continue
+		}
+		q, err := json.Marshal(label)
+		if err != nil {
+			continue
+		}
+		f["wire_label"] = q
+		stamped++
+	}
+	if stamped == 0 {
+		return eventJSON
+	}
+	nf, err := json.Marshal(findings)
+	if err != nil {
+		return eventJSON
+	}
+	m["findings"] = nf
 	out, err := json.Marshal(m)
 	if err != nil {
 		return eventJSON

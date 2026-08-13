@@ -66,6 +66,16 @@ const (
 	// usage event / pricing use the effective model (audit 双口径 I2 / P4.1),
 	// while RequestedModel keeps the client model. Absent → no mapping.
 	ctxKeyMappedEffectiveModel
+	// ctxKeyMaskRestore carries the per-request *maskRestore state (numbered
+	// placeholder → original text) built by applyInboundFilter when the inbound
+	// filter applied a RESTORABLE mask (v4 apphook contract, B3 2026-08-08).
+	// The response leg (non-streaming body + SSE restorer) reads it to swap
+	// placeholders back to the user's original text — the ONLY sanctioned
+	// response-direction rewrite (spec 2026-06-04 合规过滤方向 规则 2 唯一例外).
+	// 🚫 The mapping lives in THIS context value only: never persisted, never
+	// logged, dies with the request (B3 拍板 2026-08-06). Absent → response
+	// passes through untouched (zero cost).
+	ctxKeyMaskRestore
 	// ctxKeyProviderPathDecision pins the exact OAuth-group outbound path and
 	// override decision admitted by the path breaker. A concurrent Settings
 	// change may affect the next request, but must not make one in-flight request
@@ -94,6 +104,33 @@ const headerAikeyProbe = "X-Aikey-Probe"
 
 func isAikeyProbe(r *http.Request) bool {
 	return r != nil && r.Header.Get(headerAikeyProbe) == "1"
+}
+
+// routeSourceProbe is the ResolvedRoute.RouteSource stamped by
+// handleProbePipeline (mode C, /probe/<alias>/v1/...). It is the ONE name for
+// "this request came out of the Probe pipeline"; before it existed the concept
+// was a bare "probe" literal repeated at the producer and re-derived by hand at
+// every consumer, which is how the compliance exclusion below got lost.
+const routeSourceProbe = "probe"
+
+// isProbePipelineRoute reports whether a resolved route came from the Probe
+// pipeline. THE single exit for that question — consumers must call this rather
+// than compare RouteSource to a literal.
+//
+// Why it is not the same predicate as isAikeyProbe: the two describe different
+// trust levels and must not be merged.
+//
+//   - isProbePipelineRoute is derived SERVER-SIDE from the path the request
+//     arrived on (/probe/<alias>/...), after probepipe.Authenticate. The payload
+//     on that path is aikey's own fixed degrade-detection probe, and the pipeline
+//     can only resolve the caller's own PERSONAL aliases — it cannot reach a team
+//     virtual key at all.
+//   - isAikeyProbe is a CLIENT-SET header (X-Aikey-Probe: 1) that rides on any
+//     route including team virtual keys. It already suppresses usage accounting
+//     and quota; extending it to compliance would hand every employee a one-header
+//     DLP bypass on the team lane. Deliberately NOT done — 安全 > UX.
+func isProbePipelineRoute(routeSource string) bool {
+	return routeSource == routeSourceProbe
 }
 
 // extractVirtualKey extracts a token from the request that belongs to the
@@ -198,22 +235,36 @@ func requestProtocolFromPath(path string) string {
 	}
 }
 
-// extractProviderFromPath checks if path starts with a known provider prefix
-// (e.g., "/anthropic/v1/messages") and returns the provider code and the
-// stripped path (e.g., "anthropic", "/v1/messages"). Returns ("", "") if no
-// prefix matched.
+// extractProviderFromPath checks if path starts with a client path-prefix the
+// registry declares (e.g. "/anthropic/v1/messages", "/groq/v1/chat/completions")
+// and returns the canonical provider code plus the path with that prefix
+// removed (e.g. "anthropic", "/v1/messages"). Returns ("", "") if nothing
+// matched — the caller then falls through to token-based routing.
+//
+// The prefix table is DERIVED from provider_registry.yaml; see
+// clientPathPrefixes in pathprefix_table.go for the derivation and for why a
+// hand-written list here was a production defect (bugfix
+// workflow/CI/bugfix/20260808-provider-path-prefix-routing-registry-drift.md).
 func extractProviderFromPath(path string) (providerCode, strippedPath string) {
-	// This is a client-route list, not a Provider list. In particular `mock`
-	// must never become a URL/client namespace: Mock credentials enter through
-	// `/anthropic` or `/openai` according to their exact stored protocol.
-	// Aliases remain for old active.env files.
-	// 2026-05-08 Kimi 双平台拆分: 加 'kimi_code' 作为 path-prefix 候选。'kimi' 保留
-	// 作为 deprecated path-prefix(老 shell hook 已写到用户 env,不能断流)。
-	known := []string{"anthropic", "claude", "openai", "google", "kimi_code", "kimi", "deepseek", "moonshot", "groq", "xai", "openrouter", "perplexity", "zhipu", "qwen", "doubao", "siliconflow"}
-	for _, code := range known {
-		prefix := "/" + code
-		if strings.HasPrefix(path, prefix+"/") || path == prefix {
-			return code, strings.TrimPrefix(path, prefix)
+	if len(path) < 2 || path[0] != '/' {
+		return "", ""
+	}
+	// Bucket by first path segment so the hot path is one map lookup plus a
+	// 1-4 element scan, regardless of how many providers the registry grows to.
+	seg := path[1:]
+	if i := strings.IndexByte(seg, '/'); i >= 0 {
+		seg = seg[:i]
+	}
+	// Candidates are pre-sorted LONGEST FIRST. Longest-prefix-wins is load
+	// bearing, not a tidiness preference: "/groq/v1/..." must be matched by the
+	// full proxy_path "groq/v1" and stripped whole. If the bare "groq" candidate
+	// won instead, the surplus "/v1" would be handed to providerroutes.Stitch as
+	// if the client had sent it — that is exactly defect D-2, where the vendor
+	// received its own base path twice and answered 404.
+	for _, c := range clientPathPrefixes().candidatesFor(seg) {
+		p := "/" + c.prefix
+		if path == p || strings.HasPrefix(path, p+"/") {
+			return c.code, path[len(p):]
 		}
 	}
 	return "", ""
@@ -296,7 +347,7 @@ func resolveOAuthUpstream(canonicalCode, protocolType, existingBase string, r *h
 		// bypassed the hook and sent test traffic to the real provider edge.
 		// Production is unchanged: this branch is inert unless the explicit env
 		// value also passes the loopback / RFC 6761 .test safety gate.
-		if testBase, ok := anthropicTestBaseURL(canonicalCode, protocolType); ok {
+		if testBase, ok := oauthTestBaseURL(canonicalCode, protocolType); ok {
 			return testBase, r
 		}
 		if strings.TrimSpace(existingBase) != "" {
@@ -382,6 +433,26 @@ func anthropicTestBaseURL(canonicalCode, protocolType string) (string, bool) {
 		return "", false
 	}
 	return o, true
+}
+
+// oauthTestBaseURL is the single test-only upstream override used by real
+// binary OAuth E2Es. Every value is rejected unless it is plain HTTP on
+// loopback or the reserved .test TLD, so production traffic cannot be diverted
+// by an arbitrary environment value. Anthropic keeps its historical variable;
+// Kimi needs a separate endpoint because its OAuth wire contract is Chat
+// Completions rather than Codex Responses.
+func oauthTestBaseURL(canonicalCode, protocolType string) (string, bool) {
+	if base, ok := anthropicTestBaseURL(canonicalCode, protocolType); ok {
+		return base, true
+	}
+	if provider.CanonicalCode(canonicalCode) != "kimi_code" || provider.CanonicalProtocol(protocolType) != "openai_compatible" {
+		return "", false
+	}
+	base := strings.TrimRight(strings.TrimSpace(os.Getenv("AIKEY_PROXY_TEST_KIMI_BASE_URL")), "/")
+	if !testOnlyBaseURLAllowed(base) {
+		return "", false
+	}
+	return base, true
 }
 
 func providerDefaultBaseURL(providerCode string) string {

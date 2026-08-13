@@ -207,7 +207,7 @@ func (p *Proxy) recordEvent(req *http.Request, resp *http.Response, startTime ti
 	// exact-token blocking prevents an endless 401 re-emission loop.
 	if isHardRevoked(resp.StatusCode, errType, errMsg) {
 		p.signalReporter.enqueueAuthFailure(
-			route.CredentialID, route.OauthGroupID, route.SeatID, route.OAuthTokenFingerprint, "token_revoked")
+			route.CredentialID, route.OauthGroupID, route.SeatID, route.OAuthTokenFingerprint)
 	}
 	// Rate-limit-feed emit (best-effort, OFF the hot path, mirrors the revoked
 	// hook above): the proxy sees every upstream 429 (rate limit) / 403 (forbidden);

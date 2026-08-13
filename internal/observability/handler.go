@@ -91,10 +91,12 @@ const (
 	EventProxySyncRailRecovered = "proxy.sync.rail_recovered"
 	// #nosec G101 -- an event NAME, not a credential. The literal contains the
 	// word "credential" because that is what the event describes.
-	EventProxySyncCredentialRebuilt    = "proxy.sync.credential_rebuilt"
-	EventProxyGroupRuntimeChanged      = "proxy.group_runtime.changed"
-	EventProxyGroupRuntimeWriteFailed  = "proxy.group_runtime.write_failed"
-	EventProxyGroupRuntimeReloadFailed = "proxy.group_runtime.reload_failed"
+	EventProxySyncCredentialRebuilt          = "proxy.sync.credential_rebuilt"
+	EventProxyGroupRuntimeChanged            = "proxy.group_runtime.changed"
+	EventProxyGroupRuntimeWriteFailed        = "proxy.group_runtime.write_failed"
+	EventProxyGroupRuntimeReloadFailed       = "proxy.group_runtime.reload_failed"
+	EventProxyClusterVaultAssignmentsCorrupt = "proxy.routing_override.cluster_vault_corrupt"
+	EventProxyClusterVaultAssignmentsChanged = "proxy.routing_override.cluster_vault_changed"
 	// EventProxySyncHealthFileFailed: the statusline sync-health bypass file
 	// (~/.aikey/run/sync-health.json) could not be written/removed — the claude
 	// status bar may show a stale (or miss a fresh) sync warning.
@@ -103,6 +105,19 @@ const (
 	// after the upload pipe recovered (2026-07-04 self-heal) — carries
 	// scanned/replayed/still-failing counts, or the error when the pass failed.
 	EventReporterDeadLetterReplayed = "proxy.events.dead_letter_replayed"
+	// EventComplianceUploadDeadLettered: a team→master compliance upload failed
+	// and the batch was conserved in dead_letter.jsonl instead of being dropped
+	// (2026-08-10). Carries route_source / status / reason / count. The single
+	// most useful line when an audit trail looks short: it says the events
+	// exist, where they are, and why they have not landed yet.
+	EventComplianceUploadDeadLettered = "proxy.compliance.upload_dead_lettered"
+	// EventComplianceDeadLetterReplayed: one conserved compliance batch was
+	// re-attempted by a replay pass (automatic on recovery, or admin-triggered).
+	EventComplianceDeadLetterReplayed = "proxy.compliance.dead_letter_replayed"
+	// EventComplianceDeadLetterOverflow: the dead-letter file hit its size cap
+	// and a compliance batch was DROPPED. This is real audit loss, unlike every
+	// other event in this group — it is logged at ERROR for that reason.
+	EventComplianceDeadLetterOverflow = "proxy.compliance.dead_letter_overflow"
 )
 
 // Health events.
@@ -146,6 +161,48 @@ const (
 	// token quota floor backstops it and the server baseline catches up on
 	// re-sync. Recurring hits signal a stale summary needing a price re-sync.
 	EventProxyQuotaModelUnpriced = "proxy.quota.model_unpriced"
+	// Compliance restorable-mask chain (方案 20260808 占位符还原与全类型脱敏).
+	// EventProxyFilterRestoreAlignMismatch: the masked text and the detector's
+	// span metadata disagree for one placeholder family (user typed the literal
+	// token, spans drifted, occurrences overlap) — the mask is KEPT, only the
+	// response-side restore is dropped for that family.
+	// EventProxyFilterRestoreDuplicateToken: the detector sent more than one
+	// Restorable for the SAME placeholder token, breaking the "one token ⇒ one
+	// restorable" wire contract P1 established (alias entities must be merged
+	// child-side). Acting on it would renumber one family's occurrences with the
+	// other family's spans — a silent WRONG restore — so every family sharing
+	// the token is dropped. WARN, never a request failure: fail-open governs the
+	// whole filter chain, and the sensitive text stays masked either way.
+	// Both carry counts only; placeholder↔original content is never logged.
+	EventProxyFilterRestoreAlignMismatch  = "proxy.filter.restore_align_mismatch"
+	EventProxyFilterRestoreDuplicateToken = "proxy.filter.restore_duplicate_token"
+	// EventProxyFilterActionCapped: the detector returned mask/block for a piece
+	// whose block type is scanned for AUDIT ONLY (agent tool_result / tool_use;
+	// 方案② 2026-08-10), so the proxy recorded the finding and forwarded the
+	// content BYTE-UNCHANGED. This is the deliberate, decided behavior — not a
+	// degrade — but it is logged per occurrence because "we saw sensitive content
+	// and let it through on purpose" must never be inferable only from silence.
+	// Counts + the verdict name only; never any content.
+	// EventProxyFilterMaskUnwritablePiece: a Mask verdict landed on a piece with
+	// no write-back target (the joined tool_use.input blob). Unreachable while its
+	// action ceiling forbids masking — it fires only if someone raised the ceiling
+	// without splitting the join, so it names a code defect, not a content event.
+	EventProxyFilterActionCapped        = "proxy.filter.action_capped"
+	EventProxyFilterMaskUnwritablePiece = "proxy.filter.mask_unwritable_piece"
+	// EventProxyFilterMaxActionReadFailed means the operational enforcement
+	// ceiling could not be read from the Vault. The supervisor preserves the
+	// safer full ceiling and emits this stable event for external alerting.
+	EventProxyFilterMaxActionReadFailed = "proxy.filter.max_action_read_failed"
+	// EventProxyFilterProbeExcluded: a Probe-pipeline request (mode C,
+	// /probe/<alias>/v1/..., RouteSource "probe") reached the compliance entry
+	// point and was skipped WITHOUT entering the chain. Its payload is aikey's
+	// own fixed degrade-detection probe, not employee content: masking it would
+	// change the prompt the response fingerprint is measured against, and the
+	// resulting event would attribute aikey's text to the employee. DEBUG, one
+	// line per probe — it is the expected path, logged only so an operator
+	// debugging "why is there no compliance event for this request" can see the
+	// reason instead of inferring it from silence. Carries no content.
+	EventProxyFilterProbeExcluded = "proxy.filter.probe_excluded"
 	// Oauth-group routing (N8). EventProxyGroupRouteResolved: a group VK request
 	// picked + injected a candidate account. EventProxyGroupRouteDegraded: no
 	// usable candidate (no material / all expired-exhausted / key unavailable) →
@@ -217,13 +274,14 @@ const (
 // ---- Error code constants ----
 
 const (
-	ErrCodeTokenMissing          = "TOKEN_MISSING"
-	ErrCodeTokenInvalid          = "TOKEN_INVALID"
-	ErrCodePolicyModelForbidden  = "POLICY_MODEL_FORBIDDEN"
-	ErrCodeSecretNotConfigured   = "SECRET_NOT_CONFIGURED"
-	ErrCodeUpstreamError         = "UPSTREAM_ERROR"
-	ErrCodeProviderError         = "PROVIDER_ERROR"
-	ErrCodeUsageExtractionFailed = "USAGE_EXTRACTION_FAILED"
+	ErrCodeTokenMissing                   = "TOKEN_MISSING"
+	ErrCodeTokenInvalid                   = "TOKEN_INVALID"
+	ErrCodePolicyModelForbidden           = "POLICY_MODEL_FORBIDDEN"
+	ErrCodeSecretNotConfigured            = "SECRET_NOT_CONFIGURED"
+	ErrCodeUpstreamError                  = "UPSTREAM_ERROR"
+	ErrCodeProviderError                  = "PROVIDER_ERROR"
+	ErrCodeUsageExtractionFailed          = "USAGE_EXTRACTION_FAILED"
+	ErrCodeClusterVaultAssignmentsCorrupt = "CLUSTER_VAULT_ASSIGNMENTS_CORRUPT"
 	// Enterprise quota (Phase 2, design §5.5). Stage 3 wires the token code;
 	// USD + degraded-block are reserved for later stages ($ enforcement / §8).
 	ErrCodeQuotaExceededToken = "QUOTA_EXCEEDED_TOKEN"

@@ -365,6 +365,37 @@ func (p *Proxy) ResolveBindingCredential(
 
 // serveRoute executes the forwarding pipeline (streaming detection, transport
 // selection, reverse proxy) shared by token-based and path-prefix routing.
+// traceIDForAudit returns THIS TURN's W3C trace id for cross-audit correlation,
+// read off the observer request context the route carries.
+//
+// WHY read it off route.ObserverContext instead of re-deriving it: this is the
+// SAME *observer.RequestContext pointer that was handed to
+// observerRegistry.NotifyStart, and the conversation-audit observer stores
+// exactly its .TraceID as ConversationRecord.EventID. Same struct, same field,
+// one assignment — so "the compliance event's trace_id" and "the conversation
+// turn's event_id" are same-source BY CONSTRUCTION, not by convention. Every
+// path that builds the context stamps it from the request-scoped traceID its
+// caller was given (forward_and_resolve serveRouteWithObserver, pipelines app +
+// probe), and the chain path reuses one traceID across all fallback attempts.
+//
+// 🔴 Do NOT "fix" an empty return by calling observability.ExtractOrCreate(r)
+// here. That function is NOT idempotent: with no inbound traceparent header —
+// the normal case, since local CLIs don't send one — it MINTS A NEW RANDOM
+// TRACE. A second call therefore returns a different id than the one the
+// observer recorded, producing a key that silently joins to nothing. An empty
+// trace_id (no observers active → no conversation record exists either) is the
+// honest answer; a fabricated one is not.
+func traceIDForAudit(route *vkeys.ResolvedRoute) string {
+	if route == nil || route.ObserverContext == nil {
+		return ""
+	}
+	obsReqCtx, ok := route.ObserverContext.(*observer.RequestContext)
+	if !ok || obsReqCtx == nil {
+		return ""
+	}
+	return obsReqCtx.TraceID
+}
+
 func (p *Proxy) serveRoute(w http.ResponseWriter, r *http.Request, route *vkeys.ResolvedRoute, prov provider.Provider, realKey, bearerToken string, startTime time.Time, logger *slog.Logger) {
 	// P1d (R-C, design D-10 refined): normalize provider ATTRIBUTION to the
 	// truthful upstream vendor resolved from the binding's base_url. A binding
@@ -435,7 +466,11 @@ func (p *Proxy) serveRoute(w http.ResponseWriter, r *http.Request, route *vkeys.
 	// On Block, applyInboundFilter writes the 403 and we return without
 	// forwarding. On Mask, r.Body is rewritten to the redacted version so the
 	// upstream LLM never sees the raw sensitive prompt. Fail-open on degraded.
-	if !p.applyInboundFilter(w, r, extractModel(r), route.RouteSource, route.OrgID, route.VirtualKeyID, route.SeatID, resolveSessionID(r, route.ProtocolType, route.ProviderCode), logger) {
+	// traceIDForAudit(route) is read off the SAME *observer.RequestContext that
+	// the conversation-audit observer is handed (route.ObserverContext), so a
+	// compliance event and its conversation turn cannot disagree about the key.
+	// See traceIDForAudit for why this is same-source by construction.
+	if !p.applyInboundFilter(w, r, extractModel(r), route.RouteSource, route.OrgID, route.VirtualKeyID, route.SeatID, resolveSessionID(r, route.ProtocolType, route.ProviderCode), traceIDForAudit(route), logger) {
 		return
 	}
 
@@ -967,6 +1002,17 @@ func (p *Proxy) serveRoute(w http.ResponseWriter, r *http.Request, route *vkeys.
 				// wired in the streaming branch below.
 				body = restoreResponseModel(r.Context(), body)
 
+				// B3 placeholder restore (non-streaming leg): swap the request-side
+				// mask labels (e.g. "{{ADDR_1}}") the LLM echoed back to the
+				// user's original text — the ONLY sanctioned response-direction
+				// rewrite (spec 2026-06-04 规则 2 唯一例外). Runs AFTER extraction
+				// and translation so tokens/usage and audit see the masked form;
+				// the restored originals exist only on the wire to the client.
+				// No-op nil check when this request built no restore mapping.
+				if maskRestoreFromContext(r.Context()) != nil {
+					body = restoreMaskedResponseBody(r.Context(), body, logger)
+				}
+
 				// Rebuffer with the FINAL body (post-translation if engaged,
 				// otherwise unchanged from upstream).
 				//
@@ -1125,7 +1171,14 @@ func (p *Proxy) serveRoute(w http.ResponseWriter, r *http.Request, route *vkeys.
 				if route.ObserverContext != nil {
 					obsReqCtx, _ = route.ObserverContext.(*observer.RequestContext)
 				}
-				resp.Body = newStreamDrainer(upstream, &baseEvent, prov, collector, p.proxyCtx, r.Context(), logger, cb, obsRegistry, obsReqCtx)
+				drained := newStreamDrainer(upstream, &baseEvent, prov, collector, p.proxyCtx, r.Context(), logger, cb, obsRegistry, obsReqCtx)
+				// B3 placeholder restore (streaming leg): wrapped OUTSIDE the
+				// drainer, client-facing side only — token extraction and the
+				// conversation-audit observer keep seeing the MASKED placeholders
+				// (mirrors the request side where audit sees the masked prompt);
+				// restored originals never flow toward collector/master. No-op
+				// pass-through (returns drained unchanged) without a mapping.
+				resp.Body = newSSEPlaceholderRestorer(drained, maskRestoreFromContext(r.Context()))
 			}
 			return nil
 		},

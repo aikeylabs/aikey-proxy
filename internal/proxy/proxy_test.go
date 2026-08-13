@@ -447,18 +447,50 @@ func TestProxy_ErrorResponse_NoTokens(t *testing.T) {
 
 // ── extractProviderFromPath unit tests ───────────────────────────────────────
 
+// TestExtractProviderFromPath pins the parse. Note it asserts the INTERMEDIATE
+// stripped path, which is an implementation detail of the hand-off to
+// providerroutes.Stitch — the user-visible contract is the UPSTREAM path, fenced
+// end-to-end by TestPathPrefixMatrix_MatchesKnownDefectLedger and by
+// TestPathPrefix_ShippedProvidersUpstreamPathUnchanged.
+//
+// 🔴 2026-08-08 (plan A, bugfix 20260808-provider-path-prefix-routing-registry-drift):
+// two rows below CHANGED, and it matters that the change is understood rather
+// than pattern-matched as a relaxation:
+//
+//	/kimi/v1/…      was ("kimi",     "/v1/chat/completions")
+//	                now ("kimi_code","/chat/completions")
+//	/moonshot/v1/…  was ("moonshot", "/v1/chat/completions")
+//	                now ("moonshot", "/chat/completions")
+//
+// Both providers declare a MULTI-SEGMENT proxy_path ("kimi/v1", "moonshot/v1").
+// The whole proxy_path is now stripped, because that is the only rule that also
+// fixes the six providers whose proxy_path mirrored upstream path segments (D-2).
+// The upstream path is UNCHANGED for both — Stitch strips whatever version
+// segment the client sent and re-attaches the route row's own, so removing "/v1"
+// here and removing it inside Stitch produce the identical result
+// (/coding/v1/chat/completions and /v1/chat/completions respectively). The
+// returned code is now always the CANONICAL code, so the deprecated "kimi"
+// prefix reports "kimi_code" instead of relying on a later canonicalization step.
 func TestExtractProviderFromPath(t *testing.T) {
 	tests := []struct {
 		path             string
 		wantProvider     string
 		wantStrippedPath string
 	}{
+		// proxy_path == code: the client appends the version segment itself.
 		{"/anthropic/v1/messages", "anthropic", "/v1/messages"},
 		{"/openai/v1/chat/completions", "openai", "/v1/chat/completions"},
 		{"/deepseek/v1/chat/completions", "deepseek", "/v1/chat/completions"},
-		{"/kimi/v1/chat/completions", "kimi", "/v1/chat/completions"},
-		{"/moonshot/v1/chat/completions", "moonshot", "/v1/chat/completions"},
 		{"/google/v1/models", "google", "/v1/models"},
+		// proxy_path == code + version: the whole thing is stripped.
+		{"/kimi/v1/chat/completions", "kimi_code", "/chat/completions"},
+		{"/moonshot/v1/chat/completions", "moonshot", "/chat/completions"},
+		// canonical code alone still routes (kimi_code's proxy_path is "kimi/v1",
+		// so this arm exists only via the code candidate).
+		{"/kimi_code/v1/chat/completions", "kimi_code", "/v1/chat/completions"},
+		// Short prefix without the version segment — what an older aikey wrote
+		// into some users' shell env. Must keep routing.
+		{"/moonshot/chat/completions", "moonshot", "/chat/completions"},
 		{"/anthropic", "anthropic", ""},
 		{"/v1/messages", "", ""},
 		{"/anthropicX/v1", "", ""},

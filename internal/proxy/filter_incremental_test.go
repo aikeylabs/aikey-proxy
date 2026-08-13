@@ -46,7 +46,14 @@ func TestExtractLatestUserContent_SafetyFallbacks(t *testing.T) {
 		{"no_messages", `{"model":"m","system":"hi"}`},
 		{"empty_messages", `{"model":"m","messages":[]}`},
 		{"last_is_assistant", `{"messages":[{"role":"user","content":"hi"},{"role":"assistant","content":"yo"}]}`},
-		{"last_user_no_text", `{"messages":[{"role":"user","content":[{"type":"tool_result","content":"x"}]}]}`},
+		// 🔄 2026-08-10: this case USED to be `tool_result` content. It was changed,
+		// not deleted, because the underlying fact changed: tool_result is now
+		// extracted (at ceilingAudit, 方案②), so it no longer yields zero pieces.
+		// The invariant being fenced — "a last user turn with nothing scannable in
+		// it must force the full-scan fallback rather than silently scanning
+		// nothing" — is unchanged, so it is re-pinned on a shape that is still
+		// genuinely unscannable: an attachment-only message.
+		{"last_user_no_text", `{"messages":[{"role":"user","content":[{"type":"image","source":{"type":"base64","data":"x"}}]}]}`},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
@@ -55,6 +62,23 @@ func TestExtractLatestUserContent_SafetyFallbacks(t *testing.T) {
 				t.Errorf("%s: expected ok=false (force full-scan fallback), got ok=true", c.name)
 			}
 		})
+	}
+}
+
+// TestExtractLatestUserContent_ToolResultNowYieldsPieces records the behavior
+// change above in the positive direction, so the swap in the table cannot be
+// mistaken for a test that was quietly weakened. Before 2026-08-10 a Claude Code
+// turn ending in a tool_result reduced to ZERO pieces here; that reduction was
+// one half of the silent bypass proven by
+// aikey-test/auditeye/tool_result_scope_test.go.
+func TestExtractLatestUserContent_ToolResultNowYieldsPieces(t *testing.T) {
+	pieces, _, ok := extractLatestUserContent([]byte(
+		`{"messages":[{"role":"user","content":[{"type":"tool_result","tool_use_id":"t1","content":"FILE BODY"}]}]}`))
+	if !ok || len(pieces) != 1 {
+		t.Fatalf("tool_result must now yield a scannable piece; ok=%v pieces=%d", ok, len(pieces))
+	}
+	if pieces[0].ceiling != ceilingAudit {
+		t.Fatalf("and it must be audit-capped; got %v", pieces[0].ceiling)
 	}
 }
 
@@ -69,7 +93,7 @@ func TestApplyInboundFilter_DeprecatedIncrementalNowFullScans(t *testing.T) {
 	hook := &stubHook{resp: &apphook.Response{Action: apphook.ActionAllow}}
 	// filterIncremental=true:旧 env 仍开,但已被忽略 → 仍走全量扫。
 	p := &Proxy{filterHook: hook, filterIncremental: true}
-	if proceed := p.applyInboundFilter(nil, newReq(body), "m", "personal", "", "", "", "", discardLogger()); !proceed {
+	if proceed := p.applyInboundFilter(nil, newReq(body), "m", "personal", "", "", "", "", "", discardLogger()); !proceed {
 		t.Fatal("expected proceed")
 	}
 	// 全量扫:system + 3 条消息都扫 → >1 次。增量(旧漏因)只会 1 次(只扫最新 turn)。
@@ -85,7 +109,7 @@ func TestApplyInboundFilter_IncrementalFallsBackOnAgentLoop(t *testing.T) {
 	body := `{"messages":[{"role":"user","content":"前文"},{"role":"assistant","content":"工具调用"}]}`
 	hook := &stubHook{resp: &apphook.Response{Action: apphook.ActionAllow}}
 	p := &Proxy{filterHook: hook, filterIncremental: true}
-	if proceed := p.applyInboundFilter(nil, newReq(body), "m", "personal", "", "", "", "", discardLogger()); !proceed {
+	if proceed := p.applyInboundFilter(nil, newReq(body), "m", "personal", "", "", "", "", "", discardLogger()); !proceed {
 		t.Fatal("expected proceed")
 	}
 	// Full-scan fallback ran (the user piece got scanned), not a silent skip.

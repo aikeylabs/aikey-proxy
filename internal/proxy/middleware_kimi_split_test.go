@@ -84,11 +84,19 @@ func TestExtractProviderFromPath_KimiCodePathRecognized(t *testing.T) {
 }
 
 func TestExtractProviderFromPath_MoonshotPathRecognized(t *testing.T) {
+	// 🔴 2026-08-08: stripped changed from "/v1/chat/completions" to
+	// "/chat/completions". moonshot's proxy_path is "moonshot/v1" and the whole
+	// matched proxy_path is now stripped (plan A, bugfix
+	// 20260808-provider-path-prefix-routing-registry-drift). The UPSTREAM path is
+	// unchanged — Stitch re-attaches the route row's /v1 — and that equality is
+	// asserted directly by TestPathPrefix_ShippedProvidersUpstreamPathUnchanged.
+	// What this test is actually for (moonshot must be RECOGNIZED at all, not fall
+	// through to token routing and 401) is unaffected.
 	provider, stripped := extractProviderFromPath("/moonshot/v1/chat/completions")
 	if provider != "moonshot" {
 		t.Errorf("extractProviderFromPath moonshot: provider = %q", provider)
 	}
-	if stripped != "/v1/chat/completions" {
+	if stripped != "/chat/completions" {
 		t.Errorf("extractProviderFromPath moonshot: stripped = %q", stripped)
 	}
 }

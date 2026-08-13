@@ -235,11 +235,11 @@ func TestAuthFailureSignalIsVersionedDurableAndRetriedUntilAccepted(t *testing.T
 	}
 	// Missing token version is unsafe: a delayed signal could invalidate a new
 	// re-login, so it must not enter the outbox.
-	r.enqueueAuthFailure("c1", "g1", "s1", "", "token_revoked")
+	r.enqueueAuthFailure("c1", "g1", "s1", "")
 	if len(r.snapshotAuthFailures()) != 0 {
 		t.Fatal("unversioned auth failure entered outbox")
 	}
-	r.enqueueAuthFailure("c1", "g1", "s1", "fingerprint-1", "token_revoked")
+	r.enqueueAuthFailure("c1", "g1", "s1", "fingerprint-1")
 	pending := r.snapshotAuthFailures()
 	if len(pending) != 1 || pending[0].TokenFingerprint != "fingerprint-1" {
 		t.Fatalf("versioned auth failure not queued: %+v", pending)
@@ -288,7 +288,7 @@ func TestAuthFailureSignalIsVersionedDurableAndRetriedUntilAccepted(t *testing.T
 func TestAuthFailureOutboxHydratesOnlyVersionedEntries(t *testing.T) {
 	t.Setenv("AIKEY_RUN_DIR", t.TempDir())
 	writer := &signalReporter{authFailures: make(map[string]authFailureSample), authWake: make(chan struct{}, 1), logger: slog.Default()}
-	writer.enqueueAuthFailure("c1", "g1", "s1", "fp-1", "token_revoked")
+	writer.enqueueAuthFailure("c1", "g1", "s1", "fp-1")
 
 	reader := &signalReporter{authFailures: make(map[string]authFailureSample), logger: slog.Default()}
 	reader.hydrateAuthFailures()

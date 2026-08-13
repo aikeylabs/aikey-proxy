@@ -22,8 +22,9 @@
 // and the dispatcher skips the hash entirely.
 //
 // ISOLATION / 不能串 (INV-3): the session scope is the level-1 key, so two
-// sessions never share a bucket. scope = client session id where available (Claude
-// X-Claude-Code-Session-Id / metadata.user_id), else the resolved virtual key.
+// sessions never share a bucket. scope = the resolved conversation session id where
+// available (sessionid fingerprint table — cross-protocol, see cacheScope), else
+// metadata.user_id, else the resolved virtual key.
 //
 // PACK FRESHNESS (INV-5): detector-version is folded into the level-2 key (restart
 // invalidates) + a per-entry TTL bounds stale-clean after an in-place pack pull.
@@ -33,7 +34,6 @@ import (
 	"container/list"
 	"crypto/sha256"
 	"encoding/hex"
-	"net/http"
 	"sync"
 	"time"
 
@@ -41,11 +41,33 @@ import (
 )
 
 // maskVerdict is the cached outcome of scanning one content piece's head. Stores
-// only the masked head + action — never the raw original.
+// only the masked head + action — never the raw original. The v4 restorable
+// metadata keeps that invariant: restorables carry OFFSETS into the piece head
+// (plus the placeholder label parts), never the original span text — on a cache
+// hit the dispatcher re-slices the CURRENT head, whose bytes are guaranteed
+// identical by the content-hash key (B3 2026-08-08).
 type maskVerdict struct {
-	maskedHead string // present iff action == ActionMask
+	maskedHead string // present iff action == ActionMask (detector's NUMBERLESS token form)
 	reason     string // for ActionBlock
-	action     apphook.Action
+	// event is the team-routed compliance audit event JSON the detector handed back
+	// (apphook.Response.Event), replayed verbatim on a cache hit so a flagged piece
+	// stays auditable on EVERY turn it is re-sent, not only the turn it was first
+	// scanned (2026-08-08 审计缺口修复,用户拍板). Empty for personal routes (there the
+	// detector uploads to its own local self-view and hands the proxy nothing) and for
+	// clean pieces (the detector drops allow+0-findings events at source).
+	//
+	// Replaying the SAME bytes is what makes this safe to re-upload: the event_id
+	// inside them is the detector's, minted once, and BOTH ingest paths are keyed on
+	// it idempotently (control-master storage.IngestBatch: ON CONFLICT (event_id) DO
+	// NOTHING; local user-local compliance ingest: ON CONFLICT(event_id) DO NOTHING).
+	// So a replay reconciles a previously-FAILED upload instead of double-counting a
+	// successful one — the 幂等对账读 for an event-driven write whose only other
+	// outcome was a permanent audit gap. Content-free per DC5 (structural findings +
+	// salted prompt_hash + planner-masked snippet), so caching it keeps maskVerdict's
+	// "never store the raw original" invariant.
+	event       []byte
+	restorables []apphook.RestorableMask
+	action      apphook.Action
 }
 
 // MaskCache memoizes per-piece scan verdicts, bucketed by session scope. Safe for
@@ -93,13 +115,41 @@ func hashHead(head string) string {
 	return hex.EncodeToString(sum[:])
 }
 
-// cacheScope derives the level-1 isolation bucket (设计 §4.2). Priority: session id
-// header → metadata.user_id → resolved virtual key → global. Never "".
-func cacheScope(r *http.Request, parsed map[string]any, virtualKeyID string) string {
-	if r != nil {
-		if s := r.Header.Get("X-Claude-Code-Session-Id"); s != "" {
-			return "h:" + s
-		}
+// cacheScope derives the level-1 isolation bucket (设计 §4.2). Priority: resolved
+// session id → metadata.user_id → resolved virtual key → global. Never "".
+//
+// WHY sessionID is passed IN rather than extracted here (2026-08-08 跨 provider 会话
+// 作用域,用户拍板): the pre-2026-08-08 implementation read ONE hard-coded header,
+// X-Claude-Code-Session-Id — a Claude Code CLI-proprietary header. Every non-Claude
+// client (kimi / codex / cursor / cline / 第三方 Agent, 30+ providers) therefore fell
+// through to the metadata.user_id / vk / global buckets, so DIFFERENT conversations
+// under one virtual key shared a single bucket: the "不能串" isolation (INV-3)
+// degraded to tenant granularity, and the per-session LRU window was diluted by
+// unrelated conversations' pieces.
+//
+// The single source of truth for "where does this client carry its session id" is
+// internal/proxy/sessionid (session-fingerprint.yaml, protocol+provider → ordered
+// header/body candidates; anthropic → X-Claude-Code-Session-Id, kimi →
+// prompt_cache_key, openai → conversation_id, 通用 fallback → X-Aikey-Session-Id).
+// serveRoute ALREADY resolves it via resolveSessionID() and hands it to
+// applyInboundFilter (it also stamps the compliance event's session_id with it), so
+// this function just reuses that value. Three reasons that beats re-extracting here:
+//   - 单一真相源: session provenance stays declared once in the yaml; the cache does
+//     not grow a second, divergent header ladder.
+//   - 零额外 body 读: the body-backed candidates (kimi prompt_cache_key, openai
+//     conversation_id) were already parsed — and the body already restored — by the
+//     caller's resolveSessionID before applyInboundFilter reads it. Extracting again
+//     here would mean a second read of a body the compliance chain must still be
+//     able to consume verbatim.
+//   - 作用域与审计一致: the cache bucket and the audit event's session_id are now the
+//     same value, so a support engineer reading one can reason about the other.
+//
+// The "s:" prefix (was "h:" when the value could only come from a header) marks the
+// session-scoped namespace; it only namespaces in-memory keys against the "u:"/"vk:"
+// buckets, so renaming it costs nothing beyond a one-time all-miss on restart.
+func cacheScope(sessionID string, parsed map[string]any, virtualKeyID string) string {
+	if sessionID != "" {
+		return "s:" + sessionID
 	}
 	if md, ok := parsed["metadata"].(map[string]any); ok {
 		if uid, ok := md["user_id"].(string); ok && uid != "" {

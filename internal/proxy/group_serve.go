@@ -479,9 +479,15 @@ func (p *Proxy) serveGroupAttempt(
 	if !fw.capturedResponse() {
 		return groupAttemptResult{done: true, attempted: true} // streamed to the client
 	}
+	if fw.header.Get(HeaderAikeyErrorSource) == observability.ErrCodeAccountEgressEngine {
+		// Construction failed before a network attempt. Attribute it to the
+		// account-specific path so another account with the same invalid spec is
+		// skipped, while a distinct egress/direct path remains eligible.
+		fw.markProviderPathFailure(path.Key)
+	}
 	errType, _ := parseUpstreamErrorEnvelope(fw.buf.Bytes())
 	hardRevoked := res.CredentialType == credTypeOAuth && res.OAuth != nil &&
-		isHardRevoked(fw.status, errType, string(fw.buf.Bytes()))
+		isHardRevoked(fw.status, errType, fw.buf.String())
 	if hardRevoked {
 		p.poolCooldown.markAuthFailedToken(route.OauthGroupID, route.SeatID, res.AccountID, oauthTokenFingerprint(res.OAuth.AccessToken))
 	} else if fw.status == http.StatusUnauthorized {

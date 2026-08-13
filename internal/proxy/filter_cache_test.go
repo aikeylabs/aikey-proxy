@@ -20,17 +20,30 @@ func TestFilterCache_HistoryReuse(t *testing.T) {
 
 	// 第1轮:messages=[A] → 扫 A
 	r1 := newReq(`{"messages":[{"role":"user","content":"A"}]}`)
-	p.applyInboundFilter(httptest.NewRecorder(), r1, "m", "personal", "", "", "", "", discardLogger())
+	p.applyInboundFilter(httptest.NewRecorder(), r1, "m", "personal", "", "", "", "", "", discardLogger())
 	if hook.called != 1 {
 		t.Fatalf("turn1: Detect called %d, want 1", hook.called)
 	}
 
 	// 第2轮:messages=[A(历史 user), x(assistant), B(user)] → A 命中缓存不重扫;
-	// assistant x 不扫(返回内容);只扫新 user B。
+	// assistant x 首次出现要扫(P4 起 assistant 纳入扫描范围);新 user B 要扫。
 	r2 := newReq(`{"messages":[{"role":"user","content":"A"},{"role":"assistant","content":"x"},{"role":"user","content":"B"}]}`)
-	p.applyInboundFilter(httptest.NewRecorder(), r2, "m", "personal", "", "", "", "", discardLogger())
-	if hook.called != 2 { // 1(A) + 1(B);assistant x 跳过;A 命中缓存
-		t.Errorf("turn2: Detect 累计 %d, want 2(A 命中缓存、assistant x 不扫、只扫 B)", hook.called)
+	p.applyInboundFilter(httptest.NewRecorder(), r2, "m", "personal", "", "", "", "", "", discardLogger())
+	if hook.called != 3 { // 1(A) + 1(assistant x, 首次) + 1(B);A 命中缓存
+		t.Errorf("turn2: Detect 累计 %d, want 3(A 命中缓存;assistant x 与 B 首次各扫一次)", hook.called)
+	}
+
+	// 第3轮:再追加一条新 user C。此时 A 与 assistant x 都已在缓存里 → 只扫 C。
+	// 这一步是 P4 性能论证的核心:assistant 历史跨轮逐字不变,只在**首次出现**付一次
+	// detector 调用,之后与 user 历史同样是 O(1) 缓存命中 —— 增量是常数不是每轮翻倍。
+	r3 := newReq(`{"messages":[{"role":"user","content":"A"},{"role":"assistant","content":"x"},{"role":"user","content":"B"},{"role":"assistant","content":"y"},{"role":"user","content":"C"}]}`)
+	p.applyInboundFilter(httptest.NewRecorder(), r3, "m", "personal", "", "", "", "", "", discardLogger())
+	if hook.called != 5 { // +1(assistant y 首次) +1(C 首次);A/x/B 全命中
+		t.Errorf("turn3: Detect 累计 %d, want 5(A/x/B 命中缓存,只扫新增的 y 与 C)", hook.called)
+	}
+	performance := p.FilterPerformanceSnapshot()
+	if performance.Cold.Count != 1 || performance.Incremental.Count != 2 {
+		t.Fatalf("real requests were not split into cold/incremental lanes: %+v", performance)
 	}
 }
 
@@ -40,7 +53,7 @@ func TestFilterCache_Disabled_AlwaysScans(t *testing.T) {
 	p := &Proxy{filterHook: hook} // 不调 SetFilterCacheEnabled → 缓存关闭
 	for i := 0; i < 2; i++ {
 		r := newReq(`{"messages":[{"role":"user","content":"A"}]}`)
-		p.applyInboundFilter(httptest.NewRecorder(), r, "m", "personal", "", "", "", "", discardLogger())
+		p.applyInboundFilter(httptest.NewRecorder(), r, "m", "personal", "", "", "", "", "", discardLogger())
 	}
 	if hook.called != 2 {
 		t.Errorf("缓存关闭:Detect called %d, want 2(不应缓存)", hook.called)
@@ -54,9 +67,9 @@ func TestFilterCache_MaskVerdictReused(t *testing.T) {
 	p.SetFilterCacheEnabled(true, 5)
 
 	r1 := newReq(`{"messages":[{"role":"user","content":"secret"}]}`)
-	p.applyInboundFilter(httptest.NewRecorder(), r1, "m", "personal", "", "", "", "", discardLogger())
+	p.applyInboundFilter(httptest.NewRecorder(), r1, "m", "personal", "", "", "", "", "", discardLogger())
 	r2 := newReq(`{"messages":[{"role":"user","content":"secret"}]}`)
-	p.applyInboundFilter(httptest.NewRecorder(), r2, "m", "personal", "", "", "", "", discardLogger())
+	p.applyInboundFilter(httptest.NewRecorder(), r2, "m", "personal", "", "", "", "", "", discardLogger())
 
 	if hook.called != 1 {
 		t.Errorf("Detect called %d, want 1(第2次应命中缓存)", hook.called)
@@ -73,7 +86,7 @@ func TestFilterCache_DegradedNotCached(t *testing.T) {
 	p.SetFilterCacheEnabled(true, 5)
 	for i := 0; i < 2; i++ {
 		r := newReq(`{"messages":[{"role":"user","content":"A"}]}`)
-		p.applyInboundFilter(httptest.NewRecorder(), r, "m", "personal", "", "", "", "", discardLogger())
+		p.applyInboundFilter(httptest.NewRecorder(), r, "m", "personal", "", "", "", "", "", discardLogger())
 	}
 	if hook.called != 2 {
 		t.Errorf("degraded 被缓存了?Detect called %d, want 2(degraded 不可缓存)", hook.called)
@@ -97,7 +110,7 @@ func TestFilterCache_DegradedForwardsOriginalUnmasked(t *testing.T) {
 	p.SetFilterCacheEnabled(true, 5)
 
 	r := newReq(`{"messages":[{"role":"user","content":"` + sensitive + `"}]}`)
-	proceed := p.applyInboundFilter(httptest.NewRecorder(), r, "m", "personal", "", "", "", "", discardLogger())
+	proceed := p.applyInboundFilter(httptest.NewRecorder(), r, "m", "personal", "", "", "", "", "", discardLogger())
 
 	if !proceed {
 		t.Fatal("degraded 必须放行(fail-open):不拦截用户请求")
@@ -158,25 +171,67 @@ func TestLRUMaskCache_SlidingRefreshesOnUse(t *testing.T) {
 	}
 }
 
-// scope 优先级:header > metadata.user_id > VK > global,且绝不返回空(防串桶)。
+// scope 优先级:已解析 sessionID > metadata.user_id > VK > global,且绝不返回空(防串桶)。
 func TestCacheScope_Priority(t *testing.T) {
 	withUID := map[string]any{"metadata": map[string]any{"user_id": "u1"}}
 
-	rHdr := httptest.NewRequest("POST", "/", http.NoBody)
-	rHdr.Header.Set("X-Claude-Code-Session-Id", "sess1")
-	if got := cacheScope(rHdr, withUID, "vk1"); got != "h:sess1" {
-		t.Errorf("header 应优先:got %s", got)
+	if got := cacheScope("sess1", withUID, "vk1"); got != "s:sess1" {
+		t.Errorf("session 应优先:got %s", got)
 	}
-
-	rNo := httptest.NewRequest("POST", "/", http.NoBody)
-	if got := cacheScope(rNo, withUID, "vk1"); got != "u:u1" {
+	if got := cacheScope("", withUID, "vk1"); got != "u:u1" {
 		t.Errorf("user_id 次之:got %s", got)
 	}
-	if got := cacheScope(rNo, map[string]any{}, "vk1"); got != "vk:vk1" {
+	if got := cacheScope("", map[string]any{}, "vk1"); got != "vk:vk1" {
 		t.Errorf("VK 兜底:got %s", got)
 	}
-	if got := cacheScope(rNo, map[string]any{}, ""); got != "global" {
+	if got := cacheScope("", map[string]any{}, ""); got != "global" {
 		t.Errorf("global 最后:got %s", got)
+	}
+}
+
+// 2026-08-08 跨 provider 会话作用域:scope 的会话来源必须是 sessionid fingerprint 表
+// (resolveSessionID),而不是"只认 X-Claude-Code-Session-Id"那条硬编码。逐 provider 断言
+// 修复前会退化成同一个桶的那几类客户端现在各自拿到会话级 scope。
+func TestCacheScope_CrossProviderSessionSources(t *testing.T) {
+	// 修复前:只有这一行(anthropic + Claude 专有 header)能进会话桶。
+	rClaude := httptest.NewRequest("POST", "/v1/messages", http.NoBody)
+	rClaude.Header.Set("X-Claude-Code-Session-Id", "claude-sess")
+	if got := cacheScope(resolveSessionID(rClaude, "anthropic", "anthropic"), nil, "vk1"); got != "s:claude-sess" {
+		t.Errorf("anthropic header 场景应与修复前同作用域,got %s want s:claude-sess", got)
+	}
+
+	// 修复前:kimi 的会话在 body(prompt_cache_key),header 取不到 → 落 vk:/global 共桶。
+	rKimi := httptest.NewRequest("POST", "/v1/chat/completions",
+		strings.NewReader(`{"model":"kimi-k2","prompt_cache_key":"kimi-sess","messages":[]}`))
+	if got := cacheScope(resolveSessionID(rKimi, "openai_compatible", "kimi_code"), nil, "vk1"); got != "s:kimi-sess" {
+		t.Errorf("kimi body 会话字段应进会话桶(修复前是 vk1 共桶),got %s", got)
+	}
+
+	// 同理 openai 的 conversation_id。
+	rOpenAI := httptest.NewRequest("POST", "/v1/responses",
+		strings.NewReader(`{"model":"gpt-x","conversation_id":"oai-sess"}`))
+	if got := cacheScope(resolveSessionID(rOpenAI, "openai", "openai"), nil, "vk1"); got != "s:oai-sess" {
+		t.Errorf("openai conversation_id 应进会话桶,got %s", got)
+	}
+
+	// 通用约定 header(cursor / cline / 第三方 Agent 走 common_fallback)。
+	rAgent := httptest.NewRequest("POST", "/v1/chat/completions", http.NoBody)
+	rAgent.Header.Set("X-Aikey-Session-Id", "agent-sess")
+	if got := cacheScope(resolveSessionID(rAgent, "openai_compatible", "some_new_provider"), nil, "vk1"); got != "s:agent-sess" {
+		t.Errorf("X-Aikey-Session-Id 通用兜底应进会话桶,got %s", got)
+	}
+
+	// 取不到任何会话来源 → fallback 链行为不变(user_id → vk → global)。
+	rNone := httptest.NewRequest("POST", "/v1/chat/completions", http.NoBody)
+	empty := resolveSessionID(rNone, "openai_compatible", "zhipu")
+	if empty != "" {
+		t.Fatalf("前提:无任何会话来源时 resolveSessionID 应为空,got %q", empty)
+	}
+	if got := cacheScope(empty, map[string]any{"metadata": map[string]any{"user_id": "u9"}}, "vk1"); got != "u:u9" {
+		t.Errorf("Extract 空 → fallback 链不变(user_id 优先于 vk),got %s", got)
+	}
+	if got := cacheScope(empty, nil, "vk1"); got != "vk:vk1" {
+		t.Errorf("Extract 空 + 无 user_id → vk 兜底,got %s", got)
 	}
 }
 
@@ -210,7 +265,7 @@ func TestFilterCache_DuplicateMessagesInOneRequest(t *testing.T) {
 
 	// 两条逐字相同的敏感消息一起发
 	r := newReq(`{"messages":[{"role":"user","content":"secret"},{"role":"user","content":"secret"}]}`)
-	p.applyInboundFilter(httptest.NewRecorder(), r, "m", "personal", "", "", "", "", discardLogger())
+	p.applyInboundFilter(httptest.NewRecorder(), r, "m", "personal", "", "", "", "", "", discardLogger())
 
 	body := readReqBody(t, r)
 	if strings.Contains(body, "secret") {

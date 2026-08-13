@@ -1551,6 +1551,32 @@ func (r *Reader) GetFilterRecordAllow(slug string) (bool, error) {
 	return v.Valid && v.Int64 != 0, nil
 }
 
+// GetFilterMaxAction returns the operational enforcement ceiling for a filter
+// app. Old vaults and missing rows preserve the production-compatible default
+// `full`; malformed stored values are errors and must be surfaced by callers.
+func (r *Reader) GetFilterMaxAction(slug string) (string, error) {
+	if !hasColumn(r.db, "app_records", "filter_max_action") {
+		return "full", nil
+	}
+	var value sql.NullString
+	err := r.db.QueryRow(
+		`SELECT filter_max_action FROM app_records WHERE slug = ? LIMIT 1`, slug,
+	).Scan(&value)
+	if err == sql.ErrNoRows {
+		return "full", nil
+	}
+	if err != nil {
+		return "", fmt.Errorf("read filter_max_action for %q: %w", slug, err)
+	}
+	if !value.Valid || value.String == "" {
+		return "full", nil
+	}
+	if value.String != "full" && value.String != "warn" {
+		return "", fmt.Errorf("invalid filter_max_action %q for %q; allowed: full, warn", value.String, slug)
+	}
+	return value.String, nil
+}
+
 // ObserveSubscription is one parsed entry from `app_records.observe_streams`.
 // SPEC §1.4.3 allows both simple-string and object-form JSON elements;
 // this flat view normalises both:

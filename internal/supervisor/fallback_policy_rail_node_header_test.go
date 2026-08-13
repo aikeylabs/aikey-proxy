@@ -104,3 +104,43 @@ func TestRailOmitsTheHeaderRatherThanSendingAnEmptyNodeID(t *testing.T) {
 		t.Error("an unnamed node sent the header anyway; absent and empty must not be the same claim")
 	}
 }
+
+// Older node packages export the control token and org for the daemon but may
+// not have rendered the two newer YAML fields. The scheduler must still classify
+// this as a service-token rail; asking the empty node vault for a human team JWT
+// prevents syncFallbackPolicy from ever running.
+func TestFallbackPolicyRailUsesClusterEnvironmentWithoutATeamJWT(t *testing.T) {
+	t.Setenv(clusterControlServiceTokenEnv, "control-token")
+	t.Setenv(clusterOrgIDEnv, "org-env")
+
+	cfg := &config.Config{}
+	cfg.Cluster.Enabled = true
+	cfg.Cluster.NodeID = "node-env"
+	s := railFor(cfg)
+	if spec := s.fallbackPolicyRail(); spec.needsTeamJWT {
+		t.Fatal("cluster environment was classified as a team-JWT rail")
+	}
+
+	var gotPath, gotAuth, gotNode string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotPath = r.URL.Path
+		gotAuth = r.Header.Get("Authorization")
+		gotNode = r.Header.Get(fallbackPolicyNodeHeader)
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"version":4,"policy":{}}`))
+	}))
+	defer srv.Close()
+
+	if err := s.syncFallbackPolicy(context.Background(), nil, srv.URL, ""); err != nil {
+		t.Fatalf("syncFallbackPolicy: %v", err)
+	}
+	if gotPath != "/internal/org/org-env/fallback-policy" {
+		t.Errorf("path = %q, want env-configured org policy path", gotPath)
+	}
+	if gotAuth != "Bearer control-token" {
+		t.Error("authorization did not use the environment-configured control token")
+	}
+	if gotNode != "node-env" {
+		t.Errorf("node header = %q, want node-env", gotNode)
+	}
+}

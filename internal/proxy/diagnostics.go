@@ -10,6 +10,16 @@
 //     banner / aikey doctor / aikey test / ak use) can all answer "was a mapping
 //     configured but not taking effect?" from ONE function (mappingHealth), never
 //     an inlined marker string per caller (3.5 hard rule).
+//   - compliance mask-placeholder fidelity (P2, 方案 20260808 §3.2 L3): issued
+//     vs restored placeholder counts + a 3-state verdict. This is the only
+//     signal that surfaces "some model started rewriting our placeholders" —
+//     every such request still returns 200, so without an externally readable
+//     counter the degradation is invisible (health-signal-surface §H1).
+//   - the generation ID these counters belong to. Every counter on this
+//     endpoint is GENERATION-scoped, not process-scoped: the proxy hot-reloads
+//     in-process, keeping its PID while replacing the *Proxy that owns the
+//     counters. Publishing the generation is what makes that reset externally
+//     observable instead of an invisible re-zeroing under a live PID.
 //
 // 🔴 GET-only + read-only (design P5-deletion note: status endpoints must not
 // mutate). Health signals must be externally readable (observability §H1/H2).
@@ -17,6 +27,7 @@ package proxy
 
 import (
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"sort"
 
@@ -43,9 +54,160 @@ const (
 )
 
 // PipelineDiagnostics is the read-only payload of /v1/diagnostics/pipeline.
+//
+// MaskRestore was ADDED here rather than behind a new endpoint (慎重新建
+// API/接口协议): this endpoint already is the proxy's read-only "is the request
+// pipeline behaving?" surface, an additive field costs no new route, no new
+// auth posture and no new client contract, and the two blocks are read by the
+// same operator in the same breath.
 type PipelineDiagnostics struct {
-	Registry     RegistryProvenance `json:"registry"`
-	ModelMapping MappingHealth      `json:"model_mapping"`
+	Registry RegistryProvenance `json:"registry"`
+	// GenerationID scopes EVERY counter below it.
+	//
+	// The proxy hot-reloads in-process: `aikey` config/vault changes make the
+	// supervisor build a NEW generation (supervisor.buildGeneration → new
+	// *Proxy) and swap it in behind the same listener. The PID does not change,
+	// the process uptime does not reset — but `model_mapping.applied/rejected/
+	// passthrough_missing` and `mask_restore.placeholders_issued/restored` all
+	// restart at zero, because they live on the Proxy that was just replaced.
+	//
+	// Without this field an external reader (release E2E, ops probe, dashboard)
+	// has NO way to tell a fresh low number from a genuine cumulative one, so a
+	// reload between two polls silently invalidates any assertion built on the
+	// deltas — and it fails in the reassuring direction (counters look calm).
+	// Compare it across reads: same ID → the counters are comparable; changed ID
+	// → they were zeroed in between and the earlier sample must be discarded.
+	//
+	// Additive scalar rather than a new endpoint or a new nested object
+	// (慎重新建 API/接口协议): it annotates the numbers already served here.
+	// 0 = no supervisor wired this Proxy (unit tests / embedded use); real
+	// supervisor generations start at 1.
+	GenerationID int64             `json:"generation_id"`
+	ModelMapping MappingHealth     `json:"model_mapping"`
+	MaskRestore  MaskRestoreHealth `json:"mask_restore"`
+}
+
+// MaskRestoreStatus is the compliance-placeholder fidelity verdict. The first
+// three values are the same strings as MappingStatus so every surface renders
+// both blocks with one switch; `insufficient_sample` is specific to this signal
+// because it is the only one with a sample floor.
+type MaskRestoreStatus string
+
+const (
+	// MaskRestoreInactive: this process has never issued a mask placeholder —
+	// compliance masking is off, or no traffic hit a restorable entity.
+	MaskRestoreInactive MaskRestoreStatus = "inactive"
+	// MaskRestoreOK: placeholders are coming back and being restored.
+	MaskRestoreOK MaskRestoreStatus = "ok"
+	// MaskRestoreInsufficientSample: placeholders HAVE been issued, but too few
+	// to judge the ratio. Distinct from `ok` on purpose — this state used to be
+	// folded into it, so a proxy at 0% fidelity on a sample of one reported
+	// "placeholders are being returned and restored", contradicting its own
+	// numbers (2026-08-10). Distinct from `inactive` too: inactive means the
+	// feature never ran, this means it ran and the verdict is pending.
+	MaskRestoreInsufficientSample MaskRestoreStatus = "insufficient_sample"
+	// MaskRestoreDegraded: enough placeholders have been issued to judge, and
+	// the models are returning too few of them intact — i.e. users are seeing
+	// `{{ADDR_1}}` instead of their own text. NOT an error path: the request
+	// succeeded, the mask worked, only the convenience half is failing.
+	MaskRestoreDegraded MaskRestoreStatus = "degraded"
+)
+
+const (
+	// maskFidelityMinSample: below this many issued placeholders the ratio is
+	// noise (one unlucky answer would read as 0%), so the verdict is withheld
+	// as MaskRestoreInsufficientSample rather than asserted as `ok`.
+	maskFidelityMinSample = 20
+	// maskFidelityDegradedPct: the L3 defenses (template-syntax placeholder +
+	// tolerant matching) are designed to make near-100% the normal reading; a
+	// sustained drop below this means some model started rewriting placeholders
+	// and the mask/restore feature is silently degrading for its users.
+	maskFidelityDegradedPct = 80
+)
+
+// MaskRestoreHealth is the externally-readable 保真率 signal (方案 20260808
+// §3.2 L3).
+//
+// 🔴 Issued/Restored are cumulative for the GENERATION, not for the process
+// lifetime. This comment used to claim "process lifetime" and that was wrong:
+// the proxy hot-reloads in-process (supervisor.buildGeneration constructs a new
+// *Proxy behind the same PID and listener), and these counters live on the
+// Proxy, so a reload resets them to zero with no visible restart. Read them
+// together with PipelineDiagnostics.GenerationID — that ID is what tells a
+// caller whether two samples belong to the same counting epoch.
+//
+// The verdict is derived, never latched — a model that starts behaving again
+// pulls the ratio back up (health-signal-surface: report the current state, not
+// a terminal one).
+//
+// Privacy: counts only. No label, no entity code, no length, no text — the
+// placeholder↔original mapping never leaves request memory (B3 拍板).
+type MaskRestoreHealth struct {
+	Status MaskRestoreStatus `json:"status"`
+	Reason string            `json:"reason"`
+	// ScanRoles is the effective inbound scan-role policy (方案 §3.4). It lives in
+	// THIS block — not a config dump — because restore and scan-scope are one
+	// safety property: restoration hands the plaintext back to the client, and it
+	// only stays out of the upstream on the next turn because `assistant` is
+	// scanned. An operator (or the release E2E) must be able to READ that from
+	// outside the process, not infer it from a startup log line
+	// (health-signal-surface). Counts + this list answer "is mask/restore whole?".
+	ScanRoles []string `json:"scan_roles"`
+	// ToolBlockScan is the effective rung for agent tool traffic
+	// (off|audit — see toolBlockScanMode). It sits next to ScanRoles for the
+	// same reason: it is scan SCOPE, and an operator who turned it off has
+	// changed what compliance can see. A rung that only exists in a startup log
+	// line is not externally readable (health-signal-surface), and a silently
+	// off lane makes every downstream audit assertion vacuously green.
+	ToolBlockScan string `json:"tool_block_scan"`
+	Issued        int64  `json:"placeholders_issued"`
+	Restored      int64  `json:"placeholders_restored"`
+	FidelityPct   int    `json:"fidelity_pct"`
+}
+
+// maskRestoreHealth is the ONE function every surface consults for placeholder
+// fidelity (same posture as mappingHealth). Pure read; safe to call concurrently.
+func (p *Proxy) maskRestoreHealth() MaskRestoreHealth {
+	issued := p.maskFidelity.issued.Load()
+	restored := p.maskFidelity.restored.Load()
+	h := MaskRestoreHealth{
+		Issued:        issued,
+		Restored:      restored,
+		ScanRoles:     p.filterScanRoles.list(),
+		ToolBlockScan: ToolBlockScanMode(),
+	}
+	if issued <= 0 {
+		h.Status = MaskRestoreInactive
+		h.Reason = "No compliance mask placeholder has been issued by this proxy."
+		return h
+	}
+	h.FidelityPct = int(restored * 100 / issued)
+	if issued >= maskFidelityMinSample {
+		if h.FidelityPct < maskFidelityDegradedPct {
+			h.Status = MaskRestoreDegraded
+			h.Reason = "Models are returning too few mask placeholders intact — users are seeing placeholders instead of their own text."
+			return h
+		}
+		h.Status = MaskRestoreOK
+		h.Reason = "Mask placeholders are being returned by the models and restored."
+		return h
+	}
+
+	// Below the sample floor the ratio is noise, so no verdict is available —
+	// and "no verdict" must not be dressed up as a healthy one.
+	//
+	// It used to fall through to MaskRestoreOK: with issued=1 / restored=0 the
+	// endpoint reported status=ok and the sentence "Mask placeholders are being
+	// returned by the models and restored." at 0% fidelity — a health signal
+	// stating the exact opposite of its own measurement (observed 2026-08-10
+	// while building the pipe-wire E2E). A reader who trusts it stops looking,
+	// which is the whole failure mode a health surface exists to prevent.
+	// Reporting the counters plus "not enough data" keeps the number visible
+	// and the claim honest.
+	h.Status = MaskRestoreInsufficientSample
+	h.Reason = fmt.Sprintf("Only %d placeholder(s) issued — below the %d-sample floor, so fidelity (%d%%) is not yet a verdict.",
+		issued, maskFidelityMinSample, h.FidelityPct)
+	return h
 }
 
 // RegistryProvenance proves WHICH embedded registry is live (P7.14: the digest
@@ -129,7 +291,9 @@ func (p *Proxy) handleDiagnosticsPipeline(w http.ResponseWriter, r *http.Request
 			RouteRows:             tbl.Len(),
 			ProvidersWithModelMap: provs,
 		},
+		GenerationID: p.GenerationID(),
 		ModelMapping: p.mappingHealth(),
+		MaskRestore:  p.maskRestoreHealth(),
 	}
 
 	w.Header().Set("Content-Type", "application/json")

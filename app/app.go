@@ -200,12 +200,12 @@ func Run() {
 	// is only reachable across one. A bad value FAILS the boot rather than
 	// degrading to direct: silently ignoring it would look identical to a
 	// working config right up to the day the proxy is actually needed.
-	if err := httpdirect.SetProxyOverride(cfg.ControlPlaneProxy); err != nil {
+	if proxyErr := httpdirect.SetProxyOverride(cfg.ControlPlaneProxy); proxyErr != nil {
 		// 🔴 Redacted, never raw: a proxy spec legitimately carries credentials,
 		// and this is the one path where the value is printed. The scheme/host
 		// survive redaction, which is all an operator needs to spot the typo.
 		slog.Error("invalid control_plane_proxy — refusing to start",
-			"error", err, "value", httpdirect.Redact(cfg.ControlPlaneProxy))
+			"error", proxyErr, "value", httpdirect.Redact(cfg.ControlPlaneProxy))
 		os.Exit(1)
 	}
 	if via := httpdirect.ProxyOverride(); via != "" {
@@ -503,6 +503,23 @@ func Run() {
 		return out
 	}
 	adminHandler.EffectivePacksFn = sup.EffectivePacks
+	adminHandler.FilterPerformanceFn = func() admin.ComplianceFilterPerformance {
+		snapshot := sup.FilterPerformanceSnapshot()
+		lane := func(input proxy.FilterLatencyLaneSnapshot) admin.ComplianceFilterLatencyLane {
+			return admin.ComplianceFilterLatencyLane{
+				Count: input.Count, WindowSamples: input.WindowSamples,
+				P50Ms: input.P50Ms, P95Ms: input.P95Ms,
+				Under15MsPercent: input.Under15MsPercent,
+			}
+		}
+		return admin.ComplianceFilterPerformance{
+			WindowSize:       snapshot.WindowSize,
+			SamplesStartedAt: snapshot.SamplesStartedAt,
+			LastObservedAt:   snapshot.LastObservedAt,
+			Incremental:      lane(snapshot.Incremental),
+			Cold:             lane(snapshot.Cold),
+		}
+	}
 	adminHandler.AuditStatusFn = sup.AuditStatus
 	adminHandler.ReconcileGapsFn = sup.ReconcileGaps
 

@@ -64,7 +64,7 @@ func TestApplyInboundFilter_LiveDetector(t *testing.T) {
 	r := newReq(body)
 	w := httptest.NewRecorder()
 
-	proceed := p.applyInboundFilter(w, r, "claude-3-5-sonnet", "personal", "", "", "", "", discardLogger())
+	proceed := p.applyInboundFilter(w, r, "claude-3-5-sonnet", "personal", "", "", "", "", "", discardLogger())
 
 	// Mask verdict forwards the request (the LLM still answers, just on redacted
 	// input). Block would also be acceptable policy, but for PII the baseline
@@ -137,7 +137,7 @@ func TestApplyInboundFilter_LiveDetector_ASCII(t *testing.T) {
 	r := newReq(body)
 	w := httptest.NewRecorder()
 
-	proceed := p.applyInboundFilter(w, r, "claude-3-5-sonnet", "personal", "", "", "", "", discardLogger())
+	proceed := p.applyInboundFilter(w, r, "claude-3-5-sonnet", "personal", "", "", "", "", "", discardLogger())
 	if !proceed {
 		t.Fatalf("expected proceed=true; got blocked. status=%d", w.Code)
 	}

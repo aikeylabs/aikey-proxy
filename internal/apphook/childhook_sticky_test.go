@@ -21,7 +21,7 @@ func TestChildHook_NoStickyPacketsUnderRapidFire(t *testing.T) {
 		t.Skip("skipping rapid-fire test in short mode")
 	}
 
-	binary := findDetectorBinary(t)
+	binary := requireDetectorBinary(t)
 
 	h := NewChildHook(&ChildHookConfig{
 		Name:         "ai-compliance-detector-sticky-test",
@@ -90,7 +90,7 @@ func TestChildHook_ConcurrentDetectIsSerialized(t *testing.T) {
 		t.Skip("skipping concurrency test in short mode")
 	}
 
-	binary := findDetectorBinary(t)
+	binary := requireDetectorBinary(t)
 
 	h := NewChildHook(&ChildHookConfig{
 		Name:         "ai-compliance-detector-concurrent-test",

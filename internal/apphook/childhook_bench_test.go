@@ -34,7 +34,7 @@ func TestChildHookFullStackLatency(t *testing.T) {
 		t.Skip("latency SLO is meaningless under -race (instrumentation inflates ~10×)")
 	}
 
-	binary := findDetectorBinary(t)
+	binary := requireDetectorBinary(t)
 
 	h := NewChildHook(&ChildHookConfig{
 		Name:         "ai-compliance-detector-bench",

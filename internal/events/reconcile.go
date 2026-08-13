@@ -8,6 +8,8 @@ import (
 	"net/http"
 	"net/url"
 	"strings"
+
+	"github.com/AiKeyLabs/pkg/aikeytime"
 )
 
 // AuditStatus is the local client-side delivery state for `aikey audit status`
@@ -15,11 +17,35 @@ import (
 // client's own allocator high-water, WAL backlog, dead-letter pile, and upload
 // health. Read-only.
 type AuditStatus struct {
-	SourceID        string          `json:"source_id"`
-	Reporter        ReporterMetrics `json:"reporter"`
-	AllocatedSeq    int64           `json:"allocated_seq"`
-	WALFiles        int             `json:"wal_files"`
-	DeadLetterCount int             `json:"dead_letter_count"`
+	SourceID string          `json:"source_id"`
+	Reporter ReporterMetrics `json:"reporter"`
+	// Compliance is the team→master compliance lane's slice of the SAME
+	// dead-letter queue (2026-08-10). Reported here rather than on a new
+	// endpoint because this is already the one place an operator looks to ask
+	// "is anything undelivered on this box?" — and until now the answer only
+	// ever covered usage, so a stalled compliance pipeline was invisible.
+	Compliance      ComplianceDeliveryStatus `json:"compliance"`
+	AllocatedSeq    int64                    `json:"allocated_seq"`
+	WALFiles        int                      `json:"wal_files"`
+	DeadLetterCount int                      `json:"dead_letter_count"`
+}
+
+// ComplianceDeliveryStatus reports what the compliance lane has waiting and why
+// it is waiting. DeadLetterEntries counts conserved BATCHES and is a subset of
+// AuditStatus.DeadLetterCount (both lanes share dead_letter.jsonl);
+// DeadLetterEvents counts the individual events inside them.
+type ComplianceDeliveryStatus struct {
+	// LastFailureReason is the last upload error verbatim (status + response
+	// body excerpt). A version-skew rejection is recognizable here by the
+	// master's own "unknown field" text.
+	LastFailureReason string `json:"last_failure_reason,omitempty"`
+	// LastFailureAt is Unix epoch milliseconds (UTC), 0 when this process has
+	// never seen a compliance upload fail. Process-local, not persisted — the
+	// durable record is the queue itself plus the per-entry dead_at.
+	LastFailureAt     aikeytime.Millis `json:"last_failure_at,omitempty"`
+	DeadLetterEntries int              `json:"dead_letter_entries"`
+	DeadLetterEvents  int              `json:"dead_letter_events"`
+	LastFailureCode   int              `json:"last_failure_code,omitempty"`
 }
 
 // AuditStatus gathers the local delivery state.
@@ -34,8 +60,16 @@ func (r *Reporter) AuditStatus() AuditStatus {
 		}
 	}
 	if r.dlw != nil {
-		st.DeadLetterCount = r.dlw.Count()
+		c := r.dlw.counts()
+		st.DeadLetterCount = c.Total
+		st.Compliance.DeadLetterEntries = c.ComplianceEntries
+		st.Compliance.DeadLetterEvents = c.ComplianceEvents
 	}
+	r.mu.RLock()
+	st.Compliance.LastFailureAt = r.complianceLastFailureAt
+	st.Compliance.LastFailureCode = r.complianceLastFailureCode
+	st.Compliance.LastFailureReason = r.complianceLastFailureReason
+	r.mu.RUnlock()
 	return st
 }
 

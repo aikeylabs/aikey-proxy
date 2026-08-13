@@ -5,6 +5,7 @@ import (
 	"log/slog"
 	"net/http"
 	"net/url"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -179,9 +180,13 @@ type Proxy struct {
 	// cache OFF (dispatcher skips the content-hash entirely → stateless full scan).
 	// Lives behind the hook==nil gate, so compliance OFF pays nothing (INV-6).
 	filterCache MaskCache
-	proxyCtx    context.Context   // canceled when the proxy shuts down
-	reporter    *events.Reporter  // usage reporting to collector-service (nil = disabled)
-	wal         *events.WALWriter // local JSONL WAL (shared with reporter when both set; sole writer when reporter is nil)
+	// filterPerformance is a bounded, content-free rolling latency window for
+	// the externally readable compliance health surface. It lives with the
+	// generation so a reload cannot mix samples from different detector builds.
+	filterPerformance filterPerformanceMetrics
+	proxyCtx          context.Context   // canceled when the proxy shuts down
+	reporter          *events.Reporter  // usage reporting to collector-service (nil = disabled)
+	wal               *events.WALWriter // local JSONL WAL (shared with reporter when both set; sole writer when reporter is nil)
 	// quota is the Phase 2 enterprise token-quota gate (Stage 3). nil-safe +
 	// flag-gated: when nil or disabled it is a pure no-op, so the request path is
 	// never blocked by quota machinery — only by an actual confirmed over-limit.
@@ -251,6 +256,34 @@ type Proxy struct {
 	lastMapApplyNano atomic.Int64
 	lastMapMissNano  atomic.Int64
 	lastMapMiss      atomic.Pointer[mapMissRecord]
+	// maskFidelity is the compliance placeholder 保真率 signal (方案 20260808
+	// §3.2 L3): how many mask placeholders this GENERATION put into forwarded
+	// prompts vs how many came back from the models intact enough to restore.
+	// A falling ratio is the ONLY way to notice that some model started
+	// rewriting/dropping `{{ADDR_1}}`-style placeholders — the request itself
+	// succeeds either way, so nothing else in the system would report it.
+	// Read-only surface: /v1/diagnostics/pipeline (see maskRestoreHealth).
+	// Counts only — never a label, a code or any masked content.
+	//
+	// 🔴 Generation-scoped, NOT process-scoped: see generationID below.
+	maskFidelity maskFidelity
+	// generationID is the supervisor generation that built this Proxy
+	// (supervisor.buildGeneration → s.genID.Add(1)). It is published on
+	// /v1/diagnostics/pipeline as `generation_id`.
+	//
+	// WHY it must be externally readable (health-signal-surface): the proxy
+	// hot-reloads IN-PROCESS. A reload keeps the PID but constructs a brand new
+	// Proxy, so every counter on that endpoint (mapping applied/rejected/
+	// passthrough, mask placeholders issued/restored) restarts at zero while the
+	// process uptime keeps climbing. A release assertion that polls the endpoint
+	// and treats the numbers as process-lifetime totals will silently read a
+	// post-reset value as a cumulative one and conclude "healthy". Publishing the
+	// generation makes the reset observable: the ID changing between two reads is
+	// the ONLY evidence that the counters were zeroed in between.
+	//
+	// 0 means "not wired by a supervisor" (unit tests, embedded uses); it is
+	// never a valid supervisor generation, which start at 1.
+	generationID     atomic.Int64
 	loadedControlSeq int64 // vault change_seq loaded at generation build time
 	// Configurable slow-request thresholds (milliseconds).
 	SlowRequestMs     int64
@@ -291,6 +324,12 @@ type Proxy struct {
 	// it always full-scans (+ optional content-hash cache below). Field/setter/env
 	// retained only until the systemd units drop AIKEY_PROXY_FILTER_INCREMENTAL_SCAN.
 	filterIncremental bool
+	// filterScanRoles is the message-role allow-list the inbound filter scans
+	// (P4, 方案 §3.4). nil = defaultScanRoles ({user, assistant}) so a Proxy built
+	// without explicit configuration is already correct — the setter only exists
+	// for operators who need to widen (tool/function) or narrow it. See
+	// scanRoleSet in filter_content.go for the fail-safe semantics.
+	filterScanRoles scanRoleSet
 }
 
 // SetTransport sets a custom RoundTripper for outbound requests to AI providers.
@@ -571,6 +610,24 @@ func (p *Proxy) SetFilterIncrementalScan(on bool) {
 	p.filterIncremental = on
 }
 
+// SetFilterScanRoles configures which message roles the inbound compliance
+// filter scans (方案 §3.4). Called once at generation build by the supervisor
+// from AIKEY_PROXY_FILTER_SCAN_ROLES; unset leaves the default {user, assistant}.
+//
+// Returns the roles actually applied plus the rejected (unrecognized) names so
+// the caller can WARN — an operator typo must be visible, not silently dropped
+// (日志规范). An input with no recognized role at all keeps the DEFAULT rather
+// than scanning nothing: a misconfiguration must never disable masking.
+func (p *Proxy) SetFilterScanRoles(roles []string) (applied, rejected []string) {
+	set, rejected := newScanRoleSet(roles)
+	p.filterScanRoles = set
+	return set.list(), rejected
+}
+
+// FilterScanRoles returns the effective scan-role policy (sorted), for status
+// reporting and diagnostics.
+func (p *Proxy) FilterScanRoles() []string { return p.filterScanRoles.list() }
+
 // SetFilterCache installs (or clears, with nil) the per-piece content-hash cache
 // used by the inbound filter. nil = cache OFF (dispatcher does no hashing →
 // stateless full scan). Pluggable: the supervisor wires an lruMaskCache when
@@ -600,6 +657,12 @@ func (p *Proxy) FilterHook() apphook.Hook {
 	return p.filterHook
 }
 
+// FilterPerformanceSnapshot returns the current generation's bounded latency
+// distribution. It is safe during concurrent request processing.
+func (p *Proxy) FilterPerformanceSnapshot() FilterPerformanceSnapshot {
+	return p.filterPerformance.snapshot()
+}
+
 // SetObserverRegistry attaches the Phase 4 M2 plugin observer registry.
 // Must be called BEFORE serving requests (typically in main.go right
 // after BuildObservers). nil disables the observer pipeline entirely
@@ -614,6 +677,32 @@ func (p *Proxy) FilterHook() apphook.Hook {
 func (p *Proxy) SetObserverRegistry(reg *observer.Registry) {
 	p.observerRegistry = reg
 }
+
+// GenerationLabel renders the canonical label for a supervisor generation. It
+// lives in this package — not in the supervisor — so the string stamped on every
+// usage event as config_version and the ID published on
+// /v1/diagnostics/pipeline can never drift into two different notions of
+// "which generation".
+func GenerationLabel(id int64) string { return "gen-" + strconv.FormatInt(id, 10) }
+
+// SetGenerationID records which supervisor generation built this Proxy, and
+// derives the config-version label from it.
+//
+// Called unconditionally by supervisor.buildGeneration right after proxy.New —
+// deliberately NOT folded into SetReporter, because SetReporter is skipped
+// whenever no upload destination and no WAL are configured. A generation
+// identity that is only present on the reporting build would be absent from the
+// exact offline/standalone deployments where an operator has the fewest other
+// ways to tell that a reload zeroed the diagnostics counters.
+func (p *Proxy) SetGenerationID(id int64) {
+	p.generationID.Store(id)
+	p.proxyConfigVersion = GenerationLabel(id)
+}
+
+// GenerationID returns the supervisor generation that built this Proxy, or 0
+// when no supervisor wired one. See the generationID field for why it is part
+// of the read-only diagnostics surface.
+func (p *Proxy) GenerationID() int64 { return p.generationID.Load() }
 
 // SetReporter sets the usage reporter for collector-service upload.
 // clientVersion is the proxy build version (e.g. "0.1.0"), used as audit metadata.

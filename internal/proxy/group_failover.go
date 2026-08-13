@@ -71,14 +71,11 @@ const (
 //     transport errors): upstream/account- or path-side failure worth one try
 //     elsewhere; the caller separates account exclusion from path exclusion.
 func failoverEligibleResponse(status int, h http.Header) bool {
-	// The scheduling engine already selected this account. If its configured
-	// egress cannot be constructed locally, no upstream request happened and no
-	// account-health evidence exists. Retrying another account here would bypass
-	// the engine's current_routed decision and make /user/team-oauth disagree
-	// with the account that actually served the request.
-	if h.Get(HeaderAikeyErrorSource) == observability.ErrCodeAccountEgressEngine {
-		return false
-	}
+	// ACCOUNT egress construction failure is deliberately eligible: the broken
+	// spec belongs to one account/path, and keeping the engine's preferred choice
+	// is less important than preserving the pool's user-facing availability.
+	// The outer loop still flushes this exact typed 503 when no healthy alternate
+	// exists, so failover never hides the root cause.
 	// Same reasoning one layer out: the NODE's egress could not be built, so no
 	// upstream request happened on ANY candidate and none can. Retrying would walk
 	// the whole chain to collect identical local failures, and — worse — would put
