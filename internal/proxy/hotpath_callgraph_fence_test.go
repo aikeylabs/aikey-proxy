@@ -153,12 +153,31 @@ const dbReason = "PLANE-01: 热路径无 DB 调用. A query per request couples 
 // forward, and every entry stays visible in the test output so the inventory is
 // impossible to forget. As they are fixed, the lines come out — and the test
 // fails if one is stale, so the list can only shrink honestly.
+//
+// # 🔴 The three compliance dead-letter lines, added 2026-08-13
+//
+// They are NOT new work by this change. They arrived from develop-v1.0.5's
+// compliance dead-letter lane and this branch first met them when the two were
+// merged: the fence is GREEN on this branch alone and RED on the merge, which is
+// the only run that reflects what ships. `deadLetterWriter.Count` became
+// `.counts` in the same refactor, so its old line went stale at the same moment.
+//
+// 🚫 Recorded, not approved — same as every other line here. Their call site
+// (internal/proxy/filter_dispatch.go: `observability.GoSafe(...)`, inside a
+// bypass goroutine) documents itself as off the user's request path, and the
+// reachability walk deliberately does not model `go` boundaries: it answers
+// "can a request reach this code", not "does a request block on it". That
+// conservatism is the point — it is what keeps the crash-dump and WAL lines
+// above visible too. Whoever adjudicates PLANE-01 should decide these three as a
+// group with them, not wave them through on the goroutine alone.
 var hotPathFileCalls = map[string]struct{}{
 	"internal/apphook::ChildHook.spawnLocked|os.Stat":                       {},
 	"internal/events::ContentWAL.ensureFile|os.OpenFile":                    {},
 	"internal/events::ContentWAL.evictBeyondCap|os.Remove":                  {},
 	"internal/events::WALWriter.ensureFile|os.OpenFile":                     {},
-	"internal/events::deadLetterWriter.Count|os.ReadFile":                   {},
+	"internal/events::Reporter.deadLetterCompliance|os.Stat":                {},
+	"internal/events::deadLetterWriter.counts|os.ReadFile":                  {},
+	"internal/events::deadLetterWriter.write|os.OpenFile":                   {},
 	"internal/events::writeSeqStateAtomic|os.Remove":                        {},
 	"internal/observability::writeCrashDump|os.MkdirAll":                    {},
 	"internal/observability::writeCrashDump|os.WriteFile":                   {},
