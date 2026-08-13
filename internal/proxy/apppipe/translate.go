@@ -17,9 +17,9 @@ import (
 //
 //   - Inbound wire format is ALWAYS OpenAI Chat Completions (the URL is
 //     `/apps/<slug>/v1/chat/completions`; no protocol segment in the URL).
-//   - Upstream wire format is determined by the BINDING's provider_code,
-//     which was already keyed by the upstream inferred from body.model
-//     in handleAppPipeline before this function runs.
+//   - Upstream wire format is determined by the BINDING's protocol_type.
+//     provider_code remains the physical vendor identity and is used only
+//     for provider-scoped model normalization.
 //   - When fromFmt == toFmt (e.g. OpenAI → OpenAI), no translation is
 //     needed; this is a fast-path zero-cost short-circuit.
 //   - Streaming requests requiring translation are hard-rejected with
@@ -57,8 +57,8 @@ type TranslateOutcome struct {
 //     in production)
 //   - route: per-request ResolvedRoute; mutated to install
 //     ResponseTransform when translation engages
-//   - binding: the upstream binding resolved earlier
-//     (binding.ProviderCode is the upstream provider code, e.g. "anthropic")
+//   - binding: the upstream binding resolved earlier; ProviderCode and
+//     ProtocolType are independent axes
 //   - inboundFmt: inferred from URL path (FormatOpenAI for /chat/completions,
 //     FormatAnthropic for /v1/messages) — see InferInboundWire in router.go
 //   - r: inbound *http.Request, only used for query-string stream check
@@ -94,7 +94,7 @@ func MaybeTranslateRequest(
 		// returns a non-empty Format. Fall back to OpenAI default.
 		fromFmt = translator.FormatOpenAI
 	}
-	toFmt := translator.Format(binding.ProviderCode)
+	toFmt := bindingProtocolFormat(binding)
 
 	// G1 fix (2026-05-21): strip `<upstream>/` prefix from body.model
 	// before forwarding to upstream. Affects both translate path (passes
@@ -181,6 +181,27 @@ func MaybeTranslateRequest(
 	}
 
 	return TranslateOutcome{Engaged: true, Body: translated, UpstreamFormat: toFmt}, nil
+}
+
+// bindingProtocolFormat converts the route-table protocol vocabulary to the
+// translator registry vocabulary. Legacy bindings without protocol_type retain
+// the old provider-derived behavior only when the provider has a unique
+// protocol; normalized current bindings always take this path explicitly.
+func bindingProtocolFormat(binding *vault.ProviderBinding) translator.Format {
+	protocolType := provider.CanonicalProtocol(binding.ProtocolType)
+	if protocolType == "" {
+		protocolType, _ = provider.ProtocolFamily(binding.ProviderCode, "")
+	}
+	switch protocolType {
+	case "openai_compatible":
+		return translator.FormatOpenAI
+	case "anthropic":
+		return translator.FormatAnthropic
+	case "gemini":
+		return translator.FormatGemini
+	default:
+		return translator.Format(protocolType)
+	}
 }
 
 // requestIsStreaming detects "stream":true in the sanitized request body.

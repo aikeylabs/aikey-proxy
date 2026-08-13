@@ -6,7 +6,6 @@ import (
 	"net/http"
 	"net/url"
 	"os"
-	"strconv"
 	"strings"
 
 	"github.com/AiKeyLabs/aikey-proxy/internal/observability"
@@ -67,6 +66,11 @@ const (
 	// usage event / pricing use the effective model (audit 双口径 I2 / P4.1),
 	// while RequestedModel keeps the client model. Absent → no mapping.
 	ctxKeyMappedEffectiveModel
+	// ctxKeyProviderPathDecision pins the exact OAuth-group outbound path and
+	// override decision admitted by the path breaker. A concurrent Settings
+	// change may affect the next request, but must not make one in-flight request
+	// report success/failure against a different path than it actually used.
+	ctxKeyProviderPathDecision
 )
 
 // traceFromContext retrieves the request's TraceContext. Returns the zero value
@@ -281,26 +285,23 @@ func codexUpstreamBaseURL() string {
 
 // resolveOAuthUpstream selects the upstream base URL for an OAuth-credential
 // request AND applies any provider-specific request setup, returning the
-// (possibly re-wrapped) request. Centralizes the per-provider OAuth-upstream
-// policy so the two dispatch sites (legacy /v1 forward_and_resolve + the group
-// route in group_serve) share ONE source instead of each carrying its own
-// `if canonicalCode == "openai"` branch — a new provider whose OAuth upstream
-// differs from its API-key default (like codex) adds one case here, not two.
+// (possibly re-wrapped) request. Every OAuth dispatch lane calls this function;
+// provider-specific setup must not be copied into an individual pipeline.
+//
+// existingBase is the route/account's already-resolved endpoint. It is a valid
+// input, not an error: supervisor routes intentionally store effective URLs and
+// custom gateways may carry their own prefix. The provider table is only the
+// fallback when no endpoint has already been selected. OpenAI OAuth remains the
+// deliberate exception because it targets the ChatGPT Codex backend rather
+// than the API-key endpoint.
 //
 // codex is the one provider whose OAuth base ≠ its API-key base: OAuth hits
 // chatgpt.com/backend-api/codex (Responses API), API keys hit api.openai.com/v1.
 // It also needs deferred model capture (captureCodexModel returns a NEW request
 // carrying the model in context; the caller must use the returned request).
-// Every other provider's OAuth base is the (provider, protocol) row's ROOT
-// base_url and needs no setup.
-//
-// CONTRACT: the returned base URL is always a ROOT — scheme, host, and any
-// non-version path prefix, never a trailing version segment. Its sole consumer
-// is applyOAuthUpstreamURL, which concatenates it with a request path that
-// already carries the version. Returning the base_url+version form here is the
-// 2026-07-24 all-models-404 regression; see
-// TestResolveOAuthUpstream_NoDoubleVersionSegment.
-func resolveOAuthUpstream(canonicalCode, protocolType string, r *http.Request) (baseURL string, req *http.Request) {
+// Other providers keep an already-resolved route/account base when present and
+// otherwise fall back to the provider table; they need no request mutation.
+func resolveOAuthUpstream(canonicalCode, protocolType, existingBase string, r *http.Request) (baseURL string, req *http.Request) {
 	switch canonicalCode {
 	case "openai":
 		req = captureCodexModel(r)
@@ -321,104 +322,24 @@ func resolveOAuthUpstream(canonicalCode, protocolType string, r *http.Request) (
 		}
 		return codexUpstreamBaseURL(), req
 	default:
+		// A configured test-only override is the final upstream for hermetic
+		// Anthropic E2Es, even when the member runtime carries the provider's
+		// non-empty default URL. runtimeDeps began delivering that default in
+		// 2026-07-23; checking only in providerBaseURLForProtocol then silently
+		// bypassed the hook and sent test traffic to the real provider edge.
+		// Production is unchanged: this branch is inert unless the explicit env
+		// value also passes the loopback / RFC 6761 .test safety gate.
+		if testBase, ok := anthropicTestBaseURL(canonicalCode, protocolType); ok {
+			return testBase, r
+		}
+		if strings.TrimSpace(existingBase) != "" {
+			return existingBase, r
+		}
 		if protocolType != "" {
-			// ROOT form, not EffectiveUpstream: applyOAuthUpstreamURL prepends
-			// this path onto a request path that already carries the version
-			// segment. Returning base_url+version here produced
-			// /v1/v1/messages → a bare upstream 404 for every model
-			// (2026-07-24 onsite incident). The protocol axis still selects the
-			// right row, so GLM's .../api/anthropic endpoint keeps working.
-			if root := providerRootBaseURLForProtocol(canonicalCode, protocolType); root != "" {
-				return root, r
-			}
-			// Unknown (provider, protocol) pair — fall through to the
-			// protocol-agnostic default rather than forwarding to "".
+			return providerBaseURLForProtocol(canonicalCode, protocolType), r
 		}
 		return providerDefaultBaseURL(canonicalCode), r
 	}
-}
-
-// applyOAuthUpstreamURL points req at an OAuth upstream base URL. It is the
-// consuming half of resolveOAuthUpstream's contract: the base URL carries the
-// ROOT (scheme, host and any non-version path prefix such as
-// https://api.kimi.com/coding), and the inbound request path already carries
-// the version segment (/v1/messages), so the two are concatenated verbatim.
-//
-// ⚠️ The contract is why resolveOAuthUpstream must NOT return
-// providerroutes.EffectiveUpstream (base_url + version): that form is for UI
-// display, and prepending it here double-counts the version — an anthropic
-// OAuth request became /v1/v1/messages, which api.anthropic.com answers with a
-// bare 404 for EVERY model. Pinned by
-// TestResolveOAuthUpstream_NoDoubleVersionSegment.
-func applyOAuthUpstreamURL(req *http.Request, baseURL string) {
-	u, err := url.Parse(baseURL)
-	if err != nil {
-		return
-	}
-	req.URL.Scheme = u.Scheme
-	req.URL.Host = u.Host
-	req.Host = u.Host
-	if u.Path != "" && u.Path != "/" {
-		req.URL.Path = strings.TrimRight(u.Path, "/") + req.URL.Path
-	}
-}
-
-// looksLikeVersionSegment reports whether a single path segment (with its
-// leading slash, e.g. "/v1", "/v1beta", "/v4") is an API version segment.
-// Deliberately shape-based rather than a fixed list: the fingerprint table
-// already carries /v1, /v1beta, /v3 and /v4, and a new provider must not need a
-// code change here to be fenced.
-func looksLikeVersionSegment(seg string) bool {
-	if len(seg) < 3 || seg[0] != '/' {
-		return false
-	}
-	if seg[1] != 'v' && seg[1] != 'V' {
-		return false
-	}
-	return seg[2] >= '0' && seg[2] <= '9'
-}
-
-// oauthBaseURLFault reports why an OAuth upstream base URL cannot serve reqPath,
-// or "" when the join is sound. It is the guard for applyOAuthUpstreamURL's
-// literal-prepend contract, and its message is written to be read by the person
-// who has to fix the configuration.
-//
-// Why this exists (2026-07-24): when the base URL and the request path BOTH
-// carry the version segment, the join silently produces /v1/v1/messages and
-// api.anthropic.com answers 404 for every model. `aikey doctor --last-errors`
-// showed only `404 ← upstream:anthropic — not an aikey fault`, so a config fault
-// on our side was rendered as a provider fault, and the operator's next move was
-// to blame model names and account entitlements. Failing loud here converts a
-// half-day misdiagnosis into one actionable line.
-//
-// Scope: OAuth routes only. API-key routes join through providerroutes.Stitch,
-// which is version-aware AND row-selects on the path prefix — a stored base_url
-// ending in /v1 is normalized there, not broken, so fencing it would reject
-// configurations that work today.
-func oauthBaseURLFault(baseURL, reqPath string) string {
-	u, err := url.Parse(baseURL)
-	if err != nil {
-		return "Upstream base URL " + strconv.Quote(baseURL) + " is not a valid URL. Fix the credential's base URL in the console."
-	}
-	if u.Scheme == "" || u.Host == "" {
-		return "Upstream base URL " + strconv.Quote(baseURL) + " is missing a scheme or host. Fix the credential's base URL in the console."
-	}
-	basePath := strings.TrimRight(u.Path, "/")
-	if basePath == "" {
-		return ""
-	}
-	last := basePath[strings.LastIndex(basePath, "/"):]
-	if !looksLikeVersionSegment(last) {
-		return "" // e.g. https://api.kimi.com/coding — a real prefix, not a version
-	}
-	if !strings.HasPrefix(reqPath, last+"/") && reqPath != last {
-		return ""
-	}
-	return "Upstream base URL " + strconv.Quote(baseURL) + " already ends with the API version segment " +
-		strconv.Quote(last) + ", and the incoming request path " + strconv.Quote(reqPath) +
-		" carries it too. Forwarding would request " + strconv.Quote(basePath+reqPath) +
-		", which the provider answers with 404 for EVERY model. Fix: remove " + strconv.Quote(last) +
-		" from this credential's base URL — AiKey takes the version from the request path."
 }
 
 // oauthUpstreamRejectsPath reports whether an OAuth-credential request can NOT
@@ -480,6 +401,22 @@ func testOnlyBaseURLAllowed(raw string) bool {
 	return u.Scheme == "http" && strings.HasSuffix(u.Hostname(), ".test")
 }
 
+// anthropicTestBaseURL is the single reader for the Anthropic real-binary E2E
+// override. The bool means a valid, safety-gated override is configured. Keep
+// this separate from the production registry/runtime order: test code needs an
+// absolute final target, while production must continue honoring custom runtime
+// gateways before provider defaults.
+func anthropicTestBaseURL(canonicalCode, protocolType string) (string, bool) {
+	if canonicalCode != "anthropic" || protocolType != "anthropic" {
+		return "", false
+	}
+	o := os.Getenv("AIKEY_PROXY_TEST_ANTHROPIC_BASE_URL")
+	if !testOnlyBaseURLAllowed(o) {
+		return "", false
+	}
+	return o, true
+}
+
 func providerDefaultBaseURL(providerCode string) string {
 	canonical := providerCanonicalCode(providerCode)
 	protocol, ok := provider.ProtocolFamily(canonical, "")
@@ -498,16 +435,13 @@ func providerDefaultBaseURL(providerCode string) string {
 
 func providerBaseURLForProtocol(providerCode, protocolType string) string {
 	canonical := providerCanonicalCode(providerCode)
-	if canonical == "anthropic" && protocolType == "anthropic" {
-		// Test-only hook (gated to loopback / .test): the cross-component
-		// OAuth-account routing E2E points the otherwise-hardcoded Anthropic
-		// upstream at a local mock. OAuth accounts carry no configurable base_url
-		// (unlike api_key material), so without this the OAuth inject path can't
-		// be exercised against a mock. The guard means a prod misconfig can never
-		// reroute real traffic. See aikey-test/oauthgroup/oauth_account_routing_test.go.
-		if o := os.Getenv("AIKEY_PROXY_TEST_ANTHROPIC_BASE_URL"); testOnlyBaseURLAllowed(o) {
-			return o
-		}
+	// Test-only hook (gated to loopback / .test): the cross-component
+	// OAuth-account routing E2E points the otherwise-hardcoded Anthropic
+	// upstream at a local mock. This shared reader is also consulted BEFORE a
+	// non-empty runtime BaseURL in resolveOAuthUpstream; otherwise delivery of a
+	// provider default would bypass the same hook.
+	if o, ok := anthropicTestBaseURL(canonical, protocolType); ok {
+		return o
 	}
 	route, ok := provider.Routes().ByProviderProtocol(canonical, protocolType)
 	if !ok {
@@ -516,70 +450,13 @@ func providerBaseURLForProtocol(providerCode, protocolType string) string {
 	return providerroutes.EffectiveUpstream(route)
 }
 
-// providerRootBaseURLForProtocol is the ROOT-form counterpart of
-// providerBaseURLForProtocol: same (provider, protocol) row selection — so a
-// protocol-specific endpoint like GLM's .../api/anthropic is still honoured —
-// but it returns the row's base_url WITHOUT the version segment appended.
-//
-// Callers that hand the result to a literal-prepend join (applyOAuthUpstreamURL,
-// whose inbound path already carries /v1) MUST use this. Callers that want the
-// user-facing "where does this actually route" string, or that feed a
-// version-aware stitch, want providerBaseURLForProtocol.
-//
-// Splitting the two is the fix for the 2026-07-24 all-models-404 incident; see
-// TestResolveOAuthUpstream_NoDoubleVersionSegment.
-func providerRootBaseURLForProtocol(providerCode, protocolType string) string {
-	canonical := providerCanonicalCode(providerCode)
-	if canonical == "anthropic" && protocolType == "anthropic" {
-		// Same loopback/.test-gated E2E hook as providerBaseURLForProtocol, and
-		// deliberately verbatim: the mock's base URL is already a root, and the
-		// OAuth Director prepends its path the same way it does in production.
-		if o := os.Getenv("AIKEY_PROXY_TEST_ANTHROPIC_BASE_URL"); testOnlyBaseURLAllowed(o) {
-			return o
-		}
-	}
-	route, ok := provider.Routes().ByProviderProtocol(canonical, protocolType)
-	if !ok {
-		return ""
-	}
-	return route.BaseURL
-}
-
 // providerCanonicalCode maps a brand alias back to the canonical provider code
 // used in vault queries (e.g. "claude" → "anthropic").
 //
 // ⚠️ Same cross-language drift warning as providerDefaultBaseURL — keep in
 // sync with Rust's `provider_registry::canonical()` / the YAML oauth_aliases.
 func providerCanonicalCode(providerCode string) string {
-	switch strings.ToLower(providerCode) {
-	case "claude":
-		return "anthropic"
-	case "gpt", "chatgpt", "codex":
-		return "openai"
-	case "gemini":
-		return "google"
-	// 2026-05-08 Kimi 双平台拆分: 'kimi' 是 deprecated alias,canonical 形态是
-	// 'kimi_code'。这样 vault 查询 (GetProviderBinding) + isProviderCompatible
-	// 在新旧 path-prefix / vault 数据之间都能正确匹配。详见
-	// roadmap20260320/技术实现/update/20260508-Kimi双平台拆分-moonshot与kimi-code.md
-	case "kimi":
-		return "kimi_code"
-
-	// ── P0/P1 additions (2026-04-24) ──
-	case "grok", "xai_grok":
-		return "xai"
-	case "pplx":
-		return "perplexity"
-	case "glm", "zhipuai":
-		return "zhipu"
-	case "dashscope", "tongyi":
-		return "qwen"
-	case "ark", "volcengine":
-		return "doubao"
-
-	default:
-		return strings.ToLower(providerCode)
-	}
+	return provider.CanonicalCode(providerCode)
 }
 
 // HeaderAikeyErrorSource marks a response as GENERATED BY the aikey proxy (auth /

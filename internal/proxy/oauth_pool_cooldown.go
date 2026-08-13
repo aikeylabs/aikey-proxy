@@ -53,8 +53,8 @@ const (
 	// over-long cool idles pool capacity. Structural default, tunable.
 	poolCooldown529Overload = 2 * time.Minute
 
-	// serverErrStreakThreshold / serverErrCooldown (P0-B): generic 5xx and
-	// transport-level failures cool an account only after CONSECUTIVE repeats —
+	// serverErrStreakThreshold / serverErrCooldown (P0-B): generic HTTP 5xx
+	// failures cool an account only after CONSECUTIVE repeats —
 	// a single transient 502 must not pull a good account (sub2api marks nothing
 	// on 5xx; we need the streak because we have no EWMA soft-scoring and sticky
 	// binding otherwise re-sends every next request into the same broken
@@ -76,8 +76,9 @@ const (
 // the local vault explain why an account was skipped and when it is expected to
 // recover. RetryAt is unix seconds. Tier-only cooldowns are intentionally absent.
 type PoolAccountRouteState struct {
-	Status  string `json:"status"`
-	RetryAt int64  `json:"retry_at,omitempty"`
+	Status    string `json:"status"`
+	RetryAt   int64  `json:"retry_at,omitempty"`
+	ErrorCode string `json:"error_code,omitempty"`
 }
 
 // poolCooldownStore holds a per-account "avoid until" time. Concurrency-safe.
@@ -95,7 +96,7 @@ type poolCooldownStore struct {
 	// the current_routed display projection. Tier-only cooldowns deliberately do not
 	// notify because current_routed has no model dimension.
 	onAccountSetChanged func()
-	// serverErrStreak counts CONSECUTIVE 5xx/transport failures per account
+	// serverErrStreak counts CONSECUTIVE HTTP 5xx responses per account
 	// (P0-B); reset by any success. Deliberately NOT persisted — a streak is a
 	// live-liveness observation, not durable state.
 	serverErrStreak map[string]int
@@ -269,6 +270,16 @@ func (s *poolCooldownStore) persistLocked() {
 // threshold (the streak resets so recovery gets a fresh count after the cool).
 // Below threshold → (zero, false): a transient blip cools nobody.
 func (s *poolCooldownStore) noteServerError(accountID string) (time.Time, bool) {
+	return s.noteServerErrorWithState(accountID, PoolAccountRouteState{
+		Status: poolRouteUpstreamUnavailable,
+	})
+}
+
+// noteServerErrorWithState is the reason-preserving variant used when the
+// transport already classified a precise failure (notably per-account egress).
+// Routing still depends only on the cooldown deadline; the extra state prevents
+// the next request from being mislabeled as quota/rate-limit exhaustion.
+func (s *poolCooldownStore) noteServerErrorWithState(accountID string, state PoolAccountRouteState) (time.Time, bool) {
 	if accountID == "" {
 		return time.Time{}, false
 	}
@@ -291,7 +302,11 @@ func (s *poolCooldownStore) noteServerError(accountID string) (time.Time, bool) 
 		if s.meta == nil {
 			s.meta = make(map[string]PoolAccountRouteState)
 		}
-		s.meta[accountID] = PoolAccountRouteState{Status: poolRouteUpstreamUnavailable, RetryAt: until.Unix()}
+		if state.Status == "" {
+			state.Status = poolRouteUpstreamUnavailable
+		}
+		state.RetryAt = until.Unix()
+		s.meta[accountID] = state
 		s.persistLocked()
 	}
 	hook := s.onAccountSetChanged

@@ -12,6 +12,8 @@
 // bottom layer.
 package vkeys
 
+import "sort"
+
 // GroupAccountRef is one candidate account in a seat group's routing set. It is
 // the proxy-side mirror of master's snapshot.GroupAccountRef (JSON tags MUST
 // match byte-for-byte) and arrives in ResolvedRoute.GroupAccounts, projected by
@@ -53,7 +55,11 @@ type GroupAccountRef struct {
 // WRITER: supervisor.buildGroupRuntimeJSON (N7c-2). READER:
 // proxy.resolveGroupCredential (N8a).
 type GroupRuntimeAccount struct {
-	CredentialType   string `json:"credential_type"`   // oauth_account | api_key
+	CredentialType string `json:"credential_type"` // oauth_account | api_key
+	// CredentialID is the stable usage/billing identity. It rides the fast rail so
+	// an account added after the last CLI key sync can be selected immediately
+	// without dropping its usage events at the empty-credential guard.
+	CredentialID     string `json:"credential_id,omitempty"`
 	SecretNonce      string `json:"secret_nonce"`      // base64(nonce)
 	SecretCiphertext string `json:"secret_ciphertext"` // base64(enc(access_token|key))
 	// Display meta (non-secret, 2026-07-01): identity/provider_code/priority carried on
@@ -119,4 +125,60 @@ type GroupRuntimeAccount struct {
 	// leave it empty and use the provider profile default. Revision is KEY-only.
 	BaseURL  string `json:"base_url,omitempty"`
 	Revision string `json:"revision,omitempty"`
+}
+
+// MergeLiveGroupAccountRefs returns the candidate topology used by both request
+// forwarding and the current-route display projection.
+//
+// Once group_runtime is non-empty it is the fresher, authoritative membership
+// rail: accounts added since the last key sync appear and removed accounts drop.
+// The structural snapshot remains a compatibility/enrichment source for fields
+// an older runtime payload may omit. A nil/empty runtime means the first poll has
+// not landed, so callers keep the snapshot's legacy blind-mode behavior.
+func MergeLiveGroupAccountRefs(snapshot []GroupAccountRef, runtime map[string]GroupRuntimeAccount) []GroupAccountRef {
+	if len(runtime) == 0 {
+		return snapshot
+	}
+
+	snapshotByID := make(map[string]GroupAccountRef, len(snapshot))
+	for _, ref := range snapshot {
+		if ref.AccountID != "" {
+			snapshotByID[ref.AccountID] = ref
+		}
+	}
+
+	ids := make([]string, 0, len(runtime))
+	for accountID := range runtime {
+		if accountID != "" {
+			ids = append(ids, accountID)
+		}
+	}
+	sort.Strings(ids)
+
+	refs := make([]GroupAccountRef, 0, len(ids))
+	for _, accountID := range ids {
+		mat := runtime[accountID]
+		ref := snapshotByID[accountID]
+		ref.AccountID = accountID
+		if ref.Identity == "" {
+			ref.Identity = mat.Identity
+		}
+		if ref.ProviderCode == "" {
+			ref.ProviderCode = mat.ProviderCode
+		}
+		if ref.ProtocolType == "" {
+			ref.ProtocolType = mat.ProtocolType
+		}
+		if ref.BaseURL == "" {
+			ref.BaseURL = mat.BaseURL
+		}
+		if ref.CredentialID == "" {
+			ref.CredentialID = mat.CredentialID
+		}
+		// Priority is present (including zero) on every current fast-rail
+		// payload. Prefer it so ranking changes converge without key sync.
+		ref.Priority = mat.Priority
+		refs = append(refs, ref)
+	}
+	return refs
 }

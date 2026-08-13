@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
@@ -12,6 +13,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/AiKeyLabs/aikey-proxy/internal/config"
 	"github.com/AiKeyLabs/aikey-proxy/internal/proxy"
 	"github.com/AiKeyLabs/aikey-proxy/internal/vault"
 	"github.com/AiKeyLabs/aikey-proxy/internal/vkeys"
@@ -32,7 +34,7 @@ func TestBuildGroupRuntimeJSON_EncryptsBothTypesNoRefresh(t *testing.T) {
 	pct := 97
 	reset := int64(1750000000)
 	accts := []grAccount{
-		{AccountID: "a-oauth", CredentialType: "oauth_account", AccessToken: "at-live", ExpiresAt: 200,
+		{AccountID: "a-oauth", CredentialID: "cred-oauth", CredentialType: "oauth_account", AccessToken: "at-live", ExpiresAt: 200,
 			WindowMaxUtilPct: &pct, WindowStatus: "active", WindowResetAt: &reset,
 			BaseURL:        "http://127.0.0.1:3000/mock-provider/anthropic",
 			EgressProxyURL: "socks5://10.0.0.9:1080"}, // per-account egress (§11.7, P7) — member rail
@@ -62,6 +64,9 @@ func TestBuildGroupRuntimeJSON_EncryptsBothTypesNoRefresh(t *testing.T) {
 	}
 	if oa.ExpiresAt != 200 || oa.WindowMaxUtilPct == nil || *oa.WindowMaxUtilPct != 97 || oa.WindowStatus != "active" {
 		t.Fatalf("oauth meta wrong: %+v", oa)
+	}
+	if oa.CredentialID != "cred-oauth" {
+		t.Fatalf("credential identity missing from fast rail: %+v", oa)
 	}
 	if oa.BaseURL != "http://127.0.0.1:3000/mock-provider/anthropic" || oa.Revision != "" {
 		t.Fatalf("oauth routing metadata or KEY-only revision wrong: %+v", oa)
@@ -150,6 +155,101 @@ func TestFetchGroupRuntime_ParsesAndSendsBearer(t *testing.T) {
 	}
 	if gotObs2 != "" {
 		t.Fatalf("nil observed-resets must omit the header, got %q", gotObs2)
+	}
+}
+
+func TestGroupRuntimeSyncSignature_IncludesStableLocalVKTopology(t *testing.T) {
+	first := []vault.ManagedKey{
+		{VirtualKeyID: "vk-b", SeatID: "seat-b", OauthGroupID: "group-1"},
+		{VirtualKeyID: "vk-direct", SeatID: "seat-x"},
+		{VirtualKeyID: "vk-a", SeatID: "seat-a", OauthGroupID: "group-1"},
+	}
+	reordered := []vault.ManagedKey{first[2], first[0], first[1]}
+	if a, b := groupRuntimeSyncSignature(`{"groups":[]}`, first), groupRuntimeSyncSignature(`{"groups":[]}`, reordered); a != b {
+		t.Fatalf("vault enumeration order changed signature: %q != %q", a, b)
+	}
+	added := append(append([]vault.ManagedKey{}, first...), vault.ManagedKey{
+		VirtualKeyID: "vk-new", SeatID: "seat-new", OauthGroupID: "group-1",
+	})
+	if groupRuntimeSyncSignature(`{"groups":[]}`, first) == groupRuntimeSyncSignature(`{"groups":[]}`, added) {
+		t.Fatal("new group VK with unchanged master body must force a projection write")
+	}
+	changedSeat := append([]vault.ManagedKey{}, first...)
+	changedSeat[0].SeatID = "seat-reassigned"
+	if groupRuntimeSyncSignature(`{"groups":[]}`, first) == groupRuntimeSyncSignature(`{"groups":[]}`, changedSeat) {
+		t.Fatal("seat topology change with unchanged master body must force a projection write")
+	}
+}
+
+// A material pull is not converged until the active generation has reloaded it.
+// The vault write is intentionally idempotent, so a reload failure must leave the
+// signature uncommitted: the next rail cycle retries the same snapshot instead of
+// reporting green forever while forwarding with stale account egress material.
+func TestSyncGroupRuntime_ReloadFailureRetriesUntilRuntimeConverges(t *testing.T) {
+	t.Setenv("AIKEY_PROXY_OAUTH_GROUP_ENABLED", "1")
+	dbPath, reader := newOpenableVault(t, []map[string]string{
+		{"vk": "vk-a", "seat": "seat-1", "group": "grp-1", "override": ""},
+	})
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/accounts/me/group-runtime" {
+			w.WriteHeader(http.StatusNotFound)
+			return
+		}
+		_, _ = w.Write([]byte(`{"groups":[{"oauth_group_id":"grp-1","routing_config":"{}","accounts":[{"account_id":"acc-1","credential_id":"cred-1","credential_type":"oauth_account","access_token":"tok-1","expires_at":9000000000,"identity":"member@example.test","protocol_type":"anthropic","egress_proxy_url":"proxies:\n- name: exit\n  type: vless\n  server: 192.0.2.10\n  port: 443\n  uuid: 00000000-0000-0000-0000-000000000001\n  tls: true"}]}]}`))
+	}))
+	defer srv.Close()
+
+	s := &Supervisor{
+		cfg:              &config.Config{},
+		routingOverrides: proxy.NewRoutingOverrideCache(),
+	}
+	s.cfg.Vault.Path = dbPath
+	previousSig := "previous-material"
+	s.lastGroupRuntimeSig.Store(&previousSig)
+	gen := &generation{vault: reader}
+	s.active.Store(gen)
+
+	reloadCalls := 0
+	reload := func(context.Context) error {
+		reloadCalls++
+		if reloadCalls == 1 {
+			return errors.New("synthetic reload failure")
+		}
+		return nil
+	}
+
+	if err := s.syncGroupRuntimeWithReload(context.Background(), gen, srv.URL, "JWT", reload); err == nil {
+		t.Fatal("reload failure must fail the sync cycle so health is not falsely green")
+	}
+	got := s.lastGroupRuntimeSig.Load()
+	if got == nil {
+		t.Fatal("failed reload cleared the previously committed signature")
+	}
+	if *got != previousSig {
+		t.Fatalf("failed reload changed committed signature: got=%q want=%q", *got, previousSig)
+	}
+
+	// Same remote body on the next cycle must retry the runtime reload. The vault
+	// projection may be rewritten with fresh encryption nonces; that is safe and
+	// preferable to leaving the active registry stale.
+	if err := s.syncGroupRuntimeWithReload(context.Background(), gen, srv.URL, "JWT", reload); err != nil {
+		t.Fatalf("retry after transient reload failure: %v", err)
+	}
+	if reloadCalls != 2 {
+		t.Fatalf("reload calls=%d want 2 (same signature must retry once)", reloadCalls)
+	}
+	got = s.lastGroupRuntimeSig.Load()
+	if got == nil || *got == "" || *got == previousSig {
+		t.Fatal("successful reload did not commit the new material signature")
+	}
+
+	// Once projection + active generation agree, steady state remains no-churn.
+	if err := s.syncGroupRuntimeWithReload(context.Background(), gen, srv.URL, "JWT", reload); err != nil {
+		t.Fatalf("steady-state sync: %v", err)
+	}
+	if reloadCalls != 2 {
+		t.Fatalf("unchanged converged material reloaded again: calls=%d", reloadCalls)
 	}
 }
 

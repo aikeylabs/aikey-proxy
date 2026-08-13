@@ -18,12 +18,15 @@ package supervisor
 
 import (
 	"context"
+	"crypto/sha256"
 	"encoding/base64"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
 	"log/slog"
 	"net/http"
+	"sort"
 	"time"
 
 	"github.com/AiKeyLabs/aikey-proxy/internal/httpx"
@@ -69,6 +72,21 @@ func (s *Supervisor) groupRuntimeRail() railSpec {
 // column and reloads so the resolver (N8) picks up the fresh tokens. Any error
 // keeps the last-known material (don't flap) and is COUNTED by the framework.
 func (s *Supervisor) syncGroupRuntime(ctx context.Context, gen *generation, masterURL, bearer string) error {
+	return s.syncGroupRuntimeWithReload(ctx, gen, masterURL, bearer, s.Reload)
+}
+
+// syncGroupRuntimeWithReload keeps the durable vault projection and the active
+// generation under one convergence contract. The write is idempotent, but the
+// signature is committed only after reload succeeds. Otherwise an identical
+// master response would be skipped forever while the live registry kept serving
+// stale tokens or egress settings. reload is injected only to make the failure
+// and recovery boundary deterministic in tests; production always passes Reload.
+func (s *Supervisor) syncGroupRuntimeWithReload(
+	ctx context.Context,
+	gen *generation,
+	masterURL, bearer string,
+	reload func(context.Context) error,
+) error {
 	mks, err := gen.vault.GetActiveManagedKeys()
 	if err != nil {
 		return err
@@ -83,25 +101,58 @@ func (s *Supervisor) syncGroupRuntime(ctx context.Context, gen *generation, mast
 	if err != nil {
 		return err // unreachable / bad response → keep last-known (don't flap)
 	}
+	sig = groupRuntimeSyncSignature(sig, mks)
 	// Steady state: same material (no token refresh) → no rewrite/reload.
 	if prev := s.lastGroupRuntimeSig.Load(); prev != nil && *prev == sig {
 		return nil
 	}
 	if err := s.writeGroupRuntimeSnapshot(gen, mks, groups); err != nil {
 		slog.Warn("group_runtime write failed",
-			"event.name", "proxy.group_runtime.write_failed", "error", err.Error())
+			"event.name", observability.EventProxyGroupRuntimeWriteFailed, "error", err.Error())
 		return err // leave lastGroupRuntimeSig unchanged → retry next tick
+	}
+	if err := reload(ctx); err != nil {
+		// The vault is current but the serving generation is not. Keep the
+		// signature uncommitted and fail this rail cycle so the next poll retries
+		// the idempotent write + reload and /status cannot report a false green.
+		slog.Warn("group_runtime reload failed",
+			"event.name", observability.EventProxyGroupRuntimeReloadFailed, "error", err.Error())
+		return fmt.Errorf("reload group_runtime projection: %w", err)
 	}
 	s.lastGroupRuntimeSig.Store(&sig)
 	slog.Info("group runtime material changed",
-		"event.name", "proxy.group_runtime.changed", "groups", len(groups))
-	if err := s.Reload(ctx); err != nil {
-		// Local reload hiccup, not a master-sync failure: the material IS stored
-		// (next reload picks it up), so the cycle still counts as a success.
-		slog.Warn("group_runtime reload failed",
-			"event.name", "proxy.group_runtime.reload_failed", "error", err.Error())
-	}
+		"event.name", observability.EventProxyGroupRuntimeChanged, "groups", len(groups))
 	return nil
+}
+
+// groupRuntimeSyncSignature covers both material returned by master and the
+// local consumers that material must be projected into. Comparing only the
+// response body skipped writes when a newly synced/replaced group VK arrived
+// while master returned identical account material, leaving that VK empty until
+// some unrelated token change. Sorting makes vault enumeration order irrelevant.
+func groupRuntimeSyncSignature(remoteMaterial string, mks []vault.ManagedKey) string {
+	topology := make([][3]string, 0, len(mks))
+	for i := range mks { // index, not value-copy: vault.ManagedKey is a large struct (gocritic rangeValCopy)
+		mk := &mks[i] // read-only below — pointer form only avoids the 280-byte per-iteration copy
+		if mk.OauthGroupID == "" {
+			continue
+		}
+		topology = append(topology, [3]string{mk.VirtualKeyID, mk.SeatID, mk.OauthGroupID})
+	}
+	sort.Slice(topology, func(i, j int) bool {
+		for axis := 0; axis < len(topology[i]); axis++ {
+			if topology[i][axis] != topology[j][axis] {
+				return topology[i][axis] < topology[j][axis]
+			}
+		}
+		return false
+	})
+	topologyJSON, _ := json.Marshal(topology) // fixed primitive shape cannot fail
+	h := sha256.New()
+	_, _ = h.Write([]byte(remoteMaterial))
+	_, _ = h.Write([]byte{0})
+	_, _ = h.Write(topologyJSON)
+	return hex.EncodeToString(h.Sum(nil))
 }
 
 // writeGroupRuntimeSnapshot is the single material-sync writer for group_runtime.
@@ -376,7 +427,7 @@ func buildGroupRuntimeMap(derivedKey []byte, accounts []grAccount) map[string]vk
 		// return LOGIN_REQUIRED for it (P1), distinct from an absent account.
 		if a.NeedsLogin {
 			out[a.AccountID] = vkeys.GroupRuntimeAccount{
-				CredentialType: a.CredentialType, NeedsLogin: true,
+				CredentialType: a.CredentialType, CredentialID: a.CredentialID, NeedsLogin: true,
 				Identity: a.Identity, ProviderCode: a.ProviderCode, ProtocolType: a.ProtocolType,
 				BaseURL: a.BaseURL, Priority: a.Priority,
 				Util5h: a.Util5h, Util7d: a.Util7d, UtilObservedAt: a.UtilObservedAt,
@@ -393,6 +444,7 @@ func buildGroupRuntimeMap(derivedKey []byte, accounts []grAccount) map[string]vk
 		}
 		gra := vkeys.GroupRuntimeAccount{
 			CredentialType:   a.CredentialType,
+			CredentialID:     a.CredentialID,
 			SecretNonce:      base64.StdEncoding.EncodeToString(nonce),
 			SecretCiphertext: base64.StdEncoding.EncodeToString(ct),
 			Identity:         a.Identity,     // non-secret display meta → client list refresh
@@ -466,7 +518,11 @@ func buildGroupRuntimeJSON(derivedKey []byte, accounts []grAccount) (string, err
 // "" when the candidate list is absent/unparseable. overrideFor may be nil (→ rank-0).
 func computeRoutedAccountID(mk vault.ManagedKey, material map[string]vkeys.GroupRuntimeAccount, overrideFor func(seatID, groupID string) string, skip map[string]bool, nowUnix int64) string {
 	var refs []vkeys.GroupAccountRef
-	if mk.GroupAccounts == "" || json.Unmarshal([]byte(mk.GroupAccounts), &refs) != nil || len(refs) == 0 {
+	if mk.GroupAccounts != "" {
+		_ = json.Unmarshal([]byte(mk.GroupAccounts), &refs)
+	}
+	refs = vkeys.MergeLiveGroupAccountRefs(refs, material)
+	if len(refs) == 0 {
 		return ""
 	}
 	override := ""

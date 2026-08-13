@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"log/slog"
 	"net"
 	"net/http"
@@ -15,9 +16,11 @@ import (
 	"github.com/AiKeyLabs/aikey-proxy/internal/config"
 	"github.com/AiKeyLabs/aikey-proxy/internal/events"
 	"github.com/AiKeyLabs/aikey-proxy/internal/observability"
+	providerreg "github.com/AiKeyLabs/aikey-proxy/internal/provider"
 	"github.com/AiKeyLabs/aikey-proxy/internal/proxy/apppipe"
 	"github.com/AiKeyLabs/aikey-proxy/internal/vkeys"
 	"github.com/AiKeyLabs/pkg/egress"
+	"github.com/AiKeyLabs/pkg/providerroutes"
 )
 
 const Version = "0.1.0"
@@ -309,17 +312,33 @@ type SyncRailStatus struct {
 	LastError           string `json:"last_error,omitempty"`
 }
 
-// PoolRoutingHealth is the oauth-group account-routing health surface (N9). Built
-// by the cmd layer from the proxy's reactive cooldown state.
+// PoolRoutingHealth is the oauth-group account-and-path routing health surface.
+// Built by the cmd layer from account cooldown and Provider-path breaker state.
 type PoolRoutingHealth struct {
-	Enabled        bool            `json:"enabled"`
-	CooledAccounts []CooledAccount `json:"cooled_accounts,omitempty"`
+	Enabled        bool                 `json:"enabled"`
+	CooledAccounts []CooledAccount      `json:"cooled_accounts,omitempty"`
+	PathHealth     []ProviderPathHealth `json:"path_health,omitempty"`
 }
 
 // CooledAccount is one pool account currently routed around (401 / exhaustion).
 type CooledAccount struct {
 	AccountID       string `json:"account_id"`
 	CooldownSeconds int    `json:"cooldown_seconds"`
+}
+
+// ProviderPathHealth is one transient outbound path breaker. All identities are
+// hashed/fingerprinted; raw upstream and egress configuration never appear.
+type ProviderPathHealth struct {
+	PathID              string `json:"path_id"`
+	Provider            string `json:"provider"`
+	Protocol            string `json:"protocol"`
+	Transport           string `json:"transport"`
+	OriginFingerprint   string `json:"origin_fingerprint"`
+	EgressFingerprint   string `json:"egress_fingerprint,omitempty"`
+	State               string `json:"state"`
+	FailureClass        string `json:"failure_class"`
+	ConsecutiveFailures int    `json:"consecutive_failures"`
+	RetryAfterSeconds   int    `json:"retry_after_seconds,omitempty"`
 }
 
 // Status returns detailed proxy status.
@@ -589,7 +608,7 @@ func (h *Handler) HealthProviderTargets(w http.ResponseWriter, r *http.Request) 
 	for _, c := range checks {
 		baseURL := c.BaseURL
 		if baseURL == "" {
-			baseURL = providerDefaultBaseURL(c.Provider)
+			baseURL = providerBaseURLForProtocol(c.Provider, c.Protocol)
 		}
 		if seen[baseURL] {
 			continue
@@ -792,19 +811,23 @@ func (h *Handler) HealthKeys(w http.ResponseWriter, r *http.Request) {
 //   - 5xx        → provider-side server error
 func probeKey(ctx context.Context, client *http.Client, t *KeyCheckTarget) (int, error) {
 	baseURL := strings.TrimRight(t.BaseURL, "/")
-	if baseURL == "" {
-		baseURL = providerDefaultBaseURL(t.Provider)
+	providerCode := providerreg.CanonicalCode(t.Provider)
+	protocolType, ok := providerreg.ProtocolFamily(providerCode, t.Protocol)
+	if !ok {
+		return 0, fmt.Errorf("no unique provider route for provider=%q protocol=%q", t.Provider, t.Protocol)
 	}
-	// Strip /v1 suffix: probe functions append their own versioned paths
-	// (e.g. /v1/chat/completions). Without this, base_urls like
-	// "https://api.openai.com/v1" would produce double /v1/v1/... paths.
-	baseURL = strings.TrimSuffix(baseURL, "/v1")
+	if baseURL == "" {
+		baseURL = providerBaseURLForProtocol(providerCode, protocolType)
+	}
+	if baseURL == "" {
+		return 0, fmt.Errorf("provider route has no base URL for provider=%q protocol=%q", providerCode, protocolType)
+	}
 
-	switch t.Protocol {
+	switch protocolType {
 	case "anthropic":
-		return probeAnthropic(ctx, client, baseURL, t.APIKey)
-	case "google", "gemini":
-		return probeGoogle(ctx, client, baseURL, t.APIKey)
+		return probeAnthropic(ctx, client, baseURL, providerCode, protocolType, t.APIKey)
+	case "gemini":
+		return probeGoogle(ctx, client, baseURL, providerCode, protocolType, t.APIKey)
 	default: // openai, deepseek, kimi_code, moonshot, etc.
 		// 2026-05-08 Kimi 双平台拆分 review feedback (medium):
 		// probeModelForProtocol 名字误导,实际接收 provider code 而非 protocol。
@@ -813,14 +836,14 @@ func probeKey(ctx context.Context, client *http.Client, t *KeyCheckTarget) (int,
 		// 会 reject。改传 t.Provider (provider_code: kimi_code / moonshot / ...) ,
 		// probeModelForProtocol 内的 kimi_code → kimi-k2.5、moonshot → moonshot-v1-8k
 		// case 才能真正生效。
-		return probeOpenAICompat(ctx, client, baseURL, t.APIKey, probeModelForProtocol(t.Provider))
+		return probeOpenAICompat(ctx, client, baseURL, providerCode, protocolType, t.APIKey, probeModelForProtocol(providerCode))
 	}
 }
 
 // probeAnthropic sends a minimal POST /v1/messages (max_tokens=1) to verify the key.
-func probeAnthropic(ctx context.Context, client *http.Client, baseURL, apiKey string) (int, error) {
+func probeAnthropic(ctx context.Context, client *http.Client, baseURL, providerCode, protocolType, apiKey string) (int, error) {
 	body := `{"model":"claude-3-haiku-20240307","max_tokens":1,"messages":[{"role":"user","content":"hi"}]}`
-	req, err := http.NewRequestWithContext(ctx, "POST", baseURL+"/v1/messages", strings.NewReader(body))
+	req, err := newProviderProbeRequest(ctx, baseURL, providerCode, protocolType, "/messages", strings.NewReader(body))
 	if err != nil {
 		return 0, err
 	}
@@ -836,9 +859,9 @@ func probeAnthropic(ctx context.Context, client *http.Client, baseURL, apiKey st
 }
 
 // probeOpenAICompat sends a minimal POST /v1/chat/completions (max_tokens=1) to verify the key.
-func probeOpenAICompat(ctx context.Context, client *http.Client, baseURL, apiKey, model string) (int, error) {
+func probeOpenAICompat(ctx context.Context, client *http.Client, baseURL, providerCode, protocolType, apiKey, model string) (int, error) {
 	body := fmt.Sprintf(`{"model":%q,"max_tokens":1,"messages":[{"role":"user","content":"hi"}]}`, model)
-	req, err := http.NewRequestWithContext(ctx, "POST", baseURL+"/v1/chat/completions", strings.NewReader(body))
+	req, err := newProviderProbeRequest(ctx, baseURL, providerCode, protocolType, "/chat/completions", strings.NewReader(body))
 	if err != nil {
 		return 0, err
 	}
@@ -853,13 +876,15 @@ func probeOpenAICompat(ctx context.Context, client *http.Client, baseURL, apiKey
 }
 
 // probeGoogle sends a minimal POST to the Gemini generateContent endpoint to verify the key.
-func probeGoogle(ctx context.Context, client *http.Client, baseURL, apiKey string) (int, error) {
+func probeGoogle(ctx context.Context, client *http.Client, baseURL, providerCode, protocolType, apiKey string) (int, error) {
 	body := `{"contents":[{"parts":[{"text":"hi"}]}]}`
-	url := fmt.Sprintf("%s/v1beta/models/gemini-1.5-flash:generateContent?key=%s", baseURL, apiKey)
-	req, err := http.NewRequestWithContext(ctx, "POST", url, strings.NewReader(body))
+	req, err := newProviderProbeRequest(ctx, baseURL, providerCode, protocolType, "/models/gemini-1.5-flash:generateContent", strings.NewReader(body))
 	if err != nil {
 		return 0, err
 	}
+	query := req.URL.Query()
+	query.Set("key", apiKey)
+	req.URL.RawQuery = query.Encode()
 	req.Header.Set("content-type", "application/json")
 	resp, err := client.Do(req)
 	if err != nil {
@@ -867,6 +892,17 @@ func probeGoogle(ctx context.Context, client *http.Client, baseURL, apiKey strin
 	}
 	resp.Body.Close()
 	return resp.StatusCode, nil
+}
+
+func newProviderProbeRequest(ctx context.Context, baseURL, providerCode, protocolType, path string, body io.Reader) (*http.Request, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, path, body)
+	if err != nil {
+		return nil, err
+	}
+	if err := providerreg.Routes().StitchForProviderProtocol(req, baseURL, providerCode, protocolType); err != nil {
+		return nil, err
+	}
+	return req, nil
 }
 
 // probeModelForProtocol returns a lightweight well-known model name for each protocol,
@@ -885,26 +921,29 @@ func probeModelForProtocol(protocol string) string {
 	}
 }
 
-// providerDefaultBaseURL returns the default upstream base URL for a known provider.
+// providerDefaultBaseURL returns the effective endpoint from the shared route
+// table when a provider has one unambiguous protocol. Multi-protocol providers
+// require providerBaseURLForProtocol so row order never becomes behavior.
 func providerDefaultBaseURL(code string) string {
-	switch strings.ToLower(code) {
-	case "anthropic", "claude":
-		return "https://api.anthropic.com"
-	case "openai":
-		return "https://api.openai.com/v1"
-	case "google", "gemini":
-		return "https://generativelanguage.googleapis.com"
-	// 2026-05-08 Kimi 双平台拆分: 拆 case,'kimi' 为 deprecated alias 与 kimi_code
-	// 同 endpoint;moonshot 是独立的 api.moonshot.cn upstream。
-	case "kimi_code", "kimi":
-		return "https://api.kimi.com/coding"
-	case "moonshot":
-		return "https://api.moonshot.cn"
-	case "deepseek":
-		return "https://api.deepseek.com/v1"
-	default:
+	providerCode := providerreg.CanonicalCode(code)
+	protocolType, ok := providerreg.ProtocolFamily(providerCode, "")
+	if !ok {
 		return ""
 	}
+	return providerBaseURLForProtocol(providerCode, protocolType)
+}
+
+func providerBaseURLForProtocol(code, protocolType string) string {
+	providerCode := providerreg.CanonicalCode(code)
+	resolvedProtocol, ok := providerreg.ProtocolFamily(providerCode, protocolType)
+	if !ok {
+		return ""
+	}
+	route, ok := providerreg.Routes().ByProviderProtocol(providerCode, resolvedProtocol)
+	if !ok {
+		return ""
+	}
+	return providerroutes.EffectiveUpstream(route)
 }
 
 // ----------------------------------------------------------------------------
@@ -944,7 +983,17 @@ type ProbePingResponse struct {
 // ProbePing handles POST /admin/probe/ping.
 //
 // Measures reachability + latency from the proxy's network context to the
-// upstream provider. Two modes:
+// upstream provider.
+//
+// Mode 0 (preferred since 2026-07-29): when the LIVE forwarding transport is
+// wired (LiveUpstreamTransportFn), HTTP HEAD rides it for EVERY upstream mode
+// — the probe then measures the exact route real traffic takes (explicit
+// config > process env > OS system proxy via the sysproxy watcher > engine
+// spec, hot-swapped). The modes below are the FALLBACK chain for handlers
+// wired without it (tests / older wiring); their config→env-only resolution
+// misses the watcher level, which produced the "ping red, forwarding green"
+// false negative (bugfix 2026-07-29-probe-ping-sysproxy-split.md). Fallback
+// modes:
 //
 //  1. No upstream proxy configured (neither config.upstream_proxy.url nor
 //     HTTPS_PROXY / HTTP_PROXY / ALL_PROXY env var): raw TCP connect to
@@ -1014,7 +1063,23 @@ func (h *Handler) ProbePing(w http.ResponseWriter, r *http.Request) {
 	// bad network more than the signal is worth.
 	const probeTimeout = 3 * time.Second
 
-	// Resolve upstream proxy for THIS specific target. Precedence:
+	// Probe route resolution — SINGLE SOURCE OF TRUTH with the data plane
+	// (2026-07-29): prefer the LIVE forwarding transport for EVERY upstream
+	// mode, not only engine specs. The live transport is
+	// buildTransport(config-spec, sysproxy-watcher) — explicit config >
+	// process env > OS system proxy (registry / scutil), hot-swapped on
+	// change — i.e. the exact route real traffic takes right now.
+	//
+	// Why: the config→env-only resolution below MISSES the watcher level.
+	// On a box where the OS-detected system proxy is alive but a stale
+	// $HTTPS_PROXY points at a dead address (Win10 VM incident, bugfix
+	// 2026-07-29-probe-ping-sysproxy-split.md), ping went red and
+	// short-circuited API/Chat while real forwarding was green — the same
+	// false-negative class the mode-2 comment below was written against,
+	// fixed then only for the config/env levels.
+	//
+	// The chain below is KEPT as fallback for handlers wired without the
+	// live transport (tests / older wiring). Precedence there:
 	//   1. config.upstream_proxy.url — explicit config wins.
 	//   2. HTTPS_PROXY / HTTP_PROXY env via Go's ProxyFromEnvironment —
 	//      honors NO_PROXY automatically, so targets like 127.0.0.1 or
@@ -1022,6 +1087,11 @@ func (h *Handler) ProbePing(w http.ResponseWriter, r *http.Request) {
 	//      has `https_proxy=...` set (the 2026-04-21 test-flake scenario
 	//      from the user's Clash-configured shell).
 	//   3. Neither → direct TCP.
+	var liveRT http.RoundTripper
+	if h.LiveUpstreamTransportFn != nil {
+		liveRT = h.LiveUpstreamTransportFn()
+	}
+
 	proxyURL := ""
 	if h.cfg != nil && h.cfg.UpstreamProxy.URL != "" {
 		proxyURL = h.cfg.UpstreamProxy.URL
@@ -1038,6 +1108,34 @@ func (h *Handler) ProbePing(w http.ResponseWriter, r *http.Request) {
 	start := time.Now()
 	var err error
 	switch {
+	case liveRT != nil:
+		// The route real traffic takes RIGHT NOW (config / env / OS system
+		// proxy / engine spec — all already resolved inside the live
+		// transport, loopback+NO_PROXY bypass included). Any HTTP response
+		// from the target — 2xx/4xx alike — proves reachability; a
+		// transport-level error is the failure signal. Errors are scrubbed
+		// exactly like the engine fallback below: a dial error can quote
+		// spec internals (credentials included), so raw text stays in
+		// local Debug logs only.
+		err = httpHeadViaTransport(baseURL, liveRT, probeTimeout)
+		if err != nil {
+			logger.Debug("probe ping: live transport HEAD failed",
+				"provider", req.Provider,
+				"host", host,
+				"error.message", err.Error(),
+			)
+			reason := classifyNetErrorKnown(err)
+			if reason == "" {
+				reason = "upstream route dial failed; run Settings → Upstream proxy → Test for the detailed reason"
+			}
+			logger.Warn("probe ping failed via live upstream transport",
+				"event.name", observability.EventProxyEgressPingEngineDialFailed,
+				"provider", req.Provider,
+				"host", host,
+				"error.class", reason,
+			)
+			err = errors.New(reason)
+		}
 	case proxyURL == "":
 		// Direct TCP connect — fastest path, accurate RTT measurement.
 		var conn net.Conn
@@ -1046,23 +1144,13 @@ func (h *Handler) ProbePing(w http.ResponseWriter, r *http.Request) {
 			conn.Close()
 		}
 	case egress.IsEngineSpec(proxyURL):
-		// Engine spec (socks5 chain / mihomo fragment) — mode 3. Prefer the
-		// LIVE forwarding transport (already built at startup / hot-swap):
-		// ping then measures the exact runtime route with no per-call engine
-		// build (a fragment build takes seconds — over the CLI's 4s budget).
-		// Fallback: one-shot egress.TestDial through the same engine registry
+		// Engine spec (socks5 chain / mihomo fragment) — mode 3, reachable
+		// only when the live transport is absent (tests / older wiring):
+		// one-shot egress.TestDial through the same engine registry
 		// (mirrors egresstest.go's branching; single source of truth). Any
 		// HTTP response from the target — 2xx/4xx alike — proves
 		// reachability, same semantics as httpHeadViaProxy below.
-		var liveRT http.RoundTripper
-		if h.LiveUpstreamTransportFn != nil {
-			liveRT = h.LiveUpstreamTransportFn()
-		}
-		if liveRT != nil {
-			err = httpHeadViaTransport(baseURL, liveRT, probeTimeout)
-		} else {
-			_, err = egress.TestDial(r.Context(), proxyURL, baseURL, probeTimeout)
-		}
+		_, err = egress.TestDial(r.Context(), proxyURL, baseURL, probeTimeout)
 		if err != nil {
 			// Never echo the raw engine error to the caller: BuildDialer /
 			// yaml errors can quote the spec verbatim, credentials included.

@@ -35,6 +35,7 @@ import (
 	"testing"
 
 	"github.com/AiKeyLabs/aikey-proxy/internal/vault"
+	"github.com/AiKeyLabs/aikey-proxy/internal/vkeys"
 )
 
 // ── capturingTransport — observes outbound URL without leaving localhost ─
@@ -52,11 +53,15 @@ import (
 type capturingTransport struct {
 	host string
 	url  string
+	// codexModel proves provider setup's request-scoped context survives all
+	// the way to the outbound transport, not merely that the URL was rewritten.
+	codexModel string
 }
 
 func (c *capturingTransport) RoundTrip(req *http.Request) (*http.Response, error) {
 	c.host = req.URL.Host
 	c.url = req.URL.String()
+	c.codexModel, _ = req.Context().Value(ctxKeyCodexCandidateModel).(string)
 	// Synthetic 200 — body shape mirrors a minimal upstream response so
 	// the proxy's downstream usage extractor doesn't WARN on shape mismatch.
 	return &http.Response{
@@ -120,6 +125,7 @@ func TestFence_OAuthBinding_HappyPath(t *testing.T) {
 		providerBindings: map[string]*vault.ProviderBinding{
 			"anthropic": {
 				ProviderCode:  "anthropic",
+				ProtocolType:  "anthropic",
 				KeySourceType: "personal_oauth_account",
 				KeySourceRef:  "session_oauth-acct-1",
 			},
@@ -162,12 +168,10 @@ func TestFence_OAuthBinding_HappyPath(t *testing.T) {
 	if transport.host != "api.anthropic.com" {
 		t.Errorf("outbound Host = %q, want api.anthropic.com (OAuth binding path must use providerDefaultBaseURL, not team key BaseURL)", transport.host)
 	}
-	// Path: provider prefix stripped (/anthropic prefix → /v1/messages).
-	// injectClaudeOAuth appends `?beta=true` query so we check Contains
-	// not HasSuffix. The beta param is pinned by oauth_inject_test.go's
-	// TestInjectClaudeOAuth_BetaQueryParam — required by Anthropic OAuth.
-	if !strings.Contains(transport.url, "/v1/messages") {
-		t.Errorf("outbound URL = %q, want path /v1/messages (provider prefix should be stripped)", transport.url)
+	// Exact URL, not Contains: /v1/v1/messages also contains /v1/messages and
+	// previously let the broken OAuth composer pass this fence.
+	if want := "https://api.anthropic.com/v1/messages?beta=true"; transport.url != want {
+		t.Errorf("outbound URL = %q, want %q", transport.url, want)
 	}
 	// Request headers (mutated by oauthInject before forwarding):
 	// Authorization: Bearer <token>, x-api-key removed.
@@ -182,6 +186,43 @@ func TestFence_OAuthBinding_HappyPath(t *testing.T) {
 	// Response status: the synthetic transport returns 200.
 	if w.Code != http.StatusOK {
 		t.Errorf("expected 200, got %d — body: %s", w.Code, w.Body.String())
+	}
+}
+
+// Tier-1 OAuth routes are built by supervisor.oauthTokenToRoute and store the
+// provider table's effective endpoint. This exercises the complete registry →
+// broker → OAuth injection → Director boundary with that real route shape.
+func TestFence_Tier1OAuthRouteStitchesVersionExactlyOnce(t *testing.T) {
+	p := setupTestProxyWithActive(t, &mockActiveVault{})
+	p.SetBroker(&mockOAuthBroker{resolveCred: &OAuthCredential{
+		AccessToken: "oauth-tier1-token",
+		AccountID:   "oauth-tier1-account",
+		Provider:    "anthropic",
+		ExternalID:  "oauth-tier1-external",
+	}})
+	transport := &capturingTransport{}
+	p.SetTransport(transport)
+
+	const token = "aikey_personal_0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+	p.registry.Merge(map[string]*vkeys.ResolvedRoute{
+		token: {
+			VirtualKeyID: "oauth:oauth-tier1-account",
+			Provider:     "anthropic", ProviderCode: "anthropic", ProtocolType: "anthropic",
+			BaseURL: "https://api.anthropic.com/v1", KeyAlias: oauthSentinelKey,
+			AccountID: "oauth-tier1-account", RouteSource: "oauth",
+		},
+	})
+
+	req := httptest.NewRequest(http.MethodPost, "/anthropic/v1/messages", strings.NewReader(`{"model":"claude-sonnet-4-5","messages":[]}`))
+	req.Header.Set("x-api-key", token)
+	w := httptest.NewRecorder()
+	p.Handle(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body=%s", w.Code, w.Body.String())
+	}
+	if want := "https://api.anthropic.com/v1/messages?beta=true"; transport.url != want {
+		t.Fatalf("Tier-1 OAuth URL = %q, want %q", transport.url, want)
 	}
 }
 
@@ -299,11 +340,11 @@ func TestFence_OAuthBinding_ResolveFailReturns503(t *testing.T) {
 // Codex uses the Responses API at a separate origin. If the refactor
 // loses this override, every Codex user hits a 404 from OpenAI.
 //
-// Why this is brittle and important: the override is a single line
-// inside handlePathPrefixRoute (`if canonicalCode == "openai" {
-// baseURL = "https://chatgpt.com/backend-api/codex" }`). It has no
-// separate function — easy to miss when extracting a helper.
+// Why this is brittle and important: every OAuth dispatch lane must enter the
+// shared resolver; copying only the BaseURL override loses Codex path
+// normalization and request-scoped model capture.
 func TestFence_OAuthBinding_OpenAICodexBaseURLOverride(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
 	av := &mockActiveVault{
 		providerBindings: map[string]*vault.ProviderBinding{
 			"openai": {
@@ -355,11 +396,147 @@ func TestFence_OAuthBinding_OpenAICodexBaseURLOverride(t *testing.T) {
 	if transport.host != "chatgpt.com" {
 		t.Errorf("outbound Host = %q, want chatgpt.com (Codex BaseURL override for canonicalCode=openai + OAuth binding)", transport.host)
 	}
-	// Path must include /backend-api/codex (the Codex API path under chatgpt.com).
-	if !strings.Contains(transport.url, "/backend-api/codex") {
-		t.Errorf("outbound URL = %q, want /backend-api/codex prefix (Codex API path)", transport.url)
+	// Exact path: a Contains assertion would also accept a duplicated or trailing
+	// version segment and repeat the blind spot fixed for Anthropic above.
+	if want := "https://chatgpt.com/backend-api/codex/responses"; transport.url != want {
+		t.Errorf("outbound URL = %q, want %q", transport.url, want)
+	}
+	if transport.codexModel != "gpt-4o" {
+		t.Errorf("outbound Codex model context = %q, want gpt-4o", transport.codexModel)
 	}
 	_ = w // synthetic 200 from capturingTransport — response shape not asserted here
+}
+
+// The registry-token and connectivity-probe lanes historically duplicated the
+// OpenAI override without running the shared Codex request setup. Exact URL and
+// context assertions keep all three user-facing OAuth dispatch paths aligned.
+func TestFence_CodexOAuthDispatchLanesUseSharedSetup(t *testing.T) {
+	cases := []struct {
+		name       string
+		token      string
+		tier1Route bool
+	}{
+		{
+			name:       "tier1 registry token",
+			token:      "aikey_personal_abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789",
+			tier1Route: true,
+		},
+		{
+			name:  "tier2 connectivity probe",
+			token: "aikey_probe_session_codex_probe",
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Setenv("HOME", t.TempDir())
+			p := setupTestProxyWithActive(t, &mockActiveVault{})
+			p.SetBroker(&mockOAuthBroker{resolveCred: &OAuthCredential{
+				AccessToken: "codex-oauth-bearer",
+				AccountID:   "session_codex",
+				Provider:    "openai",
+			}})
+			if tc.tier1Route {
+				p.registry.Merge(map[string]*vkeys.ResolvedRoute{
+					tc.token: {
+						VirtualKeyID: "oauth:session_codex_tier1",
+						Provider:     "openai", ProviderCode: "openai", ProtocolType: "openai_compatible",
+						BaseURL: "https://api.openai.com/v1", KeyAlias: oauthSentinelKey,
+						AccountID: "session_codex_tier1", RouteSource: "oauth",
+					},
+				})
+			}
+			transport := &capturingTransport{}
+			p.SetTransport(transport)
+
+			req := httptest.NewRequest(http.MethodPost, "/openai/v1/responses",
+				strings.NewReader(`{"model":"gpt-5","input":"hi"}`))
+			req.Header.Set("Authorization", "Bearer "+tc.token)
+			req.Header.Set("Content-Type", "application/json")
+			w := httptest.NewRecorder()
+			p.Handle(w, req)
+
+			if w.Code != http.StatusOK {
+				t.Fatalf("status = %d, want 200; body=%s", w.Code, w.Body.String())
+			}
+			if want := "https://chatgpt.com/backend-api/codex/responses"; transport.url != want {
+				t.Errorf("outbound URL = %q, want %q", transport.url, want)
+			}
+			if transport.codexModel != "gpt-5" {
+				t.Errorf("outbound Codex model context = %q, want gpt-5", transport.codexModel)
+			}
+		})
+	}
+}
+
+func TestFence_CodexOAuthAppAndProbePipelinesPrepareRequestBeforeCredentialResolution(t *testing.T) {
+	t.Run("app pipeline", func(t *testing.T) {
+		t.Setenv("HOME", t.TempDir())
+		av := newAppPipelineTestVault("codex-agent", []string{"openai"}, "", "")
+		av.appBindings["app:codex-agent|openai"] = &vault.ProviderBinding{
+			ProviderCode:  "openai",
+			ProtocolType:  "openai_compatible",
+			KeySourceType: "personal_oauth_account",
+			KeySourceRef:  "session_codex_app",
+		}
+		p := setupTestProxyWithActive(t, av)
+		seedAppRouteInProxy(p, "codex-agent")
+		p.SetBroker(&mockOAuthBroker{resolveCred: &OAuthCredential{
+			AccessToken: "codex-app-bearer", AccountID: "session_codex_app", Provider: "openai",
+		}})
+		transport := &capturingTransport{}
+		p.SetTransport(transport)
+
+		req := httptest.NewRequest(http.MethodPost, "/apps/codex-agent/v1/responses",
+			strings.NewReader(`{"model":"gpt-5-app","input":"hi"}`))
+		req.Header.Set("Authorization", "Bearer "+testAppBearer)
+		req.Header.Set("Content-Type", "application/json")
+		w := httptest.NewRecorder()
+		p.Handle(w, req)
+
+		assertCodexPreparedRequest(t, w, transport, "gpt-5-app")
+	})
+
+	t.Run("probe pipeline", func(t *testing.T) {
+		t.Setenv("HOME", t.TempDir())
+		av := &mockActiveVault{aliasCreds: map[string]*vault.AliasCredential{
+			"codex-oauth": {
+				Status: "active", AliasKind: "oauth",
+				Binding: &vault.ProviderBinding{
+					ProviderCode: "openai", ProtocolType: "openai_compatible",
+					KeySourceType: "personal_oauth_account", KeySourceRef: "session_codex_probe_pipeline",
+				},
+			},
+		}}
+		p := setupTestProxyWithActive(t, av)
+		p.SetBroker(&mockOAuthBroker{resolveCred: &OAuthCredential{
+			AccessToken: "codex-probe-bearer", AccountID: "session_codex_probe_pipeline", Provider: "openai",
+		}})
+		transport := &capturingTransport{}
+		p.SetTransport(transport)
+
+		req := httptest.NewRequest(http.MethodPost, "/probe/codex-oauth/v1/responses",
+			strings.NewReader(`{"model":"gpt-5-probe","input":"hi"}`))
+		req.Header.Set("Authorization", "Bearer aikey_app_internal_degrade_detector_v1")
+		req.Header.Set("Content-Type", "application/json")
+		w := httptest.NewRecorder()
+		p.Handle(w, req)
+
+		assertCodexPreparedRequest(t, w, transport, "gpt-5-probe")
+	})
+}
+
+func assertCodexPreparedRequest(t *testing.T, w *httptest.ResponseRecorder, transport *capturingTransport, wantModel string) {
+	t.Helper()
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body=%s", w.Code, w.Body.String())
+	}
+	if want := "https://chatgpt.com/backend-api/codex/responses"; transport.url != want {
+		t.Errorf("outbound URL = %q, want %q", transport.url, want)
+	}
+	if transport.codexModel != wantModel {
+		t.Errorf("outbound Codex model context = %q, want %q", transport.codexModel, wantModel)
+	}
 }
 
 // ── Test errors ─────────────────────────────────────────────────────────────

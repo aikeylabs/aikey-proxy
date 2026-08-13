@@ -174,24 +174,21 @@ func ClassifyToken(token string) DispatchAction {
 // canonicalProviderCodes is the strict allowlist of canonical provider codes
 // accepted as the suffix of `aikey_probe_raw_*` (Tier2ProbeRaw, 2026-05-26).
 //
-// ⚠️  CROSS-LANGUAGE DRIFT RISK — MUST STAY IN SYNC WITH:
-//   - aikey-cli/data/provider_registry.yaml (canonical source-of-truth)
-//   - aikey-proxy/internal/proxy/middleware.go::providerDefaultBaseURL switch
-//   - aikey-proxy/internal/proxy/middleware.go::providerCanonicalCode mapper
+// DERIVED, NOT MAINTAINED (2026-07-24): the set is built at init from the
+// embedded provider_routes table (pkg/providerroutes, SHA-gated against
+// aikey-cli/data/provider_fingerprint.yaml) with providerCanonicalCode
+// normalization on top (pkg/providerregistry, same gate posture). Adding a
+// provider is a yaml edit; this map follows automatically. Earlier revisions
+// were a hand-maintained literal map with a ⚠️ sync warning pointing at a
+// providerDefaultBaseURL switch — both the switch and the warning are gone;
+// do not reintroduce a literal copy here (requirement spec
+// 2026-07-18-provider-protocol-compatibility-and-baseurl §10).
 //
-// Aliases ("claude" / "gpt" / "gemini") are INTENTIONALLY EXCLUDED — caller
-// (CLI/Web) MUST pre-normalize to canonical form before constructing the
-// aikey_probe_raw_ token. This forces explicit caller awareness of provider
-// identity (the URL path's canonical code IS the routing decision) and avoids
-// ambiguity at the proxy boundary.
-//
-// Why a separate map (not reuse providerDefaultBaseURL switch): drift across
-// the two would silently produce wrong behavior (a provider added to the
-// default-base-URL switch but missing here would reject valid probe_raw
-// tokens). Single source of truth via grep gate in CI:
-//
-//	`grep -A2 "case \"" middleware.go::providerDefaultBaseURL | grep "case"`
-//	must produce same set as keys of canonicalProviderCodes.
+// Aliases ("claude" / "gpt" / "gemini") are INTENTIONALLY EXCLUDED — the map
+// keys are canonical route-table codes, and the caller (CLI/Web) MUST
+// pre-normalize before constructing the aikey_probe_raw_ token. This forces
+// explicit caller awareness of provider identity (the URL path's canonical
+// code IS the routing decision) and avoids ambiguity at the proxy boundary.
 var canonicalProviderCodes = func() map[string]struct{} {
 	out := make(map[string]struct{})
 	for _, route := range provider.Routes().All() {

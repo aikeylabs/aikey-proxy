@@ -7,10 +7,14 @@ package proxy
 
 import (
 	"errors"
+	"io"
 	"net/http"
+	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 
+	"github.com/AiKeyLabs/aikey-proxy/internal/egresstest"
 	"github.com/AiKeyLabs/aikey-proxy/internal/observability"
 	"github.com/AiKeyLabs/aikey-proxy/internal/vkeys"
 )
@@ -141,21 +145,86 @@ func TestGroupFailover_WAF429DoesNotRetry(t *testing.T) {
 	}
 }
 
-// A transport-level failure (no HTTP response at all) is synthesized into a 502
-// by the ReverseProxy and MUST fail over like any 5xx — the gap sub2api ships
-// with (their connection errors dead-end as a client-visible 502).
-func TestGroupFailover_TransportErrorRetries(t *testing.T) {
+// A transport-level failure proves the PATH failed, not the account. Two pool
+// accounts on that SAME path must not repeat the identical dial in one logical
+// request. The path can recover on the next request; neither account is cooled.
+func TestGroupPathHealth_TransportErrorDoesNotRetrySamePath(t *testing.T) {
 	p, tr, tokToAcct := twoAccountPool(t)
 	_, ptok := probePrimary(t, p, tr, tokToAcct)
 
 	tr.errByAuth = map[string]error{"Bearer " + ptok: errors.New("dial tcp: connection refused")}
 	req, w := groupReq(groupBody)
 	p.Handle(w, req)
-	if w.Code != http.StatusOK {
-		t.Fatalf("transport failure must fail over to a 200, got %d: %s", w.Code, w.Body.String())
+	if w.Code != http.StatusServiceUnavailable {
+		t.Fatalf("same-path transport failure must remain a non-quota 503, got %d: %s", w.Code, w.Body.String())
 	}
-	if tr.calls != 2 {
-		t.Fatalf("want 2 upstream attempts, got %d", tr.calls)
+	if !strings.Contains(w.Body.String(), observability.ErrCodeGroupUpstreamUnavailable) {
+		t.Fatalf("transport path error must retain its explicit non-quota code: %s", w.Body.String())
+	}
+	if tr.calls != 1 {
+		t.Fatalf("same failed path must be dialed once per logical request, got %d attempts", tr.calls)
+	}
+	if len(p.poolCooldown.skipSet()) != 0 {
+		t.Fatalf("transport failure must not cool accounts, got %v", p.poolCooldown.skipSet())
+	}
+	if got := p.ProviderPathHealthSnapshot(); len(got) != 1 || got[0].State != pathStateSuspect {
+		t.Fatalf("transport failure must enter path suspect state, got %+v", got)
+	}
+}
+
+// A path failure must not disable useful account failover. When the next account
+// has a different egress fingerprint, the same logical request is allowed to
+// traverse that distinct real SOCKS5 path and reach the Mock Provider.
+func TestGroupPathHealth_DifferentEgressPathStillFailsOver(t *testing.T) {
+	noEgressBypass(t)
+	target := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, `{"id":"msg","type":"message","content":[{"type":"text","text":"ok"}],"model":"mock","stop_reason":"end_turn","usage":{"input_tokens":1,"output_tokens":1}}`)
+	}))
+	defer target.Close()
+	goodExit := egresstest.NewSocks5Server(t, "", "")
+
+	key := grKey()
+	refs := []vkeys.GroupAccountRef{
+		{AccountID: "acc-bad-path", ProviderCode: "mock", ProtocolType: "anthropic"},
+		{AccountID: "acc-good-path", ProviderCode: "mock", ProtocolType: "anthropic"},
+	}
+	mat := map[string]vkeys.GroupRuntimeAccount{
+		"acc-bad-path": encMat(t, key, vkeys.GroupRuntimeAccount{
+			CredentialType: "oauth_account", ProviderCode: "mock", ProtocolType: "anthropic",
+			BaseURL: target.URL, ExpiresAt: 9_000_000_000, ExternalID: "uuid-bad",
+			EgressProxyURL: "socks5://127.0.0.1:1",
+		}, "tok-bad"),
+		"acc-good-path": encMat(t, key, vkeys.GroupRuntimeAccount{
+			CredentialType: "oauth_account", ProviderCode: "mock", ProtocolType: "anthropic",
+			BaseURL: target.URL, ExpiresAt: 9_000_000_000, ExternalID: "uuid-good",
+			EgressProxyURL: "socks5://" + goodExit.Addr(),
+		}, "tok-good"),
+	}
+	route := &vkeys.ResolvedRoute{
+		VirtualKeyID: "vk-grp", ProtocolType: "anthropic", RouteSource: "team",
+		SeatID: "seat-1", OauthGroupID: "grp-1",
+		GroupAccounts: mustJSON(t, refs), GroupRuntime: mustJSON(t, mat),
+	}
+	p, _ := setupGroupProxy(t, key, route)
+	cache := NewRoutingOverrideCache()
+	cache.StoreAll(1, map[string]string{routeKey("seat-1", "grp-1"): "acc-bad-path"}, nil)
+	p.SetRoutingOverrides(cache)
+
+	req, w := groupReq(groupBody)
+	p.Handle(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("different egress path must remain eligible and recover in-request, got %d: %s", w.Code, w.Body.String())
+	}
+	if n, last := goodExit.Stats(); n != 1 || last != hostPort(t, target.URL) {
+		t.Fatalf("healthy distinct egress was not traversed exactly once: connects=%d last=%q", n, last)
+	}
+	if len(p.poolCooldown.skipSet()) != 0 {
+		t.Fatalf("path failure must not cool either account, got %v", p.poolCooldown.skipSet())
+	}
+	paths := p.ProviderPathHealthSnapshot()
+	if len(paths) != 1 || paths[0].EgressFingerprint == "" || paths[0].State != pathStateSuspect {
+		t.Fatalf("only the failed egress path should remain suspect, got %+v", paths)
 	}
 }
 
@@ -270,6 +339,47 @@ func TestGroupFailover_UpstreamErrorNotMaskedByFailoverCandidateLogin(t *testing
 	}
 	if strings.Contains(w.Body.String(), groupErrLoginRequired) || strings.Contains(w.Body.String(), "fallback@example.com") {
 		t.Fatalf("fallback login state must not mask assigned-account failure: %s", w.Body.String())
+	}
+}
+
+// A no-response path failure has no captured HTTP response. If the next
+// account needs login, preserve the concrete path 503 instead of prompting for
+// an unrelated account or dereferencing a nil capture writer.
+func TestGroupPathHealth_TransportErrorNotMaskedByFailoverCandidateLogin(t *testing.T) {
+	key := grKey()
+	refs := []vkeys.GroupAccountRef{
+		{AccountID: "acc-assigned", ProviderCode: "anthropic", Identity: "assigned@example.com"},
+		{AccountID: "acc-needs-login", ProviderCode: "anthropic", Identity: "fallback@example.com"},
+	}
+	mat := map[string]vkeys.GroupRuntimeAccount{
+		"acc-assigned": encMat(t, key, vkeys.GroupRuntimeAccount{
+			CredentialType: "oauth_account", ExpiresAt: 9_000_000_000, ExternalID: "uuid-assigned",
+		}, "tok-assigned"),
+		"acc-needs-login": {CredentialType: "oauth_account", NeedsLogin: true, Identity: "fallback@example.com"},
+	}
+	route := &vkeys.ResolvedRoute{
+		VirtualKeyID: "vk-grp", Provider: "anthropic", ProtocolType: "anthropic",
+		ProviderCode: "anthropic", RouteSource: "team",
+		SeatID: "seat-1", OauthGroupID: "grp-1",
+		GroupAccounts: mustJSON(t, refs), GroupRuntime: mustJSON(t, mat),
+	}
+	p, tr := setupGroupProxy(t, key, route)
+	cache := NewRoutingOverrideCache()
+	cache.StoreAll(1, map[string]string{routeKey("seat-1", "grp-1"): "acc-assigned"}, nil)
+	p.SetRoutingOverrides(cache)
+	tr.errByAuth = map[string]error{"Bearer tok-assigned": errors.New("dial tcp: connection refused")}
+
+	req, w := groupReq(groupBody)
+	p.Handle(w, req)
+
+	if w.Code != http.StatusServiceUnavailable || !strings.Contains(w.Body.String(), observability.ErrCodeGroupUpstreamUnavailable) {
+		t.Fatalf("transport root cause must remain explicit 503, got %d: %s", w.Code, w.Body.String())
+	}
+	if tr.calls != 1 {
+		t.Fatalf("needs-login fallback must not cause another dial, calls=%d", tr.calls)
+	}
+	if strings.Contains(w.Body.String(), groupErrLoginRequired) || strings.Contains(w.Body.String(), "fallback@example.com") {
+		t.Fatalf("fallback login state must not mask transport failure: %s", w.Body.String())
 	}
 }
 
@@ -416,23 +526,93 @@ func TestGroupCooldown_5xxStreakCoolsAcrossRequests(t *testing.T) {
 	if tr.calls != 0 {
 		t.Fatalf("cooled account must not be attempted, got %d upstream calls", tr.calls)
 	}
-	if w.Code != http.StatusTooManyRequests {
-		t.Fatalf("all-unusable pool surfaces the honest 429, got %d", w.Code)
+	if w.Code != http.StatusServiceUnavailable || !strings.Contains(w.Body.String(), observability.ErrCodeGroupUpstreamUnavailable) {
+		t.Fatalf("5xx-cooled pool must preserve upstream-unavailable as 503, got %d: %s", w.Code, w.Body.String())
 	}
 }
 
-// P0-B: transport-level failures (no HTTP response) count toward the same
-// streak — a persistently unreachable account stops being attempted.
-func TestGroupCooldown_TransportErrorStreakCools(t *testing.T) {
+// Transport failures are path-scoped. The second distinct request is the
+// half-open probe; after it fails, later requests back off without poisoning the
+// account-level cooldown state.
+func TestGroupPathHealth_TransportFailuresNeverCoolAccount(t *testing.T) {
 	p, tr := singleAccountPool(t)
 	tr.errByAuth = map[string]error{"Bearer tok-1": errors.New("dial tcp: connection refused")}
-	for i := 0; i < serverErrStreakThreshold; i++ {
+	for i := 0; i < 3; i++ {
 		req, w := groupReq(groupBody)
 		p.Handle(w, req)
 		_ = w
 	}
-	if !p.poolCooldown.skipSet()["acc-1"] {
-		t.Fatalf("%d consecutive transport failures must cool the account", serverErrStreakThreshold)
+	if len(p.poolCooldown.skipSet()) != 0 {
+		t.Fatalf("transport failures must never cool the account, got %v", p.poolCooldown.skipSet())
+	}
+	if tr.calls != 2 {
+		t.Fatalf("first request + one half-open probe should dial twice; third request backs off, got %d", tr.calls)
+	}
+	if got := p.ProviderPathHealthSnapshot(); len(got) != 1 || got[0].State != pathStateOpen {
+		t.Fatalf("repeated transport failures must open the path, got %+v", got)
+	}
+}
+
+// An account-specific egress failure already has a precise public error code on
+// the request that discovers it. Entering the resilience cooldown must not erase
+// that cause and turn the next request into a fake quota/rate-limit 429.
+func TestGroupPathHealth_EgressFailureStays503WithoutAccountCooldown(t *testing.T) {
+	p, tr := singleAccountPool(t)
+	tr.errByAuth = map[string]error{
+		"Bearer tok-1": &EgressDialError{err: errors.New("rejected username/password")},
+	}
+	for i := 0; i < 2; i++ {
+		req, w := groupReq(groupBody)
+		p.Handle(w, req)
+		if w.Code != http.StatusServiceUnavailable || !strings.Contains(w.Body.String(), observability.ErrCodeAccountEgressProxy) {
+			t.Fatalf("req %d: egress failure must be precise 503, got %d: %s", i+1, w.Code, w.Body.String())
+		}
+	}
+	if len(p.poolCooldown.skipSet()) != 0 {
+		t.Fatalf("egress transport failure must not cool the account, got %v", p.poolCooldown.skipSet())
+	}
+	before := tr.calls
+	req, w := groupReq(groupBody)
+	p.Handle(w, req)
+	if tr.calls != before {
+		t.Fatalf("open egress path must back off without dialing, before=%d after=%d", before, tr.calls)
+	}
+	if w.Code != http.StatusServiceUnavailable || !strings.Contains(w.Body.String(), observability.ErrCodeAccountEgressProxy) {
+		t.Fatalf("blocked egress path must remain precise 503, got %d: %s", w.Code, w.Body.String())
+	}
+	if w.Header().Get("Retry-After") == "" {
+		t.Fatal("blocked path response must include Retry-After")
+	}
+}
+
+// A transport/egress cooldown is a bounded circuit breaker, not a permanent
+// account tombstone. Once it expires, the same group key must automatically
+// re-admit the account and recover on the next successful request without a
+// proxy restart or any client-side key/config change.
+func TestGroupPathHealth_EgressFailureRecoversAfterAdaptiveBackoff(t *testing.T) {
+	p, tr := singleAccountPool(t)
+	now := time.Unix(1_800_000_000, 0)
+	p.pathHealth.now = func() time.Time { return now }
+	tr.errByAuth = map[string]error{
+		"Bearer tok-1": &EgressDialError{err: errors.New("rejected username/password")},
+	}
+	for i := 0; i < 2; i++ {
+		req, w := groupReq(groupBody)
+		p.Handle(w, req)
+		if w.Code != http.StatusServiceUnavailable {
+			t.Fatalf("req %d: want egress 503, got %d: %s", i+1, w.Code, w.Body.String())
+		}
+	}
+
+	delete(tr.errByAuth, "Bearer tok-1")
+	now = now.Add(time.Second)
+	req, w := groupReq(groupBody)
+	p.Handle(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("elapsed path backoff must automatically probe and recover, got %d: %s", w.Code, w.Body.String())
+	}
+	if got := p.ProviderPathHealthSnapshot(); len(got) != 0 {
+		t.Fatalf("successful half-open request must close path state, got %+v", got)
 	}
 }
 

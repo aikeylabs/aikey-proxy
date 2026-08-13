@@ -3,6 +3,7 @@ package admin
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -48,6 +49,82 @@ func postProbePing(t *testing.T, h *Handler, body any) *httptest.ResponseRecorde
 	rr := httptest.NewRecorder()
 	h.ProbePing(rr, req)
 	return rr
+}
+
+// rtFunc adapts a function to http.RoundTripper for live-transport spies.
+type rtFunc func(*http.Request) (*http.Response, error)
+
+func (f rtFunc) RoundTrip(r *http.Request) (*http.Response, error) { return f(r) }
+
+// Fence for the 2026-07-29 sysproxy-split fix: when the live forwarding
+// transport is wired, ProbePing MUST ride it — for every mode, not only
+// engine specs. Here BOTH fallback levels are deliberately poisoned (explicit
+// config proxy = dead loopback port, target = unroutable TEST-NET address),
+// so the probe can only succeed by consulting the live transport. If someone
+// reverts the precedence, this test fails via the dead-proxy path — the exact
+// "ping red, forwarding green" false negative from the Win10 VM incident
+// (bugfix 2026-07-29-probe-ping-sysproxy-split.md).
+func TestProbePing_LiveTransport_PreferredOverConfigAndEnv(t *testing.T) {
+	calls := 0
+	h := newHandlerForTest(&config.Config{})
+	h.cfg.UpstreamProxy.URL = "http://127.0.0.1:1" // dead: fallback path can't succeed
+	h.LiveUpstreamTransportFn = func() http.RoundTripper {
+		return rtFunc(func(r *http.Request) (*http.Response, error) {
+			calls++
+			// 404 on purpose: ANY HTTP response proves reachability —
+			// same semantics as httpHeadViaProxy.
+			return &http.Response{
+				StatusCode: http.StatusNotFound,
+				Body:       io.NopCloser(strings.NewReader("")),
+				Header:     http.Header{},
+			}, nil
+		})
+	}
+
+	// TEST-NET-3 (RFC 5737): unroutable, so a regressed direct/proxied path
+	// cannot accidentally green this test.
+	rr := postProbePing(t, h, ProbePingRequest{BaseURL: "https://203.0.113.1:9"})
+
+	if rr.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body = %q", rr.Code, rr.Body.String())
+	}
+	var resp ProbePingResponse
+	if err := json.Unmarshal(rr.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("decode response: %v; body = %q", err, rr.Body.String())
+	}
+	if !resp.OK {
+		t.Errorf("expected ok=true via live transport, got ok=false, error=%q", resp.Error)
+	}
+	if calls != 1 {
+		t.Errorf("live transport RoundTrip calls = %d, want 1 (probe must ride the live route)", calls)
+	}
+}
+
+// A live-transport dial failure must (a) report ok=false — if the real route
+// is dead, ping MUST be red — and (b) never echo raw dial errors, which can
+// quote engine spec internals (credentials included). Same hygiene as the
+// engine fallback branch.
+func TestProbePing_LiveTransportDialFailure_ScrubsError(t *testing.T) {
+	h := newHandlerForTest(&config.Config{})
+	h.LiveUpstreamTransportFn = func() http.RoundTripper {
+		return rtFunc(func(r *http.Request) (*http.Response, error) {
+			return nil, errors.New("dial: proxies fragment user=admin pass=sekret-hunter2")
+		})
+	}
+
+	rr := postProbePing(t, h, ProbePingRequest{BaseURL: "https://203.0.113.1:9"})
+
+	var resp ProbePingResponse
+	_ = json.Unmarshal(rr.Body.Bytes(), &resp)
+	if resp.OK {
+		t.Fatalf("expected ok=false when the live route fails, got ok=true")
+	}
+	if resp.Error == "" {
+		t.Errorf("expected non-empty scrubbed error when ok=false")
+	}
+	if strings.Contains(resp.Error, "sekret-hunter2") || strings.Contains(resp.Error, "pass=") {
+		t.Errorf("raw dial error leaked into the response: %q", resp.Error)
+	}
 }
 
 func TestProbePing_DirectTCP_SucceedsAgainstLocalListener(t *testing.T) {

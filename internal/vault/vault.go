@@ -572,28 +572,69 @@ func (r *Reader) GetAliasCredential(name string) (*AliasCredential, error) {
 
 	var (
 		acctID, provider, status string
+		protocolType             sql.NullString
 		hasLocalAlias            = hasColumn(r.db, "provider_accounts", "local_alias")
+		hasProtocolType          = hasColumn(r.db, "provider_accounts", "protocol_type")
 	)
+	oauthCredential := func() *AliasCredential {
+		protocol := ""
+		if protocolType.Valid {
+			protocol = protocolType.String
+		}
+		return &AliasCredential{
+			Binding: &ProviderBinding{
+				ProviderCode:  provider,
+				ProtocolType:  protocol,
+				KeySourceType: "personal_oauth_account",
+				KeySourceRef:  acctID,
+			},
+			Status:    status,
+			AliasKind: "oauth",
+		}
+	}
+	queryOAuth := func(byLocalAlias bool) error {
+		protocolType = sql.NullString{}
+		switch {
+		case hasProtocolType && byLocalAlias:
+			return r.db.QueryRow(
+				`SELECT provider_account_id, provider, protocol_type, status
+				   FROM provider_accounts
+				  WHERE local_alias = ? AND local_alias IS NOT NULL AND local_alias != ''
+				  LIMIT 1`,
+				name,
+			).Scan(&acctID, &provider, &protocolType, &status)
+		case hasProtocolType:
+			return r.db.QueryRow(
+				`SELECT provider_account_id, provider, protocol_type, status
+				   FROM provider_accounts
+				  WHERE display_identity = ?
+				  LIMIT 1`,
+				name,
+			).Scan(&acctID, &provider, &protocolType, &status)
+		case byLocalAlias:
+			return r.db.QueryRow(
+				`SELECT provider_account_id, provider, status
+				   FROM provider_accounts
+				  WHERE local_alias = ? AND local_alias IS NOT NULL AND local_alias != ''
+				  LIMIT 1`,
+				name,
+			).Scan(&acctID, &provider, &status)
+		default:
+			return r.db.QueryRow(
+				`SELECT provider_account_id, provider, status
+				   FROM provider_accounts
+				  WHERE display_identity = ?
+				  LIMIT 1`,
+				name,
+			).Scan(&acctID, &provider, &status)
+		}
+	}
 
 	if hasLocalAlias {
-		err = r.db.QueryRow(
-			`SELECT provider_account_id, provider, status
-			   FROM provider_accounts
-			  WHERE local_alias = ? AND local_alias IS NOT NULL AND local_alias != ''
-			  LIMIT 1`,
-			name,
-		).Scan(&acctID, &provider, &status)
+		err = queryOAuth(true)
 		switch {
 		case err == nil:
-			return &AliasCredential{
-				Binding: &ProviderBinding{
-					ProviderCode:  provider,
-					KeySourceType: "personal_oauth_account",
-					KeySourceRef:  acctID,
-				},
-				Status:    status,
-				AliasKind: "oauth",
-			}, nil
+			return oauthCredential(), nil
 		case err == sql.ErrNoRows:
 			// fall through to display_identity
 		default:
@@ -601,24 +642,10 @@ func (r *Reader) GetAliasCredential(name string) (*AliasCredential, error) {
 		}
 	}
 
-	err = r.db.QueryRow(
-		`SELECT provider_account_id, provider, status
-		   FROM provider_accounts
-		  WHERE display_identity = ?
-		  LIMIT 1`,
-		name,
-	).Scan(&acctID, &provider, &status)
+	err = queryOAuth(false)
 	switch {
 	case err == nil:
-		return &AliasCredential{
-			Binding: &ProviderBinding{
-				ProviderCode:  provider,
-				KeySourceType: "personal_oauth_account",
-				KeySourceRef:  acctID,
-			},
-			Status:    status,
-			AliasKind: "oauth",
-		}, nil
+		return oauthCredential(), nil
 	case err == sql.ErrNoRows:
 		return nil, nil
 	default:

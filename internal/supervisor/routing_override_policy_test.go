@@ -25,12 +25,13 @@ func TestFetchRoutingOverrides_ParsesAndSendsBearer(t *testing.T) {
 		_, _ = w.Write([]byte(`{"routing_version":42,"routes":[
 			{"seat_id":"seat-1","group_id":"g1","account_id":"acc-9"},
 			{"seat_id":"seat-1","group_id":"g2","account_id":"acc-3"},
-			{"seat_id":"seat-9","group_id":"g1","blocked":true}]}`))
+			{"seat_id":"seat-9","group_id":"g1","blocked":true},
+			{"seat_id":"seat-10","group_id":"g1","removed":true}]}`))
 	}))
 	defer srv.Close()
 
 	version, routes, err := fetchRoutingOverrides(context.Background(), srv.URL, "JWT123")
-	if err != nil || version != 42 || len(routes) != 3 {
+	if err != nil || version != 42 || len(routes) != 4 {
 		t.Fatalf("fetch: err=%v version=%d routes=%d", err, version, len(routes))
 	}
 	if routes[0].AccountID != "acc-9" || routes[1].GroupID != "g2" || !routes[2].Blocked {
@@ -54,6 +55,9 @@ func TestFetchRoutingOverrides_ParsesAndSendsBearer(t *testing.T) {
 	}
 	if !cache.Blocked("seat-9", "g1") {
 		t.Fatal("seat-9/g1 must be blocked")
+	}
+	if !cache.Removed("seat-10", "g1") {
+		t.Fatal("seat-10/g1 must be removed")
 	}
 
 	// Empty routes (engine redirects nothing) → ok=true, empty slice.

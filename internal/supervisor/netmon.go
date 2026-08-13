@@ -115,7 +115,21 @@ func onNetworkChange(old, cur string) {
 		"from", old, "to", cur, "clients_rebuilt", n)
 }
 
-// runNetChangeMonitor is the production loop.
-func runNetChangeMonitor(ctx context.Context) {
-	watchNetworkChanges(ctx, netChangePollInterval, interfaceFingerprint, onNetworkChange)
+// runNetChangeMonitor is the production loop. Optional callbacks let
+// Supervisor wake data-plane path breakers without moving the control-plane
+// rebuild single source out of onNetworkChange; tests and older call sites can
+// keep calling it with no callback.
+func runNetChangeMonitor(ctx context.Context, afterChange ...func()) {
+	watchNetworkChanges(ctx, netChangePollInterval, interfaceFingerprint, func(old, cur string) {
+		handleNetworkChange(old, cur, afterChange...)
+	})
+}
+
+func handleNetworkChange(old, cur string, afterChange ...func()) {
+	onNetworkChange(old, cur)
+	for _, fn := range afterChange {
+		if fn != nil {
+			fn()
+		}
+	}
 }

@@ -26,6 +26,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"log/slog"
 	"net/http"
@@ -175,7 +176,7 @@ func (p *Proxy) serveRouteWithObserver(
 //
 //   - "team" → activeReader.GetTeamKeyByID; populates ManagedKey,
 //     KeyAlias (LocalAlias), BaseURL (ProviderBaseURLs lookup with
-//     canonicalCode → providerCode → mk.BaseURL fallback). Soft-fails
+//     upstream provider → client route → mk.BaseURL fallback). Soft-fails
 //     (logger.Warn + empty RealKey) so caller falls back to legacy.
 //
 //   - default (personal) → activeReader.GetPersonalKeyByAlias;
@@ -185,19 +186,40 @@ func (p *Proxy) serveRouteWithObserver(
 // Refactored from the inline code at handlePathPrefixRoute's binding
 // branch (AKL-207, 2026-05-20). Fence tests in oauth_binding_fence_test.go
 // pin the OAuth path's exact pre-refactor behavior.
+//
+// The returned request is part of the resolution contract. OAuth provider
+// setup may return a request carrying a rewritten path or request-scoped
+// metadata (Codex does both), so callers must continue with that request
+// rather than the input pointer.
 func (p *Proxy) ResolveBindingCredential(
 	r *http.Request,
 	binding *vault.ProviderBinding,
-	providerCode, canonicalCode string,
 	logger *slog.Logger,
-) (*apppipe.BindingCredential, *apppipe.BindingResolveError) {
+) (*apppipe.BindingCredential, *http.Request, *apppipe.BindingResolveError) {
 	out := &apppipe.BindingCredential{}
+	clientRouteHint := ""
+	if binding != nil {
+		clientRouteHint = binding.ClientRoute
+	}
+	resolvedBinding, axesErr := normalizeBindingForClientRoute(binding, clientRouteHint)
+	if axesErr != nil {
+		return nil, r, &apppipe.BindingResolveError{
+			StatusCode: http.StatusBadGateway,
+			ErrorType:  "server_error",
+			ErrorCode:  observability.ErrCodeProviderError,
+			Message:    "Invalid provider binding: " + axesErr.Error(),
+		}
+	}
+	binding = resolvedBinding
+	clientRoute := binding.ClientRoute
+	upstreamProvider := binding.ProviderCode
+	protocolType := binding.ProtocolType
 
 	switch binding.KeySourceType {
 	case "personal_oauth_account":
 		// OAuth account — resolve via broker, not vault.
 		if p.broker == nil {
-			return nil, &apppipe.BindingResolveError{
+			return nil, r, &apppipe.BindingResolveError{
 				StatusCode: http.StatusServiceUnavailable,
 				ErrorType:  "server_error",
 				ErrorCode:  "OAUTH_NOT_AVAILABLE",
@@ -208,11 +230,11 @@ func (p *Proxy) ResolveBindingCredential(
 		// EnsureFresh: broker handles token refresh internally.
 		if err := p.broker.EnsureFresh(r.Context(), binding.KeySourceRef); err != nil {
 			logger.Warn("oauth: EnsureFresh failed", "account_id", binding.KeySourceRef, "error", err)
-			return nil, &apppipe.BindingResolveError{
+			return nil, r, &apppipe.BindingResolveError{
 				StatusCode: http.StatusUnauthorized,
 				ErrorType:  "auth_error",
 				ErrorCode:  "OAUTH_TOKEN_EXPIRED",
-				Message:    err.Error() + "\n  Run: aikey auth login " + providerCode,
+				Message:    err.Error() + "\n  Run: aikey auth login " + clientRoute,
 			}
 		}
 
@@ -220,7 +242,7 @@ func (p *Proxy) ResolveBindingCredential(
 		cred, err := p.broker.ResolveCredential(r.Context(), binding.KeySourceRef)
 		if err != nil {
 			logger.Error("oauth: ResolveCredential failed", "account_id", binding.KeySourceRef, "error", err)
-			return nil, &apppipe.BindingResolveError{
+			return nil, r, &apppipe.BindingResolveError{
 				StatusCode: http.StatusServiceUnavailable,
 				ErrorType:  "server_error",
 				ErrorCode:  "OAUTH_RESOLVE_FAILED",
@@ -233,15 +255,25 @@ func (p *Proxy) ResolveBindingCredential(
 		// chatgpt.com/backend-api/codex and ChatGPT's edge answered with a
 		// misleading "invalid x-api-key" — users debugged the key for hours.
 		// Same predicate the group lane uses (single source of truth).
-		if reason := oauthUpstreamRejectsPath(canonicalCode, r.URL.Path); reason != "" {
+		oauthCode, ok := oauthInjectionProvider(upstreamProvider, protocolType)
+		if !ok {
+			return nil, r, &apppipe.BindingResolveError{
+				StatusCode: http.StatusBadGateway,
+				ErrorType:  "server_error",
+				ErrorCode:  observability.ErrCodeProviderError,
+				Message:    "OAuth binding has no supported provider persona for provider=" + upstreamProvider + " protocol_type=" + protocolType,
+			}
+		}
+		if reason := oauthUpstreamRejectsPath(oauthCode, r.URL.Path); reason != "" {
 			logger.Warn("oauth: upstream does not serve this endpoint",
 				"event.name", observability.EventProxyRequestDialectUnsupported,
 				"error.code", observability.ErrCodeOAuthResponsesOnly,
 				"error.message", reason,
 				"url.path", r.URL.Path,
-				"provider", canonicalCode,
+				"provider", upstreamProvider,
+				"protocol_type", protocolType,
 			)
-			return nil, &apppipe.BindingResolveError{
+			return nil, r, &apppipe.BindingResolveError{
 				StatusCode: http.StatusBadRequest,
 				ErrorType:  "invalid_request_error",
 				ErrorCode:  observability.ErrCodeOAuthResponsesOnly,
@@ -253,15 +285,16 @@ func (p *Proxy) ResolveBindingCredential(
 		// resolver — same source as the group route. Codex's chatgpt.com override +
 		// deferred model capture live in resolveOAuthUpstream; pinned by
 		// TestFence_OAuthBinding_OpenAICodexBaseURLOverride.
-		out.BaseURL, r = resolveOAuthUpstream(canonicalCode, binding.ProtocolType, r)
-		oauthInject(r, cred, canonicalCode)
+		out.BaseURL, r = resolveOAuthUpstream(upstreamProvider, protocolType, "", r)
+		oauthInject(r, cred, oauthCode)
 
 		identityTag := cred.Identity
 		if identityTag == "" {
 			identityTag = binding.KeySourceRef
 		}
 		logger.Info("oauth: forwarding request",
-			"provider", canonicalCode,
+			"provider", upstreamProvider,
+			"protocol_type", protocolType,
 			"identity", identityTag,
 			"account_id", binding.KeySourceRef,
 		)
@@ -270,20 +303,20 @@ func (p *Proxy) ResolveBindingCredential(
 		out.VirtualKeyID = "oauth:" + binding.KeySourceRef
 		out.OAuthIdentity = identityTag
 		out.OAuthAccountID = binding.KeySourceRef
-		return out, nil
+		return out, r, nil
 
 	case "team", "managed_virtual_key":
 		// P1e (D-11): pass the resolved upstream provider so a multi-binding VK
 		// (e.g. GLM + official on one VK) picks THIS request's binding + its own
-		// key. canonicalCode is the truthful upstream vendor; empty/unmatched
+		// key. upstreamProvider is the truthful upstream vendor; empty/unmatched
 		// falls back to the VK's primary binding (legacy single-binding behavior).
-		mk, err := p.activeReader.GetTeamKeyByID(binding.KeySourceRef, canonicalCode, binding.ProtocolType)
+		mk, err := p.activeReader.GetTeamKeyByID(binding.KeySourceRef, upstreamProvider, protocolType)
 		if err != nil {
 			logger.Warn("vault: team key lookup via binding failed", "vk_id", binding.KeySourceRef, "error", err)
-			return out, nil // soft fail — caller will try legacy fallback
+			return out, r, nil // soft fail — caller will try legacy fallback
 		}
 		if mk == nil {
-			return out, nil // not found, soft fail
+			return out, r, nil // not found, soft fail
 		}
 		out.ManagedKey = mk
 		out.RealKey = mk.PlaintextKey
@@ -292,14 +325,14 @@ func (p *Proxy) ResolveBindingCredential(
 		// receipt / WAL `key_label` shows e.g. `key-335923591-0011-1`
 		// instead of the vk_id tail.
 		out.KeyAlias = mk.LocalAlias
-		if url, ok := mk.ProviderBaseURLs[canonicalCode]; ok && url != "" {
+		if url, ok := mk.ProviderBaseURLs[upstreamProvider]; ok && url != "" {
 			out.BaseURL = url
-		} else if url, ok := mk.ProviderBaseURLs[providerCode]; ok && url != "" {
+		} else if url, ok := mk.ProviderBaseURLs[clientRoute]; ok && url != "" {
 			out.BaseURL = url
 		} else {
 			out.BaseURL = mk.BaseURL
 		}
-		return out, nil
+		return out, r, nil
 
 	default:
 		// Personal key path. binding.KeySourceType is typically "personal"
@@ -310,7 +343,7 @@ func (p *Proxy) ResolveBindingCredential(
 		plaintext, _, entryBaseURL, err := p.activeReader.GetPersonalKeyByAlias(binding.KeySourceRef)
 		if err != nil {
 			logger.Warn("vault: personal key lookup via binding failed", "alias", binding.KeySourceRef, "error", err)
-			return out, nil // soft fail
+			return out, r, nil // soft fail
 		}
 		out.RealKey = plaintext
 		out.VirtualKeyID = "personal:" + binding.KeySourceRef
@@ -318,9 +351,9 @@ func (p *Proxy) ResolveBindingCredential(
 		if entryBaseURL != "" {
 			out.BaseURL = entryBaseURL
 		} else {
-			out.BaseURL = providerBaseURLForProtocol(canonicalCode, binding.ProtocolType)
+			out.BaseURL = providerBaseURLForProtocol(upstreamProvider, protocolType)
 		}
-		return out, nil
+		return out, r, nil
 	}
 }
 
@@ -344,32 +377,11 @@ func (p *Proxy) serveRoute(w http.ResponseWriter, r *http.Request, route *vkeys.
 	if route != nil {
 		route.ProviderCode = truthfulProviderCode(route.BaseURL, route.ProviderCode)
 	}
-
-	// Base-URL fault fence (2026-07-24). OAuth routes forward through
-	// applyOAuthUpstreamURL, a literal prepend that cannot repair a base URL
-	// which already carries the version segment — the result is /v1/v1/messages
-	// and a bare upstream 404 on EVERY model, attributed to the provider rather
-	// than to us. Fail loud with the fix instead, BEFORE the quota gate: a
-	// request we cannot forward must not consume the seat's quota.
-	//
-	// Excluded: the mock provider (joins via StitchForProviderProtocol, which is
-	// version-aware) and every API-key route (joins via providerroutes.Stitch,
-	// likewise version-aware). See oauthBaseURLFault's scope note.
-	if route != nil && realKey == oauthSentinelKey && route.ProviderCode != "mock" {
-		if reason := oauthBaseURLFault(route.BaseURL, r.URL.Path); reason != "" {
-			p.errors.Add(1)
-			logger.Error("oauth upstream base URL misconfigured — refusing to forward",
-				"event.name", "proxy.route.base_url_misconfigured",
-				"base_url", route.BaseURL,
-				"request_path", r.URL.Path,
-				"provider_code", route.ProviderCode,
-				"protocol_type", route.ProtocolType,
-			)
-			writeJSONError(w, http.StatusBadGateway, "server_error", "BASE_URL_MISCONFIGURED", reason)
-			return
-		}
+	currentOverride := p.oauthEgressOverride.Load()
+	pathDecision := providerPathDecision{overrideOn: currentOverride}
+	if route != nil && route.OauthGroupID != "" {
+		pathDecision = providerPathDecisionForRequest(r.Context(), route, currentOverride)
 	}
-
 	// Phase 2 quota gate — UNIVERSAL chokepoint (Stage 3 + D-U8/P7). serveRoute is
 	// the single funnel EVERY real route passes through (Tier1 token, OAuth,
 	// active-sentinel, app pipeline, default binding; serveRouteWithObserver
@@ -507,7 +519,7 @@ func (p *Proxy) serveRoute(w http.ResponseWriter, r *http.Request, route *vkeys.
 	// (applied per-account egress, or fell to node/direct) so any request is
 	// traceable, not just the egress ones. Never logs the spec verbatim — only
 	// its fingerprint (a mihomo fragment carries socks5 credentials).
-	egApplied, egEngine, egFingerprint := egressAttribution(route.EgressProxyURL, p.oauthEgressOverride.Load())
+	egApplied, egEngine, egFingerprint := egressAttribution(route.EgressProxyURL, pathDecision.overrideOn)
 	logger.Info("egress attribution",
 		"event.name", observability.EventProxyEgressRequestAttribution,
 		"account_id", route.AccountID,
@@ -560,19 +572,12 @@ func (p *Proxy) serveRoute(w http.ResponseWriter, r *http.Request, route *vkeys.
 		Transport: transport,
 		Director: func(req *http.Request) {
 			if realKey == "__oauth__" {
-				// OAuth: headers already injected by oauthInject() — only set upstream URL.
-				// BaseURL may contain a path prefix (e.g. https://api.kimi.com/coding)
-				// that must be prepended to the request path.
-				if route.ProviderCode == "mock" {
-					// The resident Mock Provider uses deployment-specific host/cluster
-					// addresses, so host lookup cannot identify its fingerprint row.
-					// Use the two explicit axes to attach the canonical version while
-					// preserving the runtime rail and its /mock-provider prefix.
-					if err := provider.Routes().StitchForProviderProtocol(req, route.BaseURL, route.ProviderCode, route.ProtocolType); err != nil {
-						logger.Error("rewrite Mock OAuth request failed", "error", err)
-					}
-				} else {
-					applyOAuthUpstreamURL(req, route.BaseURL)
+				// OAuth headers are already injected. URL composition must use the
+				// provider table's single version-aware stitch rule; the former manual
+				// prefix append was a second algorithm and turned effective endpoints
+				// such as .../v1 plus /v1/messages into /v1/v1/messages.
+				if err := stitchOAuthRequestURL(req, route); err != nil {
+					logger.Error("rewrite OAuth request failed", "error", err)
 				}
 			} else {
 				if err := prov.RewriteRequest(req, realKey, route.BaseURL); err != nil {
@@ -650,6 +655,11 @@ func (p *Proxy) serveRoute(w http.ResponseWriter, r *http.Request, route *vkeys.
 			}
 		},
 		ModifyResponse: func(resp *http.Response) error {
+			// Any HTTP response proves this outbound path is reachable. Account and
+			// provider semantics (401/429/5xx) are classified below, independently.
+			if route.OauthGroupID != "" {
+				p.pathHealth.NoteHTTPResponse(pathDecision.path)
+			}
 			// P1 error-origin (20260719): tag relayed error responses so a client
 			// can tell WHO produced the error. First-writer-wins: if a deeper aikey
 			// hop (worker/ingress) already set X-Aikey-Error-Origin, keep it (that's
@@ -971,7 +981,7 @@ func (p *Proxy) serveRoute(w http.ResponseWriter, r *http.Request, route *vkeys.
 					// either the full JSON or it's an error we surface elsewhere.
 					sessionID := resolveSessionID(r, route.ProtocolType, route.ProviderCode)
 					upstreamReqID := extractUpstreamRequestID(resp)
-					p.reportUsage(route, bearerToken, ev.Model, startTime, resp.StatusCode, breakdown, "", "", realKey, sessionID, "complete", upstreamReqID, r.URL.Path)
+					p.reportUsage(route, bearerToken, ev.Model, startTime, resp.StatusCode, breakdown, "", "", realKey, sessionID, "complete", upstreamReqID, r.URL.Path, ev.RequestID, ev.TraceID)
 					// Phase 2: accrue token + local usd quota for this completed request.
 					// Backfill the model for local usd pricing when the adapter left it
 					// empty (mirrors the streaming path) so codex/others aren't unpriced.
@@ -991,6 +1001,8 @@ func (p *Proxy) serveRoute(w http.ResponseWriter, r *http.Request, route *vkeys.
 				sessionID := resolveSessionID(r, route.ProtocolType, route.ProviderCode)
 				// Capture the path now too — same request-recycling caveat.
 				requestPath := r.URL.Path
+				requestID := baseEvent.RequestID
+				traceID := baseEvent.TraceID
 				// Capture upstreamReqID NOW (response headers are stable from
 				// here onward; the streaming body keeps draining in a goroutine
 				// but headers are already finalized by upstream).
@@ -1016,7 +1028,7 @@ func (p *Proxy) serveRoute(w http.ResponseWriter, r *http.Request, route *vkeys.
 							model = br.Model
 						}
 						if p.reporter != nil {
-							p.reportUsage(route, bearerToken, model, startTime, resp.StatusCode, br, "", "", realKey, sessionID, completion, upstreamReqID, requestPath)
+							p.reportUsage(route, bearerToken, model, startTime, resp.StatusCode, br, "", "", realKey, sessionID, completion, upstreamReqID, requestPath, requestID, traceID)
 						}
 						// Phase 2: accrue token + local usd quota on stream completion,
 						// independent of the reporter.
@@ -1068,32 +1080,42 @@ func (p *Proxy) serveRoute(w http.ResponseWriter, r *http.Request, route *vkeys.
 		ErrorHandler: func(w http.ResponseWriter, r *http.Request, err error) {
 			p.errors.Add(1)
 			latencyMs := time.Since(startTime).Milliseconds()
-			// P0-B (2026-07-19): transport-level failures (dial refused, TLS
-			// failure, pre-response timeout, egress hop down) never reach
-			// ModifyResponse, so they were invisible to the pool health path —
-			// sticky binding kept sending every next request into the dead lane.
-			// Count them toward the account's CONSECUTIVE server-error streak
-			// (same threshold as generic 5xx; one blip cools nobody). The 502/503
-			// written below flows through N9's first-byte gate, so group routes
-			// ALSO retry this request on another account. context.Canceled is the
-			// CLIENT hanging up (streaming keeps the client context) — not the
-			// account's fault, never counted.
-			if route.OauthGroupID != "" && route.AccountID != "" && !errors.Is(err, context.Canceled) {
-				if _, cooled := p.poolCooldown.noteServerError(route.AccountID); cooled {
-					logger.Warn("pool account cooled down after repeated transport errors",
-						"event.name", observability.EventProxyGroupAccountCooldown,
+			var egErr *EgressDialError
+			isEgressDialFailure := errors.As(err, &egErr)
+			if route.OauthGroupID != "" {
+				path := pathDecision.path
+				if errors.Is(err, context.Canceled) {
+					p.pathHealth.NoteProbeCanceled(path)
+				} else {
+					failureClass := pathFailureTransport
+					if isEgressDialFailure {
+						failureClass = pathFailureEgressDial
+					}
+					health := p.pathHealth.NoteTransportFailure(path, failureClass)
+					if health.RetryAfterSeconds > 0 {
+						w.Header().Set("Retry-After", fmt.Sprintf("%d", health.RetryAfterSeconds))
+					}
+					if marker, ok := w.(interface{ markProviderPathFailure(string) }); ok {
+						marker.markProviderPathFailure(path.Key)
+					}
+					logger.Warn("oauth-group provider path transport failure",
+						"event.name", observability.EventProxyGroupProviderPathState,
 						"oauth_group_id", route.OauthGroupID,
-						"account_id", route.AccountID,
-						"error.message", err.Error(),
-						"streak_threshold", serverErrStreakThreshold)
+						"path_id", health.PathID,
+						"provider", health.Provider,
+						"transport", health.Transport,
+						"state", health.State,
+						"failure_class", health.FailureClass,
+						"consecutive_failures", health.ConsecutiveFailures,
+						"retry_after_seconds", health.RetryAfterSeconds,
+					)
 				}
 			}
 			// Per-account egress dial failure (a socks5 hop refused, or a
 			// fallback/url-test group has NO reachable member): surface it plainly
 			// so the user knows it's THEIR egress, not the provider, and NEVER fall
 			// through to a direct dial (the engine already failed rather than leak).
-			var egErr *EgressDialError
-			if errors.As(err, &egErr) {
+			if isEgressDialFailure {
 				logger.Error("per-account egress connect failed",
 					"event.name", observability.EventProxyRequestUpstreamError,
 					"error.code", observability.ErrCodeAccountEgressProxy,
@@ -1104,6 +1126,18 @@ func (p *Proxy) serveRoute(w http.ResponseWriter, r *http.Request, route *vkeys.
 				writeJSONError(w, http.StatusServiceUnavailable, "server_error", observability.ErrCodeAccountEgressProxy,
 					accountEgressErrorMessage(route,
 						"its configured egress upstream is unreachable. Run `aikey doctor` and check this account's egress setting."))
+				return
+			}
+			if route.OauthGroupID != "" {
+				logger.Error("oauth-group upstream path unavailable",
+					"event.name", observability.EventProxyRequestUpstreamError,
+					"error.code", observability.ErrCodeGroupUpstreamUnavailable,
+					"error.message", err.Error(),
+					"latency_ms", latencyMs,
+				)
+				writeJSONError(w, http.StatusServiceUnavailable, "server_error",
+					observability.ErrCodeGroupUpstreamUnavailable,
+					groupDegradeMessage(observability.ErrCodeGroupUpstreamUnavailable))
 				return
 			}
 			logger.Error("upstream error",
@@ -1147,6 +1181,32 @@ func (p *Proxy) serveRoute(w http.ResponseWriter, r *http.Request, route *vkeys.
 			"threshold_ms", p.SlowRequestMs,
 		)
 	}
+}
+
+// stitchOAuthRequestURL is the single URL composer for OAuth traffic.
+// Provider+Protocol are already resolved at this boundary, so the explicit
+// stitcher can preserve deployment-specific/custom hosts while taking version
+// ownership from the provider registry. It accepts both root and effective
+// base URLs and emits the API version exactly once.
+//
+// OpenAI OAuth is the one exception: it targets ChatGPT's Codex backend rather
+// than the provider table's API-key endpoint. resolveOAuthUpstream has already
+// normalized /v1/responses to /responses, and regular Stitch deliberately uses
+// its documented table-miss literal composition for that distinct host.
+func stitchOAuthRequestURL(req *http.Request, route *vkeys.ResolvedRoute) error {
+	providerCode := route.ProviderCode
+	if providerCode == "" {
+		providerCode = route.Provider
+	}
+	canonicalCode := providerCanonicalCode(providerCode)
+	if canonicalCode == "openai" {
+		return provider.Routes().Stitch(req, route.BaseURL)
+	}
+	protocolType := route.ProtocolType
+	if protocolType == "" {
+		protocolType, _ = provider.ProtocolFamily(canonicalCode, "")
+	}
+	return provider.Routes().StitchForProviderProtocol(req, route.BaseURL, canonicalCode, protocolType)
 }
 
 // accountEgressErrorMessage names the selected shared account when that identity

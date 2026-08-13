@@ -65,10 +65,13 @@ const (
 // (bugfix 2026-07-03-routing-override-rail-silent-stall.md). See
 // supervisor/railset.go.
 const (
-	EventProxySyncRailStale         = "proxy.sync.rail_stale"
-	EventProxySyncRailOffline       = "proxy.sync.rail_offline"
-	EventProxySyncRailRecovered     = "proxy.sync.rail_recovered"
-	EventProxySyncCredentialRebuilt = "proxy.sync.credential_rebuilt"
+	EventProxySyncRailStale            = "proxy.sync.rail_stale"
+	EventProxySyncRailOffline          = "proxy.sync.rail_offline"
+	EventProxySyncRailRecovered        = "proxy.sync.rail_recovered"
+	EventProxySyncCredentialRebuilt    = "proxy.sync.credential_rebuilt"
+	EventProxyGroupRuntimeChanged      = "proxy.group_runtime.changed"
+	EventProxyGroupRuntimeWriteFailed  = "proxy.group_runtime.write_failed"
+	EventProxyGroupRuntimeReloadFailed = "proxy.group_runtime.reload_failed"
 	// EventProxySyncHealthFileFailed: the statusline sync-health bypass file
 	// (~/.aikey/run/sync-health.json) could not be written/removed — the claude
 	// status bar may show a stale (or miss a fresh) sync warning.
@@ -148,6 +151,9 @@ const (
 	// client saw nothing of the failed attempt). One event per switch, carrying
 	// from/to account + the failed status.
 	EventProxyGroupRequestFailover = "proxy.group.request_failover"
+	// EventProxyGroupProviderPathState records path-scoped transport breaker
+	// changes. It never carries raw base URLs or egress specifications.
+	EventProxyGroupProviderPathState = "proxy.group.provider_path_state"
 	// EventProxyGroupModelTierCooldown (P1-C): a premium-model window (e.g. the
 	// Fable 7d_oi weekly window) exhausted — the account is cooled for THAT model
 	// tier only and keeps serving every other model. Also used for the
@@ -200,6 +206,11 @@ const (
 	// (GROUP_NO_CANDIDATES / GROUP_NO_MATERIAL / GROUP_ALL_UNUSABLE) are surfaced
 	// verbatim; GROUP_KEY_UNAVAILABLE is the proxy-local "can't decrypt" case.
 	ErrCodeGroupKeyUnavailable = "GROUP_KEY_UNAVAILABLE"
+	// ErrCodeGroupUpstreamUnavailable preserves a non-quota pool outage after
+	// every candidate has entered a 5xx/transport cooldown. It must remain 503;
+	// collapsing it into GROUP_ALL_UNUSABLE would falsely tell clients that the
+	// provider quota or rate limit was exhausted.
+	ErrCodeGroupUpstreamUnavailable = "GROUP_UPSTREAM_UNAVAILABLE"
 	// ErrCodeGroupPoolFull (§5.5): 429 when the seat is blocked — every pool account
 	// is at the per-account user cap, or no usable account remains. Neutral wording
 	// (does not guess the cause); the user waits or contacts the admin.

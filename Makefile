@@ -25,7 +25,14 @@ GOWORK_FILE := $(abspath ../go.work)
 GOWORK     ?= $(if $(wildcard $(GOWORK_FILE)),$(GOWORK_FILE),off)
 export GOWORK
 
-.PHONY: build test run install uninstall restart clean lint cross-compile sync-fingerprint chaos-gap7 chaos-gap8 chaos filter-integration
+# The strict lint profile was enabled after this repository had accumulated
+# pre-existing findings.  Keep that debt visible via `lint-full`, while the
+# release fence fails on every finding introduced after this reviewed, pinned
+# baseline.  This SHA must only move together with a debt-audit document; never
+# derive it from origin/HEAD or a new commit could silently baseline itself.
+LINT_BASE_REV ?= 9695facb96c1fefb8a2f8ba1f4b41823cf1efad6
+
+.PHONY: build test test-bugfix-provider-routing run install uninstall restart clean lint lint-full cross-compile sync-fingerprint sync-provider-registry sync-provider-data chaos-gap7 chaos-gap8 chaos filter-integration
 
 # v4.3 (2026-05-01): aikey-cli/data/provider_fingerprint.yaml is the single
 # source of truth for provider routing. The pkg/providerroutes Go package
@@ -33,16 +40,37 @@ export GOWORK
 # go build so all consumers (this proxy + control service + future Go
 # consumers) compile against the same yaml content.
 #
-# The pkg/providerroutes/data/ copy is gitignored — canonical lives in
-# aikey-cli; editing the copy is a build-step concern, not a code change.
+# The pkg/providerroutes/data/ copy is CHECKED IN (design D-7) so every Go
+# consumer wired via a go.mod replace compiles without a per-service sync step.
+# Canonical still lives in aikey-cli; editing the copy directly is wrong — the
+# sync target regenerates it and the package's SHA gate fails the build when the
+# two diverge.
 FINGERPRINT_SRC := ../aikey-cli/data/provider_fingerprint.yaml
 FINGERPRINT_DST := ../pkg/providerroutes/data/provider_fingerprint.yaml
+
+# provider_registry.yaml is the SECOND provider source of truth and answers a
+# different question: fingerprint owns (provider × protocol → base_url), registry
+# owns provider identity — canonical code, brand aliases, family, proxy_path
+# (requirement spec 2026-07-18-provider-protocol-compatibility-and-baseurl §3).
+# Go had no path to it until pkg/providerregistry, which is why alias tables were
+# hand-copied into Go; §10 of that spec forbids exactly that. Synced the same way
+# and for the same reason as the fingerprint copy.
+REGISTRY_SRC := ../aikey-cli/data/provider_registry.yaml
+REGISTRY_DST := ../pkg/providerregistry/data/provider_registry.yaml
 
 sync-fingerprint:
 	@mkdir -p ../pkg/providerroutes/data
 	@cp $(FINGERPRINT_SRC) $(FINGERPRINT_DST)
 
-build: sync-fingerprint
+sync-provider-registry:
+	@mkdir -p ../pkg/providerregistry/data
+	@cp $(REGISTRY_SRC) $(REGISTRY_DST)
+
+# Both provider sources must be fresh before any compile — a build that embeds
+# one stale copy misroutes exactly as badly as embedding two.
+sync-provider-data: sync-fingerprint sync-provider-registry
+
+build: sync-provider-data
 	@go build $(LDFLAGS) -o bin/aikey-proxy ./cmd/aikey-proxy
 	@cp $(CONFIG) bin/$(CONFIG)
 
@@ -51,6 +79,17 @@ build: sync-fingerprint
 # they drive the REAL buildTransport — internal/... alone would skip them.
 test:
 	go test -race -v ./internal/... ./cmd/aikey-proxy/
+
+# Regression fence for the 2026-07-24 OAuth URL composer and the adjacent
+# Provider/Protocol consumer regressions. This target is the canonical entry
+# referenced by both bugfix records; keep new routing lanes in this matrix so
+# a release does not depend on remembering a list of ad-hoc go test commands.
+test-bugfix-provider-routing: ## regression: OAuth Stitch + App/Probe axes + health URL + vault projection
+	go test -v -count=1 ./internal/provider/ -run 'TestProtocolFamily'
+	go test -v -count=1 ./internal/vault/ -run 'TestGetAliasCredential_(OAuthByDisplayIdentity|PreProtocolColumnOAuthRemainsReadable)'
+	go test -v -count=1 ./internal/supervisor/ -run 'Test(OAuthTokenToRoute_SetsOAuthSource|BuildManagedRoutes_PreservesBothMockProtocolBindings)'
+	go test -v -count=1 ./internal/admin/ -run 'TestProbeKey_UsesProviderRouteStitchForEveryVersionShape'
+	go test -v -count=1 ./internal/proxy/ -run 'Test(StitchOAuthRequestURL_OneProviderTableRule|Fence_OAuthBinding|Fence_Tier1OAuthRouteStitchesVersionExactlyOnce|Fence_CodexOAuth|GroupServe_(OAuthAccountInjectsBearer|MockCodexOAuthUsesRuntimeRailAndFingerprintVersion|MockOAuthMissingBaseURLFailsClosed|EmptyRouteProviderUsesAccountProvider)|AppPipeline_PreservesProviderAndUsesProtocolAdapter|ProbePipeline_PreservesProviderAndUsesProtocolAdapter|NormalizeBindingForClientRouteKeepsIndependentAxes)'
 
 # Chaos experiments (缺口7/8) — build-tagged so they stay OUT of the normal
 # `test` suite. They drive the real newStreamDrainer / http.Server code paths
@@ -107,9 +146,19 @@ clean:
 	rm -rf bin/
 
 lint:
+	@git cat-file -e "$(LINT_BASE_REV)^{commit}" 2>/dev/null || { \
+		echo "ERROR: lint baseline commit $(LINT_BASE_REV) is unavailable; fetch repository history" >&2; \
+		exit 1; \
+	}
+	golangci-lint run --new-from-rev=$(LINT_BASE_REV) ./...
+
+# Explicit debt audit.  This is intentionally not the release fence until the
+# pinned baseline findings are paid down; unlike `lint`, it reports the entire
+# repository and is expected to remain red meanwhile.
+lint-full:
 	golangci-lint run ./...
 
-cross-compile: sync-fingerprint
+cross-compile: sync-provider-data
 	@mkdir -p bin
 	GOOS=darwin  GOARCH=arm64 go build $(LDFLAGS) -o bin/aikey-proxy-darwin-arm64  ./cmd/aikey-proxy
 	GOOS=darwin  GOARCH=amd64 go build $(LDFLAGS) -o bin/aikey-proxy-darwin-amd64  ./cmd/aikey-proxy

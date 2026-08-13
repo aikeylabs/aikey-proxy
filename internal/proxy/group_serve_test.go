@@ -20,6 +20,7 @@ import (
 	"github.com/AiKeyLabs/aikey-proxy/internal/events"
 	"github.com/AiKeyLabs/aikey-proxy/internal/observability"
 	"github.com/AiKeyLabs/aikey-proxy/internal/vkeys"
+	"github.com/AiKeyLabs/pkg/routingwire"
 )
 
 // fakeGroupKey provides the derived key for at-rest group material decryption.
@@ -129,6 +130,9 @@ func TestGroupServe_OAuthAccountInjectsBearer(t *testing.T) {
 	// OAuth → providerDefaultBaseURL(anthropic), Bearer injected, x-api-key gone.
 	if tr.host != "api.anthropic.com" {
 		t.Fatalf("outbound host=%q want api.anthropic.com", tr.host)
+	}
+	if tr.path != "/v1/messages" {
+		t.Fatalf("outbound path=%q want /v1/messages", tr.path)
 	}
 	if tr.auth != "Bearer oauth-tok-live" {
 		t.Fatalf("outbound Authorization=%q want decrypted OAuth Bearer (oauthInject must run)", tr.auth)
@@ -712,6 +716,38 @@ func TestGroupServe_BlockedSeatReturns429(t *testing.T) {
 	}
 	if tr.host != "" {
 		t.Fatalf("blocked request must NOT reach upstream, dialed %q", tr.host)
+	}
+}
+
+// Deleted access must win over keep-last-known group_runtime. This is the
+// authorization fence for a running proxy that still has usable account
+// material after Control physically removes the group.
+func TestGroupServe_RemovedSeatReturns403WithoutUpstream(t *testing.T) {
+	key := grKey()
+	refs := []vkeys.GroupAccountRef{{AccountID: "acc-old", ProviderCode: "anthropic"}}
+	mat := map[string]vkeys.GroupRuntimeAccount{
+		"acc-old": encMat(t, key, vkeys.GroupRuntimeAccount{
+			CredentialType: "oauth_account", ExpiresAt: 9_000_000_000, ExternalID: "uuid-old",
+		}, "tok-old"),
+	}
+	route := &vkeys.ResolvedRoute{
+		VirtualKeyID: "vk-old", Provider: "anthropic", ProtocolType: "anthropic",
+		ProviderCode: "anthropic", RouteSource: "team",
+		SeatID: "seat-1", OauthGroupID: "grp-deleted",
+		GroupAccounts: mustJSON(t, refs), GroupRuntime: mustJSON(t, mat),
+	}
+	p, tr := setupGroupProxy(t, key, route)
+	cache := NewRoutingOverrideCache()
+	cache.StoreRoutes(2, []routingwire.RouteEntry{{SeatID: route.SeatID, GroupID: route.OauthGroupID, Removed: true}})
+	p.SetRoutingOverrides(cache)
+
+	req, w := groupReq(groupBody)
+	p.Handle(w, req)
+	if w.Code != http.StatusForbidden || !strings.Contains(w.Body.String(), groupErrNoCandidates) {
+		t.Fatalf("removed route must 403 GROUP_NO_CANDIDATES, got %d body=%s", w.Code, w.Body.String())
+	}
+	if tr.calls != 0 {
+		t.Fatalf("removed route reached upstream %d times", tr.calls)
 	}
 }
 

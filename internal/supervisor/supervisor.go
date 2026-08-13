@@ -267,6 +267,10 @@ type Supervisor struct {
 	// re-applies it to every new generation's proxy. Default false → coexist
 	// unchanged. Set via SetOAuthEgressOverride (from the /admin toggle).
 	oauthEgressOverride atomic.Bool
+	// pathHealth is supervisor-scoped live path reachability. Every generation
+	// receives this same pointer, so a reload cannot erase an open breaker or its
+	// recovery opportunity and hot network/egress changes can wake it immediately.
+	pathHealth *proxy.ProviderPathHealthManager
 	// ctx / cancel bound the lifetime of all detached upstream calls.
 	// Canceled in Shutdown() to stop any in-flight upstream requests.
 	ctx    context.Context
@@ -335,6 +339,13 @@ type Supervisor struct {
 	convAuditMaxBytes atomic.Int64
 	genID             atomic.Int64
 	reloadMu          sync.Mutex // serialize concurrent reload requests
+	// runtimeStateMu serializes the short generation-activation boundary with
+	// hot updates of supervisor-owned runtime state. buildGeneration deliberately
+	// stays outside this lock: only applying the latest transport/override/broker
+	// snapshot and swapping active must be atomic. Without this fence, a generation
+	// built from an older snapshot can become active after a Settings PUT returned
+	// 200 and silently restore direct/old egress.
+	runtimeStateMu sync.Mutex
 	// convAuditEnabled / convAuditMaxBytes: org-level conversation-audit capture
 	// switch + per-turn content cap, polled from the control backend by
 	// pollConversationAuditPolicy (mirrors masterCompliance, v1.0.1-alpha.2).
@@ -392,6 +403,7 @@ func New(cfg *config.Config, configPath, password, version string) (*Supervisor,
 		quotaSnapshot:            quota.NewSnapshot(),
 		quotaCounter:             quota.NewCounter(),
 		routingOverrides:         proxy.NewRoutingOverrideCache(),
+		pathHealth:               proxy.NewProviderPathHealthManager(),
 		teamCred:                 &teamCredentialSource{},
 		currentRoutedRestampKick: make(chan struct{}, 1),
 	}
@@ -400,7 +412,14 @@ func New(cfg *config.Config, configPath, password, version string) (*Supervisor,
 	if err != nil {
 		return nil, fmt.Errorf("initial generation failed: %w", err)
 	}
-	s.active.Store(gen)
+	s.activateGeneration(gen)
+	// Seed the quota change-signal from the quota_rules_cache the initial
+	// generation just loaded, so the FIRST quota poll after boot is a no-op when
+	// the master's rules are unchanged — instead of always detecting a phantom
+	// "changed" against a nil baseline and forcing a reload. Stateless: the
+	// baseline is reconstructed from the already-persisted cache every boot,
+	// nothing new is persisted. Bugfix 20260725-proxy-startup-reload-storm-*.
+	s.seedQuotaSig(gen)
 	observability.GoSafe("supervisor.current_routed_restamp_loop", observability.Isolated, s.currentRoutedRestampLoop)
 	// Re-project any cooldowns hydrated from pool-cooldown.json. buildGeneration
 	// creates the Proxy before it becomes active, so the post-swap kick is the
@@ -436,32 +455,20 @@ func New(cfg *config.Config, configPath, password, version string) (*Supervisor,
 		})
 	}
 
-	// G3: poll the org-level compliance master switch so an enterprise can mandate
-	// compliance from the control backend (force-spawn the detector regardless of
-	// the user's local toggle). No-op when no team/org is configured (Personal).
-	observability.GoSafe("supervisor.compliance_policy_poll", observability.Isolated, func() { s.pollComplianceMasterPolicy(s.ctx) })
-
 	// Conversation audit (v1.0.1-alpha.2): poll the org-level capture switch so an
 	// enterprise can turn employee conversation capture on from the control backend.
 	// No-op when no team/org (Personal). A flip just gates the forward-path capture
-	// hook (reads the atomic) — no detector to spawn, unlike compliance.
+	// hook (reads the atomic) — no detector to spawn, unlike compliance. Kept here
+	// (started in New) precisely because it never triggers a Reload, so it cannot
+	// contribute to the pre-serve reload storm the way compliance/quota/group do.
 	observability.GoSafe("supervisor.conversation_audit_policy_poll", observability.Isolated, func() { s.pollConversationAuditPolicy(s.ctx) })
 
-	// C′ (2026-06-17): poll the org's quota policy so an admin's limit edit on the
-	// master takes effect on this node within 60s WITHOUT the employee running any
-	// aikey command. Quota is the last org policy that was CLI-sync-only; this puts
-	// it on the same master-poll rail as compliance/audit. No-op when no team/org
-	// or no active seats (Personal), or when quota is disabled.
-	observability.GoSafe("supervisor.quota_policy_poll", observability.Isolated, func() { s.pollQuotaPolicy(s.ctx) })
-
-	// SyncRail (2026-07-03): the group_runtime (N7c-2 channel ③ material) and
-	// routing_override (I-side §6.5 engine assignments) rails, driven by the
-	// declarative framework in railset.go — gate/URL/credential re-evaluated every
-	// cycle, failures counted into the OK→STALE→OFFLINE visibility state machine,
-	// Reload kicks an immediate re-sync. One GoSafe/Isolated goroutine per rail
-	// (names kept from the old hand-written polls so log filters carry over).
-	// quota/compliance/audit stay on their legacy loops until Phase 2.
-	s.railset.start(s)
+	// The master-policy pollers whose first sync CAN trigger a Reload — compliance
+	// mandate, quota rules, and the group_runtime / routing-override rails — are
+	// deliberately NOT started here. They are launched by StartPolicyPollers()
+	// AFTER the HTTP server is serving. See that method for why (pre-serve reload
+	// storm vs the CLI's 5s health gate). Bugfix
+	// 20260725-proxy-startup-reload-storm-5s-health-fail.
 
 	// Control-plane self-heal, Stage 2 (2026-07-01): proactively rebuild the
 	// control-plane client the moment the host's network changes (WiFi switch /
@@ -469,7 +476,9 @@ func New(cfg *config.Config, configPath, password, version string) (*Supervisor,
 	// without waiting for a failure. Dependency-free (net.Interfaces fingerprint).
 	// Isolated + cheap: a 20s poll; a panic here must never touch the data path.
 	// See netmon.go / selfheal.go.
-	observability.GoSafe("supervisor.net_change_monitor", observability.Isolated, func() { runNetChangeMonitor(s.ctx) })
+	observability.GoSafe("supervisor.net_change_monitor", observability.Isolated, func() {
+		runNetChangeMonitor(s.ctx, s.pathHealth.NotifyInputsChanged)
+	})
 
 	// Cluster mode (V3c): register this node with the hub name service + heartbeat
 	// so clients discover it via /cluster/resolve. Inert for non-cluster proxies —
@@ -534,6 +543,63 @@ func New(cfg *config.Config, configPath, password, version string) (*Supervisor,
 	return s, nil
 }
 
+// StartPolicyPollers launches the master-policy pollers whose first sync can
+// trigger a generation Reload: the compliance mandate switch, the quota rules,
+// and the group_runtime / routing-override rails.
+//
+// Why they are NOT started in New(): their immediate first sync runs concurrently
+// with the pre-serve setup (broker + credential warm-up), and on a mandate org
+// each triggered reload re-spawns the ai-compliance-detector child — a ~3s+ cold
+// start (CRF models + AC lexicons). Three such reloads at boot starve the main
+// goroutine before it reaches http.Serve, so the CLI's 5s health probe on /health
+// kills the proxy before it ever listens (found 2026-07-25: every restart-personal
+// failed with "did not become healthy in 5s"). Starting them AFTER the server is
+// serving moves that work off the startup-critical path: /health (admin mux, never
+// gated by the data-path filter) answers immediately and the pollers converge in
+// the background. The conversation-audit poller stays in New() because it never
+// triggers a Reload. Call exactly once, right after the serve goroutine launches.
+// Bugfix 20260725-proxy-startup-reload-storm-5s-health-fail.
+func (s *Supervisor) StartPolicyPollers() {
+	// G3: org-level compliance master switch (force-spawn the detector regardless
+	// of the user's local toggle). No-op when no team/org (Personal).
+	observability.GoSafe("supervisor.compliance_policy_poll", observability.Isolated, func() { s.pollComplianceMasterPolicy(s.ctx) })
+	// C′ (2026-06-17): the org's quota policy so an admin's limit edit on the master
+	// takes effect within 60s without the employee running any aikey command. No-op
+	// when no team/org, no active seats, or quota disabled.
+	observability.GoSafe("supervisor.quota_policy_poll", observability.Isolated, func() { s.pollQuotaPolicy(s.ctx) })
+	// SyncRail (2026-07-03): group_runtime (N7c-2 channel ③ material) + routing_override
+	// (I-side §6.5 engine assignments) rails. One GoSafe/Isolated goroutine per rail.
+	s.railset.start(s)
+}
+
+// seedQuotaSig primes lastQuotaSig from the quota_rules_cache that the initial
+// generation already loaded (reloadQuotaSnapshot → quota.LoadSubjects), computing
+// the signal with the SAME function the poller uses (quotaSubjectsSig). So the
+// first quota poll after boot is a no-op when the master's rules are unchanged
+// since last run, instead of always detecting a phantom "changed" against a nil
+// baseline and forcing a reload. Stateless — the baseline is rebuilt from the
+// already-persisted cache each boot; nothing new is persisted. No-op (leaves the
+// baseline nil, i.e. legacy behavior) when quota is off or the cache is
+// unreadable. Bugfix 20260725-proxy-startup-reload-storm-5s-health-fail.
+func (s *Supervisor) seedQuotaSig(gen *generation) {
+	if !s.quotaEnabled || gen == nil || gen.vault == nil {
+		return
+	}
+	subjects, err := quota.LoadPolicySubjects(gen.vault.DB())
+	if err != nil {
+		slog.Warn("quota.sig_seed.load_failed",
+			"event.name", "proxy.quota.sig_seed_failed", "error", err.Error())
+		return
+	}
+	sig, err := quotaSubjectsSig(subjects)
+	if err != nil {
+		slog.Warn("quota.sig_seed.marshal_failed",
+			"event.name", "proxy.quota.sig_seed_failed", "error", err.Error())
+		return
+	}
+	s.lastQuotaSig.Store(&sig)
+}
+
 // startQuotaHeartbeat wires the traffic-independent server-reachability probe for
 // budget-mode quota staleness (D-U7/P9). No-op unless quota is enabled, enforce_mode
 // is budget, and a collector URL is configured — keeping availability-mode and
@@ -591,33 +657,77 @@ func (s *Supervisor) startQuotaHeartbeat() {
 		"health_url", healthURL, "interval", interval, "max_staleness", maxStaleness)
 }
 
-// SetTransport sets the outbound RoundTripper used by all generations.
-// Must be called before any requests are served (right after New).
+// generationRuntimeTarget is the complete supervisor-owned runtime state that a
+// Proxy generation must inherit at activation. Keeping every setter behind
+// one interface makes omission visible in the activation regression test.
+type generationRuntimeTarget interface {
+	SetTransport(http.RoundTripper)
+	SetOAuthEgressOverride(bool)
+	SetBroker(proxy.OAuthBroker)
+	SetProviderPathHealthManager(*proxy.ProviderPathHealthManager)
+}
+
+// applyRuntimeState installs the latest supervisor-owned runtime state on target.
+// The caller must hold runtimeStateMu whenever target can become active.
+func (s *Supervisor) applyRuntimeState(target generationRuntimeTarget) {
+	var transport http.RoundTripper
+	if box := s.transport.Load(); box != nil {
+		transport = box.rt
+	}
+	target.SetTransport(transport)
+	target.SetOAuthEgressOverride(s.oauthEgressOverride.Load())
+	target.SetBroker(s.broker)
+	target.SetProviderPathHealthManager(s.pathHealth)
+}
+
+// activateGeneration is the only active-generation swap path. A concurrent hot
+// update either completes first and is copied into newGen, or completes second
+// and updates newGen after it becomes active; neither ordering can lose state.
+func (s *Supervisor) activateGeneration(newGen *generation) {
+	s.runtimeStateMu.Lock()
+	defer s.runtimeStateMu.Unlock()
+	s.applyRuntimeState(newGen.proxy)
+	s.active.Store(newGen)
+}
+
 // SetBroker sets the OAuth broker for all proxy generations.
 func (s *Supervisor) SetBroker(b proxy.OAuthBroker) {
+	s.runtimeStateMu.Lock()
+	defer s.runtimeStateMu.Unlock()
 	s.broker = b
 	if gen := s.active.Load(); gen != nil {
 		gen.proxy.SetBroker(b)
 	}
 }
 
+// SetTransport hot-swaps the outbound RoundTripper used by the active generation
+// and guarantees that a concurrently activating generation cannot restore the
+// previous transport after this call returns.
 func (s *Supervisor) SetTransport(t http.RoundTripper) {
+	s.runtimeStateMu.Lock()
+	defer s.runtimeStateMu.Unlock()
 	s.transport.Store(&transportBox{rt: t})
-	// Also apply to the already-running initial generation. proxy.SetTransport is
-	// itself atomic, so this hot-swap is safe while the generation serves requests.
 	if gen := s.active.Load(); gen != nil {
 		gen.proxy.SetTransport(t)
+	}
+	if s.pathHealth != nil {
+		s.pathHealth.NotifyInputsChanged()
 	}
 }
 
 // SetOAuthEgressOverride flips the opt-in escape hatch (2026-07-19) across all
-// generations. Stores it supervisor-scoped (so reloads inherit it via
-// buildGeneration) AND hot-applies to the running generation — same pattern as
+// generations. Stores it supervisor-scoped (so activateGeneration applies it to
+// reloads) AND hot-applies to the running generation — same pattern as
 // SetTransport. Node-local, default false.
 func (s *Supervisor) SetOAuthEgressOverride(on bool) {
-	s.oauthEgressOverride.Store(on)
+	s.runtimeStateMu.Lock()
+	defer s.runtimeStateMu.Unlock()
+	changed := s.oauthEgressOverride.Swap(on) != on
 	if gen := s.active.Load(); gen != nil {
 		gen.proxy.SetOAuthEgressOverride(on)
+	}
+	if changed && s.pathHealth != nil {
+		s.pathHealth.NotifyInputsChanged()
 	}
 }
 
@@ -1007,6 +1117,12 @@ func (s *Supervisor) PoolCooldownSnapshot() map[string]int {
 	return s.active.Load().proxy.PoolCooldownSnapshot()
 }
 
+// ProviderPathHealthSnapshot returns the shared OAuth-group outbound-path
+// breaker state for /status. Unlike account cooldowns it survives Proxy reloads.
+func (s *Supervisor) ProviderPathHealthSnapshot() []proxy.ProviderPathHealth {
+	return s.pathHealth.Snapshot()
+}
+
 // ReporterMetrics returns usage reporter counters from the active generation.
 // Returns nil if reporter is not configured (no collector_url).
 func (s *Supervisor) ReporterMetrics() *events.ReporterMetrics {
@@ -1313,8 +1429,9 @@ func (s *Supervisor) Reload(ctx context.Context) error {
 		return fmt.Errorf("reload: build generation failed: %w", err)
 	}
 
-	// Swap to new generation — new requests go to newGen from this point.
-	s.active.Store(newGen)
+	// Apply the latest supervisor-owned runtime state and swap under the same short
+	// fence used by hot updates. The generation build above remains off-lock.
+	s.activateGeneration(newGen)
 	// The new Proxy hydrates persisted cooldowns independently; re-stamp its
 	// display projection after the generation becomes active.
 	s.requestCurrentRoutedRestamp()
@@ -1466,16 +1583,8 @@ func (s *Supervisor) buildGeneration() (*generation, error) {
 	p.SetRoutingRailHealth(func() (string, int64) { return s.railHealthFor("routing_override") })
 	p.SlowRequestMs = int64(s.cfg.Log.SlowRequestMs)
 	p.VerySlowRequestMs = int64(s.cfg.Log.VerySlowRequestMs)
-	if b := s.transport.Load(); b != nil && b.rt != nil {
-		p.SetTransport(b.rt)
-	}
-	// Escape hatch (2026-07-19): a reload must inherit the member's opt-in state,
-	// so it doesn't silently revert to coexist mid-emergency. Unconditional store
-	// (default false is a no-op) — same inheritance pattern as transport above.
-	p.SetOAuthEgressOverride(s.oauthEgressOverride.Load())
-	if s.broker != nil {
-		p.SetBroker(s.broker)
-	}
+	// Supervisor-owned runtime state is applied atomically with active.Store by
+	// activateGeneration. Reading it here would recreate the stale-build window.
 	// Phase 2 Stage 3: wire the token-quota gate from the per-process snapshot +
 	// counter (both supervisor-scoped so the counter survives 5s syncs/reloads).
 	// nil-safe + flag-gated inside the enforcer — a no-op when PROXY_QUOTA_ENABLED

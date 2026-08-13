@@ -26,3 +26,22 @@ func TestProtocolFamilyLookupUsesProviderAndProtocolAxes(t *testing.T) {
 		})
 	}
 }
+
+func TestProtocolFamilyNormalizesLegacyAliasesWithoutCollapsingAxes(t *testing.T) {
+	tests := []struct {
+		provider string
+		protocol string
+		want     string
+	}{
+		{provider: "claude", protocol: "anthropic", want: "anthropic"},
+		{provider: "openai", protocol: "openai", want: "openai_compatible"},
+		{provider: "gemini", protocol: "google", want: "gemini"},
+		{provider: "mock", protocol: "openai", want: "openai_compatible"},
+	}
+	for _, tt := range tests {
+		got, ok := ProtocolFamily(tt.provider, tt.protocol)
+		if !ok || got != tt.want {
+			t.Errorf("ProtocolFamily(%q, %q) = (%q, %v), want (%q, true)", tt.provider, tt.protocol, got, ok, tt.want)
+		}
+	}
+}

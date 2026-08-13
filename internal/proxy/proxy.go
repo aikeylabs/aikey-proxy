@@ -115,6 +115,10 @@ type Proxy struct {
 	// until its cooldown lapses. Always non-nil (set in New); the request path
 	// only consults it for group routes.
 	poolCooldown *poolCooldownStore
+	// pathHealth owns transient outbound-path reachability independently of
+	// account health. Supervisor replaces the per-Proxy default with one shared
+	// instance so network recovery state survives generation reloads.
+	pathHealth *ProviderPathHealthManager
 	// signalReporter ships parsed unified-* utilization to master (I5, best-effort,
 	// off the forward hot path). nil = feature off. Set via EnableSignalReporting.
 	signalReporter *signalReporter
@@ -326,6 +330,7 @@ func New(v VaultGetter, reg *vkeys.Registry, prov *provider.Registry, coll *even
 		UpstreamTimeout:    defaultUpstreamTimeout,
 		appHealthCache:     apppipe.NewHealthCache(),
 		poolCooldown:       newPoolCooldownStore(),
+		pathHealth:         NewProviderPathHealthManager(),
 		poolObservedResets: newPoolResetStore(),
 		groupLoginState:    newGroupLoginStateStore(),
 	}
@@ -364,6 +369,16 @@ func New(v VaultGetter, reg *vkeys.Registry, prov *provider.Registry, coll *even
 // Must be called before the proxy handles any OAuth-credential requests.
 func (p *Proxy) SetBroker(b OAuthBroker) {
 	p.broker = b
+}
+
+// SetProviderPathHealthManager installs the Supervisor-scoped transient path
+// breaker. A nil manager restores an isolated empty manager instead of disabling
+// recovery guards.
+func (p *Proxy) SetProviderPathHealthManager(m *ProviderPathHealthManager) {
+	if m == nil {
+		m = NewProviderPathHealthManager()
+	}
+	p.pathHealth = m
 }
 
 // SetAppVault injects a vault reader for App pipeline requests.
@@ -440,6 +455,12 @@ func (p *Proxy) AppHealthSnapshot() []apppipe.AppHealth {
 // accounts are being routed around.
 func (p *Proxy) PoolCooldownSnapshot() map[string]int {
 	return p.poolCooldown.snapshot()
+}
+
+// ProviderPathHealthSnapshot returns only unhealthy OAuth-group paths. It is
+// non-secret and safe for the existing /status health surface.
+func (p *Proxy) ProviderPathHealthSnapshot() []ProviderPathHealth {
+	return p.pathHealth.Snapshot()
 }
 
 // CooldownSkipSet returns the EXACT set of accounts the hot-path group resolver skips

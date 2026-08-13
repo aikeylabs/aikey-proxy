@@ -114,7 +114,7 @@ func TestCooldownRouteState_WindowExhaustedCarriesProviderReset(t *testing.T) {
 	}
 }
 
-// P0-B fence (2026-07-19): generic 5xx / transport failures cool an account only
+// P0-B fence (2026-07-19): generic HTTP 5xx responses cool an account only
 // after CONSECUTIVE repeats; any success resets the streak; a literally-built
 // store (nil streak map) stays safe.
 func TestPoolCooldownStore_ServerErrorStreak(t *testing.T) {

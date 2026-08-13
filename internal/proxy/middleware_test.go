@@ -142,21 +142,45 @@ func TestUpstreamRequestIDFromHeader(t *testing.T) {
 // Both shapes must forward as /responses; non-openai providers keep their path.
 func TestResolveOAuthUpstream_StripsV1ForCodex(t *testing.T) {
 	cases := []struct {
-		code     string
-		inPath   string
-		wantPath string
+		code         string
+		existingBase string
+		inPath       string
+		wantBase     string
+		wantPath     string
 	}{
-		{"openai", "/v1/responses", "/responses"},
-		{"openai", "/responses", "/responses"},
-		{"anthropic", "/v1/messages", "/v1/messages"},
+		{"openai", "https://api.openai.com/v1", "/v1/responses", "https://chatgpt.com/backend-api/codex", "/responses"},
+		{"openai", "", "/responses", "https://chatgpt.com/backend-api/codex", "/responses"},
+		{"anthropic", "https://gateway.test/anthropic/v1", "/v1/messages", "https://gateway.test/anthropic/v1", "/v1/messages"},
 	}
 	for _, c := range cases {
 		r := httptest.NewRequest("POST", c.inPath, strings.NewReader(`{"model":"gpt-5"}`))
-		_, out := resolveOAuthUpstream(c.code, "", r)
+		base, out := resolveOAuthUpstream(c.code, "", c.existingBase, r)
+		if base != c.wantBase {
+			t.Errorf("resolveOAuthUpstream(%q, %q): base = %q, want %q",
+				c.code, c.existingBase, base, c.wantBase)
+		}
 		if out.URL.Path != c.wantPath {
 			t.Errorf("resolveOAuthUpstream(%q, %q): forwarded path = %q, want %q",
 				c.code, c.inPath, out.URL.Path, c.wantPath)
 		}
+	}
+}
+
+// The member runtime now carries the provider default BaseURL even when an
+// OAuth credential has no custom override. A configured, safety-gated test
+// upstream must still win; otherwise real-binary E2Es silently contact the
+// provider edge instead of their hermetic loopback / .test upstream.
+func TestResolveOAuthUpstream_AnthropicTestOverrideWinsRuntimeDefault(t *testing.T) {
+	t.Setenv("AIKEY_PROXY_TEST_ANTHROPIC_BASE_URL", "http://mock.test:18080/anthropic")
+	r := httptest.NewRequest(http.MethodPost, "/v1/messages", strings.NewReader(`{"model":"claude-test"}`))
+
+	base, out := resolveOAuthUpstream("anthropic", "anthropic", "https://api.anthropic.com", r)
+
+	if base != "http://mock.test:18080/anthropic" {
+		t.Fatalf("test override lost to delivered runtime default: base=%q", base)
+	}
+	if out.URL.Path != "/v1/messages" {
+		t.Fatalf("Anthropic test override must preserve incoming path, got %q", out.URL.Path)
 	}
 }
 
