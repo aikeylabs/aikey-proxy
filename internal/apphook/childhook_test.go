@@ -31,15 +31,48 @@ printf 'flushed\n' > "$marker"
 	}
 
 	h := NewChildHook(&ChildHookConfig{
-		Name:         "graceful-shutdown-test",
-		BinaryPath:   child,
-		BinaryArgs:   []string{marker},
-		// Match the package's other child fixtures. Two seconds flakes when
-		// release gates compile Rust and run Go race tests concurrently, before
-		// this tiny shell process gets scheduled at all.
-		ReadyTimeout: 5 * time.Second,
+		Name:       "graceful-shutdown-test",
+		BinaryPath: child,
+		BinaryArgs: []string{marker},
+		// 🔴 15s, not the apphook 5s default — for the reason the PRODUCT already
+		// recorded at supervisor/filter_hook.go's filterDefaultReadyTimeout:
+		//
+		//	the apphook default is 5s … that stretches past 5s under the load of
+		//	a concurrent deploy/restart — the spawn then misses the deadline and
+		//	latches fail-loud 501, even though the child is fine
+		//
+		// The production path answered that with 30s. This test kept 5s, and
+		// `go test ./...` reproduces the same condition: with ~18 package binaries
+		// running at once, the FIRST child spawn in this package pays a cold cost
+		// (measured 1.8–2.3s, and past 5s often enough to fail every full-suite
+		// run while passing alone). Same failure, same cause, same answer.
+		//
+		// 🚫 The 2s→5s raise below it never took effect: the enclosing context was
+		// ALSO 5s, so it always expired first and the error read `context deadline
+		// exceeded` rather than naming the child. That is why this needed fixing
+		// in both places — see the context comment below.
+		//
+		// 🔴 Whichever child-spawn test runs FIRST in this package pays that cold
+		// cost; this one is first only because of file/declaration order. Reorder
+		// the package and the next one inherits the problem. A warm-up in TestMain
+		// would fix the class rather than this instance — deliberately NOT done
+		// here, because it changes shared test setup for every test in the package
+		// and that is a bigger decision than this fix.
+		ReadyTimeout: 15 * time.Second,
 	})
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	// 🔴 The context must outlast ReadyTimeout, and by a margin.
+	//
+	// This was 5s — the SAME value ReadyTimeout had — which silently cancelled the
+	// readiness budget it was supposed to contain: the deadline starts before
+	// Start() does, so the context always expired first. With the two equal, "the
+	// child never signalled ready" is a diagnosis the test can never print, and
+	// every slow scheduler looks identical to it.
+	//
+	// 🚫 Not "widen until it stops flaking". Every other child fixture in this
+	// package gives the context 2–5× its ReadyTimeout (listpacks 5s/15s, the
+	// degraded and restart cases below 5s/15s, filterpool 5s/25s); this test was
+	// the only one at 1×.
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 	if err := h.Start(ctx); err != nil {
 		t.Fatalf("start fixture: %v", err)
