@@ -3,6 +3,30 @@
 # Scope: native `go test ./...` only (no docker/PG); heavier integration
 # (dbmigrate-test-postgres etc.) is intentionally left to nightly/opt-in so
 # this gate needs nothing beyond a GitHub-hosted runner.
+#
+# 🔴 Why the sibling checkout below exists (added 2026-08-14)
+#
+# This module's go.mod `replace`s fourteen dependencies to `../<repo>` paths. A
+# lone `actions/checkout` gives the runner none of them, so EVERY run died in
+# `go vet` with
+#
+#     github.com/AiKeyLabs/pkg/egress@v0.0.0: replacement directory ../pkg/egress
+#     does not exist                                        (×14)
+#
+# before a single test executed. That is not a flaky gate — it is a gate that has
+# never once run. The hot-path call-graph fence (MOD-16 / PLANE-01) has lived in
+# internal/proxy since it landed and had never been exercised by CI; it was only
+# ever run by hand. A fence CI cannot reach is a fence nobody is holding.
+#
+# ⚠️ REQUIRED SECRET: AIKEY_CI_TOKEN — a PAT or GitHub App installation token that
+# can read aikey-auth-broker, aikey-config-tool and ai-degrade-detector, which are
+# PRIVATE. The default GITHUB_TOKEN cannot read another private repository.
+#
+#     gh secret set AIKEY_CI_TOKEN --repo aikeylabs/aikey-proxy
+#
+# The preflight FAILS rather than skipping when it is absent: a run that could not
+# see two thirds of what it compiles must not report green. Same contract as
+# aikey-license-core's exit-gate.yml and aikey-cli's parity job.
 name: CI
 
 on:
@@ -13,11 +37,98 @@ concurrency:
   group: ci-${{ github.ref }}
   cancel-in-progress: true
 
+env:
+  GOWORK: "off"
+
 jobs:
   test:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+
+      - name: Preflight — the sibling-checkout token must be present
+        env:
+          TOKEN: ${{ secrets.AIKEY_CI_TOKEN }}
+        run: |
+          if [ -z "${TOKEN}" ]; then
+            echo "::error::AIKEY_CI_TOKEN is not configured. This module replaces" \
+                 "fourteen dependencies to private sibling repositories and the" \
+                 "default GITHUB_TOKEN cannot read them. Refusing to run a gate" \
+                 "that could not compile what it is meant to check."
+            exit 1
+          fi
+
+      # 🚫 `path: ../<sibling>` DOES NOT WORK — actions/checkout refuses to write
+      # outside $GITHUB_WORKSPACE. Plain `git clone` into the workspace's PARENT
+      # is how the other repositories in this org solve it, and it puts the
+      # siblings exactly where `../<name>` resolves from this checkout.
+      - name: Check out the sibling repositories this module replaces
+        env:
+          TOKEN: ${{ secrets.AIKEY_CI_TOKEN }}
+          HEAD_REF: ${{ github.head_ref }}
+          BASE_REF: ${{ github.base_ref }}
+        run: |
+          set -euo pipefail
+          parent="$(dirname "$GITHUB_WORKSPACE")"
+
+          # 🔴 The order matters. A coordinated cross-repo change puts the SAME
+          # branch name in several repositories, so the PR's own head ref wins.
+          # Then the branch this PR targets — that is what makes a PR into
+          # develop-v1.0.5 pick up develop-v1.0.5 siblings without anything here
+          # naming a release line that later goes stale.
+          for repo in pkg aikey-auth-broker aikey-config-tool ai-degrade-detector aikey-cli; do
+            url="https://x-access-token:${TOKEN}@github.com/aikeylabs/${repo}.git"
+            picked=""
+            for ref in "${HEAD_REF:-}" "${BASE_REF:-}" "${GITHUB_REF_NAME:-}" develop-v1.0.5 main; do
+              [ -n "$ref" ] || continue
+              if git ls-remote --exit-code --heads "$url" "$ref" >/dev/null 2>&1; then
+                picked="$ref"; break
+              fi
+            done
+            if [ -z "$picked" ]; then
+              echo "::error::${repo}: none of the candidate refs exist. This module" \
+                   "cannot be built without it."
+              exit 1
+            fi
+            echo "::notice::${repo} @ ${picked}"
+            git clone --quiet --depth 1 --branch "$picked" "$url" "${parent}/${repo}"
+          done
+
+      # 🔴 The anti-drift check, and the reason this job does not carry a
+      # hand-written list of module paths. The list above is REPOSITORIES; this
+      # asserts every `../` target go.mod actually names now resolves. Add a
+      # replace to a new repository and CI tells you exactly which path is
+      # missing, instead of reprinting fourteen module errors that bury the one
+      # that changed.
+      - name: Every replace target resolves
+        run: |
+          set -euo pipefail
+          parent="$(dirname "$GITHUB_WORKSPACE")"
+          missing=0
+          while IFS= read -r target; do
+            [ -n "$target" ] || continue
+            if [ ! -d "${parent}/${target#../}" ]; then
+              echo "::error::go.mod replaces ${target}, which is not checked out." \
+                   "Add its repository to the sibling checkout step above."
+              missing=1
+            fi
+          done < <(grep -oE '=> \.\./[^[:space:]]+' go.mod | sed 's/^=> //' | sort -u)
+
+          # 🔴 aikey-cli is NOT a go.mod replace and cannot be derived from it. It
+          # is here for a CROSS-LANGUAGE golden fixture: internal/supervisor's
+          # TestNormalizeTeamToken_GoldenCases reads the Rust CLI's
+          # team_token_normalize.json so the two implementations of one spec are
+          # compared against each other rather than each against its own idea of
+          # the answer. Without it that test fails "could not resolve monorepo
+          # root" — which is correct, and is also why go.mod alone is not the
+          # whole answer to "what does this suite need beside it".
+          if [ ! -f "${parent}/aikey-cli/tests/fixtures/team_token_normalize.json" ]; then
+            echo "::error::aikey-cli checked out without the team-token golden fixture."
+            missing=1
+          fi
+          [ "$missing" = 0 ] || exit 1
+          echo "all replace targets and cross-language fixtures resolve"
+
       - uses: actions/setup-go@v5
         with:
           go-version-file: go.mod
