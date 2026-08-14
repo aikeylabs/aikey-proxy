@@ -78,16 +78,44 @@ jobs:
           # naming a release line that later goes stale.
           for repo in pkg aikey-auth-broker aikey-config-tool ai-degrade-detector aikey-cli; do
             url="https://x-access-token:${TOKEN}@github.com/aikeylabs/${repo}.git"
+
+            # 🔴 Read the ref list ONCE, and keep git's stderr.
+            #
+            # This step's first form asked `git ls-remote --exit-code --heads` per
+            # candidate ref with `2>&1` sent to /dev/null, then reported "none of
+            # the candidate refs exist" if every probe failed. A token that cannot
+            # READ the repository fails exactly the same way — so the first real
+            # run blamed a missing branch on aikey-auth-broker while
+            # develop-v1.0.5 and main both existed, and the actual cause (the
+            # token's scope does not cover that private repo) was in the stderr
+            # that had been discarded. "Cannot see it" and "it is not there" are
+            # different problems with different fixes and must not print the same
+            # sentence.
+            if ! heads="$(git ls-remote --heads "$url" 2>&1)"; then
+              echo "::error::${repo}: cannot be read with AIKEY_CI_TOKEN. The repo" \
+                   "exists; the token's scope probably does not cover it. git said:"
+              # 🚫 Sanitise: git echoes the URL back, and the URL carries the token.
+              printf '%s\n' "$heads" | sed "s#${TOKEN}#***#g" | head -3
+              exit 1
+            fi
+
+            # 🔴 The order matters. A coordinated cross-repo change puts the SAME
+            # branch name in several repositories, so the PR's own head ref wins.
+            # Then the branch this PR targets — that is what makes a PR into
+            # develop-v1.0.5 pick up develop-v1.0.5 siblings without anything here
+            # naming a release line that later goes stale.
             picked=""
             for ref in "${HEAD_REF:-}" "${BASE_REF:-}" "${GITHUB_REF_NAME:-}" develop-v1.0.5 main; do
               [ -n "$ref" ] || continue
-              if git ls-remote --exit-code --heads "$url" "$ref" >/dev/null 2>&1; then
+              if printf '%s\n' "$heads" | awk '{print $2}' | grep -qxF "refs/heads/${ref}"; then
                 picked="$ref"; break
               fi
             done
             if [ -z "$picked" ]; then
-              echo "::error::${repo}: none of the candidate refs exist. This module" \
-                   "cannot be built without it."
+              echo "::error::${repo}: none of the refs tried exist" \
+                   "(${HEAD_REF:-} ${BASE_REF:-} ${GITHUB_REF_NAME:-} develop-v1.0.5 main)." \
+                   "Branches this repo actually has:"
+              printf '%s\n' "$heads" | awk '{print "  " $2}' | head -10
               exit 1
             fi
             echo "::notice::${repo} @ ${picked}"
