@@ -250,16 +250,54 @@ type manifestRow struct {
 // algorithm changed on 2026-08-03 (see the long note at the assertion below).
 //
 // Key = manifest stored_base_url, value = the path THIS binary now produces.
-// Only rows whose old-table row declares a version other than /v1 can appear
-// here; every other row is unaffected and is still held to the manifest.
 //
 // 🚫 Do not add a row here to make a red test green. A new entry means the
 // stitch changed again — go confirm what a field worker actually does first.
 var stitchAlgorithmChangedRows = map[string]string{
+	// ── 2026-08-03, known-row strip (shape A: old_route_known = true) ──────────
 	// old ark row: base /api/v3, version /v3. Client sends /v1/... — byte-equality
 	// used to leave it in place (field alpha.15: /api/v3/v1/...), the fix strips it.
 	"https://ark.cn-beijing.volces.com/api/coding/v1": "/api/v3/messages",
 	"https://ark.cn-beijing.volces.com/api/coding/v3": "/api/v3/chat/completions",
+
+	// ── 2026-08-15, degraded-path duplicate join (shape B: old_route_known = false)
+	//
+	// A DIFFERENT class from the 2026-08-03 rows above, so the old "only rows whose
+	// row declares a version other than /v1" constraint no longer describes this
+	// map. These hosts are absent from the frozen old table, so they take the
+	// degraded literal-prepend branch, and their stored base_url already ENDS in
+	// the very version segment the client sends. Literal-prepend therefore emitted
+	// it twice (field alpha.15: /v1/v1/..., exactly as old_proxy_upstream records);
+	// pkg/providerroutes.stitchRequestURL now collapses that one duplicate.
+	//
+	// Field behaviour confirmed two ways, not assumed: the manifest's
+	// old_proxy_upstream for every row below is the doubled path (verified against
+	// a real alpha.15 worker on staging 2026-08-03), and removing the new guard
+	// reproduces the doubled path byte-for-byte (mutation drill, 2026-08-15).
+	//
+	// 🔴 Operator note for release: these 19 are all vendors whose OWN docs give a
+	// base_url ending in /v1. A credential stored from the documented URL was being
+	// dialled at /v1/v1/... by un-upgraded workers; after upgrade it is dialled
+	// correctly. Nothing needs re-pointing — the upgrade is the fix.
+	"https://ai-gateway.vercel.sh/v1":          "/v1/chat/completions",
+	"https://aihubmix.com/v1":                  "/v1/chat/completions",
+	"https://api.302.ai/v1":                    "/v1/chat/completions",
+	"https://api.aihubmix.com/v1":              "/v1/chat/completions",
+	"https://api.cerebras.ai/v1":               "/v1/chat/completions",
+	"https://api.fireworks.ai/inference/v1":    "/inference/v1/chat/completions",
+	"https://api.hunyuan.cloud.tencent.com/v1": "/v1/chat/completions",
+	"https://api.minimax.io/anthropic/v1":      "/anthropic/v1/messages",
+	"https://api.minimax.io/v1":                "/v1/chat/completions",
+	"https://api.minimaxi.com/anthropic/v1":    "/anthropic/v1/messages",
+	"https://api.minimaxi.com/v1":              "/v1/chat/completions",
+	"https://api.mistral.ai/v1":                "/v1/chat/completions",
+	"https://api.moonshot.ai/anthropic/v1":     "/anthropic/v1/messages",
+	"https://api.moonshot.ai/v1":               "/v1/chat/completions",
+	"https://api.sambanova.ai/v1":              "/v1/chat/completions",
+	"https://api.stepfun.com/v1":               "/v1/chat/completions",
+	"https://api.together.ai/v1":               "/v1/chat/completions",
+	"https://api.together.xyz/v1":              "/v1/chat/completions",
+	"https://api.z.ai/api/anthropic/v1":        "/api/anthropic/v1/messages",
 }
 
 func TestMixedVersion_ManifestDescribesWhatTheProxyActuallyDoes(t *testing.T) {
