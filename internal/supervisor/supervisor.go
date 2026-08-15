@@ -181,6 +181,13 @@ func (g *generation) closeAll() {
 	// holding a live bearer closure over the old vault reader.
 	if g.proxy != nil {
 		g.proxy.StopSignalReporting()
+		// Same reason, different subsystem (2026-08-15): the observer registry is
+		// rebuilt per generation by buildObserverRegistry, and until this call
+		// existed nothing ever retired it. rhythm's settings poller (5s tick) and
+		// reporter worker pool therefore accumulated one full set per reload —
+		// observed as four duplicate `toggle_changed` events from four live
+		// pollers. See observer.ClosableObserver.
+		g.proxy.StopObservers()
 	}
 	// Standalone WAL (collector_url empty): generation owns the writer and
 	// must close it explicitly, otherwise every reload leaks a file handle
