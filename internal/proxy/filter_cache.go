@@ -26,8 +26,10 @@
 // available (sessionid fingerprint table — cross-protocol, see cacheScope), else
 // metadata.user_id, else the resolved virtual key.
 //
-// PACK FRESHNESS (INV-5): detector-version is folded into the level-2 key (restart
-// invalidates) + a per-entry TTL bounds stale-clean after an in-place pack pull.
+// PACK FRESHNESS (INV-5): the level-2 key folds in BOTH the detector's binary
+// version (a restart invalidates) and its live content-set epoch (an in-place
+// pack swap invalidates), so a rule the admin just added or deleted takes effect
+// on the next turn instead of waiting out a TTL. See cacheKey.
 package proxy
 
 import (
@@ -101,12 +103,13 @@ const (
 // expires it. 1h = the widest mainstream LLM prompt-cache window, so our cache stays warm
 // for any conversation a provider would still treat as "hot" (调研 2026-06-17: Claude 5min
 // 默认/1h extended 滑动, OpenAI 5–10min, Gemini 1h 默认 → 取最宽的 1h 兼容全部).
-// SAFETY CAVEAT: this also bounds stale-clean after an in-place pack swap — which does NOT
-// bump the detector version (childhook.go:215) — so a continuously-active session could reuse
-// a cached "clean" verdict for content a NEWLY-added pack word now flags, until the entry
-// idles out. New content is always scanned immediately; only already-cached-clean history is
-// at risk, and pack updates are rare. PROPER FIX (TODO, see 设计 §4.2): put the live pack
-// cursor in the cache key → a swap auto-invalidates → 1h fully safe regardless of activity.
+//
+// The TTL is now purely a MEMORY bound, not a correctness one. It used to double as the
+// only limit on pack staleness, and it was a bad one: the swap does not bump the detector
+// version, and the sliding refresh means a conversation that stays alive never lets its
+// entries idle out — so "1h" was in practice "forever" for exactly the sessions that matter.
+// That gap is closed at the key instead (contentVersion in cacheKey, 2026-08-13); see
+// workflow/CI/bugfix/20260813-pack-swap-does-not-invalidate-proxy-cache.md.
 var defaultMaskCacheTTL = 1 * time.Hour
 
 // hashHead returns the sha256 hex of the scanned head bytes.
@@ -162,9 +165,32 @@ func cacheScope(sessionID string, parsed map[string]any, virtualKeyID string) st
 	return "global"
 }
 
-// cacheKey is the level-2 (within-session) key = detector version + content hash.
-func cacheKey(detectorVersion, contentHash string) string {
-	return detectorVersion + "|" + contentHash
+// cacheKey is the level-2 (within-session) key. THREE parts, each answering a
+// different "is this verdict still the answer?" question:
+//
+//	detectorVersion — WHICH BINARY decided. From the child's ready handshake, so
+//	                  it moves on restart/upgrade. Covers changes in engine code
+//	                  (NER models, policy evaluation) that no report can express.
+//	contentVersion  — WHICH RULESET it decided against (apphook.CacheEpoch). This
+//	                  is the part that moves WITHOUT a restart: the detector pulls
+//	                  packs on a timer and hot-swaps its compiled ruleset in place,
+//	                  so an admin deleting a rule on the console changes this and
+//	                  nothing else. Empty for hooks with no hot-swappable content.
+//	contentHash     — WHICH BYTES were decided about.
+//
+// WHY key-scoped invalidation rather than flushing the cache when the ruleset
+// moves: the swap is observed asynchronously, per hook, while requests are
+// in flight. A flush would need to be ordered against every concurrent Get/Put
+// to be correct; a key that already carries the epoch makes every entry from the
+// previous epoch unreachable the instant the new epoch is read, with no
+// coordination at all. Stale entries are then evicted by the LRU as new ones
+// arrive — they cost memory for a while, never correctness.
+//
+// 🔴 Do NOT reduce this to two parts again. The 2026-08-13 P0 was exactly the
+// two-part key: a deleted rule kept masking because nothing in the key moved
+// when the ruleset did. Fence: filter_cache_packswap_test.go.
+func cacheKey(detectorVersion, contentVersion, contentHash string) string {
+	return detectorVersion + "|" + contentVersion + "|" + contentHash
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

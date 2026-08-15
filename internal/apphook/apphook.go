@@ -164,15 +164,79 @@ type Hook interface {
 
 // Status describes a hook's current health.
 // Stable across reads — implementations update this from background goroutines.
+//
+// 🔴 EVERY FIELD HERE IS AN EXTERNALLY READABLE HEALTH SIGNAL, not a log line.
+// This struct is projected onto GET /v1/diagnostics/pipeline (`filter_hook`), so
+// adding a state that only appears in a `slog` call is the health-signal-surface
+// violation this type exists to prevent: `DegradedReason` distinguishes "the
+// child wedged mid-write" (write_timeout) from "the child was never started"
+// (not_started), and until 2026-08-13 neither could be read from outside the
+// process — `ak doctor` had to infer both from a single `available:false`.
 type Status struct {
 	LastSpawnedAt  time.Time // wall-clock of last spawn
 	LastDetectAt   time.Time // wall-clock of last successful Detect roundtrip
 	LastErrorAt    time.Time // wall-clock of last failed Detect (any reason)
-	DegradedReason string    // populated when Healthy == false: crash | timeout | not_installed | protocol_mismatch | unauthorized
+	DegradedReason string    // populated when Healthy == false: crash | timeout | not_installed | protocol_mismatch | unauthorized | write_timeout | not_started | restarting
 	BinaryPath     string    // absolute path to child binary (e.g. ~/.aikey/apps/ai-compliance-detector/bin/detector)
 	Version        string    // protocol version + binary version from child's ready sentinel
-	RestartCount   uint64    // cumulative restart count since proxy start
-	Healthy        bool      // true iff child reachable and last detect succeeded
+	// ContentVersion is the token this unit currently reports for its
+	// hot-swappable content set (see contentversion.go), or "" when it cannot
+	// state one. ContentVersionReason names WHY it is empty — one of the
+	// contentVersionReason* constants, never a free-form string.
+	//
+	// WHY they live on Status rather than behind another accessor: "which ruleset
+	// is live" and "is this child healthy" are read by the same operator in the
+	// same breath, and the answer to "why did the verdict cache switch off?" is a
+	// per-unit fact. Additive fields on a struct that is already the health
+	// projection, rather than a second parallel surface (慎重新建 API/接口协议).
+	//
+	// They are DERIVED at Status() read time, not stored in the snapshot: every
+	// markDegraded/restart/spawn path rebuilds the snapshot from scratch, so a
+	// stored copy would be silently dropped by whichever path a future change
+	// forgets to update.
+	ContentVersion       string
+	ContentVersionReason string
+	RestartCount         uint64 // cumulative restart count since proxy start
+	Healthy              bool   // true iff child reachable and last detect succeeded
+}
+
+// MultiUnit is implemented by a Hook that fronts MORE THAN ONE independently
+// failing unit (FilterPool: M child processes).
+//
+// Implementing it is a STATEMENT: "my aggregate Status() collapses several
+// health states into one, so do not report it as if it were a single unit".
+//
+// 🔴 WHY THIS EXISTS (2026-08-13, review finding B39/B5). FilterPool.Status()
+// answers Healthy=true whenever ≥1 worker survives and buries the rest in a
+// formatted DegradedReason ("1/2 workers healthy"). That is correct for the
+// "should the pool keep serving?" question it was written for, and a FALSE GREEN
+// for every health surface: a 2-worker pool with one dead process reported
+// healthy while half of all Detect calls fail open and forward content
+// un-inspected. A health surface that cannot see the dead worker cannot warn
+// about it.
+type MultiUnit interface {
+	// WorkerStatuses returns one Status per underlying unit, in dispatch order.
+	// Cheap and non-blocking, same contract as Status().
+	WorkerStatuses() []*Status
+}
+
+// WorkerStatuses is the ONE sanctioned way to enumerate a hook's independently
+// failing units. Callers must not type-assert MultiUnit themselves — a hook that
+// is a single unit is NOT an error case to be branched on at each call site, it
+// is a pool of one, and re-deriving that at every reader is how the pool branch
+// gets lost (same posture as CacheEpoch's tri-state).
+//
+//	hook implements MultiUnit → its per-worker statuses, in dispatch order
+//	hook does not            → a 1-element slice holding its own Status
+//	hook is nil              → nil (no filter installed; not a fault)
+func WorkerStatuses(h Hook) []*Status {
+	if h == nil {
+		return nil
+	}
+	if m, ok := h.(MultiUnit); ok {
+		return m.WorkerStatuses()
+	}
+	return []*Status{h.Status()}
 }
 
 // Disabled is the no-op Hook used when no app is registered for a slot.

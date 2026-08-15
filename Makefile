@@ -71,7 +71,7 @@ AIKEY_REQUIRE_NO_TEST_SKIPS ?= $(if $(ACD_PRESENT),1,0)
 # would skip them.
 PROXY_TEST_PKGS := ./internal/... ./cmd/aikey-proxy/
 
-.PHONY: build test test-bugfix-provider-routing test-pathprefix-matrix run install uninstall restart clean lint lint-full cross-compile sync-fingerprint sync-provider-registry sync-provider-data chaos-gap7 chaos-gap8 chaos filter-integration detector-sibling-build detector-sibling-absent-notice
+.PHONY: build test test-bugfix-provider-routing test-bugfix-apphook-write-deadline test-pathprefix-matrix run install uninstall restart clean lint lint-full cross-compile sync-fingerprint sync-provider-registry sync-provider-data chaos-gap7 chaos-gap8 chaos filter-integration detector-sibling-build detector-sibling-absent-notice
 
 # v4.3 (2026-05-01): aikey-cli/data/provider_fingerprint.yaml is the single
 # source of truth for provider routing. The pkg/providerroutes Go package
@@ -159,6 +159,18 @@ test-bugfix-provider-routing: ## regression: OAuth Stitch + App/Probe axes + hea
 # ../workflow/CI/bugfix/20260808-provider-path-prefix-routing-registry-drift.md
 test-pathprefix-matrix: ## matrix: every picker:true provider routes + stitches (RED — known defects D-1/D-2)
 	go test -count=1 -tags pathprefix_matrix -run TestPathPrefixMatrix_Strict -v ./internal/proxy/
+
+# Regression fence for the 2026-08-13 P0: a detector child that is alive but has
+# stopped reading stdin filled the OS pipe buffer, and the write half of the
+# roundtrip had no deadline — so user requests hung forever, the hook never went
+# degraded (so lazy self-heal could never take over) and Shutdown/restart blocked
+# on the same lock. Uses a real never-reading child process on a real pipe;
+# nothing else reproduces OS write back-pressure. -race is mandatory: the fix
+# hands the write to a goroutine and retires the pipe session out from under it.
+# Evidence + design:
+# ../workflow/CI/bugfix/20260813-childhook-write-before-deadline-wedges-main-path.md
+test-bugfix-apphook-write-deadline: ## regression: wedged detector child must not block the main path (P0 20260813)
+	go test -count=1 -race -v -timeout 180s -run 'TestChildHook_WedgedChild|TestChildHookShutdownClosesStdinForGracefulAuditFlush|TestChildHook_ConcurrentDetect$$' ./internal/apphook/
 
 # Chaos experiments (缺口7/8) — build-tagged so they stay OUT of the normal
 # `test` suite. They drive the real newStreamDrainer / http.Server code paths

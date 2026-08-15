@@ -3,7 +3,6 @@ package proxy
 import (
 	"context"
 	"net/http/httptest"
-	"os"
 	"strings"
 	"testing"
 	"time"
@@ -27,11 +26,14 @@ import (
 //	go build -o /tmp/aikey-detector ./cmd/detector   # in ai-compliance-detector
 //	AIKEY_TEST_DETECTOR_BINARY=/tmp/aikey-detector \
 //	  go test ./internal/proxy -run TestApplyInboundFilter_LiveDetector -v
+//
+// HERMETIC BY CONSTRUCTION: the binary comes from liveDetectorBinary (see
+// detector_door_test.go), which seals the four $HOME-rooted detector inputs
+// before anything is spawned, and sealed.AssertHeld below makes the child
+// confirm it. Without that pair, "the shipped detector masks this prompt" and
+// "this developer's installed ~/.aikey masks this prompt" are indistinguishable.
 func TestApplyInboundFilter_LiveDetector(t *testing.T) {
-	bin := os.Getenv("AIKEY_TEST_DETECTOR_BINARY")
-	if bin == "" {
-		t.Skip("set AIKEY_TEST_DETECTOR_BINARY to the built detector binary to run the live closed-loop test")
-	}
+	bin, sealed := liveDetectorBinary(t, "the live closed-loop test")
 
 	hook := apphook.NewChildHook(&apphook.ChildHookConfig{
 		Name:       "ai-compliance-detector",
@@ -50,16 +52,54 @@ func TestApplyInboundFilter_LiveDetector(t *testing.T) {
 		_ = hook.Shutdown(ctx)
 		cancel()
 	}()
+	// Anti-regression: prove the child actually resolved the sealed home, before
+	// any content assertion runs. Setting the env is not evidence that it took.
+	sealed.AssertHeld(t, hook)
 
 	p := &Proxy{filterHook: hook}
 
-	// Synthetic, obviously-fake PII embedded in an Anthropic-style chat body.
-	// Phone matches pii.cn.phone (1[3-9]\d{9}); the 18-digit string matches
-	// pii.cn.id_card (\d{17}[\dXx]). Neither is a real person's data.
+	// Synthetic PII embedded in an Anthropic-style chat body. Neither value is a
+	// real person's data, but BOTH must still satisfy the rules' own admission
+	// contract — a fixture that the ruleset legitimately rejects proves nothing
+	// about the mask path.
+	//
+	// WHY THE ID CARD ENDS 7424 AND NOT 742X (fixture correction 2026-08-13)
+	//
+	// pii.cn.id_card (internal/baselines/built-in/cn-pii.yaml) declares
+	// `validator: cn_id_card` = GB 11643-1999 check digit + birthdate
+	// plausibility. Matching the \b\d{17}[\dXx]\b pattern is NOT detection; the
+	// validator is what makes the rule high-precision. The previous fixture
+	// "11010119900307742X" has an INVALID check digit (GB 11643 requires 4), so
+	// CN_ID_CARD was never emitted for it — verified by probing engine.Detect
+	// across 2026-06-10 → 2026-08-13: the entity is absent at every commit.
+	// The assertion nevertheless passed for a while because five INTERNATIONAL
+	// numeric-ID regexes (FI/PL/DE/TR/SE) also match any 17-digit+1 string and
+	// used to mask, so the raw substring disappeared for the wrong reason. That
+	// is a false green, not coverage. 110101199003077424 carries a valid check
+	// digit, so this now exercises pii.cn.id_card itself.
+	const idCard = "110101199003077424"
+
+	// WHY THE PROMPT SAYS 客户手机号 AND NOT 客户信息：手机号
+	//
+	// The production action-policy bundle gates CN_PHONE on CLAUSE-LOCAL
+	// ownership evidence (`phone_ownership` in actionpolicy bundles/
+	// wave-1-risk-accepted/v5-recovery.json: 客户手机号 / 用户手机号 / 联系方式 …).
+	// A bare 11-digit number next to a bare 手机号 is the measured 12.9%
+	// user-impact false-positive shape the gate exists to remove. The old
+	// phrasing put 客户 and 手机号 in DIFFERENT clauses (the full-width colon
+	// splits them), so the phone finding was capped at warn with
+	// reason=positive_context_missing missing=[phone_ownership] — i.e. the
+	// policy behaved as designed and the fixture simply no longer described a
+	// masked prompt.
+	//
+	// NOTE (open product question, deliberately NOT papered over here): whether
+	// "客户信息：手机号 X" SHOULD confirm ownership is a live coverage question
+	// filed as B3-a in workflow/CI/review/20260813-合规检测-未决事项backlog.md.
+	// This test proves the mask PLUMBING on CJK; it is not the adjudicator of
+	// the FP calibration.
 	const phone = "13800138000"
-	const idCard = "11010119900307742X"
 	body := `{"model":"claude-3-5-sonnet","messages":[{"role":"user","content":` +
-		`"请帮我核对客户信息：手机号 ` + phone + `，身份证号 ` + idCard + ` 是否正确"}]}`
+		`"请帮我核对客户手机号 ` + phone + `，身份证号 ` + idCard + ` 是否正确"}]}`
 
 	r := newReq(body)
 	w := httptest.NewRecorder()
@@ -97,8 +137,8 @@ func TestApplyInboundFilter_LiveDetector(t *testing.T) {
 			t.Errorf("CJK context %q missing — mask corrupted the prefix:\n%s", ctx, forwarded)
 		}
 	}
-	if strings.Contains(forwarded, "742X") {
-		t.Errorf("residual id-card tail '742X' leaked — mask span misaligned:\n%s", forwarded)
+	if strings.Contains(forwarded, "7424") {
+		t.Errorf("residual id-card tail '7424' leaked — mask span misaligned:\n%s", forwarded)
 	}
 	t.Logf("LIVE closed loop OK — masked body forwarded:\n%s", forwarded)
 }
@@ -108,10 +148,7 @@ func TestApplyInboundFilter_LiveDetector(t *testing.T) {
 // output against the CJK case isolates whether mask misalignment is triggered
 // by UTF-8 multibyte offsets. Asserts the same P4 contract (raw PII removed).
 func TestApplyInboundFilter_LiveDetector_ASCII(t *testing.T) {
-	bin := os.Getenv("AIKEY_TEST_DETECTOR_BINARY")
-	if bin == "" {
-		t.Skip("set AIKEY_TEST_DETECTOR_BINARY to run the live closed-loop test")
-	}
+	bin, sealed := liveDetectorBinary(t, "the live closed-loop test")
 
 	hook := apphook.NewChildHook(&apphook.ChildHookConfig{
 		Name:         "ai-compliance-detector",
@@ -127,10 +164,26 @@ func TestApplyInboundFilter_LiveDetector_ASCII(t *testing.T) {
 		_ = hook.Shutdown(ctx)
 		cancel()
 	}()
+	sealed.AssertHeld(t, hook)
 
 	p := &Proxy{filterHook: hook}
 
-	const email = "john.doe.test@example.com"
+	// WHY NOT @example.com (fixture correction 2026-08-13)
+	//
+	// The production bundle's `non_live_value_ceiling` stage runs the
+	// `reserved_email_domain` validator (actionpolicy/stage_v7.go) and caps any
+	// RFC 2606 reserved address at warn: the .example/.invalid/.localhost/.test
+	// TLDs plus example.com/.net/.org. Those domains can never hold a real
+	// mailbox, so masking them is a guaranteed false positive — the stage is
+	// correct, and the old fixture had merely picked a reserved domain to avoid
+	// using a real address.
+	//
+	// Control experiment (2026-08-13): the SAME prompt and the SAME rule
+	// (pii.cn.email) on a non-reserved domain evaluates to mask, so email
+	// masking is fully alive; only the documentation-example class is exempt.
+	// Keep this domain OUT of the RFC 2606 set or the assertion silently stops
+	// testing the mask path.
+	const email = "john.doe.test@aikey-fixture.cn"
 	body := `{"model":"claude-3-5-sonnet","messages":[{"role":"user","content":` +
 		`"Please verify the contact email ` + email + ` for the account"}]}`
 

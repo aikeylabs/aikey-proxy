@@ -439,8 +439,9 @@ func buildGroupRuntimeMap(derivedKey []byte, accounts []grAccount) map[string]vk
 			out[a.AccountID] = vkeys.GroupRuntimeAccount{
 				CredentialType: a.CredentialType, CredentialID: a.CredentialID, NeedsLogin: true,
 				Identity: a.Identity, ProviderCode: a.ProviderCode, ProtocolType: a.ProtocolType,
-				BaseURL: a.BaseURL, Priority: a.Priority,
-				Util5h: a.Util5h, Util7d: a.Util7d, UtilObservedAt: a.UtilObservedAt,
+				BaseURL: a.BaseURL, Priority: a.Priority, ExternalID: a.ExternalID,
+				EgressProxyURL: a.EgressProxyURL,
+				Util5h:         a.Util5h, Util7d: a.Util7d, UtilObservedAt: a.UtilObservedAt,
 			}
 			continue
 		}

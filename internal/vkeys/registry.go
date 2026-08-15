@@ -2,10 +2,13 @@ package vkeys
 
 import (
 	"encoding/json"
+	"errors"
 	"log/slog"
 	"sort"
 	"sync"
 )
+
+var errCredentialEgressInconsistent = errors.New("credential has inconsistent egress material")
 
 // Registry maps virtual key tokens to resolved routes.
 // Thread-safe for concurrent proxy use.
@@ -123,4 +126,44 @@ func (r *Registry) EgressSpecs() []AccountEgressSpec {
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].Label < out[j].Label })
 	return out
+}
+
+// EgressSpecForGroupCredential resolves one selected pool credential's
+// effective egress from that pool's already-synchronized runtime material.
+// Scoping by the Master-resolved group prevents malformed material from an
+// unrelated pool from blocking this login, while malformed or conflicting
+// material inside the selected pool still fails closed. The raw proxy URL stays
+// inside aikey-proxy: neither the Personal page nor the remote Master page
+// receives it. found=false means the selected material has not reached this
+// node yet; callers must fail visibly instead of silently using another exit.
+func (r *Registry) EgressSpecForGroupCredential(oauthGroupID, credentialID string) (spec string, found bool, err error) {
+	r.mu.RLock()
+	routes := make([]*ResolvedRoute, 0, len(r.byToken))
+	for _, rt := range r.byToken {
+		routes = append(routes, rt)
+	}
+	r.mu.RUnlock()
+
+	for _, rt := range routes {
+		if rt == nil || rt.OauthGroupID != oauthGroupID || rt.GroupRuntime == "" {
+			continue
+		}
+		var material map[string]*GroupRuntimeAccount
+		if json.Unmarshal([]byte(rt.GroupRuntime), &material) != nil {
+			return "", false, errors.New("group runtime egress material is malformed")
+		}
+		for _, account := range material {
+			if account == nil {
+				continue
+			}
+			if account.CredentialID != credentialID {
+				continue
+			}
+			if found && spec != account.EgressProxyURL {
+				return "", false, errCredentialEgressInconsistent
+			}
+			spec, found = account.EgressProxyURL, true
+		}
+	}
+	return spec, found, nil
 }

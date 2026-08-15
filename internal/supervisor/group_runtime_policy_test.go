@@ -87,6 +87,30 @@ func TestBuildGroupRuntimeJSON_EncryptsBothTypesNoRefresh(t *testing.T) {
 	}
 }
 
+func TestBuildGroupRuntimeJSON_NeedsLoginRetainsEgressForLogin(t *testing.T) {
+	value, err := buildGroupRuntimeJSON(testKey(), []grAccount{{
+		AccountID: "account-needs-login", CredentialID: "credential-needs-login",
+		CredentialType: "oauth_account", NeedsLogin: true,
+		ProviderCode: "anthropic", ProtocolType: "anthropic",
+		EgressProxyURL: "http://127.0.0.1:10808", ExternalID: "claude-account-id",
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var material map[string]vkeys.GroupRuntimeAccount
+	if err := json.Unmarshal([]byte(value), &material); err != nil {
+		t.Fatal(err)
+	}
+	account := material["account-needs-login"]
+	if !account.NeedsLogin || account.CredentialID != "credential-needs-login" ||
+		account.EgressProxyURL != "http://127.0.0.1:10808" || account.ExternalID != "claude-account-id" {
+		t.Fatalf("needs-login material dropped login context: %+v", account)
+	}
+	if account.SecretCiphertext != "" || account.SecretNonce != "" {
+		t.Fatalf("needs-login material must not contain secret ciphertext: %+v", account)
+	}
+}
+
 func decryptSecret(t *testing.T, key []byte, a vkeys.GroupRuntimeAccount) string {
 	t.Helper()
 	nonce, err := base64.StdEncoding.DecodeString(a.SecretNonce)

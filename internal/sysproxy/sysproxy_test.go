@@ -227,13 +227,17 @@ func TestObserve_ReadFailureKeepsLastKnown(t *testing.T) {
 }
 
 func TestEnvAuthoritative_WatcherInert(t *testing.T) {
+	t.Setenv("HTTPS_PROXY", "http://127.0.0.1:7890")
+	t.Setenv("https_proxy", "")
+	t.Setenv("NO_PROXY", "")
+	t.Setenv("no_proxy", "")
 	reads := 0
 	w := newWatcherForTest(func() (Snapshot, error) { reads++; return Snapshot{HTTP: "http://x:1"}, nil }, true)
 	if reads != 0 {
 		t.Fatal("env-authoritative watcher must not even prime from the OS")
 	}
-	if got := w.BrokerEgressURL(); got != "" {
-		t.Fatalf("env-authoritative BrokerEgressURL must be empty, got %q", got)
+	if got := w.BrokerEgressURL(); got != "http://127.0.0.1:7890" {
+		t.Fatalf("env-authoritative BrokerEgressURL=%q, want resolved proxy.env URL", got)
 	}
 	// Run must return immediately (no poll loop) even with a live context.
 	done := make(chan struct{})
@@ -242,6 +246,20 @@ func TestEnvAuthoritative_WatcherInert(t *testing.T) {
 	case <-done:
 	case <-time.After(2 * time.Second):
 		t.Fatal("Run must be inert when env config is authoritative")
+	}
+}
+
+func TestBrokerEgressURL_ResolvesExplicitEnvWithoutClientFallback(t *testing.T) {
+	t.Setenv("HTTPS_PROXY", "http://127.0.0.1:10808")
+	t.Setenv("https_proxy", "")
+	t.Setenv("NO_PROXY", "")
+	t.Setenv("no_proxy", "")
+	w := newWatcherForTest(func() (Snapshot, error) {
+		t.Fatal("explicit env must keep the OS watcher inert")
+		return Snapshot{}, nil
+	}, true)
+	if got := w.BrokerEgressURL(); got != "http://127.0.0.1:10808" {
+		t.Fatalf("BrokerEgressURL=%q, want explicit proxy.env URL", got)
 	}
 }
 

@@ -18,9 +18,11 @@
 //   - One dedicated reader goroutine per spawn drains the child's stdout and
 //     demuxes each response to its waiting request by a 4-byte request-id.
 //   - Detect/ListPacks are ASYNC: assign a req-id, register a pending channel,
-//     write the request (writeMu serializes the pipe write), then wait on the
-//     channel up to the per-call timeout. Many Detects can be in flight at once
-//     on a single pipe, so the child (with its own internal worker pool) can
+//     write the request (the pipeSession's write permit serializes the pipe
+//     write), then wait on that channel. BOTH halves — getting the request out
+//     and waiting for the reply — are bounded by the per-call timeout; the write
+//     half being unbounded was the 2026-08-13 P0. Many Detects can be in flight at
+//     once on a single pipe, so the child (with its own internal worker pool) can
 //     process them concurrently and reply out of order.
 //   - Degraded fallback on any IO error; bounded lazy self-heal on the next call.
 //
@@ -109,15 +111,87 @@ type childResponse struct {
 // type, which makes any change a compile error on both sides.
 type wireMaskMeta = pipewire.MaskMeta
 
+// pipeSession owns ONE spawn generation's stdin channel: the buffered writer,
+// the OS pipe FD, and the single-slot permit that serializes frame writes.
+//
+// WHY this is a per-generation value instead of the (stdin + stdinPipe +
+// writeMu) triple that used to live on ChildHook —
+// workflow/CI/bugfix/20260813-childhook-write-before-deadline-wedges-main-path.md
+// (P0, 2026-08-13):
+//
+// A child that is ALIVE BUT NOT READING (ai-compliance-detector takes its worker
+// semaphore INSIDE the stdin read loop, and AIKEY_COMPLIANCE_WORKERS defaults to
+// 1, so a single in-flight detection stops it draining stdin) fills the OS pipe
+// buffer, after which write(2) blocks forever. When that blocking state lived on
+// the hook it poisoned the hook itself: Shutdown and restart both had to take the
+// same writeMu to close the FD, so process exit and self-heal were wedged
+// together with the user's request — one sick side-car welded the whole main path
+// shut.
+//
+// Scoping the state to a session gives two properties that fix that structurally:
+//
+//   - A stuck writer can only ever poison the generation it belongs to, and that
+//     generation is retired the moment a write deadline trips. Nothing a new
+//     generation needs is held by the old one.
+//   - close() deliberately takes no permit, so closing the FD is never blocked by
+//     an in-flight write. Closing the write end is also what UNBLOCKS that write
+//     (Go's poller evicts pending I/O on Close), so the abandoned write goroutine
+//     returns instead of leaking.
+type pipeSession struct {
+	w    *bufio.Writer
+	pipe io.WriteCloser
+	// writeSlot is a 1-capacity semaphore rather than a sync.Mutex because
+	// acquiring it MUST be abortable by the caller's ctx: with a Mutex, the second
+	// caller queued behind a wedged writer blocks in Lock() with no deadline of
+	// its own — that is how "the 4th request onward hangs forever" happened.
+	writeSlot chan struct{}
+	// broken marks the frame stream unusable. Set when a write is abandoned
+	// mid-frame: an unknown prefix of that frame may already sit in the pipe, so
+	// every later frame would be parsed at the wrong offset by the child. A broken
+	// session is never written to again — it is torn down and respawned.
+	broken    atomic.Bool
+	closeOnce sync.Once
+}
+
+// close shuts the write end of the pipe. Idempotent and permit-free — see the
+// type comment: being callable while a write is stuck is the whole point.
+func (s *pipeSession) close() {
+	s.closeOnce.Do(func() { _ = s.pipe.Close() })
+}
+
 // ChildHook is a generic Hook that delegates to a spawned child binary.
 type ChildHook struct {
-	cmd       *exec.Cmd
-	stdin     *bufio.Writer
-	stdinPipe io.WriteCloser
-	pending   map[uint32]chan *childResponse
+	cmd     *exec.Cmd
+	pending map[uint32]chan *childResponse
+	// session is the current generation's stdin channel, swapped atomically on
+	// spawn/restart/shutdown so readers of it never block behind a stuck write.
+	session atomic.Pointer[pipeSession]
 	// status is atomically swapped so Status() is wait-free.
 	status atomic.Pointer[Status]
-	cfg    ChildHookConfig
+	// contentVersion is the fingerprint of the child's effective CONTENT set (its
+	// hot-swappable ruleset), refreshed by a background poll. nil = unknown.
+	// Deliberately separate from status.Version, which describes the BINARY and
+	// therefore cannot move when the child swaps packs in place. See
+	// contentversion.go for the whole mechanism.
+	contentVersion atomic.Pointer[string]
+	// contentVersionReason records WHY contentVersion is nil, as one of the
+	// contentVersionReason* constants. nil = never polled.
+	//
+	// WHY a separate reason and not just "unknown": the two unknown causes have
+	// OPPOSITE operator actions. A child that is degraded needs a restart; a child
+	// that is alive and simply too old to answer op=ListPacks needs an UPGRADE,
+	// and until then the proxy runs with its verdict cache switched off (96% hit
+	// rate → 0) as a pure, silent latency regression (review finding B6). Both
+	// used to collapse into the same nil pointer, so the endpoint could report
+	// "cache off" but never "and here is the one command that fixes it".
+	contentVersionReason atomic.Pointer[string]
+	// pollStop / pollOnce / stopPollOnce own the content-version poll's lifetime.
+	// It is started once on the first successful spawn and stopped once on
+	// Shutdown; both entry points are idempotent because their callers are.
+	pollStop     chan struct{}
+	pollOnce     sync.Once
+	stopPollOnce sync.Once
+	cfg          ChildHookConfig
 	gen    atomic.Uint64 // spawn generation; the reader tied to an older gen won't clobber a newer spawn's state
 	// lastRecoverAt (unix nano) gates the lazy self-heal: when degraded, the next
 	// request synchronously restarts the child, but a storm of requests must not
@@ -125,10 +199,6 @@ type ChildHook struct {
 	lastRecoverAt atomic.Int64
 	// mu protects spawn/exit state transitions (cmd, generation).
 	mu sync.Mutex
-	// writeMu serializes frame writes to the child's stdin AND guards the stdin
-	// pointer (replaced on spawn/restart). Reads happen on a separate pipe owned
-	// by the reader goroutine, so writes and reads never contend.
-	writeMu sync.Mutex
 	// pending holds in-flight requests keyed by request-id. The reader delivers
 	// each response to pending[id]; a timed-out caller removes its own entry.
 	pendingMu sync.Mutex
@@ -142,11 +212,11 @@ type ChildHook struct {
 func NewChildHook(in *ChildHookConfig) *ChildHook {
 	cfg := *in // copy so applyDefaults never mutates the caller's value
 	cfg.applyDefaults()
-	h := &ChildHook{cfg: cfg, pending: make(map[uint32]chan *childResponse)}
+	h := &ChildHook{cfg: cfg, pending: make(map[uint32]chan *childResponse), pollStop: make(chan struct{})}
 	h.degraded.Store(true) // start degraded; flip after successful Start
 	h.status.Store(&Status{
 		Healthy:        false,
-		DegradedReason: "not_started",
+		DegradedReason: DegradeReasonNotStarted,
 		BinaryPath:     cfg.BinaryPath,
 	})
 	return h
@@ -243,10 +313,11 @@ func (h *ChildHook) spawnLocked(ctx context.Context) error {
 	case version := <-readyCh:
 		h.cmd = cmd
 		gen := h.gen.Add(1) // bump generation; the reader below is tied to it
-		h.writeMu.Lock()
-		h.stdin = bufio.NewWriterSize(stdin, 64*1024)
-		h.stdinPipe = stdin
-		h.writeMu.Unlock()
+		h.session.Store(&pipeSession{
+			w:         bufio.NewWriterSize(stdin, 64*1024),
+			pipe:      stdin,
+			writeSlot: make(chan struct{}, 1),
+		})
 		h.degraded.Store(false)
 		h.status.Store(&Status{
 			Healthy:       true,
@@ -259,6 +330,11 @@ func (h *ChildHook) spawnLocked(ctx context.Context) error {
 		// pipe closes (process killed on restart/shutdown); a stale (older-gen)
 		// reader exiting won't clobber a newer spawn (gen check in readLoop).
 		go h.readLoop(bufio.NewReaderSize(stdout, 64*1024), gen)
+		// Track the child's hot-swappable content set from here on. Started after
+		// the pipe is live (it talks over the same pipe) and only once: the poll
+		// outlives spawn generations because a restart replaces the pipe, not the
+		// content set. See contentversion.go.
+		h.startContentVersionPoll()
 		return nil
 	case <-time.After(h.cfg.ReadyTimeout):
 		_ = cmd.Process.Kill()
@@ -373,17 +449,22 @@ func (h *ChildHook) restart(ctx context.Context) error {
 		_ = h.cmd.Wait()
 		h.cmd = nil
 	}
-	h.writeMu.Lock()
-	if h.stdinPipe != nil {
-		_ = h.stdinPipe.Close()
+	// Retire the old generation's pipe. Swapping to nil makes writes fail fast
+	// ("stdin closed") until spawnLocked installs a fresh session, and close()
+	// needs no write permit — so a child wedged mid-write can no longer block its
+	// own replacement, which is what made the self-heal path unreachable
+	// (bugfix 20260813-childhook-write-before-deadline-wedges-main-path.md).
+	//
+	// Not marked `broken`: that flag means "frame stream desynced by an abandoned
+	// write", and a caller racing this restart deserves the accurate
+	// "write_failed: file already closed" rather than a fabricated write timeout.
+	if s := h.session.Swap(nil); s != nil {
+		s.close()
 	}
-	h.stdin = nil // writes fail until spawnLocked sets a fresh stdin
-	h.stdinPipe = nil
-	h.writeMu.Unlock()
 	old := h.status.Load()
 	h.status.Store(&Status{
 		Healthy:        false,
-		DegradedReason: "restarting",
+		DegradedReason: DegradeReasonRestarting,
 		BinaryPath:     h.cfg.BinaryPath,
 		Version:        old.Version,
 		LastSpawnedAt:  old.LastSpawnedAt,
@@ -398,6 +479,38 @@ func (h *ChildHook) restart(ctx context.Context) error {
 // request stalls ≤ lazyRestartBound. On success h.degraded is cleared and the
 // caller proceeds with a fresh pipe; on failure the caller fails open and the
 // next request (after the cooldown) retries.
+// nudgeRecover is THE trigger for the request-driven self-heal. Every caller
+// that observes a degraded child goes through here; nobody starts lazyRecover
+// directly.
+//
+// 🔴 WHY IT IS A NAMED ENTRY POINT AND NOT AN INLINE `go h.lazyRecover()`
+// (2026-08-14, review finding B39). The self-heal used to be reachable from
+// exactly one place — roundtrip, i.e. a request that was ALREADY being handed
+// to the broken child. Once FilterPool.pick() stopped routing user content to
+// degraded workers (which it had to: that content was being forwarded upstream
+// un-inspected), that single trigger would have disappeared with it and a
+// transient degrade would have become a permanent amputation. Splitting the
+// TRIGGER from the PAYLOAD is what resolves that: the pool nudges the workers it
+// skips, so traffic still drives recovery — it just no longer pays for it with a
+// request's worth of un-inspected content.
+//
+// Non-blocking and self-throttling: the cooldown is checked before the goroutine
+// is created (pick() calls this on the hot path, so a storm of requests against
+// a dead pool must not become a storm of goroutines), and lazyRecover re-checks
+// it under CAS so this pre-check can never over-admit.
+func (h *ChildHook) nudgeRecover() {
+	if !h.degraded.Load() || !h.recoverDue() {
+		return
+	}
+	go h.lazyRecover()
+}
+
+// recoverDue reports whether the cooldown since the last respawn attempt has
+// elapsed. Advisory only — lazyRecover re-tests it under CAS.
+func (h *ChildHook) recoverDue() bool {
+	return time.Now().UnixNano()-h.lastRecoverAt.Load() >= int64(recoverCooldown)
+}
+
 func (h *ChildHook) lazyRecover() {
 	now := time.Now().UnixNano()
 	last := h.lastRecoverAt.Load()
@@ -427,8 +540,14 @@ func (h *ChildHook) roundtrip(ctx context.Context, op, routeClass byte, body []b
 	// is cooldown/CAS-guarded, so concurrent Detects spawn at most one restart;
 	// once it clears `degraded`, the NEXT Detect uses the recovered child.
 	if h.degraded.Load() {
-		go h.lazyRecover()
+		h.nudgeRecover()
 		return nil, errDegraded
+	}
+
+	s := h.session.Load()
+	if s == nil {
+		h.markDegraded("write_failed: stdin closed")
+		return nil, errStdinClosed
 	}
 
 	reqID := h.nextReqID.Add(1)
@@ -443,9 +562,8 @@ func (h *ChildHook) roundtrip(ctx context.Context, op, routeClass byte, body []b
 		ReqID:      reqID,
 		Prompt:     string(body),
 	})
-	if err := h.writeFrame(payload); err != nil {
+	if err := h.writeFrame(ctx, s, payload); err != nil {
 		h.removePending(reqID)
-		h.markDegraded("write_failed: " + err.Error())
 		return nil, err
 	}
 
@@ -458,7 +576,82 @@ func (h *ChildHook) roundtrip(ctx context.Context, op, routeClass byte, body []b
 	}
 }
 
-var errDegraded = errors.New("apphook: child degraded")
+// The Status().DegradedReason values a ChildHook sets on its own. EXPORTED as
+// of 2026-08-13 because they stopped being an internal log label: they are now
+// projected onto GET /v1/diagnostics/pipeline and `ak doctor` branches on them
+// to choose between "restart the proxy" and "the child never started", so they
+// are an external contract and belong in an enum rather than as literals at the
+// raise site (logging-conventions: reasons are enumerated).
+//
+// Not exhaustive — the dynamic causes stay prefixed free-form strings
+// (`not_installed: <stat error>`, `write_failed: …`, `listpacks_failed: …`)
+// because the operator needs the underlying OS error verbatim. Readers must
+// therefore match these constants exactly and treat anything else as
+// "degraded, cause as reported", never as "unknown state".
+const (
+	// DegradeReasonWriteTimeout: the request frame could not be handed to the
+	// child within the call deadline — the child is ALIVE but has stopped reading
+	// its pipe, so the OS buffer filled up (bugfix
+	// 20260813-childhook-write-before-deadline-wedges-main-path). Distinct from a
+	// crash: the process is still there and `ps` shows it running.
+	DegradeReasonWriteTimeout = "write_timeout"
+	// DegradeReasonNotStarted: the hook was constructed but Start has never
+	// succeeded. NOT the same failure as a wedge — nothing was ever spawned —
+	// and conflating the two was exactly what `ak doctor` had to do while
+	// `available:false` was the only external signal.
+	DegradeReasonNotStarted = "not_started"
+	// DegradeReasonRestarting: a restart is in flight. Transient by construction;
+	// a surface that renders it as a hard fault will flap.
+	DegradeReasonRestarting = "restarting"
+)
+
+var (
+	errDegraded    = errors.New("apphook: child degraded")
+	errStdinClosed = errors.New("apphook: stdin closed")
+	// errWriteTimeout means the request frame could not be pushed into the child's
+	// pipe before the deadline — the child is alive but has stopped reading, so
+	// the OS pipe buffer is full. Distinct from a plain ctx.DeadlineExceeded
+	// because it also implies the frame stream is no longer trustworthy.
+	errWriteTimeout = errors.New("apphook: write to child timed out (pipe wedged — child alive but not reading)")
+)
+
+// writeFrame hands one frame to the child under the caller's deadline and owns
+// what happens when that deadline expires.
+//
+// WHY the whole session is retired on timeout rather than just failing the call
+// (bugfix 20260813-childhook-write-before-deadline-wedges-main-path.md):
+//
+//   - Frame integrity: the abandoned write may have pushed an arbitrary PREFIX of
+//     the frame into the pipe. Reusing the stream would make the child parse every
+//     subsequent frame at the wrong offset. There is no way to resynchronise a
+//     byte-stream protocol from the writer side, so the only correct move is to
+//     declare the pipe dead and rebuild it.
+//   - Self-heal: markDegraded is the ONLY trigger for lazyRecover, and it used to
+//     fire exclusively on a write ERROR. A blocked write returns no error, so a
+//     wedged child stayed marked healthy forever and kept being fed requests.
+//   - Liveness: close() is what makes the abandoned write return, so this is also
+//     the goroutine-leak guard.
+//
+// s is passed in (rather than re-read from h.session) so a concurrent restart
+// that already installed a FRESH session cannot be torn down by a stale timeout.
+func (h *ChildHook) writeFrame(ctx context.Context, s *pipeSession, payload []byte) error {
+	err := s.writeFrame(ctx, payload)
+	switch {
+	case err == nil:
+		return nil
+	case errors.Is(err, errWriteTimeout):
+		// Order is load-bearing: broken BEFORE close. The stuck writer releases the
+		// permit only after close() unblocks its syscall, so any caller still queued
+		// for that permit is guaranteed to observe broken == true when it wakes up,
+		// and reports write_timeout instead of a confusing "file already closed".
+		s.broken.Store(true)
+		s.close()
+		h.markDegraded(DegradeReasonWriteTimeout)
+	default:
+		h.markDegraded("write_failed: " + err.Error())
+	}
+	return err
+}
 
 // Detect implements Hook. Async: writes a request and waits for the matching
 // response, allowing many concurrent in-flight Detects on one pipe.
@@ -533,13 +726,35 @@ var ErrPacksUnavailable = errors.New("apphook: effective packs unavailable")
 func (h *ChildHook) ListPacks(ctx context.Context) ([]byte, error) {
 	ctx, cancel := context.WithTimeout(ctx, h.cfg.Timeout)
 	defer cancel()
+	return h.listPacks(ctx, true)
+}
 
+// listPacks is the shared core. markOnErr distinguishes the two callers:
+//
+//   - ListPacks (operator-initiated, GET /admin/compliance/packs) passes true —
+//     someone asked a direct question and got no answer, which is a health signal
+//     about this child and belongs in DegradedReason.
+//   - the content-version poll (contentversion.go) passes false. It runs every
+//     15s on its own schedule, and a transient failure there must not re-label a
+//     child that is happily serving Detect as degraded, which would take it out
+//     of the FilterPool's healthy set and trigger a respawn on the data plane.
+//     Its own failure signal is EventAppHookContentVersionUnknown plus the
+//     caller's cache going fail-safe — both louder than a reused status string.
+//
+// ctx must already carry the caller's deadline.
+func (h *ChildHook) listPacks(ctx context.Context, markOnErr bool) ([]byte, error) {
 	resp, err := h.roundtrip(ctx, pipewire.OpListPacks, pipewire.RouteClassPersonal, nil)
 	if err != nil {
 		if errors.Is(err, errDegraded) {
 			return nil, ErrPacksUnavailable
 		}
-		h.markDegraded("listpacks_failed: " + err.Error())
+		if markOnErr && !errors.Is(err, errWriteTimeout) {
+			// A write timeout already recorded its own precise reason
+			// (DegradeReasonWriteTimeout) inside writeFrame; re-marking here would
+			// bury the actual cause under a generic "listpacks_failed" label and cost
+			// the operator the one clue that says "the child stopped reading".
+			h.markDegraded("listpacks_failed: " + err.Error())
+		}
 		return nil, err
 	}
 	// A child that doesn't implement op=4 returns an empty report → unavailable.
@@ -550,12 +765,45 @@ func (h *ChildHook) ListPacks(ctx context.Context) ([]byte, error) {
 }
 
 // Status implements Hook.
+//
+// The stored snapshot describes the PROCESS; the content-version fields are
+// composed here from the poll's own atomics rather than stored, because every
+// spawn/restart/degrade path rebuilds the snapshot from scratch and a stored
+// copy would be dropped by whichever path a future change forgets to carry it
+// through. Returning a copy also stops a caller from mutating shared state.
 func (h *ChildHook) Status() *Status {
-	return h.status.Load()
+	s := *h.status.Load()
+	s.ContentVersion, s.ContentVersionReason = h.contentVersionState()
+	return &s
 }
+
+// eligibleForDispatch reports whether this child should be handed user content
+// right now. It is the dispatch-side reading of the SAME `Healthy` bit that
+// Status() publishes and that /v1/diagnostics/pipeline renders as
+// `workers[i].healthy`, so the endpoint can never say "worker 1 is down" while
+// the dispatcher keeps feeding worker 1 (review finding B39: it used to say
+// exactly that).
+//
+// 🔴 Why the raw `status` pointer and not Status(): Status() copies the struct
+// and derives the content-version fields, i.e. it allocates. This runs on the
+// hot path once per candidate worker per request, where a plain atomic load
+// must stay a plain atomic load. Same bit, no allocation.
+//
+// Restart windows resolve in the safe direction on their own: restart() stores
+// Healthy=false / DegradeReasonRestarting before spawning, so a child being
+// replaced is skipped for exactly as long as it is unusable, and re-enters
+// rotation on the spawn that sets Healthy=true. The opposite window (Healthy
+// still true for the microseconds between the child dying and the read loop
+// noticing) is not new and is absorbed by the existing fail-open path.
+func (h *ChildHook) eligibleForDispatch() bool { return h.status.Load().Healthy }
 
 // Shutdown closes the pipe and waits for the child to exit. Idempotent.
 func (h *ChildHook) Shutdown(ctx context.Context) error {
+	// Stop the content-version poll BEFORE the early return: a hook that never
+	// spawned still has to release its goroutine, and a hook that did must not
+	// keep polling a pipe we are about to close (which would only manufacture a
+	// spurious "cannot state its content set" WARN on the way out).
+	h.stopContentVersionPoll()
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	if h.cmd == nil {
@@ -566,26 +814,42 @@ func (h *ChildHook) Shutdown(ctx context.Context) error {
 	// EOF in the child's read loop. The detector uses that EOF to flush its
 	// compliance intake queue before exit. Sending SIGINT first skips Go's
 	// normal return path and can lose an already-applied Mask/Block audit event.
-	h.writeMu.Lock()
-	if h.stdin != nil {
-		_ = h.stdin.Flush()
+	if s := h.session.Swap(nil); s != nil {
+		// Best-effort flush, acquired NON-BLOCKINGLY. Two reasons, both mandatory:
+		// (a) if a write is in flight the buffer may hold half a frame, and pushing
+		// that out would hand the child a corrupt prefix — skipping is the correct
+		// behavior, not a shortcut; (b) a wedged writer holds the permit forever,
+		// and blocking here is precisely the P0 (`Shutdown` never returned, leaving
+		// `kill -9` as the only way to restart the proxy). Every completed
+		// writeFrame flushes on its own, so on the normal path the buffer is
+		// already empty and this is belt-and-braces.
+		select {
+		case s.writeSlot <- struct{}{}:
+			_ = s.w.Flush()
+			<-s.writeSlot
+		default:
+		}
+		s.close()
 	}
-	if h.stdinPipe != nil {
-		_ = h.stdinPipe.Close()
-	}
-	h.stdin = nil
-	h.stdinPipe = nil
-	h.writeMu.Unlock()
 
+	// Bind the process to a local BEFORE handing it to the waiter goroutine. The
+	// goroutine used to dereference h.cmd itself, which races with the `h.cmd = nil`
+	// below whenever the reaper does not win the select — and a child that ignores
+	// stdin EOF (the wedged case this whole file now guards against) is exactly the
+	// child that makes the timeout/ctx branches the normal outcome. Latent since
+	// the reaper goroutine was introduced; only observable once a test shut down a
+	// child that does not exit on EOF. Caught by
+	// TestChildHook_WedgedChildIsReplacedByLazyRecover under -race.
+	cmd := h.cmd
 	done := make(chan error, 1)
-	go func() { done <- h.cmd.Wait() }()
+	go func() { done <- cmd.Wait() }()
 
 	select {
 	case <-done:
 	case <-time.After(2 * time.Second):
-		_ = h.cmd.Process.Kill()
+		_ = cmd.Process.Kill()
 	case <-ctx.Done():
-		_ = h.cmd.Process.Kill()
+		_ = cmd.Process.Kill()
 		return ctx.Err()
 	}
 
@@ -594,26 +858,62 @@ func (h *ChildHook) Shutdown(ctx context.Context) error {
 	return nil
 }
 
-// writeFrame writes [version][len][payload] then flushes, under writeMu (which
-// also guards the stdin pointer against spawn/restart replacement).
-func (h *ChildHook) writeFrame(payload []byte) error {
-	h.writeMu.Lock()
-	defer h.writeMu.Unlock()
-	w := h.stdin
-	if w == nil {
-		return errors.New("stdin closed")
-	}
+// writeFrame writes [version][len][payload] then flushes, bounded by ctx.
+//
+// WHY the deadline lives HERE and not only around the reply wait
+// (bugfix 20260813-childhook-write-before-deadline-wedges-main-path.md): a child
+// that stopped draining stdin fills the OS pipe buffer and write(2) blocks with
+// no error and no timeout of its own. roundtrip() used to write unconditionally
+// and only then select on ctx, so the configured Timeout guarded the half of the
+// exchange that could not hang and left the half that could completely unguarded.
+//
+// Two structural consequences are deliberate:
+//
+//   - The permit is released ONLY by the goroutine that actually finishes the
+//     write, never by an abandoning caller. A second writer must not be able to
+//     interleave its bytes into a half-written frame.
+//   - Returning errWriteTimeout is a statement about the STREAM, not about this
+//     one call: the caller must retire the session (see roundtrip). Do not
+//     "downgrade" this to a retry.
+func (s *pipeSession) writeFrame(ctx context.Context, payload []byte) error {
 	if len(payload) > math.MaxUint32 {
 		return fmt.Errorf("payload too large for frame header: %d bytes", len(payload))
 	}
-	// pipewire stamps the version we compiled against. cfg.ProtocolVersion is the
-	// version we EXPECT BACK from the child (checked in readFrame) — the two are
-	// the same value today, and separating them keeps "what we speak" owned by
-	// the shared contract rather than by a proxy-side config knob.
-	if _, err := w.Write(pipewire.EncodeFrame(payload)); err != nil {
-		return err
+	if s.broken.Load() {
+		return errWriteTimeout
 	}
-	return w.Flush()
+	select {
+	case s.writeSlot <- struct{}{}:
+	case <-ctx.Done():
+		// The permit holder is stuck mid-frame; the stream is unusable regardless
+		// of how long we wait, so report the same verdict rather than a generic
+		// deadline error.
+		return errWriteTimeout
+	}
+	if s.broken.Load() { // retired while we queued for the permit
+		<-s.writeSlot
+		return errWriteTimeout
+	}
+
+	done := make(chan error, 1) // buffered: an abandoned write must not leak on send
+	go func() {
+		// pipewire stamps the version we compiled against. cfg.ProtocolVersion is
+		// the version we EXPECT BACK from the child (checked in readFrame) — the two
+		// are the same value today, and separating them keeps "what we speak" owned
+		// by the shared contract rather than by a proxy-side config knob.
+		_, err := s.w.Write(pipewire.EncodeFrame(payload))
+		if err == nil {
+			err = s.w.Flush()
+		}
+		<-s.writeSlot
+		done <- err
+	}()
+	select {
+	case err := <-done:
+		return err
+	case <-ctx.Done():
+		return errWriteTimeout
+	}
 }
 
 // readFrame reads [version][len][payload] from r (the reader goroutine's stdout)

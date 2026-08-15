@@ -33,12 +33,15 @@ type FilterTarget interface {
 var (
 	_ FilterTarget = (*ChildHook)(nil)
 	_ FilterTarget = (*FilterPool)(nil)
+	// The pool is the ONLY multi-unit FilterTarget; ChildHook deliberately does
+	// not implement MultiUnit (apphook.WorkerStatuses wraps it as a pool of one).
+	_ MultiUnit = (*FilterPool)(nil)
 )
 
-// FilterPool dispatches across M ChildHooks round-robin. Round-robin (not
-// least-loaded) is sufficient because each ChildHook absorbs concurrent Detects
-// internally — the pool only needs to spread the steady-state load and provide
-// process isolation.
+// FilterPool dispatches across M ChildHooks round-robin, skipping workers that
+// are not currently fit to inspect (see pick). Round-robin (not least-loaded) is
+// sufficient because each ChildHook absorbs concurrent Detects internally — the
+// pool only needs to spread the steady-state load and provide process isolation.
 type FilterPool struct {
 	name    string
 	workers []*ChildHook
@@ -53,12 +56,64 @@ func NewFilterPool(name string, workers []*ChildHook) *FilterPool {
 // Name implements Hook.
 func (p *FilterPool) Name() string { return p.name }
 
+// pick returns the worker that serves the next call, skipping workers that are
+// currently unfit to inspect anything — and nudging each one it skips to
+// self-heal.
+//
+// 🔴 WHY IT SKIPS (review finding B39, live evidence 2026-08-14). Round-robin
+// used to include dead workers. Measured on a live 3-worker pool with worker 1
+// killed: 4 of 12 requests were dispatched to the corpse, where Detect fails
+// open, and their content was forwarded to the upstream LLM with the PII intact
+// — leak positions [1 4 7 10], the period-3 fingerprint of the cursor below.
+// The health endpoint reported `partial` correctly; the data plane simply did
+// not act on it. A pool at 2/3 must lose 0% of coverage, not 33%.
+//
+// 🔴 WHY IT ALSO NUDGES — the self-heal paradox. lazyRecover is triggered BY
+// REQUESTS (see nudgeRecover). "Just skip the dead ones" would therefore remove
+// the only thing that ever woke them: the degrade would stop being transient and
+// become permanent, trading a visible bug for a much harder one. The resolution
+// is to split the TRIGGER from the PAYLOAD — every request still drives recovery
+// for the workers it passes over, but no request's content is spent on a worker
+// that cannot inspect it. The scan starts at a rotating offset, so each worker is
+// the scan's first element once per M picks and therefore gets nudged within M
+// requests of any traffic at all. No timer is involved (定时器挂掉 = 不可用).
+//
+// 🔴 WHY THE ALL-DEAD CASE STILL RETURNS A WORKER. 不阻塞用户流程 outranks
+// detection. With no fit worker the pool falls back to the round-robin choice and
+// lets it take the existing fail-open path (ChildHook.Detect → Allow +
+// Degraded=true), so the user's request is served, the outage is counted, and
+// /v1/diagnostics/pipeline reports `degraded 0/M`. Returning nil, refusing, or
+// waiting for a respawn would each turn a detector outage into a user outage.
+// (The mandated-org case that genuinely must refuse traffic is enforced far
+// upstream by supervisor `declaredButMissing`, not here.)
+//
+// Cost: one atomic load per candidate. Best case (a healthy worker at the cursor)
+// is one load — the same order as the pre-fix version. Worst case is M loads,
+// and M is the operator-set worker count.
 func (p *FilterPool) pick() *ChildHook {
-	if len(p.workers) == 1 {
+	n := uint64(len(p.workers))
+	if n == 1 {
+		// Personal / Trial. Nothing to route around, and ChildHook.roundtrip
+		// already nudges its own recovery, so the scan below would be pure cost.
 		return p.workers[0]
 	}
-	i := p.next.Add(1)
-	return p.workers[i%uint64(len(p.workers))]
+	start := p.next.Add(1)
+	var fallback *ChildHook
+	for off := uint64(0); off < n; off++ {
+		w := p.workers[(start+off)%n]
+		if w.eligibleForDispatch() {
+			return w
+		}
+		if fallback == nil {
+			// The worker the cursor actually landed on. Keeping it as the all-dead
+			// fallback preserves round-robin fairness in that state, so an
+			// all-degraded pool spreads its respawn attempts instead of hammering one
+			// child.
+			fallback = w
+		}
+		w.nudgeRecover()
+	}
+	return fallback
 }
 
 // Detect implements Hook — routes to the next worker round-robin.
@@ -73,8 +128,40 @@ func (p *FilterPool) ListPacks(ctx context.Context) ([]byte, error) {
 	return p.pick().ListPacks(ctx)
 }
 
+// WorkerStatuses implements MultiUnit — one Status per process, in dispatch
+// order, so a health surface can name WHICH worker is down and WHY instead of
+// reading the pool's collapsed verdict.
+//
+// 🔴 Dispatch order is load-bearing, not cosmetic: pick() walks this exact slice
+// from a rotating cursor, so index i here IS dispatch slot i. An operator
+// reading "worker 1 is down" is reading "the slot that would otherwise take
+// ≈1/M of the load is out, and the survivors are absorbing its share". Do not
+// sort, filter or de-duplicate here.
+//
+// Machine-checked, not just asserted in prose: TestFence_WorkerStatusesIndexIsTheDispatchSlot
+// (filterpool_dispatch_order_test.go) pins index ↔ slot. Live evidence
+// 2026-08-14: killing workers[1] of a 3-worker pool produced fail-opens at
+// request positions 1, 4, 7, 10 — period 3, phase 1.
+func (p *FilterPool) WorkerStatuses() []*Status {
+	out := make([]*Status, 0, len(p.workers))
+	for _, w := range p.workers {
+		out = append(out, w.Status())
+	}
+	return out
+}
+
 // Status implements Hook — healthy iff ≥1 worker is healthy (the pool keeps
 // serving while any process survives).
+//
+// 🔴 THIS VERDICT ANSWERS "should the pool keep serving?", NOT "is the pool
+// healthy?". With 1 of 2 workers dead it returns Healthy=true, because the
+// dispatcher must keep using the survivor — and that same true is a FALSE GREEN
+// for any health surface: the operator provisioned 2 processes, is running on 1,
+// and one more failure ends inspection entirely. (Until the 2026-08-14 B39 fix
+// it was worse still: dispatch included the dead worker, so half the traffic was
+// forwarded un-inspected.) Health surfaces MUST go through apphook.WorkerStatuses
+// and grade the per-worker states; the counts embedded in DegradedReason below
+// are for human log lines only and must never be parsed.
 func (p *FilterPool) Status() *Status {
 	healthy := 0
 	var sample *Status

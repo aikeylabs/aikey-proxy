@@ -20,7 +20,6 @@ import (
 	"net"
 	"net/http"
 	"net/url"
-	"os"
 	"strings"
 	"time"
 
@@ -33,14 +32,11 @@ import (
 const egressTestTimeout = 15 * time.Second
 
 // egressTestEchoURL is the "what's my IP" endpoint the probe dials THROUGH the
-// spec to learn the exit IP. AIKEY_EGRESS_TEST_ECHO overrides it — same knob
-// name as the master console test endpoint, so an air-gapped deployment points
-// both at one internal echo.
+// spec to learn the exit IP. Target and env knob come from egress.DefaultEchoURL,
+// the one definition shared with the master console endpoint, so an air-gapped
+// deployment points every probe at one internal echo with one variable.
 func egressTestEchoURL() string {
-	if v := strings.TrimSpace(os.Getenv("AIKEY_EGRESS_TEST_ECHO")); v != "" {
-		return v
-	}
-	return "https://api.ipify.org"
+	return egress.DefaultEchoURL()
 }
 
 // egressTestResult mirrors the master per-account test endpoint's wire shape so

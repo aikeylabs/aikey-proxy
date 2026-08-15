@@ -62,7 +62,7 @@ func TestFetchPoolLoginContext_BindsExactCredential(t *testing.T) {
 		gotAuth = r.Header.Get("Authorization")
 		gotCredential = r.URL.Query().Get("credential_id")
 		w.Header().Set("Content-Type", "application/json")
-		_, _ = w.Write([]byte(`{"credential_id":"c/a","oauth_group_id":"g1","account_id":"a1","provider_code":"openai","expected_identity":"codex@team.com","external_id":"uuid-1"}`))
+		_, _ = w.Write([]byte(`{"credential_id":"c/a","oauth_group_id":"g1","account_id":"a1","provider_code":"openai","effective_egress_url":"socks5://account.example:1080","expected_identity":"codex@team.com","external_id":"uuid-1"}`))
 	}))
 	defer srv.Close()
 
@@ -73,7 +73,7 @@ func TestFetchPoolLoginContext_BindsExactCredential(t *testing.T) {
 	if gotAuth != "Bearer JWT123" || gotCredential != "c/a" {
 		t.Fatalf("request binding lost: auth=%q credential=%q", gotAuth, gotCredential)
 	}
-	if got.ProviderCode != "openai" || got.ExpectedIdentity != "codex@team.com" || got.ExternalID != "uuid-1" {
+	if got.ProviderCode != "openai" || got.EffectiveEgressURL != "socks5://account.example:1080" || got.ExpectedIdentity != "codex@team.com" || got.ExternalID != "uuid-1" {
 		t.Fatalf("context decode mismatch: %+v", got)
 	}
 }

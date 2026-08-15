@@ -20,8 +20,6 @@ import (
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
-	"path/filepath"
-	"runtime"
 	"sort"
 	"strings"
 	"sync"
@@ -30,6 +28,7 @@ import (
 	"time"
 
 	"github.com/AiKeyLabs/aikey-proxy/internal/apphook"
+	"github.com/AiKeyLabs/aikey-proxy/internal/detectortest"
 )
 
 // integSecret: synthetic JWT — a deterministic gitleaks-HP match (`secret.jwt`,
@@ -57,19 +56,20 @@ const integSecret = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiIxMjM0NTY3OD
 // Not a live credential — the body is a repeating pattern.
 var integSelfEvidentKey = "sk-ant-api03-" + strings.Repeat("Ab3Cd4Ef5", 10) + "xyzAA"
 
-func integDetectorBinary() string {
-	_, file, _, _ := runtime.Caller(0)
-	proxyDir := filepath.Dir(filepath.Dir(filepath.Dir(file))) // .../aikey-proxy
-	return filepath.Join(filepath.Dir(proxyDir), "ai-compliance-detector", "bin", "detector")
-}
-
 // startRealDetectorPool spawns the real ai-compliance-detector child (embedded baseline
 // pack) behind a FilterPool, skipping the test if the binary isn't built. Cleanup on test end.
+//
+// The binary comes from detectortest.SiblingBinary, which seals the four
+// $HOME-rooted detector inputs; the seal is then verified against the
+// running child. Both live HERE rather than at the nine call sites so every
+// present and future TestFilterIntegration_* gets the pair for free — the whole
+// point of routing detector spawning through one door.
 func startRealDetectorPool(t *testing.T) *apphook.FilterPool {
 	t.Helper()
+	bin, sealed := detectortest.SiblingBinary(t)
 	ch := apphook.NewChildHook(&apphook.ChildHookConfig{
 		Name:         "ai-compliance-detector-integ",
-		BinaryPath:   integDetectorBinary(),
+		BinaryPath:   bin,
 		BinaryArgs:   nil,              // real engine + embedded baseline pack
 		Timeout:      5 * time.Second,  // NER scan ≫ the 1ms default
 		ReadyTimeout: 20 * time.Second, // CRF model load takes a few seconds
@@ -81,6 +81,7 @@ func startRealDetectorPool(t *testing.T) *apphook.FilterPool {
 		t.Skipf("detector binary unavailable (run 'make -C ../ai-compliance-detector build'): %v", err)
 	}
 	t.Cleanup(func() { _ = pool.Shutdown(context.Background()) })
+	sealed.AssertHeld(t, pool)
 	return pool
 }
 
@@ -381,9 +382,15 @@ func TestFilterIntegration_CredentialLessConnectionURIIsNotBlocked(t *testing.T)
 // IPC overhead is ≪ a real scan (~ms), then batching (which only saves N-1 IPC round-trips)
 // can't help. Also stresses the lock under concurrency. Run via `make filter-integration`.
 func TestFilterIntegration_IPCOverhead(t *testing.T) {
+	// Through the same door as every other detector spawn. --echo-only reads none
+	// of the four $HOME inputs, so the seal is a no-op for this child — but
+	// "harmless here" is exactly how a second, unsealed path gets established, so
+	// there is no exemption. No AssertHeld: an echo child has no engine and
+	// answers op=ListPacks with an empty report, so it cannot report a home.
+	bin, _ := detectortest.SiblingBinary(t)
 	ch := apphook.NewChildHook(&apphook.ChildHookConfig{
 		Name:         "ai-compliance-detector-echo",
-		BinaryPath:   integDetectorBinary(),
+		BinaryPath:   bin,
 		BinaryArgs:   []string{"--echo-only"}, // skip rule load + scan → PURE IPC
 		Timeout:      2 * time.Second,
 		ReadyTimeout: 15 * time.Second,

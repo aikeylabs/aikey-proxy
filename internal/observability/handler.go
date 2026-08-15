@@ -16,6 +16,18 @@ const (
 	EventProxyListenerBound  = "proxy.listener.bound"
 )
 
+// Browserless pool-login events. These never carry a session key or token;
+// only stable operation metadata is logged.
+const (
+	EventProxyPoolSessionKeyExchangeFailed     = "proxy.pool.session_key_exchange_failed"
+	EventProxyPoolSessionKeyIdentityMismatch   = "proxy.pool.session_key_identity_mismatch"
+	EventProxyPoolSessionKeyWritebackFailed    = "proxy.pool.session_key_writeback_failed"
+	EventProxyPoolSessionKeyRuntimeSyncPending = "proxy.pool.session_key_runtime_sync_pending"
+
+	ErrCodeProxyPoolSessionKeyWritebackFailed    = "SESSION_KEY_WRITEBACK_FAILED"
+	ErrCodeProxyPoolSessionKeyRuntimeSyncPending = "SESSION_KEY_RUNTIME_SYNC_PENDING"
+)
+
 // Signal uplink events. The data plane remains non-blocking; these names make
 // durable auth-failure outbox and best-effort trend upload failures queryable.
 const (
@@ -203,6 +215,79 @@ const (
 	// debugging "why is there no compliance event for this request" can see the
 	// reason instead of inferring it from silence. Carries no content.
 	EventProxyFilterProbeExcluded = "proxy.filter.probe_excluded"
+	// EventProxyFilterInputTruncated: one or more content pieces in THIS request
+	// were longer than the detector's input cap (proxy pipeInputCap, 16 KiB), so
+	// only their leading bytes were scanned and the remaining tail was forwarded
+	// to the upstream LLM WITHOUT ever being inspected.
+	//
+	// WHY it exists (2026-08-13, bugfix 20260813-pipe-input-cap-truncates-silently):
+	// the cap itself is a deliberate, correct trade-off (the detector's own NLP
+	// input cap is the same 16 KiB, and a huge piece stalls/desyncs the IPC), but
+	// it used to happen with ZERO signal — no log, no counter, no event. Nothing
+	// in the system could answer "how much content did this deployment never
+	// scan?", while the far rarer "rule skipped because RE2 rejected it" already
+	// had a startup banner plus a per-rule WARN. That asymmetry is what makes it
+	// a 失败要显眼 violation rather than a design bug.
+	//
+	// The cap is a BYTE budget, not a character budget: CJK text is 3 bytes per
+	// character, so ~5,460 Chinese characters already reach it. The event's
+	// *_bytes fields are named for that unit on purpose — reading the cap as
+	// "16,000 characters" understates the exposure by ~3x.
+	//
+	// WARN, and RATE-LIMITED to exactly ONE aggregated line per request: a large
+	// agent context routinely truncates many pieces at once, and one line per
+	// piece would turn a real signal into log spam. The aggregate carries the
+	// counts (pieces_truncated / total_bytes / scanned_bytes / skipped_bytes) and
+	// the first affected piece index. Counts only — never any content.
+	// The externally readable counterpart is /v1/diagnostics/pipeline
+	// (mask_restore.scan_truncated_pieces / scan_skipped_bytes), because a signal
+	// that only exists in a log file is not externally readable (health-signal-surface).
+	EventProxyFilterInputTruncated = "proxy.filter.input_truncated"
+	// App-hook effective-content tracking (2026-08-13, bugfix
+	// 20260813-pack-swap-does-not-invalidate-proxy-cache). A child app can
+	// hot-swap the content it detects against without restarting, so the proxy
+	// polls each child for a fingerprint of its effective content set and folds
+	// it into the verdict cache key (internal/apphook/contentversion.go).
+	//
+	// EventAppHookContentVersionChanged: INFO, on transition only. The child's
+	// content set moved (an admin added or deleted a rule and the pack reached
+	// this box), so every verdict memoized under the previous one is now
+	// unreachable and will be re-scanned. This is the line that answers "did my
+	// console edit actually reach this node, and when?".
+	//
+	// EventAppHookContentVersionUnknown: WARN, on transition only. The child can
+	// no longer say which content set is live, so verdict memoization is disabled
+	// and every piece is really scanned — safe, but the latency cost is real and
+	// otherwise unattributable. The externally readable counterpart is
+	// GET /admin/compliance/packs returning {available:false}, which is driven by
+	// the same child-side condition.
+	EventAppHookContentVersionChanged = "proxy.apphook.content_version_changed"
+	EventAppHookContentVersionUnknown = "proxy.apphook.content_version_unknown"
+	// Verdict-cache suspension, observed FROM THE DATA PLANE (2026-08-13, review
+	// finding B6). The pair above is raised by the background poll inside the
+	// hook; these two are the dispatcher's own 二层兜底 (日志规范), raised at the
+	// point where a real user request actually loses the cache.
+	//
+	// WHY BOTH LAYERS. The poll's WARN says "the child can no longer state its
+	// content set". These say "…and therefore THIS request, and every request
+	// after it, is paying the full cold-scan cost", carry the enumerated cause
+	// (child_degraded vs unsupported_op_list_packs — restart vs upgrade), and
+	// come from the request logger so they carry request_id / trace_id / span_id.
+	// The poll's line has no request context and cannot; correlating a latency
+	// complaint to a trace is exactly what an operator needs here.
+	//
+	// 🔴 RATE LIMITING IS PART OF THE CONTRACT, not an optimisation. This state
+	// PERSISTS (an un-upgraded detector never self-heals), so one line per
+	// request would emit at request rate forever and bury the signal it exists to
+	// raise. Both are emitted ONLY on the transition, latched on the Proxy
+	// generation — the same 「只记状态转变」 posture as the pair above and as the
+	// 16 KiB truncation aggregate.
+	//
+	// Suspended = WARN (a real, unattributable latency regression is now in
+	// effect). Resumed = INFO (recovery is not a fault, but the operator needs
+	// the bracket to know the window closed).
+	EventProxyFilterVerdictCacheSuspended = "proxy.filter.verdict_cache_suspended"
+	EventProxyFilterVerdictCacheResumed   = "proxy.filter.verdict_cache_resumed"
 	// Oauth-group routing (N8). EventProxyGroupRouteResolved: a group VK request
 	// picked + injected a candidate account. EventProxyGroupRouteDegraded: no
 	// usable candidate (no material / all expired-exhausted / key unavailable) →

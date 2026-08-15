@@ -30,6 +30,7 @@ import (
 	"io"
 	"log/slog"
 	"net/http"
+	"sync/atomic"
 	"time"
 	"unicode/utf8"
 
@@ -44,7 +45,36 @@ import (
 // stall the request for seconds and desync the IPC (→ the hook degrades). We cap
 // the transfer and re-attach the untouched tail after masking (same forwarded
 // result, fast IPC). Snapped to a rune boundary so a multibyte char never splits.
+//
+// 🔴 The cap is a BYTE budget, not a character budget. CJK is 3 bytes/char, so a
+// Chinese prompt hits it at ~5,460 characters — roughly a third of where a reader
+// who mentally translates "16KB" into "16,000 characters" would expect. Every
+// derived field/metric below is therefore named `*_bytes`.
 const pipeInputCap = 16 * 1024
+
+// scanCoverage counts what compliance scanning did NOT see, so that "content was
+// forwarded to the LLM unscanned" is an externally readable number instead of an
+// inference from silence (health-signal-surface; bugfix 20260813-pipe-input-cap-
+// truncates-silently).
+//
+// WHY a counter in ADDITION to the per-request WARN: the WARN is rate-limited to
+// one line per request and lives in a log file that a private deployment may not
+// even ship anywhere. The question an operator actually asks — "how much of my
+// traffic is going unscanned in this deployment?" — needs an aggregate they can
+// poll, which is /v1/diagnostics/pipeline.
+//
+// 🔴 GENERATION-scoped, not process-scoped, exactly like maskFidelity: the proxy
+// hot-reloads in-process and these live on the *Proxy that gets replaced. Read
+// them together with PipelineDiagnostics.GenerationID.
+//
+// Counts only — never an index, a length distribution or any content.
+type scanCoverage struct {
+	// truncatedPieces: how many content pieces were cut at pipeInputCap.
+	truncatedPieces atomic.Int64
+	// skippedBytes: total bytes that were forwarded upstream without ever being
+	// handed to the detector. This is the number that quantifies the blind spot.
+	skippedBytes atomic.Int64
+}
 
 // capRuneBoundary returns the largest byte offset ≤ cap on a UTF-8 rune boundary.
 func capRuneBoundary(s string, limit int) int {
@@ -264,6 +294,16 @@ func (p *Proxy) applyInboundFilter(
 		detectNanos int64
 		cacheHits   int // content-hash 缓存命中(复用判定、跳过 detector)
 		cacheMiss   int // content-hash 缓存未命中(真扫 + 回填)
+		// Scan-coverage accounting for pieces cut at pipeInputCap. Accumulated
+		// across the loop and reported as ONE aggregated WARN after it — a large
+		// agent context truncates many pieces in a single request, and a line per
+		// piece would drown the signal it is meant to raise (「只记状态转变、不逐条
+		// 记」). The cut itself is deliberate and unchanged; only the signal is new.
+		truncPieces       int // how many pieces were cut
+		truncFirstIdx     = -1
+		truncTotalBytes   int // sum of the FULL size of every cut piece
+		truncScannedBytes int // sum of what the detector actually received
+		truncSkippedBytes int // sum of what reached the LLM unscanned (the blind spot)
 		// restoreState collects numbered-placeholder → original mappings for
 		// restorable masks (B3). Allocated lazily on the first restorable mask;
 		// stashed on the request context for the response leg. Memory-only,
@@ -278,17 +318,38 @@ func (p *Proxy) applyInboundFilter(
 		p.filterPerformance.observe(time.Since(filterStarted), cacheHits > 0)
 	}()
 
-	// content-hash 缓存(设计 §4):仅当缓存启用时才算 scope/detectorVer。缓存关闭
-	// (p.filterCache == nil)时下面循环根本不碰 hash → 不付 content-hash 代价(INV-6)。
-	// scope = 隔离桶(同会话历史复用、跨会话不串);detectorVer 进 key 让 detector
-	// 重启自动失效旧条目;per-entry TTL 兜底 in-place pack pull 的陈旧 clean 判定。
+	// content-hash 缓存(设计 §4):仅当缓存启用时才算 scope/detectorVer/contentVer。
+	// 缓存关闭(cache == nil)时下面循环根本不碰 hash → 不付 content-hash 代价(INV-6)。
+	// scope = 隔离桶(同会话历史复用、跨会话不串);detectorVer 让 detector 重启自动失效
+	// 旧条目;contentVer 让 detector 原地热切 ruleset(管理员增删规则)也自动失效 —— 三者
+	// 都进 key,见 cacheKey。
 	// scope 复用调用方已解析的 sessionID(serveRoute → resolveSessionID → sessionid
 	// fingerprint 表):Claude 专有 header 之外的 provider(kimi/codex/cursor/cline …)
 	// 现在也能拿到会话级隔离桶,不再降级到 vk/global 让多会话共桶。见 cacheScope 注释。
-	var cacheScopeKey, detectorVer string
-	if p.filterCache != nil {
-		cacheScopeKey = cacheScope(sessionID, parsed, virtualKeyID)
-		detectorVer = hook.Status().Version
+	//
+	// `cache` shadows p.filterCache for the rest of this request so that "cache is
+	// unusable" has ONE representation. FAIL-SAFE, NOT FAIL-STALE (2026-08-13): if
+	// the hook declares a hot-swappable content set but cannot currently say which
+	// one is live (child unreachable / first poll not back), we scan every piece
+	// for real rather than replay verdicts that may have been minted under a
+	// ruleset the admin has since deleted. 宁可多扫,不可用陈旧规则.
+	cache := p.filterCache
+	var cacheScopeKey, detectorVer, contentVer string
+	if cache != nil {
+		epoch, cacheable := apphook.CacheEpoch(hook)
+		// Transition-only observability for the fail-safe branch (2026-08-13,
+		// review finding B6). The BEHAVIOR is unchanged and deliberate; what was
+		// missing is that switching the cache off is a silent, permanent latency
+		// regression for a node whose detector is too old to answer op=ListPacks.
+		// See noteVerdictCacheState for why this is latched rather than per-request.
+		p.noteVerdictCacheState(logger, hook, cacheable)
+		if !cacheable {
+			cache = nil // both the read and the write below are skipped
+		} else {
+			cacheScopeKey = cacheScope(sessionID, parsed, virtualKeyID)
+			detectorVer = hook.Status().Version
+			contentVer = epoch
+		}
 	}
 
 	for i := range pieces {
@@ -301,20 +362,35 @@ func (p *Proxy) applyInboundFilter(
 		if len(head) > pipeInputCap {
 			b := capRuneBoundary(pieces[i].text, pipeInputCap)
 			head, tail = pieces[i].text[:b], pieces[i].text[b:]
+			// Record the blind spot (2026-08-13). `tail` is spliced back verbatim
+			// after masking and forwarded to the LLM having NEVER been inspected:
+			// a secret sitting at byte 16385 of this piece is invisible to every
+			// downstream surface — no mask, no compliance event, no audit trail.
+			// The measured behavior was 8 findings with the key at 15 KB and 0
+			// findings with the same key at 16 KB, with nothing in between to say
+			// why. Keeping the cut (correct) while emitting nothing (wrong) is the
+			// whole bug; these four counters are the fix.
+			truncPieces++
+			if truncFirstIdx < 0 {
+				truncFirstIdx = i
+			}
+			truncTotalBytes += len(pieces[i].text)
+			truncScannedBytes += len(head)
+			truncSkippedBytes += len(tail)
 		}
 		// content-hash 缓存:历史里逐字未变的内容(每轮重发)命中缓存即复用判定、
 		// 跳过 detector IPC;只有新增/被改写(miss)才真扫。命中时合成一个等价 resp,
-		// 走下面同一套处理(mask/allow/...)。缓存关闭(p.filterCache==nil)则直接真扫。
+		// 走下面同一套处理(mask/allow/...)。缓存关闭/不可用(cache==nil)则直接真扫。
 		var resp *apphook.Response
 		var ckey string
-		if p.filterCache != nil {
-			ckey = cacheKey(detectorVer, hashHead(head)) // level-2 key (scope is separate)
+		if cache != nil {
+			ckey = cacheKey(detectorVer, contentVer, hashHead(head)) // level-2 key (scope is separate)
 			// 读侧 block 守卫(用户拍板 2026-08-08,与写侧不入缓存配套):即便缓存里
 			// 残留了历史 block verdict(理论上写侧已不再写入;此处兜底进程内 pre-fix
 			// 污染 + 防写侧未来回归),也当作 miss、落到下方真扫按最新策略重判 —— block
 			// 是安全决策不复用陈旧拒绝。仅精确排除 ActionBlock,mask/warn/allow 命中路径
 			// 逐字不变(它们 action != ActionBlock,条件恒真)。
-			if v, ok := p.filterCache.Get(cacheScopeKey, ckey); ok && v.action != apphook.ActionBlock {
+			if v, ok := cache.Get(cacheScopeKey, ckey); ok && v.action != apphook.ActionBlock {
 				// Restorables replay from cache (offsets only): the hash-matched head
 				// is byte-identical, so the same spans slice the same originals.
 				// Event replays too (2026-08-08 审计缺口修复): a flagged piece resent
@@ -326,8 +402,8 @@ func (p *Proxy) applyInboundFilter(
 				cacheHits++
 			}
 		}
-		if resp == nil { // 缓存 miss 或缓存关闭 → 真扫
-			if p.filterCache != nil {
+		if resp == nil { // 缓存 miss 或缓存关闭/不可用 → 真扫
+			if cache != nil {
 				cacheMiss++
 			}
 			_t0 := time.Now()
@@ -349,15 +425,17 @@ func (p *Proxy) applyInboundFilter(
 			// BLOCK 不入缓存(用户拍板 2026-08-08,安全边界修复):block(ActionBlock)是
 			// 安全关键决策,每次都必须按【最新策略/pack】重新走 detector 判定,绝不复用
 			// 缓存的陈旧拒绝。WHY:①缓存命中回放不调 detector(见上方 Get 分支),若把 block
-			// 入缓存,则管理员放宽策略或 in-place pack swap(childhook.go 不 bump
-			// detectorVersion,见 filter_cache.go PACK FRESHNESS/TTL 注释)后,陈旧 block
-			// 仍会持续 403,且 sliding TTL 命中续期近乎永久 —— 放宽后无法立即生效;②block
-			// 走拒绝路径不转发上游,缓存省下的那一次 detector 调用收益可忽略,ROI 为负。
+			// 入缓存,则管理员放宽策略后陈旧 block 仍会持续 403;②block 走拒绝路径不转发
+			// 上游,缓存省下的那一次 detector 调用收益可忽略,ROI 为负。
+			// 2026-08-13 起 in-place pack swap 已由 contentVer 进 key 自动失效(见 cacheKey),
+			// 所以①里"放宽后无法立即生效"的窗口已从"近乎永久"收敛到一个 poll 周期 —— 但这条
+			// 规则**不因此放宽**:contentVer 只覆盖 detector 自报的 pack 集合,而 block 还受
+			// 请求级/策略级因素影响,且它的缓存收益本来就是负的(理由②独立成立)。
 			// mask/warn/allow 缓存行为保持不变(它们转发上游,复用判定收益实在)。
 			// 隐患溯源:CN_ADDRESS 本身无 block 档,但其他 entity 的 HighRiskBlock
 			// (policy.go HighRiskBlock)已在用这条链 → 当前生产就有此隐患。
 			// 配套读侧守卫见上方 Get 分支(v.action != ActionBlock)。
-			if p.filterCache != nil && resp != nil && !resp.Degraded && resp.Action != apphook.ActionBlock {
+			if cache != nil && resp != nil && !resp.Degraded && resp.Action != apphook.ActionBlock {
 				// maskedHead is cached in the detector's NUMBERLESS token form —
 				// per-request numbering happens AFTER cache replay so numbers stay
 				// request-scoped (同请求内按出现顺序编号) instead of leaking a stale
@@ -366,7 +444,7 @@ func (p *Proxy) applyInboundFilter(
 				// maskVerdict.event). Stored as handed over — never mutated in place
 				// (injectTenant/VirtualKey/Seat/Session all return fresh slices), so the
 				// async uploader and the cache can share the bytes read-only.
-				p.filterCache.Put(cacheScopeKey, ckey, maskVerdict{
+				cache.Put(cacheScopeKey, ckey, maskVerdict{
 					action:      resp.Action,
 					maskedHead:  string(resp.MutatedPayload),
 					reason:      resp.Reason,
@@ -580,6 +658,42 @@ func (p *Proxy) applyInboundFilter(
 		// r.Context() after this call. Absent for every request without a
 		// restorable mask → the response leg pays one nil ctx lookup.
 		*r = *r.WithContext(context.WithValue(r.Context(), ctxKeyMaskRestore, restoreState))
+	}
+
+	// Scan-coverage signal (2026-08-13, bugfix 20260813-pipe-input-cap-truncates-
+	// silently). ONE aggregated line per request, never one per piece: an agent
+	// turn carrying several large tool payloads truncates many pieces at once, and
+	// per-piece lines would make the operator scroll past the very signal they are
+	// looking for (「只记状态转变、不逐条记」, same posture as the degraded WARN below).
+	//
+	// WARN not INFO: unlike the action-ceiling cap — where the content IS examined
+	// and the finding IS recorded, just not enforced — this content is never
+	// examined at all. It produces no mask, no compliance event and no audit row,
+	// so it is a genuine coverage hole in the compliance guarantee, not a policy
+	// decision. request_id / trace_id / span_id come from the caller's logger
+	// (handle_dispatch stamps them via slog.With), which is why this WARN must be
+	// emitted on `logger` and never on the package-level slog default.
+	//
+	// Placed after the loop, alongside the degraded WARN, so it shares that
+	// function's exit semantics: an ActionBlock returns early and skips both. That
+	// is deliberate — a blocked request is refused outright, so none of its bytes
+	// reached the upstream and counting them here would overstate the exposure the
+	// counter exists to measure.
+	if truncPieces > 0 {
+		p.scanCoverage.truncatedPieces.Add(int64(truncPieces))
+		p.scanCoverage.skippedBytes.Add(int64(truncSkippedBytes))
+		logger.Warn("filter: content exceeded the detector input cap; the tail was forwarded to the upstream UNSCANNED",
+			"event.name", observability.EventProxyFilterInputTruncated,
+			"pieces_truncated", truncPieces,
+			"pieces_total", len(pieces),
+			// The aggregate's stand-in for the per-piece index a one-line-per-piece
+			// form would have carried; enough to locate the offender in a re-run.
+			"first_piece_index", truncFirstIdx,
+			// BYTES, not characters — a 16 KiB cap is ~5,460 CJK characters.
+			"cap_bytes", pipeInputCap,
+			"total_bytes", truncTotalBytes,
+			"scanned_bytes", truncScannedBytes,
+			"skipped_bytes", truncSkippedBytes)
 	}
 
 	if degraded {

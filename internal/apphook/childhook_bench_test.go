@@ -34,7 +34,7 @@ func TestChildHookFullStackLatency(t *testing.T) {
 		t.Skip("latency SLO is meaningless under -race (instrumentation inflates ~10×)")
 	}
 
-	binary := requireDetectorBinary(t)
+	binary, sealed := requireSealedDetector(t)
 
 	h := NewChildHook(&ChildHookConfig{
 		Name:         "ai-compliance-detector-bench",
@@ -49,6 +49,10 @@ func TestChildHookFullStackLatency(t *testing.T) {
 		t.Skipf("child binary unavailable: %v", err)
 	}
 	defer func() { _ = h.Shutdown(context.Background()) }()
+	// A latency SLO measured against a host's installed dictionary layers is not
+	// the SLO of the shipped binary: the address lane's opt-in layers are the
+	// single biggest per-request cost the $HOME tree can add or remove.
+	sealed.AssertHeld(t, h)
 
 	scenarios := []struct {
 		name   string

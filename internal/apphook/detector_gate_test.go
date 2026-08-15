@@ -45,6 +45,8 @@ import (
 	"runtime"
 	"strings"
 	"testing"
+
+	"github.com/AiKeyLabs/aikey-proxy/internal/detectortest"
 )
 
 // requireNoSkipsEnv is the project-wide "a skip is not a pass" switch. Reused,
@@ -105,10 +107,30 @@ func locateDetectorBinary() (string, error) {
 	return binary, nil
 }
 
-// requireDetectorBinary is the ONLY sanctioned way for a test in this package to
+// requireSealedDetector is the ONLY sanctioned way for a test in this package to
 // obtain the detector binary. Do not stat the path yourself and do not hand-roll
 // a `t.Skipf` on the result — that is precisely the shape this replaces.
-func requireDetectorBinary(t *testing.T) string {
+//
+// ── The second thing this door owns (2026-08-14) ─────────────────────────────
+//
+// It also SEALS the host state before returning, so no test in this package can
+// spawn a child that reads the developer's `~/.aikey`. See internal/detectortest
+// for the four $HOME-rooted detector inputs and why sealing AIKEY_PACK_CACHE_DIR
+// alone is not enough.
+//
+// This is not hypothetical here: TestChildHook_ListPacks asserts
+// `lane_actions.CN_ADDRESS == "mask"`, and a policy.json ops override in a real
+// home (host input #2, which has NO environment switch) turns it to "audit" —
+// measured 2026-08-14, the test goes RED purely because of a file in the
+// developer's home directory. Sealing is applied unconditionally, including for
+// the `--echo-only` children that read none of the four inputs: an exemption is
+// how a second, unsealed path gets established.
+//
+// Callers that spawn a REAL (non-echo) child must additionally call
+// sealed.AssertHeld once the child is up. Setting the environment is not proof
+// that the child honored it — deleting the seal must turn a test RED, not
+// quietly hand it host state.
+func requireSealedDetector(t *testing.T) (string, detectortest.Sealed) {
 	t.Helper()
 
 	binary, err := locateDetectorBinary()
@@ -116,7 +138,7 @@ func requireDetectorBinary(t *testing.T) string {
 		// The binary exists, so from here on a skip can only come from the
 		// test's own Start() failure path — a defect, not an environment fact.
 		forbidSilentSkip(t)
-		return binary
+		return binary, detectortest.Seal(t)
 	}
 
 	reason, fix := classifyDetectorErr(err)
@@ -132,7 +154,17 @@ func requireDetectorBinary(t *testing.T) string {
 	emitLoudBanner(fmt.Sprintf(detectorSkipBanner, t.Name(), reason, fix, err, requireNoSkipsEnv))
 	t.Skipf("proxy↔detector IPC contract NOT covered — %s (set %s=1 to fail instead)",
 		reason, requireNoSkipsEnv)
-	return ""
+	return "", detectortest.Sealed{}
+}
+
+// requireDetectorBinary is the convenience form for the `--echo-only` children,
+// which read none of the sealed inputs and therefore have nothing to assert
+// afterwards. It is a thin wrapper, NOT a second door: the sealing (and the
+// skip policy) still happens in exactly one place.
+func requireDetectorBinary(t *testing.T) string {
+	t.Helper()
+	binary, _ := requireSealedDetector(t)
+	return binary
 }
 
 func classifyDetectorErr(err error) (reason, fix string) {

@@ -90,8 +90,11 @@ func TestFilterCache_BlockLeavesNoCacheEntry(t *testing.T) {
 	if !ok {
 		t.Fatalf("filterCache 应是 *sessionMaskCache, got %T", p.filterCache)
 	}
-	// dispatch 里 detectorVer = hook.Status().Version(此处空串),ckey = ver|hash(head)。
-	key := cacheKey(hook.Status().Version, hashHead(content))
+	// 与 dispatch 同源地复算 key:detectorVer = Status().Version(此处空串),
+	// contentVer 走 apphook.CacheEpoch(stubHook 未声明可热切内容集 → 空串)。
+	// 手写这三段的任何一段都会在 cacheKey 变形时静默失配、把断言变成假绿。
+	epoch, _ := apphook.CacheEpoch(hook)
+	key := cacheKey(hook.Status().Version, epoch, hashHead(content))
 	if v, hit := smc.Get("global", key); hit {
 		t.Errorf("block 判定不应写入缓存,但查到条目:action=%d", v.action)
 	}
@@ -108,7 +111,8 @@ func TestFilterCache_ReadSideSkipsPollutedBlock(t *testing.T) {
 	const content = "was-blocked-now-allowed"
 	// 手工把一条陈旧 block verdict 塞进缓存(scope/key 与 dispatch 复算一致)。
 	smc := p.filterCache.(*sessionMaskCache)
-	key := cacheKey(hook.Status().Version, hashHead(content))
+	epoch, _ := apphook.CacheEpoch(hook)
+	key := cacheKey(hook.Status().Version, epoch, hashHead(content))
 	smc.Put("global", key, maskVerdict{action: apphook.ActionBlock, reason: "stale block"})
 
 	// 同内容请求:读侧守卫应跳过陈旧 block → 真扫 → 按最新策略 Allow 放行。

@@ -115,7 +115,7 @@ func (e *brokerPoolExchanger) SubmitCode(ctx context.Context, sessionID, code st
 	if err != nil {
 		return "", "", "", 0, "", "", err
 	}
-	refresh, _ := e.memTok.GetRefreshToken(ctx, r.AccountID) // optional (Claude 1y has none)
+	refresh, _ := e.memTok.GetRefreshToken(ctx, r.AccountID) // optional; stored master-only and never refreshed for Anthropic
 	externalID := ""
 	if acct, aerr := e.memAcc.GetByID(ctx, r.AccountID); aerr == nil && acct != nil {
 		externalID = acct.ExternalID
@@ -146,13 +146,30 @@ func (e *brokerPoolExchanger) LoginStatus(ctx context.Context, sessionID string)
 // (the supervisor wires them from the team credential + control-panel URL) so the
 // handler stays testable.
 type poolLoginHandler struct {
-	ex                 poolExchanger
-	masterURL          func() string
-	bearer             func(ctx context.Context) (string, error)
-	client             *http.Client
-	resolveContext     func(ctx context.Context, credentialID string) (poolLoginContext, error) // tests; nil=master
-	syncAfterWriteback func(ctx context.Context) error                                          // nil only in focused tests
-	sessions           sync.Map                                                                 // sessionID → immutable credential/provider/group binding
+	ex                   poolExchanger
+	sessionKeyExchange   func(ctx context.Context, loginCtx poolLoginContext, opts broker.SessionKeyExchangeOptions) (*broker.SessionKeyToken, error)
+	sessionKeyNodeEgress func() (string, error)
+	masterURL            func() string
+	bearer               func(ctx context.Context) (string, error)
+	client               *http.Client
+	resolveContext       func(ctx context.Context, credentialID string) (poolLoginContext, error) // tests; nil=master
+	syncAfterWriteback   func(ctx context.Context) error                                          // nil only in focused tests
+	sessions             sync.Map                                                                 // sessionID → immutable credential/provider/group binding
+	sessionKeyPending    sync.Map                                                                 // operationID → *poolSessionKeyPending (token held only until writeback)
+	sessionKeyOpsMu      sync.Mutex
+	sessionKeyOps        map[string]*poolSessionKeyOperation // short-lived per-operation locks; protects idempotent exchange/writeback
+}
+
+type poolSessionKeyPending struct {
+	loginCtx  poolLoginContext
+	token     *broker.SessionKeyToken
+	createdAt time.Time
+	expiresAt int64
+}
+
+type poolSessionKeyOperation struct {
+	mu   sync.Mutex
+	refs int
 }
 
 type poolProviderProfile struct {
@@ -474,6 +491,8 @@ func (h *poolLoginHandler) RegisterRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("POST /oauth/pool/authorize-url", h.authorizeURL)
 	mux.HandleFunc("POST /oauth/pool/submit-code", h.submitCode)
 	mux.HandleFunc("GET /oauth/pool/status", h.status)
+	mux.HandleFunc("POST /oauth/pool/session-key", h.sessionKey)
+	mux.HandleFunc("GET /oauth/pool/session-key/capabilities", h.sessionKeyCapabilities)
 }
 
 // teamBearer returns a fresh team account-JWT Bearer (same credential channel ③
@@ -493,15 +512,26 @@ func (s *Supervisor) teamBearer(ctx context.Context) (string, error) {
 
 // NewPoolLoginHandler builds the pool login handler with a MEMORY-store broker
 // (per-member tokens never touch the proxy vault) + the team bearer / control-panel
-// URL closures. The broker reuses the package-global impersonate HTTP client set
-// during the personal broker init (Cloudflare bypass). Returns nil if the broker
-// dependency isn't available.
-func (s *Supervisor) NewPoolLoginHandler() *poolLoginHandler {
+// URL closures. Session-key exchange creates isolated Chrome-impersonating
+// clients with the selected credential's explicit effective egress; it does not
+// reuse the process-global browser-OAuth client or its implicit proxy state.
+func (s *Supervisor) NewPoolLoginHandler(nodeEgress func() string) *poolLoginHandler {
 	memTok := broker.NewMemoryTokenStore()
 	memAcc := broker.NewMemoryAccountStore()
 	brk := broker.NewEmbedded(memTok, memAcc)
 	return &poolLoginHandler{
-		ex:        &brokerPoolExchanger{brk: brk, memTok: memTok, memAcc: memAcc},
+		ex:                 &brokerPoolExchanger{brk: brk, memTok: memTok, memAcc: memAcc},
+		sessionKeyExchange: exchangePoolSessionKey,
+		sessionKeyNodeEgress: func() (string, error) {
+			if nodeEgress == nil {
+				return "", errors.New("node egress proxy is unavailable")
+			}
+			resolved := strings.TrimSpace(nodeEgress())
+			if resolved == "" {
+				return "", errors.New("node egress proxy is unavailable")
+			}
+			return resolved, nil
+		},
 		masterURL: readControlPanelURL,
 		bearer:    s.teamBearer,
 		syncAfterWriteback: func(ctx context.Context) error {
@@ -555,4 +585,14 @@ func poolErr(w http.ResponseWriter, status int, code, msg string) {
 	w.Header().Set("X-Aikey-Error-Source", code)
 	w.WriteHeader(status)
 	_ = json.NewEncoder(w).Encode(map[string]any{"error": map[string]string{"code": code, "message": msg}})
+}
+
+func poolErrWithMeta(w http.ResponseWriter, status int, code, msg, operationID string) {
+	w.Header().Set("Content-Type", "application/json")
+	w.Header().Set("X-Aikey-Error-Source", code)
+	w.WriteHeader(status)
+	_ = json.NewEncoder(w).Encode(map[string]any{
+		"error":        map[string]string{"code": code, "message": msg},
+		"operation_id": operationID,
+	})
 }

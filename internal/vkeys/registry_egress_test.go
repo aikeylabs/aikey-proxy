@@ -61,3 +61,46 @@ func TestEgressSpecs_EmptyWhenNoGroups(t *testing.T) {
 		t.Fatalf("want no specs, got %+v", got)
 	}
 }
+
+func TestEgressSpecForGroupCredential_ScopesPoolAndRejectsDrift(t *testing.T) {
+	mat := func(accounts map[string]GroupRuntimeAccount) string {
+		value, _ := json.Marshal(accounts)
+		return string(value)
+	}
+	reg := NewRegistry()
+	reg.Merge(map[string]*ResolvedRoute{
+		"seat-1": {OauthGroupID: "group-1", GroupRuntime: mat(map[string]GroupRuntimeAccount{
+			"account-1": {CredentialID: "credential-1", EgressProxyURL: "http://127.0.0.1:10808"},
+		})},
+		"seat-2": {OauthGroupID: "group-1", GroupRuntime: mat(map[string]GroupRuntimeAccount{
+			"account-1": {CredentialID: "credential-1", EgressProxyURL: "http://127.0.0.1:10808"},
+		})},
+		"unrelated-malformed": {OauthGroupID: "group-2", GroupRuntime: "{"},
+	})
+
+	if got, found, err := reg.EgressSpecForGroupCredential("group-1", "credential-1"); err != nil || !found || got != "http://127.0.0.1:10808" {
+		t.Fatalf("effective credential egress = %q found=%t err=%v", got, found, err)
+	}
+	if _, found, err := reg.EgressSpecForGroupCredential("group-1", "missing"); err != nil || found {
+		t.Fatalf("missing credential must stay unresolved: found=%t err=%v", found, err)
+	}
+
+	reg.Merge(map[string]*ResolvedRoute{
+		"seat-3": {OauthGroupID: "group-1", GroupRuntime: mat(map[string]GroupRuntimeAccount{
+			"account-1": {CredentialID: "credential-1", EgressProxyURL: "socks5://different.example:1080"},
+		})},
+	})
+	if _, found, err := reg.EgressSpecForGroupCredential("group-1", "credential-1"); err == nil || found {
+		t.Fatalf("inconsistent runtime must fail closed: found=%t err=%v", found, err)
+	}
+}
+
+func TestEgressSpecForGroupCredential_MalformedSelectedPoolFailsClosed(t *testing.T) {
+	reg := NewRegistry()
+	reg.Merge(map[string]*ResolvedRoute{
+		"selected-malformed": {OauthGroupID: "group-1", GroupRuntime: "{"},
+	})
+	if _, found, err := reg.EgressSpecForGroupCredential("group-1", "credential-1"); err == nil || found {
+		t.Fatalf("malformed selected pool must fail closed: found=%t err=%v", found, err)
+	}
+}

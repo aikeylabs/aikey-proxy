@@ -13,7 +13,7 @@ import (
 // pipe right after — i.e. the meta query coexists with detection (serialized,
 // but each completes).
 func TestChildHook_ListPacks(t *testing.T) {
-	binary := requireDetectorBinary(t)
+	binary, sealed := requireSealedDetector(t)
 	h := NewChildHook(&ChildHookConfig{
 		Name:         "ai-compliance-detector-listpacks-test",
 		BinaryPath:   binary,
@@ -26,6 +26,10 @@ func TestChildHook_ListPacks(t *testing.T) {
 		t.Skipf("child binary unavailable (build first): %v", err)
 	}
 	defer func() { _ = h.Shutdown(context.Background()) }()
+	// This test is the reason the door seals: its lane_actions assertion below
+	// reads "mask" from the SHIPPED policy, and a policy.json in a real $HOME
+	// rewrites it to whatever the operator chose (measured 2026-08-14 → RED).
+	sealed.AssertHeld(t, h)
 
 	report, err := h.ListPacks(ctx)
 	if err != nil {

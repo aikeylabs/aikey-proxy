@@ -3,7 +3,37 @@ package app
 import (
 	"strings"
 	"testing"
+
+	"github.com/AiKeyLabs/pkg/egress"
 )
+
+// TestProbeTargetsDelegateToSharedDefault fences the SHAPE of the fix, not just
+// its current value: both node-side probes must READ egress.DefaultEchoURL rather
+// than restate a literal.
+//
+// Why a separate fence when the neutrality fences below already exist: those pass
+// for any neutral literal, so a copy re-pasted here stays green until it drifts —
+// which is exactly how the control plane sat on a different default for three
+// weeks (2026-08-14). This one goes red the moment a copy reappears.
+func TestProbeTargetsDelegateToSharedDefault(t *testing.T) {
+	for _, tc := range []struct{ name, env string }{
+		{"default", ""},
+		{"air-gapped override", "http://echo.internal.example/ip"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Setenv(egress.EchoURLEnv, tc.env)
+			want := egress.DefaultEchoURL()
+			if got := upstreamProbeTarget(); got != want {
+				t.Errorf("upstreamProbeTarget() = %q, want egress.DefaultEchoURL() = %q — "+
+					"do not restate the target here, delegate to the shared definition", got, want)
+			}
+			if got := egressSelfCheckEcho(); got != want {
+				t.Errorf("egressSelfCheckEcho() = %q, want egress.DefaultEchoURL() = %q — "+
+					"do not restate the target here, delegate to the shared definition", got, want)
+			}
+		})
+	}
+}
 
 // providerHostFragments are the provider hostnames a LEAVING probe must never
 // default to. Kept as fragments (not exact URLs) so a variant like

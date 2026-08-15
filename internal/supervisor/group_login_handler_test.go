@@ -1,15 +1,21 @@
 package supervisor
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
 	"io"
+	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"strings"
 	"sync/atomic"
 	"testing"
+	"time"
+
+	broker "github.com/AiKeyLabs/aikey-auth-broker"
+	"github.com/AiKeyLabs/aikey-proxy/internal/observability"
 )
 
 // fakePoolExchanger stands in for the memory-store broker so the handler's
@@ -64,12 +70,390 @@ func newPoolHandler(t *testing.T, ex poolExchanger, masterURL string) *poolLogin
 		masterURL: func() string { return masterURL },
 		bearer:    func(context.Context) (string, error) { return "JWT", nil },
 		client:    http.DefaultClient,
+		sessionKeyNodeEgress: func() (string, error) {
+			return "http://127.0.0.1:10808", nil
+		},
 		resolveContext: func(_ context.Context, credentialID string) (poolLoginContext, error) {
 			return poolLoginContext{
 				CredentialID: credentialID, OauthGroupID: "g1", AccountID: "account-" + credentialID,
-				ProviderCode: "anthropic", ExpectedIdentity: "member@team.com",
+				ProviderCode: "anthropic", ProtocolType: "anthropic", ExpectedIdentity: "member@team.com",
 			}, nil
 		},
+	}
+}
+
+func TestPoolSessionKeyProviderSupportedUsesCredentialProtocol(t *testing.T) {
+	for _, tt := range []struct {
+		name string
+		ctx  poolLoginContext
+		want bool
+	}{
+		{name: "anthropic", ctx: poolLoginContext{ProviderCode: "anthropic", ProtocolType: "anthropic"}, want: true},
+		{name: "mock anthropic", ctx: poolLoginContext{ProviderCode: "mock", ProtocolType: "anthropic", OAuthTokenURL: "http://127.0.0.1/oauth/anthropic/token"}, want: true},
+		{name: "mock missing endpoint", ctx: poolLoginContext{ProviderCode: "mock", ProtocolType: "anthropic"}, want: false},
+		{name: "mock codex", ctx: poolLoginContext{ProviderCode: "mock", ProtocolType: "openai_compatible", OAuthTokenURL: "http://127.0.0.1/oauth/openai_compatible/token"}, want: false},
+		{name: "unknown brand", ctx: poolLoginContext{ProviderCode: "other", ProtocolType: "anthropic"}, want: false},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := poolSessionKeyProviderSupported(tt.ctx); got != tt.want {
+				t.Fatalf("poolSessionKeyProviderSupported(%+v)=%t want %t", tt.ctx, got, tt.want)
+			}
+		})
+	}
+}
+
+func TestExchangePoolSessionKeyUsesResidentMockProviderContext(t *testing.T) {
+	provider := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/oauth/anthropic/token" || r.Method != http.MethodPost {
+			t.Fatalf("unexpected mock provider request: %s %s", r.Method, r.URL.Path)
+		}
+		if err := r.ParseForm(); err != nil {
+			t.Fatalf("parse form: %v", err)
+		}
+		if r.Form.Get("grant_type") != "session_key" || r.Form.Get("session_key") != "sk-ant-sid02-mock-fixture-value-long-enough" {
+			t.Fatalf("unexpected mock provider grant: %v", r.Form)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, `{"access_token":"MOCK-ACCESS","refresh_token":"MOCK-REFRESH","token_type":"Bearer","expires_in":600,"scope":"user:inference","account":{"uuid":"cred-mock","email_address":"mock@example.test"},"organization":{"uuid":"mock-org","name":"AiKey Mock Organization"}}`)
+	}))
+	defer provider.Close()
+
+	token, err := exchangePoolSessionKey(context.Background(), poolLoginContext{
+		ProviderCode: "mock", ProtocolType: "anthropic",
+		OAuthTokenURL: provider.URL + "/oauth/anthropic/token",
+	}, broker.SessionKeyExchangeOptions{
+		SessionKey: "sk-ant-sid02-mock-fixture-value-long-enough",
+		ProxyURL:   "http://127.0.0.1:1",
+	})
+	if err != nil {
+		t.Fatalf("mock Session Key exchange: %v", err)
+	}
+	if token.AccessToken != "MOCK-ACCESS" || token.Identity.ExternalID != "cred-mock" || token.Identity.Email != "mock@example.test" {
+		t.Fatalf("unexpected exchanged token metadata: %+v", token)
+	}
+}
+
+// A real Anthropic credential must enter the fixed Claude exchanger, never the
+// resident Mock Provider adapter. An invalid proxy shape makes the official
+// exchanger stop before network I/O and gives this dispatch test a hermetic
+// assertion surface.
+func TestExchangePoolSessionKeyRoutesRealAnthropicToClaudeExchanger(t *testing.T) {
+	_, err := exchangePoolSessionKey(context.Background(), poolLoginContext{
+		ProviderCode: "anthropic", ProtocolType: "anthropic",
+	}, broker.SessionKeyExchangeOptions{
+		SessionKey: "sk-ant-sid02-real-shaped-fixture-value-long-enough",
+		ProxyURL:   "ftp://proxy.invalid:21",
+	})
+	var oauthErr *broker.OAuthError
+	if !errors.As(err, &oauthErr) || oauthErr.Code != broker.ErrCodeSessionKeyEgressUnsupported {
+		t.Fatalf("real Anthropic account did not enter the Claude exchanger: %v", err)
+	}
+	if strings.Contains(oauthErr.Message, "Mock Provider") {
+		t.Fatalf("real Anthropic account entered the Mock Provider adapter: %v", err)
+	}
+}
+
+func TestPoolSessionKey_RefusesMissingEffectiveEgressBeforeExchange(t *testing.T) {
+	h := newPoolHandler(t, &fakePoolExchanger{}, "http://unused")
+	var exchanges atomic.Int32
+	h.sessionKeyNodeEgress = func() (string, error) { return "", nil }
+	h.sessionKeyExchange = func(context.Context, poolLoginContext, broker.SessionKeyExchangeOptions) (*broker.SessionKeyToken, error) {
+		exchanges.Add(1)
+		return nil, errors.New("must not run")
+	}
+	w := doJSON(h.sessionKey, `{"credential_id":"c1","session_key":"sk-ant-sid02-fixture-value-long-enough","operation_id":"proxyrequired1234567890"}`)
+	if w.Code != http.StatusConflict || !strings.Contains(w.Body.String(), broker.ErrCodeSessionKeyEgressUnavailable) {
+		t.Fatalf("missing egress: %d %s", w.Code, w.Body.String())
+	}
+	if exchanges.Load() != 0 {
+		t.Fatalf("provider exchange ran without an effective proxy: %d", exchanges.Load())
+	}
+}
+
+func TestPoolSessionKey_UsesMasterEffectiveEgressWithoutLocalVKRuntime(t *testing.T) {
+	h := newPoolHandler(t, &fakePoolExchanger{}, "http://unused")
+	h.resolveContext = func(_ context.Context, credentialID string) (poolLoginContext, error) {
+		return poolLoginContext{
+			CredentialID: credentialID, OauthGroupID: "group-without-local-vk", AccountID: "account-1",
+			ProviderCode: "anthropic", ProtocolType: "anthropic", ExpectedIdentity: "member@team.com",
+			EffectiveEgressURL: "socks5://account.example:1080",
+		}, nil
+	}
+	var fallbackCalls atomic.Int32
+	h.sessionKeyNodeEgress = func() (string, error) {
+		fallbackCalls.Add(1)
+		return "", errors.New("local VK runtime must not be required")
+	}
+	var gotProxy string
+	h.sessionKeyExchange = func(_ context.Context, _ poolLoginContext, opts broker.SessionKeyExchangeOptions) (*broker.SessionKeyToken, error) {
+		gotProxy = opts.ProxyURL
+		return &broker.SessionKeyToken{AccessToken: "ACCESS", ExpiresIn: 60, Identity: broker.IdentityInfo{Email: "member@team.com"}}, nil
+	}
+
+	w := doJSON(h.sessionKey, `{"credential_id":"c1","session_key":"sk-ant-sid02-fixture-value-long-enough","operation_id":"masteregress1234567890"}`)
+	if w.Code != http.StatusOK || !strings.Contains(w.Body.String(), `"status":"pending"`) {
+		t.Fatalf("master effective egress login: %d %s", w.Code, w.Body.String())
+	}
+	if gotProxy != "socks5://account.example:1080" || fallbackCalls.Load() != 0 {
+		t.Fatalf("egress=%q fallback_calls=%d", gotProxy, fallbackCalls.Load())
+	}
+}
+
+func TestPoolSessionKey_PendingConfirmWritesOnceWithoutTokenLeak(t *testing.T) {
+	var gotWB memberTokenWriteback
+	master := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if err := json.NewDecoder(r.Body).Decode(&gotWB); err != nil {
+			t.Fatalf("decode writeback: %v", err)
+		}
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{"status":"ok"}`))
+	}))
+	defer master.Close()
+
+	h := newPoolHandler(t, &fakePoolExchanger{}, master.URL)
+	h.client = master.Client()
+	var exchanges atomic.Int32
+	exchangedAt := time.Now().Unix()
+	h.sessionKeyExchange = func(_ context.Context, _ poolLoginContext, opts broker.SessionKeyExchangeOptions) (*broker.SessionKeyToken, error) {
+		exchanges.Add(1)
+		if opts.SessionKey != "sk-ant-sid02-fixture-value-long-enough" || opts.ProxyURL != "http://127.0.0.1:10808" {
+			t.Fatalf("wrong exchanger input: session=%q proxy=%q", opts.SessionKey, opts.ProxyURL)
+		}
+		return &broker.SessionKeyToken{
+			AccessToken: "ACCESS-SECRET", RefreshToken: "REFRESH-SECRET", TokenType: "Bearer",
+			ExpiresIn: 3600, Scope: "user:inference",
+			Identity: broker.IdentityInfo{Email: "member@team.com", ExternalID: "claude-user", OrgUUID: "org-1"},
+		}, nil
+	}
+	h.sessionKeyNodeEgress = func() (string, error) { return "http://127.0.0.1:10808", nil }
+
+	const operationID = "0123456789abcdef0123456789abcdef"
+	w1 := doJSON(h.sessionKey, `{"credential_id":"c1","session_key":"sk-ant-sid02-fixture-value-long-enough","operation_id":"`+operationID+`"}`)
+	if w1.Code != http.StatusOK || !strings.Contains(w1.Body.String(), `"status":"pending"`) {
+		t.Fatalf("exchange: %d %s", w1.Code, w1.Body.String())
+	}
+	if strings.Contains(w1.Body.String(), "ACCESS-SECRET") || strings.Contains(w1.Body.String(), "REFRESH-SECRET") {
+		t.Fatalf("pending response leaked token: %s", w1.Body.String())
+	}
+
+	w2 := doJSON(h.sessionKey, `{"credential_id":"c1","operation_id":"`+operationID+`","confirm":true}`)
+	if w2.Code != http.StatusOK || !strings.Contains(w2.Body.String(), `"status":"ok"`) {
+		t.Fatalf("confirm: %d %s", w2.Code, w2.Body.String())
+	}
+	if exchanges.Load() != 1 {
+		t.Fatalf("confirm must reuse held token, exchanges=%d", exchanges.Load())
+	}
+	if gotWB.AccessToken != "ACCESS-SECRET" || gotWB.RefreshToken != "REFRESH-SECRET" || gotWB.Identity != "member@team.com" {
+		t.Fatalf("wrong writeback: %+v", gotWB)
+	}
+	if gotWB.ExpiresAt < exchangedAt+3599 || gotWB.ExpiresAt > exchangedAt+3601 {
+		t.Fatalf("expiry must be based on exchange time, got %d near %d", gotWB.ExpiresAt, exchangedAt+3600)
+	}
+	if strings.Contains(w2.Body.String(), "ACCESS-SECRET") || strings.Contains(w2.Body.String(), "REFRESH-SECRET") {
+		t.Fatalf("confirm response leaked token: %s", w2.Body.String())
+	}
+}
+
+func TestPoolSessionKey_SweepRemovesExpiredTokenAndOperationLock(t *testing.T) {
+	h := newPoolHandler(t, &fakePoolExchanger{}, "http://unused")
+	const operationID = "expiredoperation1234567890"
+	pending := &poolSessionKeyPending{
+		token:     &broker.SessionKeyToken{AccessToken: "ACCESS-SECRET", RefreshToken: "REFRESH-SECRET"},
+		createdAt: time.Now().Add(-poolSessionTTL - time.Second),
+	}
+	h.sessionKeyPending.Store(operationID, pending)
+	h.sessionKeyOps = map[string]*poolSessionKeyOperation{operationID: {}}
+
+	h.sweepExpiredSessionKeyOperations()
+
+	if _, ok := h.sessionKeyPending.Load(operationID); ok {
+		t.Fatal("expired pending token was not removed")
+	}
+	if pending.token.AccessToken != "" || pending.token.RefreshToken != "" {
+		t.Fatal("expired pending token strings were not cleared")
+	}
+	if _, ok := h.sessionKeyOps[operationID]; ok {
+		t.Fatal("expired operation lock was not removed")
+	}
+}
+
+func TestPoolSessionKey_ScheduledExpiryClearsAbandonedToken(t *testing.T) {
+	h := newPoolHandler(t, &fakePoolExchanger{}, "http://unused")
+	const operationID = "scheduledexpiry1234567890"
+	pending := &poolSessionKeyPending{
+		token:     &broker.SessionKeyToken{AccessToken: "ACCESS-SECRET", RefreshToken: "REFRESH-SECRET"},
+		createdAt: time.Now().Add(-poolSessionTTL),
+	}
+	h.sessionKeyPending.Store(operationID, pending)
+	h.scheduleSessionKeyExpiry(operationID, pending)
+
+	deadline := time.Now().Add(time.Second)
+	for time.Now().Before(deadline) {
+		if _, ok := h.sessionKeyPending.Load(operationID); !ok {
+			break
+		}
+		time.Sleep(time.Millisecond)
+	}
+	if _, ok := h.sessionKeyPending.Load(operationID); ok {
+		t.Fatal("scheduled expiry did not remove the abandoned token")
+	}
+	if pending.token.AccessToken != "" || pending.token.RefreshToken != "" {
+		t.Fatal("scheduled expiry did not clear token strings")
+	}
+}
+
+func TestPoolSessionKey_WritebackRetryDoesNotReexchange(t *testing.T) {
+	fastBackoff(t)
+	logs := captureJSONLogs(t)
+	var hits atomic.Int32
+	master := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		if hits.Add(1) <= int32(writebackMaxAttempts) {
+			w.WriteHeader(http.StatusServiceUnavailable)
+			return
+		}
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer master.Close()
+
+	h := newPoolHandler(t, &fakePoolExchanger{}, master.URL)
+	h.client = master.Client()
+	var exchanges atomic.Int32
+	h.sessionKeyExchange = func(context.Context, poolLoginContext, broker.SessionKeyExchangeOptions) (*broker.SessionKeyToken, error) {
+		exchanges.Add(1)
+		return &broker.SessionKeyToken{AccessToken: "SECRET-WRITEBACK-TOKEN", ExpiresIn: 3600, Identity: broker.IdentityInfo{Email: "member@team.com"}}, nil
+	}
+	const operationID = "fedcba9876543210fedcba9876543210"
+	if w := doJSON(h.sessionKey, `{"credential_id":"c1","session_key":"sk-ant-sid02-fixture-value-long-enough","operation_id":"`+operationID+`"}`); w.Code != http.StatusOK {
+		t.Fatalf("exchange: %d %s", w.Code, w.Body.String())
+	}
+	if w := doJSON(h.sessionKey, `{"credential_id":"c1","operation_id":"`+operationID+`","confirm":true}`); w.Code != http.StatusBadGateway || !strings.Contains(w.Body.String(), "WRITEBACK_FAILED") {
+		t.Fatalf("first confirm: %d %s", w.Code, w.Body.String())
+	}
+	if w := doJSON(h.sessionKey, `{"credential_id":"c1","operation_id":"`+operationID+`","confirm":true}`); w.Code != http.StatusOK {
+		t.Fatalf("retry confirm: %d %s", w.Code, w.Body.String())
+	}
+	if exchanges.Load() != 1 {
+		t.Fatalf("writeback retry re-exchanged provider token: %d", exchanges.Load())
+	}
+	assertStructuredWarning(t, logs.String(), observability.EventProxyPoolSessionKeyWritebackFailed, observability.ErrCodeProxyPoolSessionKeyWritebackFailed)
+	if strings.Contains(logs.String(), "SECRET-WRITEBACK-TOKEN") {
+		t.Fatal("writeback warning leaked token material")
+	}
+}
+
+func TestPoolSessionKey_RuntimeSyncWarningCarriesStableContract(t *testing.T) {
+	master := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer master.Close()
+
+	h := newPoolHandler(t, &fakePoolExchanger{}, master.URL)
+	h.client = master.Client()
+	h.sessionKeyExchange = func(context.Context, poolLoginContext, broker.SessionKeyExchangeOptions) (*broker.SessionKeyToken, error) {
+		return &broker.SessionKeyToken{AccessToken: "SECRET-RUNTIME-SYNC-TOKEN", ExpiresIn: 3600, Identity: broker.IdentityInfo{Email: "member@team.com"}}, nil
+	}
+	h.syncAfterWriteback = func(context.Context) error { return errors.New("runtime sync fixture failed") }
+
+	const operationID = "runtimewarnings1234567890abcdef"
+	if w := doJSON(h.sessionKey, `{"credential_id":"c1","session_key":"sk-ant-sid02-fixture-value-long-enough","operation_id":"`+operationID+`"}`); w.Code != http.StatusOK {
+		t.Fatalf("exchange: %d %s", w.Code, w.Body.String())
+	}
+
+	logs := captureJSONLogs(t)
+	r := httptest.NewRequest(http.MethodPost, "/oauth/pool/session-key", strings.NewReader(`{"credential_id":"c1","operation_id":"`+operationID+`","confirm":true}`))
+	r.Header.Set("traceparent", "00-0123456789abcdef0123456789abcdef-0123456789abcdef-01")
+	r.Header.Set("x-request-id", "req-session-key-runtime-sync")
+	w := httptest.NewRecorder()
+	h.sessionKey(w, r)
+	if w.Code != http.StatusOK || !strings.Contains(w.Body.String(), `"sync_status":"pending"`) {
+		t.Fatalf("durable login with pending sync: %d %s", w.Code, w.Body.String())
+	}
+	logText := logs.String()
+	assertStructuredWarning(t, logText, observability.EventProxyPoolSessionKeyRuntimeSyncPending, observability.ErrCodeProxyPoolSessionKeyRuntimeSyncPending)
+	for _, want := range []string{
+		`"request_id":"req-session-key-runtime-sync"`,
+		`"trace_id":"0123456789abcdef0123456789abcdef"`,
+		`"span_id":"`,
+	} {
+		if !strings.Contains(logText, want) {
+			t.Fatalf("runtime-sync warning missing %s: %s", want, logText)
+		}
+	}
+	if strings.Contains(logText, "SECRET-RUNTIME-SYNC-TOKEN") {
+		t.Fatal("runtime-sync warning leaked token material")
+	}
+}
+
+func TestPoolSessionKey_CancelZerosAndRemovesPendingToken(t *testing.T) {
+	h := newPoolHandler(t, &fakePoolExchanger{}, "http://unused")
+	h.sessionKeyExchange = func(context.Context, poolLoginContext, broker.SessionKeyExchangeOptions) (*broker.SessionKeyToken, error) {
+		return &broker.SessionKeyToken{AccessToken: "T", RefreshToken: "R", ExpiresIn: 3600, Identity: broker.IdentityInfo{Email: "member@team.com"}}, nil
+	}
+	const operationID = "aaaabbbbccccddddeeeeffff00001111"
+	if w := doJSON(h.sessionKey, `{"credential_id":"c1","session_key":"sk-ant-sid02-fixture-value-long-enough","operation_id":"`+operationID+`"}`); w.Code != http.StatusOK {
+		t.Fatalf("exchange: %d %s", w.Code, w.Body.String())
+	}
+	pendingAny, _ := h.sessionKeyPending.Load(operationID)
+	pending := pendingAny.(*poolSessionKeyPending)
+	if w := doJSON(h.sessionKey, `{"credential_id":"c1","operation_id":"`+operationID+`","cancel":true}`); w.Code != http.StatusOK || !strings.Contains(w.Body.String(), "canceled") {
+		t.Fatalf("cancel: %d %s", w.Code, w.Body.String())
+	}
+	if pending.token.AccessToken != "" || pending.token.RefreshToken != "" {
+		t.Fatal("cancel must zero held token material")
+	}
+	if _, ok := h.sessionKeyPending.Load(operationID); ok {
+		t.Fatal("cancel must remove pending operation")
+	}
+}
+
+func TestPoolSessionKey_IdentityMismatchFailsBeforePendingWriteback(t *testing.T) {
+	h := newPoolHandler(t, &fakePoolExchanger{}, "http://unused")
+	token := &broker.SessionKeyToken{
+		AccessToken: "ACCESS-SECRET", RefreshToken: "REFRESH-SECRET", ExpiresIn: 3600,
+		Identity: broker.IdentityInfo{Email: "wrong@team.com", ExternalID: "wrong-uuid"},
+	}
+	h.resolveContext = func(_ context.Context, credentialID string) (poolLoginContext, error) {
+		return poolLoginContext{
+			CredentialID: credentialID, OauthGroupID: "g1", AccountID: "a1",
+			ProviderCode: "anthropic", ProtocolType: "anthropic",
+			ExpectedIdentity: "member@team.com", ExternalID: "expected-uuid",
+		}, nil
+	}
+	h.sessionKeyExchange = func(context.Context, poolLoginContext, broker.SessionKeyExchangeOptions) (*broker.SessionKeyToken, error) {
+		return token, nil
+	}
+	const operationID = "99998888777766665555444433332222"
+	w := doJSON(h.sessionKey, `{"credential_id":"c1","session_key":"sk-ant-sid02-fixture-value-long-enough","operation_id":"`+operationID+`"}`)
+	if w.Code != http.StatusConflict || !strings.Contains(w.Body.String(), broker.ErrCodeSessionKeyIdentityMismatch) {
+		t.Fatalf("identity mismatch: %d %s", w.Code, w.Body.String())
+	}
+	if token.AccessToken != "" || token.RefreshToken != "" {
+		t.Fatal("identity mismatch must zero token material")
+	}
+	if _, ok := h.sessionKeyPending.Load(operationID); ok {
+		t.Fatal("identity mismatch must not create a confirmable operation")
+	}
+	confirm := doJSON(h.sessionKey, `{"credential_id":"c1","operation_id":"`+operationID+`","confirm":true}`)
+	if confirm.Code != http.StatusBadRequest || !strings.Contains(confirm.Body.String(), "UNKNOWN_OPERATION") {
+		t.Fatalf("mismatched token became confirmable: %d %s", confirm.Code, confirm.Body.String())
+	}
+}
+
+func TestSessionKeyIdentityMatches_FailsClosedWithoutExpectedIdentity(t *testing.T) {
+	if sessionKeyIdentityMatches(poolLoginContext{}, broker.IdentityInfo{Email: "member@team.com", ExternalID: "claude-user"}) {
+		t.Fatal("account without an expected identity must not accept an exchanged token")
+	}
+	if sessionKeyIdentityMatches(
+		poolLoginContext{ExternalID: "expected-uuid", ExpectedIdentity: "member@team.com"},
+		broker.IdentityInfo{Email: "member@team.com"},
+	) {
+		t.Fatal("a stable external ID must not fall back to email when the exchanged ID is absent")
+	}
+	if !sessionKeyIdentityMatches(
+		poolLoginContext{ExpectedIdentity: "Member@Team.com"},
+		broker.IdentityInfo{Email: "member@team.com"},
+	) {
+		t.Fatal("email-only identity should match case-insensitively")
 	}
 }
 
@@ -78,6 +462,31 @@ func doJSON(h http.HandlerFunc, body string) *httptest.ResponseRecorder {
 	w := httptest.NewRecorder()
 	h(w, r)
 	return w
+}
+
+func captureJSONLogs(t *testing.T) *bytes.Buffer {
+	t.Helper()
+	old := slog.Default()
+	var logs bytes.Buffer
+	slog.SetDefault(slog.New(slog.NewJSONHandler(&logs, nil)))
+	t.Cleanup(func() { slog.SetDefault(old) })
+	return &logs
+}
+
+func assertStructuredWarning(t *testing.T, logText, eventName, errorCode string) {
+	t.Helper()
+	for _, want := range []string{
+		`"level":"WARN"`,
+		`"event.name":"` + eventName + `"`,
+		`"error.code":"` + errorCode + `"`,
+		`"request_id":"`,
+		`"trace_id":"`,
+		`"span_id":"`,
+	} {
+		if !strings.Contains(logText, want) {
+			t.Fatalf("structured warning missing %s: %s", want, logText)
+		}
+	}
 }
 
 // TestPoolLogin_EndToEnd: authorize-url binds session→credential; submit-code

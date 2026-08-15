@@ -15,13 +15,24 @@ import (
 
 	"github.com/AiKeyLabs/aikey-proxy/internal/apphook"
 	"github.com/AiKeyLabs/aikey-proxy/internal/config"
+	"github.com/AiKeyLabs/aikey-proxy/internal/detectortest"
 	"github.com/AiKeyLabs/aikey-proxy/internal/proxy"
 	"github.com/AiKeyLabs/aikey-proxy/internal/vault"
 )
 
 func TestFilterIntegration_MaxActionFullWarnFullFromVault(t *testing.T) {
-	home := t.TempDir()
-	t.Setenv("HOME", home)
+	// This harness spawns a REAL detector child (through the supervisor's own
+	// install path), so it goes through the same door as every other detector
+	// spawn in this repo — see internal/detectortest for the four $HOME-rooted
+	// inputs the detector reads and why sealing only one of them is not enough.
+	//
+	// It used to seal HOME by hand and nothing else. That was enough for the
+	// vault (which this test writes into $HOME), but it left the pack cache
+	// pointing at the developer's pulled lexicon — and this test asserts on
+	// ACTIONS (block / warn), which a pulled pack can change. sealed.Home is
+	// therefore used as this test's HOME everywhere the old local variable was.
+	detectorBinary, sealed := detectortest.SiblingBinary(t)
+	home := sealed.Home
 	t.Setenv("AIKEY_HUB_CONTROL_URL", "")
 	t.Setenv(filterBinaryEnv, "")
 	t.Setenv(filterWorkersEnv, "1")
@@ -77,7 +88,6 @@ func TestFilterIntegration_MaxActionFullWarnFullFromVault(t *testing.T) {
 	}
 	t.Cleanup(func() { reader.Close() })
 
-	detectorBinary := filepath.Join(labsRoot, "ai-compliance-detector", "bin", "detector")
 	if info, err := os.Stat(detectorBinary); err != nil || info.IsDir() {
 		t.Fatalf("real detector binary missing at %s; run sibling build: %v", detectorBinary, err)
 	}
@@ -107,6 +117,10 @@ func TestFilterIntegration_MaxActionFullWarnFullFromVault(t *testing.T) {
 		if target == nil {
 			t.Fatal("real detector child was not installed")
 		}
+		// Anti-regression: the child must confirm it resolved the sealed home
+		// before its verdict is compared against the expected action. Setting the
+		// environment is not evidence that the child honoured it.
+		sealed.AssertHeld(t, target)
 		response := target.Detect(context.Background(), request)
 		shutdownCtx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 		defer cancel()

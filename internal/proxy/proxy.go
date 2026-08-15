@@ -180,6 +180,20 @@ type Proxy struct {
 	// cache OFF (dispatcher skips the content-hash entirely → stateless full scan).
 	// Lives behind the hook==nil gate, so compliance OFF pays nothing (INV-6).
 	filterCache MaskCache
+	// filterCacheSuspended latches whether the LAST request observed the verdict
+	// cache as unusable (apphook.CacheEpoch said "I cannot state my content set"),
+	// so the dispatcher can log that transition ONCE instead of once per request.
+	//
+	// WHY a latch and not a plain per-request log: the suspension persists — a
+	// detector too old to answer op=ListPacks never starts answering on its own —
+	// so an unconditional line would emit at full request rate for the lifetime of
+	// the deployment (review finding B6; same reasoning as the 16 KiB truncation
+	// aggregate, which logs once per request rather than once per piece).
+	//
+	// Generation-scoped like every other counter here: a hot reload builds a new
+	// Proxy, so the first request after a reload re-announces the state. That is
+	// correct — the new generation has not said it yet.
+	filterCacheSuspended atomic.Bool
 	// filterPerformance is a bounded, content-free rolling latency window for
 	// the externally readable compliance health surface. It lives with the
 	// generation so a reload cannot mix samples from different detector builds.
@@ -267,6 +281,23 @@ type Proxy struct {
 	//
 	// 🔴 Generation-scoped, NOT process-scoped: see generationID below.
 	maskFidelity maskFidelity
+	// scanCoverage is the compliance SCAN-COVERAGE signal (bugfix 2026-08-13
+	// 20260813-pipe-input-cap-truncates-silently): how many content pieces were
+	// cut at pipeInputCap and how many bytes consequently reached the upstream
+	// LLM without ever being inspected.
+	//
+	// WHY it must be externally readable: every one of those requests returns
+	// 200, produces no mask and no compliance event, and looks identical to a
+	// clean scan from the outside — so an operator has literally no other way to
+	// discover that part of their traffic is unscanned. Agent tool blocks (file
+	// reads, pasted logs) routinely exceed 16 KiB, which makes the audit-coverage
+	// numbers on the compliance dashboard systematically optimistic until this is
+	// read alongside them.
+	// Read-only surface: /v1/diagnostics/pipeline (see maskRestoreHealth).
+	// Counts only — never an index, a length distribution or any content.
+	//
+	// 🔴 Generation-scoped, NOT process-scoped: see generationID below.
+	scanCoverage scanCoverage
 	// generationID is the supervisor generation that built this Proxy
 	// (supervisor.buildGeneration → s.genID.Add(1)). It is published on
 	// /v1/diagnostics/pipeline as `generation_id`.

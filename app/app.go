@@ -300,8 +300,9 @@ func Run() {
 	// its change callback can reach the live transport + broker swap.
 	sysWatcher := sysproxy.NewWatcher()
 	// effectiveBrokerEgress: static egress URL for the OAuth impersonate
-	// client — explicit config wins; else the system-derived URL ("" = client
-	// falls back to its own env handling, the pre-2026-07-08 behavior).
+	// client — explicit config wins; otherwise resolve the system/env-backed
+	// single source of truth to a concrete URL. Existing browser-OAuth clients
+	// retain their own compatibility behavior; Session Key fails closed on "".
 	effectiveBrokerEgress := func(cfgURL string) string {
 		s := strings.TrimSpace(cfgURL)
 		if s != "" && !egress.IsEngineSpec(s) {
@@ -311,6 +312,17 @@ func Run() {
 		// here with one means that path declined it, so fall back like an empty
 		// value does.
 		return sysWatcher.BrokerEgressURL()
+	}
+	var egressMu sync.Mutex
+	egressURL := cfg.UpstreamProxy.URL
+	sessionKeyEgress := func() string {
+		egressMu.Lock()
+		current := egressURL
+		egressMu.Unlock()
+		if egress.IsEngineSpec(strings.TrimSpace(current)) {
+			return current // broker rejects unsupported multi-hop specs; never silently direct.
+		}
+		return effectiveBrokerEgress(current)
 	}
 
 	// brokerEgressCloser holds the group dialer backing the CURRENT broker client
@@ -412,7 +424,7 @@ func Run() {
 		// C10/RW8: pool login handler — its own MEMORY-store broker (per-member
 		// tokens never touch the vault) reusing the global impersonate client set
 		// above; exchanges then write back to master RW10 over the team JWT.
-		poolHandler = sup.NewPoolLoginHandler()
+		poolHandler = sup.NewPoolLoginHandler(sessionKeyEgress)
 		slog.Info("OAuth broker initialized")
 	} else {
 		slog.Warn("OAuth broker disabled: vault not available")
@@ -529,8 +541,6 @@ func Run() {
 	// forwarding transport + OAuth impersonate client in place — no restart. egressMu
 	// guards the cached URL Get reads (the transport/broker swaps are themselves
 	// atomic). Decision: user chose hot-swap (B) + plaintext storage (i).
-	var egressMu sync.Mutex
-	egressURL := cfg.UpstreamProxy.URL
 	adminHandler.GetUpstreamProxyFn = func() string {
 		egressMu.Lock()
 		defer egressMu.Unlock()
@@ -862,11 +872,11 @@ func probeUpstreamProxy(
 // Probe semantics are unchanged: any HTTP response proves the tunnel carries traffic
 // (no credential is ever sent). The echo additionally returns the exit IP, which is
 // what a user configuring an egress actually wants to confirm.
+// The default and the env knob live in egress.DefaultEchoURL — the concept had
+// four hand-maintained copies and one of them (the control plane's) missed the
+// 2026-07-24 fix below, so it is now defined once and delegated to.
 func upstreamProbeTarget() string {
-	if v := strings.TrimSpace(os.Getenv("AIKEY_EGRESS_TEST_ECHO")); v != "" {
-		return v
-	}
-	return "https://api.ipify.org"
+	return egress.DefaultEchoURL()
 }
 
 // proxyResolutionTarget is a PROVIDER URL used only to ASK http.Transport which
@@ -1051,16 +1061,15 @@ func runEgressSelfCheck(ctx context.Context, specs []vkeys.AccountEgressSpec, di
 }
 
 // egressSelfCheckEcho is the neutral IP-echo the self-check dials THROUGH each
-// account's egress to learn its exit IP. Mirrors the master endpoint's env +
-// default (one behavior across control-plane and node). Neutral on purpose —
+// account's egress to learn its exit IP. It shares the master endpoint's env +
+// default BY CONSTRUCTION now (one behavior across control-plane and node); this
+// comment used to claim that mirroring while the master actually sat on a
+// different default. Neutral on purpose —
 // NEVER default to claude.ai, so an on-demand self-check doesn't probe Claude
 // from the residential exit on a cadence (§5.4 #2). A private deployment with no
 // external internet points AIKEY_EGRESS_TEST_ECHO at an internal echo.
 func egressSelfCheckEcho() string {
-	if v := strings.TrimSpace(os.Getenv("AIKEY_EGRESS_TEST_ECHO")); v != "" {
-		return v
-	}
-	return "https://api.ipify.org"
+	return egress.DefaultEchoURL()
 }
 
 // buildTransport builds the egress transport for the LIVE request path. When the

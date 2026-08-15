@@ -394,17 +394,28 @@ func (w *Watcher) ProxyFunc() func(*http.Request) (*url.URL, error) {
 	}
 }
 
-// BrokerEgressURL is the layered egress for clients that take a static proxy
-// URL string (the OAuth ImpersonateChrome client). "" when explicit env
-// config applies or nothing is detected — in both cases the client's own env
-// fallback yields the same result (explicit or inherited env respectively).
-// Callers must re-invoke this on change (main's onChange rebuilds the broker
-// client) — the returned string is a point-in-time value by design.
+// BrokerEgressURL resolves the layered HTTPS egress for clients that require
+// one explicit static proxy URL (OAuth Chrome impersonation clients). It uses
+// the same precedence as ProxyFunc, but returns the actual selected URL so the
+// client never needs to read proxy environment variables independently.
+// Callers must re-invoke this on change; the returned URL is point-in-time.
 func (w *Watcher) BrokerEgressURL() string {
-	if !w.active() {
+	target := &url.URL{Scheme: "https", Host: "claude.ai"}
+	if w.envExplicit {
+		if resolved, err := w.envProxy(target); err == nil && resolved != nil {
+			return resolved.String()
+		}
 		return ""
 	}
-	return w.Current().ProxyFor("https")
+	if w.active() {
+		if raw := w.Current().ProxyFor(target.Scheme); raw != "" {
+			return raw
+		}
+	}
+	if resolved, err := w.envProxy(target); err == nil && resolved != nil {
+		return resolved.String()
+	}
+	return ""
 }
 
 // proxyEnvNames is the variable set golang.org/x/net/http/httpproxy consults.

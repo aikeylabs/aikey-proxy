@@ -33,7 +33,7 @@ func TestComplianceLatencyMatrix(t *testing.T) {
 	if raceEnabled {
 		t.Skip("latency meaningless under -race")
 	}
-	binary := requireDetectorBinary(t)
+	binary, sealed := requireSealedDetector(t)
 	h := NewChildHook(&ChildHookConfig{
 		Name:         "ai-compliance-detector-matrix",
 		BinaryPath:   binary,
@@ -45,6 +45,9 @@ func TestComplianceLatencyMatrix(t *testing.T) {
 		t.Skipf("child binary unavailable: %v", err)
 	}
 	defer func() { _ = h.Shutdown(context.Background()) }()
+	// Same reason as the latency bench: a matrix measured on a host's installed
+	// dictionary layers describes that host, not the shipped binary.
+	sealed.AssertHeld(t, h)
 
 	// A CN ID number — reliably caught by the built-in cn-pii pack.
 	const idCard = "11010119900307851X"

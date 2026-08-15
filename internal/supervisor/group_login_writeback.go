@@ -49,16 +49,17 @@ type memberTokenWriteback struct {
 // poolLoginContext is the non-secret master binding fetched before starting an
 // OAuth provider flow. It prevents UI display fallbacks from selecting a model.
 type poolLoginContext struct {
-	CredentialID      string `json:"credential_id"`
-	OauthGroupID      string `json:"oauth_group_id"`
-	AccountID         string `json:"account_id"`
-	ProviderCode      string `json:"provider_code"`
-	ProtocolType      string `json:"protocol_type"`
-	OAuthAuthorizeURL string `json:"oauth_authorize_url,omitempty"`
-	OAuthTokenURL     string `json:"oauth_token_url,omitempty"`
-	OAuthContext      string `json:"oauth_context,omitempty"`
-	ExpectedIdentity  string `json:"expected_identity"`
-	ExternalID        string `json:"external_id"`
+	CredentialID       string `json:"credential_id"`
+	OauthGroupID       string `json:"oauth_group_id"`
+	AccountID          string `json:"account_id"`
+	ProviderCode       string `json:"provider_code"`
+	ProtocolType       string `json:"protocol_type"`
+	EffectiveEgressURL string `json:"effective_egress_url,omitempty"`
+	OAuthAuthorizeURL  string `json:"oauth_authorize_url,omitempty"`
+	OAuthTokenURL      string `json:"oauth_token_url,omitempty"`
+	OAuthContext       string `json:"oauth_context,omitempty"`
+	ExpectedIdentity   string `json:"expected_identity"`
+	ExternalID         string `json:"external_id"`
 }
 
 type poolLoginContextHTTPError struct {

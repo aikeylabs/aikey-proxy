@@ -44,11 +44,16 @@ import (
 // available the upstream's billing/auth rejection still proves structural
 // acceptance (we fail only if it rejects the body as malformed JSON).
 func TestLiveAnthropic_MaskedRequestAcceptedAndAnswered(t *testing.T) {
-	bin := os.Getenv("AIKEY_TEST_DETECTOR_BINARY")
 	key := os.Getenv("AIKEY_TEST_ANTHROPIC_KEY")
-	if bin == "" || key == "" {
-		t.Skip("set AIKEY_TEST_DETECTOR_BINARY + AIKEY_TEST_ANTHROPIC_KEY to run the live Anthropic closed loop")
+	if key == "" {
+		t.Skipf("set AIKEY_TEST_ANTHROPIC_KEY (plus %s) to run the live Anthropic closed loop",
+			liveDetectorBinaryEnv)
 	}
+	// Sealed for the same reason as the zero-cost live tests: the assertion below
+	// is "the RAW PII never left the box", and a host lexicon / ops override
+	// changes what gets masked. This one additionally spends real money, so it
+	// must not be decided by a machine-local input.
+	bin, sealed := liveDetectorBinary(t, "the live Anthropic closed loop")
 
 	// Real detector hook.
 	hook := apphook.NewChildHook(&apphook.ChildHookConfig{
@@ -65,6 +70,9 @@ func TestLiveAnthropic_MaskedRequestAcceptedAndAnswered(t *testing.T) {
 		_ = hook.Shutdown(ctx)
 		cancel()
 	}()
+	// Assert the seal held BEFORE spending a paid upstream call on a run whose
+	// masking could have come from host state.
+	sealed.AssertHeld(t, hook)
 
 	// Capture server: observes the masked body the proxy forwards, then relays
 	// it to real Anthropic with a known-good Anthropic request (its own headers,

@@ -45,6 +45,7 @@ import (
 	"time"
 
 	"github.com/AiKeyLabs/aikey-proxy/internal/apphook"
+	"github.com/AiKeyLabs/aikey-proxy/internal/detectortest"
 )
 
 // Full-form addresses the EMBEDDED recognizer (rules + 4-level divisions +
@@ -55,33 +56,40 @@ const (
 	e2eAddr2 = "浙江省杭州市西湖区文三路478号华星时代广场A座12楼"
 )
 
-// writeDetectorPolicyOverride materializes a fake HOME containing the external
-// action-policy override at its production path and returns the HOME dir.
-func writeDetectorPolicyOverride(t *testing.T, policyJSON string) string {
+// startRealDetectorPoolWithPolicyOverride spawns the real detector child inside a
+// SEALED home that holds the external action-policy override at its production
+// path, so the child resolves the override (and the asset dir) from the
+// test-controlled location.
+//
+// ── Why this used to be its own mechanism, and no longer is (2026-08-14) ─────
+//
+// This harness predates internal/detectortest and sealed HOME/USERPROFILE by
+// hand, via ChildHookConfig.ExtraEnv. That was the right instinct and a
+// DIFFERENT implementation of the same idea, which is precisely the split that
+// let the other thirteen detector-spawning tests stay unsealed: with two
+// mechanisms, neither one is "the" way, so a new test copies whichever it
+// happens to read first. It now uses the same door as everything else and plants
+// its override INSIDE the sealed home.
+//
+// Note the seal is strictly stronger than what ExtraEnv gave: it also pins
+// AIKEY_PACK_CACHE_DIR, which ExtraEnv never did, so the child can no longer
+// warm-start from the developer's pulled packs.
+func startRealDetectorPoolWithPolicyOverride(t *testing.T, policyJSON string) *apphook.FilterPool {
 	t.Helper()
-	home := t.TempDir()
-	dir := filepath.Join(home, ".aikey", "apps", "ai-compliance-detector")
+	bin, sealed := detectortest.SiblingBinary(t)
+
+	dir := filepath.Join(sealed.Home, ".aikey", "apps", "ai-compliance-detector")
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		t.Fatalf("mkdir override dir: %v", err)
 	}
 	if err := os.WriteFile(filepath.Join(dir, "policy.json"), []byte(policyJSON), 0o644); err != nil {
 		t.Fatalf("write policy override: %v", err)
 	}
-	return home
-}
 
-// startRealDetectorPoolWithHome spawns the real detector child with HOME
-// redirected, so it resolves the external policy override (and asset dir) from
-// the test-controlled location. Mirrors startRealDetectorPool otherwise.
-func startRealDetectorPoolWithHome(t *testing.T, home string) *apphook.FilterPool {
-	t.Helper()
 	ch := apphook.NewChildHook(&apphook.ChildHookConfig{
-		Name:       "ai-compliance-detector-integ-mask",
-		BinaryPath: integDetectorBinary(),
-		BinaryArgs: nil, // real engine + embedded baseline pack + embedded address assets
-		// exec.Cmd deduplicates Env keeping the LAST entry, so these override
-		// the inherited values for the child only.
-		ExtraEnv:     []string{"HOME=" + home, "USERPROFILE=" + home},
+		Name:         "ai-compliance-detector-integ-mask",
+		BinaryPath:   bin,
+		BinaryArgs:   nil,              // real engine + embedded baseline pack + embedded address assets
 		Timeout:      5 * time.Second,  // address lane + NER scan ≫ the 1ms default
 		ReadyTimeout: 20 * time.Second, // CRF model load takes a few seconds
 	})
@@ -92,6 +100,9 @@ func startRealDetectorPoolWithHome(t *testing.T, home string) *apphook.FilterPoo
 		t.Skipf("detector binary unavailable (run 'make -C ../ai-compliance-detector build'): %v", err)
 	}
 	t.Cleanup(func() { _ = pool.Shutdown(context.Background()) })
+	// Doubles as the proof that the override file this harness just wrote is the
+	// one the child read: the reported asset dir sits under the same sealed home.
+	sealed.AssertHeld(t, pool)
 	return pool
 }
 
@@ -101,8 +112,7 @@ func startRealDetectorPoolWithHome(t *testing.T, home string) *apphook.FilterPoo
 // text gone), and a simulated LLM response echoing both placeholders restores
 // to the original text.
 func TestFilterIntegration_AddressMaskLadderEndToEnd(t *testing.T) {
-	home := writeDetectorPolicyOverride(t, `{"schema_version":1,"entity_actions":{"CN_ADDRESS":"mask"}}`)
-	pool := startRealDetectorPoolWithHome(t, home)
+	pool := startRealDetectorPoolWithPolicyOverride(t, `{"schema_version":1,"entity_actions":{"CN_ADDRESS":"mask"}}`)
 
 	p := &Proxy{}
 	p.SetFilterHook(pool)
@@ -155,10 +165,9 @@ func TestFilterIntegration_AddressMaskLadderEndToEnd(t *testing.T) {
 // response-leg restore, with zero proxy-side configuration (label truth stays
 // detector-side).
 func TestFilterIntegration_AddressMaskCustomLabel(t *testing.T) {
-	home := writeDetectorPolicyOverride(t, `{"schema_version":1,
+	pool := startRealDetectorPoolWithPolicyOverride(t, `{"schema_version":1,
 		"entity_actions":{"CN_ADDRESS":"mask"},
 		"address_mask_label":{"token":"[ADDR-HIDDEN]","numbered_prefix":"[ADDR#","numbered_suffix":"-HIDDEN]"}}`)
-	pool := startRealDetectorPoolWithHome(t, home)
 
 	p := &Proxy{}
 	p.SetFilterHook(pool)
