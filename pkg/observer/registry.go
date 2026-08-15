@@ -118,6 +118,33 @@ type FullPayloadObserver interface {
 	WantsFullPayload() bool
 }
 
+// ClosableObserver is an OPTIONAL capability interface (same idiom as
+// FullPayloadObserver). An observer whose Build starts background goroutines,
+// tickers or connections implements it; Registry.Close calls it when the
+// generation that owns this registry is retired.
+//
+// Why this exists (2026-08-15): BuildObservers runs once per SUPERVISOR
+// GENERATION, not once per process — supervisor.buildGeneration calls
+// buildObserverRegistry on every reload. Before this hook there was no
+// retirement path at all, so anything an observer started in Build lived until
+// process exit. The rhythm observer starts a 5s settings poller plus a worker
+// pool, and both accumulated: one toggle flip produced FOUR
+// `settings_poller.toggle_changed` events from four leaked pollers, each
+// independently polling trust-local forever. rhythm's own doc-comment even
+// spelled out the hazard ("callers MUST call Stop before constructing a second
+// poller") but relied on "there's exactly one observer instance per proxy
+// process", which the per-generation rebuild silently violates.
+//
+// Same bug class as the allocation-engine signal reporter fixed earlier in
+// generation.closeAll (its "loop() goroutine + 30s ticker leak on every
+// reload"); the observer registry was the one that got missed.
+//
+// Close MUST be bounded — Registry.Close applies its own overall deadline, but
+// an observer that blocks forever still delays the reload's drain goroutine.
+type ClosableObserver interface {
+	Close()
+}
+
 // RequestContext is the per-request metadata observers see. Mirrors the
 // schema documented in plugin-架构设计.md §3.2; new fields require a
 // design-doc update so observers can rely on a stable shape.
@@ -740,6 +767,63 @@ func (r *Registry) Active() int {
 		}
 	}
 	return n
+}
+
+// closeBudget bounds the whole teardown. generation.closeAll runs on the
+// reload's async drain goroutine (the new generation already serves), so this
+// never blocks a request — but an observer that hangs must not pin that
+// goroutine for the process lifetime. rhythm's own Close is ~8s worst case
+// (reporter drain 5s + settings poll 3s), so the budget sits above it.
+const closeBudget = 10 * time.Second
+
+// Close retires every active observer that implements ClosableObserver, so the
+// goroutines / tickers / connections they opened in Build do not outlive the
+// generation that owns this registry. Idempotent and nil-safe: callers reach it
+// through generation.close(), which is itself guarded by a sync.Once, but a
+// second call here is harmless because each observer's own Stop is idempotent.
+//
+// Panics are contained per observer (same rule as the request hooks): a
+// misbehaving plugin must never abort teardown of the others, and must never
+// take the proxy down on reload.
+func (r *Registry) Close() {
+	if r == nil {
+		return
+	}
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		for _, ao := range r.observers {
+			c, ok := ao.impl.(ClosableObserver)
+			if !ok {
+				continue
+			}
+			func() {
+				defer func() {
+					if rec := recover(); rec != nil {
+						r.logger.Warn("observer: Close panicked; continuing teardown",
+							"event.name", "proxy.observer.close_panic",
+							"error.code", "OBSERVER_CLOSE_PANIC",
+							"observer", ao.descriptor.Name,
+							"owner_slug", ao.descriptor.OwnerAppSlug,
+							"panic", rec,
+						)
+					}
+				}()
+				c.Close()
+			}()
+		}
+	}()
+	select {
+	case <-done:
+	case <-time.After(closeBudget):
+		// Deliberately not fatal: the generation is being discarded anyway and
+		// the new one already serves. Loud so a plugin that stops honouring the
+		// bound is visible in ops logs rather than silently slowing reloads.
+		r.logger.Warn("observer: Close exceeded budget; abandoning teardown",
+			"event.name", "proxy.observer.close_timeout",
+			"budget_ms", closeBudget.Milliseconds(),
+		)
+	}
 }
 
 // WantsFullPayload reports whether any currently-active observer needs the raw
