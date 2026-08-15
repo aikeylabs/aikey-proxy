@@ -611,8 +611,18 @@ func (p *Proxy) serveRoute(w http.ResponseWriter, r *http.Request, route *vkeys.
 	// 🚫 Log only. Neither branch changes where the request goes.
 	if route.BaseURL != "" && realKey != "__oauth__" {
 		if matched, known := provider.Routes().LookupByBaseURL(route.BaseURL); !known {
-			logger.Warn("upstream host not in provider_routes — using degraded literal-prepend stitch",
-				"event.name", "proxy.route.not_found", "base_url", route.BaseURL, "provider_code", route.ProviderCode)
+			// 2026-08-15: once per distinct base_url per generation, not once per
+			// request. route.BaseURL here is always an EXPLICIT user declaration
+			// (the branch is guarded on it being non-empty and it comes straight
+			// off the credential row), so this is a supported third-party gateway
+			// being announced — not a per-request fault. Repeating it 92 times for
+			// one relay buried the WARN level. The stitch is still the degraded
+			// literal-prepend one, so P1j's "must not be silent" holds; it is now
+			// merely not deafening.
+			if _, seen := p.declaredUpstreamsLogged.LoadOrStore(route.BaseURL, struct{}{}); !seen {
+				logger.Warn("upstream host not in provider_routes — using degraded literal-prepend stitch (declared third-party gateway; logged once per base_url)",
+					"event.name", "proxy.route.not_found", "base_url", route.BaseURL, "provider_code", route.ProviderCode)
+			}
 		} else if _, discarded := provider.Routes().PathDiscarded(route.BaseURL); discarded {
 			logger.Warn("stored base_url carries a path this build's provider_routes does not know — the extra segments are being DISCARDED, so the request may be reshaped for the wrong upstream face. Most likely cause: this worker is running an older build than the control plane.",
 				"event.name", "proxy.route.path_discarded",
