@@ -817,7 +817,7 @@ func (r *Registry) Close() {
 	case <-done:
 	case <-time.After(closeBudget):
 		// Deliberately not fatal: the generation is being discarded anyway and
-		// the new one already serves. Loud so a plugin that stops honouring the
+		// the new one already serves. Loud so a plugin that stops honoring the
 		// bound is visible in ops logs rather than silently slowing reloads.
 		r.logger.Warn("observer: Close exceeded budget; abandoning teardown",
 			"event.name", "proxy.observer.close_timeout",

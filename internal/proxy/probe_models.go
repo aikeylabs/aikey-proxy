@@ -147,7 +147,7 @@ func (p *Proxy) handleProbeModelsDiscovery(
 	ctx, cancel := context.WithTimeout(r.Context(), probeModelsTimeout)
 	defer cancel()
 
-	out, reqErr := http.NewRequestWithContext(ctx, http.MethodGet, "http://placeholder/v1"+probeModelsSuffix, nil)
+	out, reqErr := http.NewRequestWithContext(ctx, http.MethodGet, "http://placeholder/v1"+probeModelsSuffix, http.NoBody)
 	if reqErr != nil {
 		p.errors.Add(1)
 		writeJSONError(w, http.StatusInternalServerError, "server_error", "PROBE_MODELS_REQUEST_BUILD_FAILED",
