@@ -209,29 +209,60 @@ func TestTheForwardingHotPathTouchesNoLicensingFileOrDatabase(t *testing.T) {
 	t.Logf("reachable from %s: %d functions across %d files", hotPathEntry, len(reached), graph.fileCount(reached))
 
 	// ── licensing imports: zero, anywhere in the reachable set ─────────────
+	for _, v := range bannedImportsReached(graph, reached, forbiddenImports) {
+		t.Errorf("🔴 %s is reachable from %s and its file imports %q.\n   %s",
+			v.fn, hotPathEntry, v.what, v.why)
+	}
+
+	// ── database CALLS: zero ───────────────────────────────────────────────
+	for _, v := range bannedCallsReached(graph, reached, forbiddenMethodCalls) {
+		t.Errorf("🔴 %s is reachable from %s and calls %s.\n   %s", v.fn, hotPathEntry, v.what, v.why)
+	}
+}
+
+// violation is one reachable function paired with the banned thing it reaches.
+type violation struct {
+	fn   string // the reachable function
+	what string // the import path, or the call as written
+	why  string // the banned entry's own explanation
+}
+
+// bannedImportsReached and bannedCallsReached are the fence's two comparisons,
+// as functions rather than inline loops.
+//
+// 🔴 WHY THEY WERE EXTRACTED. Not tidiness — so that the drill below can run the
+// SAME comparison the fence enforces. A drill that re-implemented the matching
+// would be proving its own copy, and the day the two drifted the drill would go
+// on reporting a fence that no longer behaves that way. There is one copy, and
+// both the fence and its proof call it.
+func bannedImportsReached(g *moduleGraph, reached map[string]struct{}, banned map[string]string) []violation {
+	var out []violation
 	for _, fn := range sortedKeys(reached) {
-		for _, imp := range graph.importsOf(fn) {
-			for banned, why := range forbiddenImports {
-				if imp == banned || strings.HasPrefix(imp, banned+"/") {
-					t.Errorf("🔴 %s is reachable from %s and its file imports %q.\n   %s",
-						fn, hotPathEntry, imp, why)
+		for _, imp := range g.importsOf(fn) {
+			for pkg, why := range banned {
+				if imp == pkg || strings.HasPrefix(imp, pkg+"/") {
+					out = append(out, violation{fn: fn, what: imp, why: why})
 				}
 			}
 		}
 	}
+	return out
+}
 
-	// ── database CALLS: zero ───────────────────────────────────────────────
+func bannedCallsReached(g *moduleGraph, reached map[string]struct{}, banned map[string]string) []violation {
+	var out []violation
 	for _, fn := range sortedKeys(reached) {
-		for _, call := range graph.selectorCallsIn(fn) {
+		for _, call := range g.selectorCallsIn(fn) {
 			name := call
 			if cut := strings.LastIndex(call, "."); cut >= 0 {
 				name = call[cut+1:]
 			}
-			if why, banned := forbiddenMethodCalls[name]; banned {
-				t.Errorf("🔴 %s is reachable from %s and calls %s.\n   %s", fn, hotPathEntry, call, why)
+			if why, isBanned := banned[name]; isBanned {
+				out = append(out, violation{fn: fn, what: call, why: why})
 			}
 		}
 	}
+	return out
 }
 
 // TestNoNewFileCallAppearsOnTheForwardingHotPath is the ratchet over
@@ -328,6 +359,95 @@ func TestTheHotPathFenceWouldNoticeALicensingImport(t *testing.T) {
 	if !(sample == modulePath || strings.HasPrefix(sample, modulePath+"/")) {
 		t.Fatalf("the sample import %q would not match under this fence's own comparison; the "+
 			"check is not doing what it looks like", sample)
+	}
+}
+
+// TestTheHotPathFenceGoesRedWhenSomethingForbiddenIsReached is the drill: it
+// requires the fence's verdict path to actually fire.
+//
+// 🔴 WHY THIS IS SEPARATE FROM TestTheHotPathFenceWouldNoticeALicensingImport.
+// That test proves the MACHINERY — the entry point resolves, the walk leaves
+// internal/proxy, the comparison matches a real path. None of that establishes
+// that a match becomes a FAILURE. A fence can have a correct graph, a correct
+// comparison, and still report nothing, and every assertion above would stay
+// green. This one bans something the hot path demonstrably reaches and requires
+// a violation to come back.
+//
+// 🚫 It cannot be written the obvious way — as an actual forbidden import — for
+// the reason recorded on TestThisModuleDoesNotDependOnLicensingAtAll below:
+// adding `_ ".../aikey-license-core/licstate"` fails the BUILD, because the
+// module does not require it. A mutation that does not compile proves nothing;
+// the failure it produces is the compiler's, not the fence's. So the mutation is
+// applied to the BAN LIST instead, and it runs through the same comparison the
+// fence enforces.
+//
+// 🔴 The banned entries are DISCOVERED, never hardcoded. A literal package name
+// here would turn this drill red the day the hot path stopped importing it —
+// which is a change in the product, not a broken fence, and the person who hit
+// it would "fix" the drill.
+func TestTheHotPathFenceGoesRedWhenSomethingForbiddenIsReached(t *testing.T) {
+	graph := loadModuleGraph(t)
+	reached := graph.reachableFrom(hotPathEntry)
+
+	// ── the import half ────────────────────────────────────────────────────
+	var sampleImport string
+	for _, fn := range sortedKeys(reached) {
+		if imports := graph.importsOf(fn); len(imports) > 0 {
+			sampleImport = imports[0]
+			break
+		}
+	}
+	if sampleImport == "" {
+		t.Fatal("nothing reachable from the hot path imports anything, so banning an import " +
+			"could not be observed either way — this drill would prove nothing")
+	}
+
+	if hits := bannedImportsReached(graph, reached, map[string]string{sampleImport: "drill"}); len(hits) == 0 {
+		t.Errorf("🔴 NOT A FENCE: %q is imported by something reachable from %s, and banning it "+
+			"produced no violation. The import half reports nothing no matter what is on the "+
+			"hot path", sampleImport, hotPathEntry)
+	} else {
+		t.Logf("banning %q yields %d violation(s); first: %s", sampleImport, len(hits), hits[0].fn)
+	}
+
+	// Negative control. Without it a comparison that matched EVERYTHING would
+	// pass the assertion above — and it would also pass the real fence, loudly,
+	// for every release.
+	const absent = "example.invalid/no/such/package"
+	if hits := bannedImportsReached(graph, reached, map[string]string{absent: "drill"}); len(hits) != 0 {
+		t.Errorf("🔴 the import comparison reported %d violation(s) for %q, which nothing imports. "+
+			"It is matching indiscriminately, so its green result means nothing either",
+			len(hits), absent)
+	}
+
+	// ── the call half ──────────────────────────────────────────────────────
+	var sampleCall string
+	for _, fn := range sortedKeys(reached) {
+		if calls := graph.selectorCallsIn(fn); len(calls) > 0 {
+			sampleCall = calls[0]
+			break
+		}
+	}
+	if sampleCall == "" {
+		t.Fatal("nothing reachable from the hot path makes a selector call, so banning one " +
+			"could not be observed either way")
+	}
+	sampleMethod := sampleCall
+	if cut := strings.LastIndex(sampleCall, "."); cut >= 0 {
+		sampleMethod = sampleCall[cut+1:]
+	}
+
+	if hits := bannedCallsReached(graph, reached, map[string]string{sampleMethod: "drill"}); len(hits) == 0 {
+		t.Errorf("🔴 NOT A FENCE: %s is called by something reachable from %s, and banning %q "+
+			"produced no violation. The database half reports nothing no matter what the hot "+
+			"path calls", sampleCall, hotPathEntry, sampleMethod)
+	} else {
+		t.Logf("banning method %q yields %d violation(s); first: %s", sampleMethod, len(hits), hits[0].fn)
+	}
+
+	if hits := bannedCallsReached(graph, reached, map[string]string{"NoSuchMethodIsCalledHere": "drill"}); len(hits) != 0 {
+		t.Errorf("🔴 the call comparison reported %d violation(s) for a method name nothing calls",
+			len(hits))
 	}
 }
 
