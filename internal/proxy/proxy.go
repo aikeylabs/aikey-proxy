@@ -90,6 +90,17 @@ type Proxy struct {
 	// cache key. Only populated for accounts that configure an egress proxy; the
 	// default hot path never touches it.
 	accountEgressTransports sync.Map // map[string]accountEgressEntry
+	// declaredUpstreamsLogged remembers which explicitly-declared base_urls have
+	// already had their "not in provider_routes" notice emitted, so a supported
+	// third-party gateway is announced ONCE per generation instead of once per
+	// request. 2026-08-15: a single relay produced 92 identical WARN lines in one
+	// session; a permanent, supported configuration that shouts on every request
+	// trains operators to filter WARN out, which is how a real one gets missed
+	// ("失败要显眼" only works if WARN stays rare). The signal itself is kept —
+	// P1j requires the degraded stitch to be observable — just not repeated.
+	// Bounded by the number of distinct declared base_urls (single digits) and
+	// discarded with the generation.
+	declaredUpstreamsLogged sync.Map // map[string]struct{}
 	// oauthEgressOverride is the OPT-IN emergency escape hatch (2026-07-19): when
 	// true, an OAuth pool account's per-account egress (②) is IGNORED and its
 	// traffic falls back to the NODE-level chain (currentTransport: /user/settings
@@ -778,6 +789,16 @@ func (p *Proxy) StopSignalReporting() {
 	if p.signalReporter != nil {
 		_ = p.signalReporter.Close()
 	}
+}
+
+// StopObservers retires this generation's observer registry (idempotent,
+// nil-safe). Called from generation.close() for the same reason as
+// StopSignalReporting: the registry is rebuilt per generation
+// (supervisor.buildObserverRegistry), so whatever its observers started in
+// Build — rhythm's 5s settings poller and reporter worker pool — leaks on every
+// reload without this. See observer.ClosableObserver.
+func (p *Proxy) StopObservers() {
+	p.observerRegistry.Close()
 }
 
 // SetWAL attaches a local WAL writer for offline-mode usage events.
