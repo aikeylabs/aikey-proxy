@@ -618,6 +618,18 @@ func (p *Proxy) handleProbePipeline(w http.ResponseWriter, r *http.Request, prob
 	}
 	binding := aliasCred.Binding
 
+	// Stage 2b: model discovery (GET /probe/<alias>/v1/models).
+	//
+	// 🔴 Branches HERE, before stage 3, because stages 3 and 4 both assume a
+	// chat request: the sanitizer rejects an empty body with
+	// MALFORMED_REQUEST_BODY, and stage 4 infers the upstream from
+	// `body.model` — the very thing a discovery call exists to find out. See
+	// probe_models.go for why this capability lives in the proxy at all.
+	if isProbeModelsRequest(r, probeCtx) {
+		p.handleProbeModelsDiscovery(w, r, probeCtx, binding, logger)
+		return
+	}
+
 	// Capture the genuine inbound User-Agent BEFORE the credential resolve
 	// step (which may call oauthInject and mask the UA). Mirrors the
 	// handleAppPipeline pattern; needed for the post-translation WAF rewrite
