@@ -3,6 +3,7 @@ package supervisor
 import (
 	"bytes"
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"io"
@@ -89,9 +90,11 @@ func TestPoolSessionKeyProviderSupportedUsesCredentialProtocol(t *testing.T) {
 		want bool
 	}{
 		{name: "anthropic", ctx: poolLoginContext{ProviderCode: "anthropic", ProtocolType: "anthropic"}, want: true},
+		{name: "openai codex", ctx: poolLoginContext{ProviderCode: "openai", ProtocolType: "openai_compatible"}, want: true},
 		{name: "mock anthropic", ctx: poolLoginContext{ProviderCode: "mock", ProtocolType: "anthropic", OAuthTokenURL: "http://127.0.0.1/oauth/anthropic/token"}, want: true},
 		{name: "mock missing endpoint", ctx: poolLoginContext{ProviderCode: "mock", ProtocolType: "anthropic"}, want: false},
-		{name: "mock codex", ctx: poolLoginContext{ProviderCode: "mock", ProtocolType: "openai_compatible", OAuthTokenURL: "http://127.0.0.1/oauth/openai_compatible/token"}, want: false},
+		{name: "mock codex", ctx: poolLoginContext{ProviderCode: "mock", ProtocolType: "openai_compatible", OAuthTokenURL: "http://127.0.0.1/oauth/openai_compatible/token"}, want: true},
+		{name: "mock codex missing endpoint", ctx: poolLoginContext{ProviderCode: "mock", ProtocolType: "openai_compatible"}, want: false},
 		{name: "unknown brand", ctx: poolLoginContext{ProviderCode: "other", ProtocolType: "anthropic"}, want: false},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
@@ -99,6 +102,55 @@ func TestPoolSessionKeyProviderSupportedUsesCredentialProtocol(t *testing.T) {
 				t.Fatalf("poolSessionKeyProviderSupported(%+v)=%t want %t", tt.ctx, got, tt.want)
 			}
 		})
+	}
+}
+
+func TestExchangePoolSessionKeyUsesResidentMockCodexContext(t *testing.T) {
+	header := base64.RawURLEncoding.EncodeToString([]byte(`{"alg":"none","typ":"JWT"}`))
+	payload, err := json.Marshal(map[string]any{
+		"exp":                            time.Now().Add(time.Hour).Unix(),
+		"https://api.openai.com/profile": map[string]any{"email": "mock-codex@example.test"},
+		"https://api.openai.com/auth": map[string]any{
+			"chatgpt_account_id": "cred-mock-codex",
+			"chatgpt_plan_type":  "mock",
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	accessToken := header + "." + base64.RawURLEncoding.EncodeToString(payload) + ".fixture"
+	provider := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/oauth/openai_compatible/token" || r.Method != http.MethodPost {
+			t.Fatalf("unexpected mock Codex request: %s %s", r.Method, r.URL.Path)
+		}
+		if err := r.ParseForm(); err != nil {
+			t.Fatal(err)
+		}
+		if r.Form.Get("grant_type") != "session_key" || !strings.HasPrefix(r.Form.Get("session_key"), "mock-chatgpt-session-") {
+			t.Fatalf("unexpected mock Codex grant: %v", r.Form)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"access_token": accessToken,
+			"token_type":   "Bearer",
+			"expires_in":   3600,
+		})
+	}))
+	defer provider.Close()
+
+	token, err := exchangePoolSessionKey(context.Background(), poolLoginContext{
+		ProviderCode: "mock", ProtocolType: "openai_compatible",
+		OAuthTokenURL: provider.URL + "/oauth/openai_compatible/token",
+	}, broker.SessionKeyExchangeOptions{
+		SessionKey: "mock-chatgpt-session-fixture-value-long-enough",
+		ProxyURL:   "http://127.0.0.1:1",
+	})
+	if err != nil {
+		t.Fatalf("mock Codex Session Key exchange: %v", err)
+	}
+	if token.AccessToken != accessToken || token.RefreshToken != "" ||
+		token.Identity.ExternalID != "cred-mock-codex" || token.Identity.Email != "mock-codex@example.test" {
+		t.Fatalf("unexpected mock Codex token metadata: %+v", token)
 	}
 }
 
@@ -150,6 +202,22 @@ func TestExchangePoolSessionKeyRoutesRealAnthropicToClaudeExchanger(t *testing.T
 	}
 	if strings.Contains(oauthErr.Message, "Mock Provider") {
 		t.Fatalf("real Anthropic account entered the Mock Provider adapter: %v", err)
+	}
+}
+
+func TestExchangePoolSessionKeyRoutesRealOpenAIToCodexExchanger(t *testing.T) {
+	_, err := exchangePoolSessionKey(context.Background(), poolLoginContext{
+		ProviderCode: "openai", ProtocolType: "openai_compatible",
+	}, broker.SessionKeyExchangeOptions{
+		SessionKey: "opaque-chatgpt-session-token-value-0123456789",
+		ProxyURL:   "ftp://proxy.invalid:21",
+	})
+	var oauthErr *broker.OAuthError
+	if !errors.As(err, &oauthErr) || oauthErr.Code != broker.ErrCodeSessionKeyEgressUnsupported {
+		t.Fatalf("real OpenAI account did not enter the Codex exchanger: %v", err)
+	}
+	if strings.Contains(oauthErr.Message, "Mock Provider") {
+		t.Fatalf("real OpenAI account entered the Mock Provider adapter: %v", err)
 	}
 }
 

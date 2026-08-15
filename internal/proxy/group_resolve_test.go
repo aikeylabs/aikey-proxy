@@ -127,11 +127,10 @@ func TestResolveGroup_RuntimeOnlyAddedAccountCanServeWithoutKeySync(t *testing.T
 	}
 }
 
-// TestResolveGroup_LoginRequiredNoSkip (RW2/D2): the HRW-primary account has no
-// material (member hasn't logged into it) while a LATER candidate does — the
-// resolver returns LOGIN_REQUIRED for the PRIMARY and does NOT skip to the
-// logged-in one (preserving HRW allocation).
-func TestResolveGroup_LoginRequiredNoSkip(t *testing.T) {
+// 2026-08-15 rule change (supersedes RW2/D2 "no skip"): a needs_login primary —
+// hard-revoked or never logged in — must NOT block the member while a logged-in
+// sibling exists. LOGIN_REQUIRED is reserved for "no candidate serviceable".
+func TestResolveGroup_NeedsLoginPrimaryFallsThroughToLoggedInSibling(t *testing.T) {
 	key := grKey()
 	seat := "seat-77"
 	order := rankOrder(seat, "acc-a", "acc-b")
@@ -145,14 +144,37 @@ func TestResolveGroup_LoginRequiredNoSkip(t *testing.T) {
 	}
 	route := &vkeys.ResolvedRoute{SeatID: seat, OauthGroupID: "grp", GroupAccounts: mustJSON(t, refs), GroupRuntime: mustJSON(t, mat)}
 
+	res, err := resolveGroupCredential(route, key, 1_000_000, nil, "")
+	if err != nil {
+		t.Fatalf("needs_login primary must fall through to the logged-in sibling, got %v", err)
+	}
+	if res.AccountID != other {
+		t.Fatalf("want the logged-in sibling %q to serve (primary %q stays a UI login prompt), got %q", other, primary, res.AccountID)
+	}
+}
+
+// When EVERY candidate is waiting on a login, the prompt is actionable and names
+// the highest-ranked needs_login account (the engine override wins when present —
+// covered by the override test below).
+func TestResolveGroup_AllNeedsLoginPromptsHighestRanked(t *testing.T) {
+	key := grKey()
+	seat := "seat-77"
+	order := rankOrder(seat, "acc-a", "acc-b")
+	primary := order[0]
+
+	refs := []vkeys.GroupAccountRef{{AccountID: "acc-a", ProviderCode: "anthropic"}, {AccountID: "acc-b", ProviderCode: "anthropic"}}
+	mat := map[string]vkeys.GroupRuntimeAccount{
+		"acc-a": {CredentialType: "oauth_account", NeedsLogin: true},
+		"acc-b": {CredentialType: "oauth_account", NeedsLogin: true},
+	}
+	route := &vkeys.ResolvedRoute{SeatID: seat, OauthGroupID: "grp", GroupAccounts: mustJSON(t, refs), GroupRuntime: mustJSON(t, mat)}
+
 	_, err := resolveGroupCredential(route, key, 1_000_000, nil, "")
 	ge, ok := err.(*groupResolveError)
-	if !ok || ge.Code != groupErrLoginRequired {
-		t.Fatalf("want LOGIN_REQUIRED, got %v", err)
+	if !ok || ge.Code != groupErrLoginRequired || ge.Account != primary {
+		t.Fatalf("want LOGIN_REQUIRED naming rank-0 %q, got %v", primary, err)
 	}
-	if ge.Account != primary {
-		t.Fatalf("D2: must prompt login for the HRW primary %q (not skip to %q); got %q", primary, other, ge.Account)
-	}
+	_ = key
 }
 
 // TestResolveGroup_AbsentMaterialSkips (P1): an account with NO material entry at
@@ -182,10 +204,10 @@ func TestResolveGroup_AbsentMaterialSkips(t *testing.T) {
 	}
 }
 
-// A needs-login account discovered after the assigned account became globally
-// unavailable is the new routed destination. Resolution must stop on it so the
-// display and login page can converge before any later usable account is tried.
-func TestResolveGroup_NeedsLoginSuccessorIsActionable(t *testing.T) {
+// 2026-08-15 rule change: a needs_login successor no longer stops resolution —
+// the next LOGGED-IN candidate serves (the exhausted rank-0 stays skipped, the
+// needs_login rank-1 stays a UI prompt, rank-2's token carries the traffic).
+func TestResolveGroup_NeedsLoginSuccessorDoesNotBlockLaterUsable(t *testing.T) {
 	key := grKey()
 	seat := "seat-9"
 	order := rankOrder(seat, "x", "y", "z")
@@ -195,17 +217,19 @@ func TestResolveGroup_NeedsLoginSuccessorIsActionable(t *testing.T) {
 	mat := map[string]vkeys.GroupRuntimeAccount{
 		// rank-0 exhausted → skipped (quota fallback continues).
 		first: encMat(t, key, vkeys.GroupRuntimeAccount{CredentialType: "oauth_account", ExpiresAt: 9_000_000_000, WindowStatus: "exhausted"}, "tok"),
-		// rank-2 has a usable token, but we must NOT reach it.
+		// rank-2 has a usable token and MUST serve.
 		order[2]: encMat(t, key, vkeys.GroupRuntimeAccount{CredentialType: "oauth_account", ExpiresAt: 9_000_000_000}, "tok-z"),
-		// rank-1 (second) carries master's needs_login marker → login required, stops here.
+		// rank-1 (second) carries master's needs_login marker → prompt only, no block.
 		second: {CredentialType: "oauth_account", NeedsLogin: true},
 	}
 	route := &vkeys.ResolvedRoute{SeatID: seat, OauthGroupID: "grp", GroupAccounts: mustJSON(t, refs), GroupRuntime: mustJSON(t, mat)}
 
-	_, err := resolveGroupCredential(route, key, 1_000_000, nil, "")
-	ge, ok := err.(*groupResolveError)
-	if !ok || ge.Code != groupErrLoginRequired || ge.Account != second {
-		t.Fatalf("want LOGIN_REQUIRED for rank-1 successor %q, got %v", second, err)
+	res, err := resolveGroupCredential(route, key, 1_000_000, nil, "")
+	if err != nil {
+		t.Fatalf("needs_login successor must not block the usable rank-2, got %v", err)
+	}
+	if res.AccountID != order[2] {
+		t.Fatalf("want usable rank-2 %q to serve (needs_login %q stays a prompt), got %q", order[2], second, res.AccountID)
 	}
 }
 

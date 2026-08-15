@@ -85,6 +85,13 @@ type rateLimitSample struct {
 	CredentialID string `json:"credential_id"`
 	Count        int    `json:"count"`
 	WindowSecs   int    `json:"window_secs"`
+	// ForbiddenCount is the 403 share of Count (2026-08-15 方案 c, ban-visibility).
+	// 429 and 403 are different evidence: a 429 is quota rhythm (normal pool
+	// life), a structured 403 is a suspension/permission signal that the drawer
+	// must surface as "upstream rejected" — folding them together would light
+	// the ban indicator on every ordinary rate-limit wave. Additive optional
+	// field: an old master ignores it; an old proxy omits it (reads as 0).
+	ForbiddenCount int `json:"forbidden_count,omitempty"`
 	// FallbackCount is how many of Count arrived while this credential was being
 	// tried as a FALLBACK hop rather than as the primary (F-12b = C, task 3.12).
 	//
@@ -115,11 +122,14 @@ type signalReporter struct {
 	// another upstream 401, so dropping it would leave Master falsely logged_in.
 	authFailures map[string]authFailureSample
 	authWake     chan struct{}
-	rlMu         sync.Mutex     // guards rlCounts and rlFallback
+	rlMu         sync.Mutex     // guards rlCounts, rlFallback and rlForbidden
 	rlCounts     map[string]int // per-credential 429/403 tally, reset each flush
 	// rlFallback is the subset of rlCounts that arrived on a FALLBACK hop
 	// (F-12b). Reset on the same flush, so the two always describe one window.
 	rlFallback map[string]int
+	// rlForbidden is the 403 subset of rlCounts (2026-08-15 方案 c ban
+	// visibility). Reset on the same flush for the same one-window reason.
+	rlForbidden map[string]int
 	// in-flight concurrency tracking. inflCur is the LIVE count (inc on forward
 	// start, dec on completion — persists across windows so a request spanning a
 	// flush keeps being counted); inflPeak is the max inflCur seen this window,
@@ -350,11 +360,13 @@ func (r *signalReporter) persistAuthFailuresLocked() {
 // the live credential set. Lazy-inits the map so a directly-constructed reporter
 // (tests, future call sites) can't nil-panic.
 func (r *signalReporter) incrRateLimit(credentialID string) {
-	r.incrRateLimitHop(credentialID, false)
+	r.incrRateLimitHop(credentialID, false, false)
 }
 
-// incrRateLimitHop is incrRateLimit with the fallback marking (F-12b = C).
-func (r *signalReporter) incrRateLimitHop(credentialID string, duringFallback bool) {
+// incrRateLimitHop is incrRateLimit with the fallback marking (F-12b = C) and
+// the 403 marking (2026-08-15 方案 c: forbidden responses are tallied separately
+// so the drawer can distinguish "suspension evidence" from quota rhythm).
+func (r *signalReporter) incrRateLimitHop(credentialID string, duringFallback, forbidden bool) {
 	if r == nil || credentialID == "" {
 		return
 	}
@@ -368,6 +380,12 @@ func (r *signalReporter) incrRateLimitHop(credentialID string, duringFallback bo
 			r.rlFallback = make(map[string]int)
 		}
 		r.rlFallback[credentialID]++
+	}
+	if forbidden {
+		if r.rlForbidden == nil {
+			r.rlForbidden = make(map[string]int)
+		}
+		r.rlForbidden[credentialID]++
 	}
 	r.rlMu.Unlock()
 }
@@ -385,15 +403,17 @@ func (r *signalReporter) snapshotRateLimits() []rateLimitSample {
 	out := make([]rateLimitSample, 0, len(r.rlCounts))
 	for id, n := range r.rlCounts {
 		out = append(out, rateLimitSample{
-			CredentialID:  id,
-			Count:         n,
-			FallbackCount: r.rlFallback[id],
-			WindowSecs:    int(signalFlushInterval / time.Second),
+			CredentialID:   id,
+			Count:          n,
+			FallbackCount:  r.rlFallback[id],
+			ForbiddenCount: r.rlForbidden[id],
+			WindowSecs:     int(signalFlushInterval / time.Second),
 		})
 	}
 	r.rlCounts = make(map[string]int) // reset the window
 	r.rlFallback = nil                // 🔴 reset TOGETHER — a fallback tally that
 	// outlived its window would attribute this window's refusals to the last one
+	r.rlForbidden = nil // same one-window contract as rlFallback
 	return out
 }
 

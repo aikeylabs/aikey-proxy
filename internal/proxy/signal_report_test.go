@@ -347,6 +347,25 @@ func TestRateLimitCounting(t *testing.T) {
 	}
 }
 
+// TestRateLimitForbiddenSubcount (2026-08-15 方案 c): 403s ride the same
+// counter AND a separate forbidden tally, so the master drawer can distinguish
+// suspension evidence from ordinary 429 quota rhythm. Both reset together.
+func TestRateLimitForbiddenSubcount(t *testing.T) {
+	r := &signalReporter{rlCounts: make(map[string]int)}
+	r.incrRateLimitHop("c1", false, false) // a 429
+	r.incrRateLimitHop("c1", false, true)  // a 403
+	r.incrRateLimitHop("c1", true, true)   // a 403 on a fallback hop
+	rl := r.snapshotRateLimits()
+	if len(rl) != 1 || rl[0].Count != 3 || rl[0].ForbiddenCount != 2 || rl[0].FallbackCount != 1 {
+		t.Fatalf("snapshot = %+v, want {c1 count=3 forbidden=2 fallback=1}", rl)
+	}
+	// One-window contract: the forbidden tally resets with the flush.
+	r.incrRateLimitHop("c1", false, false)
+	if rl := r.snapshotRateLimits(); len(rl) != 1 || rl[0].ForbiddenCount != 0 {
+		t.Fatalf("forbidden tally leaked across windows: %+v", rl)
+	}
+}
+
 func TestRateLimitResetAfterFlush(t *testing.T) {
 	r := &signalReporter{rlCounts: make(map[string]int)}
 	r.incrRateLimit("c1")

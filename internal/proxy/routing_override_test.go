@@ -93,13 +93,15 @@ func TestResolveGroup_StaleOverrideFallsBackToLocal(t *testing.T) {
 	}
 }
 
-// OWNER RULE (2026-07-01): the engine MAY route a member to an account they have NOT
-// logged into — an override naming a needs_login account is HONORED: the hot path stops
-// there with LOGIN_REQUIRED for THAT account (matching what vault/virtual-keys/team-oauth
-// display as the routed account), it does NOT silently fall through to a logged-in local
-// pick. 能红: make the picker treat a needs_login override as unusable (fall through) →
-// this resolves the local pick instead of erroring → fails.
-func TestResolveGroup_NeedsLoginOverridePromptsLoginForThatAccount(t *testing.T) {
+// 2026-08-15 rule change (supersedes the 2026-07-01 owner rule): an override
+// naming a needs_login account — the hard-revoke shape — must NOT block the
+// member while a logged-in candidate exists: the healthy account serves and the
+// engine's target stays the UI login prompt. Only when EVERY candidate waits on
+// a login does the hot path return LOGIN_REQUIRED, and then it names the
+// ENGINE's account (display/vault/login pages keep converging on it).
+// 能红: restore the old "honor needs_login override immediately" behavior → the
+// first request errors LOGIN_REQUIRED instead of serving → fails.
+func TestResolveGroup_NeedsLoginOverrideServesHealthySiblingAndPromptsWhenNoneLeft(t *testing.T) {
 	key := grKey()
 	seat := "seat-ovr-nl"
 	now := int64(1_000_000)
@@ -109,24 +111,33 @@ func TestResolveGroup_NeedsLoginOverridePromptsLoginForThatAccount(t *testing.T)
 		{AccountID: "acc-b", ProviderCode: "anthropic"},
 	}
 	order := rankOrder(seat, "acc-a", "acc-b")
-	primary := order[0]  // logged in + usable — the fall-through would serve this
-	override := order[1] // the ENGINE's pick — member not logged in
+	primary := order[0]  // logged in + usable — must keep serving
+	override := order[1] // the ENGINE's pick — member not logged in (e.g. hard-revoked)
 	mat := map[string]vkeys.GroupRuntimeAccount{
 		primary:  freshOAuth(t, key, "tok-primary"),
 		override: {CredentialType: "oauth_account", NeedsLogin: true},
 	}
 	route := &vkeys.ResolvedRoute{SeatID: seat, OauthGroupID: "grp", GroupAccounts: mustJSON(t, refs), GroupRuntime: mustJSON(t, mat)}
 
-	_, err := resolveGroupCredential(route, key, now, nil, override)
-	if err == nil {
-		t.Fatal("needs_login override must NOT silently serve the local pick — want LOGIN_REQUIRED")
+	res, err := resolveGroupCredential(route, key, now, nil, override)
+	if err != nil {
+		t.Fatalf("needs_login override must not block while %q is logged in: %v", primary, err)
 	}
+	if res.AccountID != primary {
+		t.Fatalf("want healthy %q to serve, got %q", primary, res.AccountID)
+	}
+
+	// Second half: the logged-in sibling also becomes needs_login (member token
+	// revoked everywhere) → NOW the prompt fires and names the ENGINE's target.
+	mat[primary] = vkeys.GroupRuntimeAccount{CredentialType: "oauth_account", NeedsLogin: true}
+	route.GroupRuntime = mustJSON(t, mat)
+	_, err = resolveGroupCredential(route, key, now, nil, override)
 	ge, ok := err.(*groupResolveError)
 	if !ok || ge.Code != groupErrLoginRequired {
-		t.Fatalf("want LOGIN_REQUIRED, got %v", err)
+		t.Fatalf("want LOGIN_REQUIRED once no candidate is serviceable, got %v", err)
 	}
 	if ge.Account != override {
-		t.Fatalf("login prompt must name the ENGINE-routed account %q (the one all pages display), got %q", override, ge.Account)
+		t.Fatalf("login prompt must name the ENGINE-routed account %q, got %q", override, ge.Account)
 	}
 }
 

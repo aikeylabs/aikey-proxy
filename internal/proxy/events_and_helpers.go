@@ -227,7 +227,8 @@ func (p *Proxy) recordEvent(req *http.Request, resp *http.Response, startTime ti
 		// Marking lets the engine decide; folding them in unmarked would silently
 		// change what its risk numbers mean, and a scheduler acting on a
 		// distribution that quietly changed shape is very hard to debug.
-		p.signalReporter.incrRateLimitHop(route.CredentialID, route.FallbackAttempt > 1)
+		p.signalReporter.incrRateLimitHop(route.CredentialID, route.FallbackAttempt > 1,
+			resp.StatusCode == http.StatusForbidden)
 	}
 	p.collector.Record(&ev)
 	// Error responses are treated as interrupted — the client never got a

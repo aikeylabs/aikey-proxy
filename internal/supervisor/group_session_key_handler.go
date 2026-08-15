@@ -1,4 +1,4 @@
-// group_session_key_handler.go isolates the desktop Claude Session Key
+// group_session_key_handler.go isolates the desktop Provider Session Key
 // flow from the existing browser OAuth flow while preserving the same account
 // binding, token writeback, and runtime synchronization boundaries.
 package supervisor
@@ -17,44 +17,68 @@ import (
 	"github.com/AiKeyLabs/aikey-proxy/internal/observability"
 )
 
-func poolSessionKeyProviderSupported(loginCtx poolLoginContext) bool {
-	if !strings.EqualFold(strings.TrimSpace(loginCtx.ProtocolType), "anthropic") {
-		return false
-	}
-	switch strings.ToLower(strings.TrimSpace(loginCtx.ProviderCode)) {
-	case "anthropic":
-		return true
-	case "mock":
-		return strings.TrimSpace(loginCtx.OAuthTokenURL) != ""
-	default:
-		return false
-	}
+type poolSessionKeyAdapter func(context.Context, poolLoginContext, broker.SessionKeyExchangeOptions) (*broker.SessionKeyToken, error)
+
+type poolSessionKeyAdapterKey struct {
+	providerCode string
+	protocolType string
 }
 
-// exchangePoolSessionKey is the sole provider dispatch for this login use case.
-// The authoritative login context comes from Master; the browser never chooses
-// an endpoint or provider. Mock credentials use their resident token endpoint,
-// while real Session Keys can only enter the fixed Anthropic implementation.
-func exchangePoolSessionKey(ctx context.Context, loginCtx poolLoginContext, opts broker.SessionKeyExchangeOptions) (*broker.SessionKeyToken, error) {
-	switch strings.ToLower(strings.TrimSpace(loginCtx.ProviderCode)) {
-	case "anthropic":
+var poolSessionKeyAdapters = map[poolSessionKeyAdapterKey]poolSessionKeyAdapter{
+	{providerCode: "anthropic", protocolType: "anthropic"}: func(ctx context.Context, _ poolLoginContext, opts broker.SessionKeyExchangeOptions) (*broker.SessionKeyToken, error) {
 		return broker.ExchangeClaudeSessionKey(ctx, opts)
-	case "mock":
+	},
+	{providerCode: "openai", protocolType: "openai_compatible"}: func(ctx context.Context, _ poolLoginContext, opts broker.SessionKeyExchangeOptions) (*broker.SessionKeyToken, error) {
+		return broker.ExchangeCodexSessionKey(ctx, opts)
+	},
+	{providerCode: "mock", protocolType: "anthropic"}: func(ctx context.Context, loginCtx poolLoginContext, opts broker.SessionKeyExchangeOptions) (*broker.SessionKeyToken, error) {
 		return broker.ExchangeMockSessionKey(ctx, broker.MockSessionKeyExchangeOptions{
 			SessionKey: opts.SessionKey,
 			ProxyURL:   opts.ProxyURL,
 			TokenURL:   loginCtx.OAuthTokenURL,
 		})
-	default:
+	},
+	{providerCode: "mock", protocolType: "openai_compatible"}: func(ctx context.Context, loginCtx poolLoginContext, opts broker.SessionKeyExchangeOptions) (*broker.SessionKeyToken, error) {
+		return broker.ExchangeMockCodexSessionKey(ctx, broker.MockSessionKeyExchangeOptions{
+			SessionKey: opts.SessionKey,
+			ProxyURL:   opts.ProxyURL,
+			TokenURL:   loginCtx.OAuthTokenURL,
+		})
+	},
+}
+
+func poolSessionKeyAdapterFor(loginCtx poolLoginContext) (poolSessionKeyAdapter, bool) {
+	provider := strings.ToLower(strings.TrimSpace(loginCtx.ProviderCode))
+	protocol := strings.ToLower(strings.TrimSpace(loginCtx.ProtocolType))
+	adapter, ok := poolSessionKeyAdapters[poolSessionKeyAdapterKey{providerCode: provider, protocolType: protocol}]
+	if !ok || (provider == "mock" && strings.TrimSpace(loginCtx.OAuthTokenURL) == "") {
+		return nil, false
+	}
+	return adapter, true
+}
+
+func poolSessionKeyProviderSupported(loginCtx poolLoginContext) bool {
+	_, ok := poolSessionKeyAdapterFor(loginCtx)
+	return ok
+}
+
+// exchangePoolSessionKey is the sole provider dispatch for this login use case.
+// The authoritative login context comes from Master; the browser never chooses
+// an endpoint or provider. Mock credentials use their resident token endpoint;
+// real Session Keys enter only their provider's fixed broker implementation.
+func exchangePoolSessionKey(ctx context.Context, loginCtx poolLoginContext, opts broker.SessionKeyExchangeOptions) (*broker.SessionKeyToken, error) {
+	adapter, ok := poolSessionKeyAdapterFor(loginCtx)
+	if !ok {
 		return nil, &broker.OAuthError{
 			Code:    broker.ErrCodeSessionKeyProviderUnsupported,
 			Message: "Session Key sign-in is not supported for this account provider.",
-			Hint:    "Choose an Anthropic-protocol OAuth account.",
+			Hint:    "Choose a supported Anthropic or OpenAI-compatible OAuth account.",
 		}
 	}
+	return adapter(ctx, loginCtx, opts)
 }
 
-// sessionKey signs an Anthropic-protocol pool account in without opening a browser. It
+// sessionKey signs a supported pool account in without opening a browser. It
 // uses the same review/writeback/runtime-sync semantics as submitCode, but the
 // authorization input is exchanged in-process by aikey-auth-broker on Windows or macOS.
 // Token material is never serialized to this HTTP response.
@@ -110,7 +134,7 @@ func (h *poolLoginHandler) sessionKey(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		if !poolSessionKeyProviderSupported(loginCtx) {
-			poolErr(w, http.StatusUnprocessableEntity, broker.ErrCodeSessionKeyProviderUnsupported, "session key sign-in is supported only for Anthropic-protocol OAuth accounts")
+			poolErr(w, http.StatusUnprocessableEntity, broker.ErrCodeSessionKeyProviderUnsupported, "session key sign-in is supported only for configured Anthropic or OpenAI-compatible OAuth accounts")
 			return
 		}
 		// The Master login context carries the authoritative account override or
@@ -302,7 +326,7 @@ func poolSessionKeyError(err error) (code, message string) {
 		}
 		return oauthErr.Code, message
 	}
-	return broker.ErrCodeLoginFailed, "Claude session key sign-in failed. Check the Windows egress proxy and try again with a fresh session key."
+	return broker.ErrCodeLoginFailed, "Session Key sign-in failed. Check the desktop egress proxy and try again with a fresh provider Session Key."
 }
 
 func poolSessionKeyHTTPStatus(code string) int {
