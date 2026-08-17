@@ -161,10 +161,11 @@ type poolLoginHandler struct {
 }
 
 type poolSessionKeyPending struct {
-	loginCtx  poolLoginContext
-	token     *broker.SessionKeyToken
-	createdAt time.Time
-	expiresAt int64
+	loginCtx         poolLoginContext
+	token            *broker.SessionKeyToken
+	identityMismatch bool
+	createdAt        time.Time
+	expiresAt        int64
 }
 
 type poolSessionKeyOperation struct {

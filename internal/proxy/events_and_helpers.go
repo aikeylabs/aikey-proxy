@@ -211,22 +211,19 @@ func (p *Proxy) recordEvent(req *http.Request, resp *http.Response, startTime ti
 	}
 	// Rate-limit-feed emit (best-effort, OFF the hot path, mirrors the revoked
 	// hook above): the proxy sees every upstream 429 (rate limit) / 403 (forbidden);
-	// counting them per credential lets master normalize a near-window 429/403
-	// frequency into the allocation engine's §5.1 w5 "Recent429FreqNorm" risk
-	// signal. We do NOT alter the response — it flows to the client unchanged. The
+	// counting them per credential lets master normalize primary 429 frequency
+	// into §5.1 w5 risk while keeping 403/fallback as visibility-only evidence. We
+	// do NOT alter the response — it flows to the client unchanged. The
 	// status is the one captureUpstreamErrorBody already read; we don't re-read the
 	// body. incrRateLimit is nil-safe (reporter off → no-op) and non-blocking (a
 	// short map lock, reset every flush bounds it); an empty CredentialID (no route)
 	// is dropped inside.
 	if resp.StatusCode == http.StatusTooManyRequests || resp.StatusCode == http.StatusForbidden {
 		// 🔴 F-12b = C: fed, but MARKED. Upstream fallback makes one client request
-		// touch several credentials, so one user request can now raise the risk
-		// score of two or three at once. Those refusals are real evidence and must
-		// not be suppressed — but they are correlated in a way the allocation
-		// engine's model does not assume (one request, not independent traffic).
-		// Marking lets the engine decide; folding them in unmarked would silently
-		// change what its risk numbers mean, and a scheduler acting on a
-		// distribution that quietly changed shape is very hard to debug.
+		// touch several credentials. Those refusals are real visibility evidence,
+		// but are correlated in a way the allocation engine's model does not assume
+		// (one request, not independent traffic). The reporter excludes marked
+		// counts from Risk429Count.
 		p.signalReporter.incrRateLimitHop(route.CredentialID, route.FallbackAttempt > 1,
 			resp.StatusCode == http.StatusForbidden)
 	}

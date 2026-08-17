@@ -6,6 +6,7 @@ import (
 	"os"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/AiKeyLabs/aikey-proxy/internal/observability"
 )
@@ -121,5 +122,27 @@ func TestTrackedWriter_FlusherPassThrough(t *testing.T) {
 	tw := &trackedWriter{ResponseWriter: rec}
 	if _, ok := interface{}(tw).(http.Flusher); !ok {
 		t.Fatal("trackedWriter must implement http.Flusher for SSE")
+	}
+}
+
+type deadlineWriter struct {
+	http.ResponseWriter
+	deadline time.Time
+}
+
+func (w *deadlineWriter) SetReadDeadline(deadline time.Time) error {
+	w.deadline = deadline
+	return nil
+}
+
+func TestTrackedWriter_ResponseControllerUnwrapsReadDeadline(t *testing.T) {
+	underlying := &deadlineWriter{ResponseWriter: httptest.NewRecorder()}
+	tw := &trackedWriter{ResponseWriter: underlying}
+	want := time.Now().Add(time.Minute).Round(time.Millisecond)
+	if err := http.NewResponseController(tw).SetReadDeadline(want); err != nil {
+		t.Fatalf("SetReadDeadline through recovery wrapper: %v", err)
+	}
+	if !underlying.deadline.Equal(want) {
+		t.Fatalf("read deadline did not reach server writer: got=%s want=%s", underlying.deadline, want)
 	}
 }

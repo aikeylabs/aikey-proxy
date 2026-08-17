@@ -90,7 +90,11 @@ func (h *poolLoginHandler) sessionKey(w http.ResponseWriter, r *http.Request) {
 		SessionKey   string `json:"session_key,omitempty"`
 		OperationID  string `json:"operation_id"`
 		Confirm      bool   `json:"confirm"`
-		Cancel       bool   `json:"cancel"`
+		// IdentityMismatchConfirmed is a separate acknowledgement from Confirm.
+		// It prevents an older or scripted client from silently saving a token
+		// after the server has discovered that it belongs to another account.
+		IdentityMismatchConfirmed bool `json:"identity_mismatch_confirmed"`
+		Cancel                    bool `json:"cancel"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		poolErr(w, http.StatusBadRequest, "BAD_BODY", "invalid or oversized request body")
@@ -165,23 +169,20 @@ func (h *poolLoginHandler) sessionKey(w http.ResponseWriter, r *http.Request) {
 			poolErr(w, poolSessionKeyHTTPStatus(code), code, message)
 			return
 		}
-		if !sessionKeyIdentityMatches(loginCtx, token.Identity) {
-			token.AccessToken = ""
-			token.RefreshToken = ""
+		identityMismatch := !sessionKeyIdentityMatches(loginCtx, token.Identity)
+		if identityMismatch {
 			slog.Warn("Session key identity does not match the selected account",
 				"event.name", observability.EventProxyPoolSessionKeyIdentityMismatch,
 				"error.code", broker.ErrCodeSessionKeyIdentityMismatch, "credential_id", req.CredentialID,
 				"request_id", trace.RequestID, "trace_id", trace.TraceID, "span_id", trace.SpanID)
-			poolErr(w, http.StatusConflict, broker.ErrCodeSessionKeyIdentityMismatch,
-				"The Session Key belongs to a different account. Copy the Session Key for the selected pool account and try again.")
-			return
 		}
 		exchangedAt := time.Now()
 		pending = &poolSessionKeyPending{
-			loginCtx:  loginCtx,
-			token:     token,
-			createdAt: exchangedAt,
-			expiresAt: exchangedAt.Unix() + token.ExpiresIn,
+			loginCtx:         loginCtx,
+			token:            token,
+			identityMismatch: identityMismatch,
+			createdAt:        exchangedAt,
+			expiresAt:        exchangedAt.Unix() + token.ExpiresIn,
 		}
 		h.sessionKeyPending.Store(req.OperationID, pending)
 		h.scheduleSessionKeyExpiry(req.OperationID, pending)
@@ -197,8 +198,14 @@ func (h *poolLoginHandler) sessionKey(w http.ResponseWriter, r *http.Request) {
 		poolJSON(w, map[string]any{
 			"status": "pending", "operation_id": req.OperationID,
 			"identity": identity, "expected_identity": pending.loginCtx.ExpectedIdentity,
-			"provider_code": pending.loginCtx.ProviderCode,
+			"provider_code":     pending.loginCtx.ProviderCode,
+			"identity_mismatch": pending.identityMismatch,
 		})
+		return
+	}
+	if pending.identityMismatch && !req.IdentityMismatchConfirmed {
+		poolErrWithMeta(w, http.StatusConflict, broker.ErrCodeSessionKeyIdentityMismatch,
+			"The Session Key belongs to a different account. Review the warning and confirm again to save it to the selected pool account.", req.OperationID)
 		return
 	}
 
@@ -218,7 +225,7 @@ func (h *poolLoginHandler) sessionKey(w http.ResponseWriter, r *http.Request) {
 		RefreshToken: pending.token.RefreshToken, ExpiresAt: pending.expiresAt,
 		ExternalID: pending.token.Identity.ExternalID, ProviderCode: ctx.ProviderCode,
 		ProtocolType: ctx.ProtocolType, OauthGroupID: ctx.OauthGroupID,
-		AccountID: ctx.AccountID, Identity: identity,
+		AccountID: ctx.AccountID, Identity: identity, IdentityMismatch: pending.identityMismatch,
 	}); err != nil {
 		slog.Warn("Session key token writeback failed",
 			"event.name", observability.EventProxyPoolSessionKeyWritebackFailed,
@@ -230,7 +237,10 @@ func (h *poolLoginHandler) sessionKey(w http.ResponseWriter, r *http.Request) {
 
 	syncStatus, syncError := h.syncPoolRuntime(r.Context(), ctx, trace)
 	h.forgetSessionKeyOperation(req.OperationID, pending)
-	resp := map[string]any{"status": "ok", "identity": identity, "sync_status": syncStatus}
+	resp := map[string]any{
+		"status": "ok", "identity": identity, "sync_status": syncStatus,
+		"identity_mismatch": pending.identityMismatch,
+	}
 	if syncError != "" {
 		resp["sync_error"] = syncError
 	}

@@ -28,6 +28,11 @@ func TestStatusResponse_PoolRoutingSerialization(t *testing.T) {
 			Transport: "mihomo", EgressFingerprint: "f00baa123456", State: "open",
 			FailureClass: "egress_dial", ConsecutiveFailures: 2, RetryAfterSeconds: 1,
 		}},
+		SignalReporting: &SignalReportingHealth{
+			Status: "degraded", ConsecutiveFailures: 3, LastAttemptAt: 100,
+			LastSuccessAt: 50, LastError: "signal report rejected with HTTP 503",
+			PendingSignals: 7, DroppedSignals: 2,
+		},
 	}})
 	s := string(b)
 	for _, want := range []string{
@@ -35,6 +40,8 @@ func TestStatusResponse_PoolRoutingSerialization(t *testing.T) {
 		`"seat_id":"seat-1"`, `"cooldown_seconds":42`,
 		`"path_health"`, `"path_id":"deadbeef1234"`, `"transport":"mihomo"`,
 		`"egress_fingerprint":"f00baa123456"`, `"retry_after_seconds":1`,
+		`"signal_reporting"`, `"status":"degraded"`, `"consecutive_failures":3`,
+		`"pending_signals":7`, `"dropped_signals":2`,
 	} {
 		if !strings.Contains(s, want) {
 			t.Fatalf("status missing %s: %s", want, s)

@@ -25,8 +25,8 @@ func twoAccountPool(t *testing.T) (*Proxy, *outboundCapture, map[string]string) 
 	t.Helper()
 	key := grKey()
 	refs := []vkeys.GroupAccountRef{
-		{AccountID: "acc-1", ProviderCode: "anthropic"},
-		{AccountID: "acc-2", ProviderCode: "anthropic"},
+		{AccountID: "acc-1", CredentialID: "cred-1", ProviderCode: "anthropic"},
+		{AccountID: "acc-2", CredentialID: "cred-2", ProviderCode: "anthropic"},
 	}
 	mat := map[string]vkeys.GroupRuntimeAccount{
 		"acc-1": encMat(t, key, vkeys.GroupRuntimeAccount{CredentialType: "oauth_account", ExpiresAt: 9_000_000_000, ExternalID: "uuid-1"}, "tok-1"),
@@ -212,6 +212,41 @@ func TestGroupFailover_Evidence429Retries(t *testing.T) {
 	}
 	if !p.poolCooldown.skipSet()[primary] {
 		t.Fatalf("the exhausted primary %s must be cooled", primary)
+	}
+}
+
+func TestGroupFailover_Fallback429IsVisibleButExcludedFromRisk(t *testing.T) {
+	p, tr, tokToAcct := twoAccountPool(t)
+	primary, _ := probePrimary(t, p, tr, tokToAcct)
+	p.signalReporter = &signalReporter{
+		rlCounts: make(map[string]int), rlRisk: make(map[string]int),
+		rlPrevious: make(map[string]struct{}),
+	}
+	tr.respHeader = http.Header{"Anthropic-Ratelimit-Unified-Status": {"rate_limited"}}
+	tr.statusByAuth = map[string]int{
+		"Bearer tok-1": http.StatusTooManyRequests,
+		"Bearer tok-2": http.StatusTooManyRequests,
+	}
+	req, w := groupReq(groupBody)
+	p.Handle(w, req)
+	if w.Code != http.StatusTooManyRequests || tr.calls != 2 {
+		t.Fatalf("both accounts should be attempted once: status=%d calls=%d body=%s", w.Code, tr.calls, w.Body)
+	}
+
+	byCredential := make(map[string]rateLimitSample)
+	for _, sample := range p.signalReporter.snapshotRateLimits() {
+		byCredential[sample.CredentialID] = sample
+	}
+	primaryCredential := "cred-1"
+	fallbackCredential := "cred-2"
+	if primary == "acc-2" {
+		primaryCredential, fallbackCredential = fallbackCredential, primaryCredential
+	}
+	if sample := byCredential[primaryCredential]; sample.Risk429Count != 1 || sample.FallbackCount != 0 {
+		t.Fatalf("primary signal=%+v, want risk429=1 fallback=0", sample)
+	}
+	if sample := byCredential[fallbackCredential]; sample.Risk429Count != 0 || sample.FallbackCount != 1 {
+		t.Fatalf("fallback signal=%+v, want visibility-only fallback=1 risk429=0", sample)
 	}
 }
 

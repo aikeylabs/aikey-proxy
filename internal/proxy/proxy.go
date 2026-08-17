@@ -764,7 +764,7 @@ func (p *Proxy) SetReporter(r *events.Reporter, instanceID, clientVersion, confi
 // /accounts/me/signals, authed with the same team account-JWT the group-runtime
 // poll uses. nil controlURL/bearer → feature stays off (newSignalReporter returns nil).
 func (p *Proxy) EnableSignalReporting(controlURL string, bearer func(ctx context.Context) (string, error)) {
-	p.signalReporter = newSignalReporter(controlURL, bearer, slog.Default())
+	p.signalReporter = newSignalReporter(controlURL, p.sourceID, bearer, slog.Default())
 }
 
 // EnableOrgSignalReporting is the Cluster-worker sibling of
@@ -777,9 +777,23 @@ func (p *Proxy) EnableOrgSignalReporting(controlURL, orgID, serviceToken string)
 		return
 	}
 	endpoint := strings.TrimRight(controlURL, "/") + "/internal/org/" + url.PathEscape(orgID) + "/signals"
-	p.signalReporter = newSignalReporterEndpoint(endpoint, func(context.Context) (string, error) {
+	p.signalReporter = newSignalReporterEndpoint(endpoint, p.sourceID, func(context.Context) (string, error) {
 		return serviceToken, nil
 	}, slog.Default())
+}
+
+// SignalReportingHealthSnapshot exposes the current allocation-signal pipeline
+// state for /status. A live Proxy with no reporter returns disabled explicitly;
+// an OAuth-pool deployment must not look healthy merely because wiring is absent.
+func (p *Proxy) SignalReportingHealthSnapshot() *SignalReportingHealth {
+	if p == nil {
+		return nil
+	}
+	if p.signalReporter == nil {
+		return &SignalReportingHealth{Status: "disabled"}
+	}
+	snapshot := p.signalReporter.healthSnapshot()
+	return &snapshot
 }
 
 // StopSignalReporting stops the signal reporter's upload loop (idempotent,

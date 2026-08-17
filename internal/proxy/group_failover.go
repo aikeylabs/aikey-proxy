@@ -39,6 +39,7 @@ package proxy
 import (
 	"bytes"
 	"net/http"
+	"sync"
 
 	"github.com/AiKeyLabs/aikey-proxy/internal/observability"
 )
@@ -133,6 +134,11 @@ type groupFailoverWriter struct {
 	// becomes an upstream or client header; the outer group loop uses it to avoid
 	// dialing the same failed network path through another account.
 	failedPathKey string
+	// onCommit releases the replay body at the first client-visible response.
+	// Captured failures deliberately do not commit because the next account needs
+	// the same body. sync.Once protects WriteHeader/flush races and double calls.
+	onCommit   func()
+	commitOnce sync.Once
 }
 
 func newGroupFailoverWriter(dst http.ResponseWriter, allowCapture bool) *groupFailoverWriter {
@@ -160,6 +166,7 @@ func (fw *groupFailoverWriter) WriteHeader(status int) {
 		dh[k] = v
 	}
 	fw.dst.WriteHeader(status)
+	fw.commit()
 }
 
 func (fw *groupFailoverWriter) Write(b []byte) (int, error) {
@@ -202,6 +209,12 @@ func (fw *groupFailoverWriter) markProviderPathFailure(pathKey string) {
 	fw.failedPathKey = pathKey
 }
 
+func (fw *groupFailoverWriter) commit() {
+	if fw.onCommit != nil {
+		fw.commitOnce.Do(fw.onCommit)
+	}
+}
+
 // flushCaptured writes the deferred response to the client verbatim — used when
 // the failover budget or the candidate set is exhausted and the last upstream
 // error IS the final answer. Content-Length reflects the (possibly truncated)
@@ -216,5 +229,6 @@ func (fw *groupFailoverWriter) flushCaptured() {
 	}
 	dh.Del("Content-Length") // recomputed by net/http from the buffered body
 	fw.dst.WriteHeader(fw.status)
+	fw.commit()
 	_, _ = fw.dst.Write(fw.buf.Bytes())
 }

@@ -1279,6 +1279,16 @@ func (s *Supervisor) ProviderPathHealthSnapshot() []proxy.ProviderPathHealth {
 	return s.pathHealth.Snapshot()
 }
 
+// SignalReportingHealthSnapshot returns the active generation's Proxy→Master
+// allocation-signal health. The pointer is nil when the feature is not wired.
+func (s *Supervisor) SignalReportingHealthSnapshot() *proxy.SignalReportingHealth {
+	gen := s.active.Load()
+	if gen == nil || gen.proxy == nil {
+		return nil
+	}
+	return gen.proxy.SignalReportingHealthSnapshot()
+}
+
 // ReporterMetrics returns usage reporter counters from the active generation.
 // Returns nil if reporter is not configured (no collector_url).
 func (s *Supervisor) ReporterMetrics() *events.ReporterMetrics {
@@ -1869,7 +1879,13 @@ func (s *Supervisor) buildGeneration() (*generation, error) {
 	// single writer touching the directory.
 	var sharedWAL *events.WALWriter
 	var seqAlloc *events.SeqAllocator
-	var sourceID string // vault source identity; reused for SetDeliveryIntegrity + ReporterConfig.SourceID
+	// Signal reporting needs a stable source even when usage WAL/reporting is
+	// disabled. Cluster's declared node_id is authoritative; member Proxies reuse
+	// the vault source identity and safely fall back to authenticated account scope.
+	sourceID, _ := vault.ReadConfigString(s.cfg.Vault.Path, SourceIdentityKey)
+	if s.cfg.Cluster.Enabled && s.cfg.Cluster.NodeID != "" {
+		sourceID = s.cfg.Cluster.NodeID
+	}
 	if s.cfg.Events.WALDir != "" {
 		if w, werr := events.NewWALWriter(s.cfg.Events.WALDir); werr != nil {
 			slog.Warn("local wal init failed, offline usage log disabled", "error", werr)
@@ -1892,12 +1908,10 @@ func (s *Supervisor) buildGeneration() (*generation, error) {
 					"event.name", "usage.seqalloc.init_failed", "error", serr)
 			} else {
 				seqAlloc = sa
-				sourceID, _ = vault.ReadConfigString(s.cfg.Vault.Path, SourceIdentityKey)
 				if sourceID == "" {
 					slog.Warn("source_identity missing from vault; events emitted without source_id",
 						"event.name", "usage.source_identity.missing")
 				}
-				p.SetDeliveryIntegrity(sourceID, seqAlloc)
 			}
 			// Thread proxy identity fields that reportUsage needs even in
 			// the offline path.  SetReporter below would overwrite these
@@ -1909,6 +1923,8 @@ func (s *Supervisor) buildGeneration() (*generation, error) {
 			p.SetReporter(nil, fmt.Sprintf("proxy-%d", id), s.version, proxy.GenerationLabel(int64(id)), loadedSeq, vaultReader.GetLoggedInAccountID())
 		}
 	}
+	// One wiring point for both usage-event identity and allocation-signal source.
+	p.SetDeliveryIntegrity(sourceID, seqAlloc)
 
 	// Attach usage reporter if any upload destination is configured —
 	// either the legacy single CollectorURL, or at least one non-empty

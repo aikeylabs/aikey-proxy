@@ -1,8 +1,10 @@
 package proxy
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
+	"fmt"
 	"io"
 	"log/slog"
 	"net/http"
@@ -85,7 +87,7 @@ func TestSignalPostSendsBatch(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	r := newSignalReporter(srv.URL, func(context.Context) (string, error) { return "tok-123", nil }, slog.Default())
+	r := newSignalReporter(srv.URL, "", func(context.Context) (string, error) { return "tok-123", nil }, slog.Default())
 	if r == nil {
 		t.Fatal("newSignalReporter returned nil")
 	}
@@ -119,7 +121,7 @@ func TestSignalPostBearerErrorDoesNotPost(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	r := newSignalReporter(srv.URL, func(context.Context) (string, error) {
+	r := newSignalReporter(srv.URL, "", func(context.Context) (string, error) {
 		return "", io.ErrUnexpectedEOF
 	}, slog.Default())
 	if r == nil {
@@ -129,6 +131,137 @@ func TestSignalPostBearerErrorDoesNotPost(t *testing.T) {
 
 	if n := atomic.LoadInt32(&hits); n != 0 {
 		t.Fatalf("server hit %d times, want 0 (bearer error short-circuits)", n)
+	}
+}
+
+func TestSignalReporterLoopRetriesTrendAndExposesHealth(t *testing.T) {
+	var hits atomic.Int32
+	bodies := make(chan []byte, 4)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+		body, _ := io.ReadAll(req.Body)
+		bodies <- body
+		if hits.Add(1) == 1 {
+			w.WriteHeader(http.StatusServiceUnavailable)
+			return
+		}
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer srv.Close()
+
+	r := newSignalReporterEndpoint(srv.URL, "worker-300", func(context.Context) (string, error) { return "tok", nil }, slog.Default())
+	if r == nil {
+		t.Fatal("newSignalReporterEndpoint returned nil")
+	}
+	defer r.Close()
+	r.enqueue("cred-1", 100, 0.7, nil)
+
+	wakeUntilBody := func() []byte {
+		t.Helper()
+		deadline := time.NewTimer(2 * time.Second)
+		defer deadline.Stop()
+		tick := time.NewTicker(10 * time.Millisecond)
+		defer tick.Stop()
+		for {
+			select {
+			case body := <-bodies:
+				return body
+			case <-tick.C:
+				select {
+				case r.authWake <- struct{}{}:
+				default:
+				}
+			case <-deadline.C:
+				t.Fatal("signal reporter did not flush")
+				return nil
+			}
+		}
+	}
+	first := wakeUntilBody()
+	if !bytes.Contains(first, []byte(`"source_id":"worker-300"`)) || !bytes.Contains(first, []byte(`"credential_id":"cred-1"`)) {
+		t.Fatalf("first attempt lost source/sample: %s", first)
+	}
+	second := wakeUntilBody()
+	if string(second) != string(first) {
+		t.Fatalf("retry payload changed: first=%s second=%s", first, second)
+	}
+
+	deadline := time.Now().Add(time.Second)
+	for {
+		health := r.healthSnapshot()
+		if health.Status == "healthy" && health.PendingSignals == 0 && health.LastSuccessAt > 0 {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("retry health did not recover: %+v", health)
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+}
+
+func TestSignalTrendAccumulatorBoundsUniqueCredentialsAcrossSignalTypes(t *testing.T) {
+	a := newSignalTrendAccumulator()
+	for i := 0; i < maxPendingSignalCredentials; i++ {
+		if !a.addUtil(signalSample{CredentialID: fmt.Sprintf("cred-%d", i)}) {
+			t.Fatalf("credential %d was rejected before the bound", i)
+		}
+	}
+	if dropped := a.mergeRate([]rateLimitSample{{CredentialID: "overflow", Count: 1}}); dropped != 1 {
+		t.Fatalf("cross-type overflow dropped=%d, want 1", dropped)
+	}
+	if dropped := a.mergeRate([]rateLimitSample{{CredentialID: "cred-0", Count: 1}}); dropped != 0 {
+		t.Fatalf("existing credential update dropped=%d, want 0", dropped)
+	}
+}
+
+func TestSignalReporterLoopIsolatesRejectedAuthFailureFromTrend(t *testing.T) {
+	t.Setenv("AIKEY_RUN_DIR", t.TempDir())
+	bodies := make(chan []byte, 4)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+		body, _ := io.ReadAll(req.Body)
+		bodies <- body
+		if bytes.Contains(body, []byte(`"auth_failures"`)) {
+			w.WriteHeader(http.StatusConflict)
+			return
+		}
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer srv.Close()
+
+	r := newSignalReporterEndpoint(srv.URL, "worker-1", func(context.Context) (string, error) { return "tok", nil }, slog.Default())
+	if r == nil {
+		t.Fatal("newSignalReporterEndpoint returned nil")
+	}
+	defer r.Close()
+	r.enqueue("cred-good", 100, 0.5, nil)
+	deadline := time.Now().Add(time.Second)
+	for len(r.in) > 0 && time.Now().Before(deadline) {
+		time.Sleep(time.Millisecond)
+	}
+	if len(r.in) > 0 {
+		t.Fatal("trend was not consumed into the retry accumulator")
+	}
+	r.enqueueAuthFailure("cred-bad", "group-1", "seat-1", "fingerprint-1")
+
+	nextBody := func() []byte {
+		t.Helper()
+		select {
+		case body := <-bodies:
+			return body
+		case <-time.After(2 * time.Second):
+			t.Fatal("signal reporter did not isolate both uploads")
+			return nil
+		}
+	}
+	first := nextBody()
+	second := nextBody()
+	if !bytes.Contains(first, []byte(`"samples"`)) || bytes.Contains(first, []byte(`"auth_failures"`)) {
+		t.Fatalf("trend upload was coupled to rejected auth failure: %s", first)
+	}
+	if !bytes.Contains(second, []byte(`"auth_failures"`)) || bytes.Contains(second, []byte(`"samples"`)) {
+		t.Fatalf("auth failure upload was not isolated: %s", second)
+	}
+	if pending := r.snapshotAuthFailures(); len(pending) != 1 {
+		t.Fatalf("rejected auth failure was acknowledged: %+v", pending)
 	}
 }
 
@@ -173,7 +306,7 @@ func TestSignalPostSendsRevoked(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	r := newSignalReporter(srv.URL, func(context.Context) (string, error) { return "tok-123", nil }, slog.Default())
+	r := newSignalReporter(srv.URL, "", func(context.Context) (string, error) { return "tok-123", nil }, slog.Default())
 	if r == nil {
 		t.Fatal("newSignalReporter returned nil")
 	}
@@ -300,11 +433,14 @@ func TestAuthFailureOutboxHydratesOnlyVersionedEntries(t *testing.T) {
 
 func TestEnableOrgSignalReporting_UsesClusterServiceEndpointAndToken(t *testing.T) {
 	t.Setenv("AIKEY_RUN_DIR", t.TempDir())
-	p := &Proxy{}
+	p := &Proxy{sourceID: "cluster-node-1"}
 	p.EnableOrgSignalReporting("https://control.example.test/", "org/cluster", "svc-token")
 	defer p.StopSignalReporting()
 	if p.signalReporter == nil {
 		t.Fatal("cluster signal reporter was not wired")
+	}
+	if p.signalReporter.sourceID != "cluster-node-1" {
+		t.Fatalf("stable signal source=%q, want cluster-node-1", p.signalReporter.sourceID)
 	}
 	if got, want := p.signalReporter.url, "https://control.example.test/internal/org/org%2Fcluster/signals"; got != want {
 		t.Fatalf("cluster signal endpoint=%q want %q", got, want)
@@ -312,6 +448,27 @@ func TestEnableOrgSignalReporting_UsesClusterServiceEndpointAndToken(t *testing.
 	token, err := p.signalReporter.bearer(context.Background())
 	if err != nil || token != "svc-token" {
 		t.Fatalf("cluster service credential lost: token=%q err=%v", token, err)
+	}
+}
+
+func TestSignalReportingHealthSnapshotSurfacesMissingWiring(t *testing.T) {
+	p := &Proxy{}
+	health := p.SignalReportingHealthSnapshot()
+	if health == nil || health.Status != "disabled" {
+		t.Fatalf("missing reporter must be externally visible, got %+v", health)
+	}
+}
+
+func TestSignalReportingHealthDropStaysDegradedUntilSuccess(t *testing.T) {
+	r := &signalReporter{health: SignalReportingHealth{Status: "starting"}}
+	r.recordSignalDrop(1)
+	r.recordSignalUpload(false, "signal upload failed")
+	if got := r.healthSnapshot(); got.Status != "degraded" || got.DroppedSignals != 1 {
+		t.Fatalf("failed retry hid buffer loss: %+v", got)
+	}
+	r.recordSignalUpload(true, "")
+	if got := r.healthSnapshot(); got.Status != "healthy" || got.ConsecutiveFailures != 0 {
+		t.Fatalf("successful retry did not recover health: %+v", got)
 	}
 }
 
@@ -342,7 +499,7 @@ func TestRateLimitCounting(t *testing.T) {
 	if len(rl) != 1 {
 		t.Fatalf("snapshot = %+v, want exactly one entry", rl)
 	}
-	if rl[0] != (rateLimitSample{CredentialID: "c1", Count: 3, WindowSecs: 30}) {
+	if rl[0] != (rateLimitSample{CredentialID: "c1", Count: 3, WindowSecs: 30, Risk429Count: 3}) {
 		t.Fatalf("snapshot[0] = %+v, want {c1, 3, 30}", rl[0])
 	}
 }
@@ -356,8 +513,8 @@ func TestRateLimitForbiddenSubcount(t *testing.T) {
 	r.incrRateLimitHop("c1", false, true)  // a 403
 	r.incrRateLimitHop("c1", true, true)   // a 403 on a fallback hop
 	rl := r.snapshotRateLimits()
-	if len(rl) != 1 || rl[0].Count != 3 || rl[0].ForbiddenCount != 2 || rl[0].FallbackCount != 1 {
-		t.Fatalf("snapshot = %+v, want {c1 count=3 forbidden=2 fallback=1}", rl)
+	if len(rl) != 1 || rl[0].Count != 3 || rl[0].ForbiddenCount != 2 || rl[0].FallbackCount != 1 || rl[0].Risk429Count != 1 {
+		t.Fatalf("snapshot = %+v, want {c1 count=3 forbidden=2 fallback=1 risk429=1}", rl)
 	}
 	// One-window contract: the forbidden tally resets with the flush.
 	r.incrRateLimitHop("c1", false, false)
@@ -373,9 +530,13 @@ func TestRateLimitResetAfterFlush(t *testing.T) {
 	if rl := r.snapshotRateLimits(); len(rl) != 1 || rl[0].Count != 2 {
 		t.Fatalf("first window = %+v, want c1 count 2", rl)
 	}
-	// next window starts empty (counter was reset on snapshot).
+	// The next window emits one explicit zero so Master clears the source's
+	// previous 403/risk projection; the following idle window is omitted.
+	if rl := r.snapshotRateLimits(); len(rl) != 1 || rl[0].CredentialID != "c1" || rl[0].Count != 0 {
+		t.Fatalf("after flush snapshot = %+v, want one explicit c1 zero", rl)
+	}
 	if rl := r.snapshotRateLimits(); rl != nil {
-		t.Fatalf("after flush snapshot = %+v, want nil (reset)", rl)
+		t.Fatalf("second idle snapshot = %+v, want nil", rl)
 	}
 	// new increments count up from 0, not from the prior window.
 	r.incrRateLimit("c1")
@@ -414,14 +575,14 @@ func TestSignalPostSendsRateLimits(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	r := newSignalReporter(srv.URL, func(context.Context) (string, error) { return "tok-123", nil }, slog.Default())
+	r := newSignalReporter(srv.URL, "", func(context.Context) (string, error) { return "tok-123", nil }, slog.Default())
 	if r == nil {
 		t.Fatal("newSignalReporter returned nil")
 	}
 
 	// rate-limits-only batch: body omits samples + revoked, exact wire contract.
 	r.post(nil, nil, []rateLimitSample{{CredentialID: "c1", Count: 3, WindowSecs: 30}}, nil)
-	if want := `{"rate_limits":[{"credential_id":"c1","count":3,"window_secs":30}]}`; string(<-got) != want {
+	if want := `{"rate_limits":[{"credential_id":"c1","count":3,"window_secs":30,"risk_429_count":0}]}`; string(<-got) != want {
 		t.Fatalf("rate-limits-only body mismatch, want %s", want)
 	}
 
@@ -542,11 +703,10 @@ func TestConcurrencyPeak(t *testing.T) {
 	if len(snap) != 1 || snap[0] != (concurrencySample{CredentialID: "c1", Peak: 2}) {
 		t.Fatalf("snapshot = %+v, want one {c1, peak 2}", snap)
 	}
-	// next window: peak map reset. d2/d3 are still in flight (cur 2) but with no
-	// NEW arrival the idle window reports nothing — peak only bumps on inc (the
-	// documented ponytail steady-state-trough ceiling). Pins that behavior.
-	if snap2 := r.snapshotConcurrency(); snap2 != nil {
-		t.Fatalf("idle next window = %+v, want nil (peak reset)", snap2)
+	// Long-running streams remain visible in every window; otherwise a source
+	// would falsely clear concurrency while two requests are still active.
+	if snap2 := r.snapshotConcurrency(); len(snap2) != 1 || snap2[0].Peak != 2 {
+		t.Fatalf("steady next window = %+v, want c1 peak 2", snap2)
 	}
 	d2()
 	d3() // cur back to 0
@@ -608,7 +768,7 @@ func TestSignalPostSendsConcurrency(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	r := newSignalReporter(srv.URL, func(context.Context) (string, error) { return "tok-123", nil }, slog.Default())
+	r := newSignalReporter(srv.URL, "", func(context.Context) (string, error) { return "tok-123", nil }, slog.Default())
 	if r == nil {
 		t.Fatal("newSignalReporter returned nil")
 	}
@@ -660,7 +820,7 @@ func TestSignalPostSendsConcurrency(t *testing.T) {
 // guard is removed. (loop()'s timing isn't deterministically testable — see the
 // file header — so the stop case itself is verified by inspection.)
 func TestSignalReporterCloseIdempotentAndNilSafe(t *testing.T) {
-	r := newSignalReporter("http://example.invalid", func(context.Context) (string, error) { return "tok", nil }, slog.Default())
+	r := newSignalReporter("http://example.invalid", "", func(context.Context) (string, error) { return "tok", nil }, slog.Default())
 	if r == nil {
 		t.Fatal("newSignalReporter returned nil")
 	}

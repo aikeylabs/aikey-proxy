@@ -44,6 +44,11 @@ type memberTokenWriteback struct {
 	OauthGroupID string `json:"oauth_group_id,omitempty"`
 	AccountID    string `json:"account_id,omitempty"`
 	Identity     string `json:"identity,omitempty"`
+	// IdentityMismatch is set only after the member explicitly confirms a
+	// Session Key whose provider identity differs from the selected pool slot.
+	// Master persists the token's provider account ID per member and must not
+	// backfill that ID onto the shared account in this case.
+	IdentityMismatch bool `json:"identity_mismatch,omitempty"`
 }
 
 // poolLoginContext is the non-secret master binding fetched before starting an

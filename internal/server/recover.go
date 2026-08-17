@@ -33,6 +33,12 @@ type trackedWriter struct {
 	wrote bool
 }
 
+// Unwrap exposes the real net/http writer to http.ResponseController. Without
+// this method SetReadDeadline returns ErrNotSupported through the recovery
+// wrapper, so the OAuth-group two-minute body deadline is silently inert and a
+// stalled upload can pin one replay reservation and connection forever.
+func (tw *trackedWriter) Unwrap() http.ResponseWriter { return tw.ResponseWriter }
+
 func (tw *trackedWriter) WriteHeader(code int) {
 	tw.wrote = true
 	tw.ResponseWriter.WriteHeader(code)

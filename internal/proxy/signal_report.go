@@ -27,10 +27,9 @@ const signalFlushInterval = 30 * time.Second
 // ring for the allocation engine to read.
 //
 // MAIN-LINK SAFETY (架构第一优先级 = 主链路健壮): this never touches the forward
-// path's latency or success. enqueue() is a NON-BLOCKING channel send (a full
-// buffer drops the sample — utilization is a trend signal, a lost reading is
-// harmless); the upload runs in a background goroutine whose failures are only
-// logged, never surfaced to the request. A nil reporter = feature off.
+// path's latency or success. enqueue() is a NON-BLOCKING channel send; the
+// background loop retains failed trend uploads in a bounded accumulator and
+// exposes retry/degraded/drop state through /status. A nil reporter = feature off.
 
 // signalSample is one parsed util reading queued for delivery. Util7d is a
 // pointer so the wire preserves "provider reported 0%" vs "provider omitted the
@@ -74,8 +73,8 @@ type authFailureSample struct {
 }
 
 // rateLimitSample reports how many 429/403 responses a credential drew in the
-// last flush window. Master normalizes count/window into the allocation engine's
-// §5.1 w5 "Recent429FreqNorm" risk signal (near-window 429/403 rhythm). Unlike
+// last flush window. Master normalizes Risk429Count/window into the allocation
+// engine's §5.1 w5 "Recent429FreqNorm" risk signal. Unlike
 // util/revoked these are a per-credential COUNTER (a map+mutex, not a channel):
 // 429s are frequent — a rate-limited account can draw a burst per second — so a
 // per-event channel send would be a POST storm. The integer is reset every flush,
@@ -108,10 +107,15 @@ type rateLimitSample struct {
 	// scheduling, and a scheduler acting on a distribution that quietly changed
 	// shape is very hard to debug from the outside.
 	FallbackCount int `json:"fallback_count,omitempty"`
+	// Risk429Count is the only count the allocation risk model may consume:
+	// primary-hop 429 responses. 403 is visibility-only; fallback refusals are
+	// correlated repeats from the same client request and are excluded as well.
+	Risk429Count int `json:"risk_429_count"`
 }
 
 type signalReporter struct {
 	url       string
+	sourceID  string                                    // stable vault/Worker identity; optional during rolling upgrade
 	bearer    func(ctx context.Context) (string, error) // account-JWT (reuses the group-runtime poll credential)
 	client    *httpx.SwappableClient                    // control-plane: rebuilt on host network change (self-heal registry)
 	in        chan signalSample
@@ -122,7 +126,7 @@ type signalReporter struct {
 	// another upstream 401, so dropping it would leave Master falsely logged_in.
 	authFailures map[string]authFailureSample
 	authWake     chan struct{}
-	rlMu         sync.Mutex     // guards rlCounts, rlFallback and rlForbidden
+	rlMu         sync.Mutex     // guards all rl* maps
 	rlCounts     map[string]int // per-credential 429/403 tally, reset each flush
 	// rlFallback is the subset of rlCounts that arrived on a FALLBACK hop
 	// (F-12b). Reset on the same flush, so the two always describe one window.
@@ -130,16 +134,24 @@ type signalReporter struct {
 	// rlForbidden is the 403 subset of rlCounts (2026-08-15 方案 c ban
 	// visibility). Reset on the same flush for the same one-window reason.
 	rlForbidden map[string]int
+	rlRisk      map[string]int
+	// rlPrevious makes an empty next window explicit once. Without that zero,
+	// Master's last non-zero 403 window stayed red forever when traffic went quiet.
+	rlPrevious map[string]struct{}
 	// in-flight concurrency tracking. inflCur is the LIVE count (inc on forward
 	// start, dec on completion — persists across windows so a request spanning a
 	// flush keeps being counted); inflPeak is the max inflCur seen this window,
 	// reset each flush. Both guarded by inflMu.
 	// ponytail: one global mutex for both maps — the critical section is two map
 	// ops; split to per-credential locks only if this lock ever shows up hot.
-	inflMu   sync.Mutex
-	inflCur  map[string]int
-	inflPeak map[string]int
-	logger   *slog.Logger
+	inflMu       sync.Mutex
+	inflCur      map[string]int
+	inflPeak     map[string]int
+	inflPrevious map[string]struct{}
+	logger       *slog.Logger
+	healthMu     sync.Mutex
+	health       SignalReportingHealth
+	dropSinceOK  bool
 
 	// stop terminates loop() on Close so the goroutine + ticker don't leak. A
 	// fresh signalReporter is built per generation (buildGeneration); without
@@ -151,31 +163,51 @@ type signalReporter struct {
 	stopOnce sync.Once
 }
 
+// SignalReportingHealth is the developer-facing /status projection for the
+// Proxy→Master allocation-signal pipe. It contains no credential/provider data.
+type SignalReportingHealth struct {
+	Status              string `json:"status"`
+	ConsecutiveFailures int    `json:"consecutive_failures"`
+	LastAttemptAt       int64  `json:"last_attempt_at,omitempty"`
+	LastSuccessAt       int64  `json:"last_success_at,omitempty"`
+	LastError           string `json:"last_error,omitempty"`
+	PendingSignals      int    `json:"pending_signals"`
+	DroppedSignals      int64  `json:"dropped_signals"`
+}
+
 // newSignalReporter returns nil (feature off) unless both a control URL and an
 // auth bearer are configured. On success it starts the background upload loop.
-func newSignalReporter(controlURL string, bearer func(context.Context) (string, error), logger *slog.Logger) *signalReporter {
+func newSignalReporter(controlURL, sourceID string, bearer func(context.Context) (string, error), logger *slog.Logger) *signalReporter {
 	if controlURL == "" {
 		return nil
 	}
-	return newSignalReporterEndpoint(strings.TrimRight(controlURL, "/")+"/accounts/me/signals", bearer, logger)
+	return newSignalReporterEndpoint(strings.TrimRight(controlURL, "/")+"/accounts/me/signals", sourceID, bearer, logger)
 }
 
-func newSignalReporterEndpoint(endpoint string, bearer func(context.Context) (string, error), logger *slog.Logger) *signalReporter {
+func newSignalReporterEndpoint(endpoint, sourceID string, bearer func(context.Context) (string, error), logger *slog.Logger) *signalReporter {
 	if endpoint == "" || bearer == nil {
 		return nil
 	}
 	r := &signalReporter{
-		url:          endpoint,
-		bearer:       bearer,
-		client:       httpx.NewSwappableDirect(10 * time.Second),
-		in:           make(chan signalSample, 256),
+		url:      endpoint,
+		sourceID: sourceID,
+		bearer:   bearer,
+		client:   httpx.NewSwappableDirect(10 * time.Second),
+		// A 300-person team can complete more than 256 requests at once. The loop
+		// collapses these by credential immediately; this buffer absorbs the burst
+		// without making the user request wait for Control.
+		in:           make(chan signalSample, maxPendingSignalCredentials),
 		revokedIn:    make(chan revokedSample, 64),
 		authFailures: make(map[string]authFailureSample),
 		authWake:     make(chan struct{}, 1),
 		rlCounts:     make(map[string]int),
+		rlRisk:       make(map[string]int),
+		rlPrevious:   make(map[string]struct{}),
 		inflCur:      make(map[string]int),
 		inflPeak:     make(map[string]int),
+		inflPrevious: make(map[string]struct{}),
 		logger:       logger,
+		health:       SignalReportingHealth{Status: "starting"},
 		stop:         make(chan struct{}),
 	}
 	r.hydrateAuthFailures()
@@ -210,6 +242,7 @@ func (r *signalReporter) enqueue(credentialID string, ts int64, util5h float64, 
 	select {
 	case r.in <- signalSample{CredentialID: credentialID, TS: ts, Util5h: util5h, Util7d: util7d}:
 	default: // buffer full → drop (trend signal; never block forwarding)
+		r.recordSignalDrop(1)
 	}
 }
 
@@ -225,6 +258,7 @@ func (r *signalReporter) enqueueRevoked(credentialID, reason string) {
 	select {
 	case r.revokedIn <- revokedSample{CredentialID: credentialID, Reason: reason}:
 	default: // buffer full → drop (best-effort; never block forwarding)
+		r.recordSignalDrop(1)
 	}
 }
 
@@ -387,33 +421,53 @@ func (r *signalReporter) incrRateLimitHop(credentialID string, duringFallback, f
 		}
 		r.rlForbidden[credentialID]++
 	}
+	if !duringFallback && !forbidden {
+		if r.rlRisk == nil {
+			r.rlRisk = make(map[string]int)
+		}
+		r.rlRisk[credentialID]++
+	}
 	r.rlMu.Unlock()
 }
 
 // snapshotRateLimits atomically reads + clears the 429/403 counters into wire
 // samples. Reset-on-read is what bounds the map: each window only retains the
-// credentials seen since the previous flush. Returns nil when nothing was seen
-// (so an empty window omits the rate_limits array entirely).
+// credentials seen since the previous flush. One explicit zero window follows
+// activity so Master can clear that source; later idle windows are omitted.
 func (r *signalReporter) snapshotRateLimits() []rateLimitSample {
 	r.rlMu.Lock()
 	defer r.rlMu.Unlock()
-	if len(r.rlCounts) == 0 {
+	if len(r.rlCounts) == 0 && len(r.rlPrevious) == 0 {
 		return nil
 	}
-	out := make([]rateLimitSample, 0, len(r.rlCounts))
-	for id, n := range r.rlCounts {
+	ids := make(map[string]struct{}, len(r.rlCounts)+len(r.rlPrevious))
+	for id := range r.rlCounts {
+		ids[id] = struct{}{}
+	}
+	for id := range r.rlPrevious {
+		ids[id] = struct{}{}
+	}
+	out := make([]rateLimitSample, 0, len(ids))
+	for id := range ids {
 		out = append(out, rateLimitSample{
 			CredentialID:   id,
-			Count:          n,
+			Count:          r.rlCounts[id],
 			FallbackCount:  r.rlFallback[id],
 			ForbiddenCount: r.rlForbidden[id],
+			Risk429Count:   r.rlRisk[id],
 			WindowSecs:     int(signalFlushInterval / time.Second),
 		})
 	}
+	nextPrevious := make(map[string]struct{}, len(r.rlCounts))
+	for id := range r.rlCounts {
+		nextPrevious[id] = struct{}{}
+	}
+	r.rlPrevious = nextPrevious
 	r.rlCounts = make(map[string]int) // reset the window
 	r.rlFallback = nil                // 🔴 reset TOGETHER — a fallback tally that
 	// outlived its window would attribute this window's refusals to the last one
 	r.rlForbidden = nil // same one-window contract as rlFallback
+	r.rlRisk = nil
 	return out
 }
 
@@ -448,6 +502,9 @@ func (r *signalReporter) trackInflight(credentialID string) func() {
 		if r.inflCur[credentialID] > 0 {
 			r.inflCur[credentialID]--
 		}
+		if r.inflCur[credentialID] == 0 {
+			delete(r.inflCur, credentialID)
+		}
 		r.inflMu.Unlock()
 	}
 }
@@ -458,80 +515,212 @@ func (r *signalReporter) trackInflight(credentialID string) func() {
 // requests still forwarding at the window boundary stay counted, so the next
 // inc keeps computing a truthful peak (a cross-window burst still registers
 // because inflPeak starts from 0 but inflCur already carries the live count).
-// Returns nil for an idle window so post() omits the concurrency array.
-//
-// ponytail: a single long-lived stream sitting in a window with no NEW arrivals
-// won't re-bump its peak, so a quiet steady-state-1 window can report nothing
-// for that credential — harmless for a "several humans?" signal where the peak
-// is what matters; revisit only if steady-state concurrency becomes a target.
+// A long-lived request is re-published every window from inflCur. One explicit
+// zero follows the final completion so Master does not retain a stale peak.
 func (r *signalReporter) snapshotConcurrency() []concurrencySample {
 	r.inflMu.Lock()
 	defer r.inflMu.Unlock()
-	if len(r.inflPeak) == 0 {
+	for id, current := range r.inflCur {
+		if current > r.inflPeak[id] {
+			r.inflPeak[id] = current
+		}
+	}
+	if len(r.inflPeak) == 0 && len(r.inflPrevious) == 0 {
 		return nil
 	}
-	out := make([]concurrencySample, 0, len(r.inflPeak))
-	for id, peak := range r.inflPeak {
-		out = append(out, concurrencySample{CredentialID: id, Peak: peak})
+	ids := make(map[string]struct{}, len(r.inflPeak)+len(r.inflPrevious))
+	for id := range r.inflPeak {
+		ids[id] = struct{}{}
+	}
+	for id := range r.inflPrevious {
+		ids[id] = struct{}{}
+	}
+	out := make([]concurrencySample, 0, len(ids))
+	for id := range ids {
+		out = append(out, concurrencySample{CredentialID: id, Peak: r.inflPeak[id]})
+	}
+	r.inflPrevious = make(map[string]struct{}, len(r.inflPeak))
+	for id := range r.inflPeak {
+		r.inflPrevious[id] = struct{}{}
 	}
 	r.inflPeak = make(map[string]int) // reset the window (inflCur persists)
 	return out
 }
 
+const maxPendingSignalCredentials = 2048
+
+// signalTrendAccumulator is a bounded, idempotent retry buffer. Utilization
+// keeps the newest reading per credential; failed rate windows are combined
+// into one longer window; concurrency keeps the maximum peak. This prevents a
+// Control outage from either silently discarding the batch or growing memory
+// with request rate.
+type signalTrendAccumulator struct {
+	credentials map[string]struct{}
+	util        map[string]signalSample
+	revoked     map[string]revokedSample
+	rate        map[string]rateLimitSample
+	conc        map[string]concurrencySample
+}
+
+func newSignalTrendAccumulator() *signalTrendAccumulator {
+	return &signalTrendAccumulator{
+		credentials: make(map[string]struct{}),
+		util:        make(map[string]signalSample), revoked: make(map[string]revokedSample),
+		rate: make(map[string]rateLimitSample), conc: make(map[string]concurrencySample),
+	}
+}
+
+func (a *signalTrendAccumulator) acceptCredential(id string) bool {
+	if _, exists := a.credentials[id]; exists {
+		return true
+	}
+	if len(a.credentials) >= maxPendingSignalCredentials {
+		return false
+	}
+	a.credentials[id] = struct{}{}
+	return true
+}
+
+func (a *signalTrendAccumulator) addUtil(s signalSample) bool {
+	if current, ok := a.util[s.CredentialID]; ok {
+		if s.TS >= current.TS {
+			a.util[s.CredentialID] = s
+		}
+		return true
+	}
+	if !a.acceptCredential(s.CredentialID) {
+		return false
+	}
+	a.util[s.CredentialID] = s
+	return true
+}
+
+func (a *signalTrendAccumulator) addRevoked(s revokedSample) bool {
+	if _, ok := a.revoked[s.CredentialID]; !ok && !a.acceptCredential(s.CredentialID) {
+		return false
+	}
+	a.revoked[s.CredentialID] = s
+	return true
+}
+
+func (a *signalTrendAccumulator) mergeRate(samples []rateLimitSample) int64 {
+	var dropped int64
+	for _, sample := range samples {
+		current, ok := a.rate[sample.CredentialID]
+		if !ok && !a.acceptCredential(sample.CredentialID) {
+			dropped++
+			continue
+		}
+		current.CredentialID = sample.CredentialID
+		current.Count += sample.Count
+		current.WindowSecs += sample.WindowSecs
+		current.ForbiddenCount += sample.ForbiddenCount
+		current.FallbackCount += sample.FallbackCount
+		current.Risk429Count += sample.Risk429Count
+		a.rate[sample.CredentialID] = current
+	}
+	return dropped
+}
+
+func (a *signalTrendAccumulator) mergeConcurrency(samples []concurrencySample) int64 {
+	var dropped int64
+	for _, sample := range samples {
+		current, ok := a.conc[sample.CredentialID]
+		if !ok && !a.acceptCredential(sample.CredentialID) {
+			dropped++
+			continue
+		}
+		if !ok || sample.Peak > current.Peak {
+			a.conc[sample.CredentialID] = sample
+		}
+	}
+	return dropped
+}
+
+func (a *signalTrendAccumulator) slices() ([]signalSample, []revokedSample, []rateLimitSample, []concurrencySample) {
+	util := make([]signalSample, 0, len(a.util))
+	for _, sample := range a.util {
+		util = append(util, sample)
+	}
+	revoked := make([]revokedSample, 0, len(a.revoked))
+	for _, sample := range a.revoked {
+		revoked = append(revoked, sample)
+	}
+	rate := make([]rateLimitSample, 0, len(a.rate))
+	for _, sample := range a.rate {
+		rate = append(rate, sample)
+	}
+	conc := make([]concurrencySample, 0, len(a.conc))
+	for _, sample := range a.conc {
+		conc = append(conc, sample)
+	}
+	return util, revoked, rate, conc
+}
+
+func (a *signalTrendAccumulator) count() int {
+	return len(a.util) + len(a.revoked) + len(a.rate) + len(a.conc)
+}
+
 func (r *signalReporter) loop() {
 	ticker := time.NewTicker(signalFlushInterval)
 	defer ticker.Stop()
-	var batch []signalSample
-	var revoked []revokedSample
-	// flush takes the rate-limit + concurrency snapshots as args rather than
-	// reading the per-window aggregates itself: the size-triggered early flushes
-	// below pass nil so they DON'T disturb those windows, keeping each span
-	// exactly one ticker period — only the ticker case snapshots, so the reported
-	// window_secs / peak stay accurate even when a util/revoked burst forces an
-	// early flush.
-	flush := func(rl []rateLimitSample, conc []concurrencySample) {
+	pending := newSignalTrendAccumulator()
+	flush := func(rate []rateLimitSample, conc []concurrencySample) {
+		r.recordSignalDrop(pending.mergeRate(rate) + pending.mergeConcurrency(conc))
 		authFailures := r.snapshotAuthFailures()
-		if len(batch) == 0 && len(revoked) == 0 && len(authFailures) == 0 && len(rl) == 0 && len(conc) == 0 {
+		r.setPendingSignals(pending.count() + len(authFailures))
+		if pending.count() == 0 && len(authFailures) == 0 {
 			return
 		}
-		// Trend samples remain best-effort and are sent separately from durable
-		// auth failures. A rejected exact route must stay in the outbox without
-		// causing successful utilization samples to be replayed and duplicated.
-		if len(batch) > 0 || len(revoked) > 0 || len(rl) > 0 || len(conc) > 0 {
-			r.postAll(batch, revoked, nil, rl, conc)
-		}
-		for _, failure := range authFailures {
-			one := []authFailureSample{failure}
-			if r.postAll(nil, nil, one, nil, nil) {
-				r.acknowledgeAuthFailures(one)
+		attempted := false
+		allOK := true
+		detail := ""
+		if pending.count() > 0 {
+			util, revoked, rates, concurrency := pending.slices()
+			ok, uploadDetail := r.uploadAll(util, revoked, nil, rates, concurrency)
+			attempted = true
+			if ok {
+				pending = newSignalTrendAccumulator()
+			} else {
+				allOK = false
+				detail = uploadDetail
 			}
 		}
-		batch = batch[:0]
-		revoked = revoked[:0]
+		// Durable auth failures are intentionally isolated one by one. The master
+		// rejects an unauthorized route with HTTP 409; batching it with trend data
+		// or another route would otherwise poison unrelated signals indefinitely.
+		for _, failure := range authFailures {
+			ok, uploadDetail := r.uploadAll(nil, nil, []authFailureSample{failure}, nil, nil)
+			attempted = true
+			if ok {
+				r.acknowledgeAuthFailures([]authFailureSample{failure})
+				continue
+			}
+			allOK = false
+			if detail == "" {
+				detail = uploadDetail
+			}
+		}
+		if attempted {
+			r.recordSignalUpload(allOK, detail)
+		}
+		r.setPendingSignals(pending.count() + len(r.snapshotAuthFailures()))
 	}
 	for {
 		select {
-		case s := <-r.in:
-			if batch = append(batch, s); len(batch) >= 64 {
-				flush(nil, nil)
+		case sample := <-r.in:
+			if !pending.addUtil(sample) {
+				r.recordSignalDrop(1)
 			}
-		case rv := <-r.revokedIn:
-			// Revoked rides the SAME 30s batch flush rather than an immediate
-			// per-event POST: a hard-ban 401s many concurrent in-flight requests
-			// at once, so per-event posting would be a POST storm; batching reuses
-			// one flush path (simplicity + main-link isolation) and the engine
-			// tolerating ≤30s quarantine latency is an acceptable best-effort
-			// trade. The >=64 cap bounds a burst so it doesn't wait the full tick.
-			if revoked = append(revoked, rv); len(revoked) >= 64 {
-				flush(nil, nil)
+		case sample := <-r.revokedIn:
+			if !pending.addRevoked(sample) {
+				r.recordSignalDrop(1)
 			}
 		case <-r.authWake:
 			flush(nil, nil)
 		case <-ticker.C:
 			flush(r.snapshotRateLimits(), r.snapshotConcurrency())
 		case <-r.stop:
-			// Final flush on shutdown so a reload doesn't drop the in-flight
-			// batch, then return — ends the goroutine + ticker (no leak).
 			flush(r.snapshotRateLimits(), r.snapshotConcurrency())
 			return
 		}
@@ -543,10 +732,19 @@ func (r *signalReporter) post(samples []signalSample, revoked []revokedSample, r
 }
 
 func (r *signalReporter) postAll(samples []signalSample, revoked []revokedSample, authFailures []authFailureSample, rateLimits []rateLimitSample, concurrency []concurrencySample) bool {
+	ok, detail := r.uploadAll(samples, revoked, authFailures, rateLimits, concurrency)
+	r.recordSignalUpload(ok, detail)
+	return ok
+}
+
+func (r *signalReporter) uploadAll(samples []signalSample, revoked []revokedSample, authFailures []authFailureSample, rateLimits []rateLimitSample, concurrency []concurrencySample) (ok bool, detail string) {
 	// All arrays are optional: marshal only the non-empty ones so an all-samples,
 	// all-revoked, all-rate_limits, or all-concurrency flush still posts a valid
 	// body the master can decode.
-	payload := make(map[string]any, 5)
+	payload := make(map[string]any, 6)
+	if r.sourceID != "" {
+		payload["source_id"] = r.sourceID
+	}
 	if len(samples) > 0 {
 		payload["samples"] = samples
 	}
@@ -562,12 +760,12 @@ func (r *signalReporter) postAll(samples []signalSample, revoked []revokedSample
 	if len(concurrency) > 0 {
 		payload["concurrency"] = concurrency
 	}
-	if len(payload) == 0 {
-		return true
+	if len(payload) == 0 || (len(payload) == 1 && r.sourceID != "") {
+		return true, ""
 	}
 	body, err := json.Marshal(payload)
 	if err != nil {
-		return false
+		return false, "signal payload encoding failed"
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
@@ -575,11 +773,11 @@ func (r *signalReporter) postAll(samples []signalSample, revoked []revokedSample
 	if err != nil {
 		r.logger.Warn("signal report bearer unavailable",
 			"event.name", observability.EventProxySignalBearerFailed, "error", err)
-		return false
+		return false, "signal bearer unavailable"
 	}
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, r.url, bytes.NewReader(body))
 	if err != nil {
-		return false
+		return false, "signal request construction failed"
 	}
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Authorization", "Bearer "+tok)
@@ -587,15 +785,69 @@ func (r *signalReporter) postAll(samples []signalSample, revoked []revokedSample
 	if err != nil {
 		r.logger.Warn("signal report upload failed",
 			"event.name", observability.EventProxySignalUploadFailed, "error", err)
-		return false
+		return false, "signal upload failed"
 	}
 	_ = resp.Body.Close()
 	if resp.StatusCode >= 300 {
 		r.logger.Warn("signal report rejected",
 			"event.name", observability.EventProxySignalUploadRejected, "status", resp.StatusCode)
-		return false
+		return false, "signal report rejected with HTTP " + strconv.Itoa(resp.StatusCode)
 	}
-	return true
+	return true, ""
+}
+
+func (r *signalReporter) recordSignalUpload(ok bool, detail string) {
+	if r == nil {
+		return
+	}
+	now := time.Now().Unix()
+	r.healthMu.Lock()
+	r.health.LastAttemptAt = now
+	if ok {
+		r.health.Status = "healthy"
+		r.health.ConsecutiveFailures = 0
+		r.health.LastSuccessAt = now
+		r.health.LastError = ""
+		r.dropSinceOK = false
+	} else {
+		r.health.ConsecutiveFailures++
+		r.health.Status = "retrying"
+		if r.health.ConsecutiveFailures >= 3 || r.dropSinceOK {
+			r.health.Status = "degraded"
+		}
+		r.health.LastError = detail
+	}
+	r.healthMu.Unlock()
+}
+
+func (r *signalReporter) setPendingSignals(count int) {
+	if r == nil {
+		return
+	}
+	r.healthMu.Lock()
+	r.health.PendingSignals = count
+	r.healthMu.Unlock()
+}
+
+func (r *signalReporter) recordSignalDrop(count int64) {
+	if r == nil || count <= 0 {
+		return
+	}
+	r.healthMu.Lock()
+	r.health.DroppedSignals += count
+	r.dropSinceOK = true
+	r.health.Status = "degraded"
+	r.health.LastError = "signal buffer capacity exceeded"
+	r.healthMu.Unlock()
+}
+
+func (r *signalReporter) healthSnapshot() SignalReportingHealth {
+	if r == nil {
+		return SignalReportingHealth{Status: "disabled"}
+	}
+	r.healthMu.Lock()
+	defer r.healthMu.Unlock()
+	return r.health
 }
 
 // parseUnifiedUtil5h reads the anthropic-ratelimit-unified-5h-utilization header

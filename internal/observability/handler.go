@@ -331,7 +331,9 @@ const (
 	// EventProxyGroupSeatBlocked (§5.5): the engine left this seat UNBOUND because
 	// every account in its pool/segment is at the ≤3-人/号 cap, so the proxy 429s it
 	// (never WRH-falls-back, which would route a 4th user onto a full account).
-	EventProxyGroupSeatBlocked = "proxy.group.seat_blocked"
+	EventProxyGroupSeatBlocked             = "proxy.group.seat_blocked"
+	EventProxyGroupRequestBodyRejected     = "proxy.group.request_body_rejected"
+	EventProxyGroupReplayCapacityExhausted = "proxy.group.replay_capacity_exhausted"
 	// EventProxyGroupLoginStateWriteFailed / ClearFailed: the bypass
 	// ~/.aikey/run/group-login-required.json state file (statusline login hint,
 	// 20260703 update) could not be written / removed. Best-effort by design —
@@ -384,7 +386,10 @@ const (
 	// ErrCodeGroupPoolFull (§5.5): 429 when the seat is blocked — every pool account
 	// is at the per-account user cap, or no usable account remains. Neutral wording
 	// (does not guess the cause); the user waits or contacts the admin.
-	ErrCodeGroupPoolFull = "GROUP_POOL_FULL"
+	ErrCodeGroupPoolFull               = "GROUP_POOL_FULL"
+	ErrCodeGroupRequestBodyTooLarge    = "GROUP_REQUEST_BODY_TOO_LARGE"
+	ErrCodeGroupRequestBodyReadFailed  = "GROUP_REQUEST_BODY_READ_FAILED"
+	ErrCodeGroupReplayCapacityExceeded = "GROUP_REPLAY_CAPACITY_EXCEEDED"
 	// ErrCodeModelTierExhausted (P1-C Phase 2, 用户拍板 2026-07-19): 429 when the
 	// REQUESTED MODEL's premium weekly window (e.g. Fable 7d_oi) is exhausted on
 	// every usable pool account, while other models still serve — the message

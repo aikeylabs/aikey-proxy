@@ -270,14 +270,14 @@ var stitchAlgorithmChangedRows = map[string]string{
 	// it twice (field alpha.15: /v1/v1/..., exactly as old_proxy_upstream records);
 	// pkg/providerroutes.stitchRequestURL now collapses that one duplicate.
 	//
-	// Field behaviour confirmed two ways, not assumed: the manifest's
+	// Field behavior confirmed two ways, not assumed: the manifest's
 	// old_proxy_upstream for every row below is the doubled path (verified against
 	// a real alpha.15 worker on staging 2026-08-03), and removing the new guard
 	// reproduces the doubled path byte-for-byte (mutation drill, 2026-08-15).
 	//
 	// 🔴 Operator note for release: these 19 are all vendors whose OWN docs give a
 	// base_url ending in /v1. A credential stored from the documented URL was being
-	// dialled at /v1/v1/... by un-upgraded workers; after upgrade it is dialled
+	// dialed at /v1/v1/... by un-upgraded workers; after upgrade it is dialed
 	// correctly. Nothing needs re-pointing — the upgrade is the fix.
 	"https://ai-gateway.vercel.sh/v1":          "/v1/chat/completions",
 	"https://aihubmix.com/v1":                  "/v1/chat/completions",
