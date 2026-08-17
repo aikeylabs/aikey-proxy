@@ -20,11 +20,15 @@ package proxy
 
 import (
 	"context"
+	"crypto/sha256"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"log/slog"
+	"net"
 	"net/http"
+	"net/url"
+	"os"
 	"strconv"
 	"strings"
 	"time"
@@ -488,6 +492,12 @@ func (p *Proxy) serveGroupAttempt(
 		"credential_type", res.CredentialType,
 		"provider", canonicalCode,
 	)
+	if os.Getenv("AIKEY_LOADTEST_OBSERVABILITY") == "1" && baseReq.Header.Get("X-AiKey-Loadtest") == "1" && !loadtestUpstreamAllowed(rc.BaseURL) {
+		p.pathHealth.NoteProbeCanceled(path)
+		writeJSONError(w, http.StatusBadGateway, "server_error", "AIKEY_LOADTEST_EGRESS_BLOCKED",
+			"Load-test safety blocked a non-allowlisted upstream before dialing it.")
+		return groupAttemptResult{done: true}
+	}
 
 	// Group VKs leave rc.ProviderCode empty by design (the provider is per-account
 	// in group_accounts; the base URL above already used the resolved canonicalCode,
@@ -506,6 +516,12 @@ func (p *Proxy) serveGroupAttempt(
 	// can distinguish a permanently revoked token from an ordinary 401. The last
 	// non-revocation failure is flushed verbatim immediately below.
 	fw := newGroupFailoverWriter(w, true)
+	if os.Getenv("AIKEY_LOADTEST_OBSERVABILITY") == "1" && baseReq.Header.Get("X-AiKey-Loadtest") == "1" {
+		accountHash := sha256.Sum256([]byte(res.AccountID))
+		fw.Header().Set("X-AiKey-Account-ID", fmt.Sprintf("acct-%x", accountHash[:6]))
+		fw.Header().Set("X-AiKey-Upstream-Attempts", strconv.Itoa(attempt+1))
+		fw.Header().Set("X-AiKey-Route-Switches", strconv.Itoa(attempt))
+	}
 	fw.onCommit = replay.Commit
 	p.serveRouteWithObserver(fw, r, &rc, prov, realKey, inboundBearer, startTime, logger,
 		observer.StreamUserChat, traceID)
@@ -560,6 +576,27 @@ func (p *Proxy) serveGroupAttempt(
 		"attempt", attempt+1,
 	)
 	return groupAttemptResult{attempted: true, authFailedAccount: authFailedAccount(hardRevoked, res.AccountID)}
+}
+
+func loadtestUpstreamAllowed(rawURL string) bool {
+	parsed, err := url.Parse(rawURL)
+	if err != nil || (parsed.Scheme != "http" && parsed.Scheme != "https") {
+		return false
+	}
+	host := strings.ToLower(parsed.Hostname())
+	if host == "localhost" {
+		return true
+	}
+	if ip := net.ParseIP(host); ip != nil && ip.IsLoopback() {
+		return true
+	}
+	for _, allowed := range strings.Split(os.Getenv("AIKEY_LOADTEST_ALLOWED_UPSTREAM_HOSTS"), ",") {
+		allowed = strings.ToLower(strings.TrimSpace(allowed))
+		if allowed != "" && (host == allowed || strings.HasSuffix(host, "."+allowed)) {
+			return true
+		}
+	}
+	return false
 }
 
 func authFailedAccount(hardRevoked bool, accountID string) string {
