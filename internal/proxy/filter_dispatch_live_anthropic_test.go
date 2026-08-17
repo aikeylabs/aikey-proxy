@@ -33,6 +33,32 @@ import (
 //	AIKEY_TEST_DETECTOR_BINARY = path to the built detector
 //	AIKEY_TEST_ANTHROPIC_KEY   = real sk-ant-... official key (from test materials,
 //	                             loaded into env by the caller — never hardcoded)
+//	AIKEY_TEST_ANTHROPIC_BASE  = optional upstream override
+//
+// WHY THIS TEST NOW HAS A ZERO-COST ENTRY (2026-08-17)
+//
+// The two env gates above meant NO make target and NO CI path could reach this
+// test — its only observer was a human choosing to spend money. It rotted
+// exactly as that predicts: the CN ID-card fixture below carried an invalid
+// GB 11643 check digit, so pii.cn.id_card never fired for it, and by the time
+// anyone looked the value was leaking RAW into the forwarded body. The test was
+// not merely uncovered, it was RED, and had been for days.
+//
+// The test has two halves and only the second one costs money:
+//
+//	L1        Handle → serveRoute → applyInboundFilter → real detector child →
+//	          the masked body observed at the capture server. Fully deterministic.
+//	upstream  that body relayed to real Anthropic for a 200 completion.
+//
+// Setting AIKEY_TEST_ANTHROPIC_BASE to a closed loopback port makes the relay
+// fail instantly with `connection refused`, which the tail of this test already
+// treats as "not a malformed-JSON rejection" — so every L1 assertion runs, no
+// external request is made, and no funded key is needed:
+//
+//	make -f workflow/CI/Makefile p4-filter-anthropic-l1
+//
+// That target is the routine observer. The paid upstream half stays MANUAL: run
+// this test with a real AIKEY_TEST_ANTHROPIC_KEY and no _BASE override.
 //
 // STATUS (2026-05-30): L1 landed (proxy extracts content from the envelope,
 // masks per-piece, re-serializes — see filter_content.go). The forwarded body
@@ -123,11 +149,52 @@ func TestLiveAnthropic_MaskedRequestAcceptedAndAnswered(t *testing.T) {
 	p := setupTestProxyWithActive(t, av)
 	p.SetFilterHook(hook)
 
-	// Synthetic PII (obviously fake) embedded in a CJK prompt with full-width
-	// punctuation 「，。」around the entities — the exact shape the offset-frame
-	// fix had to get right.
-	const phone = "13800138000"
-	const idCard = "11010119900307742X"
+	// PII embedded in a CJK prompt with full-width punctuation 「，。」around the
+	// entities — the exact shape the offset-frame fix had to get right.
+	//
+	// WHY THE PHONE IS 13857492631 AND NOT 13800138000
+	// (fixture correction 2026-08-17, action bundle Wave5 → Wave6)
+	//
+	// 13800138000 is THE canonical fake CN mobile and is a literal inside
+	// obviousNonLivePhone (actionpolicy/stage_v10.go). Wave6 made that
+	// value-shape veto explicit, so the value is capped at `warn` however strong
+	// the surrounding ownership evidence is — it can no longer stand for a LIVE
+	// phone in any fixture. Left on the old literal this test forwards the RAW
+	// phone and fails the "raw PII leaked" assertion below, i.e. it would be
+	// measuring the synthetic-value veto rather than the mask plumbing it exists
+	// to prove.
+	//
+	// That red used to be invisible until someone paid for it. Since 2026-08-17
+	// it is not: `make -f workflow/CI/Makefile p4-filter-anthropic-l1` runs every
+	// assertion below for free (see the zero-cost-entry note in this test's doc
+	// comment), so a fixture that stops exercising the rule it names is caught by
+	// a routine target instead of by the next person spending money.
+	//
+	// The full rationale — and why 13800138000 did NOT vanish from coverage (its
+	// warn verdict is pinned BY NAME in actionpolicy/bundle_test.go,
+	// TestActivePhoneHistoryRecoveryKeepsLowFalsePositiveBoundary, row "canonical
+	// fake number with strong ownership") — sits next to the same literal in
+	// filter_dispatch_live_test.go and is deliberately not restated here.
+	const phone = "13857492631"
+
+	// WHY THE ID CARD ENDS 7424 AND NOT 742X
+	// (fixture correction 2026-08-17; the sibling file was corrected 2026-08-13
+	// and this copy was missed — see "WHY THIS TEST NOW HAS A ZERO-COST ENTRY"
+	// below for why nothing noticed for four days)
+	//
+	// pii.cn.id_card declares `validator: cn_id_card` = the GB 11643-1999 check
+	// digit. "11010119900307742X" fails it (the correct digit is 4), so
+	// CN_ID_CARD was NEVER emitted for this value — the rule this line exists to
+	// exercise has never once run here.
+	//
+	// The assertion below passed anyway because five INTERNATIONAL numeric-ID
+	// regexes (FI / PL / DE / TR / SE) also match any 17-digit+1 string and used
+	// to mask, so the raw substring disappeared for an unrelated reason. That is
+	// a false green, not coverage.
+	//
+	// The full rationale sits next to the same literal in
+	// filter_dispatch_live_test.go and is deliberately not restated here.
+	const idCard = "110101199003077424"
 	model := os.Getenv("AIKEY_TEST_ANTHROPIC_MODEL")
 	if model == "" {
 		model = "claude-3-5-haiku-20241022"
@@ -155,7 +222,10 @@ func TestLiveAnthropic_MaskedRequestAcceptedAndAnswered(t *testing.T) {
 	if !strings.Contains(fb, `"messages"`) || !strings.Contains(fb, `"model"`) {
 		t.Errorf("envelope keys missing — structure not preserved:\n%s", fb)
 	}
-	for _, leak := range []string{phone, idCard, "742X"} {
+	// "7424" is the residual-tail canary: a mask whose span is off by a few bytes
+	// leaves the last digits behind, which `idCard` alone would not catch. Same
+	// literal and same reasoning as filter_dispatch_live_test.go.
+	for _, leak := range []string{phone, idCard, "7424"} {
 		if strings.Contains(fb, leak) {
 			t.Errorf("raw PII %q leaked in forwarded body:\n%s", leak, fb)
 		}
