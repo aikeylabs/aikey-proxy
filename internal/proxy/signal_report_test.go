@@ -87,7 +87,7 @@ func TestSignalPostSendsBatch(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	r := newSignalReporter(srv.URL, "", func(context.Context) (string, error) { return "tok-123", nil }, slog.Default())
+	r := newSignalReporter(srv.URL, func(context.Context) (string, error) { return "tok-123", nil }, slog.Default())
 	if r == nil {
 		t.Fatal("newSignalReporter returned nil")
 	}
@@ -121,7 +121,7 @@ func TestSignalPostBearerErrorDoesNotPost(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	r := newSignalReporter(srv.URL, "", func(context.Context) (string, error) {
+	r := newSignalReporter(srv.URL, func(context.Context) (string, error) {
 		return "", io.ErrUnexpectedEOF
 	}, slog.Default())
 	if r == nil {
@@ -306,7 +306,7 @@ func TestSignalPostSendsRevoked(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	r := newSignalReporter(srv.URL, "", func(context.Context) (string, error) { return "tok-123", nil }, slog.Default())
+	r := newSignalReporter(srv.URL, func(context.Context) (string, error) { return "tok-123", nil }, slog.Default())
 	if r == nil {
 		t.Fatal("newSignalReporter returned nil")
 	}
@@ -575,7 +575,7 @@ func TestSignalPostSendsRateLimits(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	r := newSignalReporter(srv.URL, "", func(context.Context) (string, error) { return "tok-123", nil }, slog.Default())
+	r := newSignalReporter(srv.URL, func(context.Context) (string, error) { return "tok-123", nil }, slog.Default())
 	if r == nil {
 		t.Fatal("newSignalReporter returned nil")
 	}
@@ -768,7 +768,7 @@ func TestSignalPostSendsConcurrency(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	r := newSignalReporter(srv.URL, "", func(context.Context) (string, error) { return "tok-123", nil }, slog.Default())
+	r := newSignalReporter(srv.URL, func(context.Context) (string, error) { return "tok-123", nil }, slog.Default())
 	if r == nil {
 		t.Fatal("newSignalReporter returned nil")
 	}
@@ -820,7 +820,7 @@ func TestSignalPostSendsConcurrency(t *testing.T) {
 // guard is removed. (loop()'s timing isn't deterministically testable — see the
 // file header — so the stop case itself is verified by inspection.)
 func TestSignalReporterCloseIdempotentAndNilSafe(t *testing.T) {
-	r := newSignalReporter("http://example.invalid", "", func(context.Context) (string, error) { return "tok", nil }, slog.Default())
+	r := newSignalReporter("http://example.invalid", func(context.Context) (string, error) { return "tok", nil }, slog.Default())
 	if r == nil {
 		t.Fatal("newSignalReporter returned nil")
 	}

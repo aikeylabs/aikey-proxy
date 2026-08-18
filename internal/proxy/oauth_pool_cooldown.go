@@ -112,6 +112,13 @@ type poolCooldownStore struct {
 	// model maps into that tier (skipSetFor); every other model keeps serving —
 	// a Fable weekly-window exhaustion must not block Sonnet traffic.
 	tierM map[string]time.Time
+	// lapsed records accounts whose cooldown (whole-account or tier) was
+	// observed EXPIRED and pruned — consumed once by the scheduling-log settle
+	// hook so "same account resumed after recovery" gets its route_resolved
+	// (reason=recovered) row (覆盖度审计拍板 2026-08-18). Bounded by the distinct
+	// account set; entries clear on consumption. Deliberately not persisted —
+	// recovery attribution is a live observation.
+	lapsed map[string]struct{}
 	// authFailedTokens is a route-member + token-version tombstone, not a timed
 	// cooldown. The key includes group, seat and account: one Cluster Worker can
 	// serve several members of the same pool, whose tokens must remain isolated.
@@ -145,7 +152,7 @@ type PoolAuthFailureState struct {
 func newPoolCooldownStore() *poolCooldownStore {
 	s := &poolCooldownStore{m: make(map[string]time.Time), now: time.Now,
 		meta: make(map[string]PoolAccountRouteState), serverErrStreak: make(map[string]int), tierM: make(map[string]time.Time),
-		authFailedTokens: make(map[string]string)}
+		authFailedTokens: make(map[string]string), lapsed: make(map[string]struct{})}
 	// Cross-restart persistence (2026-07-04 self-heal, §S4): without it a proxy
 	// restart forgot every cooldown and could immediately route traffic back
 	// onto an account that just 401'd / rate-limited. STRICTLY an enhancement,
@@ -575,6 +582,10 @@ func (s *poolCooldownStore) skipSet() map[string]bool {
 		} else {
 			delete(s.m, id)
 			delete(s.meta, id)
+			if s.lapsed == nil {
+				s.lapsed = make(map[string]struct{})
+			}
+			s.lapsed[id] = struct{}{}
 			pruned = true
 		}
 	}
@@ -694,6 +705,10 @@ func (s *poolCooldownStore) skipSetFor(model string) map[string]bool {
 	for key, until := range s.tierM {
 		if !now.Before(until) {
 			delete(s.tierM, key)
+			if s.lapsed == nil {
+				s.lapsed = make(map[string]struct{})
+			}
+			s.lapsed[strings.SplitN(key, "|", 2)[0]] = struct{}{}
 			continue
 		}
 		if strings.HasSuffix(key, suffix) {
@@ -718,6 +733,10 @@ func (s *poolCooldownStore) tierCooldownUntil(tierKey string) (time.Time, bool) 
 	for key, until := range s.tierM {
 		if !now.Before(until) {
 			delete(s.tierM, key)
+			if s.lapsed == nil {
+				s.lapsed = make(map[string]struct{})
+			}
+			s.lapsed[strings.SplitN(key, "|", 2)[0]] = struct{}{}
 			continue
 		}
 		if strings.HasSuffix(key, suffix) && until.After(latest) {
@@ -744,6 +763,10 @@ func (s *poolCooldownStore) snapshot() map[string]int {
 		} else {
 			delete(s.m, id)
 			delete(s.meta, id)
+			if s.lapsed == nil {
+				s.lapsed = make(map[string]struct{})
+			}
+			s.lapsed[id] = struct{}{}
 			pruned = true
 		}
 	}
@@ -1042,4 +1065,18 @@ func retryAfterDuration(h http.Header) time.Duration {
 		return time.Duration(secs) * time.Second
 	}
 	return 0
+}
+
+// consumeLapsed reports (and clears) whether accountID's cooldown was observed
+// to expire since the last consumption — the scheduling-log settle hook turns
+// this into a route_resolved(reason=recovered) row. One-shot by design: the
+// recovery is attributed to the first request that resumes the account.
+func (s *poolCooldownStore) consumeLapsed(accountID string) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if _, ok := s.lapsed[accountID]; ok {
+		delete(s.lapsed, accountID)
+		return true
+	}
+	return false
 }

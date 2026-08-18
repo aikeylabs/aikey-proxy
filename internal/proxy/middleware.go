@@ -621,6 +621,14 @@ func writeJSONErrorDetails(w http.ResponseWriter, statusCode int, errType, code,
 	// P1 error-origin: this component GENERATED the error → stamp origin + path.
 	setErrorOrigin(h, code)
 	w.WriteHeader(statusCode)
+	// 拍板 2026-08-18 #4: every aikey-GENERATED message carries the "AiKey: "
+	// prefix so a human reading the CLI output tells aikey's own errors from a
+	// provider's verbatim passthrough at a glance (the headers/origin field
+	// already give machines the same discriminator). Idempotent — messages
+	// already leading with "AiKey" are left alone.
+	if !strings.HasPrefix(message, "AiKey") {
+		message = "AiKey: " + message
+	}
 	errObj := map[string]any{"message": message, "type": errType, "code": code}
 	for key, value := range details {
 		errObj[key] = value

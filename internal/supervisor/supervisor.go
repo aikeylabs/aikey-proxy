@@ -128,6 +128,48 @@ type generation struct {
 	inflight atomic.Int64
 	id       int
 	draining atomic.Bool
+	// signalReporting is applied only when this fully-built generation becomes
+	// active. Building a replacement must not reconfigure the process-owned
+	// reporter while the current generation is still authoritative.
+	signalReporting signalReportingConfig
+}
+
+type signalReportingMode uint8
+
+const (
+	signalReportingDisabled signalReportingMode = iota
+	signalReportingMember
+	signalReportingOrg
+)
+
+type signalReportingConfig struct {
+	mode         signalReportingMode
+	controlURL   string
+	orgID        string
+	serviceToken string
+	bearer       func(context.Context) (string, error)
+}
+
+func (c signalReportingConfig) apply(p *proxy.Proxy) {
+	if p == nil {
+		return
+	}
+	// Every mode is named, and that is the point rather than style: a mode added
+	// later would otherwise fall into `default` and silently become "reporting
+	// off" — a data-loss default that nothing would flag. With the cases listed,
+	// the exhaustive linter fails the build until the new mode is handled.
+	switch c.mode {
+	case signalReportingMember:
+		p.EnableSignalReporting(c.controlURL, c.bearer)
+	case signalReportingOrg:
+		p.EnableOrgSignalReporting(c.controlURL, c.orgID, c.serviceToken)
+	case signalReportingDisabled:
+		p.DisableSignalReporting()
+	default:
+		// Unreachable while the switch above is exhaustive; kept so an
+		// out-of-range value cannot leave reporting in an undefined state.
+		p.DisableSignalReporting()
+	}
 }
 
 // ServeHTTP dispatches to the generation's proxy handler, tracking inflight count.
@@ -175,13 +217,12 @@ func (g *generation) closeAll() {
 	if g.reporter != nil {
 		_ = g.reporter.Close()
 	}
-	// Stop the allocation-engine signal reporter (lives on this generation's
-	// proxy, started per generation in buildGeneration via EnableSignalReporting).
-	// Without this its loop() goroutine + 30s ticker leak on every reload, each
-	// holding a live bearer closure over the old vault reader.
 	if g.proxy != nil {
-		g.proxy.StopSignalReporting()
-		// Same reason, different subsystem (2026-08-15): the observer registry is
+		// The allocation signal reporter is deliberately NOT closed here: it is
+		// process-owned so a draining request can publish a late 401/429 after the
+		// replacement generation is active. The Supervisor closes it on shutdown.
+		// The observer registry remains generation-owned and must be retired.
+		// Same reason, different subsystem (2026-08-15): the registry is
 		// rebuilt per generation by buildObserverRegistry, and until this call
 		// existed nothing ever retired it. rhythm's settings poller (5s tick) and
 		// reporter worker pool therefore accumulated one full set per reload —
@@ -278,6 +319,14 @@ type Supervisor struct {
 	// receives this same pointer, so a reload cannot erase an open breaker or its
 	// recovery opportunity and hot network/egress changes can wake it immediately.
 	pathHealth *proxy.ProviderPathHealthManager
+	// oauthPoolRuntime is the single in-memory truth for OAuth-pool cooldowns,
+	// exact-token tombstones, and allocation-signal pending work. Generations
+	// share it; only Shutdown closes it.
+	oauthPoolRuntime *proxy.OAuthPoolRuntimeState
+	// signalRefreshToken supplies the process-owned reporter without capturing a
+	// generation-owned vault Reader. It opens the currently activated vault only
+	// when teamCredentialSource needs to rebuild its credential.
+	signalRefreshToken *runtimeRefreshTokenSource
 	// ctx / cancel bound the lifetime of all detached upstream calls.
 	// Canceled in Shutdown() to stop any in-flight upstream requests.
 	ctx    context.Context
@@ -443,6 +492,8 @@ func New(cfg *config.Config, configPath, password, version string) (*Supervisor,
 		// would recreate the four-source base_url drift.
 		fallbackPolicy:           proxy.NewFallbackPolicyCache(localAttemptTimeoutMs(cfg)),
 		pathHealth:               proxy.NewProviderPathHealthManager(),
+		oauthPoolRuntime:         proxy.NewOAuthPoolRuntimeState(),
+		signalRefreshToken:       newRuntimeRefreshTokenSource(cfg.Vault.Path, password),
 		teamCred:                 &teamCredentialSource{},
 		currentRoutedRestampKick: make(chan struct{}, 1),
 	}
@@ -451,6 +502,7 @@ func New(cfg *config.Config, configPath, password, version string) (*Supervisor,
 	s.railset = newRailSet(s.groupRuntimeRail(), s.routingOverrideRail(), s.fallbackPolicyRail())
 	gen, err := s.buildGeneration()
 	if err != nil {
+		_ = s.oauthPoolRuntime.Close()
 		return nil, fmt.Errorf("initial generation failed: %w", err)
 	}
 	s.activateGeneration(gen)
@@ -775,6 +827,10 @@ func (s *Supervisor) activateGeneration(newGen *generation) {
 	s.runtimeStateMu.Lock()
 	defer s.runtimeStateMu.Unlock()
 	s.applyRuntimeState(newGen.proxy)
+	if s.signalRefreshToken != nil {
+		s.signalRefreshToken.update(newGen.vaultPath, s.password)
+	}
+	newGen.signalReporting.apply(newGen.proxy)
 	s.active.Store(newGen)
 }
 
@@ -1639,8 +1695,8 @@ func (s *Supervisor) Reload(ctx context.Context) error {
 	// Apply the latest supervisor-owned runtime state and swap under the same short
 	// fence used by hot updates. The generation build above remains off-lock.
 	s.activateGeneration(newGen)
-	// The new Proxy hydrates persisted cooldowns independently; re-stamp its
-	// display projection after the generation becomes active.
+	// The process-wide cooldown truth may have changed while the replacement was
+	// building; re-stamp the display projection after it becomes active.
 	s.requestCurrentRoutedRestamp()
 	slog.Info("reload: new generation active",
 		"event.name", observability.EventProxyReloadCompleted,
@@ -1701,6 +1757,9 @@ func (s *Supervisor) Shutdown(timeout time.Duration) {
 	slog.Info("supervisor shutting down", "generation_id", gen.id)
 	gen.drain(timeout, "shutdown")
 	gen.close()
+	if s.oauthPoolRuntime != nil {
+		_ = s.oauthPoolRuntime.Close()
+	}
 }
 
 // buildGeneration creates a fully-initialized generation ready to handle requests.
@@ -1771,7 +1830,7 @@ func (s *Supervisor) buildGeneration() (*generation, error) {
 	collector := events.NewCollector(eventStore, s.cfg.Events.BatchSize, s.cfg.Events.FlushInterval)
 
 	// Build the proxy handler with configured thresholds.
-	p := proxy.New(vaultReader, registry, providers, collector, s.ctx)
+	p := proxy.NewWithOAuthPoolRuntime(vaultReader, registry, providers, collector, s.ctx, s.oauthPoolRuntime)
 	// Stamp the generation identity FIRST and unconditionally. Every runtime
 	// counter this Proxy exposes on /v1/diagnostics/pipeline is scoped to this
 	// generation — a reload swaps the *Proxy behind an unchanged PID, so the
@@ -2037,11 +2096,18 @@ func (s *Supervisor) buildGeneration() (*generation, error) {
 	// destination; neither condition may suppress a hard-revoked member-token
 	// transition. Cluster uses the existing org-pinned service credential; other
 	// editions reuse the live team account JWT used by the group-runtime rails.
+	// Store the desired configuration on the generation and apply it only at the
+	// activation boundary; a generation that fails to build cannot disturb the
+	// current process-owned reporter.
 	masterURL := readControlPanelURL()
+	signalCfg := signalReportingConfig{}
 	if s.cfg.Cluster.Enabled && s.cfg.Cluster.OrgID != "" && s.cfg.Cluster.ControlServiceToken != "" {
-		p.EnableOrgSignalReporting(masterURL, s.cfg.Cluster.OrgID, s.cfg.Cluster.ControlServiceToken)
-	} else if signalURL, bearer := signalReportingAuth(masterURL, s.teamCred, vaultReader); bearer != nil {
-		p.EnableSignalReporting(signalURL, bearer)
+		signalCfg = signalReportingConfig{
+			mode: signalReportingOrg, controlURL: masterURL,
+			orgID: s.cfg.Cluster.OrgID, serviceToken: s.cfg.Cluster.ControlServiceToken,
+		}
+	} else if signalURL, bearer := signalReportingAuth(masterURL, s.teamCred, s.signalRefreshToken); bearer != nil {
+		signalCfg = signalReportingConfig{mode: signalReportingMember, controlURL: signalURL, bearer: bearer}
 	}
 
 	// Only hand the WAL to the generation when nobody else closes it. If a
@@ -2068,6 +2134,7 @@ func (s *Supervisor) buildGeneration() (*generation, error) {
 		seqAlloc:        seqAlloc,
 		contentReporter: contentReporter,
 		contentWAL:      contentWAL,
+		signalReporting: signalCfg,
 		contentSeqAlloc: contentSeqAlloc,
 		drained:         make(chan struct{}),
 	}

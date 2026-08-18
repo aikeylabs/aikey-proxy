@@ -3,7 +3,10 @@ package proxy
 import (
 	"bytes"
 	"context"
+	cryptorand "crypto/rand"
+	"encoding/hex"
 	"encoding/json"
+	"fmt"
 	"log/slog"
 	"net/http"
 	"os"
@@ -72,6 +75,47 @@ type authFailureSample struct {
 	Reason           string `json:"reason"`
 }
 
+// schedulingEventSample is one scheduling STATE-CHANGE event shipped to the
+// master's unified scheduling log (scheduling_event_log — design:
+// update/20260817-账号池调度日志统一视图与导出-方案.md). Only change-gated /
+// low-frequency events ride this rail (switch, cooldown, pre-cut, login
+// required, failover, degrade); per-request route resolutions are deliberately
+// NOT reported (拍板 2026-08-17 #3 — usage attribution already answers "which
+// account served this request").
+//
+// EventID is proxy-generated and TIME-PREFIXED so the master rows sort within
+// one second, and doubles as the idempotency key (master inserts with
+// conflict-ignore, so a retried batch never duplicates). CredentialID is the
+// real credential_id of the subject account — the master's ownership gate
+// authorizes on it; AccountID is the oauth_group_account id (display id space,
+// same as the drawer). The two id spaces are deliberately both carried:
+// account_decision_log.account_id holds credential ids, so credential_id is
+// the JOIN key to decisions while account_id matches the admin UI.
+type schedulingEventSample struct {
+	EventID      string         `json:"event_id"`
+	TSMs         int64          `json:"ts_ms"`
+	EventName    string         `json:"event_name"`
+	Severity     string         `json:"severity,omitempty"`
+	ErrorCode    string         `json:"error_code,omitempty"`
+	OauthGroupID string         `json:"oauth_group_id,omitempty"`
+	CredentialID string         `json:"credential_id,omitempty"`
+	AccountID    string         `json:"account_id,omitempty"`
+	SeatID       string         `json:"seat_id,omitempty"`
+	TraceID      string         `json:"trace_id,omitempty"`
+	// Origin says who produced the SIGNAL behind this row (拍板 2026-08-18):
+	// "provider" = a concrete upstream response triggered it (429/5xx/401/4xx
+	// passthrough); "aikey" = aikey's own scheduling/protection produced it
+	// (settle, switch, pre-cut, login prompt, degrade). Pre-cut is "aikey" by
+	// decision: the upstream reported nothing wrong — we proactively moved.
+	Origin string         `json:"origin,omitempty"`
+	Detail map[string]any `json:"detail,omitempty"`
+	// dedupeKey extends the per-window suppression key WITHOUT going on the
+	// wire: logically distinct transitions that share an event name (e.g.
+	// route_resolved reason=first_settle vs =recovered arriving in one window)
+	// must each keep their row.
+	dedupeKey string
+}
+
 // rateLimitSample reports how many 429/403 responses a credential drew in the
 // last flush window. Master normalizes Risk429Count/window into the allocation
 // engine's §5.1 w5 "Recent429FreqNorm" risk signal. Unlike
@@ -114,6 +158,7 @@ type rateLimitSample struct {
 }
 
 type signalReporter struct {
+	configMu  sync.RWMutex
 	url       string
 	sourceID  string                                    // stable vault/Worker identity; optional during rolling upgrade
 	bearer    func(ctx context.Context) (string, error) // account-JWT (reuses the group-runtime poll credential)
@@ -148,17 +193,23 @@ type signalReporter struct {
 	inflCur      map[string]int
 	inflPeak     map[string]int
 	inflPrevious map[string]struct{}
-	logger       *slog.Logger
+	// evIn queues scheduling events for the unified master log. evSuppress
+	// dedupes identical (event, group, credential, account, seat) keys within one
+	// flush window: a fault burst (429 storm, blocked login) re-emits the same
+	// condition on every request, and the LOG needs the transition, not the storm.
+	// Reset every ticker flush, so a condition persisting across windows re-logs
+	// at most once per 30s — bounded, and still visibly "ongoing" on the page.
+	evIn       chan schedulingEventSample
+	evSupMu    sync.Mutex
+	evSuppress map[string]struct{}
+	logger     *slog.Logger
 	healthMu     sync.Mutex
 	health       SignalReportingHealth
 	dropSinceOK  bool
 
-	// stop terminates loop() on Close so the goroutine + ticker don't leak. A
-	// fresh signalReporter is built per generation (buildGeneration); without
-	// this, every reload (aikey use, filter/quota/audit toggle, /admin/reload)
-	// leaked one loop() + 30s ticker holding a live bearer closure over the old
-	// vault reader. Close is idempotent (stopOnce) — generation.close() may run
-	// once but defensive against double-close.
+	// stop terminates loop() on Close so the goroutine + ticker don't leak. The
+	// Supervisor owns one reporter for the full process lifetime; hot-reload
+	// generations only reconfigure it and publish into it. Close is idempotent.
 	stop     chan struct{}
 	stopOnce sync.Once
 }
@@ -177,22 +228,35 @@ type SignalReportingHealth struct {
 
 // newSignalReporter returns nil (feature off) unless both a control URL and an
 // auth bearer are configured. On success it starts the background upload loop.
-func newSignalReporter(controlURL, sourceID string, bearer func(context.Context) (string, error), logger *slog.Logger) *signalReporter {
+//
+// No sourceID parameter: this helper builds the MEMBER endpoint
+// (/accounts/me/signals), where the caller's identity comes from the bearer
+// token and a source id would be ignored. Org-scoped reporting, which does
+// carry one, goes through newSignalReporterEndpoint directly — see
+// proxy.go's use of p.sourceID. The parameter existed and every caller passed
+// "", which is what unparam reported.
+func newSignalReporter(controlURL string, bearer func(context.Context) (string, error), logger *slog.Logger) *signalReporter {
 	if controlURL == "" {
 		return nil
 	}
-	return newSignalReporterEndpoint(strings.TrimRight(controlURL, "/")+"/accounts/me/signals", sourceID, bearer, logger)
+	return newSignalReporterEndpoint(strings.TrimRight(controlURL, "/")+"/accounts/me/signals", "", bearer, logger)
 }
 
 func newSignalReporterEndpoint(endpoint, sourceID string, bearer func(context.Context) (string, error), logger *slog.Logger) *signalReporter {
 	if endpoint == "" || bearer == nil {
 		return nil
 	}
+	r := newDormantSignalReporter(logger)
+	r.configure(endpoint, sourceID, bearer)
+	return r
+}
+
+func newDormantSignalReporter(logger *slog.Logger) *signalReporter {
+	if logger == nil {
+		logger = slog.Default()
+	}
 	r := &signalReporter{
-		url:      endpoint,
-		sourceID: sourceID,
-		bearer:   bearer,
-		client:   httpx.NewSwappableDirect(10 * time.Second),
+		client: httpx.NewSwappableDirect(10 * time.Second),
 		// A 300-person team can complete more than 256 requests at once. The loop
 		// collapses these by credential immediately; this buffer absorbs the burst
 		// without making the user request wait for Control.
@@ -206,25 +270,66 @@ func newSignalReporterEndpoint(endpoint, sourceID string, bearer func(context.Co
 		inflCur:      make(map[string]int),
 		inflPeak:     make(map[string]int),
 		inflPrevious: make(map[string]struct{}),
+		evIn:         make(chan schedulingEventSample, 256),
+		evSuppress:   make(map[string]struct{}),
 		logger:       logger,
-		health:       SignalReportingHealth{Status: "starting"},
+		health:       SignalReportingHealth{Status: "disabled"},
 		stop:         make(chan struct{}),
 	}
 	r.hydrateAuthFailures()
 	go r.loop()
-	if len(r.snapshotAuthFailures()) > 0 {
+	return r
+}
+
+// configure atomically moves the process-owned reporter to the control-plane
+// identity of a newly activated generation. In-flight uploads keep a complete
+// old snapshot; later uploads use the complete new snapshot, so endpoint and
+// bearer can never be mixed across control servers.
+func (r *signalReporter) configure(endpoint, sourceID string, bearer func(context.Context) (string, error)) {
+	if r == nil {
+		return
+	}
+	r.configMu.Lock()
+	wasEnabled := r.url != "" && r.bearer != nil
+	endpointChanged := r.url != endpoint || r.sourceID != sourceID
+	r.url = endpoint
+	r.sourceID = sourceID
+	r.bearer = bearer
+	enabled := endpoint != "" && bearer != nil
+	r.configMu.Unlock()
+
+	r.healthMu.Lock()
+	if !enabled {
+		r.health.Status = "disabled"
+		r.health.LastError = ""
+	} else if !wasEnabled || endpointChanged {
+		r.health.Status = "starting"
+		r.health.ConsecutiveFailures = 0
+		r.health.LastError = ""
+	}
+	r.healthMu.Unlock()
+
+	if enabled {
 		select {
 		case r.authWake <- struct{}{}:
 		default:
 		}
 	}
-	return r
 }
 
-// Close stops the upload loop (idempotent, nil-safe). Called from
-// generation.close() on every reload so the loop() goroutine + ticker don't
-// leak. It does NOT close r.in / r.revokedIn — the forward path may still send
-// there (non-blocking, default-drop), and closing them would panic that send.
+func (r *signalReporter) configured() bool {
+	if r == nil {
+		return false
+	}
+	r.configMu.RLock()
+	defer r.configMu.RUnlock()
+	return r.url != "" && r.bearer != nil
+}
+
+// Close stops the upload loop (idempotent, nil-safe). A Supervisor calls this
+// once during process shutdown; a standalone Proxy calls it from
+// StopSignalReporting. It does NOT close r.in / r.revokedIn because closing a
+// channel while a final request publishes would panic that send.
 func (r *signalReporter) Close() error {
 	if r == nil {
 		return nil
@@ -260,6 +365,70 @@ func (r *signalReporter) enqueueRevoked(credentialID, reason string) {
 	default: // buffer full → drop (best-effort; never block forwarding)
 		r.recordSignalDrop(1)
 	}
+}
+
+// maxPendingSchedulingEvents bounds both the per-window suppression map and the
+// retry accumulator: a master outage keeps at most this many events in memory
+// and drops (counted, /status-visible) beyond it — the log is an observability
+// bypass and must never grow with request rate.
+const maxPendingSchedulingEvents = 512
+
+// newSchedulingEventID mints a time-prefixed sortable id ("sev_<13-digit
+// ms>_<4-byte hex>"). The decimal millisecond prefix keeps lexicographic order
+// aligned with time order (13 digits covers past year 2280); the random suffix
+// disambiguates same-millisecond events from one proxy.
+func newSchedulingEventID(tsMs int64) string {
+	var b [4]byte
+	_, _ = cryptorand.Read(b[:])
+	return fmt.Sprintf("sev_%013d_%s", tsMs, hex.EncodeToString(b[:]))
+}
+
+// enqueueSchedulingEvent is the non-blocking hand-off from the serving path.
+// Same MAIN-LINK safety contract as enqueue: nil receiver / missing name are
+// dropped silently, a full buffer drops with a counted signal-drop, and the
+// per-window suppression bounds fault-burst re-emission (see evSuppress).
+func (r *signalReporter) enqueueSchedulingEvent(s schedulingEventSample) {
+	if r == nil || s.EventName == "" {
+		return
+	}
+	if s.TSMs <= 0 {
+		s.TSMs = time.Now().UnixMilli()
+	}
+	// ErrorCode joins the key so distinct conditions on one subject (e.g. a 400
+	// vs 403 passthrough in the same window) each keep one row.
+	key := s.EventName + "|" + s.ErrorCode + "|" + s.dedupeKey + "|" + s.OauthGroupID + "|" + s.CredentialID + "|" + s.AccountID + "|" + s.SeatID
+	r.evSupMu.Lock()
+	if r.evSuppress == nil {
+		r.evSuppress = make(map[string]struct{})
+	}
+	if _, dup := r.evSuppress[key]; dup {
+		r.evSupMu.Unlock()
+		return // same condition already logged this window — transition, not storm
+	}
+	if len(r.evSuppress) >= maxPendingSchedulingEvents {
+		r.evSupMu.Unlock()
+		r.recordSignalDrop(1)
+		return
+	}
+	r.evSuppress[key] = struct{}{}
+	r.evSupMu.Unlock()
+	if s.EventID == "" {
+		s.EventID = newSchedulingEventID(s.TSMs)
+	}
+	select {
+	case r.evIn <- s:
+	default:
+		r.recordSignalDrop(1)
+	}
+}
+
+// clearSchedulingEventSuppression opens a fresh emission window (called from
+// every ticker flush, success or not — suppression bounds emission RATE; the
+// accumulator owns delivery reliability).
+func (r *signalReporter) clearSchedulingEventSuppression() {
+	r.evSupMu.Lock()
+	r.evSuppress = make(map[string]struct{})
+	r.evSupMu.Unlock()
 }
 
 const signalAuthFailureFilename = "signal-auth-failures.json"
@@ -560,6 +729,10 @@ type signalTrendAccumulator struct {
 	revoked     map[string]revokedSample
 	rate        map[string]rateLimitSample
 	conc        map[string]concurrencySample
+	// events is append-only within a delivery attempt and idempotent across
+	// retries (master conflict-ignores on event_id), so unlike the trend maps it
+	// needs no merge logic — just its own bound (maxPendingSchedulingEvents).
+	events []schedulingEventSample
 }
 
 func newSignalTrendAccumulator() *signalTrendAccumulator {
@@ -622,6 +795,14 @@ func (a *signalTrendAccumulator) mergeRate(samples []rateLimitSample) int64 {
 	return dropped
 }
 
+func (a *signalTrendAccumulator) addEvent(s schedulingEventSample) bool {
+	if len(a.events) >= maxPendingSchedulingEvents {
+		return false
+	}
+	a.events = append(a.events, s)
+	return true
+}
+
 func (a *signalTrendAccumulator) mergeConcurrency(samples []concurrencySample) int64 {
 	var dropped int64
 	for _, sample := range samples {
@@ -637,7 +818,7 @@ func (a *signalTrendAccumulator) mergeConcurrency(samples []concurrencySample) i
 	return dropped
 }
 
-func (a *signalTrendAccumulator) slices() ([]signalSample, []revokedSample, []rateLimitSample, []concurrencySample) {
+func (a *signalTrendAccumulator) slices() ([]signalSample, []revokedSample, []rateLimitSample, []concurrencySample, []schedulingEventSample) {
 	util := make([]signalSample, 0, len(a.util))
 	for _, sample := range a.util {
 		util = append(util, sample)
@@ -654,11 +835,11 @@ func (a *signalTrendAccumulator) slices() ([]signalSample, []revokedSample, []ra
 	for _, sample := range a.conc {
 		conc = append(conc, sample)
 	}
-	return util, revoked, rate, conc
+	return util, revoked, rate, conc, a.events
 }
 
 func (a *signalTrendAccumulator) count() int {
-	return len(a.util) + len(a.revoked) + len(a.rate) + len(a.conc)
+	return len(a.util) + len(a.revoked) + len(a.rate) + len(a.conc) + len(a.events)
 }
 
 func (r *signalReporter) loop() {
@@ -672,12 +853,19 @@ func (r *signalReporter) loop() {
 		if pending.count() == 0 && len(authFailures) == 0 {
 			return
 		}
+		// A disabled reporter retains its bounded trend accumulator and durable
+		// auth outbox without pretending an upload failed. Activation calls
+		// configure and wakes this same loop, so recovery needs no polling or
+		// replay of the rejected Token.
+		if !r.configured() {
+			return
+		}
 		attempted := false
 		allOK := true
 		detail := ""
 		if pending.count() > 0 {
-			util, revoked, rates, concurrency := pending.slices()
-			ok, uploadDetail := r.uploadAll(util, revoked, nil, rates, concurrency)
+			util, revoked, rates, concurrency, events := pending.slices()
+			ok, uploadDetail := r.uploadAll(util, revoked, nil, rates, concurrency, events)
 			attempted = true
 			if ok {
 				pending = newSignalTrendAccumulator()
@@ -690,7 +878,7 @@ func (r *signalReporter) loop() {
 		// rejects an unauthorized route with HTTP 409; batching it with trend data
 		// or another route would otherwise poison unrelated signals indefinitely.
 		for _, failure := range authFailures {
-			ok, uploadDetail := r.uploadAll(nil, nil, []authFailureSample{failure}, nil, nil)
+			ok, uploadDetail := r.uploadAll(nil, nil, []authFailureSample{failure}, nil, nil, nil)
 			attempted = true
 			if ok {
 				r.acknowledgeAuthFailures([]authFailureSample{failure})
@@ -716,9 +904,14 @@ func (r *signalReporter) loop() {
 			if !pending.addRevoked(sample) {
 				r.recordSignalDrop(1)
 			}
+		case ev := <-r.evIn:
+			if !pending.addEvent(ev) {
+				r.recordSignalDrop(1)
+			}
 		case <-r.authWake:
 			flush(nil, nil)
 		case <-ticker.C:
+			r.clearSchedulingEventSuppression()
 			flush(r.snapshotRateLimits(), r.snapshotConcurrency())
 		case <-r.stop:
 			flush(r.snapshotRateLimits(), r.snapshotConcurrency())
@@ -732,18 +925,26 @@ func (r *signalReporter) post(samples []signalSample, revoked []revokedSample, r
 }
 
 func (r *signalReporter) postAll(samples []signalSample, revoked []revokedSample, authFailures []authFailureSample, rateLimits []rateLimitSample, concurrency []concurrencySample) bool {
-	ok, detail := r.uploadAll(samples, revoked, authFailures, rateLimits, concurrency)
+	ok, detail := r.uploadAll(samples, revoked, authFailures, rateLimits, concurrency, nil)
 	r.recordSignalUpload(ok, detail)
 	return ok
 }
 
-func (r *signalReporter) uploadAll(samples []signalSample, revoked []revokedSample, authFailures []authFailureSample, rateLimits []rateLimitSample, concurrency []concurrencySample) (ok bool, detail string) {
+func (r *signalReporter) uploadAll(samples []signalSample, revoked []revokedSample, authFailures []authFailureSample, rateLimits []rateLimitSample, concurrency []concurrencySample, events []schedulingEventSample) (ok bool, detail string) {
+	r.configMu.RLock()
+	endpoint := r.url
+	sourceID := r.sourceID
+	bearer := r.bearer
+	r.configMu.RUnlock()
+	if endpoint == "" || bearer == nil {
+		return false, "signal reporting disabled"
+	}
 	// All arrays are optional: marshal only the non-empty ones so an all-samples,
 	// all-revoked, all-rate_limits, or all-concurrency flush still posts a valid
 	// body the master can decode.
 	payload := make(map[string]any, 6)
-	if r.sourceID != "" {
-		payload["source_id"] = r.sourceID
+	if sourceID != "" {
+		payload["source_id"] = sourceID
 	}
 	if len(samples) > 0 {
 		payload["samples"] = samples
@@ -760,7 +961,10 @@ func (r *signalReporter) uploadAll(samples []signalSample, revoked []revokedSamp
 	if len(concurrency) > 0 {
 		payload["concurrency"] = concurrency
 	}
-	if len(payload) == 0 || (len(payload) == 1 && r.sourceID != "") {
+	if len(events) > 0 {
+		payload["events"] = events
+	}
+	if len(payload) == 0 || (len(payload) == 1 && sourceID != "") {
 		return true, ""
 	}
 	body, err := json.Marshal(payload)
@@ -769,13 +973,13 @@ func (r *signalReporter) uploadAll(samples []signalSample, revoked []revokedSamp
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
-	tok, err := r.bearer(ctx)
+	tok, err := bearer(ctx)
 	if err != nil {
 		r.logger.Warn("signal report bearer unavailable",
 			"event.name", observability.EventProxySignalBearerFailed, "error", err)
 		return false, "signal bearer unavailable"
 	}
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, r.url, bytes.NewReader(body))
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, bytes.NewReader(body))
 	if err != nil {
 		return false, "signal request construction failed"
 	}

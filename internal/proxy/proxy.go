@@ -148,8 +148,18 @@ type Proxy struct {
 	// instance so network recovery state survives generation reloads.
 	pathHealth *ProviderPathHealthManager
 	// signalReporter ships parsed unified-* utilization to master (I5, best-effort,
-	// off the forward hot path). nil = feature off. Set via EnableSignalReporting.
+	// off the forward hot path). A Supervisor-built Proxy shares the process-owned
+	// reporter across hot-reload generations; standalone proxies own reporters
+	// created through EnableSignalReporting. nil = feature off.
 	signalReporter *signalReporter
+	// ownsSignalReporter distinguishes standalone/test Proxy ownership from the
+	// Supervisor's process lifetime. A generation must never close the shared
+	// reporter while a draining sibling can still publish into it.
+	ownsSignalReporter bool
+	// schedRouted tracks each (group|seat)'s last routed account so the unified
+	// scheduling log receives one row per ROUTE CHANGE, never one per request
+	// (拍板 2026-08-17 #3 — see noteSchedRouteSettled).
+	schedRouted sync.Map // map[string]string: "<group>|<seat>" → account_id
 	// routingOverrides is the allocation engine's seat→account routing-override
 	// cache (I-side §6.5). Shared across generations, polled by the supervisor; the
 	// group-route hot path reads it to redirect a seat off an unhealthy default.
@@ -415,6 +425,25 @@ func (p *Proxy) OAuthEgressOverride() bool { return p.oauthEgressOverride.Load()
 // stops all detached upstream calls (called on proxy shutdown).
 // If v also implements ActiveKeyReader, path-prefix routing is enabled automatically.
 func New(v VaultGetter, reg *vkeys.Registry, prov *provider.Registry, coll *events.Collector, ctx context.Context) *Proxy {
+	return newProxy(v, reg, prov, coll, ctx, nil)
+}
+
+// NewWithOAuthPoolRuntime creates a Proxy generation backed by process-owned
+// OAuth-pool cooldown/tombstone and signal-reporting state. The runtime must be
+// created once by Supervisor and closed only during process shutdown.
+func NewWithOAuthPoolRuntime(v VaultGetter, reg *vkeys.Registry, prov *provider.Registry, coll *events.Collector, ctx context.Context, runtime *OAuthPoolRuntimeState) *Proxy {
+	return newProxy(v, reg, prov, coll, ctx, runtime)
+}
+
+func newProxy(v VaultGetter, reg *vkeys.Registry, prov *provider.Registry, coll *events.Collector, ctx context.Context, runtime *OAuthPoolRuntimeState) *Proxy {
+	var poolCooldown *poolCooldownStore
+	var signalReporter *signalReporter
+	if runtime != nil {
+		poolCooldown = runtime.poolCooldown
+		signalReporter = runtime.signalReporter
+	} else {
+		poolCooldown = newPoolCooldownStore()
+	}
 	p := &Proxy{
 		vault:              v,
 		registry:           reg,
@@ -426,12 +455,13 @@ func New(v VaultGetter, reg *vkeys.Registry, prov *provider.Registry, coll *even
 		VerySlowRequestMs:  10000,
 		UpstreamTimeout:    defaultUpstreamTimeout,
 		appHealthCache:     apppipe.NewHealthCache(),
-		poolCooldown:       newPoolCooldownStore(),
+		poolCooldown:       poolCooldown,
 		bindingCooldown:    newBindingCooldownStore(),
 		chainActivity:      newChainActivityStore(),
 		pathHealth:         NewProviderPathHealthManager(),
 		poolObservedResets: newPoolResetStore(),
 		groupLoginState:    newGroupLoginStateStore(),
+		signalReporter:     signalReporter,
 	}
 	if ar, ok := v.(ActiveKeyReader); ok {
 		p.activeReader = ar
@@ -762,9 +792,14 @@ func (p *Proxy) SetReporter(r *events.Reporter, instanceID, clientVersion, confi
 // EnableSignalReporting wires the allocation-engine util signal reporter (I5): the
 // proxy parses upstream unified-* utilization and best-effort POSTs it to master's
 // /accounts/me/signals, authed with the same team account-JWT the group-runtime
-// poll uses. nil controlURL/bearer → feature stays off (newSignalReporter returns nil).
+// poll uses. nil controlURL/bearer leaves a shared reporter dormant without
+// discarding durable pending work; a standalone Proxy remains feature-off.
 func (p *Proxy) EnableSignalReporting(controlURL string, bearer func(ctx context.Context) (string, error)) {
-	p.signalReporter = newSignalReporter(controlURL, p.sourceID, bearer, slog.Default())
+	endpoint := ""
+	if controlURL != "" {
+		endpoint = strings.TrimRight(controlURL, "/") + "/accounts/me/signals"
+	}
+	p.configureSignalReporting(endpoint, bearer)
 }
 
 // EnableOrgSignalReporting is the Cluster-worker sibling of
@@ -774,12 +809,35 @@ func (p *Proxy) EnableSignalReporting(controlURL string, bearer func(ctx context
 // an LLM upstream.
 func (p *Proxy) EnableOrgSignalReporting(controlURL, orgID, serviceToken string) {
 	if controlURL == "" || orgID == "" || serviceToken == "" {
+		p.DisableSignalReporting()
 		return
 	}
 	endpoint := strings.TrimRight(controlURL, "/") + "/internal/org/" + url.PathEscape(orgID) + "/signals"
-	p.signalReporter = newSignalReporterEndpoint(endpoint, p.sourceID, func(context.Context) (string, error) {
+	p.configureSignalReporting(endpoint, func(context.Context) (string, error) {
 		return serviceToken, nil
-	}, slog.Default())
+	})
+}
+
+func (p *Proxy) configureSignalReporting(endpoint string, bearer func(context.Context) (string, error)) {
+	if p == nil {
+		return
+	}
+	if p.signalReporter == nil {
+		p.signalReporter = newSignalReporterEndpoint(endpoint, p.sourceID, bearer, slog.Default())
+		p.ownsSignalReporter = p.signalReporter != nil
+		return
+	}
+	p.signalReporter.configure(endpoint, p.sourceID, bearer)
+}
+
+// DisableSignalReporting disables uploads without destroying process-owned
+// pending state. A later successful generation activation can re-enable the
+// same outbox and retry it.
+func (p *Proxy) DisableSignalReporting() {
+	if p == nil || p.signalReporter == nil {
+		return
+	}
+	p.signalReporter.configure("", p.sourceID, nil)
 }
 
 // SignalReportingHealthSnapshot exposes the current allocation-signal pipeline
@@ -796,21 +854,22 @@ func (p *Proxy) SignalReportingHealthSnapshot() *SignalReportingHealth {
 	return &snapshot
 }
 
-// StopSignalReporting stops the signal reporter's upload loop (idempotent,
-// nil-safe). Called from generation.close() so the per-generation reporter's
-// goroutine + ticker don't leak across reloads.
+// StopSignalReporting stops a standalone Proxy's signal reporter (idempotent,
+// nil-safe). Supervisor generations reference a process-owned reporter and do
+// not own its lifecycle; Supervisor closes it during process shutdown.
 func (p *Proxy) StopSignalReporting() {
-	if p.signalReporter != nil {
+	if p.signalReporter != nil && p.ownsSignalReporter {
 		_ = p.signalReporter.Close()
+		p.signalReporter = nil
+		p.ownsSignalReporter = false
 	}
 }
 
 // StopObservers retires this generation's observer registry (idempotent,
-// nil-safe). Called from generation.close() for the same reason as
-// StopSignalReporting: the registry is rebuilt per generation
-// (supervisor.buildObserverRegistry), so whatever its observers started in
-// Build — rhythm's 5s settings poller and reporter worker pool — leaks on every
-// reload without this. See observer.ClosableObserver.
+// nil-safe). Unlike the process-owned allocation signal reporter, this registry
+// is rebuilt per generation (supervisor.buildObserverRegistry), so whatever its
+// observers started in Build — rhythm's 5s settings poller and reporter worker
+// pool — leaks on every reload without this. See observer.ClosableObserver.
 func (p *Proxy) StopObservers() {
 	p.observerRegistry.Close()
 }

@@ -162,11 +162,13 @@ func TestExchangePoolSessionKeyUsesResidentMockProviderContext(t *testing.T) {
 		if err := r.ParseForm(); err != nil {
 			t.Fatalf("parse form: %v", err)
 		}
-		if r.Form.Get("grant_type") != "session_key" || r.Form.Get("session_key") != "sk-ant-sid02-mock-fixture-value-long-enough" {
+		if r.Form.Get("grant_type") != "session_key" ||
+			r.Form.Get("session_key") != "sk-ant-sid02-mock-fixture-value-long-enough" ||
+			r.Form.Get("expires_in") != "31536000" {
 			t.Fatalf("unexpected mock provider grant: %v", r.Form)
 		}
 		w.Header().Set("Content-Type", "application/json")
-		_, _ = io.WriteString(w, `{"access_token":"MOCK-ACCESS","refresh_token":"MOCK-REFRESH","token_type":"Bearer","expires_in":600,"scope":"user:inference","account":{"uuid":"cred-mock","email_address":"mock@example.test"},"organization":{"uuid":"mock-org","name":"AiKey Mock Organization"}}`)
+		_, _ = io.WriteString(w, `{"access_token":"MOCK-ACCESS","refresh_token":"MOCK-REFRESH","token_type":"Bearer","expires_in":31536000,"scope":"user:inference","account":{"uuid":"cred-mock","email_address":"mock@example.test"},"organization":{"uuid":"mock-org","name":"AiKey Mock Organization"}}`)
 	}))
 	defer provider.Close()
 

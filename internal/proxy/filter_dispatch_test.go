@@ -203,7 +203,7 @@ func TestApplyInboundFilter_Block(t *testing.T) {
 	if errObj["code"] != "COMPLIANCE_BLOCKED" {
 		t.Errorf("code: got %v want COMPLIANCE_BLOCKED", errObj["code"])
 	}
-	if errObj["message"] != "private key leak detected" {
+	if errObj["message"] != "AiKey: private key leak detected" {
 		t.Errorf("message: got %v", errObj["message"])
 	}
 }
@@ -219,7 +219,7 @@ func TestApplyInboundFilter_BlockDefaultMessage(t *testing.T) {
 	var body map[string]any
 	_ = json.Unmarshal(w.Body.Bytes(), &body)
 	errObj := body["error"].(map[string]any)
-	if errObj["message"] != "request blocked by compliance policy" {
+	if errObj["message"] != "AiKey: request blocked by compliance policy" {
 		t.Errorf("default message: got %v", errObj["message"])
 	}
 }

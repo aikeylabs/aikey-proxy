@@ -328,6 +328,23 @@ const (
 	// tier only and keeps serving every other model. Also used for the
 	// unmapped-exhausted-window observability WARN (tier-table gap detection).
 	EventProxyGroupModelTierCooldown = "proxy.group.model_tier_cooldown"
+	// EventProxyGroupTokenRevoked (update/20260817 覆盖度审计 2026-08-18): the
+	// upstream HARD-revoked a member token (401/403 with a documented revocation
+	// marker). The revocation MOMENT gets its own scheduling-log row — the
+	// login_required rows that follow are the consequence, not the cause.
+	EventProxyGroupTokenRevoked = "proxy.group.token_revoked"
+	// EventProxyGroupWafExcluded: a 429 carried NO exhaustion/rate-limit evidence
+	// headers and was classified as WAF/风控 — deliberately NOT cooled (cooling on
+	// a fake 429 is how a WAF starves a healthy pool) and passed through. Logged
+	// because "keeps hitting an evidence-less wall" is exactly the signal a 撞墙
+	// investigation needs.
+	EventProxyGroupWafExcluded = "proxy.group.waf_429_excluded" //nolint:gosec // G101 false positive: gosec's hardcoded-credential heuristic matches this identifier/value pair. It is an event name in the central enum, never a secret.
+	// EventProxyGroupUpstreamErrorPassthrough: a non-failover-eligible upstream
+	// 4xx (400/402/403/404/422… — NOT 401, NOT an evidence 429) was passed through
+	// verbatim. No routing state changes; the row exists so a support bundle can
+	// correlate "user saw provider errors" with the surrounding scheduling
+	// timeline (拍板 2026-08-18 #3). Per-window suppression bounds a burst.
+	EventProxyGroupUpstreamErrorPassthrough = "proxy.group.upstream_error_passthrough" //nolint:gosec // G101 false positive: gosec's hardcoded-credential heuristic matches this identifier/value pair. It is an event name in the central enum, never a secret.
 	// EventProxyGroupSeatBlocked (§5.5): the engine left this seat UNBOUND because
 	// every account in its pool/segment is at the ≤3-人/号 cap, so the proxy 429s it
 	// (never WRH-falls-back, which would route a 4th user onto a full account).

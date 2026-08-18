@@ -25,9 +25,8 @@ import (
 // even called out the hazard, but assumed "exactly one observer instance per
 // proxy process" — an invariant the per-generation rebuild quietly breaks.
 //
-// This is the same bug class as the allocation-engine signal reporter, whose fix
-// sits two lines above ours in closeAll ("Without this its loop() goroutine +
-// 30s ticker leak on every reload"). That one was found the hard way too.
+// Allocation-signal state has since moved to Supervisor/process ownership: its
+// reporter must survive generation teardown and close only at process shutdown.
 //
 // Registry.Close and Proxy.StopObservers are unit-tested in pkg/observer. Those
 // tests all stay green if the call in closeAll is deleted — which is exactly how
@@ -96,15 +95,19 @@ func TestGenerationCloseRetiresObservers(t *testing.T) {
 	}
 }
 
-// TestGenerationCloseStillRetiresSignalReporter guards the sibling call that
-// fixed the identical bug class earlier. Kept here so a future edit to this
-// block cannot silently drop one while adding the other.
-func TestGenerationCloseStillRetiresSignalReporter(t *testing.T) {
+// TestSignalReporterLifecycleMatchesProcessOwnership pins both sides of the
+// ownership boundary. Closing it per generation loses late 401/429 facts;
+// never closing it leaks its loop and ticker at process exit.
+func TestSignalReporterLifecycleMatchesProcessOwnership(t *testing.T) {
 	closeAll := funcNamed(t, "supervisor.go", "closeAll")
+	if callsMethodOn(closeAll, "proxy", "StopSignalReporting") {
+		t.Error("generation.closeAll must not stop process-owned signal reporting; " +
+			"a draining request can publish a late OAuth failure after reload")
+	}
 
-	if !callsMethodOn(closeAll, "proxy", "StopSignalReporting") {
-		t.Error("generation.closeAll no longer calls g.proxy.StopSignalReporting() " +
-			"— its loop() goroutine + 30s ticker leak on every reload, each " +
-			"holding a live bearer closure over the old vault reader.")
+	shutdown := funcNamed(t, "supervisor.go", "Shutdown")
+	if !callsMethodOn(shutdown, "oauthPoolRuntime", "Close") {
+		t.Error("Supervisor.Shutdown must close oauthPoolRuntime so the shared " +
+			"signal reporter loop and ticker do not leak at process exit")
 	}
 }

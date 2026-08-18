@@ -488,6 +488,10 @@ func (p *Proxy) serveGroupAttempt(
 		"credential_type", res.CredentialType,
 		"provider", canonicalCode,
 	)
+	// Unified scheduling log (master): one row per ROUTE CHANGE — first settle
+	// or switch — never per request (拍板 2026-08-17 #3).
+	p.noteSchedRouteSettled(rc.OauthGroupID, route.SeatID, res.AccountID, res.CredentialID,
+		observability.ExtractOrCreate(r).TraceID)
 
 	// Group VKs leave rc.ProviderCode empty by design (the provider is per-account
 	// in group_accounts; the base URL above already used the resolved canonicalCode,
@@ -527,6 +531,12 @@ func (p *Proxy) serveGroupAttempt(
 		isHardRevoked(fw.status, errType, fw.buf.String())
 	if hardRevoked {
 		p.poolCooldown.markAuthFailedToken(route.OauthGroupID, route.SeatID, res.AccountID, oauthTokenFingerprint(res.OAuth.AccessToken))
+		// The revocation MOMENT gets its own row (覆盖度审计 2026-08-18): the
+		// login_required rows that follow are the consequence, not the cause.
+		p.reportSchedEvent(observability.EventProxyGroupTokenRevoked, schedSeverityWarn, schedOriginProvider, "",
+			rc.OauthGroupID, res.CredentialID, res.AccountID, route.SeatID,
+			observability.ExtractOrCreate(r).TraceID,
+			map[string]any{"status": fw.status})
 	} else if fw.status == http.StatusUnauthorized {
 		// Preserve the released conservative behavior for an opaque 401 whose body
 		// does not prove hard revocation. The delayed classification is important:
@@ -559,6 +569,10 @@ func (p *Proxy) serveGroupAttempt(
 		"failed_status", fw.status,
 		"attempt", attempt+1,
 	)
+	p.reportSchedEvent(observability.EventProxyGroupRequestFailover, schedSeverityWarn, schedOriginProvider, "",
+		rc.OauthGroupID, res.CredentialID, res.AccountID, route.SeatID,
+		observability.ExtractOrCreate(r).TraceID,
+		map[string]any{"failed_status": fw.status, "attempt": attempt + 1})
 	return groupAttemptResult{attempted: true, authFailedAccount: authFailedAccount(hardRevoked, res.AccountID)}
 }
 
@@ -649,6 +663,9 @@ func (p *Proxy) respondLoginRequired(w http.ResponseWriter, logger *slog.Logger,
 	)
 	// Bypass statusline hint (决策3): best-effort, never blocks the response.
 	p.groupLoginState.Write(logger, route.ProviderCode, accountID, loginURL)
+	p.reportSchedEvent(observability.EventProxyGroupLoginRequired, schedSeverityWarn, schedOriginAikey, groupErrLoginRequired,
+		route.OauthGroupID, "", accountID, route.SeatID, "",
+		map[string]any{"virtual_key_id": route.VirtualKeyID})
 
 	message := "AiKey: log in to this shared account before use. " +
 		"Open your local AiKey console (" + groupLoginConsolePath + " page), complete sign-in, then retry."
@@ -718,6 +735,9 @@ func (p *Proxy) respondModelTierExhausted(w http.ResponseWriter, logger *slog.Lo
 		"tier", tierKey,
 		"reset_in", resetIn,
 	)
+	p.reportSchedEvent(observability.EventProxyGroupModelTierCooldown, schedSeverityWarn, schedOriginAikey,
+		observability.ErrCodeModelTierExhausted, route.OauthGroupID, "", "", route.SeatID, "",
+		map[string]any{"model": reqModel, "tier": tierKey, "reset_in": resetIn})
 	w.Header().Set(HeaderAikeyErrorSource, observability.ErrCodeModelTierExhausted)
 	writeJSONError(w, http.StatusTooManyRequests, "rate_limit_error", observability.ErrCodeModelTierExhausted,
 		"The weekly limit for "+reqModel+" (premium-tier models) is used up on all pool accounts; it resets in about "+resetIn+". "+
@@ -866,6 +886,9 @@ func (p *Proxy) degradeGroupWithRetry(w http.ResponseWriter, logger *slog.Logger
 		"retry_after_seconds", advice.Seconds,
 		"retry_reason", advice.Reason,
 	)
+	p.reportSchedEvent(observability.EventProxyGroupRouteDegraded, schedSeverityWarn, schedOriginAikey, code,
+		route.OauthGroupID, "", "", route.SeatID, "",
+		map[string]any{"http_status": status, "retry_after_seconds": advice.Seconds, "retry_reason": advice.Reason})
 	writeJSONErrorDetails(w, status, errType, code, message, map[string]any{
 		"retry_after_seconds": advice.Seconds,
 		"retry_at":            advice.RetryAt,
@@ -888,5 +911,8 @@ func (p *Proxy) degradeGroup(w http.ResponseWriter, logger *slog.Logger, route *
 		"oauth_group_id", route.OauthGroupID,
 		"virtual_key_id", route.VirtualKeyID,
 	)
+	p.reportSchedEvent(observability.EventProxyGroupRouteDegraded, schedSeverityWarn, schedOriginAikey, code,
+		route.OauthGroupID, "", "", route.SeatID, "",
+		map[string]any{"http_status": status})
 	writeJSONError(w, status, errType, code, clientMsg)
 }

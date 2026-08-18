@@ -41,6 +41,7 @@ import (
 	"github.com/AiKeyLabs/aikey-proxy/internal/vkeys"
 	"github.com/AiKeyLabs/aikey-proxy/pkg/observer"
 	"github.com/AiKeyLabs/pkg/providerroutes"
+	"strconv"
 )
 
 // serveRouteWithObserver wraps p.serveRoute with NotifyStart/End for the
@@ -799,6 +800,9 @@ func (p *Proxy) serveRoute(w http.ResponseWriter, r *http.Request, route *vkeys.
 						"account_id", route.AccountID,
 						"tier", tierKey,
 						"until", tierUntil.Unix())
+					p.reportSchedEvent(observability.EventProxyGroupModelTierCooldown, schedSeverityWarn, schedOriginProvider, "",
+						route.OauthGroupID, route.CredentialID, route.AccountID, route.SeatID, "",
+						map[string]any{"tier": tierKey, "until": tierUntil.Unix(), "status": resp.StatusCode})
 				} else if resp.StatusCode == http.StatusUnauthorized {
 					// A group OAuth 401 belongs to this member token, not to the
 					// shared pool account globally. group_serve reads the buffered body
@@ -807,14 +811,22 @@ func (p *Proxy) serveRoute(w http.ResponseWriter, r *http.Request, route *vkeys.
 				} else {
 					temporaryCooldown := groupTemporaryRateLimitCooldownForResponse(
 						resp.StatusCode, route.RoutingConfig, route.OauthGroupID, logger)
-					if until, ok := cooldownDecisionWithTemporaryFallback(resp, nowT, temporaryCooldown); ok {
+					until, ok := cooldownDecisionWithTemporaryFallback(resp, nowT, temporaryCooldown)
+					// switch-true, not if/else: the branches are ordered predicates on one
+					// response and MUST keep evaluating in this order (an evidence-429 is
+					// claimed by the cooldown decision before the WAF branch can see it).
+					switch {
+					case ok:
 						p.poolCooldown.markWithState(route.AccountID, until, cooldownRouteState(resp, nowT, until))
 						logger.Warn("pool account cooled down after upstream failure",
 							"event.name", observability.EventProxyGroupAccountCooldown,
 							"oauth_group_id", route.OauthGroupID,
 							"account_id", route.AccountID,
 							"status", resp.StatusCode)
-					} else if resp.StatusCode >= 500 {
+						p.reportSchedEvent(observability.EventProxyGroupAccountCooldown, schedSeverityWarn, schedOriginProvider, "",
+							route.OauthGroupID, route.CredentialID, route.AccountID, route.SeatID, "",
+							map[string]any{"status": resp.StatusCode, "until": until.Unix()})
+					case resp.StatusCode >= 500:
 						// P0-B (2026-07-19): generic 5xx cools only after CONSECUTIVE
 						// repeats — a single transient 502/503 must not pull a good
 						// account, but a persistently-broken one must stop eating one
@@ -829,10 +841,31 @@ func (p *Proxy) serveRoute(w http.ResponseWriter, r *http.Request, route *vkeys.
 								"account_id", route.AccountID,
 								"status", resp.StatusCode,
 								"streak_threshold", serverErrStreakThreshold)
+							p.reportSchedEvent(observability.EventProxyGroupAccountCooldown, schedSeverityWarn, schedOriginProvider, "",
+								route.OauthGroupID, route.CredentialID, route.AccountID, route.SeatID, "",
+								map[string]any{"status": resp.StatusCode, "streak_threshold": serverErrStreakThreshold})
 						}
-					} else if resp.StatusCode < 400 {
+					case resp.StatusCode < 400:
 						// success proves the account serves → reset its 5xx streak.
 						p.poolCooldown.noteSuccess(route.AccountID)
+					case resp.StatusCode == http.StatusTooManyRequests:
+						// A 429 with NO cooldown decision = no exhaustion/rate-limit
+						// evidence headers → WAF/风控 classification: deliberately not
+						// cooled, passed through — but LOGGED (覆盖度审计 2026-08-18):
+						// "keeps hitting an evidence-less wall" is the #1 撞墙 signal.
+						p.reportSchedEvent(observability.EventProxyGroupWafExcluded, schedSeverityWarn, schedOriginProvider, "",
+							route.OauthGroupID, route.CredentialID, route.AccountID, route.SeatID, "",
+							map[string]any{"status": resp.StatusCode})
+					case resp.StatusCode < 500:
+						// Residual 4xx passthrough (400/402/403/404/422… — 401 and
+						// evidence-429 own earlier branches): verbatim to the client,
+						// zero routing-state change, one correlation row for support
+						// bundles (拍板 2026-08-18 #3). ErrorCode carries the status so
+						// the suppression window keeps distinct statuses distinct.
+						p.reportSchedEvent(observability.EventProxyGroupUpstreamErrorPassthrough, schedSeverityWarn, schedOriginProvider,
+							"HTTP_"+strconv.Itoa(resp.StatusCode),
+							route.OauthGroupID, route.CredentialID, route.AccountID, route.SeatID, "",
+							map[string]any{"status": resp.StatusCode})
 					}
 				}
 				// N10 防封 pre-cut: on a successful response, if the account's utilization
@@ -852,6 +885,9 @@ func (p *Proxy) serveRoute(w http.ResponseWriter, r *http.Request, route *vkeys.
 							"account_id", route.AccountID,
 							"cap_5h_pct", caps.FiveHour,
 							"cap_7d_pct", caps.SevenDay)
+						p.reportSchedEvent(observability.EventProxyGroupWindowPrecut, schedSeverityWarn, schedOriginAikey, "",
+							route.OauthGroupID, route.CredentialID, route.AccountID, route.SeatID, "",
+							map[string]any{"cap_5h_pct": caps.FiveHour, "cap_7d_pct": caps.SevenDay, "until": retryAt})
 					}
 				}
 			}
