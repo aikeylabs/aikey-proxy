@@ -1,6 +1,7 @@
 package events
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -106,7 +107,7 @@ func TestContentReporter_CollectorTokenFallbackWhenNoCredential(t *testing.T) {
 		ProxyInstanceID: "proxy-1",
 		BatchSize:       100,
 	}, wal)
-	r.drainOnce(true)
+	r.drainOnce(context.Background(), true)
 	calls := m.calls()
 	if len(calls) != 1 {
 		t.Fatalf("collector calls=%d want 1", len(calls))
@@ -124,7 +125,7 @@ func TestContentReporter_HappyPathUploadsAdvancesPrunes(t *testing.T) {
 	wal := seedContentWAL(t, 5)
 	r := newTestContentReporter(m.srv.URL, wal)
 
-	r.drainOnce(true)
+	r.drainOnce(context.Background(), true)
 
 	calls := m.calls()
 	if len(calls) != 1 {
@@ -173,7 +174,7 @@ func TestContentReporter_HappyPathUploadsAdvancesPrunes(t *testing.T) {
 	}
 
 	// Second drain: seq5 ≤ sentSeq → skipped, no new upload.
-	r.drainOnce(true)
+	r.drainOnce(context.Background(), true)
 	if got := len(m.calls()); got != 1 {
 		t.Fatalf("collector calls=%d after second drain want 1 (already-sent skipped)", got)
 	}
@@ -186,7 +187,7 @@ func TestContentReporter_RetryableLeavesCursorsAndArmsBackoff(t *testing.T) {
 	wal := seedContentWAL(t, 5)
 	r := newTestContentReporter(m.srv.URL, wal)
 
-	r.drainOnce(true)
+	r.drainOnce(context.Background(), true)
 
 	if got := len(m.calls()); got != 1 {
 		t.Fatalf("collector calls=%d want 1", got)
@@ -220,7 +221,7 @@ func TestContentReporter_TerminalDropsBatchNoBackoff(t *testing.T) {
 	wal := seedContentWAL(t, 3)
 	r := newTestContentReporter(m.srv.URL, wal)
 
-	r.drainOnce(true)
+	r.drainOnce(context.Background(), true)
 
 	r.mu.Lock()
 	sent, conf := r.sentSeq["p1"], r.confirmedSeq["p1"]
@@ -237,7 +238,7 @@ func TestContentReporter_TerminalDropsBatchNoBackoff(t *testing.T) {
 	}
 
 	// Dropped (sentSeq advanced) → second drain does not re-upload.
-	r.drainOnce(true)
+	r.drainOnce(context.Background(), true)
 	if got := len(m.calls()); got != 1 {
 		t.Fatalf("collector calls=%d want 1 (dropped batch not retried)", got)
 	}
@@ -250,7 +251,7 @@ func TestContentReporter_TooManyRequestsIsRetryable(t *testing.T) {
 	wal := seedContentWAL(t, 2)
 	r := newTestContentReporter(m.srv.URL, wal)
 
-	r.drainOnce(true)
+	r.drainOnce(context.Background(), true)
 
 	r.mu.Lock()
 	sent := r.sentSeq["p1"]

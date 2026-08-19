@@ -39,7 +39,14 @@ printf 'flushed\n' > "$marker"
 		// this tiny shell process gets scheduled at all.
 		ReadyTimeout: 5 * time.Second,
 	})
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	// The outer ctx must be LARGER than ReadyTimeout, not equal to it: it also
+	// has to cover Shutdown and the marker read, so an equal budget means
+	// ReadyTimeout can never actually be spent — the ctx expires first and the
+	// 5s allowance above is dead code. That is how this failed a release round
+	// on 2026-08-19 (`start fixture: context deadline exceeded` at exactly
+	// 5.01s while the same test passes in ~0.7s on an idle machine). Sized like
+	// the other fixture in this file, which pairs ReadyTimeout 5s with a 20s ctx.
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 	defer cancel()
 	if err := h.Start(ctx); err != nil {
 		t.Fatalf("start fixture: %v", err)

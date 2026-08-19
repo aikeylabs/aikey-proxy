@@ -6,8 +6,8 @@ import (
 
 	"github.com/AiKeyLabs/aikey-proxy/internal/quota"
 
-	_ "modernc.org/sqlite"
 	"database/sql"
+	_ "modernc.org/sqlite"
 )
 
 // Fence for bugfix 20260725-proxy-startup-reload-storm-5s-health-fail (fix ②,

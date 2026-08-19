@@ -130,7 +130,16 @@ func (r *ContentReporter) Poke() {
 // Close stops the loop after a final flush.
 func (r *ContentReporter) Close() error {
 	close(r.done)
-	r.wg.Wait()
+	// Safety net over the ctx-bounded final flush — same rationale as the usage
+	// Reporter.Close: never let a regression here re-block the shutdown chain.
+	waited := make(chan struct{})
+	go func() { r.wg.Wait(); close(waited) }()
+	select {
+	case <-waited:
+	case <-time.After(shutdownFlushBudget + closeWaitGrace):
+		slog.Error("content reporter close: upload loop did not stop within budget — abandoning it",
+			"event.name", "conversation.reporter.close_timeout")
+	}
 	return nil
 }
 
@@ -148,11 +157,16 @@ func (r *ContentReporter) uploadLoop() {
 	for {
 		select {
 		case <-ticker.C:
-			r.drainOnce(false)
+			r.drainOnce(context.Background(), false)
 		case <-r.signal:
-			r.drainOnce(false)
+			r.drainOnce(context.Background(), false)
 		case <-r.done:
-			r.drainOnce(true) // final flush bypasses the backoff gate
+			// Final flush — ONE bounded attempt (same contract as the usage
+			// reporter): the content WAL is idempotent and resumes after
+			// restart; a black-holed collector must not hold shutdown.
+			ctx, cancel := context.WithTimeout(context.Background(), shutdownFlushBudget)
+			r.drainOnce(ctx, true)
+			cancel()
 			return
 		}
 	}
@@ -162,7 +176,7 @@ func (r *ContentReporter) uploadLoop() {
 // sentSeq[source]) in batches, then prunes confirmed files. A non-blocking
 // backoff gate (set after retryable failures) skips passes until it elapses;
 // `force` (shutdown flush) bypasses it.
-func (r *ContentReporter) drainOnce(force bool) {
+func (r *ContentReporter) drainOnce(ctx context.Context, force bool) {
 	if r.wal == nil || r.cfg.CollectorURL == "" {
 		return
 	}
@@ -187,7 +201,14 @@ func (r *ContentReporter) drainOnce(force bool) {
 		if len(pending) == 0 {
 			return
 		}
-		if r.uploadBatch(pending) {
+		if ctx.Err() != nil {
+			// Budget exhausted (shutdown final flush): stop attempting — the
+			// remainder stays in the WAL and resumes after restart.
+			anyRetryable = true
+			pending = pending[:0]
+			return
+		}
+		if r.uploadBatch(ctx, pending) {
 			anyRetryable = true
 		}
 		pending = pending[:0]
@@ -238,7 +259,7 @@ func (r *ContentReporter) confirmedMapCopy() map[string]int64 {
 // backoff). Success → advance sentSeq (batch max per source) + confirmedSeq (from
 // response). Terminal (4xx except 429) → advance sentSeq (drop, no retry) + WARN.
 // Retryable (429/5xx/transport) → leave cursors (re-sent next pass).
-func (r *ContentReporter) uploadBatch(batch []ContentWALEntry) (retryable bool) {
+func (r *ContentReporter) uploadBatch(ctx context.Context, batch []ContentWALEntry) (retryable bool) {
 	if len(batch) == 0 {
 		return false
 	}
@@ -265,7 +286,7 @@ func (r *ContentReporter) uploadBatch(batch []ContentWALEntry) (retryable bool) 
 		return false // our own encode error won't self-heal; don't spin
 	}
 
-	resp, status, upErr := r.doUpload(body)
+	resp, status, upErr := r.doUpload(ctx, body)
 	if upErr == nil {
 		r.mu.Lock()
 		for src, c := range maxSeq {
@@ -318,8 +339,11 @@ func (r *ContentReporter) uploadBatch(batch []ContentWALEntry) (retryable bool) 
 // any non-2xx or transport error. statusCode is 0 on transport error (→ retryable).
 // A stale credential is surfaced as a synthetic 401 so it lands as terminal (no
 // infinite retry), matching the usage reporter.
-func (r *ContentReporter) doUpload(body []byte) (*contentBatchResponse, int, error) {
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+func (r *ContentReporter) doUpload(parent context.Context, body []byte) (*contentBatchResponse, int, error) {
+	// parent is Background on the periodic path (30s attempt timeout governs,
+	// unchanged) and the shutdown flush budget on the final pass — the deadline
+	// must reach the HTTP layer or a hanging collector defeats the budget.
+	ctx, cancel := context.WithTimeout(parent, 30*time.Second)
 	defer cancel()
 	url := r.cfg.CollectorURL + "/v1/conversation-records:batch"
 	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(body))

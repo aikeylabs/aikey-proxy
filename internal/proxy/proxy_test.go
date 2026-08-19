@@ -102,7 +102,12 @@ func setupTestProxyWithStore(t *testing.T, upstreamURL string, store events.Even
 	collector := events.NewCollector(store, 1, 5*time.Millisecond)
 	t.Cleanup(func() { collector.Close() })
 
-	return New(v, registry, providers, collector, context.Background())
+	p := New(v, registry, providers, collector, context.Background())
+	// poolCooldown persistence is intentionally asynchronous in production.
+	// Drain it before t.TempDir cleanup so a late atomic rename cannot recreate a
+	// file while the testing package removes the per-test run directory.
+	t.Cleanup(func() { p.poolCooldown.flushPersistence() })
+	return p
 }
 
 func TestProxy_OpenAI_KeyReplacement(t *testing.T) {

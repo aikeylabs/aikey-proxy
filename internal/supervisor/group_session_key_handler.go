@@ -184,6 +184,16 @@ func (h *poolLoginHandler) sessionKey(w http.ResponseWriter, r *http.Request) {
 			createdAt:        exchangedAt,
 			expiresAt:        exchangedAt.Unix() + token.ExpiresIn,
 		}
+		// Codex auto-renewal (方案 20260818, default-on): retain the session key
+		// for the confirm writeback so master can re-exchange it before the
+		// access token expires. Codex protocol only — Claude session keys are
+		// deliberately NOT retained (owner ruling: Claude 只做 7 天到期预警).
+		if strings.EqualFold(loginCtx.ProtocolType, "openai_compatible") {
+			pending.sessionKey = req.SessionKey
+			if !token.SessionExpiresAt.IsZero() {
+				pending.sessionExpiresAt = token.SessionExpiresAt.Unix()
+			}
+		}
 		h.sessionKeyPending.Store(req.OperationID, pending)
 		h.scheduleSessionKeyExpiry(req.OperationID, pending)
 	}
@@ -223,6 +233,7 @@ func (h *poolLoginHandler) sessionKey(w http.ResponseWriter, r *http.Request) {
 	if err := postMemberToken(r.Context(), h.writebackClientFn(), masterURL, bearer, memberTokenWriteback{
 		CredentialID: ctx.CredentialID, AccessToken: pending.token.AccessToken,
 		RefreshToken: pending.token.RefreshToken, ExpiresAt: pending.expiresAt,
+		RenewalCredential: pending.sessionKey, RenewalExpiresAt: pending.sessionExpiresAt,
 		ExternalID: pending.token.Identity.ExternalID, ProviderCode: ctx.ProviderCode,
 		ProtocolType: ctx.ProtocolType, OauthGroupID: ctx.OauthGroupID,
 		AccountID: ctx.AccountID, Identity: identity, IdentityMismatch: pending.identityMismatch,
@@ -404,6 +415,9 @@ func (h *poolLoginHandler) forgetSessionKeyOperation(operationID string, pending
 	if pending != nil && pending.token != nil {
 		pending.token.AccessToken = ""
 		pending.token.RefreshToken = ""
+	}
+	if pending != nil {
+		pending.sessionKey = ""
 	}
 	h.sessionKeyPending.Delete(operationID)
 }

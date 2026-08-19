@@ -7,10 +7,12 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"io"
 	"log/slog"
 	"net/http"
 	"os"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -22,7 +24,10 @@ import (
 
 // ponytail: flush cadence doubles as the rate-limit count window — one constant
 // so loop()'s ticker and the reported window_secs can never drift apart.
-const signalFlushInterval = 30 * time.Second
+const (
+	signalFlushInterval           = 30 * time.Second
+	signalReporterShutdownTimeout = 12 * time.Second
+)
 
 // signal_report.go — I5 proxy emit. The proxy parses the upstream's unified-*
 // 5h-utilization off the response headers and ships it best-effort to master's
@@ -92,16 +97,16 @@ type authFailureSample struct {
 // account_decision_log.account_id holds credential ids, so credential_id is
 // the JOIN key to decisions while account_id matches the admin UI.
 type schedulingEventSample struct {
-	EventID      string         `json:"event_id"`
-	TSMs         int64          `json:"ts_ms"`
-	EventName    string         `json:"event_name"`
-	Severity     string         `json:"severity,omitempty"`
-	ErrorCode    string         `json:"error_code,omitempty"`
-	OauthGroupID string         `json:"oauth_group_id,omitempty"`
-	CredentialID string         `json:"credential_id,omitempty"`
-	AccountID    string         `json:"account_id,omitempty"`
-	SeatID       string         `json:"seat_id,omitempty"`
-	TraceID      string         `json:"trace_id,omitempty"`
+	EventID      string `json:"event_id"`
+	TSMs         int64  `json:"ts_ms"`
+	EventName    string `json:"event_name"`
+	Severity     string `json:"severity,omitempty"`
+	ErrorCode    string `json:"error_code,omitempty"`
+	OauthGroupID string `json:"oauth_group_id,omitempty"`
+	CredentialID string `json:"credential_id,omitempty"`
+	AccountID    string `json:"account_id,omitempty"`
+	SeatID       string `json:"seat_id,omitempty"`
+	TraceID      string `json:"trace_id,omitempty"`
 	// Origin says who produced the SIGNAL behind this row (拍板 2026-08-18):
 	// "provider" = a concrete upstream response triggered it (429/5xx/401/4xx
 	// passthrough); "aikey" = aikey's own scheduling/protection produced it
@@ -165,14 +170,23 @@ type signalReporter struct {
 	client    *httpx.SwappableClient                    // control-plane: rebuilt on host network change (self-heal registry)
 	in        chan signalSample
 	revokedIn chan revokedSample
-	authMu    sync.Mutex
+	// authIn is the only request-path handoff for hard-revoke persistence. The
+	// reporter loop is the single journal writer, so a slow or failed disk can
+	// never hold an inference response open.
+	authIn     chan authFailureSample
+	authQueued sync.Map // route+token fingerprint; bounds duplicate 401 bursts
+	authMu     sync.Mutex
 	// authFailures is a durable, deduplicated outbox. A hard revocation is not a
 	// trend sample: if its first upload fails, local token blocking prevents
 	// another upstream 401, so dropping it would leave Master falsely logged_in.
-	authFailures map[string]authFailureSample
-	authWake     chan struct{}
-	rlMu         sync.Mutex     // guards all rl* maps
-	rlCounts     map[string]int // per-credential 429/403 tally, reset each flush
+	authFailures     map[string]authFailureSample
+	authDurable      map[string]authFailureSample
+	authWake         chan struct{}
+	authJournalPath  string
+	authJournalOps   int
+	authJournalBytes int64
+	rlMu             sync.Mutex     // guards all rl* maps
+	rlCounts         map[string]int // per-credential 429/403 tally, reset each flush
 	// rlFallback is the subset of rlCounts that arrived on a FALLBACK hop
 	// (F-12b). Reset on the same flush, so the two always describe one window.
 	rlFallback map[string]int
@@ -199,18 +213,19 @@ type signalReporter struct {
 	// condition on every request, and the LOG needs the transition, not the storm.
 	// Reset every ticker flush, so a condition persisting across windows re-logs
 	// at most once per 30s — bounded, and still visibly "ongoing" on the page.
-	evIn       chan schedulingEventSample
-	evSupMu    sync.Mutex
-	evSuppress map[string]struct{}
-	logger     *slog.Logger
-	healthMu     sync.Mutex
-	health       SignalReportingHealth
-	dropSinceOK  bool
+	evIn        chan schedulingEventSample
+	evSupMu     sync.Mutex
+	evSuppress  map[string]struct{}
+	logger      *slog.Logger
+	healthMu    sync.Mutex
+	health      SignalReportingHealth
+	dropSinceOK bool
 
 	// stop terminates loop() on Close so the goroutine + ticker don't leak. The
 	// Supervisor owns one reporter for the full process lifetime; hot-reload
 	// generations only reconfigure it and publish into it. Close is idempotent.
 	stop     chan struct{}
+	done     chan struct{}
 	stopOnce sync.Once
 }
 
@@ -262,7 +277,9 @@ func newDormantSignalReporter(logger *slog.Logger) *signalReporter {
 		// without making the user request wait for Control.
 		in:           make(chan signalSample, maxPendingSignalCredentials),
 		revokedIn:    make(chan revokedSample, 64),
+		authIn:       make(chan authFailureSample, maxPendingAuthFailures),
 		authFailures: make(map[string]authFailureSample),
+		authDurable:  make(map[string]authFailureSample),
 		authWake:     make(chan struct{}, 1),
 		rlCounts:     make(map[string]int),
 		rlRisk:       make(map[string]int),
@@ -270,12 +287,14 @@ func newDormantSignalReporter(logger *slog.Logger) *signalReporter {
 		inflCur:      make(map[string]int),
 		inflPeak:     make(map[string]int),
 		inflPrevious: make(map[string]struct{}),
-		evIn:         make(chan schedulingEventSample, 256),
+		evIn:         make(chan schedulingEventSample, maxPendingSchedulingEvents),
 		evSuppress:   make(map[string]struct{}),
 		logger:       logger,
 		health:       SignalReportingHealth{Status: "disabled"},
 		stop:         make(chan struct{}),
+		done:         make(chan struct{}),
 	}
+	r.authJournalPath, _ = signalAuthFailurePath()
 	r.hydrateAuthFailures()
 	go r.loop()
 	return r
@@ -335,7 +354,15 @@ func (r *signalReporter) Close() error {
 		return nil
 	}
 	r.stopOnce.Do(func() { close(r.stop) })
-	return nil
+	if r.done == nil { // loopless test reporters have no lifecycle goroutine.
+		return nil
+	}
+	select {
+	case <-r.done:
+		return nil
+	case <-time.After(signalReporterShutdownTimeout):
+		return fmt.Errorf("signal reporter shutdown timed out after %s", signalReporterShutdownTimeout)
+	}
 }
 
 // enqueue is a non-blocking best-effort hand-off from the forward path. util7d
@@ -367,11 +394,13 @@ func (r *signalReporter) enqueueRevoked(credentialID, reason string) {
 	}
 }
 
-// maxPendingSchedulingEvents bounds both the per-window suppression map and the
-// retry accumulator: a master outage keeps at most this many events in memory
-// and drops (counted, /status-visible) beyond it — the log is an observability
-// bypass and must never grow with request rate.
-const maxPendingSchedulingEvents = 512
+// maxPendingSchedulingEvents bounds the handoff channel, per-window suppression
+// map, and retry accumulator. A synchronized 401 wave can legitimately emit
+// several distinct state transitions per seat (revoked, failover, and login
+// required), so a 300-person Worker needs substantially more than 300 slots.
+// The bound still prevents a Control outage from growing memory with request
+// rate; overflow remains counted and /status-visible.
+const maxPendingSchedulingEvents = 4096
 
 // newSchedulingEventID mints a time-prefixed sortable id ("sev_<13-digit
 // ms>_<4-byte hex>"). The decimal millisecond prefix keeps lexicographic order
@@ -431,10 +460,26 @@ func (r *signalReporter) clearSchedulingEventSuppression() {
 	r.evSupMu.Unlock()
 }
 
-const signalAuthFailureFilename = "signal-auth-failures.json"
+const (
+	signalAuthFailureFilename     = "signal-auth-failures.json"
+	authFailureJournalVersion     = 1
+	maxPendingAuthFailures        = 4096
+	maxAuthFailureJournalBytes    = 8 << 20
+	maxAuthFailureUploadBatchSize = 128
+)
+
+type authFailureJournalRecord struct {
+	Version int                `json:"version"`
+	Op      string             `json:"op"`
+	Failure *authFailureSample `json:"failure,omitempty"`
+}
 
 func authFailureKey(s authFailureSample) string {
 	return s.CredentialID + "|" + s.OAuthGroupID + "|" + s.SeatID
+}
+
+func authFailureQueueKey(s authFailureSample) string {
+	return authFailureKey(s) + "|" + s.TokenFingerprint
 }
 
 func signalAuthFailurePath() (string, error) {
@@ -445,9 +490,18 @@ func signalAuthFailurePath() (string, error) {
 	return filepath.Join(filepath.Dir(cooldownPath), signalAuthFailureFilename), nil
 }
 
-// enqueueAuthFailure performs no network work on the request path. It makes one
-// rare, bounded local state-file write so a Proxy crash cannot lose the only
-// hard-revocation observation; network delivery always happens in loop().
+func (r *signalReporter) authFailurePath() (string, error) {
+	if r != nil && r.authJournalPath != "" {
+		return r.authJournalPath, nil
+	}
+	return signalAuthFailurePath()
+}
+
+// enqueueAuthFailure is an O(1), non-blocking request-path handoff. Both journal
+// persistence and network delivery belong to loop(), which is the single
+// writer. Duplicate observations for the same route+token collapse before they
+// consume queue capacity; a truly full queue degrades /status instead of
+// delaying the developer's inference response.
 func (r *signalReporter) enqueueAuthFailure(credentialID, oauthGroupID, seatID, tokenFingerprint string) {
 	if r == nil || credentialID == "" || oauthGroupID == "" || seatID == "" || tokenFingerprint == "" {
 		return
@@ -456,19 +510,77 @@ func (r *signalReporter) enqueueAuthFailure(credentialID, oauthGroupID, seatID, 
 		CredentialID: credentialID, OAuthGroupID: oauthGroupID, SeatID: seatID,
 		TokenFingerprint: tokenFingerprint, Reason: "token_revoked",
 	}
+	queuedKey := authFailureQueueKey(sample)
+	if _, duplicate := r.authQueued.LoadOrStore(queuedKey, struct{}{}); duplicate {
+		return
+	}
+	select {
+	case r.authIn <- sample:
+		// loop() persists before it attempts delivery.
+	default:
+		r.authQueued.Delete(queuedKey)
+		r.recordSignalDrop(1)
+	}
+}
+
+// ingestAuthFailures runs only on the reporter loop. It updates the bounded
+// in-memory outbox and appends all new values with one write+sync per drained
+// burst. The request goroutines never participate in either operation.
+func (r *signalReporter) ingestAuthFailures(samples []authFailureSample) {
+	if len(samples) == 0 {
+		return
+	}
+	records := make([]authFailureJournalRecord, 0, len(samples))
+	var dropped int64
 	r.authMu.Lock()
 	if r.authFailures == nil {
 		r.authFailures = make(map[string]authFailureSample)
 	}
-	r.authFailures[authFailureKey(sample)] = sample
-	r.persistAuthFailuresLocked()
+	if r.authDurable == nil {
+		r.authDurable = make(map[string]authFailureSample)
+	}
+	for _, sample := range samples {
+		key := authFailureKey(sample)
+		current, exists := r.authFailures[key]
+		if exists && current == sample && r.authDurable[key] == sample {
+			continue
+		}
+		if !exists && len(r.authFailures) >= maxPendingAuthFailures {
+			dropped++
+			continue
+		}
+		r.authFailures[key] = sample
+		copyOfSample := sample
+		records = append(records, authFailureJournalRecord{
+			Version: authFailureJournalVersion, Op: "put", Failure: &copyOfSample,
+		})
+	}
 	r.authMu.Unlock()
-	if r.authWake != nil {
-		select {
-		case r.authWake <- struct{}{}:
-		default:
+	for _, sample := range samples {
+		r.authQueued.Delete(authFailureQueueKey(sample))
+	}
+	if dropped > 0 {
+		r.recordSignalDrop(dropped)
+	}
+	if len(records) == 0 {
+		return
+	}
+	written, err := r.appendAuthFailureJournal(records)
+	if err != nil {
+		r.recordAuthJournalFailure(err)
+		return
+	}
+	r.authMu.Lock()
+	for _, record := range records {
+		sample := *record.Failure
+		if r.authFailures[authFailureKey(sample)] == sample {
+			r.authDurable[authFailureKey(sample)] = sample
 		}
 	}
+	r.authMu.Unlock()
+	r.authJournalOps += len(records)
+	r.authJournalBytes += int64(written)
+	r.compactAuthFailureJournalIfNeeded()
 }
 
 func (r *signalReporter) snapshotAuthFailures() []authFailureSample {
@@ -488,71 +600,248 @@ func (r *signalReporter) acknowledgeAuthFailures(sent []authFailureSample) {
 	if len(sent) == 0 {
 		return
 	}
-	r.authMu.Lock()
+	records := make([]authFailureJournalRecord, 0, len(sent))
 	for _, sample := range sent {
+		r.authMu.Lock()
+		key := authFailureKey(sample)
+		matches := r.authFailures[key] == sample
+		durable := r.authDurable[key] == sample
+		r.authMu.Unlock()
+		if matches {
+			copyOfSample := sample
+			if !durable {
+				// A previous PUT may have failed after the in-memory state changed.
+				// Persist PUT+DELETE together so an older token version cannot
+				// resurrect on restart after Control already accepted this one.
+				records = append(records, authFailureJournalRecord{
+					Version: authFailureJournalVersion, Op: "put", Failure: &copyOfSample,
+				})
+			}
+			records = append(records, authFailureJournalRecord{
+				Version: authFailureJournalVersion, Op: "delete", Failure: &copyOfSample,
+			})
+		}
+	}
+	if len(records) == 0 {
+		return
+	}
+	written, err := r.appendAuthFailureJournal(records)
+	if err != nil {
+		// Keep the already accepted entries in memory. A later retry is harmless
+		// because Control applies auth-failure observations idempotently.
+		r.recordAuthJournalFailure(err)
+		return
+	}
+	r.authJournalOps += len(records)
+	r.authJournalBytes += int64(written)
+	r.authMu.Lock()
+	for _, record := range records {
+		sample := *record.Failure
 		key := authFailureKey(sample)
 		if r.authFailures[key] == sample {
 			delete(r.authFailures, key)
+			delete(r.authDurable, key)
 		}
 	}
-	r.persistAuthFailuresLocked()
+	empty := len(r.authFailures) == 0
 	r.authMu.Unlock()
+	if empty {
+		r.compactAuthFailureJournal()
+	} else {
+		r.compactAuthFailureJournalIfNeeded()
+	}
 }
 
 func (r *signalReporter) hydrateAuthFailures() {
-	path, err := signalAuthFailurePath()
+	path, err := r.authFailurePath()
 	if err != nil {
 		return
 	}
-	raw, err := os.ReadFile(path)
+	f, err := os.Open(path)
 	if err != nil {
 		return
 	}
-	var body struct {
-		Failures []authFailureSample `json:"auth_failures"`
-	}
-	if err := json.Unmarshal(raw, &body); err != nil {
-		r.logger.Warn("auth-failure signal outbox is unreadable; starting empty",
+	defer f.Close()
+	raw, err := io.ReadAll(io.LimitReader(f, maxAuthFailureJournalBytes+1))
+	if err != nil || len(raw) > maxAuthFailureJournalBytes {
+		r.logger.Warn("auth-failure signal journal is unreadable or over its safety limit; starting empty",
 			"event.name", observability.EventProxySignalAuthFailureStateInvalid, "error", err)
 		return
 	}
-	for _, sample := range body.Failures {
-		if sample.CredentialID != "" && sample.OAuthGroupID != "" && sample.SeatID != "" && sample.TokenFingerprint != "" {
-			r.authFailures[authFailureKey(sample)] = sample
+	r.authJournalBytes = int64(len(raw))
+
+	// Rolling-upgrade compatibility: the predecessor stored one JSON object
+	// containing auth_failures. Detect the key explicitly so a one-record JSONL
+	// journal is not mistaken for an empty legacy snapshot.
+	var legacy map[string]json.RawMessage
+	if json.Unmarshal(raw, &legacy) == nil && legacy["auth_failures"] != nil {
+		var failures []authFailureSample
+		if err := json.Unmarshal(legacy["auth_failures"], &failures); err != nil {
+			r.logger.Warn("legacy auth-failure signal outbox is invalid; starting empty",
+				"event.name", observability.EventProxySignalAuthFailureStateInvalid, "error", err)
+			return
+		}
+		for _, sample := range failures {
+			r.hydrateAuthFailurePut(sample)
+		}
+		// Convert once at startup. Startup persistence is outside all requests and
+		// makes every later mutation fixed-cost append-only.
+		r.compactAuthFailureJournal()
+		return
+	}
+
+	for lineNumber, line := range bytes.Split(raw, []byte{'\n'}) {
+		line = bytes.TrimSpace(line)
+		if len(line) == 0 {
+			continue
+		}
+		var record authFailureJournalRecord
+		if err := json.Unmarshal(line, &record); err != nil || record.Version != authFailureJournalVersion || record.Failure == nil {
+			r.logger.Warn("auth-failure signal journal record is invalid; skipping record",
+				"event.name", observability.EventProxySignalAuthFailureStateInvalid,
+				"record", lineNumber+1, "error", err)
+			continue
+		}
+		r.authJournalOps++
+		sample := *record.Failure
+		switch record.Op {
+		case "put":
+			r.hydrateAuthFailurePut(sample)
+		case "delete":
+			key := authFailureKey(sample)
+			if r.authFailures[key] == sample {
+				delete(r.authFailures, key)
+				delete(r.authDurable, key)
+			}
+		default:
+			r.logger.Warn("auth-failure signal journal operation is invalid; skipping record",
+				"event.name", observability.EventProxySignalAuthFailureStateInvalid,
+				"record", lineNumber+1)
 		}
 	}
+	r.compactAuthFailureJournalIfNeeded()
 }
 
-func (r *signalReporter) persistAuthFailuresLocked() {
-	path, err := signalAuthFailurePath()
+func (r *signalReporter) hydrateAuthFailurePut(sample authFailureSample) {
+	if sample.CredentialID == "" || sample.OAuthGroupID == "" || sample.SeatID == "" || sample.TokenFingerprint == "" {
+		return
+	}
+	key := authFailureKey(sample)
+	if _, exists := r.authFailures[key]; !exists && len(r.authFailures) >= maxPendingAuthFailures {
+		r.recordSignalDrop(1)
+		return
+	}
+	r.authFailures[key] = sample
+	if r.authDurable == nil {
+		r.authDurable = make(map[string]authFailureSample)
+	}
+	r.authDurable[key] = sample
+}
+
+func (r *signalReporter) appendAuthFailureJournal(records []authFailureJournalRecord) (int, error) {
+	if len(records) == 0 {
+		return 0, nil
+	}
+	path, err := r.authFailurePath()
 	if err != nil {
-		return
+		return 0, err
 	}
-	if len(r.authFailures) == 0 {
-		if removeErr := os.Remove(path); removeErr != nil && !os.IsNotExist(removeErr) {
-			r.logger.Warn("auth-failure signal outbox remove failed",
-				"event.name", observability.EventProxySignalAuthFailureStateWriteFailed, "error", removeErr)
+	if mkdirErr := os.MkdirAll(filepath.Dir(path), 0o700); mkdirErr != nil {
+		return 0, mkdirErr
+	}
+	var data bytes.Buffer
+	for _, record := range records {
+		encoded, marshalErr := json.Marshal(record)
+		if marshalErr != nil {
+			return 0, marshalErr
 		}
+		data.Write(encoded)
+		data.WriteByte('\n')
+	}
+	f, err := os.OpenFile(path, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o600)
+	if err != nil {
+		return 0, err
+	}
+	written, writeErr := f.Write(data.Bytes())
+	if writeErr == nil {
+		writeErr = f.Sync()
+	}
+	if closeErr := f.Close(); writeErr == nil {
+		writeErr = closeErr
+	}
+	return written, writeErr
+}
+
+func (r *signalReporter) compactAuthFailureJournalIfNeeded() {
+	if r.authJournalOps < maxPendingAuthFailures*2 && r.authJournalBytes < maxAuthFailureJournalBytes/2 {
 		return
 	}
-	failures := make([]authFailureSample, 0, len(r.authFailures))
-	for _, sample := range r.authFailures {
-		failures = append(failures, sample)
+	r.compactAuthFailureJournal()
+}
+
+func (r *signalReporter) compactAuthFailureJournal() {
+	path, err := r.authFailurePath()
+	if err != nil {
+		r.recordAuthJournalFailure(err)
+		return
 	}
-	data, err := json.Marshal(map[string]any{"auth_failures": failures})
-	if err == nil {
-		err = os.MkdirAll(filepath.Dir(path), 0o700)
+	failures := r.snapshotAuthFailures()
+	if len(failures) == 0 {
+		if err = os.Remove(path); err != nil && !os.IsNotExist(err) {
+			r.recordAuthJournalFailure(err)
+			return
+		}
+		r.authJournalOps = 0
+		r.authJournalBytes = 0
+		return
 	}
-	if err == nil {
-		tmp := path + ".tmp"
-		if err = os.WriteFile(tmp, data, 0o600); err == nil {
+	sort.Slice(failures, func(i, j int) bool { return authFailureKey(failures[i]) < authFailureKey(failures[j]) })
+	records := make([]authFailureJournalRecord, 0, len(failures))
+	for index := range failures {
+		sample := failures[index]
+		records = append(records, authFailureJournalRecord{
+			Version: authFailureJournalVersion, Op: "put", Failure: &sample,
+		})
+	}
+	var data bytes.Buffer
+	for _, record := range records {
+		encoded, marshalErr := json.Marshal(record)
+		if marshalErr != nil {
+			r.recordAuthJournalFailure(marshalErr)
+			return
+		}
+		data.Write(encoded)
+		data.WriteByte('\n')
+	}
+	// err (outer) deliberately carries the whole mkdir→write→rename chain: a
+	// shadowed `err :=` here once made the failure check below impossible
+	// (nilness: nil != nil) and auth-journal compaction failures were silently
+	// swallowed — 日志规范 forbids silent fallback paths.
+	if err = os.MkdirAll(filepath.Dir(path), 0o700); err == nil {
+		tmp := path + ".compact.tmp"
+		if err = os.WriteFile(tmp, data.Bytes(), 0o600); err == nil {
 			err = os.Rename(tmp, path)
 		}
+		if err != nil {
+			_ = os.Remove(tmp)
+		}
 	}
 	if err != nil {
-		r.logger.Warn("auth-failure signal outbox write failed",
-			"event.name", observability.EventProxySignalAuthFailureStateWriteFailed, "error", err)
+		r.recordAuthJournalFailure(err)
+		return
 	}
+	r.authJournalOps = len(records)
+	r.authJournalBytes = int64(data.Len())
+}
+
+func (r *signalReporter) recordAuthJournalFailure(err error) {
+	r.logger.Warn("auth-failure signal journal write failed",
+		"event.name", observability.EventProxySignalAuthFailureStateWriteFailed, "error", err)
+	r.healthMu.Lock()
+	r.dropSinceOK = true
+	r.health.Status = "degraded"
+	r.health.LastError = "auth-failure journal persistence failed"
+	r.healthMu.Unlock()
 }
 
 // incrRateLimit tallies one upstream 429/403 for a credential. Same MAIN-LINK
@@ -842,14 +1131,83 @@ func (a *signalTrendAccumulator) count() int {
 	return len(a.util) + len(a.revoked) + len(a.rate) + len(a.conc) + len(a.events)
 }
 
+func (r *signalReporter) drainAuthFailures(first authFailureSample) []authFailureSample {
+	batch := make([]authFailureSample, 0, maxAuthFailureUploadBatchSize)
+	batch = append(batch, first)
+	for len(batch) < maxAuthFailureUploadBatchSize {
+		select {
+		case sample := <-r.authIn:
+			batch = append(batch, sample)
+		default:
+			return batch
+		}
+	}
+	return batch
+}
+
+func (r *signalReporter) deliverAuthFailures(failures []authFailureSample) (attempted, allOK bool, detail string) {
+	if len(failures) == 0 {
+		return false, true, ""
+	}
+	allOK = true
+	for start := 0; start < len(failures); start += maxAuthFailureUploadBatchSize {
+		end := start + maxAuthFailureUploadBatchSize
+		if end > len(failures) {
+			end = len(failures)
+		}
+		chunkAttempted, chunkOK, chunkDetail := r.deliverAuthFailureChunk(failures[start:end])
+		attempted = attempted || chunkAttempted
+		if !chunkOK {
+			allOK = false
+			if detail == "" {
+				detail = chunkDetail
+			}
+			// A timeout/5xx is a dependency outage, not a poison record. Stop
+			// after one bounded attempt and retry the retained journal later.
+			if chunkDetail != "signal report rejected with HTTP 409" {
+				break
+			}
+		}
+	}
+	return attempted, allOK, detail
+}
+
+func (r *signalReporter) deliverAuthFailureChunk(failures []authFailureSample) (attempted, allOK bool, detail string) {
+	if len(failures) == 0 {
+		return false, true, ""
+	}
+	result := r.uploadAllResult(nil, nil, failures, nil, nil, nil)
+	if result.ok {
+		r.acknowledgeAuthFailures(failures)
+		return true, true, ""
+	}
+	if result.statusCode != http.StatusConflict || len(failures) == 1 {
+		return true, false, result.detail
+	}
+	// Control uses 409 for a route that is no longer authorized. Bisect only
+	// that permanent class so one stale route cannot retain 127 valid siblings;
+	// transient outages never fan out into one request per failure.
+	mid := len(failures) / 2
+	_, leftOK, leftDetail := r.deliverAuthFailureChunk(failures[:mid])
+	_, rightOK, rightDetail := r.deliverAuthFailureChunk(failures[mid:])
+	if leftOK && rightOK {
+		return true, true, ""
+	}
+	if leftDetail != "" {
+		return true, false, leftDetail
+	}
+	return true, false, rightDetail
+}
+
 func (r *signalReporter) loop() {
 	ticker := time.NewTicker(signalFlushInterval)
 	defer ticker.Stop()
+	defer close(r.done)
 	pending := newSignalTrendAccumulator()
 	flush := func(rate []rateLimitSample, conc []concurrencySample) {
 		r.recordSignalDrop(pending.mergeRate(rate) + pending.mergeConcurrency(conc))
 		authFailures := r.snapshotAuthFailures()
-		r.setPendingSignals(pending.count() + len(authFailures))
+		r.setPendingSignals(pending.count() + len(authFailures) + len(r.authIn))
 		if pending.count() == 0 && len(authFailures) == 0 {
 			return
 		}
@@ -877,22 +1235,18 @@ func (r *signalReporter) loop() {
 		// Durable auth failures are intentionally isolated one by one. The master
 		// rejects an unauthorized route with HTTP 409; batching it with trend data
 		// or another route would otherwise poison unrelated signals indefinitely.
-		for _, failure := range authFailures {
-			ok, uploadDetail := r.uploadAll(nil, nil, []authFailureSample{failure}, nil, nil, nil)
-			attempted = true
-			if ok {
-				r.acknowledgeAuthFailures([]authFailureSample{failure})
-				continue
-			}
+		authAttempted, authOK, authDetail := r.deliverAuthFailures(authFailures)
+		attempted = attempted || authAttempted
+		if !authOK {
 			allOK = false
 			if detail == "" {
-				detail = uploadDetail
+				detail = authDetail
 			}
 		}
 		if attempted {
 			r.recordSignalUpload(allOK, detail)
 		}
-		r.setPendingSignals(pending.count() + len(r.snapshotAuthFailures()))
+		r.setPendingSignals(pending.count() + len(r.snapshotAuthFailures()) + len(r.authIn))
 	}
 	for {
 		select {
@@ -908,12 +1262,18 @@ func (r *signalReporter) loop() {
 			if !pending.addEvent(ev) {
 				r.recordSignalDrop(1)
 			}
+		case sample := <-r.authIn:
+			r.ingestAuthFailures(r.drainAuthFailures(sample))
+			flush(nil, nil)
 		case <-r.authWake:
 			flush(nil, nil)
 		case <-ticker.C:
 			r.clearSchedulingEventSuppression()
 			flush(r.snapshotRateLimits(), r.snapshotConcurrency())
 		case <-r.stop:
+			for len(r.authIn) > 0 {
+				r.ingestAuthFailures(r.drainAuthFailures(<-r.authIn))
+			}
 			flush(r.snapshotRateLimits(), r.snapshotConcurrency())
 			return
 		}
@@ -931,13 +1291,24 @@ func (r *signalReporter) postAll(samples []signalSample, revoked []revokedSample
 }
 
 func (r *signalReporter) uploadAll(samples []signalSample, revoked []revokedSample, authFailures []authFailureSample, rateLimits []rateLimitSample, concurrency []concurrencySample, events []schedulingEventSample) (ok bool, detail string) {
+	result := r.uploadAllResult(samples, revoked, authFailures, rateLimits, concurrency, events)
+	return result.ok, result.detail
+}
+
+type signalUploadResult struct {
+	ok         bool
+	detail     string
+	statusCode int
+}
+
+func (r *signalReporter) uploadAllResult(samples []signalSample, revoked []revokedSample, authFailures []authFailureSample, rateLimits []rateLimitSample, concurrency []concurrencySample, events []schedulingEventSample) signalUploadResult {
 	r.configMu.RLock()
 	endpoint := r.url
 	sourceID := r.sourceID
 	bearer := r.bearer
 	r.configMu.RUnlock()
 	if endpoint == "" || bearer == nil {
-		return false, "signal reporting disabled"
+		return signalUploadResult{detail: "signal reporting disabled"}
 	}
 	// All arrays are optional: marshal only the non-empty ones so an all-samples,
 	// all-revoked, all-rate_limits, or all-concurrency flush still posts a valid
@@ -965,11 +1336,11 @@ func (r *signalReporter) uploadAll(samples []signalSample, revoked []revokedSamp
 		payload["events"] = events
 	}
 	if len(payload) == 0 || (len(payload) == 1 && sourceID != "") {
-		return true, ""
+		return signalUploadResult{ok: true}
 	}
 	body, err := json.Marshal(payload)
 	if err != nil {
-		return false, "signal payload encoding failed"
+		return signalUploadResult{detail: "signal payload encoding failed"}
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
@@ -977,11 +1348,11 @@ func (r *signalReporter) uploadAll(samples []signalSample, revoked []revokedSamp
 	if err != nil {
 		r.logger.Warn("signal report bearer unavailable",
 			"event.name", observability.EventProxySignalBearerFailed, "error", err)
-		return false, "signal bearer unavailable"
+		return signalUploadResult{detail: "signal bearer unavailable"}
 	}
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, bytes.NewReader(body))
 	if err != nil {
-		return false, "signal request construction failed"
+		return signalUploadResult{detail: "signal request construction failed"}
 	}
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Authorization", "Bearer "+tok)
@@ -989,15 +1360,15 @@ func (r *signalReporter) uploadAll(samples []signalSample, revoked []revokedSamp
 	if err != nil {
 		r.logger.Warn("signal report upload failed",
 			"event.name", observability.EventProxySignalUploadFailed, "error", err)
-		return false, "signal upload failed"
+		return signalUploadResult{detail: "signal upload failed"}
 	}
 	_ = resp.Body.Close()
 	if resp.StatusCode >= 300 {
 		r.logger.Warn("signal report rejected",
 			"event.name", observability.EventProxySignalUploadRejected, "status", resp.StatusCode)
-		return false, "signal report rejected with HTTP " + strconv.Itoa(resp.StatusCode)
+		return signalUploadResult{detail: "signal report rejected with HTTP " + strconv.Itoa(resp.StatusCode), statusCode: resp.StatusCode}
 	}
-	return true, ""
+	return signalUploadResult{ok: true, statusCode: resp.StatusCode}
 }
 
 func (r *signalReporter) recordSignalUpload(ok bool, detail string) {

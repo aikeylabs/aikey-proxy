@@ -53,6 +53,16 @@ func (s *Supervisor) groupRuntimeRail() railSpec {
 		interval:     groupRuntimePollInterval,
 		needsTeamJWT: true,
 		gate: func(gen *generation) bool {
+			if s.cfg.Cluster.Enabled {
+				// Cluster workers get group material via the daemon spine
+				// (org key-delivery oauth_group_runtime → cluster_apply → node
+				// vault; N14 单脊柱, V3c §5.8 single-writer). This rail needs a
+				// human team JWT no cluster node ever has — running it here can
+				// only produce a permanent no-team-credential failure loop that
+				// misled the 2026-08-19 P0-3 triage. 方案
+				// 20260819-集群TeamOAuth-调度一致性与投影对账 D2.
+				return false
+			}
 			if !oauthGroupRoutingEnabled() {
 				return false // feature off → the whole rail is bypassed (direct-bind unchanged)
 			}

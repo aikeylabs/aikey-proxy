@@ -25,8 +25,19 @@ func NewOAuthPoolRuntimeState() *OAuthPoolRuntimeState {
 // Close retires process-owned background work. Hot-reload generation teardown
 // must not call this; only Supervisor shutdown owns this lifecycle boundary.
 func (s *OAuthPoolRuntimeState) Close() error {
-	if s == nil || s.signalReporter == nil {
+	if s == nil {
 		return nil
 	}
-	return s.signalReporter.Close()
+	// Drain the hard-revoke journal first. Cooldown snapshots are explicitly an
+	// enhancement, while an accepted auth-failure is the only event that can
+	// move Master out of a stale logged_in state. A wedged cooldown filesystem
+	// write must not consume the Supervisor watchdog before that journal drains.
+	var reporterErr error
+	if s.signalReporter != nil {
+		reporterErr = s.signalReporter.Close()
+	}
+	if s.poolCooldown != nil {
+		s.poolCooldown.flushPersistence()
+	}
+	return reporterErr
 }

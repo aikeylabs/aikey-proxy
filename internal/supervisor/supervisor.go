@@ -30,6 +30,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"runtime/pprof"
 	"sort"
 	"strconv"
 	"strings"
@@ -1756,9 +1757,51 @@ func (s *Supervisor) Shutdown(timeout time.Duration) {
 	gen := s.active.Load()
 	slog.Info("supervisor shutting down", "generation_id", gen.id)
 	gen.drain(timeout, "shutdown")
-	gen.close()
-	if s.oauthPoolRuntime != nil {
-		_ = s.oauthPoolRuntime.Close()
+	// The teardown below is a WATCHDOGGED stage (bugfix
+	// 2026-08-19-proxy-shutdown-unbounded-close): generation.close() strings
+	// together reporter/WAL/SQLite closes, and an unbounded wait anywhere in
+	// that chain once held the drained process hostage until systemd's 90s
+	// SIGKILL — killing rolling upgrades and the self-heal restart path (which
+	// reuses this exact function). Every subsystem is expected to close within
+	// its own budget (reporters: shutdownFlushBudget); the watchdog is the
+	// structural fence for the ones that can't promise it (SQLite on a wedged
+	// disk, future additions). On overrun: dump all goroutine stacks to stderr
+	// (journald/launchd log = persisted forensic evidence, per the "超时退出必须
+	// 自动保存诊断证据" acceptance bar) and return — abandoning teardown is safe
+	// here because the process is about to exit and the WAL/SQLite layers are
+	// crash-safe by design.
+	closed := make(chan struct{})
+	go func() {
+		gen.close()
+		if s.oauthPoolRuntime != nil {
+			_ = s.oauthPoolRuntime.Close()
+		}
+		close(closed)
+	}()
+	select {
+	case <-closed:
+	case <-time.After(closeWatchdogTimeout):
+		slog.Error("supervisor shutdown: teardown watchdog fired — dumping goroutines and abandoning close",
+			"event.name", observability.EventProxyShutdownWatchdogTimeout,
+			"generation_id", gen.id,
+			"watchdog_seconds", int(closeWatchdogTimeout/time.Second))
+		dumpGoroutineStacks()
+	}
+}
+
+// closeWatchdogTimeout bounds the whole post-drain teardown. It must stay well
+// under every OS stop timeout that supervises this process (systemd
+// TimeoutStopSec=90 on cluster nodes; launchd ExitTimeOut default 20s is the
+// tightest) so a graceful stop always beats the OS kill.
+const closeWatchdogTimeout = 15 * time.Second
+
+// dumpGoroutineStacks writes every goroutine's stack to stderr. Debug level 2
+// (full stacks with goroutine states) is what actually answers "WHICH close is
+// stuck on WHAT" — the exact evidence that was missing when workers hung until
+// SIGKILL with nothing in the journal but the last drained log line.
+func dumpGoroutineStacks() {
+	if p := pprof.Lookup("goroutine"); p != nil {
+		_ = p.WriteTo(os.Stderr, 2)
 	}
 }
 

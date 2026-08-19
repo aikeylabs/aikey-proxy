@@ -88,13 +88,13 @@ type deadLetterEntry struct {
 	// Kind selects the re-delivery lane; empty = usage (see the constants
 	// above — absent on every pre-2026-08-10 line, so it must stay the zero
 	// value forever).
-	Kind          string            `json:"kind,omitempty"`
-	ConfigHash    string            `json:"config_hash"`
-	Reason        string            `json:"reason"` // "terminal", "retryable" or "exhausted"
-	ErrorMsg      string            `json:"error_msg"`
-	ResponseBody  string            `json:"response_body"`
-	CollectorURL  string            `json:"collector_url"`
-	ProxyBuildID  string            `json:"proxy_build_id"`
+	Kind         string `json:"kind,omitempty"`
+	ConfigHash   string `json:"config_hash"`
+	Reason       string `json:"reason"` // "terminal", "retryable" or "exhausted"
+	ErrorMsg     string `json:"error_msg"`
+	ResponseBody string `json:"response_body"`
+	CollectorURL string `json:"collector_url"`
+	ProxyBuildID string `json:"proxy_build_id"`
 	// RouteSource resolves the destination URL + credential at REPLAY time for
 	// lanes that carry opaque payloads. The usage lane reads it off Events[0]
 	// instead and leaves this empty.
@@ -347,7 +347,7 @@ func (r *Reporter) ReplayDeadLetter(ctx context.Context) (ReplayDeadLetterResult
 
 		uploadURL := url + "/v1/usage-events:batch"
 
-		if _, upErr := r.doUpload(uploadURL, body, cred); upErr != nil {
+		if _, upErr := r.doUpload(context.Background(), uploadURL, body, cred); upErr != nil {
 			result.EntriesStillFailing++
 			result.EventsStillFailing += len(entry.Events)
 			result.LastError = fmt.Sprintf("HTTP %d: %s", upErr.StatusCode, upErr.Err)

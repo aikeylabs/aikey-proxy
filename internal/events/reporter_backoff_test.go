@@ -1,6 +1,7 @@
 package events
 
 import (
+	"context"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
@@ -93,13 +94,13 @@ func TestReporter_RetryableFailure_WALDrivenRetry(t *testing.T) {
 
 	// --- Phase 2: backoff gate suppresses an un-forced drain ---
 	failing.Store(false) // collector recovered
-	reporter.drainOnce(false)
+	reporter.drainOnce(context.Background(), false)
 	if got := received.Load(); got != 0 {
 		t.Fatalf("phase2: gate should suppress the un-forced drain even though collector recovered; got %d delivered", got)
 	}
 
 	// --- Phase 3: forced drain bypasses the gate and re-sends from the WAL ---
-	reporter.drainOnce(true)
+	reporter.drainOnce(context.Background(), true)
 	if got := received.Load(); got != n {
 		t.Fatalf("phase3: forced drain must re-send all %d events from the WAL, got %d", n, got)
 	}

@@ -41,11 +41,14 @@ const (
 	groupErrNoCandidates = "GROUP_NO_CANDIDATES" // route has no parseable candidate set
 	groupErrNoMaterial   = "GROUP_NO_MATERIAL"   // group_runtime empty/unparseable (not pulled yet)
 	groupErrAllUnusable  = "GROUP_ALL_UNUSABLE"  // every candidate expired / exhausted / undecryptable
-	// groupErrLoginRequired (RW2, per-member): the HRW-selected account has no
-	// token for THIS member (they haven't logged into it). Per D2 the walk stops
-	// here — it does NOT skip to a later already-logged-in account (that would
-	// break the HRW load allocation) — and the caller returns a structured login
-	// prompt naming groupResolveError.Account so the member logs into THAT account.
+	// groupErrLoginRequired (RW2, per-member): NO candidate is serviceable and at
+	// least one is waiting on a member login; the caller returns a structured
+	// login prompt naming groupResolveError.Account so the member logs into THAT
+	// account. Semantics are 2026-08-15 方案 b (supersedes the D2 "walk stops at
+	// the routed account" rule): a needs_login candidate never blocks while a
+	// healthy logged-in sibling can serve — this code surfaces only when the
+	// whole pool is unserviceable for this member (see vkeys.PickRoutedAccount
+	// + property fences P1–P6 + spec R27).
 	groupErrLoginRequired = "OAUTH_GROUP_MEMBER_LOGIN_REQUIRED"
 )
 
@@ -154,11 +157,18 @@ func resolveGroupCredential(route *vkeys.ResolvedRoute, derivedKey []byte, nowUn
 	}
 
 	// SINGLE SOURCE OF TRUTH (2026-07-01): the pick — engine override first (§6.5,
-	// member-validity re-checked; needs_login overrides are HONORED per the owner rule
-	// "the engine may route a member to an account they haven't logged into"), else the
-	// local ranked pick — is vkeys.PickRoutedAccount, the SAME function the display
-	// stamp (supervisor.computeRoutedAccountID → /user/vault current_routed) uses. Do
+	// member-validity re-checked), else the local ranked pick — is
+	// vkeys.PickRoutedAccount, the SAME function the display stamp
+	// (supervisor.computeRoutedAccountID → /user/vault current_routed) uses. Do
 	// NOT re-derive routing here; forwarding and display must agree by construction.
+	//
+	// needs_login semantics (2026-08-15 方案 b, supersedes the 2026-07-01 owner rule
+	// that HONORED a needs_login override immediately): a needs_login candidate —
+	// override included — no longer blocks the request; healthy candidates serve
+	// first and the needs_login target survives only as the login PROMPT when
+	// nothing is serviceable. The rule lives inside PickRoutedAccount (see its
+	// header + vkeys property fences P1–P6 + spec R27); this note exists because
+	// the old wording here already misled one external review (2026-08-18).
 	//
 	// The only hot-path-extra gate is DECRYPT (needs the vault key, so it can't be in
 	// the pure picker): a corrupt secret adds the account to the skip set and re-picks,

@@ -364,7 +364,7 @@ func TestAuthFailureSignalIsVersionedDurableAndRetriedUntilAccepted(t *testing.T
 	r := &signalReporter{
 		url: srv.URL, bearer: func(context.Context) (string, error) { return "svc-token", nil },
 		client: httpx.NewSwappableDirect(time.Second), authFailures: make(map[string]authFailureSample),
-		authWake: make(chan struct{}, 1), logger: slog.Default(),
+		authIn: make(chan authFailureSample, 4), authWake: make(chan struct{}, 1), logger: slog.Default(),
 	}
 	// Missing token version is unsafe: a delayed signal could invalidate a new
 	// re-login, so it must not enter the outbox.
@@ -373,6 +373,7 @@ func TestAuthFailureSignalIsVersionedDurableAndRetriedUntilAccepted(t *testing.T
 		t.Fatal("unversioned auth failure entered outbox")
 	}
 	r.enqueueAuthFailure("c1", "g1", "s1", "fingerprint-1")
+	r.ingestAuthFailures([]authFailureSample{<-r.authIn})
 	pending := r.snapshotAuthFailures()
 	if len(pending) != 1 || pending[0].TokenFingerprint != "fingerprint-1" {
 		t.Fatalf("versioned auth failure not queued: %+v", pending)
@@ -420,14 +421,111 @@ func TestAuthFailureSignalIsVersionedDurableAndRetriedUntilAccepted(t *testing.T
 
 func TestAuthFailureOutboxHydratesOnlyVersionedEntries(t *testing.T) {
 	t.Setenv("AIKEY_RUN_DIR", t.TempDir())
-	writer := &signalReporter{authFailures: make(map[string]authFailureSample), authWake: make(chan struct{}, 1), logger: slog.Default()}
+	writer := &signalReporter{
+		authFailures: make(map[string]authFailureSample), authIn: make(chan authFailureSample, 1),
+		authWake: make(chan struct{}, 1), logger: slog.Default(),
+	}
 	writer.enqueueAuthFailure("c1", "g1", "s1", "fp-1")
+	writer.ingestAuthFailures([]authFailureSample{<-writer.authIn})
 
 	reader := &signalReporter{authFailures: make(map[string]authFailureSample), logger: slog.Default()}
 	reader.hydrateAuthFailures()
 	got := reader.snapshotAuthFailures()
 	if len(got) != 1 || got[0].TokenFingerprint != "fp-1" {
 		t.Fatalf("durable auth failure did not hydrate: %+v", got)
+	}
+}
+
+func TestAuthFailureBurstDeduplicatesBeforeBoundedWriter(t *testing.T) {
+	r := &signalReporter{
+		authIn: make(chan authFailureSample, maxPendingAuthFailures),
+		health: SignalReportingHealth{Status: "starting"},
+	}
+	for i := 0; i < 3000; i++ {
+		r.enqueueAuthFailure("c1", "g1", "s1", "fp-1")
+	}
+	if got := len(r.authIn); got != 1 {
+		t.Fatalf("duplicate 401 burst queued=%d records, want one route+token observation", got)
+	}
+	if got := r.healthSnapshot(); got.DroppedSignals != 0 {
+		t.Fatalf("duplicate 401 burst consumed bounded capacity: %+v", got)
+	}
+}
+
+func TestAuthFailureDeliveryBatches300AndCompactsJournal(t *testing.T) {
+	t.Setenv("AIKEY_RUN_DIR", t.TempDir())
+	var hits atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+		hits.Add(1)
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer srv.Close()
+
+	r := &signalReporter{
+		url: srv.URL, bearer: func(context.Context) (string, error) { return "svc-token", nil },
+		client: httpx.NewSwappableDirect(time.Second), logger: slog.Default(),
+		authFailures: make(map[string]authFailureSample), authDurable: make(map[string]authFailureSample),
+	}
+	failures := make([]authFailureSample, 300)
+	for i := range failures {
+		failures[i] = authFailureSample{
+			CredentialID: fmt.Sprintf("credential-%03d", i), OAuthGroupID: "group-1",
+			SeatID: fmt.Sprintf("seat-%03d", i), TokenFingerprint: fmt.Sprintf("fp-%03d", i),
+			Reason: "token_revoked",
+		}
+	}
+	r.ingestAuthFailures(failures)
+	if pending := r.snapshotAuthFailures(); len(pending) != 300 {
+		t.Fatalf("journal pending=%d, want 300", len(pending))
+	}
+	attempted, ok, detail := r.deliverAuthFailures(r.snapshotAuthFailures())
+	if !attempted || !ok {
+		t.Fatalf("batched auth delivery attempted=%v ok=%v detail=%q", attempted, ok, detail)
+	}
+	if got, want := hits.Load(), int32(3); got != want {
+		t.Fatalf("300 auth failures used %d uploads, want %d bounded batches", got, want)
+	}
+	if pending := r.snapshotAuthFailures(); len(pending) != 0 {
+		t.Fatalf("accepted batch remained pending: %d", len(pending))
+	}
+	path, _ := r.authFailurePath()
+	if _, err := os.Stat(path); !os.IsNotExist(err) {
+		t.Fatalf("empty journal was not compacted away: %v", err)
+	}
+}
+
+func TestAuthFailureTransientOutageMakesOneBoundedAttemptFor300(t *testing.T) {
+	t.Setenv("AIKEY_RUN_DIR", t.TempDir())
+	var hits atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+		hits.Add(1)
+		w.WriteHeader(http.StatusServiceUnavailable)
+	}))
+	defer srv.Close()
+
+	r := &signalReporter{
+		url: srv.URL, bearer: func(context.Context) (string, error) { return "svc-token", nil },
+		client: httpx.NewSwappableDirect(time.Second), logger: slog.Default(),
+		authFailures: make(map[string]authFailureSample), authDurable: make(map[string]authFailureSample),
+	}
+	failures := make([]authFailureSample, 300)
+	for i := range failures {
+		failures[i] = authFailureSample{
+			CredentialID: fmt.Sprintf("credential-%03d", i), OAuthGroupID: "group-1",
+			SeatID: fmt.Sprintf("seat-%03d", i), TokenFingerprint: fmt.Sprintf("fp-%03d", i),
+			Reason: "token_revoked",
+		}
+	}
+	r.ingestAuthFailures(failures)
+	_, ok, _ := r.deliverAuthFailures(r.snapshotAuthFailures())
+	if ok {
+		t.Fatal("503 auth delivery reported success")
+	}
+	if got := hits.Load(); got != 1 {
+		t.Fatalf("Control outage amplified 300 pending failures into %d uploads, want one", got)
+	}
+	if pending := r.snapshotAuthFailures(); len(pending) != 300 {
+		t.Fatalf("transient outage dropped pending failures: %d", len(pending))
 	}
 }
 

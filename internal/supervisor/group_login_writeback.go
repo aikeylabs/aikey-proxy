@@ -33,6 +33,10 @@ type memberTokenWriteback struct {
 	AccessToken  string `json:"access_token"`
 	RefreshToken string `json:"refresh_token,omitempty"`
 	ExpiresAt    int64  `json:"expires_at,omitempty"`
+	// RenewalCredential (方案 20260818): retained Codex session key for master
+	// auto-renewal. Optional/additive — masters older than alpha.6 ignore it.
+	RenewalCredential string `json:"renewal_credential,omitempty"`
+	RenewalExpiresAt  int64  `json:"renewal_expires_at,omitempty"`
 	// ExternalID (optional, C5): the provider account UUID from the exchange, so
 	// master backfills it on first login (Claude metadata.user_id).
 	ExternalID string `json:"external_id,omitempty"`

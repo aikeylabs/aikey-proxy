@@ -262,7 +262,7 @@ func (r *Reporter) resendWALSeqs(source string, seqs []int64) int {
 		// failure (groupRetryLater) is left un-marked: B' (缺口2) no longer
 		// dead-letters retryable failures, so the seqs stay in the WAL and a
 		// re-run of reconcile can recover them — `sent` stays honest.
-		if r.uploadGroupTo(r.urlForRouteSource(routeSource), r.credentialForRouteSource(routeSource), group) == groupDone {
+		if r.uploadGroupTo(context.Background(), r.urlForRouteSource(routeSource), r.credentialForRouteSource(routeSource), group) == groupDone {
 			r.markProcessed(group)
 			sent += len(group)
 		}

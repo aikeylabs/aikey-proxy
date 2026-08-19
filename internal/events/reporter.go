@@ -146,8 +146,8 @@ type Reporter struct {
 	complianceLastFailureAt     aikeytime.Millis
 	complianceLastFailureReason string
 	complianceLastFailureCode   int
-	wal                 *WALWriter
-	done                chan struct{}
+	wal                         *WALWriter
+	done                        chan struct{}
 	// delivery-integrity cursors (memory only; see type doc). Guarded by mu.
 	sentSeq             map[string]int64       // source_id → highest seq handed to upload
 	confirmedSeq        map[string]int64       // source_id → server contiguous high-water
@@ -380,7 +380,19 @@ func (r *Reporter) Report(ev *ReportableEvent) {
 // queue.
 func (r *Reporter) Close() error {
 	close(r.done)
-	r.wg.Wait()
+	// The final flush above is ctx-bounded, so the loop goroutine exits within
+	// shutdownFlushBudget+ε on its own. The timed wait is a SAFETY NET, not the
+	// bound: if a future edit re-introduces an unbounded wait inside the loop,
+	// abandon it loudly instead of holding the whole shutdown chain (the
+	// goroutine dies with the process; on reload it finishes late and is GC'd).
+	waited := make(chan struct{})
+	go func() { r.wg.Wait(); close(waited) }()
+	select {
+	case <-waited:
+	case <-time.After(shutdownFlushBudget + closeWaitGrace):
+		slog.Error("usage reporter close: upload loop did not stop within budget — abandoning it",
+			"event.name", "usage.reporter.close_timeout")
+	}
 	if r.wal != nil {
 		return r.wal.Close()
 	}
@@ -480,11 +492,19 @@ func (r *Reporter) uploadLoop() {
 	for {
 		select {
 		case <-ticker.C:
-			r.drainOnce(false)
+			r.drainOnce(context.Background(), false)
 		case <-r.signal:
-			r.drainOnce(false)
+			r.drainOnce(context.Background(), false)
 		case <-r.done:
-			r.drainOnce(true) // final flush — bypass the backoff gate for one last attempt
+			// Final flush — one BOUNDED attempt, not a backlog clearance. The WAL
+			// is crash-safe and idempotent (seq + server dedup), so anything not
+			// delivered inside the budget simply resumes after restart. Unbounded
+			// flushing here once held process exit past systemd's 90s stop
+			// timeout when the collector network black-holed (accept-then-hang ×
+			// every batch) — bugfix 2026-08-19-proxy-shutdown-unbounded-close.
+			ctx, cancel := context.WithTimeout(context.Background(), shutdownFlushBudget)
+			r.drainOnce(ctx, true) // bypass the backoff gate for this one attempt
+			cancel()
 			return
 		}
 	}
@@ -494,7 +514,7 @@ func (r *Reporter) uploadLoop() {
 // (source_seq > sentSeq[source], plus a one-shot pass over legacy v1 entries),
 // uploads them grouped by RouteSource, then prunes confirmed WAL files. One WAL
 // read per pass keeps it simple; the BatchSize cap bounds a single HTTP body.
-func (r *Reporter) drainOnce(force bool) {
+func (r *Reporter) drainOnce(ctx context.Context, force bool) {
 	if r.wal == nil {
 		return
 	}
@@ -554,14 +574,20 @@ func (r *Reporter) drainOnce(force bool) {
 		}
 		pending = append(pending, ev)
 		if len(pending) >= r.cfg.BatchSize {
-			if r.uploadPending(pending) {
+			if ctx.Err() != nil {
+				// Budget exhausted (shutdown final flush): stop attempting —
+				// everything unsent stays in the WAL and resumes after restart.
+				anyRetryable = true
+				break
+			}
+			if r.uploadPending(ctx, pending) {
 				anyRetryable = true
 			}
 			pending = pending[:0]
 		}
 	}
-	if len(pending) > 0 {
-		if r.uploadPending(pending) {
+	if len(pending) > 0 && ctx.Err() == nil {
+		if r.uploadPending(ctx, pending) {
 			anyRetryable = true
 		}
 	}
@@ -587,7 +613,7 @@ func (r *Reporter) drainOnce(force bool) {
 // re-sends it (B', 缺口2). Returns true if any group failed retryably, so the
 // caller (drainOnce) can arm the non-blocking backoff gate. Confirmed-seq (for
 // WAL pruning) is advanced separately from the server's response in uploadGroupTo.
-func (r *Reporter) uploadPending(batch []ReportableEvent) (anyRetryable bool) {
+func (r *Reporter) uploadPending(ctx context.Context, batch []ReportableEvent) (anyRetryable bool) {
 	if len(batch) == 0 {
 		return false
 	}
@@ -608,9 +634,12 @@ func (r *Reporter) uploadPending(batch []ReportableEvent) (anyRetryable bool) {
 		r.dropped.Add(int64(skipped))
 	}
 	for routeSource, group := range groups {
+		if ctx.Err() != nil {
+			return true // budget gone mid-pass: remaining groups stay in the WAL
+		}
 		url := r.urlForRouteSource(routeSource)
 		cred := r.credentialForRouteSource(routeSource)
-		if r.uploadGroupTo(url, cred, group) == groupDone {
+		if r.uploadGroupTo(ctx, url, cred, group) == groupDone {
 			r.markProcessed(group)
 		} else {
 			anyRetryable = true
@@ -718,6 +747,17 @@ const (
 	groupRetryLater                          // retryable failure — conserve in WAL, retry next drain
 )
 
+// Shutdown budgets (bugfix 2026-08-19-proxy-shutdown-unbounded-close): the
+// final WAL flush on Close gets ONE bounded attempt — the WAL is crash-safe and
+// idempotent, so anything unsent resumes after restart; an unreachable or
+// black-holed collector must never hold process exit past the OS stop timeout.
+// closeWaitGrace pads the safety-net wait in Close over the flush budget so a
+// flush that finishes exactly at the budget still joins cleanly.
+const (
+	shutdownFlushBudget = 5 * time.Second
+	closeWaitGrace      = 3 * time.Second
+)
+
 // backoffForFailures maps the consecutive-failure count to the non-blocking gate
 // before the next upload attempt. Same ceiling as the old in-line backoff
 // (5s → 15s → 60s → 5min) but applied once per drain pass at the loop level, so
@@ -751,7 +791,7 @@ func backoffForFailures(n int) time.Duration {
 //
 // cred may be nil — doUpload tolerates that by sending without an Authorization
 // header (matches pre-CollectorToken behavior).
-func (r *Reporter) uploadGroupTo(collectorURL string, cred Credential, batch []ReportableEvent) uploadGroupResult {
+func (r *Reporter) uploadGroupTo(ctx context.Context, collectorURL string, cred Credential, batch []ReportableEvent) uploadGroupResult {
 	req := batchRequest{
 		Source:          "aikey-proxy",
 		SourceVersion:   "0.1.0",
@@ -778,7 +818,7 @@ func (r *Reporter) uploadGroupTo(collectorURL string, cred Credential, batch []R
 
 	url := collectorURL + "/v1/usage-events:batch"
 
-	resp, upErr := r.doUpload(url, body, cred)
+	resp, upErr := r.doUpload(ctx, url, body, cred)
 	if upErr == nil {
 		r.uploadSuccess.Add(int64(len(batch)))
 		r.onUploadSuccess(len(batch))
@@ -911,8 +951,11 @@ func (r *Reporter) onUploadFail(count int, upErr *uploadError, terminal bool) {
 // the retry/dead-letter loop treats stale credentials the same as a
 // server-side 401 (no infinite retry; lands in dead_letter.jsonl with
 // the credential error message as response body).
-func (r *Reporter) doUpload(url string, body []byte, cred Credential) (*batchResponse, *uploadError) {
-	httpReq, err := http.NewRequestWithContext(context.Background(), http.MethodPost, url, bytes.NewReader(body))
+func (r *Reporter) doUpload(ctx context.Context, url string, body []byte, cred Credential) (*batchResponse, *uploadError) {
+	// ctx bounds THIS attempt: Background on the periodic path (the client's
+	// 30s timeout governs, unchanged), the shutdown budget on the final flush —
+	// a black-holed collector must not be able to hold process exit hostage.
+	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(body))
 	if err != nil {
 		return nil, &uploadError{Err: fmt.Errorf("build request: %w", err)}
 	}

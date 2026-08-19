@@ -92,10 +92,19 @@ type PoolAccountRouteState struct {
 // Bounded by the number of distinct pool accounts; lapsed entries are dropped
 // lazily on read.
 type poolCooldownStore struct {
-	mu   sync.Mutex
-	m    map[string]time.Time             // accountID → avoid-until (whole account)
-	meta map[string]PoolAccountRouteState // accountID → display reason/recovery
-	now  func() time.Time                 // injectable clock (tests)
+	mu sync.Mutex
+	// persistTimer coalesces a burst of route-state mutations into one
+	// background snapshot. persistIO serializes timer and shutdown flushes. No
+	// filesystem operation is permitted while a request holds mu.
+	persistTimer      *time.Timer
+	persistWriting    bool
+	persistRevision   uint64
+	persistIO         sync.Mutex
+	persistedRevision uint64
+	persistPath       string
+	m                 map[string]time.Time             // accountID → avoid-until (whole account)
+	meta              map[string]PoolAccountRouteState // accountID → display reason/recovery
+	now               func() time.Time                 // injectable clock (tests)
 	// onAccountSetChanged is a best-effort notification that the WHOLE-ACCOUNT
 	// skip-set membership changed (enter cooldown or expire). The callback must be
 	// non-blocking: mark() runs on the request hot path. It is copied under mu and
@@ -153,6 +162,7 @@ func newPoolCooldownStore() *poolCooldownStore {
 	s := &poolCooldownStore{m: make(map[string]time.Time), now: time.Now,
 		meta: make(map[string]PoolAccountRouteState), serverErrStreak: make(map[string]int), tierM: make(map[string]time.Time),
 		authFailedTokens: make(map[string]string), lapsed: make(map[string]struct{})}
+	s.persistPath, _ = poolCooldownPath()
 	// Cross-restart persistence (2026-07-04 self-heal, §S4): without it a proxy
 	// restart forgot every cooldown and could immediately route traffic back
 	// onto an account that just 401'd / rate-limited. STRICTLY an enhancement,
@@ -172,9 +182,9 @@ func (s *poolCooldownStore) setAccountSetChangedHook(hook func()) {
 
 // ── cross-restart persistence (bypass state file, §S4 2026-07-04) ───────────
 // Same ownership pattern as sync-health.json / group-login-required.json:
-// one concern, one file, one writer (this store). Writes happen on mark()
-// (rare — an upstream 401/exhaustion) and are atomic (temp+rename). Reads
-// happen ONCE at construction. Every failure path is best-effort:
+// one concern, one file, one background writer (this store). Mutations on
+// mark() schedule a coalesced atomic snapshot (temp+rename); reads happen ONCE
+// at construction. Every failure path is best-effort:
 // write → WARN and keep serving; read → empty store (fallback, never blocks).
 
 const poolCooldownFilename = "pool-cooldown.json"
@@ -212,8 +222,8 @@ func poolCooldownPath() (string, error) {
 // by design: any error (missing file, bad JSON, unreadable) leaves the store
 // empty — the data path never depends on this file.
 func (s *poolCooldownStore) hydrateFromFile() {
-	path, err := poolCooldownPath()
-	if err != nil {
+	path := s.persistPath
+	if path == "" {
 		return
 	}
 	raw, err := os.ReadFile(path)
@@ -259,14 +269,38 @@ func (s *poolCooldownStore) hydrateFromFile() {
 	}
 }
 
-// persistLocked mirrors the current unexpired cooldowns to the state file
-// (s.mu held by the caller). Empty set removes the file. Best-effort: a
-// failure is WARN-logged and never surfaces to the request path.
+// persistLocked schedules a coalesced snapshot and returns immediately. The
+// caller holds s.mu, often on the request path; it must never encode JSON or
+// touch the filesystem here. A 300-member 401 burst therefore creates one
+// background snapshot instead of 300 serialized temp-file rewrites.
 func (s *poolCooldownStore) persistLocked() {
-	path, err := poolCooldownPath()
-	if err != nil {
-		return
+	s.persistRevision++
+	if s.persistTimer == nil && !s.persistWriting {
+		s.persistTimer = time.AfterFunc(5*time.Millisecond, s.persistScheduledSnapshot)
 	}
+}
+
+func (s *poolCooldownStore) persistScheduledSnapshot() {
+	s.mu.Lock()
+	s.persistTimer = nil
+	s.persistWriting = true
+	revision := s.persistRevision
+	body := s.persistenceSnapshotLocked()
+	s.mu.Unlock()
+	s.writePersistenceSnapshot(body, revision)
+
+	// Mutations that arrive during a blocked write only advance the revision;
+	// they never spawn more writers. Once this write finishes, schedule exactly
+	// one coalesced snapshot for the newest state.
+	s.mu.Lock()
+	s.persistWriting = false
+	if s.persistRevision != revision && s.persistTimer == nil {
+		s.persistTimer = time.AfterFunc(5*time.Millisecond, s.persistScheduledSnapshot)
+	}
+	s.mu.Unlock()
+}
+
+func (s *poolCooldownStore) persistenceSnapshotLocked() poolCooldownFileBody {
 	now := s.now()
 	accounts := make(map[string]int64, len(s.m))
 	for id, until := range s.m {
@@ -283,28 +317,50 @@ func (s *poolCooldownStore) persistLocked() {
 			tierAccounts[key] = until.Unix()
 		}
 	}
-	if len(accounts) == 0 && len(tierAccounts) == 0 && len(s.authFailedTokens) == 0 {
+	states := make(map[string]PoolAccountRouteState, len(accounts))
+	for id := range accounts {
+		if state, ok := s.meta[id]; ok && state.Status != "" {
+			states[id] = state
+		}
+	}
+	authFailedTokens := make(map[string]string, len(s.authFailedTokens))
+	for id, fingerprint := range s.authFailedTokens {
+		authFailedTokens[id] = fingerprint
+	}
+	return poolCooldownFileBody{
+		Accounts: accounts, AccountStates: states, TierAccounts: tierAccounts,
+		AuthFailedTokens: authFailedTokens, WrittenAt: time.Now().UnixMilli(),
+	}
+}
+
+func (s *poolCooldownStore) writePersistenceSnapshot(body poolCooldownFileBody, revision uint64) {
+	s.persistIO.Lock()
+	defer s.persistIO.Unlock()
+	// A timer may have captured an older snapshot just before shutdown flush
+	// captured a newer one. Mutex serialization alone does not define which
+	// waiter writes last, so reject stale revisions explicitly; otherwise the
+	// old timer could overwrite the shutdown snapshot after flush returned.
+	if revision < s.persistedRevision {
+		return
+	}
+	path := s.persistPath
+	if path == "" {
+		return
+	}
+	var err error
+	if len(body.Accounts) == 0 && len(body.TierAccounts) == 0 && len(body.AuthFailedTokens) == 0 {
 		if rmErr := os.Remove(path); rmErr != nil && !os.IsNotExist(rmErr) {
 			slog.Warn("pool cooldown state file remove failed",
 				"event.name", observability.EventProxyGroupAccountCooldown, "error", rmErr.Error())
 		}
+		s.persistedRevision = revision
 		return
 	}
 	err = func() error {
 		if mkErr := os.MkdirAll(filepath.Dir(path), 0o700); mkErr != nil {
 			return mkErr
 		}
-		states := make(map[string]PoolAccountRouteState, len(accounts))
-		for id := range accounts {
-			if state, ok := s.meta[id]; ok && state.Status != "" {
-				states[id] = state
-			}
-		}
-		authFailedTokens := make(map[string]string, len(s.authFailedTokens))
-		for id, fingerprint := range s.authFailedTokens {
-			authFailedTokens[id] = fingerprint
-		}
-		data, mErr := json.Marshal(poolCooldownFileBody{Accounts: accounts, AccountStates: states, TierAccounts: tierAccounts, AuthFailedTokens: authFailedTokens, WrittenAt: time.Now().UnixMilli()})
+		data, mErr := json.Marshal(body)
 		if mErr != nil {
 			return mErr
 		}
@@ -318,6 +374,25 @@ func (s *poolCooldownStore) persistLocked() {
 		slog.Warn("pool cooldown state file write failed — cooldowns won't survive a restart",
 			"event.name", observability.EventProxyGroupAccountCooldown, "error", err.Error())
 	}
+	s.persistedRevision = revision
+}
+
+// flushPersistence is a lifecycle/test barrier. It is deliberately allowed to
+// block because callers are process shutdown or persistence assertions, never
+// inference requests.
+func (s *poolCooldownStore) flushPersistence() {
+	if s == nil {
+		return
+	}
+	s.mu.Lock()
+	if s.persistTimer != nil {
+		s.persistTimer.Stop()
+		s.persistTimer = nil
+	}
+	body := s.persistenceSnapshotLocked()
+	revision := s.persistRevision
+	s.mu.Unlock()
+	s.writePersistenceSnapshot(body, revision)
 }
 
 // oauthTokenFingerprint returns a non-reversible identifier for one delivered

@@ -354,6 +354,7 @@ func TestAuthFailureTombstone_IsolatedByGroupAndSeat(t *testing.T) {
 	key := grKey()
 	accountID := "shared-pool-account"
 	store := newPoolCooldownStore()
+	t.Cleanup(store.flushPersistence)
 	store.markAuthFailedToken("group-1", "seat-a", accountID, oauthTokenFingerprint("seat-a-old-token"))
 
 	seatARuntime := mustJSON(t, map[string]vkeys.GroupRuntimeAccount{

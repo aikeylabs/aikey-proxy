@@ -12,6 +12,11 @@ import (
 const (
 	EventProxyProcessStarted = "proxy.process.started"
 	EventProxyProcessStopped = "proxy.process.stopped"
+	// EventProxyShutdownWatchdogTimeout: the post-drain teardown (generation
+	// close chain) overran its watchdog and was abandoned; goroutine stacks
+	// were dumped to stderr. Exit still completes — this is forensic evidence,
+	// not a hang (bugfix 2026-08-19-proxy-shutdown-unbounded-close).
+	EventProxyShutdownWatchdogTimeout = "proxy.shutdown.watchdog_timeout"
 	EventProxyConfigLoaded   = "proxy.config.loaded"
 	EventProxyListenerBound  = "proxy.listener.bound"
 )
@@ -306,10 +311,12 @@ const (
 	// was unusable (cooled / exhausted / expired / no material) so the request
 	// fell back to a different candidate — an auditable account switch.
 	EventProxyGroupAccountSwitched = "proxy.group.account_switched"
-	// EventProxyGroupLoginRequired (RW2/D2): the HRW-routed account has no token
-	// for this member (they haven't logged into it). The proxy returns a structured
-	// login prompt naming the account (strict HRW — it does NOT skip to a later
-	// logged-in account) so the member logs into THAT account on their local node.
+	// EventProxyGroupLoginRequired (RW2; semantics = 2026-08-15 方案 b, which
+	// supersedes the old D2 "strict HRW, never skip" rule): NO pool candidate is
+	// serviceable for this member and at least one is waiting on a login. The
+	// proxy returns a structured login prompt naming the actionable account (the
+	// engine's target first). A needs_login account alone does NOT emit this —
+	// healthy siblings serve first (vkeys.PickRoutedAccount, spec R27).
 	EventProxyGroupLoginRequired = "proxy.group.login_required"
 	// EventProxyGroupWindowPrecut (N10): an account's upstream utilization crossed
 	// its randomized window cap (window_max_util_pct), so it was pre-cut for that

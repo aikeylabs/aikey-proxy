@@ -1,7 +1,9 @@
 package proxy
 
 import (
+	"bytes"
 	"context"
+	"os"
 	"testing"
 	"time"
 )
@@ -38,7 +40,8 @@ func TestOAuthPoolRuntimeStateIsSharedAcrossProxyGenerations(t *testing.T) {
 	}
 
 	oldProxy.signalReporter.enqueueAuthFailure("credential-1", "group-1", "seat-1", "fingerprint-v1")
-	if got := newProxy.signalReporter.snapshotAuthFailures(); len(got) != 1 || got[0].TokenFingerprint != "fingerprint-v1" {
+	got := waitForAuthFailureSnapshot(t, newProxy.signalReporter, 1)
+	if got[0].TokenFingerprint != "fingerprint-v1" {
 		t.Fatalf("active generation cannot see draining generation's durable signal: %+v", got)
 	}
 }
@@ -65,6 +68,30 @@ func TestGenerationStopDoesNotCloseProcessSignalReporter(t *testing.T) {
 	}
 }
 
+func TestProcessRuntimeCloseDrainsAuthFailureToJournal(t *testing.T) {
+	t.Setenv("AIKEY_RUN_DIR", t.TempDir())
+	runtime := NewOAuthPoolRuntimeState()
+	runtime.signalReporter.enqueueAuthFailure("credential-1", "group-1", "seat-1", "fingerprint-v1")
+
+	// Close immediately: the request-side handoff may still be buffered. The
+	// process lifecycle owner must wait until the reporter has durably drained
+	// it, otherwise a restart directly after a 401 can forget the revocation.
+	if err := runtime.Close(); err != nil {
+		t.Fatalf("close process runtime: %v", err)
+	}
+	path, err := signalAuthFailurePath()
+	if err != nil {
+		t.Fatalf("resolve auth-failure journal: %v", err)
+	}
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read auth-failure journal after close: %v", err)
+	}
+	if !bytes.Contains(raw, []byte(`"token_fingerprint":"fingerprint-v1"`)) {
+		t.Fatalf("shutdown journal omitted queued auth failure: %s", raw)
+	}
+}
+
 func TestProcessSignalReporterReconfiguresWithoutLosingPendingAuthFailure(t *testing.T) {
 	t.Setenv("AIKEY_RUN_DIR", t.TempDir())
 	runtime := NewOAuthPoolRuntimeState()
@@ -79,7 +106,8 @@ func TestProcessSignalReporterReconfiguresWithoutLosingPendingAuthFailure(t *tes
 	oldProxy.signalReporter.enqueueAuthFailure("credential-1", "group-1", "seat-1", "fingerprint-v1")
 	newProxy.EnableSignalReporting("http://new-control.invalid", func(context.Context) (string, error) { return "new", nil })
 
-	if got := newProxy.signalReporter.snapshotAuthFailures(); len(got) != 1 || got[0].TokenFingerprint != "fingerprint-v1" {
+	got := waitForAuthFailureSnapshot(t, newProxy.signalReporter, 1)
+	if got[0].TokenFingerprint != "fingerprint-v1" {
 		t.Fatalf("reporter reconfiguration lost pending auth failure: %+v", got)
 	}
 	newProxy.signalReporter.configMu.RLock()
@@ -88,6 +116,21 @@ func TestProcessSignalReporterReconfiguresWithoutLosingPendingAuthFailure(t *tes
 	if endpoint != "http://new-control.invalid/accounts/me/signals" {
 		t.Fatalf("reporter endpoint = %q, want activated generation endpoint", endpoint)
 	}
+}
+
+func waitForAuthFailureSnapshot(t *testing.T, reporter *signalReporter, want int) []authFailureSample {
+	t.Helper()
+	deadline := time.Now().Add(time.Second)
+	for time.Now().Before(deadline) {
+		got := reporter.snapshotAuthFailures()
+		if len(got) == want {
+			return got
+		}
+		time.Sleep(time.Millisecond)
+	}
+	got := reporter.snapshotAuthFailures()
+	t.Fatalf("auth-failure snapshot length = %d, want %d: %+v", len(got), want, got)
+	return nil
 }
 
 func TestDormantProcessSignalReporterRetainsPendingWithoutFalseFailure(t *testing.T) {
