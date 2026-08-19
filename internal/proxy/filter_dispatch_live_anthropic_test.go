@@ -127,7 +127,20 @@ func TestLiveAnthropic_MaskedRequestAcceptedAndAnswered(t *testing.T) {
 	// punctuation 「，。」around the entities — the exact shape the offset-frame
 	// fix had to get right.
 	const phone = "13800138000"
-	const idCard = "11010119900307742X"
+	// 🔴 The check digit matters. "11010119900307742X" is INVALID under
+	// GB 11643 (which requires 4), so pii.cn.id_card — a validating,
+	// high-precision rule — never emitted CN_ID_CARD for it and this test was
+	// asserting nothing about CN ID cards at all. It passed anyway for a while,
+	// because five international numeric-ID regexes (FI/PL/DE/TR/SE) match any
+	// 17-digit+1 string and masked the substring for the wrong reason: a false
+	// green, not coverage.
+	//
+	// The sibling fixture in filter_dispatch_live_test.go was corrected on
+	// 2026-08-13 and THIS copy was missed, which nothing noticed because no make
+	// target reached this test — it is gated behind a funded Anthropic key. The
+	// Makefile comment on p4-filter-anthropic-l1 records that history; this is
+	// the line it was written about.
+	const idCard = "110101199003077424"
 	model := os.Getenv("AIKEY_TEST_ANTHROPIC_MODEL")
 	if model == "" {
 		model = "claude-3-5-haiku-20241022"
