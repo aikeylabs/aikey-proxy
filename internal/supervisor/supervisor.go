@@ -665,10 +665,17 @@ func New(cfg *config.Config, configPath, password, version string) (*Supervisor,
 				}
 				return accounts[i].SeatID < accounts[j].SeatID
 			})
+			// assignment_routing_version: the engine-assignment revision this
+			// worker is SERVING (override cache). The control-side cluster
+			// health compares it against the ledger's max routing_version —
+			// the P3 "projection stale" yellow light (方案 20260819 D4): a
+			// worker whose daemon/apply chain stalls stops advancing this
+			// number while control's keeps moving.
 			return struct {
-				Enabled        bool            `json:"enabled"`
-				CooledAccounts []cooledAccount `json:"cooled_accounts,omitempty"`
-			}{Enabled: true, CooledAccounts: accounts}
+				Enabled                  bool            `json:"enabled"`
+				AssignmentRoutingVersion int64           `json:"assignment_routing_version,omitempty"`
+				CooledAccounts           []cooledAccount `json:"cooled_accounts,omitempty"`
+			}{Enabled: true, AssignmentRoutingVersion: s.routingOverrides.Version(), CooledAccounts: accounts}
 		}
 		reg.SetHealthSource(cluster.NodeHealthSource(s.cfg.Vault.Path, s.version, time.Now(), canaryFn, metricsFn, poolRoutingFn))
 		observability.GoSafe("supervisor.cluster_registrar", observability.Isolated, func() { reg.Run(s.ctx) })
