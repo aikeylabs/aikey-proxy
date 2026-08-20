@@ -34,9 +34,9 @@ type AuditStatus struct {
 	// SentUnconfirmed with growing AutoReconcileRuns and no Resent progress is
 	// the operator's cue that the collector's diagnostics endpoints are broken
 	// or the gap is WAL-absent (check dead letters / known-loss).
-	SentUnconfirmed     int64 `json:"sent_unconfirmed"`      // Σ max(sentSeq-confirmedSeq, 0)
-	AutoReconcileRuns   int64 `json:"auto_reconcile_runs"`   // total automatic ReconcileGaps triggers
-	AutoReconcileResent int64 `json:"auto_reconcile_resent"` // total seqs recovered by auto-reconcile
+	SentUnconfirmed     int64 `json:"sent_unconfirmed"`       // Σ max(sentSeq-confirmedSeq, 0)
+	AutoReconcileRuns   int64 `json:"auto_reconcile_runs"`    // total automatic ReconcileGaps triggers
+	AutoReconcileResent int64 `json:"auto_reconcile_resent"`  // total seqs recovered by auto-reconcile
 	AutoReconcileGaveUp int64 `json:"auto_reconcile_gave_up"` // seqs ledgered lost after the terminal-resend budget (N4)
 }
 
@@ -133,13 +133,68 @@ const terminalResendAttempts = 3
 // re-sends, and confirm-lost only ledgers genuinely-absent seqs.
 func (r *Reporter) ReconcileGaps(ctx context.Context) (ReconcileResult, error) {
 	var res ReconcileResult
-	base := r.collectorBase()
-	if base == "" {
-		return res, fmt.Errorf("no collector_url configured; cannot reconcile")
-	}
 	if r.cfg.SourceID == "" {
 		return res, fmt.Errorf("source identity unknown; cannot reconcile")
 	}
+	bases := r.reconcileDestinations()
+	if len(bases) == 0 {
+		return res, fmt.Errorf("no collector destination configured; cannot reconcile")
+	}
+	var firstErr error
+	for _, base := range bases {
+		sub, err := r.reconcileAgainst(ctx, base)
+		res.Sources += sub.Sources
+		res.Resent += sub.Resent
+		res.ConfirmedLost += sub.ConfirmedLost
+		res.GaveUp += sub.GaveUp
+		res.StillMissing += sub.StillMissing
+		if err != nil && firstErr == nil {
+			// Keep reconciling the OTHER destinations: one unreachable collector
+			// must not leave a reachable one un-reconciled (that is how a single
+			// offline team server froze local delivery integrity).
+			firstErr = fmt.Errorf("reconcile against %s: %w", base, err)
+		}
+	}
+	return res, firstErr
+}
+
+// reconcileDestinations lists the DISTINCT collectors this proxy uploads to.
+//
+// 🔴 Reconcile must ask each destination about the seqs IT was given (bugfix
+// 2026-08-20). It used to ask exactly one — collectorBase(), i.e. the legacy
+// single CollectorURL, which on a Personal install is the LOCAL collector —
+// about every seq the source ever allocated, including the ones uploaded to the
+// REMOTE team collector. The local one truthfully answered "never saw those",
+// so reconcile re-sent them and then ledgered them as client-confirmed losses
+// in the LOCAL ledger: 479 rows and climbing, none of them real.
+//
+// Cause: per-route destinations (collector_routes) landed 2026-06-13 in 212f908
+// and were wired into the upload path and the dead-letter replay path, but not
+// into this one — collectorBase() has not been touched since it was written on
+// 2026-06-01, when one destination was the only possibility.
+func (r *Reporter) reconcileDestinations() []string {
+	seen := make(map[string]bool, 3)
+	var out []string
+	add := func(u string) {
+		u = strings.TrimRight(strings.TrimSpace(u), "/")
+		if u == "" || seen[u] {
+			return
+		}
+		seen[u] = true
+		out = append(out, u)
+	}
+	for _, u := range r.cfg.CollectorRoutes {
+		add(u)
+	}
+	// Legacy single sink: also the fallback destination for any route source
+	// with no entry of its own (see urlForRouteSource), so it can hold events.
+	add(r.cfg.CollectorURL)
+	return out
+}
+
+// reconcileAgainst runs one full reconcile pass against a single collector.
+func (r *Reporter) reconcileAgainst(ctx context.Context, base string) (ReconcileResult, error) {
+	var res ReconcileResult
 
 	// Discover the (org, source) pairs for THIS source via completeness, then ask
 	// /gaps for the actual missing seqs. We do NOT gate on completeness's
@@ -361,19 +416,13 @@ func (r *Reporter) maybeAutoReconcile() {
 	}()
 }
 
-// collectorBase resolves the collector base URL (legacy single URL, else the
-// first non-empty per-route URL). The reconcile endpoints live on the collector.
-func (r *Reporter) collectorBase() string {
-	if r.cfg.CollectorURL != "" {
-		return strings.TrimRight(r.cfg.CollectorURL, "/")
-	}
-	for _, u := range r.cfg.CollectorRoutes {
-		if u != "" {
-			return strings.TrimRight(u, "/")
-		}
-	}
-	return ""
-}
+// (removed 2026-08-20) collectorBase() used to resolve ONE collector base URL —
+// the legacy single CollectorURL — and every reconcile/diagnostics call went
+// there regardless of which collector the events had actually been uploaded to.
+// It is replaced by reconcileDestinations(), which enumerates them all. Do not
+// reintroduce a single-base helper here: on a Personal install CollectorURL is
+// the LOCAL collector, so a single base silently reconciles TEAM deliveries
+// against the PERSONAL ledger.
 
 // walSeqSet returns the set of source_seqs present in the WAL for one source.
 func (r *Reporter) walSeqSet(source string) map[int64]bool {

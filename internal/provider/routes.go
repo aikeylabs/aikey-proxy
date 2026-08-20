@@ -126,3 +126,11 @@ func ProtocolFamily(providerCode, protocolHint string) (string, bool) {
 	// have one guessed for it.
 	return Routes().LegacyProtocolForProvider(providerCode)
 }
+
+// FamilyOf exposes the registry's provider family (e.g. kimi_code and
+// moonshot both belong to the `kimi` family). Used by the active-key matcher
+// to accept a legacy route-shaped entry without hard-coding which suppliers
+// a route may use — provider_registry.yaml owns that.
+func FamilyOf(providerOrAlias string) (string, bool) {
+	return providerregistry.Default().Family(providerOrAlias)
+}

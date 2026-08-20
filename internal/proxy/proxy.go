@@ -732,6 +732,14 @@ func (p *Proxy) SetFilterStub501(cause *FilterStubCause) {
 	p.filterStub501 = cause
 }
 
+// FilterStub501Cause returns the active fail-loud cause, or nil when the proxy
+// is serving normally. The supervisor polls it to know whether it is currently
+// REFUSING traffic over a missing/unspawnable filter binary — the one state in
+// which it must keep re-checking the filesystem (bugfix 2026-08-20: the latch's
+// cause is a file, its cure was only ever a vault-declaration change, so a
+// binary that arrived later was never noticed).
+func (p *Proxy) FilterStub501Cause() *FilterStubCause { return p.filterStub501 }
+
 // SetFilterHook installs the P4 filter dispatcher hook. Called once at
 // generation build time by the supervisor when a filter app is registered
 // AND its child binary spawned OK. Passing a working hook is the signal that

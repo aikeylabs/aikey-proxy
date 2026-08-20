@@ -912,6 +912,47 @@ func (s *Supervisor) managedKeySyncLoop() {
 	}
 }
 
+// healFilterStubIfResolvable clears a fail-loud 501 latch once the binary it
+// was waiting for exists. It reloads (rather than flipping the flag) because
+// the filter child lives on the generation: only a rebuild can spawn it.
+//
+// Scope is deliberately narrow — it acts ONLY when the proxy is currently
+// latched, and only for the binary-missing causes. A spawn failure is left
+// alone: retrying a child that just failed to start, every five seconds,
+// forever, is a crash loop, and its cure (fix the binary, reinstall) does go
+// through a declaration change or a restart.
+func (s *Supervisor) healFilterStubIfResolvable() {
+	s.healFilterStubWithReload(s.Reload)
+}
+
+// healFilterStubWithReload is the testable core: the reload is a parameter so a
+// test can assert WHETHER it was called (the whole point of the fix) without
+// standing up a real generation rebuild.
+func (s *Supervisor) healFilterStubWithReload(reload func(context.Context) error) {
+	gen := s.active.Load()
+	if gen == nil || gen.proxy == nil {
+		return
+	}
+	cause := gen.proxy.FilterStub501Cause()
+	if cause == nil {
+		return // serving normally: no stat, no work
+	}
+	switch cause.Reason {
+	case proxy.FilterStubReasonBinaryMissing, proxy.FilterStubReasonMandateNotInstalled:
+	default:
+		return // spawn failures do not self-heal on a timer (see above)
+	}
+	if bin, _ := resolveAppBinary(s.appsDir(), []string{slugOrDetector(cause.Slug)}); bin == "" {
+		return // still missing
+	}
+	slog.Info("supervisor: filter binary appeared while the data plane was fail-loud; reloading to spawn it",
+		"event.name", "proxy.filter_stub_healing", "slug", cause.Slug, "binary", cause.ExpectedPath)
+	if err := reload(s.ctx); err != nil {
+		slog.Warn("supervisor: reload to clear the filter 501 failed; will retry next tick",
+			"event.name", "proxy.filter_stub_heal_failed", "error", err)
+	}
+}
+
 // computeFilterSig returns a stable signature of the vault's current filter-app
 // set (sorted, comma-joined slugs). ok=false on read error so the caller skips
 // the comparison rather than mistaking an error for a "set changed" → reload storm.
@@ -988,6 +1029,16 @@ func (s *Supervisor) syncManagedKeys() {
 	// (≤1 tick behind, safe side). Runs every tick regardless of vault-seq, before
 	// the early-return below. Best-effort: a write failure only WARNs.
 	s.flushLocalUsage()
+
+	// SELF-HEAL while fail-loud (bugfix 2026-08-20). When the data plane is
+	// refusing everything because a declared filter binary could not be
+	// resolved, the cure is a FILE appearing — but every reload trigger below
+	// keys on the vault's change_seq, and `aikey app install` laying the
+	// binary down changes no vault row. Cause and cure sat on different axes,
+	// so a machine that was fixed stayed 501 until someone restarted the proxy
+	// (staging, 2026-08-20). Poll only while latched: one stat per tick in the
+	// broken state, nothing at all in the healthy one.
+	s.healFilterStubIfResolvable()
 
 	vaultSeq, err := vault.ReadConfigU64LE(s.cfg.Vault.Path, VaultChangeSeqKey)
 	if err != nil {

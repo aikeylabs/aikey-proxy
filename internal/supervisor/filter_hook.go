@@ -142,9 +142,14 @@ func (s *Supervisor) installFilterHook(p *proxy.Proxy, vaultReader *vault.Reader
 		if declaredButMissing {
 			// A filter is required (vault declaration or org mandate) but its
 			// installed binary can't be resolved. Fail loud — do NOT pass
-			// traffic through unfiltered (anti-example F). Re-evaluated each
-			// Reload, so it self-heals once `aikey app install` lays the
-			// binary down. The cause carries the SAME facts as these logs so
+			// traffic through unfiltered (anti-example F).
+			//
+			// Recovery is NOT automatic by virtue of being "re-evaluated each
+			// Reload" — that claim stood here until 2026-08-20 and was false in
+			// the case that matters: laying the binary down changes no vault
+			// row, so no reload is triggered and the 501 outlives the fix. The
+			// sync loop's healFilterStubIfResolvable is what actually closes
+			// that gap; it polls the path only while this latch is set. The cause carries the SAME facts as these logs so
 			// the client-visible 501 can never diverge from them again
 			// (bugfix 2026-08-19 filterpipe-501-stale-copy).
 			causeSlug := slug

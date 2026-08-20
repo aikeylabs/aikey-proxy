@@ -1544,7 +1544,11 @@ func (p *Proxy) handlePathPrefixRoute(w http.ResponseWriter, r *http.Request, pr
 			if cfg != nil && cfg.KeyType == "personal" {
 				supported := len(cfg.Providers) == 0
 				for _, code := range cfg.Providers {
-					if strings.EqualFold(providerCanonicalCode(code), canonicalCode) {
+					// Dual-axis (bugfix 2026-08-20): canonical equality alone
+					// accepted a legacy route-shaped entry as ONE supplier of
+					// its family and refused the siblings — a moonshot key
+					// served /kimi/v1 and 503'd /moonshot/v1.
+					if activeEntryServesProvider(code, canonicalCode) {
 						supported = true
 						break
 					}
