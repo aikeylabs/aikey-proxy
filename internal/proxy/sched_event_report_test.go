@@ -168,10 +168,10 @@ func TestNoteSchedRouteSettledIsChangeGated(t *testing.T) {
 	}
 
 	// First settle → exactly one route_resolved(reason=first_settle, origin=aikey).
-	p.noteSchedRouteSettled("g1", "seat1", "acctA", "credA", "tr-1")
+	p.noteSchedRouteSettled("g1", "seat1", "acctA", "credA", "tr-1", "local_hrw")
 	// Sticky repeats (same day) → nothing.
-	p.noteSchedRouteSettled("g1", "seat1", "acctA", "credA", "tr-2")
-	p.noteSchedRouteSettled("g1", "seat1", "acctA", "credA", "tr-3")
+	p.noteSchedRouteSettled("g1", "seat1", "acctA", "credA", "tr-2", "local_hrw")
+	p.noteSchedRouteSettled("g1", "seat1", "acctA", "credA", "tr-3", "local_hrw")
 	events := drain()
 	if len(events) != 1 || events[0].EventName != observability.EventProxyGroupRouteResolved {
 		t.Fatalf("first settle: got %+v, want one route_resolved", events)
@@ -181,7 +181,7 @@ func TestNoteSchedRouteSettledIsChangeGated(t *testing.T) {
 	}
 
 	// Change → exactly one account_switched carrying from→to.
-	p.noteSchedRouteSettled("g1", "seat1", "acctB", "credB", "tr-4")
+	p.noteSchedRouteSettled("g1", "seat1", "acctB", "credB", "tr-4", "local_hrw")
 	events = drain()
 	if len(events) != 1 || events[0].EventName != observability.EventProxyGroupAccountSwitched {
 		t.Fatalf("switch: got %+v, want one account_switched", events)
@@ -191,7 +191,7 @@ func TestNoteSchedRouteSettledIsChangeGated(t *testing.T) {
 	}
 
 	// Another seat settling on the same account is its own first settle.
-	p.noteSchedRouteSettled("g1", "seat2", "acctB", "credB", "tr-5")
+	p.noteSchedRouteSettled("g1", "seat2", "acctB", "credB", "tr-5", "local_hrw")
 	events = drain()
 	if len(events) != 1 || events[0].EventName != observability.EventProxyGroupRouteResolved {
 		t.Fatalf("second seat: got %+v, want one route_resolved", events)
@@ -208,15 +208,15 @@ func TestNoteSchedRouteSettled_DailyFirstCall(t *testing.T) {
 	defer func() { schedDay = origDay }()
 
 	schedDay = func() string { return "2026-08-18" }
-	p.noteSchedRouteSettled("g1", "seat1", "acctA", "credA", "")
+	p.noteSchedRouteSettled("g1", "seat1", "acctA", "credA", "", "local_hrw")
 	<-r.evIn // consume first_settle
-	p.noteSchedRouteSettled("g1", "seat1", "acctA", "credA", "")
+	p.noteSchedRouteSettled("g1", "seat1", "acctA", "credA", "", "local_hrw")
 	if len(r.evIn) != 0 {
 		t.Fatal("same-day sticky must stay silent")
 	}
 
 	schedDay = func() string { return "2026-08-19" }
-	p.noteSchedRouteSettled("g1", "seat1", "acctA", "credA", "")
+	p.noteSchedRouteSettled("g1", "seat1", "acctA", "credA", "", "local_hrw")
 	if len(r.evIn) != 1 {
 		t.Fatalf("day rollover must emit exactly one row, got %d", len(r.evIn))
 	}
@@ -225,7 +225,7 @@ func TestNoteSchedRouteSettled_DailyFirstCall(t *testing.T) {
 		t.Fatalf("daily row wrong: %+v", ev)
 	}
 	// And only once per day.
-	p.noteSchedRouteSettled("g1", "seat1", "acctA", "credA", "")
+	p.noteSchedRouteSettled("g1", "seat1", "acctA", "credA", "", "local_hrw")
 	if len(r.evIn) != 0 {
 		t.Fatal("second call of the new day must stay silent")
 	}
@@ -240,7 +240,7 @@ func TestNoteSchedRouteSettled_RecoveredSameAccount(t *testing.T) {
 	store := newPoolCooldownStore()
 	p := &Proxy{signalReporter: r, poolCooldown: store}
 
-	p.noteSchedRouteSettled("g1", "seat1", "acctA", "credA", "")
+	p.noteSchedRouteSettled("g1", "seat1", "acctA", "credA", "", "local_hrw")
 	<-r.evIn // first_settle
 
 	// Cool the account, then advance the injected clock past the deadline; the
@@ -250,7 +250,7 @@ func TestNoteSchedRouteSettled_RecoveredSameAccount(t *testing.T) {
 	store.now = func() time.Time { return time.Now().Add(time.Minute) }
 	_ = store.skipSet()
 
-	p.noteSchedRouteSettled("g1", "seat1", "acctA", "credA", "")
+	p.noteSchedRouteSettled("g1", "seat1", "acctA", "credA", "", "local_hrw")
 	if len(r.evIn) != 1 {
 		t.Fatalf("recovery must emit exactly one row, got %d", len(r.evIn))
 	}
@@ -259,7 +259,7 @@ func TestNoteSchedRouteSettled_RecoveredSameAccount(t *testing.T) {
 		t.Fatalf("recovered row wrong: %+v", ev)
 	}
 	// Consumed — the next sticky request is silent again.
-	p.noteSchedRouteSettled("g1", "seat1", "acctA", "credA", "")
+	p.noteSchedRouteSettled("g1", "seat1", "acctA", "credA", "", "local_hrw")
 	if len(r.evIn) != 0 {
 		t.Fatal("recovery marker must be one-shot")
 	}
@@ -290,8 +290,87 @@ func TestSchedEventHooksAreNilReporterSafe(t *testing.T) {
 	p := &Proxy{} // signalReporter nil — the Personal shape
 	p.reportSchedEvent(observability.EventProxyGroupAccountCooldown, schedSeverityWarn, schedOriginProvider, "",
 		"g1", "cred1", "acct1", "seat1", "tr", map[string]any{"status": 429})
-	p.noteSchedRouteSettled("g1", "seat1", "acct1", "cred1", "tr")
+	p.noteSchedRouteSettled("g1", "seat1", "acct1", "cred1", "tr", "local_hrw")
 	if _, loaded := p.schedRouted.Load("g1|seat1"); loaded {
 		t.Fatal("nil-reporter settle must not record state (Personal stays untouched)")
+	}
+}
+
+// TestClassifyPickSource pins the provenance truth table (方案 20260819 P0-2 S4):
+// the discriminator between "the engine decided" and "the local HRW floor
+// decided" — the exact question the P0-2 triage could not answer from any log.
+func TestClassifyPickSource(t *testing.T) {
+	cases := []struct {
+		name                      string
+		served, primary, override string
+		want                      string
+	}{
+		{"engine redirected off rank-0", "B", "A", "B", pickSourceEngineOverride},
+		{"engine pick coincides with rank-0", "A", "A", "A", pickSourceOverrideConfirmsHRW},
+		{"no override, floor serves rank-0", "A", "A", "", pickSourceLocalHRW},
+		{"unusable override, floor serves rank-0", "A", "A", "C", pickSourceLocalHRW},
+		{"ranked walk advanced past override and rank-0", "C", "A", "B", pickSourceLocalFallback},
+		{"no override, ranked walk advanced past rank-0", "B", "A", "", pickSourceLocalFallback},
+	}
+	for _, tc := range cases {
+		if got := classifyPickSource(tc.served, tc.primary, tc.override); got != tc.want {
+			t.Errorf("%s: classifyPickSource(%q,%q,%q) = %q, want %q",
+				tc.name, tc.served, tc.primary, tc.override, got, tc.want)
+		}
+	}
+}
+
+// TestNoteSchedRouteSettledPickSourceChange — 方案 20260819 P0-2 S4: the change
+// gate is the (account, pick_source) PAIR. A floor→engine handover on an
+// unchanged account (the moment the P0-2 no-data window closes) must leave a
+// pick_source_changed row instead of vanishing into sticky suppression.
+func TestNoteSchedRouteSettledPickSourceChange(t *testing.T) {
+	r := looplessSignalReporter()
+	p := &Proxy{signalReporter: r, poolCooldown: newPoolCooldownStore()}
+
+	drain := func() []schedulingEventSample {
+		var out []schedulingEventSample
+		for {
+			select {
+			case ev := <-r.evIn:
+				out = append(out, ev)
+				continue
+			default:
+			}
+			return out
+		}
+	}
+
+	// Settle on the floor (engine has no data yet — the P0-2 window).
+	p.noteSchedRouteSettled("g1", "seat1", "acctA", "credA", "tr-1", "local_hrw")
+	events := drain()
+	if len(events) != 1 || events[0].Detail["pick_source"] != "local_hrw" {
+		t.Fatalf("first settle: got %+v, want pick_source=local_hrw in detail", events)
+	}
+
+	// Engine binds the SAME account → provenance flips, account doesn't.
+	p.noteSchedRouteSettled("g1", "seat1", "acctA", "credA", "tr-2", "override_confirms_hrw")
+	events = drain()
+	if len(events) != 1 || events[0].EventName != observability.EventProxyGroupRouteResolved {
+		t.Fatalf("provenance flip: got %+v, want one route_resolved", events)
+	}
+	if events[0].Detail["reason"] != schedResolvePickSourceChanged ||
+		events[0].Detail["pick_source"] != "override_confirms_hrw" ||
+		events[0].Detail["from_pick_source"] != "local_hrw" {
+		t.Fatalf("provenance flip detail wrong: %+v", events[0].Detail)
+	}
+
+	// Same account, same provenance → sticky, no row.
+	p.noteSchedRouteSettled("g1", "seat1", "acctA", "credA", "tr-3", "override_confirms_hrw")
+	if events = drain(); len(events) != 0 {
+		t.Fatalf("sticky same provenance: got %+v, want nothing", events)
+	}
+
+	// Switched row must carry pick_source too.
+	p.noteSchedRouteSettled("g1", "seat1", "acctB", "credB", "tr-4", "engine_override")
+	events = drain()
+	if len(events) != 1 || events[0].EventName != observability.EventProxyGroupAccountSwitched ||
+		events[0].Detail["pick_source"] != "engine_override" {
+		t.Fatalf("switch: got %+v, want account_switched with pick_source", events)
 	}
 }

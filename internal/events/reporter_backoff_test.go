@@ -124,8 +124,11 @@ func TestBackoffForFailures(t *testing.T) {
 		{1, 5 * time.Second},
 		{2, 15 * time.Second},
 		{3, 60 * time.Second},
-		{4, 5 * time.Minute},
-		{99, 5 * time.Minute},
+		// Top tier capped at 60s (2026-08-19): the max retry interval must stay
+		// well inside the five-minute delivery-convergence window; 5min-tier
+		// retries armed at load-stop landed outside it (P0-4 F4 ladder tail).
+		{4, 60 * time.Second},
+		{99, 60 * time.Second},
 	}
 	for _, c := range cases {
 		if got := backoffForFailures(c.n); got != c.want {

@@ -522,10 +522,35 @@ func (p *Proxy) serveRoute(w http.ResponseWriter, r *http.Request, route *vkeys.
 	// and stops billing. Partial token usage is still recorded by the drainer.
 	inner := p.currentTransport()
 	if inner == nil {
-		inner = http.DefaultTransport
+		inner = defaultUpstreamTransport
 		logger.Debug("using default transport (no custom transport set)")
 	} else {
 		logger.Debug("using custom transport (upstream proxy)")
+	}
+	// Resident Mock Provider is node-LOCAL IPC, never provider egress traffic
+	// (bugfix 2026-08-19 staging P0-1): the node-upstream chain inside
+	// currentTransport() tunneled the Mock's private base_url out through the
+	// configured node upstream, which RST every dial; the path breaker opened
+	// and every Team OAuth request answered 503 pre-dial while the Mock and its
+	// runtime material were perfectly healthy. Provider-identity judgment (not
+	// an IP allowlist) mirrors the broker's mock branch and the E2E invariant
+	// "mock loopback IPC never traverses egress"; mock tokens are synthetic (no
+	// anti-ban need) and the mock provider does not exist outside
+	// MOCK_PROVIDER_ENABLED deployments, so production dialing is untouched.
+	// Scope: OAUTH-GROUP routes only (the incident path), and only when the
+	// process transport is a standard *http.Transport — exactly the shape the
+	// node-upstream chain uses (buildTransport). Its Proxy hook is what
+	// tunneled the Mock's private base_url out; stripping Proxy on a clone
+	// keeps every other dial property. Custom RoundTrippers (unit-test
+	// interception, engine chains) pass through untouched.
+	if route.OauthGroupID != "" &&
+		(providerCanonicalCode(route.ProviderCode) == "mock" || providerCanonicalCode(route.Provider) == "mock") {
+		if ht, ok := inner.(*http.Transport); ok && ht.Proxy != nil {
+			direct := ht.Clone()
+			direct.Proxy = nil
+			inner = direct
+			logger.Debug("resident mock group route: node-upstream proxy stripped (direct dial)")
+		}
 	}
 	// Per-account egress proxy (§11.7, P7): when the resolved oauth-group account
 	// pins an egress_proxy_url, THIS request leaves through it, chained through the
@@ -1260,6 +1285,24 @@ func (p *Proxy) serveRoute(w http.ResponseWriter, r *http.Request, route *vkeys.
 						"consecutive_failures", health.ConsecutiveFailures,
 						"retry_after_seconds", health.RetryAfterSeconds,
 					)
+					// E1 (方案 20260819-入口错误可见性 W1): the dial failure itself
+					// must reach the master's unified scheduling log. Before this
+					// hook only the PRE-dial breaker refusal reported centrally, so
+					// the first failing request of every path-health window was
+					// invisible off-box — the exact blind spot the staging P0-1
+					// outage sat in. Code derivation shares the single exit with
+					// respondProviderPathUnavailable; the reporter's per-window
+					// suppression bounds a failure burst to one row per subject.
+					p.reportSchedEvent(observability.EventProxyGroupProviderPathState,
+						schedSeverityWarn, schedOriginAikey, groupPathUnavailableCode(health),
+						route.OauthGroupID, route.CredentialID, route.AccountID, route.SeatID, "",
+						map[string]any{
+							"path_id":              health.PathID,
+							"transport":            health.Transport,
+							"state":                health.State,
+							"failure_class":        health.FailureClass,
+							"consecutive_failures": health.ConsecutiveFailures,
+						})
 				}
 			}
 			// Per-account egress dial failure (a socks5 hop refused, or a
@@ -1392,3 +1435,4 @@ func accountEgressErrorMessage(route *vkeys.ResolvedRoute, detail string) string
 	}
 	return "AiKey: " + subject + " is signed in, but " + detail
 }
+

@@ -343,19 +343,26 @@ type Proxy struct {
 	// UpstreamTimeout caps how long a detached upstream call may run after
 	// the client disconnects. Default: defaultUpstreamTimeout (10 min).
 	UpstreamTimeout time.Duration
-	// filterStub501Active is set at proxy generation build time when the
-	// vault contains any app_records row with filter_stages != NULL BUT no
-	// working filter dispatcher could be constructed (e.g. detector binary
-	// missing). While active, ALL data-plane traffic returns 501
-	// FILTER_NOT_IMPLEMENTED — SPEC §1.5.7 / §6.6 anti-example F mandate that
-	// an unimplemented/broken filter chain must NOT silently let traffic
-	// through (would be "pseudo-security": looks configured, actually inert).
-	// Set during supervisor.buildGeneration; not flipped at runtime.
+	// filterStub501 is set (non-nil) at proxy generation build time when a
+	// compliance filter is REQUIRED (vault filter_stages declaration or org
+	// mandate) but no working filter dispatcher could be constructed. While
+	// set, ALL data-plane traffic returns 501 — SPEC §1.5.7 / §6.6
+	// anti-example F mandate that a broken filter chain must NOT silently let
+	// traffic through (would be "pseudo-security": looks configured, actually
+	// inert). Set during supervisor.buildGeneration; not flipped at runtime.
+	//
+	// The cause carries WHY (bugfix 2026-08-19 filterpipe-501-stale-copy):
+	// the supervisor always knew the real reason and the fix path, but the
+	// P3-era user-facing string kept claiming "dispatcher not implemented /
+	// wait for the build / server-side / temporary" long after the P4
+	// dispatcher shipped — three lies and zero actionable steps while the
+	// logs told the truth. The 501 body must render the SAME facts the
+	// supervisor logs.
 	//
 	// Mutually exclusive with filterHook: supervisor sets EITHER a working
-	// filterHook (dispatcher present) OR filterStub501Active (declared but
-	// no working dispatcher), never both.
-	filterStub501Active bool
+	// filterHook (dispatcher present) OR filterStub501 (declared but no
+	// working dispatcher), never both.
+	filterStub501 *FilterStubCause
 	// filterIncremental, when true, makes the inbound filter scan ONLY the
 	// latest user turn (the new content) instead of re-scanning system + the
 	// whole conversation history every request. WHY: clients like OpenClaw
@@ -386,7 +393,8 @@ type Proxy struct {
 
 // SetTransport sets a custom RoundTripper for outbound requests to AI providers.
 // Must be called before serving requests. A nil value restores the default
-// behavior (http.DefaultTransport, which honors HTTP_PROXY / HTTPS_PROXY env vars).
+// behavior (defaultUpstreamTransport — http.DefaultTransport semantics incl.
+// HTTP_PROXY / HTTPS_PROXY, with per-host idle capacity raised, see below).
 func (p *Proxy) SetTransport(t http.RoundTripper) {
 	p.transport.Store(&transportBox{rt: t})
 	if t != nil {
@@ -397,6 +405,25 @@ func (p *Proxy) SetTransport(t http.RoundTripper) {
 // transportBox boxes the RoundTripper so it can live in an atomic.Pointer (atomics
 // can't hold an interface value directly). A nil rt means "use the default".
 type transportBox struct{ rt http.RoundTripper }
+
+// defaultUpstreamTransport is the fallback outbound transport when no custom
+// transport (node-upstream chain / test interception) is set. It is
+// http.DefaultTransport CLONED (Proxy env semantics and HTTP/2 wiring stay
+// identical) with MaxIdleConnsPerHost raised from Go's default of 2: a worker
+// fans hundreds of concurrent requests into a SINGLE provider host, so
+// per-host idle capacity 2 discards almost every connection after use —
+// TIME_WAIT piles up until the host exhausts ephemeral ports (EADDRNOTAVAIL)
+// and unrelated local dials (cluster heartbeats!) start failing, and every
+// discarded connection is an extra TLS handshake toward the provider (WAF
+// exposure). N2 定案 2026-08-19 (容量 P0-4 方案): reproduced 3× at 120 users.
+// The egress engine already used 100 (egress_engine.go) — this closes the gap
+// on the default path.
+var defaultUpstreamTransport = func() http.RoundTripper {
+	t := http.DefaultTransport.(*http.Transport).Clone()
+	t.MaxIdleConns = 100
+	t.MaxIdleConnsPerHost = 100
+	return t
+}()
 
 // currentTransport returns the live RoundTripper (nil → caller falls back to the
 // default). Lock-free atomic read: safe on the hot path concurrently with a
@@ -654,14 +681,45 @@ func (p *Proxy) recordAppHealth(slug string, statusCode int, errorType string) {
 	p.appHealthCache.RecordCall(slug, statusCode, errorType, time.Now())
 }
 
-// SetFilterStub501Active is the supervisor wiring entry for the SPEC
-// §1.5.7 P3 stub: when the vault has any app declaring filter_stages
-// but the real filter dispatcher is not yet shipped, the proxy must
-// fail-loud rather than silent-allow. Called once at generation build;
-// must not be flipped at runtime (the filterpipe implementation will
-// land in P4 alongside its own runtime wiring).
-func (p *Proxy) SetFilterStub501Active(active bool) {
-	p.filterStub501Active = active
+// FilterStubCause says WHY the fail-loud filter 501 is active, in enough
+// detail for the 501 body to give the user the SAME facts and fix path the
+// supervisor logs carry (they must never diverge again — bugfix 2026-08-19).
+type FilterStubCause struct {
+	// Reason is one of the FilterStubReason* constants.
+	Reason string
+	// Slug is the filter app whose dispatcher could not be built.
+	Slug string
+	// ExpectedPath is where the binary was looked for (empty when unknown,
+	// e.g. spawn failures report the resolved binary path instead).
+	ExpectedPath string
+	// Mandated marks the org-mandate flavor: the block cannot be lifted by
+	// clearing local settings — only installing the detector (or the org
+	// dropping the mandate) unblocks traffic.
+	Mandated bool
+}
+
+// Reason vocabulary for FilterStubCause (also emitted as the additive
+// `reason_code` field on the 501 body; error-code-changelog entry required
+// when this list changes).
+const (
+	// FilterStubReasonMandateNotInstalled: org mandates compliance but the
+	// detector binary is absent on this machine.
+	FilterStubReasonMandateNotInstalled = "COMPLIANCE_MANDATED_NOT_INSTALLED"
+	// FilterStubReasonBinaryMissing: vault declares a filter app but its
+	// binary was not found at the canonical path.
+	FilterStubReasonBinaryMissing = "FILTER_BINARY_MISSING"
+	// FilterStubReasonSpawnFailed: binary present but every detector process
+	// failed to start.
+	FilterStubReasonSpawnFailed = "FILTER_SPAWN_FAILED"
+)
+
+// SetFilterStub501 is the supervisor wiring entry for the SPEC §1.5.7 /
+// §6.6 fail-loud guard: when a compliance filter is required (vault
+// declaration or org mandate) but no working dispatcher could be built, the
+// proxy must fail-loud rather than silent-allow. nil clears the guard.
+// Called once at generation build; must not be flipped at runtime.
+func (p *Proxy) SetFilterStub501(cause *FilterStubCause) {
+	p.filterStub501 = cause
 }
 
 // SetFilterHook installs the P4 filter dispatcher hook. Called once at

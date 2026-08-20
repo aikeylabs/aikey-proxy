@@ -52,6 +52,37 @@ const (
 	groupErrLoginRequired = "OAUTH_GROUP_MEMBER_LOGIN_REQUIRED"
 )
 
+// pick_source values (方案 20260819 P0-2 S4): who decided the served account.
+// Value enum lives next to its producer (sched_event_report.go origin precedent);
+// it rides slog + scheduling-event detail only — NOT a filterable column (upgrade
+// per the origin-column precedent if filtering is ever needed). A true "sticky"
+// value is deliberately absent: engine binding_state does not cross routingwire,
+// so the proxy cannot write it — declaring it would be a signal with no writer.
+// needs_login is likewise absent: that outcome never settles a route (it is the
+// distinct proxy.group.login_required error event instead).
+const (
+	pickSourceEngineOverride      = "engine_override"       // engine redirected off the local rank-0
+	pickSourceOverrideConfirmsHRW = "override_confirms_hrw" // engine pick coincides with local rank-0
+	pickSourceLocalHRW            = "local_hrw"             // no usable override — local floor served rank-0
+	pickSourceLocalFallback       = "local_fallback"        // ranked walk advanced past override and rank-0
+)
+
+// classifyPickSource labels the served account's decision provenance from the
+// three values the resolver already holds. Pure so the fence test can pin the
+// truth table.
+func classifyPickSource(served, primary, override string) string {
+	switch {
+	case override != "" && served == override && served != primary:
+		return pickSourceEngineOverride
+	case override != "" && served == override:
+		return pickSourceOverrideConfirmsHRW
+	case served == primary:
+		return pickSourceLocalHRW
+	default:
+		return pickSourceLocalFallback
+	}
+}
+
 // groupResolveError is a typed resolver failure so the caller can map a precise
 // HTTP status + error code without string matching.
 type groupResolveError struct {
@@ -77,6 +108,10 @@ type groupResolution struct {
 	// from AccountID, a fallback happened (the primary was cooled / exhausted /
 	// expired / has no material) — the caller audits the switch (N9 #8).
 	Primary string
+	// PickSource labels WHO decided AccountID (方案 20260819 P0-2 S4) — one of the
+	// pickSource* constants below. Rides slog + scheduling-event detail so ops can
+	// tell engine-authoritative routing from the local HRW floor after the fact.
+	PickSource string
 
 	// oauth_account: header injection via oauthInject(req, OAuth, ProviderCode).
 	OAuth *OAuthCredential
@@ -202,6 +237,7 @@ func resolveGroupCredential(route *vkeys.ResolvedRoute, derivedKey []byte, nowUn
 			}
 			res := buildGroupResolution(acc, refByID[acc], mat, secret)
 			res.Primary = primary
+			res.PickSource = classifyPickSource(acc, primary, overrideAccountID)
 			return res, nil
 		default: // PickNone
 			// R36 (2026-07-04, codex pools): expiry is member-fixable, but only the

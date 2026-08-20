@@ -474,14 +474,18 @@ func (p *Proxy) serveGroupAttempt(
 		path: path, overrideOn: overrideOn,
 	}))
 
-	// N9 #8: audit a fallback — the seat's primary account was unusable (cooled /
-	// exhausted / expired / no material) so we routed to a different candidate.
+	// N9 #8: audit a pick that landed off the local rank-0. pick_source now
+	// distinguishes the two very different causes this used to conflate
+	// (方案 20260819 P0-2 S4): engine_override = the engine deliberately
+	// redirected; local_fallback = rank-0 (and any override) was unusable
+	// (cooled / exhausted / expired / no material) and the ranked walk advanced.
 	if res.Primary != "" && res.Primary != res.AccountID {
-		logger.Info("oauth-group account switched (primary unusable)",
+		logger.Info("oauth-group account switched off rank-0",
 			"event.name", observability.EventProxyGroupAccountSwitched,
 			"oauth_group_id", rc.OauthGroupID,
 			"from_account_id", res.Primary,
 			"to_account_id", res.AccountID,
+			"pick_source", res.PickSource,
 		)
 	}
 
@@ -491,6 +495,7 @@ func (p *Proxy) serveGroupAttempt(
 		"account_id", res.AccountID,
 		"credential_type", res.CredentialType,
 		"provider", canonicalCode,
+		"pick_source", res.PickSource,
 	)
 	// Load-test egress safety must run BEFORE we note a settled route: a blocked
 	// load-test request never actually serves, so it must not record a route
@@ -504,7 +509,7 @@ func (p *Proxy) serveGroupAttempt(
 	// Unified scheduling log (master): one row per ROUTE CHANGE — first settle
 	// or switch — never per request (拍板 2026-08-17 #3).
 	p.noteSchedRouteSettled(rc.OauthGroupID, route.SeatID, res.AccountID, res.CredentialID,
-		observability.ExtractOrCreate(r).TraceID)
+		observability.ExtractOrCreate(r).TraceID, res.PickSource)
 
 	// Group VKs leave rc.ProviderCode empty by design (the provider is per-account
 	// in group_accounts; the base URL above already used the resolved canonicalCode,
@@ -623,13 +628,23 @@ func authFailedAccount(hardRevoked bool, accountID string) string {
 	return ""
 }
 
+// groupPathUnavailableCode is the SINGLE exit mapping a provider-path health
+// observation to the client-facing error code. Both consumers — the pre-dial
+// breaker refusal (respondProviderPathUnavailable) and the dial-failure
+// scheduling event (ErrorHandler, 方案 20260819-入口错误可见性 W1) — MUST derive
+// the code here; deriving it twice is how the two legs of one incident end up
+// filed under different codes in the master scheduling log.
+func groupPathUnavailableCode(health ProviderPathHealth) string {
+	if health.Transport != "node" || health.FailureClass == pathFailureEgressDial {
+		return observability.ErrCodeAccountEgressProxy
+	}
+	return observability.ErrCodeGroupUpstreamUnavailable
+}
+
 func (p *Proxy) respondProviderPathUnavailable(
 	w http.ResponseWriter, logger *slog.Logger, route *vkeys.ResolvedRoute, health ProviderPathHealth,
 ) {
-	code := observability.ErrCodeGroupUpstreamUnavailable
-	if health.Transport != "node" || health.FailureClass == pathFailureEgressDial {
-		code = observability.ErrCodeAccountEgressProxy
-	}
+	code := groupPathUnavailableCode(health)
 	if health.RetryAfterSeconds > 0 {
 		w.Header().Set("Retry-After", fmt.Sprintf("%d", health.RetryAfterSeconds))
 	}

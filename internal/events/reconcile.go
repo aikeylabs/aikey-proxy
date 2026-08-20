@@ -5,9 +5,11 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"log/slog"
 	"net/http"
 	"net/url"
 	"strings"
+	"time"
 
 	"github.com/AiKeyLabs/pkg/aikeytime"
 )
@@ -28,6 +30,13 @@ type AuditStatus struct {
 	AllocatedSeq    int64                    `json:"allocated_seq"`
 	WALFiles        int                      `json:"wal_files"`
 	DeadLetterCount int                      `json:"dead_letter_count"`
+	// D' auto-reconcile visibility (P0-4): a persistently-positive
+	// SentUnconfirmed with growing AutoReconcileRuns and no Resent progress is
+	// the operator's cue that the collector's diagnostics endpoints are broken
+	// or the gap is WAL-absent (check dead letters / known-loss).
+	SentUnconfirmed     int64 `json:"sent_unconfirmed"`      // Σ max(sentSeq-confirmedSeq, 0)
+	AutoReconcileRuns   int64 `json:"auto_reconcile_runs"`   // total automatic ReconcileGaps triggers
+	AutoReconcileResent int64 `json:"auto_reconcile_resent"` // total seqs recovered by auto-reconcile
 }
 
 // ComplianceDeliveryStatus reports what the compliance lane has waiting and why
@@ -69,7 +78,14 @@ func (r *Reporter) AuditStatus() AuditStatus {
 	st.Compliance.LastFailureAt = r.complianceLastFailureAt
 	st.Compliance.LastFailureCode = r.complianceLastFailureCode
 	st.Compliance.LastFailureReason = r.complianceLastFailureReason
+	for src, sent := range r.sentSeq {
+		if d := sent - r.confirmedSeq[src]; d > 0 {
+			st.SentUnconfirmed += d
+		}
+	}
 	r.mu.RUnlock()
+	st.AutoReconcileRuns = r.autoReconcileRuns.Load()
+	st.AutoReconcileResent = r.autoReconcileResent.Load()
 	return st
 }
 
@@ -183,6 +199,77 @@ func (r *Reporter) ReconcileGaps(ctx context.Context) (ReconcileResult, error) {
 // drains per source (each window is up to advanceWatermarkScanLimit seqs). A
 // huge gap beyond this is reported via StillMissing for a follow-up run.
 const maxReconcileWindows = 100
+
+// D' auto-reconcile tuning (P0-4 sentSeq silent-loss fix, user-approved
+// 2026-08-19). sentStallReconcilePasses is the N=3 the user signed off: three
+// consecutive un-gated drain passes with sentSeq ahead of confirmedSeq and
+// ZERO confirmedSeq progress = a stalled window that the drain loop can never
+// heal on its own. autoReconcileMinInterval debounces repeat triggers so a
+// gap that reconcile cannot fix (e.g. the collector's diagnostics endpoints
+// erroring) retries gently instead of hammering.
+const (
+	sentStallReconcilePasses = 3
+	autoReconcileMinInterval = 30 * time.Second
+)
+
+// maybeAutoReconcile is called at the end of every un-gated, non-force drain
+// pass. It watches the sent-but-unconfirmed window: progress on ANY source's
+// confirmedSeq resets the stall counter; a fully-caught-up state resets it
+// too. Only a persistent stall (sentSeq ahead + no progress for
+// sentStallReconcilePasses passes) fires ReconcileGaps, asynchronously and
+// singly (CAS guard), so the drain loop is never blocked.
+func (r *Reporter) maybeAutoReconcile() {
+	r.mu.Lock()
+	stalled := false
+	progressed := false
+	for src, sent := range r.sentSeq {
+		c := r.confirmedSeq[src]
+		if c > r.lastConfirmedView[src] {
+			progressed = true
+		}
+		r.lastConfirmedView[src] = c
+		if sent > c {
+			stalled = true
+		}
+	}
+	if !stalled || progressed {
+		r.stallPasses = 0
+		r.mu.Unlock()
+		return
+	}
+	r.stallPasses++
+	trigger := r.stallPasses >= sentStallReconcilePasses &&
+		time.Since(r.lastAutoReconcileAt) >= autoReconcileMinInterval
+	if trigger {
+		r.stallPasses = 0
+		r.lastAutoReconcileAt = time.Now()
+	}
+	r.mu.Unlock()
+	if !trigger {
+		return
+	}
+	if !r.autoReconcileRunning.CompareAndSwap(false, true) {
+		return // one reconcile at a time
+	}
+	go func() {
+		defer r.autoReconcileRunning.Store(false)
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+		defer cancel()
+		res, err := r.ReconcileGaps(ctx)
+		r.autoReconcileRuns.Add(1)
+		if err != nil {
+			slog.Warn("reporter: auto-reconcile failed",
+				"event.name", "usage.reporter.auto_reconcile_failed", "error", err)
+			return
+		}
+		r.autoReconcileResent.Add(int64(res.Resent))
+		slog.Warn("reporter: auto-reconcile recovered a stalled sent window",
+			"event.name", "usage.reporter.auto_reconcile_recovered",
+			"resent", res.Resent,
+			"confirmed_lost", res.ConfirmedLost,
+			"still_missing", res.StillMissing)
+	}()
+}
 
 // collectorBase resolves the collector base URL (legacy single URL, else the
 // first non-empty per-route URL). The reconcile endpoints live on the collector.

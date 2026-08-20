@@ -124,6 +124,55 @@ func TestCooldownDecision_Classification(t *testing.T) {
 	}
 }
 
+// Coverage-audit fences (2026-08-19): the GENERAL weekly (7d) window. Every
+// other 429 fence in this file exercises the 5h window, so the `"7d"` literal in
+// anthropicExhaustionEvidence / anthropicExhaustedWindowResetDuration ran with
+// zero coverage, and R52.1 (both general windows exhausted → cool to the LATER
+// wall) was written in the requirement spec without a fence. A typo in that one
+// literal would silently drop 7d-only exhaustion to the 5s transient cooldown
+// and re-hammer a fully rate-limited account.
+func TestCooldownDecision_GeneralWeekly7d(t *testing.T) {
+	now := time.Unix(1_750_000_000, 0)
+
+	// ONLY the 7d window exhausted — 5h visibly healthy, NO aggregate status —
+	// so both the evidence and the reset must come from the 7d branch alone.
+	sevenDReset := now.Add(40 * time.Minute) // under poolCooldownMax → exact wall asserts
+	only7d := http.Header{
+		"Anthropic-Ratelimit-Unified-5h-Status":      {"allowed"},
+		"Anthropic-Ratelimit-Unified-5h-Utilization": {"0.42"},
+		"Anthropic-Ratelimit-Unified-7d-Status":      {"rejected"},
+		"Anthropic-Ratelimit-Unified-7d-Reset":       {strconv.FormatInt(sevenDReset.Unix(), 10)},
+	}
+	if until, ok := cooldownDecision(resp(429, only7d), now); !ok || !until.Equal(sevenDReset) { //nolint:bodyclose // synthetic response: no Body, no transport — nothing to close
+		t.Fatalf("7d-only exhaustion must cool until the 7d reset, got until=%v ok=%v", until, ok)
+	}
+
+	// R52.1: BOTH general windows exhausted → the LATER wall wins, in either
+	// direction (max semantics, not a preference for the 7d window).
+	dual := func(fiveHReset, sevenDReset time.Time) http.Header {
+		return http.Header{
+			"Anthropic-Ratelimit-Unified-5h-Utilization": {"1.0"},
+			"Anthropic-Ratelimit-Unified-5h-Reset":       {strconv.FormatInt(fiveHReset.Unix(), 10)},
+			"Anthropic-Ratelimit-Unified-7d-Status":      {"rejected"},
+			"Anthropic-Ratelimit-Unified-7d-Reset":       {strconv.FormatInt(sevenDReset.Unix(), 10)},
+		}
+	}
+	sooner, later := now.Add(10*time.Minute), now.Add(50*time.Minute)
+	if until, ok := cooldownDecision(resp(429, dual(sooner, later)), now); !ok || !until.Equal(later) { //nolint:bodyclose // synthetic response: no Body, no transport — nothing to close
+		t.Fatalf("dual exhaustion must cool to the later (7d) wall, got until=%v ok=%v", until, ok)
+	}
+	if until, ok := cooldownDecision(resp(429, dual(later, sooner)), now); !ok || !until.Equal(later) { //nolint:bodyclose // synthetic response: no Body, no transport — nothing to close
+		t.Fatalf("dual exhaustion must cool to the later (5h) wall, got until=%v ok=%v", until, ok)
+	}
+
+	// A realistic 7d reset sits DAYS ahead: the whole-account reactive cooldown
+	// deliberately caps at poolCooldownMax (the next 429 re-confirms; only the
+	// tier-scoped path may hold a multi-day wall).
+	if until, _ := cooldownDecision(resp(429, dual(sooner, now.Add(72*time.Hour))), now); !until.Equal(now.Add(poolCooldownMax)) { //nolint:bodyclose // synthetic response: no Body, no transport — nothing to close
+		t.Fatalf("multi-day 7d wall must cap at poolCooldownMax, got %v", until)
+	}
+}
+
 func TestCooldownDecision_TemporaryFallbackIsPoolConfigurable(t *testing.T) {
 	now := time.Unix(1_750_000_000, 0)
 	temporary := http.Header{"Anthropic-Ratelimit-Unified-Status": {"rate_limited"}}

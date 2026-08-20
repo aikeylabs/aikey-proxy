@@ -66,6 +66,19 @@ func TestAnthropicTierOnlyLimit(t *testing.T) {
 		t.Fatal("dual exhaustion must not classify as tier-only")
 	}
 
+	// DUAL exhaustion via the general WEEKLY window (7d_oi + 7d, 5h healthy) —
+	// the guard's `"7d"` branch, untested before the 2026-08-19 coverage audit.
+	// Misclassifying this as tier-only would only cool the fable scope and keep
+	// routing Sonnet/Opus traffic to a fully rate-limited account.
+	hWeekly := http.Header{
+		"Anthropic-Ratelimit-Unified-7d_oi-Status":   {"rejected"},
+		"Anthropic-Ratelimit-Unified-5h-Utilization": {"0.4"},
+		"Anthropic-Ratelimit-Unified-7d-Utilization": {"1.0"},
+	}
+	if _, _, ok := anthropicTierOnlyLimit(hWeekly, now); ok {
+		t.Fatal("7d_oi + general 7d dual exhaustion must not classify as tier-only")
+	}
+
 	// reset falls back to the aggregate unified-reset; milliseconds auto-detect.
 	h2 := http.Header{
 		"Anthropic-Ratelimit-Unified-7d_oi-Utilization": {"1.0"},

@@ -156,6 +156,24 @@ type Reporter struct {
 	dlw                 *deadLetterWriter      // dead letter writer for terminal failures
 	client              *httpx.SwappableClient // control-plane→collector: rebuilt on host network change (self-heal registry)
 	lastUploadStatus    string                 // "ok" | "retryable_failed" | "terminal_failed"
+
+	// D' auto-reconcile state (P0-4 sentSeq silent-loss fix, 2026-08-19).
+	// sentSeq is allowed to run ahead of confirmedSeq transiently (in-flight
+	// window), but a PERSISTENT stall means some "sent" seq was never stored
+	// server-side (per-event rejected inside a 200, or a WAL line skipped on a
+	// torn read) — the drain loop can never recover it because of the sentSeq
+	// filter. After sentStallReconcilePasses consecutive un-gated drain passes
+	// with zero confirmedSeq progress, the reporter triggers the EXISTING
+	// ReconcileGaps (D3): server enumerates the exact missing seqs,
+	// WAL-present ones are re-sent (bypassing the filter), WAL-absent ones are
+	// confirm-lost. Guarded by mu except the atomics.
+	lastConfirmedView    map[string]int64 // confirmedSeq as of the previous counted pass
+	stallPasses          int
+	lastAutoReconcileAt  time.Time
+	autoReconcileRunning atomic.Bool
+	autoReconcileRuns    atomic.Int64
+	autoReconcileResent  atomic.Int64
+
 	cfg                 ReporterConfig
 	wg                  sync.WaitGroup
 	consecutiveFailures int
@@ -230,7 +248,8 @@ func NewReporter(in *ReporterConfig) (*Reporter, error) {
 		signal:       make(chan struct{}, 1),
 		done:         make(chan struct{}),
 		client:       httpx.NewSwappableDirect(30 * time.Second),
-		sentSeq:      make(map[string]int64),
+		sentSeq:           make(map[string]int64),
+		lastConfirmedView: make(map[string]int64),
 		confirmedSeq: make(map[string]int64),
 		seenV1:       make(map[string]bool),
 	}
@@ -595,7 +614,8 @@ func (r *Reporter) drainOnce(ctx context.Context, force bool) {
 	r.pruneConfirmedWAL()
 
 	// Arm or clear the non-blocking backoff gate for the next pass (B', 缺口2):
-	// retryable failures push the next attempt out (capped at 5min); a clean pass
+	// retryable failures push the next attempt out (capped at 60s — must stay
+	// well inside the five-minute delivery-convergence window); a clean pass
 	// clears the gate so recovery is picked up on the next tick/poke.
 	r.mu.Lock()
 	if anyRetryable {
@@ -604,6 +624,14 @@ func (r *Reporter) drainOnce(ctx context.Context, force bool) {
 		r.nextUploadAttempt = time.Time{}
 	}
 	r.mu.Unlock()
+
+	// D' auto-reconcile check — only on passes that actually ran (gated passes
+	// returned earlier, so a down collector doesn't count toward the stall) and
+	// not on the shutdown flush (force) — a detached goroutine at exit would
+	// race Close.
+	if !force {
+		r.maybeAutoReconcile()
+	}
 }
 
 // uploadPending groups events by RouteSource and uploads each group. A group
@@ -762,16 +790,22 @@ const (
 // before the next upload attempt. Same ceiling as the old in-line backoff
 // (5s → 15s → 60s → 5min) but applied once per drain pass at the loop level, so
 // the pump goroutine never blocks and stays responsive to shutdown/new events.
+// backoffForFailures caps at 60s (was 5min until 2026-08-19). Why the cap
+// came down: the delivery contract promises client_ok == ODS == DWD within a
+// FIVE-MINUTE convergence window (R66 / capacity fences), and a 5-minute top
+// backoff tier armed right at load-stop pushes the recovery pass past that
+// window — the elevated capacity ladder caught exactly this tail (9/86,400
+// events landing late, bugfix 2026-08-19-reporter-sentseq-silent-loss.md,
+// F4 round). One probe per minute against a down collector is still gentle;
+// a max retry interval must stay well inside the declared convergence window.
 func backoffForFailures(n int) time.Duration {
 	switch {
 	case n <= 1:
 		return 5 * time.Second
 	case n == 2:
 		return 15 * time.Second
-	case n == 3:
-		return 60 * time.Second
 	default:
-		return 5 * time.Minute
+		return 60 * time.Second
 	}
 }
 
