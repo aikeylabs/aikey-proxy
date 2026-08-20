@@ -37,6 +37,7 @@ type AuditStatus struct {
 	SentUnconfirmed     int64 `json:"sent_unconfirmed"`      // Σ max(sentSeq-confirmedSeq, 0)
 	AutoReconcileRuns   int64 `json:"auto_reconcile_runs"`   // total automatic ReconcileGaps triggers
 	AutoReconcileResent int64 `json:"auto_reconcile_resent"` // total seqs recovered by auto-reconcile
+	AutoReconcileGaveUp int64 `json:"auto_reconcile_gave_up"` // seqs ledgered lost after the terminal-resend budget (N4)
 }
 
 // ComplianceDeliveryStatus reports what the compliance lane has waiting and why
@@ -86,7 +87,16 @@ func (r *Reporter) AuditStatus() AuditStatus {
 	r.mu.RUnlock()
 	st.AutoReconcileRuns = r.autoReconcileRuns.Load()
 	st.AutoReconcileResent = r.autoReconcileResent.Load()
+	st.AutoReconcileGaveUp = r.autoReconcileGaveUp.Load()
 	return st
+}
+
+// setPeriodicReconcileInterval overrides the hourly sweep cadence (tests; 0
+// disables the sweep).
+func (r *Reporter) setPeriodicReconcileInterval(d time.Duration) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.periodicReconcileInterval = d
 }
 
 // ReconcileResult summarizes one client-confirmed reconciliation pass (D3).
@@ -94,8 +104,22 @@ type ReconcileResult struct {
 	Sources       int `json:"sources"`        // this client's sources that had gaps
 	Resent        int `json:"resent"`         // gap seqs FOUND in WAL and re-uploaded (recoverable)
 	ConfirmedLost int `json:"confirmed_lost"` // gap seqs ABSENT from WAL → server-ledgered as lost now
-	StillMissing  int `json:"still_missing"`  // truncated remainder (re-run reconcile to continue)
+	// GaveUp counts WAL-present seqs ledgered as lost after the terminal-resend
+	// budget: DELIVERED (200) resends that the server still refused to store
+	// (N4 拍板 2026-08-19 — auditable loss beats a forever-stuck watermark).
+	GaveUp       int `json:"gave_up"`
+	StillMissing int `json:"still_missing"` // truncated remainder (re-run reconcile to continue)
 }
+
+// terminalResendAttempts (N4 拍板 2026-08-19, K=3): a gap seq that the WAL
+// holds and that has been DELIVERED (HTTP 200) this many times yet is STILL
+// enumerated missing by /gaps is a terminal in-200 rejection (validation /
+// content-hash-conflict class — per-event results are not on the wire, so
+// delivery+still-missing is the only client-observable fingerprint). It is
+// then confirm-lost like a WAL-absent seq. Network-shaped failures (dial
+// error / 503 / timeout) never mark the WAL group processed, so they NEVER
+// consume this budget — those retry indefinitely (拍板: 网络问题不放弃重试).
+const terminalResendAttempts = 3
 
 // ReconcileGaps performs the stage-D3 client-confirmed reconciliation: ask the
 // collector which of THIS source's seqs are missing, check each against the
@@ -161,17 +185,47 @@ func (r *Reporter) ReconcileGaps(ctx context.Context) (ReconcileResult, error) {
 			}
 
 			walSet := r.walSeqSet(s.SourceID)
-			var inWAL, notInWAL []int64
+			missingSet := make(map[int64]bool, len(gaps.MissingSeqs))
 			for _, seq := range gaps.MissingSeqs {
-				if walSet[seq] {
-					inWAL = append(inWAL, seq)
-				} else {
-					notInWAL = append(notInWAL, seq)
+				missingSet[seq] = true
+			}
+			var inWAL, notInWAL, gaveUp []int64
+			r.mu.Lock()
+			tracked := r.resendDelivered[s.SourceID]
+			if tracked == nil {
+				tracked = make(map[int64]int)
+				r.resendDelivered[s.SourceID] = tracked
+			}
+			// Prune healed seqs: an entry no longer enumerated missing means the
+			// delivered resend actually landed — its budget never mattered.
+			for seq := range tracked {
+				if !missingSet[seq] {
+					delete(tracked, seq)
 				}
 			}
-			// Recover WAL-present gaps by re-sending (server dedup-safe).
+			for _, seq := range gaps.MissingSeqs {
+				switch {
+				case !walSet[seq]:
+					notInWAL = append(notInWAL, seq)
+				case tracked[seq] >= terminalResendAttempts:
+					// Delivered K times, still missing: terminal rejection.
+					gaveUp = append(gaveUp, seq)
+				default:
+					inWAL = append(inWAL, seq)
+				}
+			}
+			r.mu.Unlock()
+			// Recover WAL-present gaps by re-sending (server dedup-safe). Only
+			// DELIVERED groups (200 / terminal dead-letter) consume budget —
+			// retryable network failures leave the WAL untouched and uncounted.
 			if len(inWAL) > 0 {
-				res.Resent += r.resendWALSeqs(s.SourceID, inWAL)
+				delivered := r.resendWALSeqs(s.SourceID, inWAL)
+				res.Resent += len(delivered)
+				r.mu.Lock()
+				for _, seq := range delivered {
+					tracked[seq]++
+				}
+				r.mu.Unlock()
 			}
 			// Confirm WAL-absent gaps as lost NOW (server ledgers the genuinely-absent).
 			if len(notInWAL) > 0 {
@@ -183,6 +237,32 @@ func (r *Reporter) ReconcileGaps(ctx context.Context) (ReconcileResult, error) {
 					return res, err
 				}
 				res.ConfirmedLost += cl.Promoted
+			}
+			// Terminal-rejected seqs: ledger as known loss (N4 拍板). LOUD by
+			// design — this is billable-event loss with an audit trail, and the
+			// alternative is a watermark stuck forever re-sending a copy the
+			// server will never store.
+			if len(gaveUp) > 0 {
+				var cl struct {
+					Promoted int `json:"promoted"`
+				}
+				body := map[string]any{"org_id": s.OrgID, "source_id": s.SourceID, "seqs": gaveUp}
+				if err := r.httpPostJSON(ctx, base+"/v1/diagnostics/confirm-lost", body, &cl); err != nil {
+					return res, err
+				}
+				res.ConfirmedLost += cl.Promoted
+				res.GaveUp += len(gaveUp)
+				r.autoReconcileGaveUp.Add(int64(len(gaveUp)))
+				sample := gaveUp
+				if len(sample) > 10 {
+					sample = sample[:10]
+				}
+				slog.Warn("reporter: terminally rejected seqs ledgered as known loss after bounded delivered resends",
+					"event.name", "usage.reporter.reconcile_gave_up",
+					"source_id", s.SourceID,
+					"count", len(gaveUp),
+					"seqs_sample", sample,
+					"delivered_attempts", terminalResendAttempts)
 			}
 			if !gaps.Truncated {
 				break // last window for this source
@@ -240,9 +320,18 @@ func (r *Reporter) maybeAutoReconcile() {
 	r.stallPasses++
 	trigger := r.stallPasses >= sentStallReconcilePasses &&
 		time.Since(r.lastAutoReconcileAt) >= autoReconcileMinInterval
+	// Periodic sweep (N4 拍板 2): even when the stall trigger's debounce has
+	// silenced repeat fires (e.g. a gap reconcile cannot fix keeps the window
+	// stalled), a sweep re-runs reconcile on its own clock so retries keep
+	// happening for as long as anything is sent-but-unconfirmed.
+	if !trigger && r.periodicReconcileInterval > 0 &&
+		time.Since(r.lastPeriodicSweepAt) >= r.periodicReconcileInterval {
+		trigger = true
+	}
 	if trigger {
 		r.stallPasses = 0
 		r.lastAutoReconcileAt = time.Now()
+		r.lastPeriodicSweepAt = time.Now()
 	}
 	r.mu.Unlock()
 	if !trigger {
@@ -267,6 +356,7 @@ func (r *Reporter) maybeAutoReconcile() {
 			"event.name", "usage.reporter.auto_reconcile_recovered",
 			"resent", res.Resent,
 			"confirmed_lost", res.ConfirmedLost,
+			"gave_up", res.GaveUp,
 			"still_missing", res.StillMissing)
 	}()
 }
@@ -309,9 +399,13 @@ func (r *Reporter) walSeqSet(source string) map[int64]bool {
 // It deliberately bypasses the sentSeq filter — these seqs were already "sent"
 // but the server never stored them, so the only way to recover without a restart
 // is to push them again. Returns how many were re-uploaded.
-func (r *Reporter) resendWALSeqs(source string, seqs []int64) int {
+// resendWALSeqs re-uploads the WAL entries for the given seqs and returns the
+// seqs whose group was DELIVERED (uploaded 200 or terminally dead-lettered) —
+// the caller's terminal-resend budget counts exactly these; retryable network
+// failures return nothing and stay in the WAL for the next round.
+func (r *Reporter) resendWALSeqs(source string, seqs []int64) []int64 {
 	if r.wal == nil || len(seqs) == 0 {
-		return 0
+		return nil
 	}
 	want := make(map[int64]bool, len(seqs))
 	for _, s := range seqs {
@@ -319,7 +413,7 @@ func (r *Reporter) resendWALSeqs(source string, seqs []int64) int {
 	}
 	entries, err := ReadAllWAL(r.wal.Dir())
 	if err != nil {
-		return 0
+		return nil
 	}
 	groups := make(map[string][]ReportableEvent)
 	for i := range entries {
@@ -341,7 +435,7 @@ func (r *Reporter) resendWALSeqs(source string, seqs []int64) int {
 		}
 		groups[ev.RouteSource] = append(groups[ev.RouteSource], ev)
 	}
-	sent := 0
+	var sent []int64
 	for routeSource, group := range groups {
 		// Mark + count only when the group actually landed (uploaded ok or was
 		// terminally dead-lettered). Advancing sentSeq here mirrors uploadPending
@@ -351,7 +445,11 @@ func (r *Reporter) resendWALSeqs(source string, seqs []int64) int {
 		// re-run of reconcile can recover them — `sent` stays honest.
 		if r.uploadGroupTo(context.Background(), r.urlForRouteSource(routeSource), r.credentialForRouteSource(routeSource), group) == groupDone {
 			r.markProcessed(group)
-			sent += len(group)
+			for i := range group {
+				if group[i].SourceSeq != nil {
+					sent = append(sent, *group[i].SourceSeq)
+				}
+			}
 		}
 	}
 	return sent

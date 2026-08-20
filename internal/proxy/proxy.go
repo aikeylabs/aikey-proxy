@@ -419,7 +419,17 @@ type transportBox struct{ rt http.RoundTripper }
 // The egress engine already used 100 (egress_engine.go) — this closes the gap
 // on the default path.
 var defaultUpstreamTransport = func() http.RoundTripper {
-	t := http.DefaultTransport.(*http.Transport).Clone()
+	// Comma-ok, not a bare assertion: errcheck rejects the unguarded form, and a
+	// panic here would kill the proxy at package-init time — before any log line
+	// exists to explain it. http.DefaultTransport is *http.Transport in every
+	// stdlib we build against, so the fallback is unreachable in practice; it
+	// exists so a future stdlib change degrades to the stock transport (smaller
+	// idle pool) instead of taking the process down.
+	base, ok := http.DefaultTransport.(*http.Transport)
+	if !ok {
+		return http.DefaultTransport
+	}
+	t := base.Clone()
 	t.MaxIdleConns = 100
 	t.MaxIdleConnsPerHost = 100
 	return t

@@ -173,6 +173,19 @@ type Reporter struct {
 	autoReconcileRunning atomic.Bool
 	autoReconcileRuns    atomic.Int64
 	autoReconcileResent  atomic.Int64
+	autoReconcileGaveUp  atomic.Int64
+	// resendDelivered tracks, per source, how many times a gap seq was
+	// DELIVERED (200) by reconcile yet still enumerated missing — the
+	// terminal-resend budget (N4 拍板, see terminalResendAttempts). Guarded by
+	// mu; entries are pruned the moment a seq stops being missing, so the map
+	// is bounded by the live gap window.
+	resendDelivered map[string]map[int64]int
+	// Periodic reconcile sweep (N4 拍板 2: 定期兜底对账 — the 周期必经 leg of
+	// 事件驱动写必配对账读). Rides the existing drain tick; no extra timer
+	// goroutine to die. lastPeriodicSweepAt starts at boot; ANY reconcile
+	// (stall-triggered or sweep) resets it.
+	periodicReconcileInterval time.Duration
+	lastPeriodicSweepAt       time.Time
 
 	cfg                 ReporterConfig
 	wg                  sync.WaitGroup
@@ -250,8 +263,13 @@ func NewReporter(in *ReporterConfig) (*Reporter, error) {
 		client:       httpx.NewSwappableDirect(30 * time.Second),
 		sentSeq:           make(map[string]int64),
 		lastConfirmedView: make(map[string]int64),
-		confirmedSeq: make(map[string]int64),
-		seenV1:       make(map[string]bool),
+		confirmedSeq:      make(map[string]int64),
+		seenV1:            make(map[string]bool),
+		resendDelivered:   make(map[string]map[int64]int),
+		// Hourly by default (N4 拍板: "每一个小时扫描后重试一次"). Boot-anchored
+		// so a fresh process gives the stall trigger (N=3) first shot.
+		periodicReconcileInterval: time.Hour,
+		lastPeriodicSweepAt:       time.Now(),
 	}
 
 	// Start upload loop if any destination is configured (legacy single

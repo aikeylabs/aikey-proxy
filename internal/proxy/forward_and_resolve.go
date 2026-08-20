@@ -543,13 +543,24 @@ func (p *Proxy) serveRoute(w http.ResponseWriter, r *http.Request, route *vkeys.
 	// tunneled the Mock's private base_url out; stripping Proxy on a clone
 	// keeps every other dial property. Custom RoundTrippers (unit-test
 	// interception, engine chains) pass through untouched.
+	// 2026-08-20 修正（staging 回执排查定案）: the original action here was
+	// "strip the Proxy hook on a clone" — but a mihomo MULTI-PROTOCOL node
+	// upstream (staging runs a VLESS/Reality fragment) is still handed to the
+	// supervisor as a *http.Transport whose tunnel lives in DialContext with a
+	// NIL Proxy hook, so the strip never fired and the Mock kept tunneling
+	// AFTER the fix was deployed (post-deploy scheduling-log events:
+	// GROUP_UPSTREAM_UNAVAILABLE, transport=node, dial EOF). The judgment
+	// stays provider-identity; the ACTION is now "swap in the direct default
+	// transport" — every node-upstream shape is a *http.Transport
+	// (installTransport's signature guarantees it), while unit-test
+	// interception transports are custom RoundTrippers and pass through
+	// untouched. Fence: group_mock_direct_dial_test.go (Proxy-hook leg +
+	// engine-shaped leg).
 	if route.OauthGroupID != "" &&
 		(providerCanonicalCode(route.ProviderCode) == "mock" || providerCanonicalCode(route.Provider) == "mock") {
-		if ht, ok := inner.(*http.Transport); ok && ht.Proxy != nil {
-			direct := ht.Clone()
-			direct.Proxy = nil
-			inner = direct
-			logger.Debug("resident mock group route: node-upstream proxy stripped (direct dial)")
+		if _, ok := inner.(*http.Transport); ok {
+			inner = defaultUpstreamTransport
+			logger.Debug("resident mock group route: node-upstream transport bypassed (direct dial)")
 		}
 	}
 	// Per-account egress proxy (§11.7, P7): when the resolved oauth-group account
