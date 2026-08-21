@@ -349,9 +349,20 @@ type SyncRailStatus struct {
 // PoolRoutingHealth is the oauth-group account-and-path routing health surface.
 // Built by the cmd layer from account cooldown and Provider-path breaker state.
 type PoolRoutingHealth struct {
-	Enabled        bool                 `json:"enabled"`
-	CooledAccounts []CooledAccount      `json:"cooled_accounts,omitempty"`
-	PathHealth     []ProviderPathHealth `json:"path_health,omitempty"`
+	Enabled         bool                   `json:"enabled"`
+	CooledAccounts  []CooledAccount        `json:"cooled_accounts,omitempty"`
+	PathHealth      []ProviderPathHealth   `json:"path_health,omitempty"`
+	SignalReporting *SignalReportingHealth `json:"signal_reporting,omitempty"`
+}
+
+type SignalReportingHealth struct {
+	Status              string `json:"status"`
+	ConsecutiveFailures int    `json:"consecutive_failures"`
+	LastAttemptAt       int64  `json:"last_attempt_at,omitempty"`
+	LastSuccessAt       int64  `json:"last_success_at,omitempty"`
+	LastError           string `json:"last_error,omitempty"`
+	PendingSignals      int    `json:"pending_signals"`
+	DroppedSignals      int64  `json:"dropped_signals"`
 }
 
 // CooledAccount is one pool account currently routed around (401 / exhaustion).

@@ -161,10 +161,16 @@ type poolLoginHandler struct {
 }
 
 type poolSessionKeyPending struct {
-	loginCtx  poolLoginContext
-	token     *broker.SessionKeyToken
-	createdAt time.Time
-	expiresAt int64
+	loginCtx         poolLoginContext
+	token            *broker.SessionKeyToken
+	identityMismatch bool
+	createdAt        time.Time
+	expiresAt        int64
+	// sessionKey retains the exchanged Codex session key ONLY until the confirm
+	// writeback ships it to master for auto-renewal (方案 20260818, default-on).
+	// Codex-protocol logins only; zeroed on forget/sweep like the token fields.
+	sessionKey       string
+	sessionExpiresAt int64
 }
 
 type poolSessionKeyOperation struct {

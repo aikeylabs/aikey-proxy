@@ -174,6 +174,15 @@ func fable429(resetIn time.Duration) upstreamReply { // tier-only: 7d_oi exhaust
 		"Anthropic-Ratelimit-Unified-7d_oi-Reset":  strconv.FormatInt(time.Now().Add(resetIn).Unix(), 10),
 	}}
 }
+func exhaustion429Weekly7d(resetIn time.Duration) upstreamReply { // real GENERAL 7d exhaustion, 5h healthy
+	// Deliberately no aggregate Unified-Status header: the evidence must come
+	// from the per-window 7d branch alone (coverage audit 2026-08-19).
+	return upstreamReply{status: 429, headers: map[string]string{
+		"Anthropic-Ratelimit-Unified-5h-Utilization": "0.4",
+		"Anthropic-Ratelimit-Unified-7d-Status":      "rejected",
+		"Anthropic-Ratelimit-Unified-7d-Reset":       strconv.FormatInt(time.Now().Add(resetIn).Unix(), 10),
+	}}
+}
 
 // ── the narrative ────────────────────────────────────────────────────────────
 
@@ -227,6 +236,45 @@ func TestE2E_Pool_RealExhaustionFailsOverAndCools(t *testing.T) {
 	state := p.poolCooldown.routeStateSnapshot()[firstAcct]
 	if state.Status != poolRouteWindowExhausted {
 		t.Fatalf("confirmed 429 must remain window_exhausted for the drawer, got %+v", state)
+	}
+}
+
+// Phase 2b (coverage audit 2026-08-19): the GENERAL weekly (7d) window — unlike
+// the Fable-only 7d_oi — is a WHOLE-account limit. Every other exhaustion test
+// uses the 5h window, so this is the only end-to-end run of the `"7d"`
+// evidence/reset branch. The regression it fences is ugly: a 7d-only 429
+// misread as tier-only (or as evidence-free WAF) would keep Sonnet/Opus traffic
+// hammering a fully rate-limited account.
+func TestE2E_Pool_GeneralWeekly7dCoolsWholeAccount(t *testing.T) {
+	p, up := setupE2EPool(t, 2)
+	var firstAcct string
+	up.reset(func(c upstreamCall) upstreamReply {
+		if firstAcct == "" {
+			firstAcct = c.account
+			return exhaustion429Weekly7d(48 * time.Hour)
+		}
+		return upstreamReply{status: 200}
+	})
+
+	req, w := groupReq(modelBody("claude-sonnet-4-5"))
+	p.Handle(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("client must see the failover 200, got %d: %s", w.Code, w.Body.String())
+	}
+	if up.callCount() != 2 {
+		t.Fatalf("want 2 attempts (exhausted + healthy), got %d", up.callCount())
+	}
+	// WHOLE-account cooled — not fable-tier-scoped, not left uncooled.
+	if !p.poolCooldown.skipSet()[firstAcct] {
+		t.Fatalf("the 7d-exhausted account %s must be whole-account cooled", firstAcct)
+	}
+	if _, ok := p.poolCooldown.tierCooldownUntil("fable"); ok {
+		t.Fatal("general 7d exhaustion must not be misfiled as a fable tier cooldown")
+	}
+	state := p.poolCooldown.routeStateSnapshot()[firstAcct]
+	if state.Status != poolRouteWindowExhausted {
+		t.Fatalf("confirmed 7d 429 must surface as window_exhausted for the drawer, got %+v", state)
 	}
 }
 

@@ -31,48 +31,37 @@ printf 'flushed\n' > "$marker"
 	}
 
 	h := NewChildHook(&ChildHookConfig{
+		// 15s, not 5s (2026-08-20, the THIRD round on this fixture family: 2s → 5s,
+		// then the outer ctx 5s → 20s, now this). MEASURED on an 18-core machine,
+		// not guessed:
+		//     idle, single test              6/6 pass
+		//     2x-core CPU saturation         6/6 pass
+		//     four heavy packages in parallel 3/3 pass
+		//     `go test ./internal/...` (-p 18, 25 packages)  2/2 FAIL
+		//     the same suite with -p 4        0/2 fail
+		// So the trigger is package-level PARALLELISM — a few dozen concurrent test
+		// binaries each spawning children — not CPU load, and it is deterministic,
+		// not flaky. The child here is a three-line shell script: it needs headroom
+		// to be scheduled and exec'd, nothing more. Production already learned this
+		// (filterDefaultReadyTimeout is 30s for the real detector, see
+		// supervisor/filter_hook.go); a fixture stricter than production is the
+		// anomaly. A genuinely stuck child still fails — just 10s later.
 		Name:       "graceful-shutdown-test",
 		BinaryPath: child,
 		BinaryArgs: []string{marker},
-		// 🔴 15s, not the apphook 5s default — for the reason the PRODUCT already
-		// recorded at supervisor/filter_hook.go's filterDefaultReadyTimeout:
-		//
-		//	the apphook default is 5s … that stretches past 5s under the load of
-		//	a concurrent deploy/restart — the spawn then misses the deadline and
-		//	latches fail-loud 501, even though the child is fine
-		//
-		// The production path answered that with 30s. This test kept 5s, and
-		// `go test ./...` reproduces the same condition: with ~18 package binaries
-		// running at once, the FIRST child spawn in this package pays a cold cost
-		// (measured 1.8–2.3s, and past 5s often enough to fail every full-suite
-		// run while passing alone). Same failure, same cause, same answer.
-		//
-		// 🚫 The 2s→5s raise below it never took effect: the enclosing context was
-		// ALSO 5s, so it always expired first and the error read `context deadline
-		// exceeded` rather than naming the child. That is why this needed fixing
-		// in both places — see the context comment below.
-		//
-		// 🔴 Whichever child-spawn test runs FIRST in this package pays that cold
-		// cost; this one is first only because of file/declaration order. Reorder
-		// the package and the next one inherits the problem. A warm-up in TestMain
-		// would fix the class rather than this instance — deliberately NOT done
-		// here, because it changes shared test setup for every test in the package
-		// and that is a bigger decision than this fix.
+		// Match the package's other child fixtures. Two seconds flakes when
+		// release gates compile Rust and run Go race tests concurrently, before
+		// this tiny shell process gets scheduled at all.
 		ReadyTimeout: 15 * time.Second,
 	})
-	// 🔴 The context must outlast ReadyTimeout, and by a margin.
-	//
-	// This was 5s — the SAME value ReadyTimeout had — which silently cancelled the
-	// readiness budget it was supposed to contain: the deadline starts before
-	// Start() does, so the context always expired first. With the two equal, "the
-	// child never signalled ready" is a diagnosis the test can never print, and
-	// every slow scheduler looks identical to it.
-	//
-	// 🚫 Not "widen until it stops flaking". Every other child fixture in this
-	// package gives the context 2–5× its ReadyTimeout (listpacks 5s/15s, the
-	// degraded and restart cases below 5s/15s, filterpool 5s/25s); this test was
-	// the only one at 1×.
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	// The outer ctx must be LARGER than ReadyTimeout, not equal to it: it also
+	// has to cover Shutdown and the marker read, so an equal budget means
+	// ReadyTimeout can never actually be spent — the ctx expires first and the
+	// 5s allowance above is dead code. That is how this failed a release round
+	// on 2026-08-19 (`start fixture: context deadline exceeded` at exactly
+	// 5.01s while the same test passes in ~0.7s on an idle machine). Sized like
+	// the other fixture in this file, which pairs ReadyTimeout 5s with a 20s ctx.
+	ctx, cancel := context.WithTimeout(context.Background(), 45*time.Second)
 	defer cancel()
 	if err := h.Start(ctx); err != nil {
 		t.Fatalf("start fixture: %v", err)
@@ -93,9 +82,9 @@ printf 'flushed\n' > "$marker"
 func TestChildHook_ConcurrentDetect(t *testing.T) {
 	h := NewChildHook(&ChildHookConfig{
 		Name: "concurrent-test", BinaryPath: requireDetectorBinary(t), BinaryArgs: detectorArgs(),
-		Timeout: 2 * time.Second, ReadyTimeout: 5 * time.Second,
+		Timeout: 2 * time.Second, ReadyTimeout: 15 * time.Second,
 	})
-	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), 45*time.Second)
 	defer cancel()
 	if err := h.Start(ctx); err != nil {
 		t.Skipf("child binary unavailable, skipping (build first): %v", err)
@@ -152,9 +141,9 @@ func detectorArgs() []string {
 func TestChildHook_RestartRecovers(t *testing.T) {
 	h := NewChildHook(&ChildHookConfig{
 		Name: "recover-test", BinaryPath: requireDetectorBinary(t), BinaryArgs: detectorArgs(),
-		Timeout: 1 * time.Second, ReadyTimeout: 5 * time.Second,
+		Timeout: 1 * time.Second, ReadyTimeout: 15 * time.Second,
 	})
-	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), 45*time.Second)
 	defer cancel()
 	if err := h.Start(ctx); err != nil {
 		t.Skipf("child binary unavailable, skipping (build first): %v", err)
@@ -188,9 +177,9 @@ func TestChildHook_RestartRecovers(t *testing.T) {
 func TestChildHook_LazyRecoverOnDetect(t *testing.T) {
 	h := NewChildHook(&ChildHookConfig{
 		Name: "lazy-test", BinaryPath: requireDetectorBinary(t), BinaryArgs: detectorArgs(),
-		Timeout: 1 * time.Second, ReadyTimeout: 5 * time.Second,
+		Timeout: 1 * time.Second, ReadyTimeout: 15 * time.Second,
 	})
-	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), 45*time.Second)
 	defer cancel()
 	if err := h.Start(ctx); err != nil {
 		t.Skipf("child binary unavailable, skipping (build first): %v", err)
@@ -236,10 +225,12 @@ func TestChildHookEchoRoundtrip(t *testing.T) {
 		BinaryPath:   binary,
 		BinaryArgs:   detectorArgs(),  // --echo-only: skip rule load, deterministic for IPC test
 		Timeout:      1 * time.Second, // generous for first-call test
-		ReadyTimeout: 5 * time.Second,
+		ReadyTimeout: 15 * time.Second,
 	})
 
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	// Must exceed ReadyTimeout above, or the ctx expires first and the ready
+	// allowance is dead code (the trap documented on the first fixture).
+	ctx, cancel := context.WithTimeout(context.Background(), 45*time.Second)
 	defer cancel()
 
 	if err := h.Start(ctx); err != nil {

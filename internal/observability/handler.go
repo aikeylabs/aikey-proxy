@@ -12,6 +12,11 @@ import (
 const (
 	EventProxyProcessStarted = "proxy.process.started"
 	EventProxyProcessStopped = "proxy.process.stopped"
+	// EventProxyShutdownWatchdogTimeout: the post-drain teardown (generation
+	// close chain) overran its watchdog and was abandoned; goroutine stacks
+	// were dumped to stderr. Exit still completes — this is forensic evidence,
+	// not a hang (bugfix 2026-08-19-proxy-shutdown-unbounded-close).
+	EventProxyShutdownWatchdogTimeout = "proxy.shutdown.watchdog_timeout"
 	EventProxyConfigLoaded   = "proxy.config.loaded"
 	EventProxyListenerBound  = "proxy.listener.bound"
 )
@@ -306,10 +311,12 @@ const (
 	// was unusable (cooled / exhausted / expired / no material) so the request
 	// fell back to a different candidate — an auditable account switch.
 	EventProxyGroupAccountSwitched = "proxy.group.account_switched"
-	// EventProxyGroupLoginRequired (RW2/D2): the HRW-routed account has no token
-	// for this member (they haven't logged into it). The proxy returns a structured
-	// login prompt naming the account (strict HRW — it does NOT skip to a later
-	// logged-in account) so the member logs into THAT account on their local node.
+	// EventProxyGroupLoginRequired (RW2; semantics = 2026-08-15 方案 b, which
+	// supersedes the old D2 "strict HRW, never skip" rule): NO pool candidate is
+	// serviceable for this member and at least one is waiting on a login. The
+	// proxy returns a structured login prompt naming the actionable account (the
+	// engine's target first). A needs_login account alone does NOT emit this —
+	// healthy siblings serve first (vkeys.PickRoutedAccount, spec R27).
 	EventProxyGroupLoginRequired = "proxy.group.login_required"
 	// EventProxyGroupWindowPrecut (N10): an account's upstream utilization crossed
 	// its randomized window cap (window_max_util_pct), so it was pre-cut for that
@@ -328,10 +335,29 @@ const (
 	// tier only and keeps serving every other model. Also used for the
 	// unmapped-exhausted-window observability WARN (tier-table gap detection).
 	EventProxyGroupModelTierCooldown = "proxy.group.model_tier_cooldown"
+	// EventProxyGroupTokenRevoked (update/20260817 覆盖度审计 2026-08-18): the
+	// upstream HARD-revoked a member token (401/403 with a documented revocation
+	// marker). The revocation MOMENT gets its own scheduling-log row — the
+	// login_required rows that follow are the consequence, not the cause.
+	EventProxyGroupTokenRevoked = "proxy.group.token_revoked"
+	// EventProxyGroupWafExcluded: a 429 carried NO exhaustion/rate-limit evidence
+	// headers and was classified as WAF/风控 — deliberately NOT cooled (cooling on
+	// a fake 429 is how a WAF starves a healthy pool) and passed through. Logged
+	// because "keeps hitting an evidence-less wall" is exactly the signal a 撞墙
+	// investigation needs.
+	EventProxyGroupWafExcluded = "proxy.group.waf_429_excluded" //nolint:gosec // G101 false positive: gosec's hardcoded-credential heuristic matches this identifier/value pair. It is an event name in the central enum, never a secret.
+	// EventProxyGroupUpstreamErrorPassthrough: a non-failover-eligible upstream
+	// 4xx (400/402/403/404/422… — NOT 401, NOT an evidence 429) was passed through
+	// verbatim. No routing state changes; the row exists so a support bundle can
+	// correlate "user saw provider errors" with the surrounding scheduling
+	// timeline (拍板 2026-08-18 #3). Per-window suppression bounds a burst.
+	EventProxyGroupUpstreamErrorPassthrough = "proxy.group.upstream_error_passthrough" //nolint:gosec // G101 false positive: gosec's hardcoded-credential heuristic matches this identifier/value pair. It is an event name in the central enum, never a secret.
 	// EventProxyGroupSeatBlocked (§5.5): the engine left this seat UNBOUND because
 	// every account in its pool/segment is at the ≤3-人/号 cap, so the proxy 429s it
 	// (never WRH-falls-back, which would route a 4th user onto a full account).
-	EventProxyGroupSeatBlocked = "proxy.group.seat_blocked"
+	EventProxyGroupSeatBlocked             = "proxy.group.seat_blocked"
+	EventProxyGroupRequestBodyRejected     = "proxy.group.request_body_rejected"
+	EventProxyGroupReplayCapacityExhausted = "proxy.group.replay_capacity_exhausted"
 	// EventProxyGroupLoginStateWriteFailed / ClearFailed: the bypass
 	// ~/.aikey/run/group-login-required.json state file (statusline login hint,
 	// 20260703 update) could not be written / removed. Best-effort by design —
@@ -384,7 +410,10 @@ const (
 	// ErrCodeGroupPoolFull (§5.5): 429 when the seat is blocked — every pool account
 	// is at the per-account user cap, or no usable account remains. Neutral wording
 	// (does not guess the cause); the user waits or contacts the admin.
-	ErrCodeGroupPoolFull = "GROUP_POOL_FULL"
+	ErrCodeGroupPoolFull               = "GROUP_POOL_FULL"
+	ErrCodeGroupRequestBodyTooLarge    = "GROUP_REQUEST_BODY_TOO_LARGE"
+	ErrCodeGroupRequestBodyReadFailed  = "GROUP_REQUEST_BODY_READ_FAILED"
+	ErrCodeGroupReplayCapacityExceeded = "GROUP_REPLAY_CAPACITY_EXCEEDED"
 	// ErrCodeModelTierExhausted (P1-C Phase 2, 用户拍板 2026-07-19): 429 when the
 	// REQUESTED MODEL's premium weekly window (e.g. Fable 7d_oi) is exhausted on
 	// every usable pool account, while other models still serve — the message

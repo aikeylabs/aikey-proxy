@@ -452,6 +452,14 @@ func Run() {
 			return nil
 		}
 		h := &admin.PoolRoutingHealth{Enabled: true}
+		if signal := sup.SignalReportingHealthSnapshot(); signal != nil {
+			h.SignalReporting = &admin.SignalReportingHealth{
+				Status: signal.Status, ConsecutiveFailures: signal.ConsecutiveFailures,
+				LastAttemptAt: signal.LastAttemptAt, LastSuccessAt: signal.LastSuccessAt,
+				LastError: signal.LastError, PendingSignals: signal.PendingSignals,
+				DroppedSignals: signal.DroppedSignals,
+			}
+		}
 		states := sup.PoolRouteStateSnapshot()
 		for id, secs := range sup.PoolCooldownSnapshot() {
 			item := admin.CooledAccount{AccountID: id, CooldownSeconds: secs}

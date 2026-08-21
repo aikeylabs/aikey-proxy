@@ -19,13 +19,16 @@
 package proxy
 
 import (
-	"bytes"
 	"context"
+	"crypto/sha256"
 	"encoding/json"
+	"errors"
 	"fmt"
-	"io"
 	"log/slog"
+	"net"
 	"net/http"
+	"net/url"
+	"os"
 	"strconv"
 	"strings"
 	"time"
@@ -80,17 +83,46 @@ func (p *Proxy) handleOauthGroupRoute(
 			"No available account in your pool right now. Contact your administrator if this persists.")
 		return
 	}
-	// N9 in-request failover (2026-07-19, sub2api blueprint — see group_failover.go):
-	// buffer the request body ONCE so every attempt can replay a pristine clone;
-	// per-attempt header/context mutations (oauthInject persona, URL rewrite,
-	// window-cap stash) live on that attempt's clone only.
-	reqBody, rerr := io.ReadAll(r.Body)
+	// N9 in-request failover needs one replayable body, but prompt bytes are an
+	// adversarial resource at 300-person concurrency. Capture under a request and
+	// process-wide memory budget; a read deadline protects the server's otherwise
+	// intentionally timeout-free SSE connection without imposing a write deadline.
+	controller := http.NewResponseController(w)
+	_ = controller.SetReadDeadline(time.Now().Add(2 * time.Minute))
+	replay, rerr := readGroupReplayBody(r.Body, r.ContentLength, groupReplayBodyLimit, processGroupReplayBudget)
+	_ = controller.SetReadDeadline(time.Time{})
+	_ = r.Body.Close()
 	if rerr != nil {
-		p.degradeGroup(w, logger, route, observability.ErrCodeGroupKeyUnavailable,
-			"Failed to read the request body. Please retry.")
+		switch {
+		case errors.Is(rerr, errGroupReplayBodyTooLarge):
+			logger.Warn("oauth-group request body exceeds the replay limit",
+				"event.name", observability.EventProxyGroupRequestBodyRejected,
+				"error.code", observability.ErrCodeGroupRequestBodyTooLarge,
+				"content_length", r.ContentLength, "limit_bytes", groupReplayBodyLimit)
+			writeJSONError(w, http.StatusRequestEntityTooLarge, "invalid_request_error",
+				observability.ErrCodeGroupRequestBodyTooLarge,
+				"Request body exceeds the 64 MiB account-failover replay limit. Reduce attached context or split the request.")
+		case errors.Is(rerr, errGroupReplayCapacity):
+			w.Header().Set("Retry-After", "1")
+			logger.Warn("oauth-group replay memory budget is exhausted",
+				"event.name", observability.EventProxyGroupReplayCapacityExhausted,
+				"error.code", observability.ErrCodeGroupReplayCapacityExceeded,
+				"budget_bytes", groupReplayProcessBudget)
+			writeJSONError(w, http.StatusServiceUnavailable, "server_error",
+				observability.ErrCodeGroupReplayCapacityExceeded,
+				"Proxy is handling too many large requests. Retry shortly or reduce the request size.")
+		default:
+			logger.Warn("oauth-group request body could not be read",
+				"event.name", observability.EventProxyGroupRequestBodyRejected,
+				"error.code", observability.ErrCodeGroupRequestBodyReadFailed,
+				"error", rerr)
+			writeJSONError(w, http.StatusBadRequest, "invalid_request_error",
+				observability.ErrCodeGroupRequestBodyReadFailed,
+				"Failed to read the request body. Check the client connection and retry.")
+		}
 		return
 	}
-	_ = r.Body.Close()
+	defer replay.Close()
 	baseReq := r
 
 	// failed accounts of THIS request (merged into the resolver skip set): the
@@ -106,7 +138,7 @@ func (p *Proxy) handleOauthGroupRoute(
 	// P1-C: the skip set is MODEL-AWARE — an account cooled only for a premium
 	// tier (Fable weekly window) is skipped for that tier's requests and stays
 	// fully available to everything else.
-	reqModel := extractModelLazy(reqBody)
+	reqModel := extractModelLazy(replay.Bytes())
 
 	override := p.routingOverrides.lookup(route.SeatID, route.OauthGroupID)
 	for {
@@ -225,7 +257,7 @@ func (p *Proxy) handleOauthGroupRoute(
 			p.degradeGroup(w, logger, route, code, groupDegradeMessage(code))
 			return
 		}
-		result := p.serveGroupAttempt(w, baseReq, reqBody, route, res, inboundBearer, startTime, logger, traceID,
+		result := p.serveGroupAttempt(w, baseReq, replay, route, res, inboundBearer, startTime, logger, traceID,
 			upstreamAttempts, failed, failedPaths, &lastCaptured)
 		if result.attempted {
 			upstreamAttempts++
@@ -256,7 +288,7 @@ type groupAttemptResult struct {
 // captured upstream failure adds the account/path to the request-local skip set
 // so the caller can resolve the next useful candidate.
 func (p *Proxy) serveGroupAttempt(
-	w http.ResponseWriter, baseReq *http.Request, reqBody []byte,
+	w http.ResponseWriter, baseReq *http.Request, replay *groupReplayBody,
 	route *vkeys.ResolvedRoute, res *groupResolution, inboundBearer string,
 	startTime time.Time, logger *slog.Logger, traceID string,
 	attempt int, failed map[string]bool, failedPaths map[string]bool, lastCaptured **groupFailoverWriter,
@@ -264,9 +296,13 @@ func (p *Proxy) serveGroupAttempt(
 	// fresh clone per attempt: pristine headers + replayed body + inherited
 	// context stashes (route/model extraction ride the context, not the body).
 	r := baseReq.Clone(baseReq.Context())
-	if len(reqBody) > 0 {
-		r.Body = io.NopCloser(bytes.NewReader(reqBody))
-		r.ContentLength = int64(len(reqBody))
+	if replay.Len() > 0 {
+		r.Body = replay.Open()
+		// Keep ownership of the replay reader even if an audit/debug helper reads
+		// and replaces r.Body with its own bytes.Reader before the transport sees it.
+		// Without this defer, that optional side path pins the process budget forever.
+		defer r.Body.Close()
+		r.ContentLength = int64(replay.Len())
 	} else {
 		r.Body = http.NoBody
 		r.ContentLength = 0
@@ -281,6 +317,10 @@ func (p *Proxy) serveGroupAttempt(
 	rc := *route
 	rc.AccountID = res.AccountID       // usage attribution → the account actually used
 	rc.CredentialID = res.CredentialID // I5 signal reporting keyed by credential_id (T2 uplink; empty group route.CredentialID was dropping all signals)
+	// The ordinal is also the signal reporter's primary-vs-fallback discriminator.
+	// Without stamping the account axis here, every retry looked like a primary
+	// 429 and one client request inflated risk on each account it touched.
+	rc.FallbackAttempt = attempt + 1
 	if res.OAuth != nil {
 		rc.OAuthTokenFingerprint = oauthTokenFingerprint(res.OAuth.AccessToken)
 	}
@@ -434,14 +474,18 @@ func (p *Proxy) serveGroupAttempt(
 		path: path, overrideOn: overrideOn,
 	}))
 
-	// N9 #8: audit a fallback — the seat's primary account was unusable (cooled /
-	// exhausted / expired / no material) so we routed to a different candidate.
+	// N9 #8: audit a pick that landed off the local rank-0. pick_source now
+	// distinguishes the two very different causes this used to conflate
+	// (方案 20260819 P0-2 S4): engine_override = the engine deliberately
+	// redirected; local_fallback = rank-0 (and any override) was unusable
+	// (cooled / exhausted / expired / no material) and the ranked walk advanced.
 	if res.Primary != "" && res.Primary != res.AccountID {
-		logger.Info("oauth-group account switched (primary unusable)",
+		logger.Info("oauth-group account switched off rank-0",
 			"event.name", observability.EventProxyGroupAccountSwitched,
 			"oauth_group_id", rc.OauthGroupID,
 			"from_account_id", res.Primary,
 			"to_account_id", res.AccountID,
+			"pick_source", res.PickSource,
 		)
 	}
 
@@ -451,7 +495,21 @@ func (p *Proxy) serveGroupAttempt(
 		"account_id", res.AccountID,
 		"credential_type", res.CredentialType,
 		"provider", canonicalCode,
+		"pick_source", res.PickSource,
 	)
+	// Load-test egress safety must run BEFORE we note a settled route: a blocked
+	// load-test request never actually serves, so it must not record a route
+	// settle (would be a phantom row in the scheduling log).
+	if os.Getenv("AIKEY_LOADTEST_OBSERVABILITY") == "1" && baseReq.Header.Get("X-AiKey-Loadtest") == "1" && !loadtestUpstreamAllowed(rc.BaseURL) {
+		p.pathHealth.NoteProbeCanceled(path)
+		writeJSONError(w, http.StatusBadGateway, "server_error", "AIKEY_LOADTEST_EGRESS_BLOCKED",
+			"Load-test safety blocked a non-allowlisted upstream before dialing it.")
+		return groupAttemptResult{done: true}
+	}
+	// Unified scheduling log (master): one row per ROUTE CHANGE — first settle
+	// or switch — never per request (拍板 2026-08-17 #3).
+	p.noteSchedRouteSettled(rc.OauthGroupID, route.SeatID, res.AccountID, res.CredentialID,
+		observability.ExtractOrCreate(r).TraceID, res.PickSource)
 
 	// Group VKs leave rc.ProviderCode empty by design (the provider is per-account
 	// in group_accounts; the base URL above already used the resolved canonicalCode,
@@ -470,6 +528,13 @@ func (p *Proxy) serveGroupAttempt(
 	// can distinguish a permanently revoked token from an ordinary 401. The last
 	// non-revocation failure is flushed verbatim immediately below.
 	fw := newGroupFailoverWriter(w, true)
+	if os.Getenv("AIKEY_LOADTEST_OBSERVABILITY") == "1" && baseReq.Header.Get("X-AiKey-Loadtest") == "1" {
+		accountHash := sha256.Sum256([]byte(res.AccountID))
+		fw.Header().Set("X-AiKey-Account-ID", fmt.Sprintf("acct-%x", accountHash[:6]))
+		fw.Header().Set("X-AiKey-Upstream-Attempts", strconv.Itoa(attempt+1))
+		fw.Header().Set("X-AiKey-Route-Switches", strconv.Itoa(attempt))
+	}
+	fw.onCommit = replay.Commit
 	p.serveRouteWithObserver(fw, r, &rc, prov, realKey, inboundBearer, startTime, logger,
 		observer.StreamUserChat, traceID)
 	// No-op after an HTTP response (the entry is already closed) or transport
@@ -490,6 +555,12 @@ func (p *Proxy) serveGroupAttempt(
 		isHardRevoked(fw.status, errType, fw.buf.String())
 	if hardRevoked {
 		p.poolCooldown.markAuthFailedToken(route.OauthGroupID, route.SeatID, res.AccountID, oauthTokenFingerprint(res.OAuth.AccessToken))
+		// The revocation MOMENT gets its own row (覆盖度审计 2026-08-18): the
+		// login_required rows that follow are the consequence, not the cause.
+		p.reportSchedEvent(observability.EventProxyGroupTokenRevoked, schedSeverityWarn, schedOriginProvider, "",
+			rc.OauthGroupID, res.CredentialID, res.AccountID, route.SeatID,
+			observability.ExtractOrCreate(r).TraceID,
+			map[string]any{"status": fw.status})
 	} else if fw.status == http.StatusUnauthorized {
 		// Preserve the released conservative behavior for an opaque 401 whose body
 		// does not prove hard revocation. The delayed classification is important:
@@ -522,7 +593,32 @@ func (p *Proxy) serveGroupAttempt(
 		"failed_status", fw.status,
 		"attempt", attempt+1,
 	)
+	p.reportSchedEvent(observability.EventProxyGroupRequestFailover, schedSeverityWarn, schedOriginProvider, "",
+		rc.OauthGroupID, res.CredentialID, res.AccountID, route.SeatID,
+		observability.ExtractOrCreate(r).TraceID,
+		map[string]any{"failed_status": fw.status, "attempt": attempt + 1})
 	return groupAttemptResult{attempted: true, authFailedAccount: authFailedAccount(hardRevoked, res.AccountID)}
+}
+
+func loadtestUpstreamAllowed(rawURL string) bool {
+	parsed, err := url.Parse(rawURL)
+	if err != nil || (parsed.Scheme != "http" && parsed.Scheme != "https") {
+		return false
+	}
+	host := strings.ToLower(parsed.Hostname())
+	if host == "localhost" {
+		return true
+	}
+	if ip := net.ParseIP(host); ip != nil && ip.IsLoopback() {
+		return true
+	}
+	for _, allowed := range strings.Split(os.Getenv("AIKEY_LOADTEST_ALLOWED_UPSTREAM_HOSTS"), ",") {
+		allowed = strings.ToLower(strings.TrimSpace(allowed))
+		if allowed != "" && (host == allowed || strings.HasSuffix(host, "."+allowed)) {
+			return true
+		}
+	}
+	return false
 }
 
 func authFailedAccount(hardRevoked bool, accountID string) string {
@@ -532,13 +628,23 @@ func authFailedAccount(hardRevoked bool, accountID string) string {
 	return ""
 }
 
+// groupPathUnavailableCode is the SINGLE exit mapping a provider-path health
+// observation to the client-facing error code. Both consumers — the pre-dial
+// breaker refusal (respondProviderPathUnavailable) and the dial-failure
+// scheduling event (ErrorHandler, 方案 20260819-入口错误可见性 W1) — MUST derive
+// the code here; deriving it twice is how the two legs of one incident end up
+// filed under different codes in the master scheduling log.
+func groupPathUnavailableCode(health ProviderPathHealth) string {
+	if health.Transport != "node" || health.FailureClass == pathFailureEgressDial {
+		return observability.ErrCodeAccountEgressProxy
+	}
+	return observability.ErrCodeGroupUpstreamUnavailable
+}
+
 func (p *Proxy) respondProviderPathUnavailable(
 	w http.ResponseWriter, logger *slog.Logger, route *vkeys.ResolvedRoute, health ProviderPathHealth,
 ) {
-	code := observability.ErrCodeGroupUpstreamUnavailable
-	if health.Transport != "node" || health.FailureClass == pathFailureEgressDial {
-		code = observability.ErrCodeAccountEgressProxy
-	}
+	code := groupPathUnavailableCode(health)
 	if health.RetryAfterSeconds > 0 {
 		w.Header().Set("Retry-After", fmt.Sprintf("%d", health.RetryAfterSeconds))
 	}
@@ -612,6 +718,9 @@ func (p *Proxy) respondLoginRequired(w http.ResponseWriter, logger *slog.Logger,
 	)
 	// Bypass statusline hint (决策3): best-effort, never blocks the response.
 	p.groupLoginState.Write(logger, route.ProviderCode, accountID, loginURL)
+	p.reportSchedEvent(observability.EventProxyGroupLoginRequired, schedSeverityWarn, schedOriginAikey, groupErrLoginRequired,
+		route.OauthGroupID, "", accountID, route.SeatID, "",
+		map[string]any{"virtual_key_id": route.VirtualKeyID})
 
 	message := "AiKey: log in to this shared account before use. " +
 		"Open your local AiKey console (" + groupLoginConsolePath + " page), complete sign-in, then retry."
@@ -681,6 +790,9 @@ func (p *Proxy) respondModelTierExhausted(w http.ResponseWriter, logger *slog.Lo
 		"tier", tierKey,
 		"reset_in", resetIn,
 	)
+	p.reportSchedEvent(observability.EventProxyGroupModelTierCooldown, schedSeverityWarn, schedOriginAikey,
+		observability.ErrCodeModelTierExhausted, route.OauthGroupID, "", "", route.SeatID, "",
+		map[string]any{"model": reqModel, "tier": tierKey, "reset_in": resetIn})
 	w.Header().Set(HeaderAikeyErrorSource, observability.ErrCodeModelTierExhausted)
 	writeJSONError(w, http.StatusTooManyRequests, "rate_limit_error", observability.ErrCodeModelTierExhausted,
 		"The weekly limit for "+reqModel+" (premium-tier models) is used up on all pool accounts; it resets in about "+resetIn+". "+
@@ -829,6 +941,9 @@ func (p *Proxy) degradeGroupWithRetry(w http.ResponseWriter, logger *slog.Logger
 		"retry_after_seconds", advice.Seconds,
 		"retry_reason", advice.Reason,
 	)
+	p.reportSchedEvent(observability.EventProxyGroupRouteDegraded, schedSeverityWarn, schedOriginAikey, code,
+		route.OauthGroupID, "", "", route.SeatID, "",
+		map[string]any{"http_status": status, "retry_after_seconds": advice.Seconds, "retry_reason": advice.Reason})
 	writeJSONErrorDetails(w, status, errType, code, message, map[string]any{
 		"retry_after_seconds": advice.Seconds,
 		"retry_at":            advice.RetryAt,
@@ -851,5 +966,8 @@ func (p *Proxy) degradeGroup(w http.ResponseWriter, logger *slog.Logger, route *
 		"oauth_group_id", route.OauthGroupID,
 		"virtual_key_id", route.VirtualKeyID,
 	)
+	p.reportSchedEvent(observability.EventProxyGroupRouteDegraded, schedSeverityWarn, schedOriginAikey, code,
+		route.OauthGroupID, "", "", route.SeatID, "",
+		map[string]any{"http_status": status})
 	writeJSONError(w, status, errType, code, clientMsg)
 }

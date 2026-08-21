@@ -23,6 +23,17 @@ require (
 	modernc.org/sqlite v1.48.2
 )
 
+require (
+	github.com/bdandy/go-errors v1.2.2 // indirect
+	github.com/bdandy/go-socks4 v1.2.3 // indirect
+	github.com/bogdanfinn/fhttp v0.6.8 // indirect
+	github.com/bogdanfinn/quic-go-utls v1.0.9-utls // indirect
+	github.com/bogdanfinn/tls-client v1.15.1 // indirect
+	github.com/bogdanfinn/utls v1.7.7-barnius // indirect
+	github.com/bogdanfinn/websocket v1.5.5-barnius // indirect
+	github.com/tam7t/hpkp v0.0.0-20160821193359-2b70b4024ed5 // indirect
+)
+
 replace github.com/AiKeyLabs/pkg/buildinfo => ../pkg/buildinfo
 
 replace github.com/AiKeyLabs/pkg/fallbackpolicy => ../pkg/fallbackpolicy

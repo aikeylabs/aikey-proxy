@@ -134,21 +134,43 @@ func (s *Supervisor) installFilterHook(p *proxy.Proxy, vaultReader *vault.Reader
 	if complianceDisabledByOperator() {
 		slog.Info("supervisor: compliance disabled by operator (AIKEY_DE_COMPLIANCE=off) — filter hook NOT installed, traffic forwarded unfiltered",
 			"event.name", "proxy.filter.disabled_by_operator")
-		p.SetFilterStub501Active(false) // ensure we are NOT in fail-loud mode
+		p.SetFilterStub501(nil) // ensure we are NOT in fail-loud mode
 		return nil
 	}
-	binPath, binArgs, slug, declaredButMissing := s.resolveFilterBinary(vaultReader)
+	binPath, binArgs, slug, declaredButMissing, mandated := s.resolveFilterBinary(vaultReader)
 	if binPath == "" {
 		if declaredButMissing {
-			// Vault declares a filter app but its installed binary can't be
-			// resolved. Fail loud — do NOT pass traffic through unfiltered
-			// (anti-example F). Re-evaluated each Reload, so it self-heals once
-			// `aikey app install` lays the binary down.
-			slog.Warn("supervisor: vault declares a filter app but its binary was not found "+
-				"(expected <apps_dir>/<slug>/bin/<slug>, or set "+filterBinaryEnv+"). "+
-				"Data-plane returns 501 until resolved. SPEC §1.5.7 anti-example F.",
-				"event.name", "proxy.filter_stub_active")
-			p.SetFilterStub501Active(true)
+			// A filter is required (vault declaration or org mandate) but its
+			// installed binary can't be resolved. Fail loud — do NOT pass
+			// traffic through unfiltered (anti-example F).
+			//
+			// Recovery is NOT automatic by virtue of being "re-evaluated each
+			// Reload" — that claim stood here until 2026-08-20 and was false in
+			// the case that matters: laying the binary down changes no vault
+			// row, so no reload is triggered and the 501 outlives the fix. The
+			// sync loop's healFilterStubIfResolvable is what actually closes
+			// that gap; it polls the path only while this latch is set. The cause carries the SAME facts as these logs so
+			// the client-visible 501 can never diverge from them again
+			// (bugfix 2026-08-19 filterpipe-501-stale-copy).
+			causeSlug := slug
+			if causeSlug == "" {
+				causeSlug = complianceDetectorSlug
+			}
+			expected := filepath.Join(s.appsDir(), causeSlug, "bin", appBinaryFileName(causeSlug))
+			reason := proxy.FilterStubReasonBinaryMissing
+			if mandated {
+				reason = proxy.FilterStubReasonMandateNotInstalled
+			} else {
+				// The mandate branch already logged its own ERROR with the
+				// canonical install path inside resolveFilterBinary.
+				slog.Warn("supervisor: vault declares a filter app but its binary was not found "+
+					"(expected "+expected+", or set "+filterBinaryEnv+"). "+
+					"Data-plane returns 501 until resolved. SPEC §1.5.7 anti-example F.",
+					"event.name", "proxy.filter_stub_active", "slug", causeSlug)
+			}
+			p.SetFilterStub501(&proxy.FilterStubCause{
+				Reason: reason, Slug: causeSlug, ExpectedPath: expected, Mandated: mandated,
+			})
 		}
 		return nil // nothing declared (normal serving), or declared-but-missing (501 set)
 	}
@@ -277,7 +299,10 @@ func (s *Supervisor) installFilterHook(p *proxy.Proxy, vaultReader *vault.Reader
 		slog.Error("supervisor: filter hook spawn failed; enabling fail-loud 501",
 			"event.name", "proxy.filter_spawn_failed",
 			"binary", binPath, "workers", m, "error", err)
-		p.SetFilterStub501Active(true)
+		p.SetFilterStub501(&proxy.FilterStubCause{
+			Reason: proxy.FilterStubReasonSpawnFailed, Slug: slugOrDetector(slug),
+			ExpectedPath: binPath,
+		})
 		_ = pool.Shutdown(context.Background()) // best-effort; never started → no-op
 		return nil
 	}
@@ -337,17 +362,26 @@ func (s *Supervisor) installFilterHook(p *proxy.Proxy, vaultReader *vault.Reader
 // Returns ("", nil, false) when nothing is declared (normal serving), and
 // ("", nil, true) when a filter app IS declared but no binary was found
 // (caller fails loud rather than serving unfiltered).
-func (s *Supervisor) resolveFilterBinary(vaultReader *vault.Reader) (binPath string, args []string, slug string, declaredButMissing bool) {
+// slugOrDetector defaults an empty filter slug to the canonical compliance
+// detector (the dev-override path resolves no slug).
+func slugOrDetector(slug string) string {
+	if slug == "" {
+		return complianceDetectorSlug
+	}
+	return slug
+}
+
+func (s *Supervisor) resolveFilterBinary(vaultReader *vault.Reader) (binPath string, args []string, slug string, declaredButMissing, mandated bool) {
 	if env := strings.TrimSpace(os.Getenv(filterBinaryEnv)); env != "" {
 		// Dev override: no slug → caller can't read per-app vault config (gets
 		// the record-allow default-off env).
-		return env, strings.Fields(os.Getenv(filterArgsEnv)), "", false
+		return env, strings.Fields(os.Getenv(filterArgsEnv)), "", false, false
 	}
 	slugs, err := vaultReader.GetFilterAppSlugs()
 	if err != nil {
 		slog.Warn("supervisor: filter_stages check failed; treating as inactive",
 			"event.name", "proxy.filter_stub_check_failed", "error", err)
-		return "", nil, "", false
+		return "", nil, "", false, false
 	}
 	if len(slugs) == 0 {
 		// G3: the user hasn't enabled the local filter, but the org may mandate it.
@@ -355,7 +389,7 @@ func (s *Supervisor) resolveFilterBinary(vaultReader *vault.Reader) (binPath str
 		// master forces compliance, run the detector even with no local filter_stages.
 		if s.masterCompliance.Load() {
 			if bin, sl := resolveAppBinary(s.appsDir(), []string{complianceDetectorSlug}); bin != "" {
-				return bin, nil, sl, false
+				return bin, nil, sl, false, true
 			}
 			// Org MANDATES compliance but the detector binary is absent at the
 			// canonical <apps_dir>/ai-compliance-detector/bin/ai-compliance-detector.
@@ -374,14 +408,16 @@ func (s *Supervisor) resolveFilterBinary(vaultReader *vault.Reader) (binPath str
 				"/bin/"+complianceDetectorSlug,
 				"event.name", "proxy.compliance_mandate_binary_missing",
 				"apps_dir", s.appsDir(), "slug", complianceDetectorSlug)
-			return "", nil, complianceDetectorSlug, true
+			return "", nil, complianceDetectorSlug, true, true
 		}
-		return "", nil, "", false
+		return "", nil, "", false, false
 	}
 	if bin, sl := resolveAppBinary(s.appsDir(), slugs); bin != "" {
-		return bin, nil, sl, false
+		return bin, nil, sl, false, false
 	}
-	return "", nil, "", true
+	// Declared in vault but no binary — surface the first declared slug so the
+	// 501 cause can name it (bugfix 2026-08-19).
+	return "", nil, slugs[0], true, false
 }
 
 // complianceDetectorSlug is the app slug force-spawned under a master mandate.

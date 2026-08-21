@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -99,6 +100,10 @@ type batchResponse struct {
 	Accepted      int              `json:"accepted"`
 	Duplicated    int              `json:"duplicated"`
 	Rejected      int              `json:"rejected"`
+	// Quarantined mirrors BatchResponse.Quarantined: stored but held for review
+	// (content_hash mismatch). Counted as "accounted for" by noteBatchVerdict —
+	// the row exists, so a batch full of them is not the silent-drop case.
+	Quarantined int `json:"quarantined,omitempty"`
 }
 
 // Reporter handles usage event reporting: WAL write + async upload to collector-service.
@@ -146,16 +151,59 @@ type Reporter struct {
 	complianceLastFailureAt     aikeytime.Millis
 	complianceLastFailureReason string
 	complianceLastFailureCode   int
-	wal                 *WALWriter
-	done                chan struct{}
+	wal                         *WALWriter
+	done                        chan struct{}
 	// delivery-integrity cursors (memory only; see type doc). Guarded by mu.
-	sentSeq             map[string]int64       // source_id → highest seq handed to upload
-	confirmedSeq        map[string]int64       // source_id → server contiguous high-water
-	seenV1              map[string]bool        // event_id → uploaded; A1 one-shot for v1 entries
-	signal              chan struct{}          // cap-1 wakeup poke from Report → uploadLoop
-	dlw                 *deadLetterWriter      // dead letter writer for terminal failures
-	client              *httpx.SwappableClient // control-plane→collector: rebuilt on host network change (self-heal registry)
-	lastUploadStatus    string                 // "ok" | "retryable_failed" | "terminal_failed"
+	sentSeq          map[string]int64       // source_id → highest seq handed to upload
+	confirmedSeq     map[string]int64       // source_id → server contiguous high-water
+	seenV1           map[string]bool        // event_id → uploaded; A1 one-shot for v1 entries
+	signal           chan struct{}          // cap-1 wakeup poke from Report → uploadLoop
+	dlw              *deadLetterWriter      // dead letter writer for terminal failures
+	client           *httpx.SwappableClient // control-plane→collector: rebuilt on host network change (self-heal registry)
+	lastUploadStatus string                 // "ok" | "retryable_failed" | "terminal_failed"
+	// noRouteWarned dedups the "route has no destination" WARN to once per
+	// route source per process (see warnNoRouteOnce). Guarded by mu.
+	noRouteWarned map[string]bool
+	// misroutedWarned dedups the "this URL is not a collector" diagnostic to
+	// once per destination per process (see warnMisroutedCollectorOnce).
+	// Guarded by mu.
+	misroutedWarned map[string]bool
+	// routedSeq is collector URL → highest source_seq ROUTED to that
+	// destination (whether or not the upload then succeeded). It is what gets
+	// stamped as batchRequest.AllocatedSeq, replacing the allocator's GLOBAL
+	// high-water. See noteRouted for why. Guarded by mu.
+	routedSeq map[string]int64
+
+	// D' auto-reconcile state (P0-4 sentSeq silent-loss fix, 2026-08-19).
+	// sentSeq is allowed to run ahead of confirmedSeq transiently (in-flight
+	// window), but a PERSISTENT stall means some "sent" seq was never stored
+	// server-side (per-event rejected inside a 200, or a WAL line skipped on a
+	// torn read) — the drain loop can never recover it because of the sentSeq
+	// filter. After sentStallReconcilePasses consecutive un-gated drain passes
+	// with zero confirmedSeq progress, the reporter triggers the EXISTING
+	// ReconcileGaps (D3): server enumerates the exact missing seqs,
+	// WAL-present ones are re-sent (bypassing the filter), WAL-absent ones are
+	// confirm-lost. Guarded by mu except the atomics.
+	lastConfirmedView    map[string]int64 // confirmedSeq as of the previous counted pass
+	stallPasses          int
+	lastAutoReconcileAt  time.Time
+	autoReconcileRunning atomic.Bool
+	autoReconcileRuns    atomic.Int64
+	autoReconcileResent  atomic.Int64
+	autoReconcileGaveUp  atomic.Int64
+	// resendDelivered tracks, per source, how many times a gap seq was
+	// DELIVERED (200) by reconcile yet still enumerated missing — the
+	// terminal-resend budget (N4 拍板, see terminalResendAttempts). Guarded by
+	// mu; entries are pruned the moment a seq stops being missing, so the map
+	// is bounded by the live gap window.
+	resendDelivered map[string]map[int64]int
+	// Periodic reconcile sweep (N4 拍板 2: 定期兜底对账 — the 周期必经 leg of
+	// 事件驱动写必配对账读). Rides the existing drain tick; no extra timer
+	// goroutine to die. lastPeriodicSweepAt starts at boot; ANY reconcile
+	// (stall-triggered or sweep) resets it.
+	periodicReconcileInterval time.Duration
+	lastPeriodicSweepAt       time.Time
+
 	cfg                 ReporterConfig
 	wg                  sync.WaitGroup
 	consecutiveFailures int
@@ -224,15 +272,21 @@ func NewReporter(in *ReporterConfig) (*Reporter, error) {
 	}
 
 	r := &Reporter{
-		cfg:          cfg,
-		wal:          wal,
-		dlw:          dlw,
-		signal:       make(chan struct{}, 1),
-		done:         make(chan struct{}),
-		client:       httpx.NewSwappableDirect(30 * time.Second),
-		sentSeq:      make(map[string]int64),
-		confirmedSeq: make(map[string]int64),
-		seenV1:       make(map[string]bool),
+		cfg:               cfg,
+		wal:               wal,
+		dlw:               dlw,
+		signal:            make(chan struct{}, 1),
+		done:              make(chan struct{}),
+		client:            httpx.NewSwappableDirect(30 * time.Second),
+		sentSeq:           make(map[string]int64),
+		lastConfirmedView: make(map[string]int64),
+		confirmedSeq:      make(map[string]int64),
+		seenV1:            make(map[string]bool),
+		resendDelivered:   make(map[string]map[int64]int),
+		// Hourly by default (N4 拍板: "每一个小时扫描后重试一次"). Boot-anchored
+		// so a fresh process gives the stall trigger (N=3) first shot.
+		periodicReconcileInterval: time.Hour,
+		lastPeriodicSweepAt:       time.Now(),
 	}
 
 	// Start upload loop if any destination is configured (legacy single
@@ -272,8 +326,25 @@ func (r *Reporter) urlForEvent(ev *ReportableEvent) string {
 // pick the right credential per group, not just per URL — two route
 // sources COULD collide on the same URL with different credentials).
 func (r *Reporter) urlForRouteSource(routeSource string) string {
+	// Three-way, exactly as EventsConfig.CollectorRoutes documents it:
+	//
+	//   key present, non-empty → that URL
+	//   key present, EMPTY     → NO destination; the event stays in the WAL
+	//   key absent             → fall through to CollectorURL (legacy single
+	//                            sink; TestReporter_PerRouteRouting pins this)
+	//
+	// 🔴 The empty case used to fall through as well (`ok && u != ""`), which
+	// silently defeated the only mechanism the config had for "configured, but
+	// deliberately not uploading" (bugfix 2026-08-20). On a Personal install
+	// CollectorURL is the LOCAL collector, so an empty `team` route pushed TEAM
+	// usage into the employee's PERSONAL database — inverting the isolation
+	// this split exists to enforce (20260510-personal-team-数据隔离与合并显示.md
+	// constraint 1: personal traffic must not reach the team server; the mirror
+	// obligation is that team traffic must not land in the personal store).
+	// Downstream it also stalls the Personal projector forever: a Personal
+	// install has no managed_key_control_events table to enrich a team VK from.
 	if r.cfg.CollectorRoutes != nil {
-		if u, ok := r.cfg.CollectorRoutes[routeSource]; ok && u != "" {
+		if u, ok := r.cfg.CollectorRoutes[routeSource]; ok {
 			return u
 		}
 	}
@@ -380,7 +451,19 @@ func (r *Reporter) Report(ev *ReportableEvent) {
 // queue.
 func (r *Reporter) Close() error {
 	close(r.done)
-	r.wg.Wait()
+	// The final flush above is ctx-bounded, so the loop goroutine exits within
+	// shutdownFlushBudget+ε on its own. The timed wait is a SAFETY NET, not the
+	// bound: if a future edit re-introduces an unbounded wait inside the loop,
+	// abandon it loudly instead of holding the whole shutdown chain (the
+	// goroutine dies with the process; on reload it finishes late and is GC'd).
+	waited := make(chan struct{})
+	go func() { r.wg.Wait(); close(waited) }()
+	select {
+	case <-waited:
+	case <-time.After(shutdownFlushBudget + closeWaitGrace):
+		slog.Error("usage reporter close: upload loop did not stop within budget — abandoning it",
+			"event.name", "usage.reporter.close_timeout")
+	}
 	if r.wal != nil {
 		return r.wal.Close()
 	}
@@ -480,11 +563,19 @@ func (r *Reporter) uploadLoop() {
 	for {
 		select {
 		case <-ticker.C:
-			r.drainOnce(false)
+			r.drainOnce(context.Background(), false)
 		case <-r.signal:
-			r.drainOnce(false)
+			r.drainOnce(context.Background(), false)
 		case <-r.done:
-			r.drainOnce(true) // final flush — bypass the backoff gate for one last attempt
+			// Final flush — one BOUNDED attempt, not a backlog clearance. The WAL
+			// is crash-safe and idempotent (seq + server dedup), so anything not
+			// delivered inside the budget simply resumes after restart. Unbounded
+			// flushing here once held process exit past systemd's 90s stop
+			// timeout when the collector network black-holed (accept-then-hang ×
+			// every batch) — bugfix 2026-08-19-proxy-shutdown-unbounded-close.
+			ctx, cancel := context.WithTimeout(context.Background(), shutdownFlushBudget)
+			r.drainOnce(ctx, true) // bypass the backoff gate for this one attempt
+			cancel()
 			return
 		}
 	}
@@ -494,7 +585,7 @@ func (r *Reporter) uploadLoop() {
 // (source_seq > sentSeq[source], plus a one-shot pass over legacy v1 entries),
 // uploads them grouped by RouteSource, then prunes confirmed WAL files. One WAL
 // read per pass keeps it simple; the BatchSize cap bounds a single HTTP body.
-func (r *Reporter) drainOnce(force bool) {
+func (r *Reporter) drainOnce(ctx context.Context, force bool) {
 	if r.wal == nil {
 		return
 	}
@@ -554,14 +645,20 @@ func (r *Reporter) drainOnce(force bool) {
 		}
 		pending = append(pending, ev)
 		if len(pending) >= r.cfg.BatchSize {
-			if r.uploadPending(pending) {
+			if ctx.Err() != nil {
+				// Budget exhausted (shutdown final flush): stop attempting —
+				// everything unsent stays in the WAL and resumes after restart.
+				anyRetryable = true
+				break
+			}
+			if r.uploadPending(ctx, pending) {
 				anyRetryable = true
 			}
 			pending = pending[:0]
 		}
 	}
-	if len(pending) > 0 {
-		if r.uploadPending(pending) {
+	if len(pending) > 0 && ctx.Err() == nil {
+		if r.uploadPending(ctx, pending) {
 			anyRetryable = true
 		}
 	}
@@ -569,7 +666,8 @@ func (r *Reporter) drainOnce(force bool) {
 	r.pruneConfirmedWAL()
 
 	// Arm or clear the non-blocking backoff gate for the next pass (B', 缺口2):
-	// retryable failures push the next attempt out (capped at 5min); a clean pass
+	// retryable failures push the next attempt out (capped at 60s — must stay
+	// well inside the five-minute delivery-convergence window); a clean pass
 	// clears the gate so recovery is picked up on the next tick/poke.
 	r.mu.Lock()
 	if anyRetryable {
@@ -578,6 +676,14 @@ func (r *Reporter) drainOnce(force bool) {
 		r.nextUploadAttempt = time.Time{}
 	}
 	r.mu.Unlock()
+
+	// D' auto-reconcile check — only on passes that actually ran (gated passes
+	// returned earlier, so a down collector doesn't count toward the stall) and
+	// not on the shutdown flush (force) — a detached goroutine at exit would
+	// race Close.
+	if !force {
+		r.maybeAutoReconcile()
+	}
 }
 
 // uploadPending groups events by RouteSource and uploads each group. A group
@@ -587,7 +693,34 @@ func (r *Reporter) drainOnce(force bool) {
 // re-sends it (B', 缺口2). Returns true if any group failed retryably, so the
 // caller (drainOnce) can arm the non-blocking backoff gate. Confirmed-seq (for
 // WAL pruning) is advanced separately from the server's response in uploadGroupTo.
-func (r *Reporter) uploadPending(batch []ReportableEvent) (anyRetryable bool) {
+// warnNoRouteOnce logs, at most once per route source per process, that events
+// are being held in the WAL because their route has no configured destination.
+// Names the route source and the fix so the reader does not have to reverse the
+// config layering to find out which key is missing.
+func (r *Reporter) warnNoRouteOnce(batch []ReportableEvent) {
+	for i := range batch {
+		rs := batch[i].RouteSource
+		if r.urlForRouteSource(rs) != "" {
+			continue
+		}
+		r.mu.Lock()
+		if r.noRouteWarned == nil {
+			r.noRouteWarned = make(map[string]bool, 3)
+		}
+		first := !r.noRouteWarned[rs]
+		r.noRouteWarned[rs] = true
+		r.mu.Unlock()
+		if !first {
+			continue
+		}
+		slog.Warn("reporter: no upload destination for this route source — events are held in the WAL, not uploaded anywhere",
+			"event.name", "usage.reporter.route_unconfigured",
+			"route_source", rs,
+			"fix", "set events.collector_routes."+rs+" (team is written by `aikey account login --control-url <REMOTE>`)")
+	}
+}
+
+func (r *Reporter) uploadPending(ctx context.Context, batch []ReportableEvent) (anyRetryable bool) {
 	if len(batch) == 0 {
 		return false
 	}
@@ -606,11 +739,19 @@ func (r *Reporter) uploadPending(batch []ReportableEvent) (anyRetryable bool) {
 		// personal install). These stay in the WAL; counted as dropped so
 		// metrics distinguish "no route" backlog from real discard.
 		r.dropped.Add(int64(skipped))
+		// Holding events is the correct behavior, but a SILENT hold is how
+		// "my usage never showed up" becomes an unexplainable ticket. One WARN
+		// per route source per process — enough to find, not enough to spam a
+		// 5-second drain loop (bugfix 2026-08-20).
+		r.warnNoRouteOnce(batch)
 	}
 	for routeSource, group := range groups {
+		if ctx.Err() != nil {
+			return true // budget gone mid-pass: remaining groups stay in the WAL
+		}
 		url := r.urlForRouteSource(routeSource)
 		cred := r.credentialForRouteSource(routeSource)
-		if r.uploadGroupTo(url, cred, group) == groupDone {
+		if r.uploadGroupTo(ctx, url, cred, group) == groupDone {
 			r.markProcessed(group)
 		} else {
 			anyRetryable = true
@@ -718,20 +859,37 @@ const (
 	groupRetryLater                          // retryable failure — conserve in WAL, retry next drain
 )
 
+// Shutdown budgets (bugfix 2026-08-19-proxy-shutdown-unbounded-close): the
+// final WAL flush on Close gets ONE bounded attempt — the WAL is crash-safe and
+// idempotent, so anything unsent resumes after restart; an unreachable or
+// black-holed collector must never hold process exit past the OS stop timeout.
+// closeWaitGrace pads the safety-net wait in Close over the flush budget so a
+// flush that finishes exactly at the budget still joins cleanly.
+const (
+	shutdownFlushBudget = 5 * time.Second
+	closeWaitGrace      = 3 * time.Second
+)
+
 // backoffForFailures maps the consecutive-failure count to the non-blocking gate
 // before the next upload attempt. Same ceiling as the old in-line backoff
 // (5s → 15s → 60s → 5min) but applied once per drain pass at the loop level, so
 // the pump goroutine never blocks and stays responsive to shutdown/new events.
+// backoffForFailures caps at 60s (was 5min until 2026-08-19). Why the cap
+// came down: the delivery contract promises client_ok == ODS == DWD within a
+// FIVE-MINUTE convergence window (R66 / capacity fences), and a 5-minute top
+// backoff tier armed right at load-stop pushes the recovery pass past that
+// window — the elevated capacity ladder caught exactly this tail (9/86,400
+// events landing late, bugfix 2026-08-19-reporter-sentseq-silent-loss.md,
+// F4 round). One probe per minute against a down collector is still gentle;
+// a max retry interval must stay well inside the declared convergence window.
 func backoffForFailures(n int) time.Duration {
 	switch {
 	case n <= 1:
 		return 5 * time.Second
 	case n == 2:
 		return 15 * time.Second
-	case n == 3:
-		return 60 * time.Second
 	default:
-		return 5 * time.Minute
+		return 60 * time.Second
 	}
 }
 
@@ -749,21 +907,150 @@ func backoffForFailures(n int) time.Duration {
 //     non-blocking backoff gate so the next drain re-sends
 //     them (conserve, never lose). Returns groupRetryLater.
 //
+// misroutedCollectorMarker appears in the error body when a usage batch reaches
+// an aikey-proxy LLM gateway instead of a collector. The gateway answers every
+// unauthenticated request the same way, so the reporter otherwise records it as
+// an ordinary terminal 401 — "bad token" — and the real cause (this URL does
+// not serve collector ingest at all) stays invisible. See
+// middleware.go's HeaderAikeyErrorOrigin for where the marker is minted.
+const misroutedCollectorMarker = `"origin":"worker-proxy.`
+
+// warnMisroutedCollectorOnce turns "401, token rejected" into the sentence that
+// actually names the problem, once per destination per process.
+//
+// Why this exists (bugfix 2026-08-20): a team member's usage uploads were
+// posted to {control_url}/v1/usage-events:batch — configure_proxy_collector
+// assumes nginx on the control origin routes that path to collector-service
+// (nginx.default.conf.tmpl does). On a deployment where it does not, the
+// request falls through to the LLM gateway, which demands a virtual key and
+// answers TOKEN_MISSING. Every team usage event on that machine was
+// dead-lettered for days, and the only clue on disk was an auth error naming a
+// component nobody expected to be in this path.
+func (r *Reporter) warnMisroutedCollectorOnce(collectorURL string, upErr *uploadError) {
+	if upErr == nil || upErr.StatusCode != http.StatusUnauthorized {
+		return
+	}
+	if !strings.Contains(upErr.ResponseBody, misroutedCollectorMarker) {
+		return
+	}
+	r.mu.Lock()
+	if r.misroutedWarned == nil {
+		r.misroutedWarned = make(map[string]bool, 2)
+	}
+	first := !r.misroutedWarned[collectorURL]
+	r.misroutedWarned[collectorURL] = true
+	r.mu.Unlock()
+	if !first {
+		return
+	}
+	slog.Error("reporter: this collector URL is answering with an LLM-gateway auth error — usage ingest is NOT reachable there, so every event to it is being dead-lettered",
+		"event.name", "usage.reporter.collector_misrouted",
+		"error.code", "COLLECTOR_URL_NOT_INGEST",
+		"collector_url", collectorURL,
+		"fix", "the URL must serve POST /v1/usage-events:batch on collector-service "+
+			"(server-install nginx maps `location /v1/usage-events` to the collector backend). "+
+			"Re-run `aikey account login --control-url <REMOTE>` against the control origin, "+
+			"or fix that origin's reverse-proxy mapping.")
+}
+
+// destinationCount is how many DISTINCT collectors this proxy uploads to. One
+// (the overwhelmingly common shape: Personal-only, Trial, Production, a cluster
+// node) keeps the allocator's global high-water valid; more than one does not.
+func (r *Reporter) destinationCount() int {
+	seen := make(map[string]bool, 3)
+	for _, u := range r.cfg.CollectorRoutes {
+		if u = strings.TrimRight(strings.TrimSpace(u), "/"); u != "" {
+			seen[u] = true
+		}
+	}
+	if u := strings.TrimRight(strings.TrimSpace(r.cfg.CollectorURL), "/"); u != "" {
+		seen[u] = true
+	}
+	return len(seen)
+}
+
+// noteRouted records that every seq in batch has now been ROUTED to
+// collectorURL. Called before the upload attempt, deliberately: a batch that
+// fails to upload was still routed here, and its seqs must count toward this
+// destination's high-water or a genuine delivery failure would be invisible to
+// the tail-gap detector.
+func (r *Reporter) noteRouted(collectorURL string, batch []ReportableEvent) {
+	if collectorURL == "" {
+		return
+	}
+	var hi int64
+	for i := range batch {
+		if s := batch[i].SourceSeq; s != nil && *s > hi {
+			hi = *s
+		}
+	}
+	if hi == 0 {
+		return // v1 events carry no seq; nothing to high-water
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.routedSeq == nil {
+		r.routedSeq = make(map[string]int64, 3)
+	}
+	if hi > r.routedSeq[collectorURL] {
+		r.routedSeq[collectorURL] = hi
+	}
+}
+
+// routedHighWater returns the highest seq routed to collectorURL, and whether
+// anything has been routed there at all. The bool matters: reporting 0 would
+// tell the server "I have allocated nothing", which is a claim, not a silence.
+func (r *Reporter) routedHighWater(collectorURL string) (int64, bool) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	hi, ok := r.routedSeq[collectorURL]
+	return hi, ok && hi > 0
+}
+
 // cred may be nil — doUpload tolerates that by sending without an Authorization
 // header (matches pre-CollectorToken behavior).
-func (r *Reporter) uploadGroupTo(collectorURL string, cred Credential, batch []ReportableEvent) uploadGroupResult {
+func (r *Reporter) uploadGroupTo(ctx context.Context, collectorURL string, cred Credential, batch []ReportableEvent) uploadGroupResult {
+	r.noteRouted(collectorURL, batch)
 	req := batchRequest{
 		Source:          "aikey-proxy",
 		SourceVersion:   "0.1.0",
 		ProxyInstanceID: r.cfg.ProxyInstanceID,
 		Events:          batch,
 	}
-	// Stamp the allocator high-water so the server can detect tail gaps (events
-	// allocated but never delivered). Read live — it's monotonic and the server
-	// MAXes it, so a fresh snapshot is safe. Skipped when no allocator is wired
-	// (offline/degraded), leaving the field omitted (old-server compatible).
-	if r.cfg.SeqAlloc != nil {
-		allocated := r.cfg.SeqAlloc.Allocated()
+	// Stamp the seq high-water this destination should measure its tail gap
+	// against. The server MAXes it, so a fresh snapshot is safe.
+	//
+	// 🔴 Which high-water is correct depends on how many collectors this proxy
+	// uploads to, and the two answers are genuinely irreconcilable (bugfix
+	// 2026-08-20) — do not "simplify" this back to one branch:
+	//
+	//   ONE destination → SeqAlloc.Allocated(), the allocator's GLOBAL
+	//     high-water. It is the only surviving evidence of seqs that were
+	//     allocated and then never even reached the WAL (crash between Next()
+	//     and append). Reporting only what we delivered would make that class
+	//     of loss invisible — TestOutbox_CarriesAllocatedSeq pins it.
+	//
+	//   MANY destinations → the high-water ROUTED HERE. The allocator is
+	//     per-SOURCE and spans every route source, while uploads are per-route,
+	//     so the global value is not a valid tail-gap bound for any single
+	//     collector. Telling the LOCAL collector "allocated up to 1032" when
+	//     518..1032 went to the REMOTE team collector made it compute
+	//     (contiguous, 1032] as ITS tail gap — 253 phantom pending seqs, which
+	//     the reconcile loop then ledgered as 1026 client-confirmed losses in
+	//     the LOCAL ledger.
+	//
+	// 🔴 KNOWN LIMITATION, stated rather than hidden: in the many-destination
+	// case, allocated-but-never-WAL'd seqs are no longer detectable as a tail
+	// gap. Closing that needs a per-route seq stream (one allocator per route
+	// source) so the global and the per-destination bound become the same
+	// number again. That is a wire + on-disk change and is deliberately NOT
+	// smuggled in here.
+	if dests := r.destinationCount(); dests <= 1 {
+		if r.cfg.SeqAlloc != nil {
+			allocated := r.cfg.SeqAlloc.Allocated()
+			req.AllocatedSeq = &allocated
+		}
+	} else if allocated, ok := r.routedHighWater(collectorURL); ok {
 		req.AllocatedSeq = &allocated
 	}
 
@@ -778,8 +1065,9 @@ func (r *Reporter) uploadGroupTo(collectorURL string, cred Credential, batch []R
 
 	url := collectorURL + "/v1/usage-events:batch"
 
-	resp, upErr := r.doUpload(url, body, cred)
+	resp, upErr := r.doUpload(ctx, url, body, cred)
 	if upErr == nil {
+		r.noteBatchVerdict(resp, len(batch))
 		r.uploadSuccess.Add(int64(len(batch)))
 		r.onUploadSuccess(len(batch))
 		// Advance the server-confirmed contiguous high-water per source so
@@ -808,6 +1096,7 @@ func (r *Reporter) uploadGroupTo(collectorURL string, cred Credential, batch []R
 			"count", len(batch),
 			"status", upErr.StatusCode,
 			"response", upErr.ResponseBody)
+		r.warnMisroutedCollectorOnce(collectorURL, upErr)
 		return groupDone
 	}
 
@@ -821,6 +1110,43 @@ func (r *Reporter) uploadGroupTo(collectorURL string, cred Credential, batch []R
 		"error", upErr.Err,
 		"count", len(batch))
 	return groupRetryLater
+}
+
+// noteBatchVerdict is the second-layer check on a 2xx upload (日志规范:
+// "HTTP 200 + 非空 body + 解析结果全 0/空 必须再打一条 WARN").
+//
+// WHY it exists (bugfix 2026-08-20): the transport succeeding and the DATA
+// landing are different facts, and this reporter conflated them. A 2xx made it
+// count len(batch) successes, advance sentSeq, and drop the events from the
+// outbox — no matter what the body said. On a machine whose events were being
+// rejected row-by-row, `usage_events_upload_success_total` climbed past 300
+// while the collector stored NOTHING, and the only place the truth existed was
+// a slog.Debug nobody runs with. The counters were not just useless, they were
+// reassuring in the wrong direction.
+//
+// Deliberately does NOT change the delivery decision: a 2xx is still "handed
+// over" (the alternative — retrying on rejected — turns a schema-level reject
+// into an infinite loop, which is the failure this pipeline already survived
+// once). It only makes the disagreement audible.
+func (r *Reporter) noteBatchVerdict(resp *batchResponse, sent int) {
+	if resp == nil {
+		return // 2xx with no parseable body — an older collector; doUpload logged it
+	}
+	stored := resp.Accepted + resp.Duplicated + resp.Quarantined
+	switch {
+	case resp.Rejected > 0:
+		// The collector took the request and refused rows inside it. Nothing
+		// upstream of here will ever mention these events again.
+		slog.Warn("reporter: collector accepted the batch but REJECTED events inside it — those events are not stored anywhere",
+			"event.name", "usage.reporter.batch_rejected_rows",
+			"sent", sent, "accepted", resp.Accepted,
+			"duplicated", resp.Duplicated, "rejected", resp.Rejected)
+	case stored == 0 && sent > 0:
+		// HTTP 200, parseable body, and it accounts for nothing at all.
+		slog.Warn("reporter: collector returned success but accounted for no events in the batch",
+			"event.name", "usage.reporter.batch_stored_none",
+			"sent", sent)
+	}
 }
 
 // onUploadSuccess updates delivery state after a successful upload.
@@ -911,8 +1237,11 @@ func (r *Reporter) onUploadFail(count int, upErr *uploadError, terminal bool) {
 // the retry/dead-letter loop treats stale credentials the same as a
 // server-side 401 (no infinite retry; lands in dead_letter.jsonl with
 // the credential error message as response body).
-func (r *Reporter) doUpload(url string, body []byte, cred Credential) (*batchResponse, *uploadError) {
-	httpReq, err := http.NewRequestWithContext(context.Background(), http.MethodPost, url, bytes.NewReader(body))
+func (r *Reporter) doUpload(ctx context.Context, url string, body []byte, cred Credential) (*batchResponse, *uploadError) {
+	// ctx bounds THIS attempt: Background on the periodic path (the client's
+	// 30s timeout governs, unchanged), the shutdown budget on the final flush —
+	// a black-holed collector must not be able to hold process exit hostage.
+	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(body))
 	if err != nil {
 		return nil, &uploadError{Err: fmt.Errorf("build request: %w", err)}
 	}

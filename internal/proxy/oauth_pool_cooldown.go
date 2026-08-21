@@ -92,10 +92,19 @@ type PoolAccountRouteState struct {
 // Bounded by the number of distinct pool accounts; lapsed entries are dropped
 // lazily on read.
 type poolCooldownStore struct {
-	mu   sync.Mutex
-	m    map[string]time.Time             // accountID → avoid-until (whole account)
-	meta map[string]PoolAccountRouteState // accountID → display reason/recovery
-	now  func() time.Time                 // injectable clock (tests)
+	mu sync.Mutex
+	// persistTimer coalesces a burst of route-state mutations into one
+	// background snapshot. persistIO serializes timer and shutdown flushes. No
+	// filesystem operation is permitted while a request holds mu.
+	persistTimer      *time.Timer
+	persistWriting    bool
+	persistRevision   uint64
+	persistIO         sync.Mutex
+	persistedRevision uint64
+	persistPath       string
+	m                 map[string]time.Time             // accountID → avoid-until (whole account)
+	meta              map[string]PoolAccountRouteState // accountID → display reason/recovery
+	now               func() time.Time                 // injectable clock (tests)
 	// onAccountSetChanged is a best-effort notification that the WHOLE-ACCOUNT
 	// skip-set membership changed (enter cooldown or expire). The callback must be
 	// non-blocking: mark() runs on the request hot path. It is copied under mu and
@@ -112,6 +121,13 @@ type poolCooldownStore struct {
 	// model maps into that tier (skipSetFor); every other model keeps serving —
 	// a Fable weekly-window exhaustion must not block Sonnet traffic.
 	tierM map[string]time.Time
+	// lapsed records accounts whose cooldown (whole-account or tier) was
+	// observed EXPIRED and pruned — consumed once by the scheduling-log settle
+	// hook so "same account resumed after recovery" gets its route_resolved
+	// (reason=recovered) row (覆盖度审计拍板 2026-08-18). Bounded by the distinct
+	// account set; entries clear on consumption. Deliberately not persisted —
+	// recovery attribution is a live observation.
+	lapsed map[string]struct{}
 	// authFailedTokens is a route-member + token-version tombstone, not a timed
 	// cooldown. The key includes group, seat and account: one Cluster Worker can
 	// serve several members of the same pool, whose tokens must remain isolated.
@@ -145,7 +161,8 @@ type PoolAuthFailureState struct {
 func newPoolCooldownStore() *poolCooldownStore {
 	s := &poolCooldownStore{m: make(map[string]time.Time), now: time.Now,
 		meta: make(map[string]PoolAccountRouteState), serverErrStreak: make(map[string]int), tierM: make(map[string]time.Time),
-		authFailedTokens: make(map[string]string)}
+		authFailedTokens: make(map[string]string), lapsed: make(map[string]struct{})}
+	s.persistPath, _ = poolCooldownPath()
 	// Cross-restart persistence (2026-07-04 self-heal, §S4): without it a proxy
 	// restart forgot every cooldown and could immediately route traffic back
 	// onto an account that just 401'd / rate-limited. STRICTLY an enhancement,
@@ -165,9 +182,9 @@ func (s *poolCooldownStore) setAccountSetChangedHook(hook func()) {
 
 // ── cross-restart persistence (bypass state file, §S4 2026-07-04) ───────────
 // Same ownership pattern as sync-health.json / group-login-required.json:
-// one concern, one file, one writer (this store). Writes happen on mark()
-// (rare — an upstream 401/exhaustion) and are atomic (temp+rename). Reads
-// happen ONCE at construction. Every failure path is best-effort:
+// one concern, one file, one background writer (this store). Mutations on
+// mark() schedule a coalesced atomic snapshot (temp+rename); reads happen ONCE
+// at construction. Every failure path is best-effort:
 // write → WARN and keep serving; read → empty store (fallback, never blocks).
 
 const poolCooldownFilename = "pool-cooldown.json"
@@ -205,8 +222,8 @@ func poolCooldownPath() (string, error) {
 // by design: any error (missing file, bad JSON, unreadable) leaves the store
 // empty — the data path never depends on this file.
 func (s *poolCooldownStore) hydrateFromFile() {
-	path, err := poolCooldownPath()
-	if err != nil {
+	path := s.persistPath
+	if path == "" {
 		return
 	}
 	raw, err := os.ReadFile(path)
@@ -252,14 +269,38 @@ func (s *poolCooldownStore) hydrateFromFile() {
 	}
 }
 
-// persistLocked mirrors the current unexpired cooldowns to the state file
-// (s.mu held by the caller). Empty set removes the file. Best-effort: a
-// failure is WARN-logged and never surfaces to the request path.
+// persistLocked schedules a coalesced snapshot and returns immediately. The
+// caller holds s.mu, often on the request path; it must never encode JSON or
+// touch the filesystem here. A 300-member 401 burst therefore creates one
+// background snapshot instead of 300 serialized temp-file rewrites.
 func (s *poolCooldownStore) persistLocked() {
-	path, err := poolCooldownPath()
-	if err != nil {
-		return
+	s.persistRevision++
+	if s.persistTimer == nil && !s.persistWriting {
+		s.persistTimer = time.AfterFunc(5*time.Millisecond, s.persistScheduledSnapshot)
 	}
+}
+
+func (s *poolCooldownStore) persistScheduledSnapshot() {
+	s.mu.Lock()
+	s.persistTimer = nil
+	s.persistWriting = true
+	revision := s.persistRevision
+	body := s.persistenceSnapshotLocked()
+	s.mu.Unlock()
+	s.writePersistenceSnapshot(body, revision)
+
+	// Mutations that arrive during a blocked write only advance the revision;
+	// they never spawn more writers. Once this write finishes, schedule exactly
+	// one coalesced snapshot for the newest state.
+	s.mu.Lock()
+	s.persistWriting = false
+	if s.persistRevision != revision && s.persistTimer == nil {
+		s.persistTimer = time.AfterFunc(5*time.Millisecond, s.persistScheduledSnapshot)
+	}
+	s.mu.Unlock()
+}
+
+func (s *poolCooldownStore) persistenceSnapshotLocked() poolCooldownFileBody {
 	now := s.now()
 	accounts := make(map[string]int64, len(s.m))
 	for id, until := range s.m {
@@ -276,28 +317,50 @@ func (s *poolCooldownStore) persistLocked() {
 			tierAccounts[key] = until.Unix()
 		}
 	}
-	if len(accounts) == 0 && len(tierAccounts) == 0 && len(s.authFailedTokens) == 0 {
+	states := make(map[string]PoolAccountRouteState, len(accounts))
+	for id := range accounts {
+		if state, ok := s.meta[id]; ok && state.Status != "" {
+			states[id] = state
+		}
+	}
+	authFailedTokens := make(map[string]string, len(s.authFailedTokens))
+	for id, fingerprint := range s.authFailedTokens {
+		authFailedTokens[id] = fingerprint
+	}
+	return poolCooldownFileBody{
+		Accounts: accounts, AccountStates: states, TierAccounts: tierAccounts,
+		AuthFailedTokens: authFailedTokens, WrittenAt: time.Now().UnixMilli(),
+	}
+}
+
+func (s *poolCooldownStore) writePersistenceSnapshot(body poolCooldownFileBody, revision uint64) {
+	s.persistIO.Lock()
+	defer s.persistIO.Unlock()
+	// A timer may have captured an older snapshot just before shutdown flush
+	// captured a newer one. Mutex serialization alone does not define which
+	// waiter writes last, so reject stale revisions explicitly; otherwise the
+	// old timer could overwrite the shutdown snapshot after flush returned.
+	if revision < s.persistedRevision {
+		return
+	}
+	path := s.persistPath
+	if path == "" {
+		return
+	}
+	var err error
+	if len(body.Accounts) == 0 && len(body.TierAccounts) == 0 && len(body.AuthFailedTokens) == 0 {
 		if rmErr := os.Remove(path); rmErr != nil && !os.IsNotExist(rmErr) {
 			slog.Warn("pool cooldown state file remove failed",
 				"event.name", observability.EventProxyGroupAccountCooldown, "error", rmErr.Error())
 		}
+		s.persistedRevision = revision
 		return
 	}
 	err = func() error {
 		if mkErr := os.MkdirAll(filepath.Dir(path), 0o700); mkErr != nil {
 			return mkErr
 		}
-		states := make(map[string]PoolAccountRouteState, len(accounts))
-		for id := range accounts {
-			if state, ok := s.meta[id]; ok && state.Status != "" {
-				states[id] = state
-			}
-		}
-		authFailedTokens := make(map[string]string, len(s.authFailedTokens))
-		for id, fingerprint := range s.authFailedTokens {
-			authFailedTokens[id] = fingerprint
-		}
-		data, mErr := json.Marshal(poolCooldownFileBody{Accounts: accounts, AccountStates: states, TierAccounts: tierAccounts, AuthFailedTokens: authFailedTokens, WrittenAt: time.Now().UnixMilli()})
+		data, mErr := json.Marshal(body)
 		if mErr != nil {
 			return mErr
 		}
@@ -311,6 +374,25 @@ func (s *poolCooldownStore) persistLocked() {
 		slog.Warn("pool cooldown state file write failed — cooldowns won't survive a restart",
 			"event.name", observability.EventProxyGroupAccountCooldown, "error", err.Error())
 	}
+	s.persistedRevision = revision
+}
+
+// flushPersistence is a lifecycle/test barrier. It is deliberately allowed to
+// block because callers are process shutdown or persistence assertions, never
+// inference requests.
+func (s *poolCooldownStore) flushPersistence() {
+	if s == nil {
+		return
+	}
+	s.mu.Lock()
+	if s.persistTimer != nil {
+		s.persistTimer.Stop()
+		s.persistTimer = nil
+	}
+	body := s.persistenceSnapshotLocked()
+	revision := s.persistRevision
+	s.mu.Unlock()
+	s.writePersistenceSnapshot(body, revision)
 }
 
 // oauthTokenFingerprint returns a non-reversible identifier for one delivered
@@ -575,6 +657,10 @@ func (s *poolCooldownStore) skipSet() map[string]bool {
 		} else {
 			delete(s.m, id)
 			delete(s.meta, id)
+			if s.lapsed == nil {
+				s.lapsed = make(map[string]struct{})
+			}
+			s.lapsed[id] = struct{}{}
 			pruned = true
 		}
 	}
@@ -694,6 +780,10 @@ func (s *poolCooldownStore) skipSetFor(model string) map[string]bool {
 	for key, until := range s.tierM {
 		if !now.Before(until) {
 			delete(s.tierM, key)
+			if s.lapsed == nil {
+				s.lapsed = make(map[string]struct{})
+			}
+			s.lapsed[strings.SplitN(key, "|", 2)[0]] = struct{}{}
 			continue
 		}
 		if strings.HasSuffix(key, suffix) {
@@ -718,6 +808,10 @@ func (s *poolCooldownStore) tierCooldownUntil(tierKey string) (time.Time, bool) 
 	for key, until := range s.tierM {
 		if !now.Before(until) {
 			delete(s.tierM, key)
+			if s.lapsed == nil {
+				s.lapsed = make(map[string]struct{})
+			}
+			s.lapsed[strings.SplitN(key, "|", 2)[0]] = struct{}{}
 			continue
 		}
 		if strings.HasSuffix(key, suffix) && until.After(latest) {
@@ -744,6 +838,10 @@ func (s *poolCooldownStore) snapshot() map[string]int {
 		} else {
 			delete(s.m, id)
 			delete(s.meta, id)
+			if s.lapsed == nil {
+				s.lapsed = make(map[string]struct{})
+			}
+			s.lapsed[id] = struct{}{}
 			pruned = true
 		}
 	}
@@ -1042,4 +1140,18 @@ func retryAfterDuration(h http.Header) time.Duration {
 		return time.Duration(secs) * time.Second
 	}
 	return 0
+}
+
+// consumeLapsed reports (and clears) whether accountID's cooldown was observed
+// to expire since the last consumption — the scheduling-log settle hook turns
+// this into a route_resolved(reason=recovered) row. One-shot by design: the
+// recovery is attributed to the first request that resumes the account.
+func (s *poolCooldownStore) consumeLapsed(accountID string) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if _, ok := s.lapsed[accountID]; ok {
+		delete(s.lapsed, accountID)
+		return true
+	}
+	return false
 }

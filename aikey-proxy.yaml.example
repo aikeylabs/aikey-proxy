@@ -80,10 +80,15 @@ events:
   # collector_routes — per-RouteSource upload destinations. Populated by
   # `aikey-config-tool render` based on profile + login state.
   #   personal/oauth → local collector  (8090 on personal/trial)
-  #   team           → remote control_url after `aikey login`, else local
+  #   team           → EMPTY until `aikey account login --control-url <REMOTE>`
+  #                    writes the remote team-server URL into the user layer.
+  #                    🔴 NOT the local collector (bugfix 2026-08-20): this is a
+  #                    PERSONAL install, it is not a team backend, and pointing
+  #                    the team route here wrote an employee's TEAM usage into
+  #                    their PERSONAL database. Empty = hold in the WAL.
   collector_routes:
     personal: "http://127.0.0.1:8090"
-    team:     "http://127.0.0.1:8090"
+    team:     ""
     oauth:    "http://127.0.0.1:8090"
 
   queue_capacity: 10000

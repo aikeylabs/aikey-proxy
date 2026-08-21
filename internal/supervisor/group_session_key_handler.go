@@ -1,4 +1,4 @@
-// group_session_key_handler.go isolates the desktop Claude Session Key
+// group_session_key_handler.go isolates the desktop Provider Session Key
 // flow from the existing browser OAuth flow while preserving the same account
 // binding, token writeback, and runtime synchronization boundaries.
 package supervisor
@@ -17,44 +17,68 @@ import (
 	"github.com/AiKeyLabs/aikey-proxy/internal/observability"
 )
 
-func poolSessionKeyProviderSupported(loginCtx poolLoginContext) bool {
-	if !strings.EqualFold(strings.TrimSpace(loginCtx.ProtocolType), "anthropic") {
-		return false
-	}
-	switch strings.ToLower(strings.TrimSpace(loginCtx.ProviderCode)) {
-	case "anthropic":
-		return true
-	case "mock":
-		return strings.TrimSpace(loginCtx.OAuthTokenURL) != ""
-	default:
-		return false
-	}
+type poolSessionKeyAdapter func(context.Context, poolLoginContext, broker.SessionKeyExchangeOptions) (*broker.SessionKeyToken, error)
+
+type poolSessionKeyAdapterKey struct {
+	providerCode string
+	protocolType string
 }
 
-// exchangePoolSessionKey is the sole provider dispatch for this login use case.
-// The authoritative login context comes from Master; the browser never chooses
-// an endpoint or provider. Mock credentials use their resident token endpoint,
-// while real Session Keys can only enter the fixed Anthropic implementation.
-func exchangePoolSessionKey(ctx context.Context, loginCtx poolLoginContext, opts broker.SessionKeyExchangeOptions) (*broker.SessionKeyToken, error) {
-	switch strings.ToLower(strings.TrimSpace(loginCtx.ProviderCode)) {
-	case "anthropic":
+var poolSessionKeyAdapters = map[poolSessionKeyAdapterKey]poolSessionKeyAdapter{
+	{providerCode: "anthropic", protocolType: "anthropic"}: func(ctx context.Context, _ poolLoginContext, opts broker.SessionKeyExchangeOptions) (*broker.SessionKeyToken, error) {
 		return broker.ExchangeClaudeSessionKey(ctx, opts)
-	case "mock":
+	},
+	{providerCode: "openai", protocolType: "openai_compatible"}: func(ctx context.Context, _ poolLoginContext, opts broker.SessionKeyExchangeOptions) (*broker.SessionKeyToken, error) {
+		return broker.ExchangeCodexSessionKey(ctx, opts)
+	},
+	{providerCode: "mock", protocolType: "anthropic"}: func(ctx context.Context, loginCtx poolLoginContext, opts broker.SessionKeyExchangeOptions) (*broker.SessionKeyToken, error) {
 		return broker.ExchangeMockSessionKey(ctx, broker.MockSessionKeyExchangeOptions{
 			SessionKey: opts.SessionKey,
 			ProxyURL:   opts.ProxyURL,
 			TokenURL:   loginCtx.OAuthTokenURL,
 		})
-	default:
+	},
+	{providerCode: "mock", protocolType: "openai_compatible"}: func(ctx context.Context, loginCtx poolLoginContext, opts broker.SessionKeyExchangeOptions) (*broker.SessionKeyToken, error) {
+		return broker.ExchangeMockCodexSessionKey(ctx, broker.MockSessionKeyExchangeOptions{
+			SessionKey: opts.SessionKey,
+			ProxyURL:   opts.ProxyURL,
+			TokenURL:   loginCtx.OAuthTokenURL,
+		})
+	},
+}
+
+func poolSessionKeyAdapterFor(loginCtx poolLoginContext) (poolSessionKeyAdapter, bool) {
+	provider := strings.ToLower(strings.TrimSpace(loginCtx.ProviderCode))
+	protocol := strings.ToLower(strings.TrimSpace(loginCtx.ProtocolType))
+	adapter, ok := poolSessionKeyAdapters[poolSessionKeyAdapterKey{providerCode: provider, protocolType: protocol}]
+	if !ok || (provider == "mock" && strings.TrimSpace(loginCtx.OAuthTokenURL) == "") {
+		return nil, false
+	}
+	return adapter, true
+}
+
+func poolSessionKeyProviderSupported(loginCtx poolLoginContext) bool {
+	_, ok := poolSessionKeyAdapterFor(loginCtx)
+	return ok
+}
+
+// exchangePoolSessionKey is the sole provider dispatch for this login use case.
+// The authoritative login context comes from Master; the browser never chooses
+// an endpoint or provider. Mock credentials use their resident token endpoint;
+// real Session Keys enter only their provider's fixed broker implementation.
+func exchangePoolSessionKey(ctx context.Context, loginCtx poolLoginContext, opts broker.SessionKeyExchangeOptions) (*broker.SessionKeyToken, error) {
+	adapter, ok := poolSessionKeyAdapterFor(loginCtx)
+	if !ok {
 		return nil, &broker.OAuthError{
 			Code:    broker.ErrCodeSessionKeyProviderUnsupported,
 			Message: "Session Key sign-in is not supported for this account provider.",
-			Hint:    "Choose an Anthropic-protocol OAuth account.",
+			Hint:    "Choose a supported Anthropic or OpenAI-compatible OAuth account.",
 		}
 	}
+	return adapter(ctx, loginCtx, opts)
 }
 
-// sessionKey signs an Anthropic-protocol pool account in without opening a browser. It
+// sessionKey signs a supported pool account in without opening a browser. It
 // uses the same review/writeback/runtime-sync semantics as submitCode, but the
 // authorization input is exchanged in-process by aikey-auth-broker on Windows or macOS.
 // Token material is never serialized to this HTTP response.
@@ -66,7 +90,11 @@ func (h *poolLoginHandler) sessionKey(w http.ResponseWriter, r *http.Request) {
 		SessionKey   string `json:"session_key,omitempty"`
 		OperationID  string `json:"operation_id"`
 		Confirm      bool   `json:"confirm"`
-		Cancel       bool   `json:"cancel"`
+		// IdentityMismatchConfirmed is a separate acknowledgement from Confirm.
+		// It prevents an older or scripted client from silently saving a token
+		// after the server has discovered that it belongs to another account.
+		IdentityMismatchConfirmed bool `json:"identity_mismatch_confirmed"`
+		Cancel                    bool `json:"cancel"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		poolErr(w, http.StatusBadRequest, "BAD_BODY", "invalid or oversized request body")
@@ -110,7 +138,7 @@ func (h *poolLoginHandler) sessionKey(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		if !poolSessionKeyProviderSupported(loginCtx) {
-			poolErr(w, http.StatusUnprocessableEntity, broker.ErrCodeSessionKeyProviderUnsupported, "session key sign-in is supported only for Anthropic-protocol OAuth accounts")
+			poolErr(w, http.StatusUnprocessableEntity, broker.ErrCodeSessionKeyProviderUnsupported, "session key sign-in is supported only for configured Anthropic or OpenAI-compatible OAuth accounts")
 			return
 		}
 		// The Master login context carries the authoritative account override or
@@ -141,23 +169,30 @@ func (h *poolLoginHandler) sessionKey(w http.ResponseWriter, r *http.Request) {
 			poolErr(w, poolSessionKeyHTTPStatus(code), code, message)
 			return
 		}
-		if !sessionKeyIdentityMatches(loginCtx, token.Identity) {
-			token.AccessToken = ""
-			token.RefreshToken = ""
+		identityMismatch := !sessionKeyIdentityMatches(loginCtx, token.Identity)
+		if identityMismatch {
 			slog.Warn("Session key identity does not match the selected account",
 				"event.name", observability.EventProxyPoolSessionKeyIdentityMismatch,
 				"error.code", broker.ErrCodeSessionKeyIdentityMismatch, "credential_id", req.CredentialID,
 				"request_id", trace.RequestID, "trace_id", trace.TraceID, "span_id", trace.SpanID)
-			poolErr(w, http.StatusConflict, broker.ErrCodeSessionKeyIdentityMismatch,
-				"The Session Key belongs to a different account. Copy the Session Key for the selected pool account and try again.")
-			return
 		}
 		exchangedAt := time.Now()
 		pending = &poolSessionKeyPending{
-			loginCtx:  loginCtx,
-			token:     token,
-			createdAt: exchangedAt,
-			expiresAt: exchangedAt.Unix() + token.ExpiresIn,
+			loginCtx:         loginCtx,
+			token:            token,
+			identityMismatch: identityMismatch,
+			createdAt:        exchangedAt,
+			expiresAt:        exchangedAt.Unix() + token.ExpiresIn,
+		}
+		// Codex auto-renewal (方案 20260818, default-on): retain the session key
+		// for the confirm writeback so master can re-exchange it before the
+		// access token expires. Codex protocol only — Claude session keys are
+		// deliberately NOT retained (owner ruling: Claude 只做 7 天到期预警).
+		if strings.EqualFold(loginCtx.ProtocolType, "openai_compatible") {
+			pending.sessionKey = req.SessionKey
+			if !token.SessionExpiresAt.IsZero() {
+				pending.sessionExpiresAt = token.SessionExpiresAt.Unix()
+			}
 		}
 		h.sessionKeyPending.Store(req.OperationID, pending)
 		h.scheduleSessionKeyExpiry(req.OperationID, pending)
@@ -173,8 +208,14 @@ func (h *poolLoginHandler) sessionKey(w http.ResponseWriter, r *http.Request) {
 		poolJSON(w, map[string]any{
 			"status": "pending", "operation_id": req.OperationID,
 			"identity": identity, "expected_identity": pending.loginCtx.ExpectedIdentity,
-			"provider_code": pending.loginCtx.ProviderCode,
+			"provider_code":     pending.loginCtx.ProviderCode,
+			"identity_mismatch": pending.identityMismatch,
 		})
+		return
+	}
+	if pending.identityMismatch && !req.IdentityMismatchConfirmed {
+		poolErrWithMeta(w, http.StatusConflict, broker.ErrCodeSessionKeyIdentityMismatch,
+			"The Session Key belongs to a different account. Review the warning and confirm again to save it to the selected pool account.", req.OperationID)
 		return
 	}
 
@@ -192,9 +233,10 @@ func (h *poolLoginHandler) sessionKey(w http.ResponseWriter, r *http.Request) {
 	if err := postMemberToken(r.Context(), h.writebackClientFn(), masterURL, bearer, memberTokenWriteback{
 		CredentialID: ctx.CredentialID, AccessToken: pending.token.AccessToken,
 		RefreshToken: pending.token.RefreshToken, ExpiresAt: pending.expiresAt,
+		RenewalCredential: pending.sessionKey, RenewalExpiresAt: pending.sessionExpiresAt,
 		ExternalID: pending.token.Identity.ExternalID, ProviderCode: ctx.ProviderCode,
 		ProtocolType: ctx.ProtocolType, OauthGroupID: ctx.OauthGroupID,
-		AccountID: ctx.AccountID, Identity: identity,
+		AccountID: ctx.AccountID, Identity: identity, IdentityMismatch: pending.identityMismatch,
 	}); err != nil {
 		slog.Warn("Session key token writeback failed",
 			"event.name", observability.EventProxyPoolSessionKeyWritebackFailed,
@@ -206,7 +248,10 @@ func (h *poolLoginHandler) sessionKey(w http.ResponseWriter, r *http.Request) {
 
 	syncStatus, syncError := h.syncPoolRuntime(r.Context(), ctx, trace)
 	h.forgetSessionKeyOperation(req.OperationID, pending)
-	resp := map[string]any{"status": "ok", "identity": identity, "sync_status": syncStatus}
+	resp := map[string]any{
+		"status": "ok", "identity": identity, "sync_status": syncStatus,
+		"identity_mismatch": pending.identityMismatch,
+	}
 	if syncError != "" {
 		resp["sync_error"] = syncError
 	}
@@ -302,7 +347,7 @@ func poolSessionKeyError(err error) (code, message string) {
 		}
 		return oauthErr.Code, message
 	}
-	return broker.ErrCodeLoginFailed, "Claude session key sign-in failed. Check the Windows egress proxy and try again with a fresh session key."
+	return broker.ErrCodeLoginFailed, "Session Key sign-in failed. Check the desktop egress proxy and try again with a fresh provider Session Key."
 }
 
 func poolSessionKeyHTTPStatus(code string) int {
@@ -370,6 +415,9 @@ func (h *poolLoginHandler) forgetSessionKeyOperation(operationID string, pending
 	if pending != nil && pending.token != nil {
 		pending.token.AccessToken = ""
 		pending.token.RefreshToken = ""
+	}
+	if pending != nil {
+		pending.sessionKey = ""
 	}
 	h.sessionKeyPending.Delete(operationID)
 }

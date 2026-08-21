@@ -3,6 +3,7 @@ package supervisor
 import (
 	"bytes"
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"io"
@@ -89,9 +90,11 @@ func TestPoolSessionKeyProviderSupportedUsesCredentialProtocol(t *testing.T) {
 		want bool
 	}{
 		{name: "anthropic", ctx: poolLoginContext{ProviderCode: "anthropic", ProtocolType: "anthropic"}, want: true},
+		{name: "openai codex", ctx: poolLoginContext{ProviderCode: "openai", ProtocolType: "openai_compatible"}, want: true},
 		{name: "mock anthropic", ctx: poolLoginContext{ProviderCode: "mock", ProtocolType: "anthropic", OAuthTokenURL: "http://127.0.0.1/oauth/anthropic/token"}, want: true},
 		{name: "mock missing endpoint", ctx: poolLoginContext{ProviderCode: "mock", ProtocolType: "anthropic"}, want: false},
-		{name: "mock codex", ctx: poolLoginContext{ProviderCode: "mock", ProtocolType: "openai_compatible", OAuthTokenURL: "http://127.0.0.1/oauth/openai_compatible/token"}, want: false},
+		{name: "mock codex", ctx: poolLoginContext{ProviderCode: "mock", ProtocolType: "openai_compatible", OAuthTokenURL: "http://127.0.0.1/oauth/openai_compatible/token"}, want: true},
+		{name: "mock codex missing endpoint", ctx: poolLoginContext{ProviderCode: "mock", ProtocolType: "openai_compatible"}, want: false},
 		{name: "unknown brand", ctx: poolLoginContext{ProviderCode: "other", ProtocolType: "anthropic"}, want: false},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
@@ -99,6 +102,55 @@ func TestPoolSessionKeyProviderSupportedUsesCredentialProtocol(t *testing.T) {
 				t.Fatalf("poolSessionKeyProviderSupported(%+v)=%t want %t", tt.ctx, got, tt.want)
 			}
 		})
+	}
+}
+
+func TestExchangePoolSessionKeyUsesResidentMockCodexContext(t *testing.T) {
+	header := base64.RawURLEncoding.EncodeToString([]byte(`{"alg":"none","typ":"JWT"}`))
+	payload, err := json.Marshal(map[string]any{
+		"exp":                            time.Now().Add(time.Hour).Unix(),
+		"https://api.openai.com/profile": map[string]any{"email": "mock-codex@example.test"},
+		"https://api.openai.com/auth": map[string]any{
+			"chatgpt_account_id": "cred-mock-codex",
+			"chatgpt_plan_type":  "mock",
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	accessToken := header + "." + base64.RawURLEncoding.EncodeToString(payload) + ".fixture"
+	provider := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/oauth/openai_compatible/token" || r.Method != http.MethodPost {
+			t.Fatalf("unexpected mock Codex request: %s %s", r.Method, r.URL.Path)
+		}
+		if err := r.ParseForm(); err != nil {
+			t.Fatal(err)
+		}
+		if r.Form.Get("grant_type") != "session_key" || !strings.HasPrefix(r.Form.Get("session_key"), "mock-chatgpt-session-") {
+			t.Fatalf("unexpected mock Codex grant: %v", r.Form)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"access_token": accessToken,
+			"token_type":   "Bearer",
+			"expires_in":   3600,
+		})
+	}))
+	defer provider.Close()
+
+	token, err := exchangePoolSessionKey(context.Background(), poolLoginContext{
+		ProviderCode: "mock", ProtocolType: "openai_compatible",
+		OAuthTokenURL: provider.URL + "/oauth/openai_compatible/token",
+	}, broker.SessionKeyExchangeOptions{
+		SessionKey: "mock-chatgpt-session-fixture-value-long-enough",
+		ProxyURL:   "http://127.0.0.1:1",
+	})
+	if err != nil {
+		t.Fatalf("mock Codex Session Key exchange: %v", err)
+	}
+	if token.AccessToken != accessToken || token.RefreshToken != "" ||
+		token.Identity.ExternalID != "cred-mock-codex" || token.Identity.Email != "mock-codex@example.test" {
+		t.Fatalf("unexpected mock Codex token metadata: %+v", token)
 	}
 }
 
@@ -110,11 +162,13 @@ func TestExchangePoolSessionKeyUsesResidentMockProviderContext(t *testing.T) {
 		if err := r.ParseForm(); err != nil {
 			t.Fatalf("parse form: %v", err)
 		}
-		if r.Form.Get("grant_type") != "session_key" || r.Form.Get("session_key") != "sk-ant-sid02-mock-fixture-value-long-enough" {
+		if r.Form.Get("grant_type") != "session_key" ||
+			r.Form.Get("session_key") != "sk-ant-sid02-mock-fixture-value-long-enough" ||
+			r.Form.Get("expires_in") != "31536000" {
 			t.Fatalf("unexpected mock provider grant: %v", r.Form)
 		}
 		w.Header().Set("Content-Type", "application/json")
-		_, _ = io.WriteString(w, `{"access_token":"MOCK-ACCESS","refresh_token":"MOCK-REFRESH","token_type":"Bearer","expires_in":600,"scope":"user:inference","account":{"uuid":"cred-mock","email_address":"mock@example.test"},"organization":{"uuid":"mock-org","name":"AiKey Mock Organization"}}`)
+		_, _ = io.WriteString(w, `{"access_token":"MOCK-ACCESS","refresh_token":"MOCK-REFRESH","token_type":"Bearer","expires_in":31536000,"scope":"user:inference","account":{"uuid":"cred-mock","email_address":"mock@example.test"},"organization":{"uuid":"mock-org","name":"AiKey Mock Organization"}}`)
 	}))
 	defer provider.Close()
 
@@ -150,6 +204,22 @@ func TestExchangePoolSessionKeyRoutesRealAnthropicToClaudeExchanger(t *testing.T
 	}
 	if strings.Contains(oauthErr.Message, "Mock Provider") {
 		t.Fatalf("real Anthropic account entered the Mock Provider adapter: %v", err)
+	}
+}
+
+func TestExchangePoolSessionKeyRoutesRealOpenAIToCodexExchanger(t *testing.T) {
+	_, err := exchangePoolSessionKey(context.Background(), poolLoginContext{
+		ProviderCode: "openai", ProtocolType: "openai_compatible",
+	}, broker.SessionKeyExchangeOptions{
+		SessionKey: "opaque-chatgpt-session-token-value-0123456789",
+		ProxyURL:   "ftp://proxy.invalid:21",
+	})
+	var oauthErr *broker.OAuthError
+	if !errors.As(err, &oauthErr) || oauthErr.Code != broker.ErrCodeSessionKeyEgressUnsupported {
+		t.Fatalf("real OpenAI account did not enter the Codex exchanger: %v", err)
+	}
+	if strings.Contains(oauthErr.Message, "Mock Provider") {
+		t.Fatalf("real OpenAI account entered the Mock Provider adapter: %v", err)
 	}
 }
 
@@ -406,8 +476,23 @@ func TestPoolSessionKey_CancelZerosAndRemovesPendingToken(t *testing.T) {
 	}
 }
 
-func TestPoolSessionKey_IdentityMismatchFailsBeforePendingWriteback(t *testing.T) {
-	h := newPoolHandler(t, &fakePoolExchanger{}, "http://unused")
+func TestPoolSessionKey_IdentityMismatchRequiresSecondConfirmationBeforeWriteback(t *testing.T) {
+	var (
+		gotWB      memberTokenWriteback
+		writebacks atomic.Int32
+	)
+	master := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		writebacks.Add(1)
+		if err := json.NewDecoder(r.Body).Decode(&gotWB); err != nil {
+			t.Fatalf("decode writeback: %v", err)
+		}
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{"status":"ok"}`))
+	}))
+	defer master.Close()
+
+	h := newPoolHandler(t, &fakePoolExchanger{}, master.URL)
+	h.client = master.Client()
 	token := &broker.SessionKeyToken{
 		AccessToken: "ACCESS-SECRET", RefreshToken: "REFRESH-SECRET", ExpiresIn: 3600,
 		Identity: broker.IdentityInfo{Email: "wrong@team.com", ExternalID: "wrong-uuid"},
@@ -424,18 +509,45 @@ func TestPoolSessionKey_IdentityMismatchFailsBeforePendingWriteback(t *testing.T
 	}
 	const operationID = "99998888777766665555444433332222"
 	w := doJSON(h.sessionKey, `{"credential_id":"c1","session_key":"sk-ant-sid02-fixture-value-long-enough","operation_id":"`+operationID+`"}`)
-	if w.Code != http.StatusConflict || !strings.Contains(w.Body.String(), broker.ErrCodeSessionKeyIdentityMismatch) {
+	if w.Code != http.StatusOK || !strings.Contains(w.Body.String(), `"status":"pending"`) || !strings.Contains(w.Body.String(), `"identity_mismatch":true`) {
 		t.Fatalf("identity mismatch: %d %s", w.Code, w.Body.String())
 	}
+	if token.AccessToken == "" || token.RefreshToken == "" {
+		t.Fatal("first warning must retain token only in the pending in-memory operation")
+	}
+	if _, ok := h.sessionKeyPending.Load(operationID); !ok {
+		t.Fatal("identity mismatch must create a confirmable pending operation")
+	}
+	if writebacks.Load() != 0 {
+		t.Fatalf("first warning must not write to master, got %d", writebacks.Load())
+	}
+
+	confirm := doJSON(h.sessionKey, `{"credential_id":"c1","operation_id":"`+operationID+`","confirm":true}`)
+	if confirm.Code != http.StatusConflict || !strings.Contains(confirm.Body.String(), broker.ErrCodeSessionKeyIdentityMismatch) {
+		t.Fatalf("first confirm without mismatch acknowledgement: %d %s", confirm.Code, confirm.Body.String())
+	}
+	if writebacks.Load() != 0 {
+		t.Fatalf("unacknowledged mismatch must not write to master, got %d", writebacks.Load())
+	}
+	if _, ok := h.sessionKeyPending.Load(operationID); !ok {
+		t.Fatal("unacknowledged mismatch must remain retryable")
+	}
+
+	confirmed := doJSON(h.sessionKey, `{"credential_id":"c1","operation_id":"`+operationID+`","confirm":true,"identity_mismatch_confirmed":true}`)
+	if confirmed.Code != http.StatusOK || !strings.Contains(confirmed.Body.String(), `"identity_mismatch":true`) {
+		t.Fatalf("second confirm: %d %s", confirmed.Code, confirmed.Body.String())
+	}
+	if writebacks.Load() != 1 {
+		t.Fatalf("second confirm must write exactly once, got %d", writebacks.Load())
+	}
+	if gotWB.ExternalID != "wrong-uuid" || gotWB.Identity != "wrong@team.com" || !gotWB.IdentityMismatch {
+		t.Fatalf("writeback must carry actual provider identity and mismatch acknowledgement: %+v", gotWB)
+	}
 	if token.AccessToken != "" || token.RefreshToken != "" {
-		t.Fatal("identity mismatch must zero token material")
+		t.Fatal("successful writeback must zero held token material")
 	}
 	if _, ok := h.sessionKeyPending.Load(operationID); ok {
-		t.Fatal("identity mismatch must not create a confirmable operation")
-	}
-	confirm := doJSON(h.sessionKey, `{"credential_id":"c1","operation_id":"`+operationID+`","confirm":true}`)
-	if confirm.Code != http.StatusBadRequest || !strings.Contains(confirm.Body.String(), "UNKNOWN_OPERATION") {
-		t.Fatalf("mismatched token became confirmable: %d %s", confirm.Code, confirm.Body.String())
+		t.Fatal("successful writeback must consume the pending operation")
 	}
 }
 

@@ -41,13 +41,47 @@ const (
 	groupErrNoCandidates = "GROUP_NO_CANDIDATES" // route has no parseable candidate set
 	groupErrNoMaterial   = "GROUP_NO_MATERIAL"   // group_runtime empty/unparseable (not pulled yet)
 	groupErrAllUnusable  = "GROUP_ALL_UNUSABLE"  // every candidate expired / exhausted / undecryptable
-	// groupErrLoginRequired (RW2, per-member): the HRW-selected account has no
-	// token for THIS member (they haven't logged into it). Per D2 the walk stops
-	// here — it does NOT skip to a later already-logged-in account (that would
-	// break the HRW load allocation) — and the caller returns a structured login
-	// prompt naming groupResolveError.Account so the member logs into THAT account.
+	// groupErrLoginRequired (RW2, per-member): NO candidate is serviceable and at
+	// least one is waiting on a member login; the caller returns a structured
+	// login prompt naming groupResolveError.Account so the member logs into THAT
+	// account. Semantics are 2026-08-15 方案 b (supersedes the D2 "walk stops at
+	// the routed account" rule): a needs_login candidate never blocks while a
+	// healthy logged-in sibling can serve — this code surfaces only when the
+	// whole pool is unserviceable for this member (see vkeys.PickRoutedAccount
+	// + property fences P1–P6 + spec R27).
 	groupErrLoginRequired = "OAUTH_GROUP_MEMBER_LOGIN_REQUIRED"
 )
+
+// pick_source values (方案 20260819 P0-2 S4): who decided the served account.
+// Value enum lives next to its producer (sched_event_report.go origin precedent);
+// it rides slog + scheduling-event detail only — NOT a filterable column (upgrade
+// per the origin-column precedent if filtering is ever needed). A true "sticky"
+// value is deliberately absent: engine binding_state does not cross routingwire,
+// so the proxy cannot write it — declaring it would be a signal with no writer.
+// needs_login is likewise absent: that outcome never settles a route (it is the
+// distinct proxy.group.login_required error event instead).
+const (
+	pickSourceEngineOverride      = "engine_override"       // engine redirected off the local rank-0
+	pickSourceOverrideConfirmsHRW = "override_confirms_hrw" // engine pick coincides with local rank-0
+	pickSourceLocalHRW            = "local_hrw"             // no usable override — local floor served rank-0
+	pickSourceLocalFallback       = "local_fallback"        // ranked walk advanced past override and rank-0
+)
+
+// classifyPickSource labels the served account's decision provenance from the
+// three values the resolver already holds. Pure so the fence test can pin the
+// truth table.
+func classifyPickSource(served, primary, override string) string {
+	switch {
+	case override != "" && served == override && served != primary:
+		return pickSourceEngineOverride
+	case override != "" && served == override:
+		return pickSourceOverrideConfirmsHRW
+	case served == primary:
+		return pickSourceLocalHRW
+	default:
+		return pickSourceLocalFallback
+	}
+}
 
 // groupResolveError is a typed resolver failure so the caller can map a precise
 // HTTP status + error code without string matching.
@@ -74,6 +108,10 @@ type groupResolution struct {
 	// from AccountID, a fallback happened (the primary was cooled / exhausted /
 	// expired / has no material) — the caller audits the switch (N9 #8).
 	Primary string
+	// PickSource labels WHO decided AccountID (方案 20260819 P0-2 S4) — one of the
+	// pickSource* constants below. Rides slog + scheduling-event detail so ops can
+	// tell engine-authoritative routing from the local HRW floor after the fact.
+	PickSource string
 
 	// oauth_account: header injection via oauthInject(req, OAuth, ProviderCode).
 	OAuth *OAuthCredential
@@ -154,11 +192,18 @@ func resolveGroupCredential(route *vkeys.ResolvedRoute, derivedKey []byte, nowUn
 	}
 
 	// SINGLE SOURCE OF TRUTH (2026-07-01): the pick — engine override first (§6.5,
-	// member-validity re-checked; needs_login overrides are HONORED per the owner rule
-	// "the engine may route a member to an account they haven't logged into"), else the
-	// local ranked pick — is vkeys.PickRoutedAccount, the SAME function the display
-	// stamp (supervisor.computeRoutedAccountID → /user/vault current_routed) uses. Do
+	// member-validity re-checked), else the local ranked pick — is
+	// vkeys.PickRoutedAccount, the SAME function the display stamp
+	// (supervisor.computeRoutedAccountID → /user/vault current_routed) uses. Do
 	// NOT re-derive routing here; forwarding and display must agree by construction.
+	//
+	// needs_login semantics (2026-08-15 方案 b, supersedes the 2026-07-01 owner rule
+	// that HONORED a needs_login override immediately): a needs_login candidate —
+	// override included — no longer blocks the request; healthy candidates serve
+	// first and the needs_login target survives only as the login PROMPT when
+	// nothing is serviceable. The rule lives inside PickRoutedAccount (see its
+	// header + vkeys property fences P1–P6 + spec R27); this note exists because
+	// the old wording here already misled one external review (2026-08-18).
 	//
 	// The only hot-path-extra gate is DECRYPT (needs the vault key, so it can't be in
 	// the pure picker): a corrupt secret adds the account to the skip set and re-picks,
@@ -192,6 +237,7 @@ func resolveGroupCredential(route *vkeys.ResolvedRoute, derivedKey []byte, nowUn
 			}
 			res := buildGroupResolution(acc, refByID[acc], mat, secret)
 			res.Primary = primary
+			res.PickSource = classifyPickSource(acc, primary, overrideAccountID)
 			return res, nil
 		default: // PickNone
 			// R36 (2026-07-04, codex pools): expiry is member-fixable, but only the

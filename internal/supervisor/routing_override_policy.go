@@ -51,6 +51,14 @@ func (s *Supervisor) routingOverrideRail() railSpec {
 		interval:     routingOverridePollInterval,
 		needsTeamJWT: true,
 		gate: func(gen *generation) bool {
+			// Cluster: same D2 gate as group_runtime — engine assignments reach
+			// cluster workers via the daemon spine (方案 20260819 D1), never via
+			// this team-JWT rail. Single writer per edition for
+			// my_assignment_override: non-cluster = this rail, cluster = cli
+			// apply. Both writing would split the source of truth.
+			if s.cfg.Cluster.Enabled {
+				return false
+			}
 			return oauthGroupRoutingEnabled() && len(s.localSeatGroupsFor(gen)) > 0
 		},
 		hydrate: s.hydrateRoutingOverrides,

@@ -8,8 +8,11 @@ import (
 
 // PickRoutedAccount is the proxy-side single source of truth for "which account does
 // this seat route to" — shared by the hot-path resolver AND the display stamp. These
-// cases lock its contract (esp. the 2026-07-01 owner rule: an engine override naming a
-// needs_login account is HONORED, not treated as stale).
+// cases lock its contract. 2026-08-15 rule change (schedstress P04 decision): a
+// needs_login candidate — override included — never blocks while a healthy candidate
+// exists; LOGIN_REQUIRED is reserved for "no candidate serviceable" and then names
+// the engine's target first. (Supersedes the 2026-07-01 owner rule that honored a
+// needs_login override immediately.)
 func TestPickRoutedAccount(t *testing.T) {
 	refs := []GroupAccountRef{
 		{AccountID: "acc-a", Priority: 1},
@@ -24,11 +27,19 @@ func TestPickRoutedAccount(t *testing.T) {
 		other = "acc-b"
 	}
 
-	t.Run("owner rule: needs_login override is HONORED (PickNeedsLogin, that account)", func(t *testing.T) {
+	t.Run("needs_login override must NOT block while a healthy sibling serves (2026-08-15)", func(t *testing.T) {
 		mat := map[string]GroupRuntimeAccount{hrw: fresh, other: needsLogin}
 		acc, oc := PickRoutedAccount("seat-1", refs, mat, other, nil, now)
+		if acc != hrw || oc != PickOK {
+			t.Fatalf("hard-revoked/not-logged-in override must fall through to healthy %q: got (%q, %v)", hrw, acc, oc)
+		}
+	})
+
+	t.Run("all candidates needs_login → prompt names the ENGINE's target first", func(t *testing.T) {
+		mat := map[string]GroupRuntimeAccount{hrw: needsLogin, other: needsLogin}
+		acc, oc := PickRoutedAccount("seat-1", refs, mat, other, nil, now)
 		if acc != other || oc != PickNeedsLogin {
-			t.Fatalf("engine may route to a not-logged-in account: want (%q, NeedsLogin), got (%q, %v)", other, acc, oc)
+			t.Fatalf("login prompt must name the override target %q: got (%q, %v)", other, acc, oc)
 		}
 	})
 
@@ -54,10 +65,17 @@ func TestPickRoutedAccount(t *testing.T) {
 		}
 	})
 
-	t.Run("ranked loop stops at first needs_login (strict HRW, RW2)", func(t *testing.T) {
+	t.Run("needs_login rank-0 falls through to the logged-in sibling (2026-08-15)", func(t *testing.T) {
 		mat := map[string]GroupRuntimeAccount{hrw: needsLogin, other: fresh}
+		if acc, oc := PickRoutedAccount("seat-1", refs, mat, "", nil, now); acc != other || oc != PickOK {
+			t.Fatalf("needs_login rank-0 %q must not block; want healthy %q, got (%q, %v)", hrw, other, acc, oc)
+		}
+	})
+
+	t.Run("no override, all candidates needs_login → prompt names rank-0", func(t *testing.T) {
+		mat := map[string]GroupRuntimeAccount{hrw: needsLogin, other: needsLogin}
 		if acc, oc := PickRoutedAccount("seat-1", refs, mat, "", nil, now); acc != hrw || oc != PickNeedsLogin {
-			t.Fatalf("must stop at needs_login rank-0 %q (not hop to %q), got (%q, %v)", hrw, other, acc, oc)
+			t.Fatalf("want rank-0 login prompt (%q, NeedsLogin), got (%q, %v)", hrw, acc, oc)
 		}
 	})
 

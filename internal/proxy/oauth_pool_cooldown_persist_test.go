@@ -20,6 +20,7 @@ func TestPoolCooldown_PersistAndHydrateAcrossRestart(t *testing.T) {
 	s1 := newPoolCooldownStore()
 	until := time.Now().Add(30 * time.Minute)
 	s1.mark("acc-cooled", until)
+	s1.flushPersistence()
 	path, _ := poolCooldownPath()
 	if _, err := os.Stat(path); err != nil {
 		t.Fatalf("mark must persist the state file: %v", err)
@@ -41,6 +42,7 @@ func TestPoolCooldown_ErrorCauseSurvivesRestart(t *testing.T) {
 		Status:    poolRouteUpstreamUnavailable,
 		ErrorCode: observability.ErrCodeAccountEgressProxy,
 	})
+	s1.flushPersistence()
 
 	// "Restart": routing and its public failure reason must hydrate together;
 	// otherwise the first post-restart request regresses to a fake quota 429.
@@ -59,6 +61,7 @@ func TestPoolCooldown_ExpiredEntriesNotHydrated(t *testing.T) {
 
 	s1 := newPoolCooldownStore()
 	s1.mark("acc-expired", time.Now().Add(50*time.Millisecond))
+	s1.flushPersistence()
 	time.Sleep(80 * time.Millisecond)
 
 	s2 := newPoolCooldownStore()
@@ -86,6 +89,7 @@ func TestPoolCooldown_CorruptOrMissingFileFallsBackEmpty(t *testing.T) {
 		t.Fatalf("corrupt file must yield empty store, skip=%v", skip)
 	}
 	s2.mark("acc-new", time.Now().Add(time.Minute))
+	s2.flushPersistence()
 	if !s2.skipSet()["acc-new"] {
 		t.Fatal("store must keep working after a corrupt-file fallback")
 	}
@@ -101,6 +105,7 @@ func TestPoolCooldown_AllExpiredRemovesFile(t *testing.T) {
 
 	s := newPoolCooldownStore()
 	s.mark("acc-1", time.Now().Add(40*time.Millisecond))
+	s.flushPersistence()
 	time.Sleep(60 * time.Millisecond)
 	// skipSet prunes the lapsed entry; the NEXT mark persists the (now empty →
 	// file removed on a later persist) view. Trigger a persist via a mark that
@@ -109,8 +114,32 @@ func TestPoolCooldown_AllExpiredRemovesFile(t *testing.T) {
 	s.mu.Lock()
 	s.persistLocked()
 	s.mu.Unlock()
+	s.flushPersistence()
 	path, _ := poolCooldownPath()
 	if _, err := os.Stat(path); !os.IsNotExist(err) {
 		t.Fatalf("all-expired persist must remove the state file, stat err=%v", err)
+	}
+}
+
+func TestPoolCooldown_OlderBackgroundSnapshotCannotOverwriteNewerFlush(t *testing.T) {
+	t.Setenv("AIKEY_RUN_DIR", t.TempDir())
+	s := newPoolCooldownStore()
+	until := time.Now().Add(time.Hour).Unix()
+
+	s.writePersistenceSnapshot(poolCooldownFileBody{
+		Accounts:  map[string]int64{"acc-new": until},
+		WrittenAt: time.Now().UnixMilli(),
+	}, 2)
+	// Model a timer that captured revision 1 before shutdown, but only acquired
+	// persistIO after the revision-2 shutdown flush completed.
+	s.writePersistenceSnapshot(poolCooldownFileBody{
+		Accounts:  map[string]int64{"acc-stale": until},
+		WrittenAt: time.Now().UnixMilli(),
+	}, 1)
+
+	restarted := newPoolCooldownStore()
+	skip := restarted.skipSet()
+	if !skip["acc-new"] || skip["acc-stale"] {
+		t.Fatalf("stale writer replaced newer shutdown snapshot: %v", skip)
 	}
 }

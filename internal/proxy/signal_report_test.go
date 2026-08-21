@@ -1,8 +1,10 @@
 package proxy
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
+	"fmt"
 	"io"
 	"log/slog"
 	"net/http"
@@ -132,6 +134,137 @@ func TestSignalPostBearerErrorDoesNotPost(t *testing.T) {
 	}
 }
 
+func TestSignalReporterLoopRetriesTrendAndExposesHealth(t *testing.T) {
+	var hits atomic.Int32
+	bodies := make(chan []byte, 4)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+		body, _ := io.ReadAll(req.Body)
+		bodies <- body
+		if hits.Add(1) == 1 {
+			w.WriteHeader(http.StatusServiceUnavailable)
+			return
+		}
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer srv.Close()
+
+	r := newSignalReporterEndpoint(srv.URL, "worker-300", func(context.Context) (string, error) { return "tok", nil }, slog.Default())
+	if r == nil {
+		t.Fatal("newSignalReporterEndpoint returned nil")
+	}
+	defer r.Close()
+	r.enqueue("cred-1", 100, 0.7, nil)
+
+	wakeUntilBody := func() []byte {
+		t.Helper()
+		deadline := time.NewTimer(2 * time.Second)
+		defer deadline.Stop()
+		tick := time.NewTicker(10 * time.Millisecond)
+		defer tick.Stop()
+		for {
+			select {
+			case body := <-bodies:
+				return body
+			case <-tick.C:
+				select {
+				case r.authWake <- struct{}{}:
+				default:
+				}
+			case <-deadline.C:
+				t.Fatal("signal reporter did not flush")
+				return nil
+			}
+		}
+	}
+	first := wakeUntilBody()
+	if !bytes.Contains(first, []byte(`"source_id":"worker-300"`)) || !bytes.Contains(first, []byte(`"credential_id":"cred-1"`)) {
+		t.Fatalf("first attempt lost source/sample: %s", first)
+	}
+	second := wakeUntilBody()
+	if string(second) != string(first) {
+		t.Fatalf("retry payload changed: first=%s second=%s", first, second)
+	}
+
+	deadline := time.Now().Add(time.Second)
+	for {
+		health := r.healthSnapshot()
+		if health.Status == "healthy" && health.PendingSignals == 0 && health.LastSuccessAt > 0 {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("retry health did not recover: %+v", health)
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+}
+
+func TestSignalTrendAccumulatorBoundsUniqueCredentialsAcrossSignalTypes(t *testing.T) {
+	a := newSignalTrendAccumulator()
+	for i := 0; i < maxPendingSignalCredentials; i++ {
+		if !a.addUtil(signalSample{CredentialID: fmt.Sprintf("cred-%d", i)}) {
+			t.Fatalf("credential %d was rejected before the bound", i)
+		}
+	}
+	if dropped := a.mergeRate([]rateLimitSample{{CredentialID: "overflow", Count: 1}}); dropped != 1 {
+		t.Fatalf("cross-type overflow dropped=%d, want 1", dropped)
+	}
+	if dropped := a.mergeRate([]rateLimitSample{{CredentialID: "cred-0", Count: 1}}); dropped != 0 {
+		t.Fatalf("existing credential update dropped=%d, want 0", dropped)
+	}
+}
+
+func TestSignalReporterLoopIsolatesRejectedAuthFailureFromTrend(t *testing.T) {
+	t.Setenv("AIKEY_RUN_DIR", t.TempDir())
+	bodies := make(chan []byte, 4)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+		body, _ := io.ReadAll(req.Body)
+		bodies <- body
+		if bytes.Contains(body, []byte(`"auth_failures"`)) {
+			w.WriteHeader(http.StatusConflict)
+			return
+		}
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer srv.Close()
+
+	r := newSignalReporterEndpoint(srv.URL, "worker-1", func(context.Context) (string, error) { return "tok", nil }, slog.Default())
+	if r == nil {
+		t.Fatal("newSignalReporterEndpoint returned nil")
+	}
+	defer r.Close()
+	r.enqueue("cred-good", 100, 0.5, nil)
+	deadline := time.Now().Add(time.Second)
+	for len(r.in) > 0 && time.Now().Before(deadline) {
+		time.Sleep(time.Millisecond)
+	}
+	if len(r.in) > 0 {
+		t.Fatal("trend was not consumed into the retry accumulator")
+	}
+	r.enqueueAuthFailure("cred-bad", "group-1", "seat-1", "fingerprint-1")
+
+	nextBody := func() []byte {
+		t.Helper()
+		select {
+		case body := <-bodies:
+			return body
+		case <-time.After(2 * time.Second):
+			t.Fatal("signal reporter did not isolate both uploads")
+			return nil
+		}
+	}
+	first := nextBody()
+	second := nextBody()
+	if !bytes.Contains(first, []byte(`"samples"`)) || bytes.Contains(first, []byte(`"auth_failures"`)) {
+		t.Fatalf("trend upload was coupled to rejected auth failure: %s", first)
+	}
+	if !bytes.Contains(second, []byte(`"auth_failures"`)) || bytes.Contains(second, []byte(`"samples"`)) {
+		t.Fatalf("auth failure upload was not isolated: %s", second)
+	}
+	if pending := r.snapshotAuthFailures(); len(pending) != 1 {
+		t.Fatalf("rejected auth failure was acknowledged: %+v", pending)
+	}
+}
+
 func TestEnqueueRevokedNilEmptyAndNonBlocking(t *testing.T) {
 	// nil receiver guard: feature-off reporter must not panic.
 	var nilR *signalReporter
@@ -231,7 +364,7 @@ func TestAuthFailureSignalIsVersionedDurableAndRetriedUntilAccepted(t *testing.T
 	r := &signalReporter{
 		url: srv.URL, bearer: func(context.Context) (string, error) { return "svc-token", nil },
 		client: httpx.NewSwappableDirect(time.Second), authFailures: make(map[string]authFailureSample),
-		authWake: make(chan struct{}, 1), logger: slog.Default(),
+		authIn: make(chan authFailureSample, 4), authWake: make(chan struct{}, 1), logger: slog.Default(),
 	}
 	// Missing token version is unsafe: a delayed signal could invalidate a new
 	// re-login, so it must not enter the outbox.
@@ -240,6 +373,7 @@ func TestAuthFailureSignalIsVersionedDurableAndRetriedUntilAccepted(t *testing.T
 		t.Fatal("unversioned auth failure entered outbox")
 	}
 	r.enqueueAuthFailure("c1", "g1", "s1", "fingerprint-1")
+	r.ingestAuthFailures([]authFailureSample{<-r.authIn})
 	pending := r.snapshotAuthFailures()
 	if len(pending) != 1 || pending[0].TokenFingerprint != "fingerprint-1" {
 		t.Fatalf("versioned auth failure not queued: %+v", pending)
@@ -287,8 +421,12 @@ func TestAuthFailureSignalIsVersionedDurableAndRetriedUntilAccepted(t *testing.T
 
 func TestAuthFailureOutboxHydratesOnlyVersionedEntries(t *testing.T) {
 	t.Setenv("AIKEY_RUN_DIR", t.TempDir())
-	writer := &signalReporter{authFailures: make(map[string]authFailureSample), authWake: make(chan struct{}, 1), logger: slog.Default()}
+	writer := &signalReporter{
+		authFailures: make(map[string]authFailureSample), authIn: make(chan authFailureSample, 1),
+		authWake: make(chan struct{}, 1), logger: slog.Default(),
+	}
 	writer.enqueueAuthFailure("c1", "g1", "s1", "fp-1")
+	writer.ingestAuthFailures([]authFailureSample{<-writer.authIn})
 
 	reader := &signalReporter{authFailures: make(map[string]authFailureSample), logger: slog.Default()}
 	reader.hydrateAuthFailures()
@@ -298,13 +436,109 @@ func TestAuthFailureOutboxHydratesOnlyVersionedEntries(t *testing.T) {
 	}
 }
 
+func TestAuthFailureBurstDeduplicatesBeforeBoundedWriter(t *testing.T) {
+	r := &signalReporter{
+		authIn: make(chan authFailureSample, maxPendingAuthFailures),
+		health: SignalReportingHealth{Status: "starting"},
+	}
+	for i := 0; i < 3000; i++ {
+		r.enqueueAuthFailure("c1", "g1", "s1", "fp-1")
+	}
+	if got := len(r.authIn); got != 1 {
+		t.Fatalf("duplicate 401 burst queued=%d records, want one route+token observation", got)
+	}
+	if got := r.healthSnapshot(); got.DroppedSignals != 0 {
+		t.Fatalf("duplicate 401 burst consumed bounded capacity: %+v", got)
+	}
+}
+
+func TestAuthFailureDeliveryBatches300AndCompactsJournal(t *testing.T) {
+	t.Setenv("AIKEY_RUN_DIR", t.TempDir())
+	var hits atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+		hits.Add(1)
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer srv.Close()
+
+	r := &signalReporter{
+		url: srv.URL, bearer: func(context.Context) (string, error) { return "svc-token", nil },
+		client: httpx.NewSwappableDirect(time.Second), logger: slog.Default(),
+		authFailures: make(map[string]authFailureSample), authDurable: make(map[string]authFailureSample),
+	}
+	failures := make([]authFailureSample, 300)
+	for i := range failures {
+		failures[i] = authFailureSample{
+			CredentialID: fmt.Sprintf("credential-%03d", i), OAuthGroupID: "group-1",
+			SeatID: fmt.Sprintf("seat-%03d", i), TokenFingerprint: fmt.Sprintf("fp-%03d", i),
+			Reason: "token_revoked",
+		}
+	}
+	r.ingestAuthFailures(failures)
+	if pending := r.snapshotAuthFailures(); len(pending) != 300 {
+		t.Fatalf("journal pending=%d, want 300", len(pending))
+	}
+	attempted, ok, detail := r.deliverAuthFailures(r.snapshotAuthFailures())
+	if !attempted || !ok {
+		t.Fatalf("batched auth delivery attempted=%v ok=%v detail=%q", attempted, ok, detail)
+	}
+	if got, want := hits.Load(), int32(3); got != want {
+		t.Fatalf("300 auth failures used %d uploads, want %d bounded batches", got, want)
+	}
+	if pending := r.snapshotAuthFailures(); len(pending) != 0 {
+		t.Fatalf("accepted batch remained pending: %d", len(pending))
+	}
+	path, _ := r.authFailurePath()
+	if _, err := os.Stat(path); !os.IsNotExist(err) {
+		t.Fatalf("empty journal was not compacted away: %v", err)
+	}
+}
+
+func TestAuthFailureTransientOutageMakesOneBoundedAttemptFor300(t *testing.T) {
+	t.Setenv("AIKEY_RUN_DIR", t.TempDir())
+	var hits atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+		hits.Add(1)
+		w.WriteHeader(http.StatusServiceUnavailable)
+	}))
+	defer srv.Close()
+
+	r := &signalReporter{
+		url: srv.URL, bearer: func(context.Context) (string, error) { return "svc-token", nil },
+		client: httpx.NewSwappableDirect(time.Second), logger: slog.Default(),
+		authFailures: make(map[string]authFailureSample), authDurable: make(map[string]authFailureSample),
+	}
+	failures := make([]authFailureSample, 300)
+	for i := range failures {
+		failures[i] = authFailureSample{
+			CredentialID: fmt.Sprintf("credential-%03d", i), OAuthGroupID: "group-1",
+			SeatID: fmt.Sprintf("seat-%03d", i), TokenFingerprint: fmt.Sprintf("fp-%03d", i),
+			Reason: "token_revoked",
+		}
+	}
+	r.ingestAuthFailures(failures)
+	_, ok, _ := r.deliverAuthFailures(r.snapshotAuthFailures())
+	if ok {
+		t.Fatal("503 auth delivery reported success")
+	}
+	if got := hits.Load(); got != 1 {
+		t.Fatalf("Control outage amplified 300 pending failures into %d uploads, want one", got)
+	}
+	if pending := r.snapshotAuthFailures(); len(pending) != 300 {
+		t.Fatalf("transient outage dropped pending failures: %d", len(pending))
+	}
+}
+
 func TestEnableOrgSignalReporting_UsesClusterServiceEndpointAndToken(t *testing.T) {
 	t.Setenv("AIKEY_RUN_DIR", t.TempDir())
-	p := &Proxy{}
+	p := &Proxy{sourceID: "cluster-node-1"}
 	p.EnableOrgSignalReporting("https://control.example.test/", "org/cluster", "svc-token")
 	defer p.StopSignalReporting()
 	if p.signalReporter == nil {
 		t.Fatal("cluster signal reporter was not wired")
+	}
+	if p.signalReporter.sourceID != "cluster-node-1" {
+		t.Fatalf("stable signal source=%q, want cluster-node-1", p.signalReporter.sourceID)
 	}
 	if got, want := p.signalReporter.url, "https://control.example.test/internal/org/org%2Fcluster/signals"; got != want {
 		t.Fatalf("cluster signal endpoint=%q want %q", got, want)
@@ -312,6 +546,27 @@ func TestEnableOrgSignalReporting_UsesClusterServiceEndpointAndToken(t *testing.
 	token, err := p.signalReporter.bearer(context.Background())
 	if err != nil || token != "svc-token" {
 		t.Fatalf("cluster service credential lost: token=%q err=%v", token, err)
+	}
+}
+
+func TestSignalReportingHealthSnapshotSurfacesMissingWiring(t *testing.T) {
+	p := &Proxy{}
+	health := p.SignalReportingHealthSnapshot()
+	if health == nil || health.Status != "disabled" {
+		t.Fatalf("missing reporter must be externally visible, got %+v", health)
+	}
+}
+
+func TestSignalReportingHealthDropStaysDegradedUntilSuccess(t *testing.T) {
+	r := &signalReporter{health: SignalReportingHealth{Status: "starting"}}
+	r.recordSignalDrop(1)
+	r.recordSignalUpload(false, "signal upload failed")
+	if got := r.healthSnapshot(); got.Status != "degraded" || got.DroppedSignals != 1 {
+		t.Fatalf("failed retry hid buffer loss: %+v", got)
+	}
+	r.recordSignalUpload(true, "")
+	if got := r.healthSnapshot(); got.Status != "healthy" || got.ConsecutiveFailures != 0 {
+		t.Fatalf("successful retry did not recover health: %+v", got)
 	}
 }
 
@@ -342,8 +597,27 @@ func TestRateLimitCounting(t *testing.T) {
 	if len(rl) != 1 {
 		t.Fatalf("snapshot = %+v, want exactly one entry", rl)
 	}
-	if rl[0] != (rateLimitSample{CredentialID: "c1", Count: 3, WindowSecs: 30}) {
+	if rl[0] != (rateLimitSample{CredentialID: "c1", Count: 3, WindowSecs: 30, Risk429Count: 3}) {
 		t.Fatalf("snapshot[0] = %+v, want {c1, 3, 30}", rl[0])
+	}
+}
+
+// TestRateLimitForbiddenSubcount (2026-08-15 方案 c): 403s ride the same
+// counter AND a separate forbidden tally, so the master drawer can distinguish
+// suspension evidence from ordinary 429 quota rhythm. Both reset together.
+func TestRateLimitForbiddenSubcount(t *testing.T) {
+	r := &signalReporter{rlCounts: make(map[string]int)}
+	r.incrRateLimitHop("c1", false, false) // a 429
+	r.incrRateLimitHop("c1", false, true)  // a 403
+	r.incrRateLimitHop("c1", true, true)   // a 403 on a fallback hop
+	rl := r.snapshotRateLimits()
+	if len(rl) != 1 || rl[0].Count != 3 || rl[0].ForbiddenCount != 2 || rl[0].FallbackCount != 1 || rl[0].Risk429Count != 1 {
+		t.Fatalf("snapshot = %+v, want {c1 count=3 forbidden=2 fallback=1 risk429=1}", rl)
+	}
+	// One-window contract: the forbidden tally resets with the flush.
+	r.incrRateLimitHop("c1", false, false)
+	if rl := r.snapshotRateLimits(); len(rl) != 1 || rl[0].ForbiddenCount != 0 {
+		t.Fatalf("forbidden tally leaked across windows: %+v", rl)
 	}
 }
 
@@ -354,9 +628,13 @@ func TestRateLimitResetAfterFlush(t *testing.T) {
 	if rl := r.snapshotRateLimits(); len(rl) != 1 || rl[0].Count != 2 {
 		t.Fatalf("first window = %+v, want c1 count 2", rl)
 	}
-	// next window starts empty (counter was reset on snapshot).
+	// The next window emits one explicit zero so Master clears the source's
+	// previous 403/risk projection; the following idle window is omitted.
+	if rl := r.snapshotRateLimits(); len(rl) != 1 || rl[0].CredentialID != "c1" || rl[0].Count != 0 {
+		t.Fatalf("after flush snapshot = %+v, want one explicit c1 zero", rl)
+	}
 	if rl := r.snapshotRateLimits(); rl != nil {
-		t.Fatalf("after flush snapshot = %+v, want nil (reset)", rl)
+		t.Fatalf("second idle snapshot = %+v, want nil", rl)
 	}
 	// new increments count up from 0, not from the prior window.
 	r.incrRateLimit("c1")
@@ -402,7 +680,7 @@ func TestSignalPostSendsRateLimits(t *testing.T) {
 
 	// rate-limits-only batch: body omits samples + revoked, exact wire contract.
 	r.post(nil, nil, []rateLimitSample{{CredentialID: "c1", Count: 3, WindowSecs: 30}}, nil)
-	if want := `{"rate_limits":[{"credential_id":"c1","count":3,"window_secs":30}]}`; string(<-got) != want {
+	if want := `{"rate_limits":[{"credential_id":"c1","count":3,"window_secs":30,"risk_429_count":0}]}`; string(<-got) != want {
 		t.Fatalf("rate-limits-only body mismatch, want %s", want)
 	}
 
@@ -523,11 +801,10 @@ func TestConcurrencyPeak(t *testing.T) {
 	if len(snap) != 1 || snap[0] != (concurrencySample{CredentialID: "c1", Peak: 2}) {
 		t.Fatalf("snapshot = %+v, want one {c1, peak 2}", snap)
 	}
-	// next window: peak map reset. d2/d3 are still in flight (cur 2) but with no
-	// NEW arrival the idle window reports nothing — peak only bumps on inc (the
-	// documented ponytail steady-state-trough ceiling). Pins that behavior.
-	if snap2 := r.snapshotConcurrency(); snap2 != nil {
-		t.Fatalf("idle next window = %+v, want nil (peak reset)", snap2)
+	// Long-running streams remain visible in every window; otherwise a source
+	// would falsely clear concurrency while two requests are still active.
+	if snap2 := r.snapshotConcurrency(); len(snap2) != 1 || snap2[0].Peak != 2 {
+		t.Fatalf("steady next window = %+v, want c1 peak 2", snap2)
 	}
 	d2()
 	d3() // cur back to 0

@@ -148,8 +148,18 @@ type Proxy struct {
 	// instance so network recovery state survives generation reloads.
 	pathHealth *ProviderPathHealthManager
 	// signalReporter ships parsed unified-* utilization to master (I5, best-effort,
-	// off the forward hot path). nil = feature off. Set via EnableSignalReporting.
+	// off the forward hot path). A Supervisor-built Proxy shares the process-owned
+	// reporter across hot-reload generations; standalone proxies own reporters
+	// created through EnableSignalReporting. nil = feature off.
 	signalReporter *signalReporter
+	// ownsSignalReporter distinguishes standalone/test Proxy ownership from the
+	// Supervisor's process lifetime. A generation must never close the shared
+	// reporter while a draining sibling can still publish into it.
+	ownsSignalReporter bool
+	// schedRouted tracks each (group|seat)'s last routed account so the unified
+	// scheduling log receives one row per ROUTE CHANGE, never one per request
+	// (拍板 2026-08-17 #3 — see noteSchedRouteSettled).
+	schedRouted sync.Map // map[string]string: "<group>|<seat>" → account_id
 	// routingOverrides is the allocation engine's seat→account routing-override
 	// cache (I-side §6.5). Shared across generations, polled by the supervisor; the
 	// group-route hot path reads it to redirect a seat off an unhealthy default.
@@ -333,19 +343,26 @@ type Proxy struct {
 	// UpstreamTimeout caps how long a detached upstream call may run after
 	// the client disconnects. Default: defaultUpstreamTimeout (10 min).
 	UpstreamTimeout time.Duration
-	// filterStub501Active is set at proxy generation build time when the
-	// vault contains any app_records row with filter_stages != NULL BUT no
-	// working filter dispatcher could be constructed (e.g. detector binary
-	// missing). While active, ALL data-plane traffic returns 501
-	// FILTER_NOT_IMPLEMENTED — SPEC §1.5.7 / §6.6 anti-example F mandate that
-	// an unimplemented/broken filter chain must NOT silently let traffic
-	// through (would be "pseudo-security": looks configured, actually inert).
-	// Set during supervisor.buildGeneration; not flipped at runtime.
+	// filterStub501 is set (non-nil) at proxy generation build time when a
+	// compliance filter is REQUIRED (vault filter_stages declaration or org
+	// mandate) but no working filter dispatcher could be constructed. While
+	// set, ALL data-plane traffic returns 501 — SPEC §1.5.7 / §6.6
+	// anti-example F mandate that a broken filter chain must NOT silently let
+	// traffic through (would be "pseudo-security": looks configured, actually
+	// inert). Set during supervisor.buildGeneration; not flipped at runtime.
+	//
+	// The cause carries WHY (bugfix 2026-08-19 filterpipe-501-stale-copy):
+	// the supervisor always knew the real reason and the fix path, but the
+	// P3-era user-facing string kept claiming "dispatcher not implemented /
+	// wait for the build / server-side / temporary" long after the P4
+	// dispatcher shipped — three lies and zero actionable steps while the
+	// logs told the truth. The 501 body must render the SAME facts the
+	// supervisor logs.
 	//
 	// Mutually exclusive with filterHook: supervisor sets EITHER a working
-	// filterHook (dispatcher present) OR filterStub501Active (declared but
-	// no working dispatcher), never both.
-	filterStub501Active bool
+	// filterHook (dispatcher present) OR filterStub501 (declared but no
+	// working dispatcher), never both.
+	filterStub501 *FilterStubCause
 	// filterIncremental, when true, makes the inbound filter scan ONLY the
 	// latest user turn (the new content) instead of re-scanning system + the
 	// whole conversation history every request. WHY: clients like OpenClaw
@@ -376,7 +393,8 @@ type Proxy struct {
 
 // SetTransport sets a custom RoundTripper for outbound requests to AI providers.
 // Must be called before serving requests. A nil value restores the default
-// behavior (http.DefaultTransport, which honors HTTP_PROXY / HTTPS_PROXY env vars).
+// behavior (defaultUpstreamTransport — http.DefaultTransport semantics incl.
+// HTTP_PROXY / HTTPS_PROXY, with per-host idle capacity raised, see below).
 func (p *Proxy) SetTransport(t http.RoundTripper) {
 	p.transport.Store(&transportBox{rt: t})
 	if t != nil {
@@ -387,6 +405,35 @@ func (p *Proxy) SetTransport(t http.RoundTripper) {
 // transportBox boxes the RoundTripper so it can live in an atomic.Pointer (atomics
 // can't hold an interface value directly). A nil rt means "use the default".
 type transportBox struct{ rt http.RoundTripper }
+
+// defaultUpstreamTransport is the fallback outbound transport when no custom
+// transport (node-upstream chain / test interception) is set. It is
+// http.DefaultTransport CLONED (Proxy env semantics and HTTP/2 wiring stay
+// identical) with MaxIdleConnsPerHost raised from Go's default of 2: a worker
+// fans hundreds of concurrent requests into a SINGLE provider host, so
+// per-host idle capacity 2 discards almost every connection after use —
+// TIME_WAIT piles up until the host exhausts ephemeral ports (EADDRNOTAVAIL)
+// and unrelated local dials (cluster heartbeats!) start failing, and every
+// discarded connection is an extra TLS handshake toward the provider (WAF
+// exposure). N2 定案 2026-08-19 (容量 P0-4 方案): reproduced 3× at 120 users.
+// The egress engine already used 100 (egress_engine.go) — this closes the gap
+// on the default path.
+var defaultUpstreamTransport = func() http.RoundTripper {
+	// Comma-ok, not a bare assertion: errcheck rejects the unguarded form, and a
+	// panic here would kill the proxy at package-init time — before any log line
+	// exists to explain it. http.DefaultTransport is *http.Transport in every
+	// stdlib we build against, so the fallback is unreachable in practice; it
+	// exists so a future stdlib change degrades to the stock transport (smaller
+	// idle pool) instead of taking the process down.
+	base, ok := http.DefaultTransport.(*http.Transport)
+	if !ok {
+		return http.DefaultTransport
+	}
+	t := base.Clone()
+	t.MaxIdleConns = 100
+	t.MaxIdleConnsPerHost = 100
+	return t
+}()
 
 // currentTransport returns the live RoundTripper (nil → caller falls back to the
 // default). Lock-free atomic read: safe on the hot path concurrently with a
@@ -415,6 +462,25 @@ func (p *Proxy) OAuthEgressOverride() bool { return p.oauthEgressOverride.Load()
 // stops all detached upstream calls (called on proxy shutdown).
 // If v also implements ActiveKeyReader, path-prefix routing is enabled automatically.
 func New(v VaultGetter, reg *vkeys.Registry, prov *provider.Registry, coll *events.Collector, ctx context.Context) *Proxy {
+	return newProxy(v, reg, prov, coll, ctx, nil)
+}
+
+// NewWithOAuthPoolRuntime creates a Proxy generation backed by process-owned
+// OAuth-pool cooldown/tombstone and signal-reporting state. The runtime must be
+// created once by Supervisor and closed only during process shutdown.
+func NewWithOAuthPoolRuntime(v VaultGetter, reg *vkeys.Registry, prov *provider.Registry, coll *events.Collector, ctx context.Context, runtime *OAuthPoolRuntimeState) *Proxy {
+	return newProxy(v, reg, prov, coll, ctx, runtime)
+}
+
+func newProxy(v VaultGetter, reg *vkeys.Registry, prov *provider.Registry, coll *events.Collector, ctx context.Context, runtime *OAuthPoolRuntimeState) *Proxy {
+	var poolCooldown *poolCooldownStore
+	var signalReporter *signalReporter
+	if runtime != nil {
+		poolCooldown = runtime.poolCooldown
+		signalReporter = runtime.signalReporter
+	} else {
+		poolCooldown = newPoolCooldownStore()
+	}
 	p := &Proxy{
 		vault:              v,
 		registry:           reg,
@@ -426,12 +492,13 @@ func New(v VaultGetter, reg *vkeys.Registry, prov *provider.Registry, coll *even
 		VerySlowRequestMs:  10000,
 		UpstreamTimeout:    defaultUpstreamTimeout,
 		appHealthCache:     apppipe.NewHealthCache(),
-		poolCooldown:       newPoolCooldownStore(),
+		poolCooldown:       poolCooldown,
 		bindingCooldown:    newBindingCooldownStore(),
 		chainActivity:      newChainActivityStore(),
 		pathHealth:         NewProviderPathHealthManager(),
 		poolObservedResets: newPoolResetStore(),
 		groupLoginState:    newGroupLoginStateStore(),
+		signalReporter:     signalReporter,
 	}
 	if ar, ok := v.(ActiveKeyReader); ok {
 		p.activeReader = ar
@@ -624,15 +691,54 @@ func (p *Proxy) recordAppHealth(slug string, statusCode int, errorType string) {
 	p.appHealthCache.RecordCall(slug, statusCode, errorType, time.Now())
 }
 
-// SetFilterStub501Active is the supervisor wiring entry for the SPEC
-// §1.5.7 P3 stub: when the vault has any app declaring filter_stages
-// but the real filter dispatcher is not yet shipped, the proxy must
-// fail-loud rather than silent-allow. Called once at generation build;
-// must not be flipped at runtime (the filterpipe implementation will
-// land in P4 alongside its own runtime wiring).
-func (p *Proxy) SetFilterStub501Active(active bool) {
-	p.filterStub501Active = active
+// FilterStubCause says WHY the fail-loud filter 501 is active, in enough
+// detail for the 501 body to give the user the SAME facts and fix path the
+// supervisor logs carry (they must never diverge again — bugfix 2026-08-19).
+type FilterStubCause struct {
+	// Reason is one of the FilterStubReason* constants.
+	Reason string
+	// Slug is the filter app whose dispatcher could not be built.
+	Slug string
+	// ExpectedPath is where the binary was looked for (empty when unknown,
+	// e.g. spawn failures report the resolved binary path instead).
+	ExpectedPath string
+	// Mandated marks the org-mandate flavor: the block cannot be lifted by
+	// clearing local settings — only installing the detector (or the org
+	// dropping the mandate) unblocks traffic.
+	Mandated bool
 }
+
+// Reason vocabulary for FilterStubCause (also emitted as the additive
+// `reason_code` field on the 501 body; error-code-changelog entry required
+// when this list changes).
+const (
+	// FilterStubReasonMandateNotInstalled: org mandates compliance but the
+	// detector binary is absent on this machine.
+	FilterStubReasonMandateNotInstalled = "COMPLIANCE_MANDATED_NOT_INSTALLED"
+	// FilterStubReasonBinaryMissing: vault declares a filter app but its
+	// binary was not found at the canonical path.
+	FilterStubReasonBinaryMissing = "FILTER_BINARY_MISSING"
+	// FilterStubReasonSpawnFailed: binary present but every detector process
+	// failed to start.
+	FilterStubReasonSpawnFailed = "FILTER_SPAWN_FAILED"
+)
+
+// SetFilterStub501 is the supervisor wiring entry for the SPEC §1.5.7 /
+// §6.6 fail-loud guard: when a compliance filter is required (vault
+// declaration or org mandate) but no working dispatcher could be built, the
+// proxy must fail-loud rather than silent-allow. nil clears the guard.
+// Called once at generation build; must not be flipped at runtime.
+func (p *Proxy) SetFilterStub501(cause *FilterStubCause) {
+	p.filterStub501 = cause
+}
+
+// FilterStub501Cause returns the active fail-loud cause, or nil when the proxy
+// is serving normally. The supervisor polls it to know whether it is currently
+// REFUSING traffic over a missing/unspawnable filter binary — the one state in
+// which it must keep re-checking the filesystem (bugfix 2026-08-20: the latch's
+// cause is a file, its cure was only ever a vault-declaration change, so a
+// binary that arrived later was never noticed).
+func (p *Proxy) FilterStub501Cause() *FilterStubCause { return p.filterStub501 }
 
 // SetFilterHook installs the P4 filter dispatcher hook. Called once at
 // generation build time by the supervisor when a filter app is registered
@@ -762,9 +868,14 @@ func (p *Proxy) SetReporter(r *events.Reporter, instanceID, clientVersion, confi
 // EnableSignalReporting wires the allocation-engine util signal reporter (I5): the
 // proxy parses upstream unified-* utilization and best-effort POSTs it to master's
 // /accounts/me/signals, authed with the same team account-JWT the group-runtime
-// poll uses. nil controlURL/bearer → feature stays off (newSignalReporter returns nil).
+// poll uses. nil controlURL/bearer leaves a shared reporter dormant without
+// discarding durable pending work; a standalone Proxy remains feature-off.
 func (p *Proxy) EnableSignalReporting(controlURL string, bearer func(ctx context.Context) (string, error)) {
-	p.signalReporter = newSignalReporter(controlURL, bearer, slog.Default())
+	endpoint := ""
+	if controlURL != "" {
+		endpoint = strings.TrimRight(controlURL, "/") + "/accounts/me/signals"
+	}
+	p.configureSignalReporting(endpoint, bearer)
 }
 
 // EnableOrgSignalReporting is the Cluster-worker sibling of
@@ -774,29 +885,67 @@ func (p *Proxy) EnableSignalReporting(controlURL string, bearer func(ctx context
 // an LLM upstream.
 func (p *Proxy) EnableOrgSignalReporting(controlURL, orgID, serviceToken string) {
 	if controlURL == "" || orgID == "" || serviceToken == "" {
+		p.DisableSignalReporting()
 		return
 	}
 	endpoint := strings.TrimRight(controlURL, "/") + "/internal/org/" + url.PathEscape(orgID) + "/signals"
-	p.signalReporter = newSignalReporterEndpoint(endpoint, func(context.Context) (string, error) {
+	p.configureSignalReporting(endpoint, func(context.Context) (string, error) {
 		return serviceToken, nil
-	}, slog.Default())
+	})
 }
 
-// StopSignalReporting stops the signal reporter's upload loop (idempotent,
-// nil-safe). Called from generation.close() so the per-generation reporter's
-// goroutine + ticker don't leak across reloads.
+func (p *Proxy) configureSignalReporting(endpoint string, bearer func(context.Context) (string, error)) {
+	if p == nil {
+		return
+	}
+	if p.signalReporter == nil {
+		p.signalReporter = newSignalReporterEndpoint(endpoint, p.sourceID, bearer, slog.Default())
+		p.ownsSignalReporter = p.signalReporter != nil
+		return
+	}
+	p.signalReporter.configure(endpoint, p.sourceID, bearer)
+}
+
+// DisableSignalReporting disables uploads without destroying process-owned
+// pending state. A later successful generation activation can re-enable the
+// same outbox and retry it.
+func (p *Proxy) DisableSignalReporting() {
+	if p == nil || p.signalReporter == nil {
+		return
+	}
+	p.signalReporter.configure("", p.sourceID, nil)
+}
+
+// SignalReportingHealthSnapshot exposes the current allocation-signal pipeline
+// state for /status. A live Proxy with no reporter returns disabled explicitly;
+// an OAuth-pool deployment must not look healthy merely because wiring is absent.
+func (p *Proxy) SignalReportingHealthSnapshot() *SignalReportingHealth {
+	if p == nil {
+		return nil
+	}
+	if p.signalReporter == nil {
+		return &SignalReportingHealth{Status: "disabled"}
+	}
+	snapshot := p.signalReporter.healthSnapshot()
+	return &snapshot
+}
+
+// StopSignalReporting stops a standalone Proxy's signal reporter (idempotent,
+// nil-safe). Supervisor generations reference a process-owned reporter and do
+// not own its lifecycle; Supervisor closes it during process shutdown.
 func (p *Proxy) StopSignalReporting() {
-	if p.signalReporter != nil {
+	if p.signalReporter != nil && p.ownsSignalReporter {
 		_ = p.signalReporter.Close()
+		p.signalReporter = nil
+		p.ownsSignalReporter = false
 	}
 }
 
 // StopObservers retires this generation's observer registry (idempotent,
-// nil-safe). Called from generation.close() for the same reason as
-// StopSignalReporting: the registry is rebuilt per generation
-// (supervisor.buildObserverRegistry), so whatever its observers started in
-// Build — rhythm's 5s settings poller and reporter worker pool — leaks on every
-// reload without this. See observer.ClosableObserver.
+// nil-safe). Unlike the process-owned allocation signal reporter, this registry
+// is rebuilt per generation (supervisor.buildObserverRegistry), so whatever its
+// observers started in Build — rhythm's 5s settings poller and reporter worker
+// pool — leaks on every reload without this. See observer.ClosableObserver.
 func (p *Proxy) StopObservers() {
 	p.observerRegistry.Close()
 }

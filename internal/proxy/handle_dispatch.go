@@ -41,28 +41,30 @@ func (p *Proxy) Handle(w http.ResponseWriter, r *http.Request) {
 		"request_id", tc.RequestID,
 	)
 
-	// 0-pre. SPEC §1.5.7 / §6.6 E-mode fail-loud stub.
+	// 0-pre. SPEC §1.5.7 / §6.6 E-mode fail-loud guard.
 	//
-	// If vault has any app_records row declaring filter_stages but the
-	// filterpipe dispatcher is not implemented (always true in P3 — real
-	// impl lands in P4), reject ALL data-plane requests with 501. This
-	// is the explicit fix for anti-example F: an unimplemented filter
-	// MUST NOT silently let traffic through, otherwise an operator who
-	// configured filter_stages believes they have compliance enforcement
-	// while actually the chain is inert.
+	// If a compliance filter is REQUIRED (vault filter_stages declaration or
+	// org mandate) but no working dispatcher could be built, reject ALL
+	// data-plane requests with 501. This is the explicit fix for
+	// anti-example F: a broken filter MUST NOT silently let traffic through,
+	// otherwise an operator who configured filter_stages believes they have
+	// compliance enforcement while actually the chain is inert.
 	//
 	// Lives BEFORE all routing branches so probe / app / user_chat all
-	// return uniformly. supervisor.buildGeneration warns the operator at
-	// startup so they see this state in logs, not just in client 501s.
-	if p.filterStub501Active {
+	// return uniformly. The body message renders the CAUSE the supervisor
+	// recorded — same facts, same fix path as the startup logs (bugfix
+	// 2026-08-19: the P3-era static string here contradicted the logs for
+	// two months and sent users chasing "server-side/temporary" ghosts).
+	if cause := p.filterStub501; cause != nil {
 		p.errors.Add(1)
-		writeJSONError(w, http.StatusNotImplemented, "server_error",
-			"FILTER_NOT_IMPLEMENTED",
-			"This proxy build has vault rows declaring filter_stages but the "+
-				"filterpipe dispatcher is not implemented yet (SPEC §1.5.7 P3 stub). "+
-				"All traffic is being rejected to avoid silent-allow. Either clear "+
-				"the filter declaration in vault or wait for the proxy build that "+
-				"includes the filter dispatcher.")
+		writeJSONErrorDetails(w, http.StatusNotImplemented, "server_error",
+			"FILTER_NOT_IMPLEMENTED", filterStub501Message(cause),
+			map[string]any{
+				"reason_code":   cause.Reason,
+				"filter_slug":   cause.Slug,
+				"expected_path": cause.ExpectedPath,
+				"org_mandated":  cause.Mandated,
+			})
 		return
 	}
 
@@ -350,4 +352,43 @@ func (p *Proxy) Handle(w http.ResponseWriter, r *http.Request) {
 	// observer through helper so ndjson-fanout subscribers see this stream.
 	p.serveRouteWithObserver(w, r, route, prov, realKey, token, startTime, logger,
 		observer.StreamUserChat, tc.TraceID)
+}
+
+// filterStub501Message renders the fail-loud 501 body for one FilterStubCause.
+// Contract (bugfix 2026-08-19 filterpipe-501-stale-copy): every branch states
+// the REAL cause and a step the user can actually execute — never "wait for a
+// build", never "server-side", never "temporary". The org-mandate branch must
+// not suggest clearing local settings (that path cannot lift a mandate block).
+func filterStub501Message(cause *FilterStubCause) string {
+	slug := cause.Slug
+	if slug == "" {
+		slug = "ai-compliance-detector"
+	}
+	where := ""
+	if cause.ExpectedPath != "" {
+		where = " (expected at " + cause.ExpectedPath + ")"
+	}
+	switch cause.Reason {
+	case FilterStubReasonMandateNotInstalled:
+		return "Your organization requires the AiKey compliance detector, but it is " +
+			"not installed on this machine" + where + ". Run `aikey app install " + slug +
+			"` to install it; traffic is blocked until then (fail-closed by org policy — " +
+			"clearing local filter settings will not lift this block)."
+	case FilterStubReasonSpawnFailed:
+		return "The compliance filter '" + slug + "' is installed but failed to start" +
+			where + ". Check the proxy logs for the spawn error, then reinstall it with " +
+			"`aikey app install " + slug + "`. Traffic is blocked to avoid forwarding unfiltered."
+	default: // FilterStubReasonBinaryMissing and any future unclassified cause
+		// The disable hint must reference a command that actually ships (the
+		// P3-era text told users to "clear the filter declaration" with no
+		// public verb for it): the compliance detector has `aikey compliance
+		// off`; any other filter app is removed with `aikey app uninstall`.
+		off := "`aikey app uninstall " + slug + "` to remove it"
+		if slug == "ai-compliance-detector" {
+			off = "`aikey compliance off` to disable compliance scanning"
+		}
+		return "This machine declares the compliance filter '" + slug + "' but its " +
+			"binary was not found" + where + ". Run `aikey app install " + slug + "` to " +
+			"install it, or " + off + ". Traffic is blocked to avoid forwarding unfiltered."
+	}
 }

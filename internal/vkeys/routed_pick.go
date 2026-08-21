@@ -45,14 +45,16 @@ const (
 //	            so the display can still stamp a nominal pick pre-poll. The hot path
 //	            never passes an empty map (it errors NO_MATERIAL before picking).
 //	override  — the engine's (seat,group) routing override ("" = none). Honored when
-//	            the account is a candidate and not skipped — INCLUDING needs_login
-//	            (owner rule above). Falls through when genuinely unusable.
+//	            the account is a candidate, not skipped, and serviceable. A
+//	            needs_login override no longer blocks (2026-08-15 rule change, see
+//	            below): it becomes the preferred login-prompt target while any
+//	            healthy candidate keeps serving.
 //	skip      — accounts to route around (cooldown / this-request retries). nil ok.
 //	nowUnix   — clock for the expiry gate (injected for deterministic tests).
 //
-// The first non-skipped account in override/strict-HRW order may return PickNeedsLogin.
-// This is required when a globally cooled account routes around to a not-yet-logged-in
-// successor: display and login controls must converge on that successor.
+// PickNeedsLogin is returned only when NO candidate is serviceable and at least
+// one is waiting on a member login — the actionable prompt names the engine's
+// override target first, else the highest-ranked needs_login account.
 func PickRoutedAccount(seatID string, refs []GroupAccountRef, material map[string]GroupRuntimeAccount, override string, skip map[string]bool, nowUnix int64) (string, PickOutcome) {
 	if len(refs) == 0 {
 		return "", PickNone
@@ -85,19 +87,42 @@ func PickRoutedAccount(seatID string, refs []GroupAccountRef, material map[strin
 		return PickOK
 	}
 
-	// Engine override first. A non-skipped needs_login override is actionable.
+	// 2026-08-15 rule change (decision: 硬吊销/未登录不阻塞用户流程 — supersedes the
+	// 2026-07-01 owner rule "a needs_login override is honored immediately"):
+	// a needs_login candidate is remembered as the ACTIONABLE login target but no
+	// longer blocks the request while a healthy candidate exists. LOGIN_REQUIRED
+	// therefore only surfaces when NO candidate is serviceable — matching the
+	// spec's three-state table ("候选 token 都失效 → LOGIN_REQUIRED"). WHY: a hard
+	// revoke marks the pinned account's token needs_login; under the old rule the
+	// member was fully blocked until they re-logged in even though a healthy
+	// sibling sat in the same pool (schedstress P04, live-measured). The engine's
+	// target still wins as the login PROMPT (pendingLogin prefers the override),
+	// and the display stamp shares this exact pick, so UI and hot path agree.
+	pendingLogin := ""
 	if override != "" {
-		if oc := gate(override); oc == PickOK || oc == PickNeedsLogin {
-			return override, oc
+		switch gate(override) {
+		case PickOK:
+			return override, PickOK
+		case PickNeedsLogin:
+			pendingLogin = override // remembered prompt target; keep searching for service
+		case PickNone:
+			// An unusable/stale override is not authoritative; try ranked candidates.
 		}
 	}
-	// Local ranked pick. The first non-skipped destination is authoritative even
-	// when it still needs this member to log in.
 	for _, a := range ordered {
-		oc := gate(a.AccountID)
-		if oc == PickOK || oc == PickNeedsLogin {
-			return a.AccountID, oc
+		switch gate(a.AccountID) {
+		case PickOK:
+			return a.AccountID, PickOK
+		case PickNeedsLogin:
+			if pendingLogin == "" {
+				pendingLogin = a.AccountID
+			}
+		case PickNone:
+			continue
 		}
+	}
+	if pendingLogin != "" {
+		return pendingLogin, PickNeedsLogin
 	}
 	return "", PickNone
 }

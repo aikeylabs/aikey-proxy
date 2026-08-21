@@ -1,6 +1,7 @@
 package events
 
 import (
+	"context"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
@@ -93,13 +94,13 @@ func TestReporter_RetryableFailure_WALDrivenRetry(t *testing.T) {
 
 	// --- Phase 2: backoff gate suppresses an un-forced drain ---
 	failing.Store(false) // collector recovered
-	reporter.drainOnce(false)
+	reporter.drainOnce(context.Background(), false)
 	if got := received.Load(); got != 0 {
 		t.Fatalf("phase2: gate should suppress the un-forced drain even though collector recovered; got %d delivered", got)
 	}
 
 	// --- Phase 3: forced drain bypasses the gate and re-sends from the WAL ---
-	reporter.drainOnce(true)
+	reporter.drainOnce(context.Background(), true)
 	if got := received.Load(); got != n {
 		t.Fatalf("phase3: forced drain must re-send all %d events from the WAL, got %d", n, got)
 	}
@@ -123,8 +124,11 @@ func TestBackoffForFailures(t *testing.T) {
 		{1, 5 * time.Second},
 		{2, 15 * time.Second},
 		{3, 60 * time.Second},
-		{4, 5 * time.Minute},
-		{99, 5 * time.Minute},
+		// Top tier capped at 60s (2026-08-19): the max retry interval must stay
+		// well inside the five-minute delivery-convergence window; 5min-tier
+		// retries armed at load-stop landed outside it (P0-4 F4 ladder tail).
+		{4, 60 * time.Second},
+		{99, 60 * time.Second},
 	}
 	for _, c := range cases {
 		if got := backoffForFailures(c.n); got != c.want {

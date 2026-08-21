@@ -79,25 +79,47 @@ func TestApplyInboundFilter_LiveDetector(t *testing.T) {
 	// digit, so this now exercises pii.cn.id_card itself.
 	const idCard = "110101199003077424"
 
-	// WHY THE PROMPT SAYS 客户手机号 AND NOT 客户信息：手机号
+	// WHY THE PHONE IS 13857492631 AND NOT 13800138000
+	// (fixture correction 2026-08-17, action bundle Wave5 → Wave6)
 	//
-	// The production action-policy bundle gates CN_PHONE on CLAUSE-LOCAL
-	// ownership evidence (`phone_ownership` in actionpolicy bundles/
-	// wave-1-risk-accepted/v5-recovery.json: 客户手机号 / 用户手机号 / 联系方式 …).
-	// A bare 11-digit number next to a bare 手机号 is the measured 12.9%
-	// user-impact false-positive shape the gate exists to remove. The old
-	// phrasing put 客户 and 手机号 in DIFFERENT clauses (the full-width colon
-	// splits them), so the phone finding was capped at warn with
-	// reason=positive_context_missing missing=[phone_ownership] — i.e. the
-	// policy behaved as designed and the fixture simply no longer described a
-	// masked prompt.
+	// The production action-policy bundle (bundles/
+	// wave-6-phone-ownership-inheritance/v12-phone-ownership-inheritance.json,
+	// selected by active-bundle.json) gates CN_PHONE on two independent things:
+	// clause-local ownership evidence (`phone_ownership`) AND a VALUE-shape veto,
+	// `non_live_value_validator: obvious_non_live_phone`.
 	//
-	// NOTE (open product question, deliberately NOT papered over here): whether
-	// "客户信息：手机号 X" SHOULD confirm ownership is a live coverage question
-	// filed as B3-a in workflow/CI/review/20260813-合规检测-未决事项backlog.md.
-	// This test proves the mask PLUMBING on CJK; it is not the adjudicator of
-	// the FP calibration.
-	const phone = "13800138000"
+	// 13800138000 is THE canonical fake CN mobile and is a literal inside
+	// obviousNonLivePhone (actionpolicy/stage_v10.go). Wave6 made that veto
+	// explicit, so the number is now capped at warn no matter how strong the
+	// surrounding ownership evidence is — it can no longer stand for a LIVE phone
+	// in any fixture. Measured here before this correction: the forwarded body
+	// still carried the raw 13800138000 while the id card masked, i.e. the test
+	// was RED and would have been measuring the synthetic-value veto rather than
+	// the mask plumbing it exists to prove. 13857492631 is the realistic literal
+	// the detector-side fixtures moved to in the same change
+	// (cmd/detector/pack_rule_action_test.go, actionpolicy/lane_tier_action_test.go).
+	//
+	// 13800138000 did NOT silently vanish from coverage: its warn verdict is
+	// pinned BY NAME in actionpolicy/bundle_test.go,
+	// TestActivePhoneHistoryRecoveryKeepsLowFalsePositiveBoundary, row
+	// "canonical fake number with strong ownership".
+	//
+	// WHY THE PROMPT SAYS 客户手机号 (and why the old B3-a note is gone)
+	//
+	// The 2026-08-13 version of this comment justified the phrasing by a
+	// clause-local list of COMPOUND ownership words (客户手机号 / 用户手机号 / …)
+	// held privately by clause_aware_recovery in wave-1-risk-accepted/
+	// v5-recovery.json, and filed "should 客户信息：手机号 X confirm ownership"
+	// as an OPEN product question (backlog B3-a). Both statements are stale:
+	// v5-recovery.json is no longer the active bundle, and B3-a was
+	// re-adjudicated as a real bug and CLOSED on 2026-08-17 — that private list
+	// was a drifted second copy of base_production_action's vocabulary, costing
+	// 180 true positives while never stopping a single false positive. Wave6
+	// replaced it with inheritance from base (which contains the bare 手机号).
+	// See workflow/CI/bugfix/20260817-clause-recovery-duplicate-phone-vocabulary.md.
+	// The phrasing is kept unchanged because it is what this fixture has always
+	// asserted on; rewording it would change what the test covers.
+	const phone = "13857492631"
 	body := `{"model":"claude-3-5-sonnet","messages":[{"role":"user","content":` +
 		`"请帮我核对客户手机号 ` + phone + `，身份证号 ` + idCard + ` 是否正确"}]}`
 

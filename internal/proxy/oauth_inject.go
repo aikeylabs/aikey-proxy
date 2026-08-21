@@ -183,10 +183,23 @@ func injectClaudeOAuth(req *http.Request, cred *OAuthCredential) {
 
 	// NOTE: oauth_group POOL requests pass the REAL client identity upstream
 	// unchanged. The former AccountPersona normalization (N users → one frozen
-	// SHA256(accountID) identity) was removed 2026-06-29: a frozen synthetic
-	// fingerprint can't track Claude Code version bumps, so it drifts stale and
-	// becomes its OWN detection signal — worse than transparent pass-through.
-	// Risk is now bounded by a ≤3-users-per-account cap, not by disguise.
+	// SHA256(accountID) identity) was removed 2026-06-29 (46545a3): a frozen
+	// synthetic fingerprint can't track Claude Code version bumps, so it drifts
+	// stale and becomes its OWN detection signal — worse than transparent
+	// pass-through.
+	//
+	// What bounds the risk instead (R7.2, owner decision 2026-08-18): the
+	// per-pool seat cap — a pool holds at most 30 seats, so at worst 30 people
+	// share one upstream account. There is deliberately NO dedicated
+	// per-account anti-ban cap. This note previously claimed "risk is now
+	// bounded by a ≤3-users-per-account cap": true when written (d25e95d, same
+	// day, "replace identity forgery with an honest cap"), but that cap was
+	// raised 3 → 100 on 2026-07-25 (b535b85) as part of a ratio/capacity rework
+	// that never mentioned anti-ban, and the claim here silently went false for
+	// seven weeks. Enforcement now lives in a fence, not in prose:
+	// aikey-control-master internal/oauthgroup/antiban_headcount_fence_test.go.
+	// Do not restate a bound here — state the mechanism and let the fence hold
+	// the number.
 }
 
 // claudeCodeSystemPrompt is the byte-exact 57-char marker that Anthropic's

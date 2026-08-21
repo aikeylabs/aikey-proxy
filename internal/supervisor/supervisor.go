@@ -30,6 +30,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"runtime/pprof"
 	"sort"
 	"strconv"
 	"strings"
@@ -128,6 +129,48 @@ type generation struct {
 	inflight atomic.Int64
 	id       int
 	draining atomic.Bool
+	// signalReporting is applied only when this fully-built generation becomes
+	// active. Building a replacement must not reconfigure the process-owned
+	// reporter while the current generation is still authoritative.
+	signalReporting signalReportingConfig
+}
+
+type signalReportingMode uint8
+
+const (
+	signalReportingDisabled signalReportingMode = iota
+	signalReportingMember
+	signalReportingOrg
+)
+
+type signalReportingConfig struct {
+	mode         signalReportingMode
+	controlURL   string
+	orgID        string
+	serviceToken string
+	bearer       func(context.Context) (string, error)
+}
+
+func (c signalReportingConfig) apply(p *proxy.Proxy) {
+	if p == nil {
+		return
+	}
+	// Every mode is named, and that is the point rather than style: a mode added
+	// later would otherwise fall into `default` and silently become "reporting
+	// off" — a data-loss default that nothing would flag. With the cases listed,
+	// the exhaustive linter fails the build until the new mode is handled.
+	switch c.mode {
+	case signalReportingMember:
+		p.EnableSignalReporting(c.controlURL, c.bearer)
+	case signalReportingOrg:
+		p.EnableOrgSignalReporting(c.controlURL, c.orgID, c.serviceToken)
+	case signalReportingDisabled:
+		p.DisableSignalReporting()
+	default:
+		// Unreachable while the switch above is exhaustive; kept so an
+		// out-of-range value cannot leave reporting in an undefined state.
+		p.DisableSignalReporting()
+	}
 }
 
 // ServeHTTP dispatches to the generation's proxy handler, tracking inflight count.
@@ -175,13 +218,12 @@ func (g *generation) closeAll() {
 	if g.reporter != nil {
 		_ = g.reporter.Close()
 	}
-	// Stop the allocation-engine signal reporter (lives on this generation's
-	// proxy, started per generation in buildGeneration via EnableSignalReporting).
-	// Without this its loop() goroutine + 30s ticker leak on every reload, each
-	// holding a live bearer closure over the old vault reader.
 	if g.proxy != nil {
-		g.proxy.StopSignalReporting()
-		// Same reason, different subsystem (2026-08-15): the observer registry is
+		// The allocation signal reporter is deliberately NOT closed here: it is
+		// process-owned so a draining request can publish a late 401/429 after the
+		// replacement generation is active. The Supervisor closes it on shutdown.
+		// The observer registry remains generation-owned and must be retired.
+		// Same reason, different subsystem (2026-08-15): the registry is
 		// rebuilt per generation by buildObserverRegistry, and until this call
 		// existed nothing ever retired it. rhythm's settings poller (5s tick) and
 		// reporter worker pool therefore accumulated one full set per reload —
@@ -278,6 +320,14 @@ type Supervisor struct {
 	// receives this same pointer, so a reload cannot erase an open breaker or its
 	// recovery opportunity and hot network/egress changes can wake it immediately.
 	pathHealth *proxy.ProviderPathHealthManager
+	// oauthPoolRuntime is the single in-memory truth for OAuth-pool cooldowns,
+	// exact-token tombstones, and allocation-signal pending work. Generations
+	// share it; only Shutdown closes it.
+	oauthPoolRuntime *proxy.OAuthPoolRuntimeState
+	// signalRefreshToken supplies the process-owned reporter without capturing a
+	// generation-owned vault Reader. It opens the currently activated vault only
+	// when teamCredentialSource needs to rebuild its credential.
+	signalRefreshToken *runtimeRefreshTokenSource
 	// ctx / cancel bound the lifetime of all detached upstream calls.
 	// Canceled in Shutdown() to stop any in-flight upstream requests.
 	ctx    context.Context
@@ -443,6 +493,8 @@ func New(cfg *config.Config, configPath, password, version string) (*Supervisor,
 		// would recreate the four-source base_url drift.
 		fallbackPolicy:           proxy.NewFallbackPolicyCache(localAttemptTimeoutMs(cfg)),
 		pathHealth:               proxy.NewProviderPathHealthManager(),
+		oauthPoolRuntime:         proxy.NewOAuthPoolRuntimeState(),
+		signalRefreshToken:       newRuntimeRefreshTokenSource(cfg.Vault.Path, password),
 		teamCred:                 &teamCredentialSource{},
 		currentRoutedRestampKick: make(chan struct{}, 1),
 	}
@@ -451,6 +503,7 @@ func New(cfg *config.Config, configPath, password, version string) (*Supervisor,
 	s.railset = newRailSet(s.groupRuntimeRail(), s.routingOverrideRail(), s.fallbackPolicyRail())
 	gen, err := s.buildGeneration()
 	if err != nil {
+		_ = s.oauthPoolRuntime.Close()
 		return nil, fmt.Errorf("initial generation failed: %w", err)
 	}
 	s.activateGeneration(gen)
@@ -612,10 +665,17 @@ func New(cfg *config.Config, configPath, password, version string) (*Supervisor,
 				}
 				return accounts[i].SeatID < accounts[j].SeatID
 			})
+			// assignment_routing_version: the engine-assignment revision this
+			// worker is SERVING (override cache). The control-side cluster
+			// health compares it against the ledger's max routing_version —
+			// the P3 "projection stale" yellow light (方案 20260819 D4): a
+			// worker whose daemon/apply chain stalls stops advancing this
+			// number while control's keeps moving.
 			return struct {
-				Enabled        bool            `json:"enabled"`
-				CooledAccounts []cooledAccount `json:"cooled_accounts,omitempty"`
-			}{Enabled: true, CooledAccounts: accounts}
+				Enabled                  bool            `json:"enabled"`
+				AssignmentRoutingVersion int64           `json:"assignment_routing_version,omitempty"`
+				CooledAccounts           []cooledAccount `json:"cooled_accounts,omitempty"`
+			}{Enabled: true, AssignmentRoutingVersion: s.routingOverrides.Version(), CooledAccounts: accounts}
 		}
 		reg.SetHealthSource(cluster.NodeHealthSource(s.cfg.Vault.Path, s.version, time.Now(), canaryFn, metricsFn, poolRoutingFn))
 		observability.GoSafe("supervisor.cluster_registrar", observability.Isolated, func() { reg.Run(s.ctx) })
@@ -775,6 +835,10 @@ func (s *Supervisor) activateGeneration(newGen *generation) {
 	s.runtimeStateMu.Lock()
 	defer s.runtimeStateMu.Unlock()
 	s.applyRuntimeState(newGen.proxy)
+	if s.signalRefreshToken != nil {
+		s.signalRefreshToken.update(newGen.vaultPath, s.password)
+	}
+	newGen.signalReporting.apply(newGen.proxy)
 	s.active.Store(newGen)
 }
 
@@ -845,6 +909,47 @@ func (s *Supervisor) managedKeySyncLoop() {
 		case <-ticker.C:
 			s.syncManagedKeys()
 		}
+	}
+}
+
+// healFilterStubIfResolvable clears a fail-loud 501 latch once the binary it
+// was waiting for exists. It reloads (rather than flipping the flag) because
+// the filter child lives on the generation: only a rebuild can spawn it.
+//
+// Scope is deliberately narrow — it acts ONLY when the proxy is currently
+// latched, and only for the binary-missing causes. A spawn failure is left
+// alone: retrying a child that just failed to start, every five seconds,
+// forever, is a crash loop, and its cure (fix the binary, reinstall) does go
+// through a declaration change or a restart.
+func (s *Supervisor) healFilterStubIfResolvable() {
+	s.healFilterStubWithReload(s.Reload)
+}
+
+// healFilterStubWithReload is the testable core: the reload is a parameter so a
+// test can assert WHETHER it was called (the whole point of the fix) without
+// standing up a real generation rebuild.
+func (s *Supervisor) healFilterStubWithReload(reload func(context.Context) error) {
+	gen := s.active.Load()
+	if gen == nil || gen.proxy == nil {
+		return
+	}
+	cause := gen.proxy.FilterStub501Cause()
+	if cause == nil {
+		return // serving normally: no stat, no work
+	}
+	switch cause.Reason {
+	case proxy.FilterStubReasonBinaryMissing, proxy.FilterStubReasonMandateNotInstalled:
+	default:
+		return // spawn failures do not self-heal on a timer (see above)
+	}
+	if bin, _ := resolveAppBinary(s.appsDir(), []string{slugOrDetector(cause.Slug)}); bin == "" {
+		return // still missing
+	}
+	slog.Info("supervisor: filter binary appeared while the data plane was fail-loud; reloading to spawn it",
+		"event.name", "proxy.filter_stub_healing", "slug", cause.Slug, "binary", cause.ExpectedPath)
+	if err := reload(s.ctx); err != nil {
+		slog.Warn("supervisor: reload to clear the filter 501 failed; will retry next tick",
+			"event.name", "proxy.filter_stub_heal_failed", "error", err)
 	}
 }
 
@@ -924,6 +1029,16 @@ func (s *Supervisor) syncManagedKeys() {
 	// (≤1 tick behind, safe side). Runs every tick regardless of vault-seq, before
 	// the early-return below. Best-effort: a write failure only WARNs.
 	s.flushLocalUsage()
+
+	// SELF-HEAL while fail-loud (bugfix 2026-08-20). When the data plane is
+	// refusing everything because a declared filter binary could not be
+	// resolved, the cure is a FILE appearing — but every reload trigger below
+	// keys on the vault's change_seq, and `aikey app install` laying the
+	// binary down changes no vault row. Cause and cure sat on different axes,
+	// so a machine that was fixed stayed 501 until someone restarted the proxy
+	// (staging, 2026-08-20). Poll only while latched: one stat per tick in the
+	// broken state, nothing at all in the healthy one.
+	s.healFilterStubIfResolvable()
 
 	vaultSeq, err := vault.ReadConfigU64LE(s.cfg.Vault.Path, VaultChangeSeqKey)
 	if err != nil {
@@ -1279,6 +1394,16 @@ func (s *Supervisor) ProviderPathHealthSnapshot() []proxy.ProviderPathHealth {
 	return s.pathHealth.Snapshot()
 }
 
+// SignalReportingHealthSnapshot returns the active generation's Proxy→Master
+// allocation-signal health. The pointer is nil when the feature is not wired.
+func (s *Supervisor) SignalReportingHealthSnapshot() *proxy.SignalReportingHealth {
+	gen := s.active.Load()
+	if gen == nil || gen.proxy == nil {
+		return nil
+	}
+	return gen.proxy.SignalReportingHealthSnapshot()
+}
+
 // ReporterMetrics returns usage reporter counters from the active generation.
 // Returns nil if reporter is not configured (no collector_url).
 func (s *Supervisor) ReporterMetrics() *events.ReporterMetrics {
@@ -1629,8 +1754,8 @@ func (s *Supervisor) Reload(ctx context.Context) error {
 	// Apply the latest supervisor-owned runtime state and swap under the same short
 	// fence used by hot updates. The generation build above remains off-lock.
 	s.activateGeneration(newGen)
-	// The new Proxy hydrates persisted cooldowns independently; re-stamp its
-	// display projection after the generation becomes active.
+	// The process-wide cooldown truth may have changed while the replacement was
+	// building; re-stamp the display projection after it becomes active.
 	s.requestCurrentRoutedRestamp()
 	slog.Info("reload: new generation active",
 		"event.name", observability.EventProxyReloadCompleted,
@@ -1690,7 +1815,52 @@ func (s *Supervisor) Shutdown(timeout time.Duration) {
 	gen := s.active.Load()
 	slog.Info("supervisor shutting down", "generation_id", gen.id)
 	gen.drain(timeout, "shutdown")
-	gen.close()
+	// The teardown below is a WATCHDOGGED stage (bugfix
+	// 2026-08-19-proxy-shutdown-unbounded-close): generation.close() strings
+	// together reporter/WAL/SQLite closes, and an unbounded wait anywhere in
+	// that chain once held the drained process hostage until systemd's 90s
+	// SIGKILL — killing rolling upgrades and the self-heal restart path (which
+	// reuses this exact function). Every subsystem is expected to close within
+	// its own budget (reporters: shutdownFlushBudget); the watchdog is the
+	// structural fence for the ones that can't promise it (SQLite on a wedged
+	// disk, future additions). On overrun: dump all goroutine stacks to stderr
+	// (journald/launchd log = persisted forensic evidence, per the "超时退出必须
+	// 自动保存诊断证据" acceptance bar) and return — abandoning teardown is safe
+	// here because the process is about to exit and the WAL/SQLite layers are
+	// crash-safe by design.
+	closed := make(chan struct{})
+	go func() {
+		gen.close()
+		if s.oauthPoolRuntime != nil {
+			_ = s.oauthPoolRuntime.Close()
+		}
+		close(closed)
+	}()
+	select {
+	case <-closed:
+	case <-time.After(closeWatchdogTimeout):
+		slog.Error("supervisor shutdown: teardown watchdog fired — dumping goroutines and abandoning close",
+			"event.name", observability.EventProxyShutdownWatchdogTimeout,
+			"generation_id", gen.id,
+			"watchdog_seconds", int(closeWatchdogTimeout/time.Second))
+		dumpGoroutineStacks()
+	}
+}
+
+// closeWatchdogTimeout bounds the whole post-drain teardown. It must stay well
+// under every OS stop timeout that supervises this process (systemd
+// TimeoutStopSec=90 on cluster nodes; launchd ExitTimeOut default 20s is the
+// tightest) so a graceful stop always beats the OS kill.
+const closeWatchdogTimeout = 15 * time.Second
+
+// dumpGoroutineStacks writes every goroutine's stack to stderr. Debug level 2
+// (full stacks with goroutine states) is what actually answers "WHICH close is
+// stuck on WHAT" — the exact evidence that was missing when workers hung until
+// SIGKILL with nothing in the journal but the last drained log line.
+func dumpGoroutineStacks() {
+	if p := pprof.Lookup("goroutine"); p != nil {
+		_ = p.WriteTo(os.Stderr, 2)
+	}
 }
 
 // buildGeneration creates a fully-initialized generation ready to handle requests.
@@ -1761,7 +1931,7 @@ func (s *Supervisor) buildGeneration() (*generation, error) {
 	collector := events.NewCollector(eventStore, s.cfg.Events.BatchSize, s.cfg.Events.FlushInterval)
 
 	// Build the proxy handler with configured thresholds.
-	p := proxy.New(vaultReader, registry, providers, collector, s.ctx)
+	p := proxy.NewWithOAuthPoolRuntime(vaultReader, registry, providers, collector, s.ctx, s.oauthPoolRuntime)
 	// Stamp the generation identity FIRST and unconditionally. Every runtime
 	// counter this Proxy exposes on /v1/diagnostics/pipeline is scoped to this
 	// generation — a reload swaps the *Proxy behind an unchanged PID, so the
@@ -1869,7 +2039,13 @@ func (s *Supervisor) buildGeneration() (*generation, error) {
 	// single writer touching the directory.
 	var sharedWAL *events.WALWriter
 	var seqAlloc *events.SeqAllocator
-	var sourceID string // vault source identity; reused for SetDeliveryIntegrity + ReporterConfig.SourceID
+	// Signal reporting needs a stable source even when usage WAL/reporting is
+	// disabled. Cluster's declared node_id is authoritative; member Proxies reuse
+	// the vault source identity and safely fall back to authenticated account scope.
+	sourceID, _ := vault.ReadConfigString(s.cfg.Vault.Path, SourceIdentityKey)
+	if s.cfg.Cluster.Enabled && s.cfg.Cluster.NodeID != "" {
+		sourceID = s.cfg.Cluster.NodeID
+	}
 	if s.cfg.Events.WALDir != "" {
 		if w, werr := events.NewWALWriter(s.cfg.Events.WALDir); werr != nil {
 			slog.Warn("local wal init failed, offline usage log disabled", "error", werr)
@@ -1892,12 +2068,10 @@ func (s *Supervisor) buildGeneration() (*generation, error) {
 					"event.name", "usage.seqalloc.init_failed", "error", serr)
 			} else {
 				seqAlloc = sa
-				sourceID, _ = vault.ReadConfigString(s.cfg.Vault.Path, SourceIdentityKey)
 				if sourceID == "" {
 					slog.Warn("source_identity missing from vault; events emitted without source_id",
 						"event.name", "usage.source_identity.missing")
 				}
-				p.SetDeliveryIntegrity(sourceID, seqAlloc)
 			}
 			// Thread proxy identity fields that reportUsage needs even in
 			// the offline path.  SetReporter below would overwrite these
@@ -1909,6 +2083,8 @@ func (s *Supervisor) buildGeneration() (*generation, error) {
 			p.SetReporter(nil, fmt.Sprintf("proxy-%d", id), s.version, proxy.GenerationLabel(int64(id)), loadedSeq, vaultReader.GetLoggedInAccountID())
 		}
 	}
+	// One wiring point for both usage-event identity and allocation-signal source.
+	p.SetDeliveryIntegrity(sourceID, seqAlloc)
 
 	// Attach usage reporter if any upload destination is configured —
 	// either the legacy single CollectorURL, or at least one non-empty
@@ -2021,11 +2197,18 @@ func (s *Supervisor) buildGeneration() (*generation, error) {
 	// destination; neither condition may suppress a hard-revoked member-token
 	// transition. Cluster uses the existing org-pinned service credential; other
 	// editions reuse the live team account JWT used by the group-runtime rails.
+	// Store the desired configuration on the generation and apply it only at the
+	// activation boundary; a generation that fails to build cannot disturb the
+	// current process-owned reporter.
 	masterURL := readControlPanelURL()
+	signalCfg := signalReportingConfig{}
 	if s.cfg.Cluster.Enabled && s.cfg.Cluster.OrgID != "" && s.cfg.Cluster.ControlServiceToken != "" {
-		p.EnableOrgSignalReporting(masterURL, s.cfg.Cluster.OrgID, s.cfg.Cluster.ControlServiceToken)
-	} else if signalURL, bearer := signalReportingAuth(masterURL, s.teamCred, vaultReader); bearer != nil {
-		p.EnableSignalReporting(signalURL, bearer)
+		signalCfg = signalReportingConfig{
+			mode: signalReportingOrg, controlURL: masterURL,
+			orgID: s.cfg.Cluster.OrgID, serviceToken: s.cfg.Cluster.ControlServiceToken,
+		}
+	} else if signalURL, bearer := signalReportingAuth(masterURL, s.teamCred, s.signalRefreshToken); bearer != nil {
+		signalCfg = signalReportingConfig{mode: signalReportingMember, controlURL: signalURL, bearer: bearer}
 	}
 
 	// Only hand the WAL to the generation when nobody else closes it. If a
@@ -2052,6 +2235,7 @@ func (s *Supervisor) buildGeneration() (*generation, error) {
 		seqAlloc:        seqAlloc,
 		contentReporter: contentReporter,
 		contentWAL:      contentWAL,
+		signalReporting: signalCfg,
 		contentSeqAlloc: contentSeqAlloc,
 		drained:         make(chan struct{}),
 	}
