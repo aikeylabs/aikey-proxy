@@ -25,10 +25,11 @@ import (
 
 // routedEvent is v2Event with an explicit route source.
 //
-// identity this helper exists to vary; dropping it would force every future
-// multi-source case to re-thread it through the call sites.
+// src is uniform across today's cases, which is why unparam flags it, but it is
+// part of the event identity this helper exists to vary. Dropping it would force
+// the first multi-source case to re-thread it through every call site.
 //
-//nolint:unparam // src is uniform in today's cases but is part of the event
+//nolint:unparam // see the note above
 func routedEvent(id, src string, seq int64, routeSource string) ReportableEvent {
 	e := v2Event(id, src, seq)
 	e.RouteSource = routeSource
