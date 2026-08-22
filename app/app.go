@@ -104,6 +104,13 @@ func resolveConfigPath(explicit string) (string, error) {
 }
 
 func Run() {
+	// Arm the parent-liveness leash before anything else can block or fail: a
+	// sandbox proxy that outlives its test run is the failure this guards, and
+	// it must hold even if startup goes wrong later. Unset in every real
+	// install, so this is a no-op outside the test harness — see
+	// supervisor.ParentWatchEnv for why a leaked proxy cost ten days once.
+	supervisor.WatchParent(nil)
+
 	// Handle "version" subcommand before flag parsing (flags expect --config etc.)
 	if len(os.Args) > 1 && os.Args[1] == "version" {
 		bi := buildinfo.Get()
