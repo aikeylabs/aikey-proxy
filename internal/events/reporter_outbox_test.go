@@ -4,7 +4,6 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
-	"path/filepath"
 	"sync"
 	"testing"
 	"time"
@@ -269,18 +268,15 @@ func TestOutbox_CarriesAllocatedSeq(t *testing.T) {
 	defer srv.Close()
 
 	dir := t.TempDir()
-	sa, err := NewSeqAllocator(filepath.Join(dir, "seq.state"), DefaultSeqBlockSize)
-	if err != nil {
-		t.Fatal(err)
-	}
+	sa := NewLaneAllocator(dir, DefaultSeqBlockSize)
 	defer sa.Close()
 	// Hand out seqs 1..5 (allocator high-water = 5) but only deliver 1..3.
 	for i := 0; i < 5; i++ {
-		if _, nErr := sa.Next(); nErr != nil {
+		if _, nErr := sa.Next("o"); nErr != nil {
 			t.Fatal(nErr)
 		}
 	}
-	if got := sa.Allocated(); got != 5 {
+	if got := sa.Allocated("o"); got != 5 {
 		t.Fatalf("Allocated()=%d, want 5", got)
 	}
 

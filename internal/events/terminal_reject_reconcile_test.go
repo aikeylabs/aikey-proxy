@@ -38,7 +38,7 @@ type terminalCollector struct {
 	confirmLostNoop bool
 	srcID           string
 
-	rejectDeliveries int     // 200-delivered batches that carried rejectSeq
+	rejectDeliveries int // 200-delivered batches that carried rejectSeq
 	gapsCalls        int
 	confirmLostSeqs  []int64 // every seq ever posted to /confirm-lost
 }

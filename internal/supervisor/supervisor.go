@@ -117,7 +117,7 @@ type generation struct {
 	// Closed in close() so a graceful shutdown shrinks the persisted high-water
 	// mark to the actual last-used seq (zero seq burn on the common restart
 	// path; only a hard crash leaves a bounded auditable gap). nil when no WAL.
-	seqAlloc *events.SeqAllocator
+	seqAlloc *events.LaneAllocator
 	// Conversation-audit content outbox (enterprise Cluster feature). All nil
 	// unless this is a team deployment with a collector + credential — see
 	// conversation_audit_wiring.go. Closed in close() like the usage trio:
@@ -1417,7 +1417,14 @@ func (s *Supervisor) ReporterMetrics() *events.ReporterMetrics {
 
 // CollectorMetrics returns the active generation's collector counters (queue-full
 // drops). Returns nil if no collector is active. Mirrors ReporterMetrics so
-// /admin/metrics exposes both billing-loss paths.
+// GET /admin/audit/status exposes both billing-loss paths.
+//
+// 🔴 The route is /admin/audit/status, NOT /admin/metrics (comment fixed
+// 2026-08-21). No /admin/metrics route has ever existed — three comments named
+// it, so an operator following them hits the data-plane catch-all and gets a
+// 401 TOKEN_MISSING from the LLM gateway, which reads like an auth problem
+// rather than a wrong path. It cost a diagnosis session exactly that way.
+// Loopback callers need no token (server/adminauth.go loopbackOK).
 func (s *Supervisor) CollectorMetrics() *events.CollectorMetrics {
 	gen := s.active.Load()
 	if gen == nil || gen.collector == nil {
@@ -2038,7 +2045,7 @@ func (s *Supervisor) buildGeneration() (*generation, error) {
 	// also created below we hand it this shared instance so there is only a
 	// single writer touching the directory.
 	var sharedWAL *events.WALWriter
-	var seqAlloc *events.SeqAllocator
+	var seqAlloc *events.LaneAllocator
 	// Signal reporting needs a stable source even when usage WAL/reporting is
 	// disabled. Cluster's declared node_id is authoritative; member Proxies reuse
 	// the vault source identity and safely fall back to authenticated account scope.
@@ -2063,10 +2070,14 @@ func (s *Supervisor) buildGeneration() (*generation, error) {
 			// (no seq) rather than blocking the proxy — usage still flows, it
 			// just doesn't participate in server gap detection until fixed.
 			seqStatePath := filepath.Join(s.cfg.Events.WALDir, seqStateFile)
-			if sa, serr := events.NewSeqAllocator(seqStatePath, events.DefaultSeqBlockSize); serr != nil {
-				slog.Warn("seq allocator init failed, events emitted without source_seq",
-					"event.name", "usage.seqalloc.init_failed", "error", serr)
-			} else {
+			// Per-lane from 2026-08-21: one dense stream per org, because the
+			// server accounts per (org, source). seqStatePath's directory is
+			// the WAL dir; the legacy single-stream file in it is preserved and
+			// used as the floor every lane starts above (never-reuse survives
+			// the split). Construction cannot fail — lanes are created lazily,
+			// so a bad state file surfaces on first use, per lane.
+			_ = seqStatePath
+			if sa := events.NewLaneAllocator(s.cfg.Events.WALDir, events.DefaultSeqBlockSize); sa != nil {
 				seqAlloc = sa
 				if sourceID == "" {
 					slog.Warn("source_identity missing from vault; events emitted without source_id",

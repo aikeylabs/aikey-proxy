@@ -33,7 +33,7 @@ type ReporterConfig struct {
 	// tail-gap detection — it does NOT own its lifecycle (the supervisor's
 	// generation.close() owns the zero-burn Close()). nil → batches carry no
 	// allocated_seq (offline / degraded). Added 2026-05-30 (delivery integrity).
-	SeqAlloc *SeqAllocator
+	SeqAlloc *LaneAllocator
 	// CollectorRoutes maps RouteSource ("personal" / "team" / "oauth") →
 	// upload URL. When ev.RouteSource has a non-empty mapping, that URL
 	// is used for the event; misses fall through to CollectorURL.
@@ -154,7 +154,16 @@ type Reporter struct {
 	wal                         *WALWriter
 	done                        chan struct{}
 	// delivery-integrity cursors (memory only; see type doc). Guarded by mu.
-	sentSeq          map[string]int64       // source_id → highest seq handed to upload
+	sentSeq map[string]int64 // source_id → highest seq handed to upload
+	// switchRetryAt / switchBackoff gate stream-switch retries PER LANE. The
+	// declaration is a one-off owed to the server and the obligation is kept
+	// until it lands — but a destination that fails PERMANENTLY (the team
+	// collector answering 401 because its reverse proxy does not route /v1/
+	// yet) turned that into a WARN on every batch: six lines in 0.7s, observed
+	// live on winpc2 2026-08-21. Drowning the log is how a real problem becomes
+	// invisible. Guarded by mu.
+	switchRetryAt    map[string]time.Time
+	switchBackoff    map[string]time.Duration
 	confirmedSeq     map[string]int64       // source_id → server contiguous high-water
 	seenV1           map[string]bool        // event_id → uploaded; A1 one-shot for v1 entries
 	signal           chan struct{}          // cap-1 wakeup poke from Report → uploadLoop
@@ -279,6 +288,8 @@ func NewReporter(in *ReporterConfig) (*Reporter, error) {
 		done:              make(chan struct{}),
 		client:            httpx.NewSwappableDirect(30 * time.Second),
 		sentSeq:           make(map[string]int64),
+		switchRetryAt:     make(map[string]time.Time),
+		switchBackoff:     make(map[string]time.Duration),
 		lastConfirmedView: make(map[string]int64),
 		confirmedSeq:      make(map[string]int64),
 		seenV1:            make(map[string]bool),
@@ -425,7 +436,7 @@ func (r *Reporter) Report(ev *ReportableEvent) {
 	// (every 5min) don't pollute business watermark freshness indicators.
 	now := time.Now()
 	r.mu.Lock()
-	if ev.OrgID == "__canary__" {
+	if ev.OrgID == CanaryOrgSentinel {
 		r.lastCanaryEventAt = now
 	} else {
 		r.lastBusinessEventAt = now
@@ -724,7 +735,14 @@ func (r *Reporter) uploadPending(ctx context.Context, batch []ReportableEvent) (
 	if len(batch) == 0 {
 		return false
 	}
-	groups := make(map[string][]ReportableEvent, 1)
+	// Grouped by (route source, LANE), not route source alone (2026-08-21).
+	// The destination comes from the route source; the allocated_seq scalar in
+	// the batch belongs to a single lane. A batch mixing two orgs would carry
+	// one number that is wrong for at least one of the watermark rows it
+	// touches — the same "report another stream's high-water" mistake that
+	// ledgered 768 real events as lost, just at batch granularity.
+	type groupKey struct{ routeSource, lane string }
+	groups := make(map[groupKey][]ReportableEvent, 1)
 	skipped := 0
 	for i := range batch {
 		ev := &batch[i]
@@ -732,7 +750,8 @@ func (r *Reporter) uploadPending(ctx context.Context, batch []ReportableEvent) (
 			skipped++
 			continue
 		}
-		groups[ev.RouteSource] = append(groups[ev.RouteSource], *ev)
+		k := groupKey{routeSource: ev.RouteSource, lane: LaneOfEvent(ev)}
+		groups[k] = append(groups[k], *ev)
 	}
 	if skipped > 0 {
 		// No destination for this route_source (e.g. team route on a pure
@@ -745,7 +764,8 @@ func (r *Reporter) uploadPending(ctx context.Context, batch []ReportableEvent) (
 		// 5-second drain loop (bugfix 2026-08-20).
 		r.warnNoRouteOnce(batch)
 	}
-	for routeSource, group := range groups {
+	for key, group := range groups {
+		routeSource := key.routeSource
 		if ctx.Err() != nil {
 			return true // budget gone mid-pass: remaining groups stay in the WAL
 		}
@@ -953,22 +973,6 @@ func (r *Reporter) warnMisroutedCollectorOnce(collectorURL string, upErr *upload
 			"or fix that origin's reverse-proxy mapping.")
 }
 
-// destinationCount is how many DISTINCT collectors this proxy uploads to. One
-// (the overwhelmingly common shape: Personal-only, Trial, Production, a cluster
-// node) keeps the allocator's global high-water valid; more than one does not.
-func (r *Reporter) destinationCount() int {
-	seen := make(map[string]bool, 3)
-	for _, u := range r.cfg.CollectorRoutes {
-		if u = strings.TrimRight(strings.TrimSpace(u), "/"); u != "" {
-			seen[u] = true
-		}
-	}
-	if u := strings.TrimRight(strings.TrimSpace(r.cfg.CollectorURL), "/"); u != "" {
-		seen[u] = true
-	}
-	return len(seen)
-}
-
 // noteRouted records that every seq in batch has now been ROUTED to
 // collectorURL. Called before the upload attempt, deliberately: a batch that
 // fails to upload was still routed here, and its seqs must count toward this
@@ -997,19 +1001,15 @@ func (r *Reporter) noteRouted(collectorURL string, batch []ReportableEvent) {
 	}
 }
 
-// routedHighWater returns the highest seq routed to collectorURL, and whether
-// anything has been routed there at all. The bool matters: reporting 0 would
-// tell the server "I have allocated nothing", which is a claim, not a silence.
-func (r *Reporter) routedHighWater(collectorURL string) (int64, bool) {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	hi, ok := r.routedSeq[collectorURL]
-	return hi, ok && hi > 0
-}
-
 // cred may be nil — doUpload tolerates that by sending without an Authorization
 // header (matches pre-CollectorToken behavior).
 func (r *Reporter) uploadGroupTo(ctx context.Context, collectorURL string, cred Credential, batch []ReportableEvent) uploadGroupResult {
+	// Every batch is single-lane (uploadPending groups by route source AND
+	// lane), so the first event's lane identifies the whole batch.
+	batchLane := ""
+	if len(batch) > 0 {
+		batchLane = LaneOfEvent(&batch[0])
+	}
 	r.noteRouted(collectorURL, batch)
 	req := batchRequest{
 		Source:          "aikey-proxy",
@@ -1045,13 +1045,36 @@ func (r *Reporter) uploadGroupTo(ctx context.Context, collectorURL string, cred 
 	// source) so the global and the per-destination bound become the same
 	// number again. That is a wire + on-disk change and is deliberately NOT
 	// smuggled in here.
-	if dests := r.destinationCount(); dests <= 1 {
-		if r.cfg.SeqAlloc != nil {
-			allocated := r.cfg.SeqAlloc.Allocated()
-			req.AllocatedSeq = &allocated
-		}
-	} else if allocated, ok := r.routedHighWater(collectorURL); ok {
+	// PER-LANE (2026-08-21). Every batch is single-lane by construction — see
+	// uploadPending's grouping — so the batch's own lane high-water is the
+	// correct bound for the (org, source) row this batch touches, whether there
+	// is one destination or ten.
+	//
+	// This replaces the old one-destination / many-destinations split (the
+	// helpers behind it are gone with it). That branch existed
+	// because a single global stream had no correct per-row answer: with one
+	// destination it reported the global high-water (legal, since one recipient
+	// saw every seq) and with many it reported only what was routed there. Both
+	// were workarounds for allocating on the wrong key. With one dense stream
+	// per lane the question has a single right answer again.
+	if r.cfg.SeqAlloc != nil && batchLane != "" {
+		allocated := r.cfg.SeqAlloc.Allocated(batchLane)
 		req.AllocatedSeq = &allocated
+	}
+
+	// Settle any owed stream-switch BEFORE the first batch of this lane goes
+	// out (2026-08-21). The lane was seeded above the legacy single stream's
+	// high-water so never-reuse survives the split; until the server is told
+	// that span is TERMINATED it reads it as a gap and reconcile eventually
+	// writes it into the known-loss ledger — the upgrade would reproduce the
+	// defect it fixes.
+	//
+	// Best-effort and ordered-before, not blocking: if the declaration fails
+	// the batch still ships (usage must not be held hostage to an
+	// administrative call) and the obligation stays pending, so the next batch
+	// retries it. The endpoint is idempotent, so retrying is free.
+	if batchLane != "" {
+		r.declareStreamSwitch(ctx, collectorURL, batchLane)
 	}
 
 	body, err := json.Marshal(req)
@@ -1171,6 +1194,16 @@ func (r *Reporter) onUploadSuccess(count int) {
 // autoReplayCooldown spaces automatic dead-letter replays so a flapping
 // upstream can't turn the replay pass into a hot loop. 10 min ≈ one recovery
 // window; entries left behind are retried on the next trigger.
+// streamSwitchBackoff bounds how often a failed declaration is retried. Min is
+// short because a transient collector restart should settle fast; max is a
+// minute because a destination that is broken by configuration (not load) will
+// stay broken until a human fixes it, and one line a minute is enough to notice
+// without burying everything else.
+const (
+	streamSwitchBackoffMin = 2 * time.Second
+	streamSwitchBackoffMax = 60 * time.Second
+)
+
 const autoReplayCooldown = 10 * time.Minute
 
 // maybeAutoReplayLocked (r.mu held) fires the self-healing dead-letter replay
@@ -1291,4 +1324,64 @@ func (r *Reporter) doUpload(ctx context.Context, url string, body []byte, cred C
 	slog.Debug("reporter: batch uploaded",
 		"accepted", result.Accepted, "duplicated", result.Duplicated, "rejected", result.Rejected)
 	return &result, nil
+}
+
+// declareStreamSwitch tells the collector that everything at or below this
+// lane's owed floor is terminated. No-op when nothing is owed (the steady
+// state — this fires once per lane per upgrade).
+//
+// Reuses httpPostJSON, the same helper ReconcileGaps uses for the diagnostics
+// surface, rather than a second HTTP path: one place to get timeouts, the
+// shared client and error shaping right.
+func (r *Reporter) declareStreamSwitch(ctx context.Context, collectorURL, lane string) {
+	if r.cfg.SeqAlloc == nil {
+		return
+	}
+	floor := r.cfg.SeqAlloc.PendingFloor(lane)
+	if floor <= 0 {
+		return
+	}
+	// Backoff gate: retry, but not on every batch.
+	r.mu.Lock()
+	if at, ok := r.switchRetryAt[lane]; ok && time.Now().Before(at) {
+		r.mu.Unlock()
+		return
+	}
+	r.mu.Unlock()
+	body := map[string]any{
+		"org_id":    lane, // lane IS the org — see LaneOfOrg
+		"source_id": r.cfg.SourceID,
+		"floor_seq": floor,
+	}
+	if err := r.httpPostJSON(ctx, strings.TrimRight(collectorURL, "/")+"/v1/diagnostics/stream-switch", body, nil); err != nil {
+		// Loud: an undeclared floor becomes ledgered "loss" on the next
+		// reconcile pass, so this must not fail quietly. The obligation stays
+		// pending and the next batch retries it (the endpoint is idempotent).
+		// Exponential-ish, capped: quick enough that a transient outage settles
+		// within a minute, slow enough that a permanently-broken destination
+		// costs one line a minute instead of one per batch.
+		r.mu.Lock()
+		next := r.switchBackoff[lane] * 2
+		if next < streamSwitchBackoffMin {
+			next = streamSwitchBackoffMin
+		}
+		if next > streamSwitchBackoffMax {
+			next = streamSwitchBackoffMax
+		}
+		r.switchBackoff[lane] = next
+		r.switchRetryAt[lane] = time.Now().Add(next)
+		r.mu.Unlock()
+		slog.Warn("reporter: stream-switch declaration failed; the terminated span will look like a gap until it lands",
+			"event.name", "usage.reporter.stream_switch_failed",
+			"lane", lane, "floor_seq", floor, "retry_in", next.String(), "error", err)
+		return
+	}
+	r.mu.Lock()
+	delete(r.switchRetryAt, lane)
+	delete(r.switchBackoff, lane)
+	r.mu.Unlock()
+	r.cfg.SeqAlloc.ClearPendingFloor(lane)
+	slog.Info("reporter: stream-switch declared",
+		"event.name", "usage.reporter.stream_switch_declared",
+		"lane", lane, "floor_seq", floor)
 }

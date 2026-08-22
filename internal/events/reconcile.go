@@ -26,10 +26,15 @@ type AuditStatus struct {
 	// endpoint because this is already the one place an operator looks to ask
 	// "is anything undelivered on this box?" — and until now the answer only
 	// ever covered usage, so a stalled compliance pipeline was invisible.
-	Compliance      ComplianceDeliveryStatus `json:"compliance"`
-	AllocatedSeq    int64                    `json:"allocated_seq"`
-	WALFiles        int                      `json:"wal_files"`
-	DeadLetterCount int                      `json:"dead_letter_count"`
+	Compliance   ComplianceDeliveryStatus `json:"compliance"`
+	AllocatedSeq int64                    `json:"allocated_seq"`
+	// AllocatedSeqByLane breaks AllocatedSeq down per delivery lane (= org).
+	// Added with the per-lane split (2026-08-21): one number cannot describe
+	// two independent streams, and the whole class of bug this work addresses
+	// is "a number from one stream read as if it described another".
+	AllocatedSeqByLane map[string]int64 `json:"allocated_seq_by_lane,omitempty"`
+	WALFiles           int              `json:"wal_files"`
+	DeadLetterCount    int              `json:"dead_letter_count"`
 	// D' auto-reconcile visibility (P0-4): a persistently-positive
 	// SentUnconfirmed with growing AutoReconcileRuns and no Resent progress is
 	// the operator's cue that the collector's diagnostics endpoints are broken
@@ -62,7 +67,19 @@ type ComplianceDeliveryStatus struct {
 func (r *Reporter) AuditStatus() AuditStatus {
 	st := AuditStatus{SourceID: r.cfg.SourceID, Reporter: r.Metrics()}
 	if r.cfg.SeqAlloc != nil {
-		st.AllocatedSeq = r.cfg.SeqAlloc.Allocated()
+		// Per-lane now: report the MAX across lanes so `aikey audit status`
+		// keeps showing "how far this install has counted" as one number, and
+		// add the breakdown so an operator can see the two streams. A single
+		// summed or arbitrary value would hide the very split this field is
+		// most useful for diagnosing.
+		st.AllocatedSeqByLane = map[string]int64{}
+		for _, lane := range r.cfg.SeqAlloc.Lanes() {
+			v := r.cfg.SeqAlloc.Allocated(lane)
+			st.AllocatedSeqByLane[lane] = v
+			if v > st.AllocatedSeq {
+				st.AllocatedSeq = v
+			}
+		}
 	}
 	if r.wal != nil {
 		if files, err := ListWALFiles(r.wal.Dir()); err == nil {
@@ -258,7 +275,31 @@ func (r *Reporter) reconcileAgainst(ctx context.Context, base string) (Reconcile
 					delete(tracked, seq)
 				}
 			}
+			// 🔴 Terminated-not-lost guard (2026-08-21). A lane seeded above the
+			// legacy single stream owes the server a stream-switch declaration;
+			// until it lands the server cannot know that span is TERMINATED and
+			// enumerates it as missing. Confirming those seqs would file
+			// never-issued numbers as DATA LOSS — the exact pollution this whole
+			// change exists to remove, and it would happen on precisely the
+			// deployments where the declaration cannot land (observed live: the
+			// team collector answers 401 because its reverse proxy does not
+			// route /v1/ yet).
+			//
+			// So: below an OWED floor we neither resend nor confirm. Silence is
+			// the honest answer — "we cannot account for this yet" is a
+			// different fact from "this was lost", and only one of them is
+			// reversible. The seqs simply stay unaccounted until the
+			// declaration lands, which the reporter keeps retrying.
+			owedFloor := int64(0)
+			if r.cfg.SeqAlloc != nil {
+				owedFloor = r.cfg.SeqAlloc.PendingFloor(s.OrgID)
+			}
+			heldBack := 0
 			for _, seq := range gaps.MissingSeqs {
+				if owedFloor > 0 && seq <= owedFloor {
+					heldBack++
+					continue
+				}
 				switch {
 				case !walSet[seq]:
 					notInWAL = append(notInWAL, seq)
@@ -270,6 +311,15 @@ func (r *Reporter) reconcileAgainst(ctx context.Context, base string) (Reconcile
 				}
 			}
 			r.mu.Unlock()
+			if heldBack > 0 {
+				// Loud, because an operator seeing "gaps that never resolve"
+				// deserves to know they are waiting on a declaration, not on
+				// data — and which lane is stuck.
+				slog.Warn("reporter: gaps below an undeclared stream floor are held back, NOT confirmed lost",
+					"event.name", "usage.reporter.gaps_held_below_floor",
+					"org_id", s.OrgID, "source_id", s.SourceID,
+					"floor_seq", owedFloor, "held_back", heldBack)
+			}
 			// Recover WAL-present gaps by re-sending (server dedup-safe). Only
 			// DELIVERED groups (200 / terminal dead-letter) consume budget —
 			// retryable network failures leave the WAL untouched and uncounted.

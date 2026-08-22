@@ -1,4 +1,4 @@
-# deploy-production.ps1 — Windows production deployment for aikey-proxy.
+﻿# deploy-production.ps1 — Windows production deployment for aikey-proxy.
 #
 # Supports deploying to Windows targets (local or remote via WinRM/PSRemoting).
 # Run this script from a Windows build machine (PowerShell 5.1+ or PowerShell 7+).

@@ -5,7 +5,6 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
-	"path/filepath"
 	"sync"
 	"testing"
 	"time"
@@ -29,11 +28,27 @@ import (
 // part of the event identity this helper exists to vary. Dropping it would force
 // the first multi-source case to re-thread it through every call site.
 //
+// routedEvent builds an event for one route, with an org that MATCHES that
+// route — because org IS the delivery lane since 2026-08-21, and a machine that
+// sends a "team"-routed event carrying a personal org does not exist. The
+// earlier version set only RouteSource and left every event on org "o", which
+// made the fixture describe an impossible machine the moment lanes appeared.
+//
 //nolint:unparam // see the note above
 func routedEvent(id, src string, seq int64, routeSource string) ReportableEvent {
 	e := v2Event(id, src, seq)
 	e.RouteSource = routeSource
+	e.OrgID = orgForRoute(routeSource)
 	return e
+}
+
+// orgForRoute is the fixture's stand-in for what a real proxy does: team
+// traffic carries the team org, personal/oauth traffic carries the sentinel.
+func orgForRoute(routeSource string) string {
+	if routeSource == "team" {
+		return "org-team-fixture"
+	}
+	return PersonalOrgSentinel
 }
 
 func TestAllocatedSeq_NotSharedAcrossDestinations(t *testing.T) {
@@ -44,16 +59,8 @@ func TestAllocatedSeq_NotSharedAcrossDestinations(t *testing.T) {
 	defer srvB.Close()
 
 	dir := t.TempDir()
-	sa, err := NewSeqAllocator(filepath.Join(dir, "seq.state"), DefaultSeqBlockSize)
-	if err != nil {
-		t.Fatal(err)
-	}
+	sa := NewLaneAllocator(dir, DefaultSeqBlockSize)
 	defer sa.Close()
-	for i := 0; i < 6; i++ {
-		if _, nErr := sa.Next(); nErr != nil {
-			t.Fatal(nErr)
-		}
-	}
 
 	r, err := NewReporter(&ReporterConfig{
 		CollectorURL: srvA.URL,
@@ -69,6 +76,20 @@ func TestAllocatedSeq_NotSharedAcrossDestinations(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	// Each lane is its own dense stream now, so allocate ON the lane the events
+	// belong to. The assertion below is unchanged in spirit: neither collector
+	// may be told a high-water that belongs to the other.
+	for i := 0; i < 2; i++ {
+		if _, nErr := sa.Next(orgForRoute("personal")); nErr != nil {
+			t.Fatal(nErr)
+		}
+	}
+	for i := 0; i < 6; i++ {
+		if _, nErr := sa.Next(orgForRoute("team")); nErr != nil {
+			t.Fatal(nErr)
+		}
+	}
+
 	// seqs 1..2 → A (personal), seqs 5..6 → B (team).
 	for _, e := range []ReportableEvent{
 		routedEvent("p1", "srcA", 1, "personal"),
