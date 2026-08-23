@@ -1,6 +1,7 @@
 package supervisor
 
 import (
+	"errors"
 	"log/slog"
 	"os"
 	"strconv"
@@ -34,8 +35,8 @@ import (
 // check is a signal-0 probe.
 //
 // 🔴 WHY THIS IS NOT A FEATURE FLAG. The project rule against env-var switches
-// targets behaviour toggles that fork the product's logic. This forks nothing:
-// unset (every real install) means no goroutine and no behaviour at all. It
+// targets behavior toggles that fork the product's logic. This forks nothing:
+// unset (every real install) means no goroutine and no behavior at all. It
 // binds a LIFETIME, which has no other expression here.
 const ParentWatchEnv = "AIKEY_PARENT_WATCH_PID"
 
@@ -91,5 +92,9 @@ func pidAlive(pid int) bool {
 	if err == nil {
 		return true
 	}
-	return err == syscall.EPERM
+	// errors.Is, not ==: os.Process.Signal can return the errno WRAPPED (e.g.
+	// *os.SyscallError), and a wrapped EPERM would fail the == comparison and be
+	// read as "parent is gone" — the exact opposite of what EPERM means here
+	// (the process exists, we just may not signal it). errorlint flags this.
+	return errors.Is(err, syscall.EPERM)
 }

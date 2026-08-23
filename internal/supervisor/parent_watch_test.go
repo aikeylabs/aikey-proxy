@@ -20,7 +20,7 @@ import (
 //
 // The test watches a REAL process it kills, not a fabricated pid: the whole
 // mechanism is "does signal-0 still find it", so a made-up number would prove
-// nothing about the syscall behaviour this depends on.
+// nothing about the syscall behavior this depends on.
 func TestParentWatchExitsWhenTheWatchedProcessDies(t *testing.T) {
 	victim := exec.Command("sleep", "30")
 	if err := victim.Start(); err != nil {
