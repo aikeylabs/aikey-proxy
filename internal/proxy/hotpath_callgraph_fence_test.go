@@ -60,9 +60,9 @@ const hotPathEntry = "internal/proxy::Proxy.Handle"
 // package names teaches nobody why they are on it.
 var forbiddenImports = map[string]string{
 	"github.com/AiKeyLabs/aikey-license-core": "PLANE-01 / MOD-16: 热路径无 licensing import. " +
-		"A licence evaluation on the forwarding path means every request pays for it, and a " +
+		"A license evaluation on the forwarding path means every request pays for it, and a " +
 		"licensing failure becomes a forwarding outage — design D3.1 puts authorization off " +
-		"this path precisely so that a licence problem degrades the control plane and not the " +
+		"this path precisely so that a license problem degrades the control plane and not the " +
 		"customer's traffic",
 }
 
@@ -171,29 +171,48 @@ const dbReason = "PLANE-01: 热路径无 DB 调用. A query per request couples 
 // above visible too. Whoever adjudicates PLANE-01 should decide these three as a
 // group with them, not wave them through on the goroutine alone.
 var hotPathFileCalls = map[string]struct{}{
-	"internal/apphook::ChildHook.spawnLocked|os.Stat":                       {},
-	"internal/events::ContentWAL.ensureFile|os.OpenFile":                    {},
-	"internal/events::ContentWAL.evictBeyondCap|os.Remove":                  {},
-	"internal/events::WALWriter.ensureFile|os.OpenFile":                     {},
-	"internal/events::Reporter.deadLetterCompliance|os.Stat":                {},
-	"internal/events::deadLetterWriter.counts|os.ReadFile":                  {},
-	"internal/events::deadLetterWriter.write|os.OpenFile":                   {},
-	"internal/events::writeSeqStateAtomic|os.Remove":                        {},
-	"internal/observability::writeCrashDump|os.MkdirAll":                    {},
-	"internal/observability::writeCrashDump|os.WriteFile":                   {},
-	"internal/proxy::groupLoginStateStore.Clear|os.Remove":                  {},
-	"internal/proxy::groupLoginStateStore.Write|os.MkdirAll":                {},
-	"internal/proxy::groupLoginStateStore.Write|os.WriteFile":               {},
-	"internal/proxy::lastErrorsRing.persist|os.MkdirAll":                    {},
-	"internal/proxy::lastErrorsRing.persist|os.WriteFile":                   {},
-	"internal/proxy::poolCooldownStore.persistLocked|os.MkdirAll":           {},
-	"internal/proxy::poolCooldownStore.persistLocked|os.Remove":             {},
-	"internal/proxy::poolCooldownStore.persistLocked|os.WriteFile":          {},
-	"internal/proxy::signalReporter.persistAuthFailuresLocked|os.MkdirAll":  {},
-	"internal/proxy::signalReporter.persistAuthFailuresLocked|os.Remove":    {},
-	"internal/proxy::signalReporter.persistAuthFailuresLocked|os.WriteFile": {},
-	"internal/proxy::writeCodexLastModel|os.MkdirAll":                       {},
-	"internal/proxy::writeCodexLastModel|os.Remove":                         {},
+	"internal/apphook::ChildHook.spawnLocked|os.Stat":        {},
+	"internal/events::ContentWAL.ensureFile|os.OpenFile":     {},
+	"internal/events::ContentWAL.evictBeyondCap|os.Remove":   {},
+	"internal/events::WALWriter.ensureFile|os.OpenFile":      {},
+	"internal/events::Reporter.deadLetterCompliance|os.Stat": {},
+	"internal/events::deadLetterWriter.counts|os.ReadFile":   {},
+	"internal/events::deadLetterWriter.write|os.OpenFile":    {},
+	// ── seq lane allocator (769f0b1 "usage-seq stream split by recipient") ──
+	//
+	// 🚫 Recorded, not approved — like every other line here.
+	//
+	// Both sit BEHIND a cache-miss guard: LaneAllocator.For returns the memoized
+	// *SeqAllocator on every hit and only reaches os.Stat / loadSeqState the FIRST
+	// time a given lane is seen in this process. Lanes are bounded and few (the
+	// method's own doc contrasts the personal lane with the team lane), so the
+	// disk cost is once per lane per process, not once per request. The walk
+	// cannot see that guard — it answers "can a request reach this code", not
+	// "does a request block on it" — which is the same conservatism that keeps the
+	// crash-dump and WAL lines visible, and the reason these are RECORDED here
+	// rather than waved through.
+	//
+	// ⚠️ FOR WHOEVER ADJUDICATES: LaneAllocator.For holds l.mu across that I/O
+	// (os.Stat + loadSeqState + writeSeqStateAtomic + NewSeqAllocator). A first-
+	// sighting of one lane therefore blocks allocation on EVERY other lane,
+	// including cache hits. Bounded by the lane count, so it is not a per-request
+	// cost — but it is a lock-scope question that came in with this change and has
+	// not been reviewed by its author.
+	"internal/events::LaneAllocator.For|os.Stat":                              {},
+	"internal/events::loadSeqState|os.ReadFile":                               {},
+	"internal/events::writeSeqStateAtomic|os.Remove":                          {},
+	"internal/observability::writeCrashDump|os.MkdirAll":                      {},
+	"internal/observability::writeCrashDump|os.WriteFile":                     {},
+	"internal/proxy::groupLoginStateStore.Clear|os.Remove":                    {},
+	"internal/proxy::groupLoginStateStore.Write|os.MkdirAll":                  {},
+	"internal/proxy::groupLoginStateStore.Write|os.WriteFile":                 {},
+	"internal/proxy::lastErrorsRing.persist|os.MkdirAll":                      {},
+	"internal/proxy::lastErrorsRing.persist|os.WriteFile":                     {},
+	"internal/proxy::poolCooldownStore.writePersistenceSnapshot|os.MkdirAll":  {},
+	"internal/proxy::poolCooldownStore.writePersistenceSnapshot|os.Remove":    {},
+	"internal/proxy::poolCooldownStore.writePersistenceSnapshot|os.WriteFile": {},
+	"internal/proxy::writeCodexLastModel|os.MkdirAll":                         {},
+	"internal/proxy::writeCodexLastModel|os.Remove":                           {},
 }
 
 // TestTheForwardingHotPathTouchesNoLicensingFileOrDatabase is MOD-16 + PLANE-01.
@@ -473,8 +492,8 @@ func TestThisModuleDoesNotDependOnLicensingAtAll(t *testing.T) {
 	for banned := range forbiddenImports {
 		if strings.Contains(body, banned) {
 			t.Errorf("🔴 go.mod requires %q. MOD-16 and PLANE-01 both rest on the forwarding "+
-				"process not knowing what a licence is; once the module can resolve it, only "+
-				"the call-graph walk stands between a licence check and the request path.", banned)
+				"process not knowing what a license is; once the module can resolve it, only "+
+				"the call-graph walk stands between a license check and the request path.", banned)
 		}
 	}
 	// 🔴 NON-VACUITY: the file really was read and really is a go.mod.
@@ -614,6 +633,15 @@ func receiverType(expr ast.Expr) string {
 
 // reachableFrom walks the call graph, following every callee NAME it can resolve
 // inside this module.
+//
+// entry stays a parameter even though every current caller passes hotPathEntry:
+// the entry point is the axis this walker exists to model, and the fences below
+// read as "what is reachable FROM x" precisely because x is named at the call
+// site. Collapsing it to the constant to satisfy unparam would hard-wire the
+// walker to one entry and delete the knob a future second plane (supervisor,
+// admin surface) needs.
+//
+//nolint:unparam // deliberate: see above
 func (g *moduleGraph) reachableFrom(entry string) map[string]struct{} {
 	reached := map[string]struct{}{}
 	queue := []string{entry}

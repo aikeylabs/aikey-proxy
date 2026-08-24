@@ -100,7 +100,7 @@ func TestAdvanceOnSend_CursorMovesOnSendSoRecoveryMustComeFromReconcile(t *testi
 			"skipped on the next drain", skipped, len(batch))
 	}
 
-	t.Logf("characterised: %d upload(s), collector confirmed 0, cursor still advanced "+
+	t.Logf("characterized: %d upload(s), collector confirmed 0, cursor still advanced "+
 		"to %d, so all %d events are skipped by any later drain in this process. "+
 		"This is BY DESIGN — the only way back is auto-reconcile, which is why a "+
 		"blinded collector watermark (D1) turns a transient miss into permanent loss.",
