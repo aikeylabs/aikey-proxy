@@ -25,14 +25,14 @@ type Collector struct {
 	batchSize     int
 	flushInterval time.Duration
 	// dropped counts usage events discarded because the buffer was full.
-	// Mirrors Reporter.dropped so /admin/metrics exposes both discard paths
+	// Mirrors Reporter.dropped so GET /admin/audit/status exposes both discard paths
 	// (queue-full here, no-route in the reporter) — billing loss must be
 	// externally observable, never log-only (health-signal-surface).
 	dropped atomic.Int64
 }
 
 // CollectorMetrics holds observable collector counters. Surfaced via
-// /admin/metrics alongside ReporterMetrics so an operator can see usage events
+// GET /admin/audit/status alongside ReporterMetrics so an operator can see usage events
 // lost to backpressure without scraping logs.
 type CollectorMetrics struct {
 	Dropped int64 `json:"usage_events_dropped_total"`

@@ -64,6 +64,31 @@ const (
 	railOK
 	railStale
 	railOffline
+	// railNeedsReauth is a REFUSED state: the control plane did not fail, it
+	// said no. Retrying every cycle cannot change that answer, so the rail backs
+	// off to an hourly re-probe.
+	//
+	// 🔴 The name is now WIDER than "re-auth" and deliberately not renamed yet:
+	// it is already a wire value in /status (control_plane_sync.<rail>.state),
+	// so renaming is a contract change. Read it as "refused", not as "the user
+	// must log in" — on the route where this actually fires today, logging in
+	// changes nothing (control-master router.go:869 registers
+	// GET /v1/fallback-policy with no auth middleware while the handler reads
+	// JWT claims, so the refusal is constant and credential-independent).
+	//
+	// 🔴 WHY THIS STATE EXISTS (2026-08-22). Live finding on a developer
+	// machine: GET <control>/v1/fallback-policy answered
+	// 403 {"error":"BIZ_AUTH_TOKEN_REVOKED"} and this rail retried it every
+	// cycle for FORTY-EIGHT DAYS — 180 consecutive failures at the moment it
+	// was noticed. (⚠️ 2026-08-22 correction: the 466 MB log on that machine was NOT this rail. observe() rate-limits to one line per 60 failures, which cannot reach that size; the bulk was a per-second "authentication failed: missing virtual key" from a leaked test proxy. The rail's defect — retrying a deterministic refusal forever — is real and unchanged; only the log-size attribution was wrong.)
+	// The
+	// machine kept serving traffic the whole time (rails never gate serving,
+	// by design and correctly), so nothing else showed a symptom.
+	//
+	// The bug was treating a DETERMINISTIC REFUSAL as a transient outage. The
+	// existing states all mean "the control plane is unreachable-ish, keep
+	// trying"; there was no way to say "it answered, and the answer is no".
+	railNeedsReauth
 )
 
 func (s railState) String() string {
@@ -74,6 +99,8 @@ func (s railState) String() string {
 		return "stale"
 	case railOffline:
 		return "offline"
+	case railNeedsReauth:
+		return "needs_reauth"
 	default:
 		return "init"
 	}
@@ -121,6 +148,10 @@ type RailSyncStatus struct {
 // only by the rail's own goroutine; read by the /status snapshot).
 type railRunner struct {
 	spec railSpec
+
+	// terminalSkips counts cycles skipped since the last re-probe of a refused
+	// rail. See terminalReprobeEveryCycles for why a refusal is not final.
+	terminalSkips int
 
 	mu            sync.Mutex
 	state         railState
@@ -291,7 +322,61 @@ var (
 	errRailNoControlURL = errors.New("control panel URL not configured")
 )
 
+// errRailCredentialRevoked marks a sync failure the control plane will give the
+// SAME answer to forever. Rails wrap their terminal refusals in it (see
+// syncFallbackPolicy); everything else stays retryable.
+//
+// 🔴 Only genuinely terminal conditions belong here. A 401 is NOT one — a
+// bearer can expire and be refreshed on the next cycle, which is exactly what
+// teamCred does. A 5xx is not one either. Revocation is, because it is a
+// decision the control plane recorded, not a state it is recovering from.
+var errRailCredentialRevoked = errors.New("team credential revoked by the control plane")
+
+// terminalReprobeEveryCycles re-asks a refused rail about once an hour (60 × the
+// 60s cycle). Not "never again", and the difference is the whole point.
+//
+// 🔴 WHY IT MUST RE-PROBE (2026-08-22, found while writing the E2E for this very
+// fix). The control plane's 403 does NOT mean what its error code says.
+// handler_fallback_policy.go:155 answers BIZ_AUTH_TOKEN_REVOKED for EVERY org
+// resolution failure — no credential, bad credential, expired credential, and
+// `err != nil`, which includes a transient database error. So a one-second
+// blip is indistinguishable, on the wire, from a permanent revocation.
+//
+// Stopping forever on that signal would convert a blip into a rail that never
+// recovers until someone re-logs in — and re-logging in does not fix a database
+// blip. Re-probing hourly keeps the log quiet (the harm being bounded: repeated
+// identical lines) while letting a wrongly-classified failure heal itself.
+//
+// Revisit when the control plane can distinguish the four cases; then, and only
+// then, a true terminal state may stop for good.
+const terminalReprobeEveryCycles = 60
+
+// isTerminal reports whether this rail is in its refused state AND is not due
+// for its periodic re-probe.
+func (r *railRunner) isTerminal() bool {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.state != railNeedsReauth {
+		return false
+	}
+	r.terminalSkips++
+	if r.terminalSkips >= terminalReprobeEveryCycles {
+		r.terminalSkips = 0
+		return false // let this cycle through: the refusal may have been transient
+	}
+	return true
+}
+
 func (r *railRunner) cycle(s *Supervisor) railCycleResult {
+	// 🔴 STOP POLLING once refused. Before this check the rail re-asked a
+	// question it already had a permanent answer to, once per cycle, forever
+	// (48 days of identical log lines on the machine where this was
+	// found). Recovery is `aikey login`, which mints a fresh credential and
+	// reloads the supervisor — rebuilding these runners, so this state does not
+	// need its own reset path.
+	if r.isTerminal() {
+		return railCycleResult{}
+	}
 	gen := s.active.Load()
 	if gen == nil || gen.vault == nil {
 		// Local not-ready (mid-reload window / early start): neither success nor
@@ -347,6 +432,7 @@ func (r *railRunner) observe(err error) bool {
 			outageSecs = now - r.failedSince
 		}
 		r.state, r.failures, r.lastError, r.failedSince = railOK, 0, "", 0
+		r.terminalSkips = 0
 		r.lastSuccessAt = now
 		if prev == railStale || prev == railOffline {
 			slog.Info("control-plane sync rail recovered",
@@ -359,6 +445,29 @@ func (r *railRunner) observe(err error) bool {
 	r.lastError = err.Error()
 	if r.failedSince == 0 {
 		r.failedSince = now
+	}
+	if errors.Is(err, errRailCredentialRevoked) {
+		// ERROR, not WARN, and said ONCE: a terminal refusal is not a blip that
+		// deserves an hourly reminder — it is a thing an operator must act on.
+		// The state is what carries it from here on (/status → CLI → panel).
+		if r.state != railNeedsReauth {
+			r.state = railNeedsReauth
+			// 🔴 DO NOT tell the operator to run `aikey login` here (2026-08-22).
+			// The control plane's BIZ_AUTH_TOKEN_REVOKED does not mean what it
+			// says on this route: GET /v1/fallback-policy is registered with NO
+			// auth middleware (control-master router.go:869) while its handler
+			// resolves the org from JWT claims, so the claims are always empty
+			// and the refusal is CONSTANT — verified live, a forged bearer gets
+			// the identical 403. Re-logging in cannot fix a handler that never
+			// reads the credential; that advice would send every affected
+			// operator down a dead end. State the observation, not a remedy we
+			// cannot stand behind.
+			slog.Error("control-plane sync rail stopped — the control plane refused this machine and will keep refusing; serving built-in defaults. Check the control plane's logs for this route before changing anything locally",
+				"event.name", observability.EventProxySyncRailOffline,
+				"rail", r.spec.name, "consecutive_failures", r.failures, "error", r.lastError)
+			return true
+		}
+		return false
 	}
 	switch {
 	case r.failures == railStaleAfterFailures:

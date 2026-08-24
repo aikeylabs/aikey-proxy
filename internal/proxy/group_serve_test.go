@@ -640,11 +640,20 @@ func TestGroupServe_CooldownOn401(t *testing.T) {
 	if !p.poolCooldown.skipSet()["acc-1"] {
 		t.Fatal("a 401 upstream must cool the account down")
 	}
+	if tr.calls != 1 {
+		t.Fatalf("first request must reach upstream exactly once, calls=%d", tr.calls)
+	}
 
 	// Second request: the only candidate is cooling down → no usable account.
+	// Cooling must be enforced BEFORE dialing: the closure criterion is not just
+	// "the client gets 429" but "the throttled upstream sees zero traffic" —
+	// otherwise we keep feeding a provider that is already rate-limiting us.
 	tr.status = 0
 	req2, w2 := groupReq(groupBody)
 	p.Handle(w2, req2)
+	if tr.calls != 1 {
+		t.Fatalf("cooling account must not be dialed again, calls=%d want 1", tr.calls)
+	}
 	// ALL_UNUSABLE = a genuine rate-limit (recovers when the window resets) → 429,
 	// not 503: honest code, and it's the client's call whether to back off + retry.
 	if w2.Code != http.StatusTooManyRequests || !strings.Contains(w2.Body.String(), "GROUP_ALL_UNUSABLE") {

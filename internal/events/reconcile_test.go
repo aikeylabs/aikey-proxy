@@ -115,13 +115,10 @@ func TestReconcileGaps_ResendAndConfirmLost(t *testing.T) {
 // TestAuditStatus_LocalState confirms AuditStatus surfaces the local-only signals.
 func TestAuditStatus_LocalState(t *testing.T) {
 	dir := t.TempDir()
-	sa, err := NewSeqAllocator(dir+"/seq.state", DefaultSeqBlockSize)
-	if err != nil {
-		t.Fatal(err)
-	}
+	sa := NewLaneAllocator(dir, DefaultSeqBlockSize)
 	defer sa.Close()
 	for i := 0; i < 4; i++ {
-		_, _ = sa.Next()
+		_, _ = sa.Next("o")
 	}
 	r, err := NewReporter(&ReporterConfig{
 		WALDir:   dir,

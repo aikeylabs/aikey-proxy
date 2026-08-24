@@ -599,8 +599,12 @@ func (p *Proxy) reportUsage(route *vkeys.ResolvedRoute, bearerToken, model strin
 	// the reserve-ahead invariant guarantees the failed seq is never reused.
 	var sourceID string
 	var sourceSeq *int64
-	if p.seqAlloc != nil && p.sourceID != "" && route != nil && route.OrgID != "__canary__" {
-		if seq, err := p.seqAlloc.Next(); err != nil {
+	if p.seqAlloc != nil && p.sourceID != "" && route != nil && route.OrgID != events.CanaryOrgSentinel {
+		// Lane = the event's org, which is what the SERVER keys its watermark
+		// on. Allocating on any other key (route_source was the obvious
+		// candidate) hands this event a number from a stream the server will
+		// account against a different row — the 2026-08-20 defect.
+		if seq, err := p.seqAlloc.Next(events.LaneOfOrg(route.OrgID)); err != nil {
 			slog.Warn("reportUsage: seq alloc failed, emitting v1 event",
 				"event.name", "usage.seqalloc.next_failed", "error", err)
 		} else {

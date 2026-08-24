@@ -236,7 +236,7 @@ type Proxy struct {
 	// projection.
 	appHealthCache *apppipe.HealthCache
 	collector      *events.Collector
-	seqAlloc       *events.SeqAllocator
+	seqAlloc       *events.LaneAllocator
 	providers      *provider.Registry
 	registry       *vkeys.Registry
 	// observerRegistry holds the Phase 4 M2 plugin observer fan-out.
@@ -965,7 +965,7 @@ func (p *Proxy) SetWAL(w *events.WALWriter) {
 // generation by the supervisor. When seqAlloc is nil (e.g. WAL init failed),
 // reportUsage falls back to emitting v1-shaped events (no source_seq), which
 // are still stored locally but excluded from server-side gap detection.
-func (p *Proxy) SetDeliveryIntegrity(sourceID string, seqAlloc *events.SeqAllocator) {
+func (p *Proxy) SetDeliveryIntegrity(sourceID string, seqAlloc *events.LaneAllocator) {
 	p.sourceID = sourceID
 	p.seqAlloc = seqAlloc
 }

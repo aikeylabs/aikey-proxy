@@ -248,6 +248,31 @@ func (s *Supervisor) syncFallbackPolicy(ctx context.Context, _ *generation, mast
 		return nil
 	case http.StatusOK:
 		// fall through
+	case http.StatusForbidden:
+		// 🔴 A 403 alone is NOT proof of revocation — the BODY must say so.
+		//
+		// Two different services on this path answer 403 for reasons that have
+		// nothing to do with credentials:
+		//   · aikey-trial-server/internal/serve/middleware.go:40 returns a plain
+		//     text 403 "Host not allowed" for any non-loopback Host, which a seat
+		//     pointed at a LAN Trial console hits every cycle;
+		//   · the master's own handler answers BIZ_AUTH_TOKEN_REVOKED for EVERY
+		//     org-resolution failure (handler_fallback_policy.go:155), including
+		//     a transient DB error.
+		// Treating either as "your credential was revoked" tells the operator to
+		// run `aikey login`, which fixes neither. So the terminal mark requires
+		// the control plane to NAME the condition; anything else stays retryable.
+		body, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
+		var domainErr struct {
+			Error string `json:"error"`
+		}
+		_ = json.Unmarshal(body, &domainErr)
+		if domainErr.Error == "BIZ_AUTH_TOKEN_REVOKED" {
+			return fmt.Errorf("fallback policy: control plane refused this machine's credential (status %d, %s): %w",
+				resp.StatusCode, domainErr.Error, errRailCredentialRevoked)
+		}
+		return fmt.Errorf("fallback policy: forbidden (status %d, error=%q) — not a credential revocation, will keep retrying",
+			resp.StatusCode, domainErr.Error)
 	default:
 		return fmt.Errorf("fallback policy: unexpected status %d", resp.StatusCode)
 	}
