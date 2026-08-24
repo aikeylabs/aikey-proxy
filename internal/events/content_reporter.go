@@ -356,16 +356,16 @@ func (r *ContentReporter) doUpload(parent context.Context, body []byte) (*conten
 	// CollectorToken (cluster worker nodes — no team credential, authenticate
 	// the collector with the cluster service token). Either may be empty for a
 	// network-trust deployment, in which case no Authorization header is sent.
-	if r.cfg.Credential != nil {
-		tok, berr := r.cfg.Credential.Bearer(ctx)
-		if berr != nil {
-			return nil, http.StatusUnauthorized, fmt.Errorf("credential bearer: %w", berr)
-		}
-		if tok != "" {
-			httpReq.Header.Set("Authorization", "Bearer "+tok)
-		}
-	} else if r.cfg.CollectorToken != "" {
-		httpReq.Header.Set("Authorization", "Bearer "+r.cfg.CollectorToken)
+	// One decision point for the whole package — see authorize(). This block used
+	// to be the ONLY correct copy of it; the reconcile path had a second, empty
+	// one that answered 401 forever. Resolve which credential, then let the
+	// shared helper attach it.
+	cred := r.cfg.Credential
+	if cred == nil && r.cfg.CollectorToken != "" {
+		cred = &StaticTokenCredential{Token: r.cfg.CollectorToken}
+	}
+	if aerr := authorize(ctx, httpReq, cred); aerr != nil {
+		return nil, http.StatusUnauthorized, aerr
 	}
 	httpResp, err := r.client.Get().Do(httpReq)
 	if err != nil {

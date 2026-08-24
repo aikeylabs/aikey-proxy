@@ -597,6 +597,7 @@ func (p *Proxy) serveGroupAttempt(
 		rc.OauthGroupID, res.CredentialID, res.AccountID, route.SeatID,
 		observability.ExtractOrCreate(r).TraceID,
 		map[string]any{"failed_status": fw.status, "attempt": attempt + 1})
+
 	return groupAttemptResult{attempted: true, authFailedAccount: authFailedAccount(hardRevoked, res.AccountID)}
 }
 

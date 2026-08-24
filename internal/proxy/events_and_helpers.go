@@ -880,3 +880,4 @@ func stashExtractedFields(r *http.Request, model, promptCacheKey string) {
 		r.Header.Set("x-aikey-kimi-session", promptCacheKey)
 	}
 }
+

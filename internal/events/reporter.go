@@ -1074,7 +1074,7 @@ func (r *Reporter) uploadGroupTo(ctx context.Context, collectorURL string, cred 
 	// administrative call) and the obligation stays pending, so the next batch
 	// retries it. The endpoint is idempotent, so retrying is free.
 	if batchLane != "" {
-		r.declareStreamSwitch(ctx, collectorURL, batchLane)
+		r.declareStreamSwitch(ctx, collectorURL, batchLane, cred)
 	}
 
 	body, err := json.Marshal(req)
@@ -1333,7 +1333,11 @@ func (r *Reporter) doUpload(ctx context.Context, url string, body []byte, cred C
 // Reuses httpPostJSON, the same helper ReconcileGaps uses for the diagnostics
 // surface, rather than a second HTTP path: one place to get timeouts, the
 // shared client and error shaping right.
-func (r *Reporter) declareStreamSwitch(ctx context.Context, collectorURL, lane string) {
+// 🔴 cred is threaded in rather than resolved here (2026-08-24): this call is
+// made from inside uploadGroupTo, which ALREADY holds the credential for this
+// destination. Re-deriving it would be a second decision point — the exact
+// shape that let the reconcile path ship with no Authorization at all.
+func (r *Reporter) declareStreamSwitch(ctx context.Context, collectorURL, lane string, cred Credential) {
 	if r.cfg.SeqAlloc == nil {
 		return
 	}
@@ -1353,7 +1357,7 @@ func (r *Reporter) declareStreamSwitch(ctx context.Context, collectorURL, lane s
 		"source_id": r.cfg.SourceID,
 		"floor_seq": floor,
 	}
-	if err := r.httpPostJSON(ctx, strings.TrimRight(collectorURL, "/")+"/v1/diagnostics/stream-switch", body, nil); err != nil {
+	if err := r.httpPostJSON(ctx, strings.TrimRight(collectorURL, "/")+"/v1/diagnostics/stream-switch", cred, body, nil); err != nil {
 		// Loud: an undeclared floor becomes ledgered "loss" on the next
 		// reconcile pass, so this must not fail quietly. The obligation stays
 		// pending and the next batch retries it (the endpoint is idempotent).

@@ -189,28 +189,50 @@ func (r *Reporter) ReconcileGaps(ctx context.Context) (ReconcileResult, error) {
 // and were wired into the upload path and the dead-letter replay path, but not
 // into this one — collectorBase() has not been touched since it was written on
 // 2026-06-01, when one destination was the only possibility.
-func (r *Reporter) reconcileDestinations() []string {
+// reconcileTarget is one collector to reconcile against, WITH the route source
+// it came from.
+//
+// 🔴 The route source used to be dropped here (2026-08-24). This function
+// returned bare URLs, so reconcileAgainst had no way to pick the credential for
+// the destination it was talking to — and ended up sending none at all, which
+// answered 401 forever on any authenticated deployment. Carrying the identity
+// alongside the URL is what makes authorizing possible; losing it is what made
+// the reconcile read a no-op.
+type reconcileTarget struct {
+	routeSource string
+	url         string
+}
+
+func (r *Reporter) reconcileDestinations() []reconcileTarget {
 	seen := make(map[string]bool, 3)
-	var out []string
-	add := func(u string) {
+	var out []reconcileTarget
+	add := func(routeSource, u string) {
 		u = strings.TrimRight(strings.TrimSpace(u), "/")
 		if u == "" || seen[u] {
 			return
 		}
 		seen[u] = true
-		out = append(out, u)
+		out = append(out, reconcileTarget{routeSource: routeSource, url: u})
 	}
-	for _, u := range r.cfg.CollectorRoutes {
-		add(u)
+	for src, u := range r.cfg.CollectorRoutes {
+		add(src, u)
 	}
 	// Legacy single sink: also the fallback destination for any route source
 	// with no entry of its own (see urlForRouteSource), so it can hold events.
-	add(r.cfg.CollectorURL)
+	// Legacy single sink has no route source of its own; credentialForRouteSource
+	// falls back to the static CollectorToken for the empty key, which is the
+	// pre-existing behavior.
+	add("", r.cfg.CollectorURL)
 	return out
 }
 
 // reconcileAgainst runs one full reconcile pass against a single collector.
-func (r *Reporter) reconcileAgainst(ctx context.Context, base string) (ReconcileResult, error) {
+func (r *Reporter) reconcileAgainst(ctx context.Context, target reconcileTarget) (ReconcileResult, error) {
+	base := target.url
+	// One credential for the whole pass: the same one the UPLOAD to this
+	// destination uses, so a reconcile can never be authorized differently from
+	// the write it is reconciling.
+	cred := r.credentialForRouteSource(target.routeSource)
 	var res ReconcileResult
 
 	// Discover the (org, source) pairs for THIS source via completeness, then ask
@@ -225,7 +247,7 @@ func (r *Reporter) reconcileAgainst(ctx context.Context, base string) (Reconcile
 			SourceID string `json:"source_id"`
 		} `json:"sources"`
 	}
-	if err := r.httpGetJSON(ctx, base+"/v1/diagnostics/completeness", &comp); err != nil {
+	if err := r.httpGetJSON(ctx, base+"/v1/diagnostics/completeness", cred, &comp); err != nil {
 		return res, err
 	}
 
@@ -245,7 +267,7 @@ func (r *Reporter) reconcileAgainst(ctx context.Context, base string) (Reconcile
 			}
 			gapsURL := fmt.Sprintf("%s/v1/diagnostics/gaps?org_id=%s&source_id=%s",
 				base, url.QueryEscape(s.OrgID), url.QueryEscape(s.SourceID))
-			if err := r.httpGetJSON(ctx, gapsURL, &gaps); err != nil {
+			if err := r.httpGetJSON(ctx, gapsURL, cred, &gaps); err != nil {
 				return res, err
 			}
 			if len(gaps.MissingSeqs) == 0 {
@@ -338,7 +360,7 @@ func (r *Reporter) reconcileAgainst(ctx context.Context, base string) (Reconcile
 					Promoted int `json:"promoted"`
 				}
 				body := map[string]any{"org_id": s.OrgID, "source_id": s.SourceID, "seqs": notInWAL}
-				if err := r.httpPostJSON(ctx, base+"/v1/diagnostics/confirm-lost", body, &cl); err != nil {
+				if err := r.httpPostJSON(ctx, base+"/v1/diagnostics/confirm-lost", cred, body, &cl); err != nil {
 					return res, err
 				}
 				res.ConfirmedLost += cl.Promoted
@@ -352,7 +374,7 @@ func (r *Reporter) reconcileAgainst(ctx context.Context, base string) (Reconcile
 					Promoted int `json:"promoted"`
 				}
 				body := map[string]any{"org_id": s.OrgID, "source_id": s.SourceID, "seqs": gaveUp}
-				if err := r.httpPostJSON(ctx, base+"/v1/diagnostics/confirm-lost", body, &cl); err != nil {
+				if err := r.httpPostJSON(ctx, base+"/v1/diagnostics/confirm-lost", cred, body, &cl); err != nil {
 					return res, err
 				}
 				res.ConfirmedLost += cl.Promoted
@@ -554,10 +576,13 @@ func (r *Reporter) resendWALSeqs(source string, seqs []int64) []int64 {
 	return sent
 }
 
-func (r *Reporter) httpGetJSON(ctx context.Context, u string, out any) error {
+func (r *Reporter) httpGetJSON(ctx context.Context, u string, cred Credential, out any) error {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u, http.NoBody)
 	if err != nil {
 		return err
+	}
+	if aerr := authorize(ctx, req, cred); aerr != nil {
+		return aerr
 	}
 	resp, err := r.client.Get().Do(req)
 	if err != nil {
@@ -570,7 +595,7 @@ func (r *Reporter) httpGetJSON(ctx context.Context, u string, out any) error {
 	return json.NewDecoder(resp.Body).Decode(out)
 }
 
-func (r *Reporter) httpPostJSON(ctx context.Context, u string, body, out any) error {
+func (r *Reporter) httpPostJSON(ctx context.Context, u string, cred Credential, body, out any) error {
 	b, err := json.Marshal(body)
 	if err != nil {
 		return err
@@ -580,6 +605,9 @@ func (r *Reporter) httpPostJSON(ctx context.Context, u string, body, out any) er
 		return err
 	}
 	req.Header.Set("Content-Type", "application/json")
+	if aerr := authorize(ctx, req, cred); aerr != nil {
+		return aerr
+	}
 	resp, err := r.client.Get().Do(req)
 	if err != nil {
 		return err
