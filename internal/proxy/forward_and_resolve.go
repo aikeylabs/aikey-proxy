@@ -506,6 +506,18 @@ func (p *Proxy) serveRoute(w http.ResponseWriter, r *http.Request, route *vkeys.
 		return
 	}
 
+	// 6e. Test-only dial redirect (gated to loopback / .test by
+	// testOnlyBaseURLAllowed). Deliberately AFTER 6d: model mapping selects a
+	// provider's map from route.BaseURL, so redirecting before this point would
+	// make the map unselectable and any test built on it would assert on a
+	// mapping that never ran. Inert unless the env var is set.
+	if override, ok := testDialOverrideBaseURL(route.BaseURL); ok {
+		logger.Debug("test dial override applied",
+			"event.name", "proxy.route.test_dial_override",
+			"declared_base_url", route.BaseURL, "dialled_base_url", override)
+		route.BaseURL = override
+	}
+
 	// 7. Store metadata in context for post-processing.
 	// For streaming requests, bridge the HTTP/1.1 close-notifier to a context
 	// so the streamDrainer can abort the upstream call when the client
