@@ -71,7 +71,7 @@ AIKEY_REQUIRE_NO_TEST_SKIPS ?= $(if $(ACD_PRESENT),1,0)
 # would skip them.
 PROXY_TEST_PKGS := ./internal/... ./cmd/aikey-proxy/
 
-.PHONY: build test test-bugfix-provider-routing test-bugfix-apphook-write-deadline test-pathprefix-matrix run install uninstall restart clean lint lint-full cross-compile sync-fingerprint sync-provider-registry sync-provider-data chaos-gap7 chaos-gap8 chaos filter-integration detector-sibling-build detector-sibling-absent-notice
+.PHONY: build test test-bugfix-custom-provider-axes test-bugfix-provider-routing test-bugfix-apphook-write-deadline test-pathprefix-matrix run install uninstall restart clean lint lint-full cross-compile sync-fingerprint sync-provider-registry sync-provider-data chaos-gap7 chaos-gap8 chaos filter-integration detector-sibling-build detector-sibling-absent-notice
 
 # v4.3 (2026-05-01): aikey-cli/data/provider_fingerprint.yaml is the single
 # source of truth for provider routing. The pkg/providerroutes Go package
@@ -138,6 +138,19 @@ detector-sibling-absent-notice:
 # Provider/Protocol consumer regressions. This target is the canonical entry
 # referenced by both bugfix records; keep new routing lanes in this matrix so
 # a release does not depend on remembering a list of ad-hoc go test commands.
+# Regression fence for the 2026-08-25 custom third-party provider defect: a
+# provider code typed by an administrator in the console (Provider Accounts →
+# custom provider) could be created and shown as a live channel, then answer 502
+# on its first request. master and the Rust CLI allow such a provider on
+# purpose; only the proxy failed closed. Fixed in-place in ProtocolFamily
+# (2449baa) — this target also pins the two places that must NOT inherit that
+# relaxation: the client-route axis, and the probe path's address stitch.
+# Evidence: ../workflow/CI/bugfix/2026-08-25-custom-provider-protocolfamily-failclosed-502.md
+test-bugfix-custom-provider-axes: ## regression: custom provider must route + probe, client route stays strict (20260825)
+	go test -v -count=1 ./internal/provider/ -run 'Test(ProtocolFamilyCustomProviderTrustsExplicitVocabularyHint|ClientRouteSupportsProtocol|CredentialAndClientRouteDisagreeOnACustomProvider)'
+	go test -v -count=1 ./internal/proxy/ -run 'Test(NormalizeBindingForClientRouteKeepsIndependentAxes|CustomThirdPartyProvider)'
+	go test -v -count=1 ./internal/admin/ -run 'TestProbeKey_(CustomThirdPartyProviderIsProbeable|CustomProviderRejectsInventedProtocolAndMissingAddress|UsesProviderRouteStitchForEveryVersionShape)'
+
 test-bugfix-provider-routing: ## regression: OAuth Stitch + App/Probe axes + health URL + vault projection
 	go test -v -count=1 ./internal/provider/ -run 'TestProtocolFamily'
 	go test -v -count=1 ./internal/vault/ -run 'TestGetAliasCredential_(OAuthByDisplayIdentity|PreProtocolColumnOAuthRemainsReadable)'

@@ -98,6 +98,40 @@ func CanonicalProtocol(protocol string) string {
 // credentials whose protocol_type predates the two-axis model and is therefore
 // EMPTY. A non-empty hint the table just refused is never "corrected" to the
 // provider's own protocol — see the gate below.
+// ClientRouteSupportsProtocol answers "does this CLIENT-FACING route carry this
+// wire protocol", which is a different question from ProtocolFamily's "what
+// protocol does this credential speak" — and it must be answered by the routing
+// TABLE alone.
+//
+// # Why this cannot reuse ProtocolFamily (2026-08-25)
+//
+// ProtocolFamily trusts an explicitly declared protocol for a provider the table
+// has zero rows for, because such a provider is a console-registered custom one
+// and its declaration is the only truth there is. That is right for a
+// CREDENTIAL. It is wrong here: a client route the table does not know would
+// then confirm whatever protocol it was handed, so the check returns true for
+// every input and stops rejecting anything — the axes split it exists to
+// protect would be gone while still looking like it was being enforced.
+//
+// A route with no rows therefore cannot confirm anything, and says so.
+//
+// 需求规格 §11: workflow/CI/requirements/2026-07-18-provider-protocol-compatibility-and-baseurl.md
+// Fence: TestClientRouteSupportsProtocol + the "custom client route may not
+// confirm its own protocol" case in TestNormalizeBindingForClientRouteKeepsIndependentAxes.
+func ClientRouteSupportsProtocol(clientRoute, protocol string) bool {
+	route := CanonicalCode(clientRoute)
+	want := CanonicalProtocol(protocol)
+	if route == "" || want == "" {
+		return false
+	}
+	for _, p := range Routes().ProtocolsForProvider(route) {
+		if strings.EqualFold(CanonicalProtocol(p), want) {
+			return true
+		}
+	}
+	return false
+}
+
 func ProtocolFamily(providerCode, protocolHint string) (string, bool) {
 	providerCode = CanonicalCode(providerCode)
 	protocolHint = CanonicalProtocol(protocolHint)
