@@ -53,6 +53,14 @@ func normalizeBindingForClientRoute(binding *vault.ProviderBinding, requestedCli
 		if protocolHint == "" {
 			return nil, fmt.Errorf("provider %q requires an explicit protocol_type", resolved.ProviderCode)
 		}
+		// Distinguish the two remaining fail-closed shapes so the error points at
+		// what the operator can actually change (2026-08-25): a KNOWN provider
+		// carrying a protocol the matrix declares illegal for it, vs a CUSTOM
+		// provider (zero matrix rows) whose declared protocol is not a protocol
+		// this build recognizes at all.
+		if len(provider.Routes().ProtocolsForProvider(provider.CanonicalCode(resolved.ProviderCode))) == 0 {
+			return nil, fmt.Errorf("custom provider %q declares unrecognized protocol_type %q; register the credential with a supported protocol (e.g. openai_compatible, anthropic)", resolved.ProviderCode, resolved.ProtocolType)
+		}
 		return nil, fmt.Errorf("provider %q does not support protocol_type %q", resolved.ProviderCode, resolved.ProtocolType)
 	}
 	resolved.ProtocolType = protocolType

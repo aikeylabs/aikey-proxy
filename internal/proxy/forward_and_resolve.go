@@ -415,6 +415,27 @@ func (p *Proxy) serveRoute(w http.ResponseWriter, r *http.Request, route *vkeys.
 	if route != nil {
 		route.ProviderCode = truthfulProviderCode(route.BaseURL, route.ProviderCode)
 	}
+	// Empty-base guard (2026-08-25, bugfix
+	// 2026-08-25-empty-upstream-base-url-unhelpful-error; requirements
+	// 2026-07-18 §自定义第三方供应商 rule 4). An empty BaseURL can never be
+	// served on the key-injection path: Stitch("") yields a host-less target and
+	// the transport answers with a generic UPSTREAM_ERROR ("Failed to connect")
+	// that reads as a network failure — while the actual defect is CONFIGURATION
+	// (typically a custom provider whose credential carries no Base URL and
+	// whose provider row has no default; official providers always resolve a
+	// table default upstream of here). Fail here, at the single funnel every
+	// real route passes through, and name the fix. OAuth lanes are exempt: their
+	// base comes from resolveOAuthUpstream inside the Director, not route.BaseURL.
+	if route != nil && route.BaseURL == "" && realKey != oauthSentinelKey {
+		p.errors.Add(1)
+		writeJSONError(w, http.StatusBadGateway, "server_error",
+			observability.ErrCodeUpstreamBaseURLMissing,
+			"No upstream base URL is configured for provider \""+route.ProviderCode+"\". "+
+				"A custom provider has no built-in endpoint: set the credential's Base URL in the console "+
+				"(Provider Accounts → the credential) and re-run `aikey key sync`, or for a personal key "+
+				"re-add it with `aikey add <alias> --base-url <URL>`.")
+		return
+	}
 	currentOverride := p.oauthEgressOverride.Load()
 	pathDecision := providerPathDecision{overrideOn: currentOverride}
 	if route != nil && route.OauthGroupID != "" {

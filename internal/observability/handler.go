@@ -389,6 +389,13 @@ const (
 	ErrCodeTokenInvalid                   = "TOKEN_INVALID"
 	ErrCodePolicyModelForbidden           = "POLICY_MODEL_FORBIDDEN"
 	ErrCodeSecretNotConfigured            = "SECRET_NOT_CONFIGURED"
+	// ErrCodeUpstreamBaseURLMissing (2026-08-25, bugfix
+	// 2026-08-25-empty-upstream-base-url-unhelpful-error): the resolved route
+	// carries no upstream base URL — a configuration gap (custom provider with
+	// neither a credential Base URL nor a provider default), NOT a network
+	// failure. Kept distinct from UPSTREAM_ERROR so the error names the fix
+	// instead of sending the operator to debug connectivity.
+	ErrCodeUpstreamBaseURLMissing         = "UPSTREAM_BASE_URL_MISSING"
 	ErrCodeUpstreamError                  = "UPSTREAM_ERROR"
 	ErrCodeProviderError                  = "PROVIDER_ERROR"
 	ErrCodeUsageExtractionFailed          = "USAGE_EXTRACTION_FAILED"

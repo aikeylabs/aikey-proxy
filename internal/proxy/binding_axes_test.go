@@ -52,6 +52,54 @@ func TestNormalizeBindingForClientRouteKeepsIndependentAxes(t *testing.T) {
 			client:    "anthropic",
 			wantError: true,
 		},
+		// Custom third-party providers (bugfix
+		// 2026-08-25-custom-provider-protocolfamily-failclosed-502): a
+		// console-registered provider_code with zero fingerprint-matrix rows must
+		// resolve through its explicitly declared protocol — this is the exact
+		// binding a `key sync` + auto-assign lands for the console's 第三方供应商
+		// mode, and it used to 502 on the member's first request. The two error
+		// rows pin the fail-closed edges the fix must NOT loosen.
+		{
+			name:       "custom provider behind openai client route",
+			binding:    vault.ProviderBinding{ProviderCode: "customtest", ProtocolType: "openai_compatible"},
+			client:     "openai",
+			wantClient: "openai", wantVendor: "customtest", wantProto: "openai_compatible",
+		},
+		{
+			name:       "custom provider behind anthropic client route",
+			binding:    vault.ProviderBinding{ProviderCode: "customrelay", ProtocolType: "anthropic"},
+			client:     "anthropic",
+			wantClient: "anthropic", wantVendor: "customrelay", wantProto: "anthropic",
+		},
+		{
+			name:      "custom provider without protocol fails closed",
+			binding:   vault.ProviderBinding{ProviderCode: "customtest"},
+			client:    "openai",
+			wantError: true,
+		},
+		{
+			name:      "custom provider with unrecognized protocol fails closed",
+			binding:   vault.ProviderBinding{ProviderCode: "customtest", ProtocolType: "not-a-protocol"},
+			client:    "openai",
+			wantError: true,
+		},
+		{
+			name:      "custom provider protocol must still match the client route",
+			binding:   vault.ProviderBinding{ProviderCode: "customtest", ProtocolType: "anthropic"},
+			client:    "openai",
+			wantError: true,
+		},
+		// bugfix 2026-08-25-protocolfamily-swallows-wrong-nonempty-hint: before
+		// the gate, this binding was silently "corrected" to anthropic and SERVED
+		// (the client route matches the provider's own protocol, so the route
+		// cross-check never caught it). The declared dialect and the spoken
+		// dialect must never differ silently.
+		{
+			name:      "known provider with explicitly wrong protocol fails closed",
+			binding:   vault.ProviderBinding{ProviderCode: "anthropic", ProtocolType: "openai_compatible"},
+			client:    "anthropic",
+			wantError: true,
+		},
 	}
 
 	for _, tt := range tests {

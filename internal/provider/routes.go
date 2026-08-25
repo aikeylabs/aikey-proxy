@@ -94,8 +94,10 @@ func CanonicalProtocol(protocol string) string {
 // when protocolHint is missing or invalid; silently choosing their first YAML
 // row would make routing depend on row order.
 //
-// The single-protocol fallback keeps legacy credentials (whose protocol_type
-// predates the two-axis model and may therefore be empty) working.
+// The single-protocol and legacy-bare-host fallbacks serve ONLY legacy
+// credentials whose protocol_type predates the two-axis model and is therefore
+// EMPTY. A non-empty hint the table just refused is never "corrected" to the
+// provider's own protocol — see the gate below.
 func ProtocolFamily(providerCode, protocolHint string) (string, bool) {
 	providerCode = CanonicalCode(providerCode)
 	protocolHint = CanonicalProtocol(protocolHint)
@@ -103,6 +105,37 @@ func ProtocolFamily(providerCode, protocolHint string) (string, bool) {
 		return route.Protocol, true
 	}
 	protocols := Routes().ProtocolsForProvider(providerCode)
+	// 2026-08-25 (custom third-party providers — bugfix
+	// 2026-08-25-custom-provider-protocolfamily-failclosed-502): a provider with
+	// ZERO matrix rows is a console-registered custom provider ("第三方供应商",
+	// e.g. an OpenAI-compatible relay or a local Ollama/vLLM). The matrix has no
+	// opinion about it, and master's validateProviderProtocol deliberately waves
+	// it through on exactly that reasoning ("custom — can't validate, allow",
+	// aikey-control-master service/internal/provider/service.go). Failing closed
+	// here made every such credential create+sync fine and then 502 on the
+	// member's first request. Trust the EXPLICITLY declared protocol instead —
+	// but only when it belongs to the table's protocol vocabulary, so a
+	// garbage/typo hint still fails closed rather than reaching the adapter
+	// registry as an unroutable protocol. Known providers are untouched: an
+	// illegal (known provider, protocol) pair still fails right here.
+	if len(protocols) == 0 && protocolHint != "" &&
+		len(Routes().ProvidersForProtocol(protocolHint)) > 0 {
+		return protocolHint, true
+	}
+	// 2026-08-25 (bugfix 2026-08-25-protocolfamily-swallows-wrong-nonempty-hint):
+	// everything below this gate is LEGACY fallback for credentials whose
+	// protocol_type predates the two-axis model and is therefore EMPTY. A
+	// non-empty hint that reaches here was just REFUSED by the table (illegal
+	// pair for a known provider, or vocabulary-unknown protocol for a custom
+	// one). Silently "correcting" it — single-protocol providers via the len==1
+	// branch, multi-protocol providers via the bare-host legacy answer — is the
+	// same silent-misroute class the 2026-07-24 axes split exists to kill: the
+	// binding SAYS one wire dialect and the proxy would speak another. Fail
+	// closed instead; the caller's error names the declared protocol so the
+	// operator fixes the credential, not the symptom.
+	if protocolHint != "" {
+		return "", false
+	}
 	if len(protocols) == 1 {
 		return protocols[0], true
 	}
