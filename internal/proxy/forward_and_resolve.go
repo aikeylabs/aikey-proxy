@@ -514,7 +514,7 @@ func (p *Proxy) serveRoute(w http.ResponseWriter, r *http.Request, route *vkeys.
 	if override, ok := testDialOverrideBaseURL(route.BaseURL); ok {
 		logger.Debug("test dial override applied",
 			"event.name", "proxy.route.test_dial_override",
-			"declared_base_url", route.BaseURL, "dialled_base_url", override)
+			"declared_base_url", route.BaseURL, "dialed_base_url", override)
 		route.BaseURL = override
 	}
 

@@ -44,6 +44,14 @@ import (
 // custom third-party provider: the binding names the custom vendor while the
 // client route stays the protocol's own surface, and the upstream address
 // arrives as a provider_base_urls entry keyed by that custom code.
+// providerCode stays a parameter even though every current case passes
+// "thirdparty_relay": naming it at each call site is what makes the four tests
+// below readable as "a CUSTOM vendor code paired with a standard client route"
+// — the exact pairing this fixture exists to model. Collapsing it to a constant
+// to satisfy unparam would hide the axis under test and delete the knob a
+// second custom vendor case needs.
+//
+//nolint:unparam // deliberate: see above
 func relayVaultFixture(clientRoute, providerCode, protocol, baseURL string) *mockActiveVault {
 	return &mockActiveVault{
 		providerBindings: map[string]*vault.ProviderBinding{

@@ -484,7 +484,7 @@ func providerDefaultBaseURL(providerCode string) string {
 // would assert on a mapping that never ran.
 //
 // This one is therefore applied AFTER mapping and attribution have consumed the
-// real base URL, and only swaps the address actually dialled. It is what lets a
+// real base URL, and only swaps the address actually dialed. It is what lets a
 // hermetic test exercise `provider_model_maps` at all: every base URL that
 // selects a mapped provider is, by construction, a real vendor edge (route rows
 // do not match once a port is present, so a loopback address can never resolve
