@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"log/slog"
 	"strings"
+	"sync/atomic"
 
 	_ "modernc.org/sqlite"
 )
@@ -43,6 +44,46 @@ type Reader struct {
 	db         *sql.DB
 	cache      *cache
 	derivedKey []byte
+	// revokedVKs holds virtual-key ids the control plane has stopped honouring,
+	// as published by the proxy's key_revocation rail. Consulted by the reads that
+	// hand out TEAM key MATERIAL, so a suspension takes effect on the very next
+	// request instead of waiting for the member to run an aikey command.
+	//
+	// 🔴 Deliberately NOT consulted by GetActiveManagedKeys. That read has two
+	// unrelated consumers: route building (which must honour revocation, and does
+	// so explicitly in supervisor.buildManagedRoutes) and the sync rails, which use
+	// it only to derive "which org / which seats does this node serve". Filtering it
+	// here would silently change quota, compliance and group-runtime inputs too —
+	// a side effect well outside what revocation is supposed to mean.
+	//
+	// nil = no filter, i.e. exactly the pre-2026-08-26 behaviour. See
+	// workflow/CI/bugfix/20260826-proxy-revocation-window-unbounded.md.
+	revokedVKs atomic.Pointer[map[string]bool]
+}
+
+// SetRevokedVirtualKeys publishes the current revocation set. Safe to call from
+// another goroutine while requests are in flight (atomic swap, never mutated in
+// place). A nil or empty map clears the filter.
+func (r *Reader) SetRevokedVirtualKeys(m map[string]bool) {
+	copied := make(map[string]bool, len(m))
+	for k, v := range m {
+		if v {
+			copied[k] = true
+		}
+	}
+	r.revokedVKs.Store(&copied)
+}
+
+// IsVirtualKeyRevoked reports whether the control plane has stopped honouring
+// this virtual key. False when no filter has been published.
+func (r *Reader) IsVirtualKeyRevoked(virtualKeyID string) bool {
+	if virtualKeyID == "" {
+		return false
+	}
+	if m := r.revokedVKs.Load(); m != nil {
+		return (*m)[virtualKeyID]
+	}
+	return false
 }
 
 // WithBusyTimeoutDSN appends the busy_timeout pragma to a vault DB path.
@@ -877,6 +918,13 @@ func (r *Reader) GetActiveTeamKeyByProvider(providerCode, protocolType string) (
 		return nil, fmt.Errorf("scan managed key: %w", scanErr)
 	}
 
+	// Control-plane revocation gate — same rule as GetTeamKeyByID, applied to the
+	// row this legacy pre-binding-table path selected. Checked BEFORE decrypting:
+	// a revoked key's material should not be unwrapped at all.
+	if r.IsVirtualKeyRevoked(vkID) {
+		return nil, nil
+	}
+
 	plaintext, err := Decrypt(r.derivedKey, nonce, ciphertext)
 	if err != nil {
 		return nil, fmt.Errorf("decrypt managed key %s: %w", vkID, err)
@@ -922,6 +970,17 @@ func (r *Reader) GetActiveTeamKeyByProvider(providerCode, protocolType string) (
 // falls through to another row. Only callers that provide neither axis get the
 // deterministic legacy primary.
 func (r *Reader) GetTeamKeyByID(virtualKeyID, targetProviderCode, protocolType string) (*ManagedKey, error) {
+	// 🔴 Control-plane revocation gate. This is the read the follow-active path
+	// (`aikey_active_<provider>` → provider binding → team VK) uses to fetch key
+	// MATERIAL, and it is the path a real user is on: the wrapper injects that
+	// sentinel on every launch. Dropping the route from the vkeys registry alone
+	// does NOT cover it — the registry is only consulted for `aikey_team_<vk>`
+	// bearers and for group VKs. Measured live 2026-08-26: with the registry
+	// filter in place and this gate absent, a suspended seat kept getting 200s
+	// indefinitely. Fenced by TestRevokedVirtualKeyIsNotServedByEitherRead.
+	if r.IsVirtualKeyRevoked(virtualKeyID) {
+		return nil, nil
+	}
 	var provCode, protType, baseURL, effectiveAlias string
 	var nonce, ciphertext []byte
 	var providerBaseURLsJSON *string
