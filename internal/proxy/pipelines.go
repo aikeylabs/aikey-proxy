@@ -1583,6 +1583,29 @@ func (p *Proxy) handlePathPrefixRoute(w http.ResponseWriter, r *http.Request, pr
 
 	if realKey == "" {
 		p.errors.Add(1)
+		// 🔴 Name the REAL cause when we know it (2026-08-26). If the active
+		// binding points at a team virtual key the control plane has revoked, the
+		// generic NO_ACTIVE_KEY answer is not merely vague, it is WRONG ADVICE:
+		// it tells the member to run `aikey use <key>`, which cannot succeed —
+		// the key is gone server-side, and no local command brings it back. A
+		// suspended employee would follow that hint, fail, and open a support
+		// ticket about a proxy bug that does not exist.
+		//
+		// 503 was also the wrong shape: it reads as "the proxy is unwell, retry",
+		// so clients retry a decision that will never change. This is a refusal,
+		// so it answers 401.
+		//
+		// See workflow/CI/bugfix/20260826-proxy-revocation-window-unbounded.md.
+		if binding != nil && binding.KeySourceType == "team" &&
+			p.activeReader != nil && p.activeReader.IsVirtualKeyRevoked(binding.KeySourceRef) {
+			logger.Warn("active binding points at a virtual key revoked by the control plane",
+				"event.name", observability.EventProxyKeyRevocationRefused,
+				"provider", providerCode, "virtual_key_id", binding.KeySourceRef)
+			writeJSONError(w, http.StatusUnauthorized, "authentication_error", "SEAT_OR_KEY_REVOKED",
+				"This key is no longer active: your organization administrator has suspended "+
+					"the seat or revoked the key. Ask them to restore it — no local command can.")
+			return
+		}
 		logger.Warn("no active key for provider")
 		writeJSONError(w, http.StatusServiceUnavailable, "server_error", "NO_ACTIVE_KEY",
 			"No active key for '"+providerCode+"'. Run 'aikey use <key>'.")

@@ -83,7 +83,7 @@ func TestBuildManagedRoutes_PreservesBothMockProtocolBindings(t *testing.T) {
 		},
 	}
 
-	routes := buildManagedRoutes(keys)
+	routes := buildManagedRoutes(keys, nil)
 	route := routes["aikey_team_vk-mock-both"]
 	if route == nil {
 		t.Fatal("shared team token was not registered")
