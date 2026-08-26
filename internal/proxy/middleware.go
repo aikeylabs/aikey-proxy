@@ -471,6 +471,44 @@ func providerDefaultBaseURL(providerCode string) string {
 	return route.BaseURL
 }
 
+// testDialOverrideBaseURL returns a loopback / .test address to DIAL INSTEAD of
+// baseURL, for the provider that baseURL resolves to.
+//
+// # Why this is a DIAL-time override and not a resolution-time one
+//
+// The three older hooks (ANTHROPIC / KIMI / CODEX) are read inside
+// providerBaseURLForProtocol, i.e. they replace the base URL *before* anything
+// else looks at it. That is fine for those lanes but useless for model mapping:
+// `applyModelMapping` selects the provider's map FROM route.BaseURL, so a hook
+// that rewrote the base URL first would make the map unselectable and the test
+// would assert on a mapping that never ran.
+//
+// This one is therefore applied AFTER mapping and attribution have consumed the
+// real base URL, and only swaps the address actually dialled. It is what lets a
+// hermetic test exercise `provider_model_maps` at all: every base URL that
+// selects a mapped provider is, by construction, a real vendor edge (route rows
+// do not match once a port is present, so a loopback address can never resolve
+// to one).
+//
+// 🚫 Every value is rejected unless testOnlyBaseURLAllowed accepts it — plain
+// HTTP on loopback or the reserved .test TLD — so a production deployment cannot
+// be diverted by an arbitrary environment value.
+func testDialOverrideBaseURL(baseURL string) (string, bool) {
+	if strings.TrimSpace(baseURL) == "" {
+		return "", false
+	}
+	route, ok := provider.Routes().LookupByBaseURL(baseURL)
+	if !ok {
+		return "", false
+	}
+	name := "AIKEY_PROXY_TEST_" + strings.ToUpper(strings.TrimSpace(route.Provider)) + "_BASE_URL"
+	o := strings.TrimRight(strings.TrimSpace(os.Getenv(name)), "/")
+	if !testOnlyBaseURLAllowed(o) {
+		return "", false
+	}
+	return o, true
+}
+
 func providerBaseURLForProtocol(providerCode, protocolType string) string {
 	canonical := providerCanonicalCode(providerCode)
 	// Test-only hook (gated to loopback / .test): the cross-component
