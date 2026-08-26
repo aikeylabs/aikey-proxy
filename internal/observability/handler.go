@@ -395,7 +395,16 @@ const (
 	// neither a credential Base URL nor a provider default), NOT a network
 	// failure. Kept distinct from UPSTREAM_ERROR so the error names the fix
 	// instead of sending the operator to debug connectivity.
-	ErrCodeUpstreamBaseURLMissing         = "UPSTREAM_BASE_URL_MISSING"
+	ErrCodeUpstreamBaseURLMissing = "UPSTREAM_BASE_URL_MISSING"
+	// ErrCodeUpstreamPrivateViaEgress (2026-08-26, bugfix
+	// 20260826-egress-private-destination-undiagnosable): the credential's base
+	// URL is an intranet-only address, the node has an explicit `upstream_proxy`,
+	// and the destination is not declared in NO_PROXY — so the dial happened at
+	// the FAR END of the tunnel, where that address does not exist. A
+	// configuration gap, NOT a broken credential. Kept distinct from
+	// UPSTREAM_ERROR because the remedy (declare it in NO_PROXY on the node) is
+	// nowhere near "debug connectivity to the provider".
+	ErrCodeUpstreamPrivateViaEgress       = "UPSTREAM_PRIVATE_VIA_EGRESS"
 	ErrCodeUpstreamError                  = "UPSTREAM_ERROR"
 	ErrCodeProviderError                  = "PROVIDER_ERROR"
 	ErrCodeUsageExtractionFailed          = "USAGE_EXTRACTION_FAILED"
