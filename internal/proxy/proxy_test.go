@@ -519,7 +519,7 @@ func TestExtractProviderFromPath(t *testing.T) {
 
 // mockActiveVault implements both VaultGetter and ActiveKeyReader for testing.
 // revokedVKs lets a test exercise the "the control plane revoked this" answer
-// without standing up a vault. Empty = nothing revoked, i.e. the old behaviour.
+// without standing up a vault. Empty = nothing revoked, i.e. the old behavior.
 func (m *mockActiveVault) IsVirtualKeyRevoked(virtualKeyID string) bool {
 	return m.revokedVKs[virtualKeyID]
 }

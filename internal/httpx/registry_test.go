@@ -9,7 +9,7 @@ import (
 // TestSwappableDirect_BypassesEnvProxy is the REGRESSION guard for the whole
 // point of these clients: control-plane clients MUST bypass the env HTTP proxy.
 // Wrapping them in a SwappableClient — and rebuilding them on a network change
-// — must NOT reintroduce env-proxy routing. Asserted behaviourally under a
+// — must NOT reintroduce env-proxy routing. Asserted behaviorally under a
 // hostile env; see direct_test.go assertDirect for why the old structural
 // `Proxy == nil` check was replaced.
 func TestSwappableDirect_BypassesEnvProxy(t *testing.T) {

@@ -118,7 +118,7 @@ const (
 	// (~/.aikey/run/sync-health.json) could not be written/removed — the claude
 	// status bar may show a stale (or miss a fresh) sync warning.
 	// Key-revocation rail (2026-08-26): bounds how long a running proxy keeps
-	// honouring a virtual key the control plane has stopped honouring. See
+	// honoring a virtual key the control plane has stopped honoring. See
 	// supervisor/key_revocation_rail.go and
 	// workflow/CI/bugfix/20260826-proxy-revocation-window-unbounded.md.
 	EventProxyKeyRevocationDropped   = "proxy.key_revocation.route_dropped"

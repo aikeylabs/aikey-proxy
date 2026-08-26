@@ -394,7 +394,7 @@ type Supervisor struct {
 	// 2026-07-03 "credential baked at start with a stale URL" incident).
 	teamCred *teamCredentialSource
 	// revokedVKIDs holds the virtual-key ids the control plane has stopped
-	// honouring, as of the key_revocation rail's last successful poll. Read on
+	// honoring, as of the key_revocation rail's last successful poll. Read on
 	// every route rebuild (buildManagedRoutes), written only by that rail.
 	//
 	// 🔴 A nil pointer means "the rail has never successfully answered", which is

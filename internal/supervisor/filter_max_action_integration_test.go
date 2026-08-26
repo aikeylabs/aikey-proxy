@@ -119,7 +119,7 @@ func TestFilterIntegration_MaxActionFullWarnFullFromVault(t *testing.T) {
 		}
 		// Anti-regression: the child must confirm it resolved the sealed home
 		// before its verdict is compared against the expected action. Setting the
-		// environment is not evidence that the child honoured it.
+		// environment is not evidence that the child honored it.
 		sealed.AssertHeld(t, target)
 		response := target.Detect(context.Background(), request)
 		shutdownCtx, cancel := context.WithTimeout(context.Background(), 2*time.Second)

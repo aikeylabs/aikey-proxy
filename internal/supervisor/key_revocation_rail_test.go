@@ -192,7 +192,7 @@ func TestBuildManagedRoutesDropsRevokedVirtualKeys(t *testing.T) {
 	if dead {
 		t.Fatalf("the revoked key must NOT be routable; got tokens %v", routes)
 	}
-	// A nil set is today's behaviour: never a blanket outage.
+	// A nil set is today's behavior: never a blanket outage.
 	if got := buildManagedRoutes(keys, nil); len(got) != 2 {
 		t.Fatalf("a nil revocation set must change nothing, got %d routes", len(got))
 	}

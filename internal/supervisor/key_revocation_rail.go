@@ -1,5 +1,5 @@
-// key_revocation_rail.go — bounds how long a RUNNING proxy keeps honouring a
-// virtual key the control plane has already stopped honouring.
+// key_revocation_rail.go — bounds how long a RUNNING proxy keeps honoring a
+// virtual key the control plane has already stopped honoring.
 //
 // # The problem, in one sentence
 //
@@ -97,7 +97,7 @@ const maxKeyRevocationBody = 1 << 20
 // effectiveStatusActive is the ONLY value that keeps a route alive. Matching on
 // the good value rather than enumerating the bad ones is the point: a status the
 // control plane adds later (say "expired") is then treated as not-active by
-// default instead of being silently honoured by a proxy that has not shipped yet.
+// default instead of being silently honored by a proxy that has not shipped yet.
 const effectiveStatusActive = "active"
 
 var keyRevocationHTTPClient = httpx.NewSwappableDirect(10 * time.Second)
@@ -255,7 +255,7 @@ func sortedKeys(m map[string]bool) []string {
 // from later being copied onto an upstream request
 // (principles/no-aikey-headers-to-llm-upstream.md).
 func getJSONWithBearer(ctx context.Context, url, bearer string, out any) error {
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, http.NoBody)
 	if err != nil {
 		return err
 	}

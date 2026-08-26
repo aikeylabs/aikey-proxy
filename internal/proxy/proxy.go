@@ -49,7 +49,7 @@ type ActiveKeyReader interface {
 	// P1e (D-11): targetProviderCode selects the matching binding (one row per
 	// binding, ciphertext per row) — empty falls back to the primary binding.
 	GetTeamKeyByID(virtualKeyID, targetProviderCode, protocolType string) (*vault.ManagedKey, error)
-	// IsVirtualKeyRevoked reports whether the control plane has stopped honouring
+	// IsVirtualKeyRevoked reports whether the control plane has stopped honoring
 	// this VK, as of the key_revocation rail's last successful poll. Used ONLY to
 	// tell the member the truthful reason a request was refused — the refusal
 	// itself already happened, inside the reads above.

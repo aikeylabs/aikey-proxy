@@ -40,7 +40,7 @@ func mustJSON(t *testing.T, v any) string {
 }
 
 // rankOrder returns the seatassign order the resolver must follow (so tests
-// pin behaviour to the same lib master uses, not a guessed order).
+// pin behavior to the same lib master uses, not a guessed order).
 func rankOrder(seatID string, ids ...string) []string {
 	accts := make([]seatassign.Account, len(ids))
 	for i, id := range ids {

@@ -83,7 +83,7 @@ func managedKeyToRoute(mk *vault.ManagedKey) *vkeys.ResolvedRoute {
 // silently kept whichever row SQLite happened to return last.
 // buildManagedRoutes turns the vault's team keys into routes.
 //
-// 🔴 `revoked` holds virtual-key ids the CONTROL PLANE has stopped honouring
+// 🔴 `revoked` holds virtual-key ids the CONTROL PLANE has stopped honoring
 // (seat suspended, VK revoked, credential withdrawn) as of the key_revocation
 // rail's last successful poll. It is applied HERE — the one place a managed key
 // becomes a route — so every rebuild path (startup Merge and the periodic
@@ -92,7 +92,7 @@ func managedKeyToRoute(mk *vault.ManagedKey) *vkeys.ResolvedRoute {
 // the auth hot path: that splits the source of truth (registry says the route
 // exists, a side table says it does not) and the two WILL drift.
 //
-// nil/empty revoked = today's behaviour, so an offline or never-yet-successful
+// nil/empty revoked = today's behavior, so an offline or never-yet-successful
 // rail can only fail towards "serve what the vault says", never towards a
 // blanket outage. See workflow/CI/bugfix/20260826-proxy-revocation-window-unbounded.md.
 func buildManagedRoutes(keys []vault.ManagedKey, revoked map[string]bool) map[string]*vkeys.ResolvedRoute {

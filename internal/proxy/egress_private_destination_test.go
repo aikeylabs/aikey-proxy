@@ -14,7 +14,7 @@ func (r errRoundTripper) RoundTrip(*http.Request) (*http.Response, error) { retu
 
 func mustRequest(t *testing.T, rawURL string) *http.Request {
 	t.Helper()
-	req, err := http.NewRequest(http.MethodPost, rawURL, nil)
+	req, err := http.NewRequestWithContext(t.Context(), http.MethodPost, rawURL, http.NoBody)
 	if err != nil {
 		t.Fatalf("build request %q: %v", rawURL, err)
 	}
@@ -37,7 +37,7 @@ func TestEgressDiagnosticTransport_TagsIntranetDestination(t *testing.T) {
 
 	t.Run("intranet destination is tagged and names the host", func(t *testing.T) {
 		rt := &egressDiagnosticTransport{base: errRoundTripper{underlying}, bypass: noBypass}
-		_, err := rt.RoundTrip(mustRequest(t, "http://10.0.0.93:19099/v1/chat/completions"))
+		_, err := rt.RoundTrip(mustRequest(t, "http://10.0.0.93:19099/v1/chat/completions")) //nolint:bodyclose // errRoundTripper always returns (nil, err): there is no response, so there is no Body to close
 
 		var privErr *PrivateDestinationEgressError
 		if !errors.As(err, &privErr) {
@@ -56,7 +56,7 @@ func TestEgressDiagnosticTransport_TagsIntranetDestination(t *testing.T) {
 	// transport that tagged unconditionally would still pass the case above.
 	t.Run("public destination is left alone", func(t *testing.T) {
 		rt := &egressDiagnosticTransport{base: errRoundTripper{underlying}, bypass: noBypass}
-		_, err := rt.RoundTrip(mustRequest(t, "https://api.openai.com/v1/chat/completions"))
+		_, err := rt.RoundTrip(mustRequest(t, "https://api.openai.com/v1/chat/completions")) //nolint:bodyclose // errRoundTripper always returns (nil, err): there is no response, so there is no Body to close
 
 		var privErr *PrivateDestinationEgressError
 		if errors.As(err, &privErr) {
@@ -72,7 +72,7 @@ func TestEgressDiagnosticTransport_TagsIntranetDestination(t *testing.T) {
 		// This host dials DIRECT, so its failure is not the tunnel's doing.
 		bypassAll := func(string) bool { return true }
 		rt := &egressDiagnosticTransport{base: errRoundTripper{underlying}, bypass: bypassAll}
-		_, err := rt.RoundTrip(mustRequest(t, "http://10.0.0.93:19099/v1/chat/completions"))
+		_, err := rt.RoundTrip(mustRequest(t, "http://10.0.0.93:19099/v1/chat/completions")) //nolint:bodyclose // errRoundTripper always returns (nil, err): there is no response, so there is no Body to close
 
 		var privErr *PrivateDestinationEgressError
 		if errors.As(err, &privErr) {
@@ -88,7 +88,7 @@ func TestEgressDiagnosticTransport_TagsIntranetDestination(t *testing.T) {
 			// Would tag everything if it were consulted on the success path.
 			bypass: noBypass,
 		}
-		resp, err := rt.RoundTrip(mustRequest(t, "http://10.0.0.93:19099/v1/chat/completions"))
+		resp, err := rt.RoundTrip(mustRequest(t, "http://10.0.0.93:19099/v1/chat/completions")) //nolint:bodyclose // ok is &http.Response{StatusCode: 200} with no Body field: Body is nil, so there is nothing to close (and closing would nil-panic)
 		if err != nil || resp != ok {
 			t.Fatalf("a successful round trip must pass through untouched, got resp=%v err=%v", resp, err)
 		}

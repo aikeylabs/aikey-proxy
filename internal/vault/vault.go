@@ -44,19 +44,19 @@ type Reader struct {
 	db         *sql.DB
 	cache      *cache
 	derivedKey []byte
-	// revokedVKs holds virtual-key ids the control plane has stopped honouring,
+	// revokedVKs holds virtual-key ids the control plane has stopped honoring,
 	// as published by the proxy's key_revocation rail. Consulted by the reads that
 	// hand out TEAM key MATERIAL, so a suspension takes effect on the very next
 	// request instead of waiting for the member to run an aikey command.
 	//
 	// 🔴 Deliberately NOT consulted by GetActiveManagedKeys. That read has two
-	// unrelated consumers: route building (which must honour revocation, and does
+	// unrelated consumers: route building (which must honor revocation, and does
 	// so explicitly in supervisor.buildManagedRoutes) and the sync rails, which use
 	// it only to derive "which org / which seats does this node serve". Filtering it
 	// here would silently change quota, compliance and group-runtime inputs too —
 	// a side effect well outside what revocation is supposed to mean.
 	//
-	// nil = no filter, i.e. exactly the pre-2026-08-26 behaviour. See
+	// nil = no filter, i.e. exactly the pre-2026-08-26 behavior. See
 	// workflow/CI/bugfix/20260826-proxy-revocation-window-unbounded.md.
 	revokedVKs atomic.Pointer[map[string]bool]
 }
@@ -74,7 +74,7 @@ func (r *Reader) SetRevokedVirtualKeys(m map[string]bool) {
 	r.revokedVKs.Store(&copied)
 }
 
-// IsVirtualKeyRevoked reports whether the control plane has stopped honouring
+// IsVirtualKeyRevoked reports whether the control plane has stopped honoring
 // this virtual key. False when no filter has been published.
 func (r *Reader) IsVirtualKeyRevoked(virtualKeyID string) bool {
 	if virtualKeyID == "" {
