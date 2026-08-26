@@ -111,3 +111,38 @@ func TestProtocolFamilyNeverCorrectsExplicitWrongHint(t *testing.T) {
 		})
 	}
 }
+
+// TestProtocolFamilyCustomProviderVocabularyIsNotAdapterCoverage pins §11 rule 6
+// of the compatibility spec: the credential axis asks "is this protocol part of
+// the table's VOCABULARY", NOT "does this build ship an adapter for it".
+//
+// Why this needs its own fence: `gemini` is in the vocabulary (google has a row)
+// but the proxy carries no gemini adapter, so a custom provider declaring
+// `gemini` is allowed HERE and rejected at the adapter. That asymmetry looks like
+// a bug to the next reader, and "tightening" it here would silently make custom
+// providers stricter than the very vendor whose protocol they borrow — `google` +
+// `gemini` resolves today, and holding the two to different rules is the exact
+// inconsistency §11 rule 6 exists to prevent.
+//
+// The client-route half of the same question is the opposite answer and is fenced
+// separately in client_route_protocol_test.go ("custom route cannot confirm an
+// adapterless protocol either") — the two must not be collapsed.
+//
+// This assertion previously lived on ProtocolFamilyForCredential, which this
+// change folded back into ProtocolFamily; carried over so the documented rule
+// keeps a fence.
+// spec: workflow/CI/requirements/2026-07-18-provider-protocol-compatibility-and-baseurl.md §11 rule 6
+// bugfix: workflow/CI/bugfix/20260825-custom-thirdparty-provider-axes-rejected.md
+func TestProtocolFamilyCustomProviderVocabularyIsNotAdapterCoverage(t *testing.T) {
+	fam, ok := ProtocolFamily("thirdparty_relay", "gemini")
+	if !ok || fam != "gemini" {
+		t.Fatalf("ProtocolFamily(\"thirdparty_relay\", \"gemini\") = (%q, %v), want (\"gemini\", true) — the credential axis is a vocabulary check, not an adapter check", fam, ok)
+	}
+	if _, err := NewRegistry().Get("gemini"); err == nil {
+		t.Skip("a gemini adapter now exists — the asymmetry this test documents is gone")
+	}
+	// Same treatment for the vendor whose protocol it is: no special-casing.
+	if _, googleOK := ProtocolFamily("google", "gemini"); !googleOK {
+		t.Errorf("google+gemini must resolve too, otherwise custom providers are being held to a different rule than the vendor they borrow the protocol from")
+	}
+}
