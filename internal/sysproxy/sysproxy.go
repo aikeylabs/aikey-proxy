@@ -261,6 +261,68 @@ func NoProxyBypass() func(host string) bool {
 	}
 }
 
+// IsNonPublicDestination reports whether a destination host can NEVER be reached
+// from outside the local network — RFC1918 / CGNAT / link-local / ULA / loopback
+// IP literals, and the special-use names reserved for local naming.
+//
+// 🔴 DIAGNOSTICS ONLY. This predicate must NOT be wired into a routing decision.
+// Whether such a destination bypasses an explicit egress is settled by
+// NoProxyBypass (loopback + operator-declared NO_PROXY), per the 2026-07-16
+// option ② 拍板 recorded in
+// workflow/CI/requirements/2026-07-08-egress-follows-system-proxy.md:
+// "默认行为不变，想直连内网段用 NO_PROXY 显式声明". Making this predicate
+// authoritative for routing would silently reverse that decision and change a
+// security-relevant default (an operator who mandates that ALL traffic — intranet
+// included — traverse an audited tunnel would lose that guarantee without asking).
+//
+// WHY it exists at all: when such a destination is dialed THROUGH an external
+// egress it fails at the far end, and the operator sees a bare
+// "UPSTREAM_ERROR / EOF" that names neither the cause nor the remedy. This
+// predicate is what lets the failure say "this address is intranet-only, your
+// node egress is in force, declare it in NO_PROXY". See
+// workflow/CI/bugfix/20260826-egress-private-destination-undiagnosable.md.
+//
+// Being wrong here costs a slightly-off HINT on an already-failed request and
+// nothing else — which is why single-label hostnames are included: they cannot be
+// public FQDNs, and a LAN provider is commonly reached by a bare name.
+func IsNonPublicDestination(host string) bool {
+	host = strings.TrimSpace(host)
+	if host == "" {
+		return false
+	}
+	// Literal IPv6 may arrive bracketed from a URL host.
+	host = strings.TrimSuffix(strings.TrimPrefix(host, "["), "]")
+	if ip := net.ParseIP(host); ip != nil {
+		return ip.IsLoopback() || ip.IsPrivate() ||
+			ip.IsLinkLocalUnicast() || ip.IsLinkLocalMulticast() ||
+			ip.IsUnspecified() || isSharedAddressSpace(ip)
+	}
+	name := strings.ToLower(strings.TrimSuffix(host, "."))
+	if name == "localhost" {
+		return true
+	}
+	for _, suffix := range nonPublicNameSuffixes {
+		if strings.HasSuffix(name, suffix) {
+			return true
+		}
+	}
+	// A single-label name ("ollama", "gpu-box") has no public parent zone.
+	return !strings.Contains(name, ".")
+}
+
+// nonPublicNameSuffixes are the special-use suffixes reserved for local naming
+// (RFC 6762 .local, RFC 8375 .home.arpa, and the .internal / .lan conventions
+// cloud providers and home routers hand out). None can resolve publicly.
+var nonPublicNameSuffixes = []string{".local", ".internal", ".lan", ".home.arpa", ".intranet"}
+
+// isSharedAddressSpace reports whether ip is in 100.64.0.0/10 (RFC 6598 carrier
+// -grade NAT / shared address space). net.IP.IsPrivate covers RFC1918 and ULA but
+// not this range, which cloud VPCs and overlay networks (Tailscale) hand out.
+func isSharedAddressSpace(ip net.IP) bool {
+	v4 := ip.To4()
+	return v4 != nil && v4[0] == 100 && v4[1] >= 64 && v4[1] <= 127
+}
+
 func envProxyVarsSplitFrom(get func(string) string) (explicit, inherited map[string]string) {
 	marked := explicitEnvKeySet(get)
 	explicit, inherited = map[string]string{}, map[string]string{}

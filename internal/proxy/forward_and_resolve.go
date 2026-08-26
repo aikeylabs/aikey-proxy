@@ -1387,6 +1387,29 @@ func (p *Proxy) serveRoute(w http.ResponseWriter, r *http.Request, route *vkeys.
 						"or install the enterprise package if the spec is a multi-protocol fragment.")
 				return
 			}
+			// Intranet destination sent through the node's egress proxy. Checked
+			// BEFORE the generic upstream branch because the remedy is a node config
+			// change (NO_PROXY), not provider connectivity — see
+			// workflow/CI/bugfix/20260826-egress-private-destination-undiagnosable.md.
+			var privErr *PrivateDestinationEgressError
+			if errors.As(err, &privErr) {
+				logger.Error("intranet upstream unreachable through node egress",
+					"event.name", observability.EventProxyRequestUpstreamError,
+					"error.code", observability.ErrCodeUpstreamPrivateViaEgress,
+					"error.message", err.Error(),
+					"upstream_host", privErr.Host,
+					"latency_ms", latencyMs,
+				)
+				w.Header().Set(HeaderAikeyErrorSource, observability.ErrCodeUpstreamPrivateViaEgress)
+				writeJSONError(w, http.StatusBadGateway, "server_error",
+					observability.ErrCodeUpstreamPrivateViaEgress,
+					"The provider address "+privErr.Host+" is an intranet-only address, but this node has an "+
+						"upstream egress proxy configured, so the request was dialed from the far end of that "+
+						"tunnel — where this address does not exist. Either declare the address in the node's "+
+						"NO_PROXY (e.g. NO_PROXY="+privErr.Host+") so it dials direct, or give the credential a "+
+						"Base URL that is reachable from the egress exit.")
+				return
+			}
 			if route.OauthGroupID != "" {
 				logger.Error("oauth-group upstream path unavailable",
 					"event.name", observability.EventProxyRequestUpstreamError,

@@ -213,6 +213,70 @@ func (e *NodeEgressUnavailableError) Error() string {
 }
 func (e *NodeEgressUnavailableError) Unwrap() error { return e.err }
 
+// PrivateDestinationEgressError tags an upstream failure whose destination is an
+// intranet-only address that was sent THROUGH the node's explicit egress proxy.
+//
+// WHY this type exists (2026-08-26, staging Cluster): the "custom provider" entry
+// in the console offers 「本地模型 / 中转站 / 企业反代」, two of which are normally
+// LAN addresses. On a node with `upstream_proxy` configured, such a request is
+// dialed at the FAR END of the tunnel, where an RFC1918 address does not exist —
+// so it fails with a bare `UPSTREAM_ERROR` / `EOF` that names neither the cause
+// nor the fix, and the admin reasonably concludes the credential is broken. It
+// cost a full staging investigation to tell this apart from a routing bug.
+//
+// 🔴 This changes NO routing. Whether intranet targets bypass the egress is still
+// decided solely by sysproxy.NoProxyBypass (loopback + operator-declared
+// NO_PROXY) per the 2026-07-16 option ② 拍板 — see IsNonPublicDestination. This
+// type only makes the resulting failure diagnosable and self-serve.
+//
+// Bugfix: workflow/CI/bugfix/20260826-egress-private-destination-undiagnosable.md
+type PrivateDestinationEgressError struct {
+	// Host is the intranet destination as written on the credential's base URL.
+	Host string
+	err  error
+}
+
+func (e *PrivateDestinationEgressError) Error() string {
+	return "intranet destination " + e.Host + " unreachable through node egress proxy: " + e.err.Error()
+}
+func (e *PrivateDestinationEgressError) Unwrap() error { return e.err }
+
+// egressDiagnosticTransport wraps the node's egress transport so that a failure
+// to an intranet-only destination is RE-TAGGED with the actionable error above.
+//
+// Applied at the single point where BOTH node egress paths converge
+// (app.buildTransport: the single-URL branch and the mihomo engine branch), so
+// there is one wrap rather than one per engine. Success is untouched, and the
+// classification runs ONLY on the error return — the hot path pays nothing.
+type egressDiagnosticTransport struct {
+	base   http.RoundTripper
+	bypass func(string) bool
+}
+
+func (t *egressDiagnosticTransport) RoundTrip(req *http.Request) (*http.Response, error) {
+	resp, err := t.base.RoundTrip(req)
+	if err == nil {
+		return resp, nil
+	}
+	host := req.URL.Hostname()
+	// A bypassed host went DIRECT — its failure has nothing to do with the egress,
+	// so tagging it would send the operator to the wrong place.
+	if t.bypass(host) || !sysproxy.IsNonPublicDestination(host) {
+		return resp, err
+	}
+	return resp, &PrivateDestinationEgressError{Host: host, err: err}
+}
+
+// NewEgressDiagnosticTransport wraps rt so intranet-destination failures carry
+// *PrivateDestinationEgressError. Returns rt unchanged when rt is nil so callers
+// can wrap unconditionally.
+func NewEgressDiagnosticTransport(rt http.RoundTripper) http.RoundTripper {
+	if rt == nil {
+		return nil
+	}
+	return &egressDiagnosticTransport{base: rt, bypass: egressBypass()}
+}
+
 // RefusingTransport is the transport installed when the node's configured egress
 // spec cannot be built. Every request to an EXTERNAL destination fails with
 // *NodeEgressUnavailableError instead of dialing direct.

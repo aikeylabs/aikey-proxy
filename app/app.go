@@ -571,9 +571,20 @@ func Run() {
 	// hot-swap between two multi-protocol specs (or engine→single-URL) never leaks
 	// a health-check loop — GC can't reclaim it because the loop keeps it live.
 	var liveEgressCloser io.Closer
-	installTransport := func(t *http.Transport, closer io.Closer) {
+	// egressSpec is the spec the transport was built from — "" means direct. It is
+	// passed explicitly (rather than captured) because the diagnostic wrap below is
+	// only CORRECT when an egress is actually in force: in direct mode an intranet
+	// dial failure has nothing to do with a tunnel, and tagging it would send the
+	// operator to the wrong remedy.
+	installTransport := func(t *http.Transport, closer io.Closer, egressSpec string) {
 		liveTransport.Store(t)
-		sup.SetTransport(t)
+		// The forward path gets the diagnostic wrapper; liveTransport keeps the
+		// concrete *http.Transport (idle-conn flushing needs the real type).
+		if strings.TrimSpace(egressSpec) == "" {
+			sup.SetTransport(t)
+		} else {
+			sup.SetTransport(proxy.NewEgressDiagnosticTransport(t))
+		}
 		egressMu.Lock()
 		old := liveEgressCloser
 		liveEgressCloser = closer
@@ -590,7 +601,8 @@ func Run() {
 		if err := config.PersistUpstreamProxyURL(resolvedPath, spec); err != nil {
 			return err
 		}
-		installTransport(buildTransport(spec, sysWatcher.ProxyFunc()))
+		tr, closer := buildTransport(spec, sysWatcher.ProxyFunc())
+		installTransport(tr, closer, spec)
 		// 2026-07-18 (reversed the L1 override): the node upstream serves only
 		// non-egress traffic; per-account egress stays independent, so setting/clearing
 		// the node upstream no longer touches per-account egress precedence.
@@ -673,11 +685,14 @@ func Run() {
 	// ready. installTransport is atomic and closes the interim direct transport.
 	bootSpec := strings.TrimSpace(cfg.UpstreamProxy.URL)
 	if bootSpec == "" || !egress.IsEngineSpec(bootSpec) {
-		installTransport(buildTransport(cfg.UpstreamProxy.URL, sysWatcher.ProxyFunc()))
+		tr, closer := buildTransport(cfg.UpstreamProxy.URL, sysWatcher.ProxyFunc())
+		installTransport(tr, closer, cfg.UpstreamProxy.URL)
 	} else {
-		installTransport(buildTransport("", sysWatcher.ProxyFunc())) // interim: direct
+		tr, closer := buildTransport("", sysWatcher.ProxyFunc()) // interim: direct
+		installTransport(tr, closer, "")
 		go func() {
-			installTransport(buildTransport(cfg.UpstreamProxy.URL, sysWatcher.ProxyFunc()))
+			tr, closer := buildTransport(cfg.UpstreamProxy.URL, sysWatcher.ProxyFunc())
+			installTransport(tr, closer, cfg.UpstreamProxy.URL)
 		}()
 	}
 	// Start the system-proxy poll loop (inert when env config is authoritative,
