@@ -393,6 +393,21 @@ type Supervisor struct {
 	// rebuilt whenever the control URL changes or a refresh fails (the fix for the
 	// 2026-07-03 "credential baked at start with a stale URL" incident).
 	teamCred *teamCredentialSource
+	// revokedVKIDs holds the virtual-key ids the control plane has stopped
+	// honouring, as of the key_revocation rail's last successful poll. Read on
+	// every route rebuild (buildManagedRoutes), written only by that rail.
+	//
+	// 🔴 A nil pointer means "the rail has never successfully answered", which is
+	// deliberately indistinguishable from "nothing is revoked": both serve what
+	// the vault holds. Failing the other way — refusing every team key while the
+	// control plane is unreachable — would turn a master outage into a fleet-wide
+	// outage, which is the opposite of the offline-first rule every other rail
+	// follows (railset.go §2.3).
+	revokedVKIDs atomic.Pointer[map[string]bool]
+	// lastSyncVersion is the account sync_version this proxy has already resolved
+	// into revokedVKIDs. The rail skips the (heavier) snapshot fetch while the
+	// server's counter is unchanged.
+	lastSyncVersion atomic.Int64
 	// quotaHeartbeat is the traffic-independent server-reachability probe behind
 	// budget-mode staleness (D-U7/P9). nil unless enforce_mode=budget AND a
 	// collector URL is configured — so the default availability path (and Personal)
@@ -500,7 +515,10 @@ func New(cfg *config.Config, configPath, password, version string) (*Supervisor,
 	}
 	// 🔴 A sixth FOLLOWER, not a sixth loop (task 1b.4). railSpec.interval is
 	// per-rail, so declaring 10s here leaves the other five untouched.
-	s.railset = newRailSet(s.groupRuntimeRail(), s.routingOverrideRail(), s.fallbackPolicyRail())
+	// key_revocation (2026-08-26) rides the same framework so a control-plane
+	// suspension reaches a running proxy within one cycle instead of waiting for
+	// the member to type an aikey command (which may never happen).
+	s.railset = newRailSet(s.groupRuntimeRail(), s.routingOverrideRail(), s.fallbackPolicyRail(), s.keyRevocationRail())
 	gen, err := s.buildGeneration()
 	if err != nil {
 		_ = s.oauthPoolRuntime.Close()
@@ -1084,6 +1102,41 @@ func (s *Supervisor) syncManagedKeys() {
 		}
 	}
 
+	totalRoutes := s.rebuildRouteRegistry(gen)
+
+	// Quota rules ride the same vault-seq advance (design §0.5/§5.2). This is
+	// strictly after the managed-key path above and fully fault-isolated (gated
+	// by the flag, swallows errors, keeps last-known-good) so a quota problem
+	// can never disturb managed-key delivery — the proxy's main path.
+	s.reloadQuotaSnapshot(gen)
+
+	// Record that we've caught up to this seq.
+	if werr := vault.WriteConfigU64LE(s.cfg.Vault.Path, ProxyLoadedSeqKey, vaultSeq); werr != nil {
+		slog.Warn("managed key sync: failed to write loaded_vault_change_seq", "error", werr)
+	} else {
+		slog.Info("managed key sync: registry rebuilt",
+			"total_routes", totalRoutes,
+			"vault_seq", vaultSeq,
+		)
+	}
+}
+
+// rebuildRouteRegistry loads every token source from the vault and atomically
+// replaces the route registry, returning how many routes were installed.
+//
+// 🔴 Why this is its own function (2026-08-26, revocation-window fix). It used to
+// be the tail of syncManagedKeys, which is gated on the vault's change_seq — it
+// early-returns when the LOCAL vault has not changed. That gate is correct for
+// its own purpose and fatally wrong for a second caller: a seat suspended on the
+// control plane changes nothing in this machine's vault, so a rebuild triggered
+// through syncManagedKeys would have been skipped exactly when it mattered.
+// The key_revocation rail therefore needs to reach the rebuild WITHOUT the seq
+// gate, and the only alternatives were worse: a full Reload() re-spawns the
+// filter child (the startup reload-storm bugfix, 20260725) and a second
+// hand-rolled route builder would split the source of truth for what a route is.
+//
+// See workflow/CI/bugfix/20260826-proxy-revocation-window-unbounded.md.
+func (s *Supervisor) rebuildRouteRegistry(gen *generation) int {
 	// Full rebuild: load all token sources and atomically replace the registry.
 	// Why ReplaceAll instead of Merge: deleted/revoked tokens must be removed
 	// immediately. Merge is additive and cannot remove stale entries.
@@ -1103,7 +1156,7 @@ func (s *Supervisor) syncManagedKeys() {
 		// not update RoutingOverrideCache.
 		s.refreshClusterRoutingOverrides(managedKeys)
 	}
-	for token, route := range buildManagedRoutes(managedKeys) {
+	for token, route := range buildManagedRoutes(managedKeys, s.revokedVKs()) {
 		allRoutes[token] = route
 	}
 
@@ -1151,22 +1204,7 @@ func (s *Supervisor) syncManagedKeys() {
 
 	// Atomic replace — deleted/revoked tokens disappear immediately.
 	gen.registry.ReplaceAll(allRoutes)
-
-	// Quota rules ride the same vault-seq advance (design §0.5/§5.2). This is
-	// strictly after the managed-key path above and fully fault-isolated (gated
-	// by the flag, swallows errors, keeps last-known-good) so a quota problem
-	// can never disturb managed-key delivery — the proxy's main path.
-	s.reloadQuotaSnapshot(gen)
-
-	// Record that we've caught up to this seq.
-	if werr := vault.WriteConfigU64LE(s.cfg.Vault.Path, ProxyLoadedSeqKey, vaultSeq); werr != nil {
-		slog.Warn("managed key sync: failed to write loaded_vault_change_seq", "error", werr)
-	} else {
-		slog.Info("managed key sync: registry rebuilt",
-			"total_routes", len(allRoutes),
-			"vault_seq", vaultSeq,
-		)
-	}
+	return len(allRoutes)
 }
 
 // quotaEnabledFromEnv reads the PROXY_QUOTA_ENABLED switch. Default ON
@@ -1879,6 +1917,12 @@ func (s *Supervisor) buildGeneration() (*generation, error) {
 	if err != nil {
 		return nil, fmt.Errorf("open vault: %w", err)
 	}
+	// Re-arm the control-plane revocation filter on the FRESH reader. A Reload
+	// builds a new *vault.Reader, which starts with no filter — without this a
+	// reload would silently un-revoke every suspended key until the next
+	// key_revocation cycle (up to 60s of serving traffic that was already cut
+	// off). Cheap and idempotent; empty set on a proxy that has never polled.
+	vaultReader.SetRevokedVirtualKeys(s.revokedVKs())
 
 	// Build virtual key registry. Stage C-2.c removed the static-yaml
 	// loading path (was: iterate s.cfg.VirtualKeys → registry.Load).
@@ -1895,7 +1939,7 @@ func (s *Supervisor) buildGeneration() (*generation, error) {
 	if managedKeys, mkErr := vaultReader.GetActiveManagedKeys(); mkErr != nil {
 		slog.Warn("could not load managed virtual keys", "error", mkErr)
 	} else if len(managedKeys) > 0 {
-		registry.Merge(buildManagedRoutes(managedKeys))
+		registry.Merge(buildManagedRoutes(managedKeys, s.revokedVKs()))
 	}
 
 	// Load personal-key + OAuth bearers (v1.0.4+) into the registry.

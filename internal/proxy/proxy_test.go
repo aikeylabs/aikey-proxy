@@ -518,7 +518,14 @@ func TestExtractProviderFromPath(t *testing.T) {
 // ── Path-prefix routing integration tests ────────────────────────────────────
 
 // mockActiveVault implements both VaultGetter and ActiveKeyReader for testing.
+// revokedVKs lets a test exercise the "the control plane revoked this" answer
+// without standing up a vault. Empty = nothing revoked, i.e. the old behaviour.
+func (m *mockActiveVault) IsVirtualKeyRevoked(virtualKeyID string) bool {
+	return m.revokedVKs[virtualKeyID]
+}
+
 type mockActiveVault struct {
+	revokedVKs       map[string]bool
 	secrets          map[string]string
 	activeKeyConfig  *vault.ActiveKeyConfig
 	activeTeamKeys   map[string]*vault.ManagedKey      // keyed by lowercase provider code
@@ -1362,5 +1369,47 @@ func TestExtractModel_KimiShape_FieldsAfterLargeMessagesArray(t *testing.T) {
 	if !bytes.Equal(rebuffered, bodyBytes) {
 		t.Errorf("Kimi shape: body replay mismatch; len(got)=%d, len(want)=%d",
 			len(rebuffered), len(bodyBytes))
+	}
+}
+
+// 🔴 A revoked seat must be told the truth (2026-08-26).
+//
+// Before this, a member whose seat an administrator had suspended got
+// `503 NO_ACTIVE_KEY — "Run 'aikey use <key>'"`. Both halves were wrong:
+// 503 reads as "the proxy is unwell, retry", so clients retry a decision that
+// will never change; and the advice cannot work, because the key is gone
+// server-side and no local command brings it back. A suspended employee would
+// follow the hint, fail, and file a bug against a proxy that is behaving
+// correctly.
+//
+// 能红: delete the revocation branch in pipelines.go and this falls back to
+// 503/NO_ACTIVE_KEY. See
+// workflow/CI/bugfix/20260826-proxy-revocation-window-unbounded.md.
+func TestHandlePathPrefix_RevokedTeamBindingIsRefusedNotCalledUnavailable(t *testing.T) {
+	av := &mockActiveVault{
+		activeTeamKeys: map[string]*vault.ManagedKey{},
+		providerBindings: map[string]*vault.ProviderBinding{
+			"anthropic": {
+				ClientRoute: "anthropic", ProviderCode: "anthropic", ProtocolType: "anthropic",
+				KeySourceType: "team", KeySourceRef: "vk-revoked",
+			},
+		},
+		revokedVKs: map[string]bool{"vk-revoked": true},
+	}
+	p := setupTestProxyWithActive(t, av)
+
+	req := httptest.NewRequest(http.MethodPost, "/anthropic/v1/messages", strings.NewReader(`{}`))
+	w := httptest.NewRecorder()
+	p.Handle(w, req)
+
+	if w.Code != http.StatusUnauthorized {
+		t.Errorf("a revoked seat is a REFUSAL, want 401, got %d — body: %s", w.Code, w.Body.String())
+	}
+	body := w.Body.String()
+	if !strings.Contains(body, "SEAT_OR_KEY_REVOKED") {
+		t.Errorf("want error code SEAT_OR_KEY_REVOKED, got: %s", body)
+	}
+	if strings.Contains(body, "aikey use") {
+		t.Errorf("must NOT tell a suspended member to run `aikey use` — it cannot work: %s", body)
 	}
 }

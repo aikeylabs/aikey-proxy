@@ -120,7 +120,7 @@ func TestCustomThirdPartyProvider_AnthropicRelayRoutesEndToEnd(t *testing.T) {
 	}))
 	defer upstream.Close()
 
-	p := setupTestProxyWithActive(t, relayVaultFixture("anthropic", "thirdparty_relay", "anthropic", upstream.URL))
+	p := setupTestProxyWithActive(t, relayVaultFixture("anthropic", "acme_gateway", "anthropic", upstream.URL))
 
 	req := httptest.NewRequest(http.MethodPost, "/anthropic/v1/messages",
 		strings.NewReader(`{"model":"claude-3","messages":[{"role":"user","content":"hi"}],"max_tokens":5}`))

@@ -117,7 +117,15 @@ const (
 	// EventProxySyncHealthFileFailed: the statusline sync-health bypass file
 	// (~/.aikey/run/sync-health.json) could not be written/removed — the claude
 	// status bar may show a stale (or miss a fresh) sync warning.
-	EventProxySyncHealthFileFailed = "proxy.sync.health_file_failed"
+	// Key-revocation rail (2026-08-26): bounds how long a running proxy keeps
+	// honouring a virtual key the control plane has stopped honouring. See
+	// supervisor/key_revocation_rail.go and
+	// workflow/CI/bugfix/20260826-proxy-revocation-window-unbounded.md.
+	EventProxyKeyRevocationDropped   = "proxy.key_revocation.route_dropped"
+	EventProxyKeyRevocationChanged   = "proxy.key_revocation.set_changed"
+	EventProxyKeyRevocationMalformed = "proxy.key_revocation.snapshot_malformed"
+	EventProxyKeyRevocationRefused   = "proxy.key_revocation.request_refused"
+	EventProxySyncHealthFileFailed   = "proxy.sync.health_file_failed"
 	// EventReporterDeadLetterReplayed: the automatic dead-letter replay ran
 	// after the upload pipe recovered (2026-07-04 self-heal) — carries
 	// scanned/replayed/still-failing counts, or the error when the pass failed.

@@ -5,6 +5,7 @@ import (
 	"log/slog"
 	"sort"
 
+	"github.com/AiKeyLabs/aikey-proxy/internal/observability"
 	providerreg "github.com/AiKeyLabs/aikey-proxy/internal/provider"
 	"github.com/AiKeyLabs/aikey-proxy/internal/vault"
 	"github.com/AiKeyLabs/aikey-proxy/internal/vkeys"
@@ -80,10 +81,30 @@ func managedKeyToRoute(mk *vault.ManagedKey) *vkeys.ResolvedRoute {
 // buildManagedRoutes groups cache rows at the bearer-token grain while
 // retaining every exact Provider+Protocol binding. The old map assignment
 // silently kept whichever row SQLite happened to return last.
-func buildManagedRoutes(keys []vault.ManagedKey) map[string]*vkeys.ResolvedRoute {
+// buildManagedRoutes turns the vault's team keys into routes.
+//
+// 🔴 `revoked` holds virtual-key ids the CONTROL PLANE has stopped honouring
+// (seat suspended, VK revoked, credential withdrawn) as of the key_revocation
+// rail's last successful poll. It is applied HERE — the one place a managed key
+// becomes a route — so every rebuild path (startup Merge and the periodic
+// ReplaceAll) inherits it and the registry stays the single authority on which
+// bearers exist. 🚫 Do NOT re-implement this as a veto consulted per request in
+// the auth hot path: that splits the source of truth (registry says the route
+// exists, a side table says it does not) and the two WILL drift.
+//
+// nil/empty revoked = today's behaviour, so an offline or never-yet-successful
+// rail can only fail towards "serve what the vault says", never towards a
+// blanket outage. See workflow/CI/bugfix/20260826-proxy-revocation-window-unbounded.md.
+func buildManagedRoutes(keys []vault.ManagedKey, revoked map[string]bool) map[string]*vkeys.ResolvedRoute {
 	grouped := make(map[string][]*vkeys.ResolvedRoute)
 	for i := range keys {
 		mk := &keys[i]
+		if revoked[mk.VirtualKeyID] {
+			slog.Info("registry load: dropping team key revoked by the control plane",
+				"event.name", observability.EventProxyKeyRevocationDropped,
+				"vk_id", mk.VirtualKeyID, "seat_id", mk.SeatID)
+			continue
+		}
 		if mk.OauthGroupID != "" && !oauthGroupRoutingEnabled() {
 			continue
 		}
