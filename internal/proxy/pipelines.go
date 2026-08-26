@@ -354,7 +354,10 @@ func (p *Proxy) handleAppPipeline(w http.ResponseWriter, r *http.Request, appCtx
 	protocolFamily := ""
 	if pr, ok := provider.Routes().LookupByBaseURL(cred.BaseURL); ok {
 		protocolFamily = pr.Protocol
-	} else if pf, ok := provider.ProtocolFamily(binding.ProviderCode, protocolType); ok {
+	} else if pf, ok := provider.ProtocolFamilyForCredential(binding.ProviderCode, protocolType); ok {
+		// 2026-08-25: ForCredential so a custom third-party provider still gets an
+		// audited protocol family. Audit-only — a miss leaves the field empty.
+		// bugfix: workflow/CI/bugfix/20260825-custom-thirdparty-provider-axes-rejected.md (regression: make -C aikey-proxy test-bugfix-custom-provider-axes)
 		protocolFamily = pf
 	}
 	if protocolType == "" {
@@ -735,7 +738,10 @@ func (p *Proxy) handleProbePipeline(w http.ResponseWriter, r *http.Request, prob
 	protocolFamily := ""
 	if pr, ok := provider.Routes().LookupByBaseURL(cred.BaseURL); ok {
 		protocolFamily = pr.Protocol
-	} else if pf, ok := provider.ProtocolFamily(binding.ProviderCode, protocolType); ok {
+	} else if pf, ok := provider.ProtocolFamilyForCredential(binding.ProviderCode, protocolType); ok {
+		// 2026-08-25: ForCredential so a custom third-party provider still gets an
+		// audited protocol family. Audit-only — a miss leaves the field empty.
+		// bugfix: workflow/CI/bugfix/20260825-custom-thirdparty-provider-axes-rejected.md (regression: make -C aikey-proxy test-bugfix-custom-provider-axes)
 		protocolFamily = pf
 	}
 	if protocolType == "" {

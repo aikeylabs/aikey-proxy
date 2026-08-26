@@ -889,7 +889,14 @@ func (h *Handler) HealthKeys(w http.ResponseWriter, r *http.Request) {
 func probeKey(ctx context.Context, client *http.Client, t *KeyCheckTarget) (int, error) {
 	baseURL := strings.TrimRight(t.BaseURL, "/")
 	providerCode := providerreg.CanonicalCode(t.Provider)
-	protocolType, ok := providerreg.ProtocolFamily(providerCode, t.Protocol)
+	// 2026-08-25: ForCredential — a probe target IS a stored credential, so a
+	// custom third-party provider (absent from the routing table, carrying its own
+	// base_url) must be probeable. The strict lookup rejected every such target
+	// here even when t.BaseURL was fully specified, so `aikey test` reported
+	// "no unique provider route" for a relay it could have reached — the same root
+	// cause as the binding-axes rejection, on a second surface.
+	// bugfix: workflow/CI/bugfix/20260825-custom-thirdparty-provider-axes-rejected.md (regression: make -C aikey-proxy test-bugfix-custom-provider-axes)
+	protocolType, ok := providerreg.ProtocolFamilyForCredential(providerCode, t.Protocol)
 	if !ok {
 		return 0, fmt.Errorf("no unique provider route for provider=%q protocol=%q", t.Provider, t.Protocol)
 	}
@@ -975,6 +982,26 @@ func newProviderProbeRequest(ctx context.Context, baseURL, providerCode, protoco
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, path, body)
 	if err != nil {
 		return nil, err
+	}
+	// 2026-08-25: a CUSTOM third-party provider has no (provider, protocol) row,
+	// so the explicit stitch has no version segment to take and refuses outright —
+	// which is how a fully specified relay target still failed the probe after the
+	// protocol itself resolved.
+	//
+	// Falling back to the degraded literal-prepend Stitch is not a workaround: it
+	// is what StitchForProviderProtocol's own contract prescribes ("a private
+	// third-party gateway must retain Stitch's degraded literal-prepend
+	// behavior"), and it is byte-identical to what serveRoute composes when it
+	// FORWARDS the same credential. requirements/2026-07-18 §上游地址单一解析 rule 2
+	// (展示=执行) requires exactly that agreement between the probe and the
+	// forward path; refusing here broke it in the most misleading direction, by
+	// reporting a configuration error for an upstream the proxy could reach.
+	// bugfix: workflow/CI/bugfix/20260825-custom-thirdparty-provider-axes-rejected.md (regression: make -C aikey-proxy test-bugfix-custom-provider-axes)
+	if _, rowKnown := providerreg.Routes().ByProviderProtocol(providerCode, protocolType); !rowKnown {
+		if err := providerreg.Routes().Stitch(req, baseURL); err != nil {
+			return nil, err
+		}
+		return req, nil
 	}
 	if err := providerreg.Routes().StitchForProviderProtocol(req, baseURL, providerCode, protocolType); err != nil {
 		return nil, err

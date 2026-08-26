@@ -17,8 +17,8 @@ const (
 	// were dumped to stderr. Exit still completes — this is forensic evidence,
 	// not a hang (bugfix 2026-08-19-proxy-shutdown-unbounded-close).
 	EventProxyShutdownWatchdogTimeout = "proxy.shutdown.watchdog_timeout"
-	EventProxyConfigLoaded   = "proxy.config.loaded"
-	EventProxyListenerBound  = "proxy.listener.bound"
+	EventProxyConfigLoaded            = "proxy.config.loaded"
+	EventProxyListenerBound           = "proxy.listener.bound"
 )
 
 // Browserless pool-login events. These never carry a session key or token;
@@ -117,7 +117,14 @@ const (
 	// EventProxySyncHealthFileFailed: the statusline sync-health bypass file
 	// (~/.aikey/run/sync-health.json) could not be written/removed — the claude
 	// status bar may show a stale (or miss a fresh) sync warning.
-	EventProxySyncHealthFileFailed = "proxy.sync.health_file_failed"
+	// Key-revocation rail (2026-08-26): bounds how long a running proxy keeps
+	// honouring a virtual key the control plane has stopped honouring. See
+	// supervisor/key_revocation_rail.go and
+	// workflow/CI/bugfix/20260826-proxy-revocation-window-unbounded.md.
+	EventProxyKeyRevocationDropped   = "proxy.key_revocation.route_dropped"
+	EventProxyKeyRevocationChanged   = "proxy.key_revocation.set_changed"
+	EventProxyKeyRevocationMalformed = "proxy.key_revocation.snapshot_malformed"
+	EventProxySyncHealthFileFailed   = "proxy.sync.health_file_failed"
 	// EventReporterDeadLetterReplayed: the automatic dead-letter replay ran
 	// after the upload pipe recovered (2026-07-04 self-heal) — carries
 	// scanned/replayed/still-failing counts, or the error when the pass failed.
@@ -389,17 +396,17 @@ const (
 	ErrCodeTokenInvalid                   = "TOKEN_INVALID"
 	ErrCodePolicyModelForbidden           = "POLICY_MODEL_FORBIDDEN"
 	ErrCodeSecretNotConfigured            = "SECRET_NOT_CONFIGURED"
-	// ErrCodeUpstreamBaseURLMissing (2026-08-25, bugfix
-	// 2026-08-25-empty-upstream-base-url-unhelpful-error): the resolved route
-	// carries no upstream base URL — a configuration gap (custom provider with
-	// neither a credential Base URL nor a provider default), NOT a network
-	// failure. Kept distinct from UPSTREAM_ERROR so the error names the fix
-	// instead of sending the operator to debug connectivity.
-	ErrCodeUpstreamBaseURLMissing         = "UPSTREAM_BASE_URL_MISSING"
 	ErrCodeUpstreamError                  = "UPSTREAM_ERROR"
 	ErrCodeProviderError                  = "PROVIDER_ERROR"
 	ErrCodeUsageExtractionFailed          = "USAGE_EXTRACTION_FAILED"
 	ErrCodeClusterVaultAssignmentsCorrupt = "CLUSTER_VAULT_ASSIGNMENTS_CORRUPT"
+	// A credential resolved with no upstream address at all. Reachable mainly for
+	// a CUSTOM third-party provider registered without a base_url: it has no
+	// routing-table row to fall back to, so there is nowhere to send the request.
+	// Named separately from ErrCodeProviderError because the remedy is specific
+	// and the operator can act on it — see serveRoute for the message.
+	// bugfix: workflow/CI/bugfix/20260825-custom-thirdparty-provider-axes-rejected.md (regression: make -C aikey-proxy test-bugfix-custom-provider-axes)
+	ErrCodeUpstreamAddressMissing = "UPSTREAM_ADDRESS_MISSING"
 	// Enterprise quota (Phase 2, design §5.5). Stage 3 wires the token code;
 	// USD + degraded-block are reserved for later stages ($ enforcement / §8).
 	ErrCodeQuotaExceededToken = "QUOTA_EXCEEDED_TOKEN"

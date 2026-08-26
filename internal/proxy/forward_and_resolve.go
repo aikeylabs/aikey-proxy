@@ -110,7 +110,10 @@ func (p *Proxy) serveRouteWithObserver(
 			if pr, ok := provider.Routes().LookupByBaseURL(route.BaseURL); ok {
 				pf = pr.Protocol
 			} else if route.ProviderCode != "" {
-				pf, _ = provider.ProtocolFamily(route.ProviderCode, route.ProtocolType)
+				// 2026-08-25: ForCredential so a custom third-party provider still
+				// gets an audited protocol family. Audit-only, as the surrounding
+				// comment says — a miss leaves the field empty, it never blocks.
+				pf, _ = provider.ProtocolFamilyForCredential(route.ProviderCode, route.ProtocolType)
 			}
 		}
 		obsReqCtx = &observer.RequestContext{
@@ -415,27 +418,6 @@ func (p *Proxy) serveRoute(w http.ResponseWriter, r *http.Request, route *vkeys.
 	if route != nil {
 		route.ProviderCode = truthfulProviderCode(route.BaseURL, route.ProviderCode)
 	}
-	// Empty-base guard (2026-08-25, bugfix
-	// 2026-08-25-empty-upstream-base-url-unhelpful-error; requirements
-	// 2026-07-18 §自定义第三方供应商 rule 4). An empty BaseURL can never be
-	// served on the key-injection path: Stitch("") yields a host-less target and
-	// the transport answers with a generic UPSTREAM_ERROR ("Failed to connect")
-	// that reads as a network failure — while the actual defect is CONFIGURATION
-	// (typically a custom provider whose credential carries no Base URL and
-	// whose provider row has no default; official providers always resolve a
-	// table default upstream of here). Fail here, at the single funnel every
-	// real route passes through, and name the fix. OAuth lanes are exempt: their
-	// base comes from resolveOAuthUpstream inside the Director, not route.BaseURL.
-	if route != nil && route.BaseURL == "" && realKey != oauthSentinelKey {
-		p.errors.Add(1)
-		writeJSONError(w, http.StatusBadGateway, "server_error",
-			observability.ErrCodeUpstreamBaseURLMissing,
-			"No upstream base URL is configured for provider \""+route.ProviderCode+"\". "+
-				"A custom provider has no built-in endpoint: set the credential's Base URL in the console "+
-				"(Provider Accounts → the credential) and re-run `aikey key sync`, or for a personal key "+
-				"re-add it with `aikey add <alias> --base-url <URL>`.")
-		return
-	}
 	currentOverride := p.oauthEgressOverride.Load()
 	pathDecision := providerPathDecision{overrideOn: currentOverride}
 	if route != nil && route.OauthGroupID != "" {
@@ -702,6 +684,39 @@ func (p *Proxy) serveRoute(w http.ResponseWriter, r *http.Request, route *vkeys.
 				"provider_code", route.ProviderCode,
 			)
 		}
+	} else if route.BaseURL == "" && realKey != "__oauth__" {
+		// 2026-08-25: fail LOUDLY instead of forwarding to nowhere.
+		//
+		// Every provider in provider_routes has a row to fall back on, so an empty
+		// address only reaches here for a provider the table does NOT know — i.e. a
+		// custom third-party provider registered without a base_url. Before this
+		// guard the empty string flowed into Routes().Stitch, which parses it into
+		// a URL with no host, and the reverse proxy answered
+		// `http: no Host in request URL` — a message that names neither the
+		// credential nor the missing field, and so cannot be acted on.
+		//
+		// 🚫 Do not "fall back" to a provider default here: there is none for an
+		// unknown provider, and inventing one would send an operator's traffic to a
+		// vendor they never configured.
+		//
+		// The OAuth lane is excluded on purpose (same predicate as the WARN branch
+		// above): its URL is composed by stitchOAuthRequestURL from the route row,
+		// not from route.BaseURL.
+		//
+		// bugfix: workflow/CI/bugfix/20260825-custom-thirdparty-provider-axes-rejected.md (regression: make -C aikey-proxy test-bugfix-custom-provider-axes)
+		p.errors.Add(1)
+		logger.Error("no upstream address for this credential — refusing to forward",
+			"event.name", "proxy.route.upstream_address_missing",
+			"error.code", observability.ErrCodeUpstreamAddressMissing,
+			"provider_code", route.ProviderCode,
+			"protocol_type", route.ProtocolType,
+			"key_alias", route.KeyAlias,
+		)
+		writeJSONError(w, http.StatusBadGateway, "server_error", observability.ErrCodeUpstreamAddressMissing,
+			"AiKey: no upstream address for provider "+route.ProviderCode+
+				". A custom provider is not in the built-in provider table, so it has no default address and must carry its own. "+
+				"Fix: open the console → Provider Accounts → this credential → set Base URL (for example https://your-relay.example.com/v1), then re-run `aikey use`.")
+		return
 	}
 
 	// 9. Build and execute reverse proxy.

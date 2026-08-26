@@ -94,10 +94,8 @@ func CanonicalProtocol(protocol string) string {
 // when protocolHint is missing or invalid; silently choosing their first YAML
 // row would make routing depend on row order.
 //
-// The single-protocol and legacy-bare-host fallbacks serve ONLY legacy
-// credentials whose protocol_type predates the two-axis model and is therefore
-// EMPTY. A non-empty hint the table just refused is never "corrected" to the
-// provider's own protocol — see the gate below.
+// The single-protocol fallback keeps legacy credentials (whose protocol_type
+// predates the two-axis model and may therefore be empty) working.
 func ProtocolFamily(providerCode, protocolHint string) (string, bool) {
 	providerCode = CanonicalCode(providerCode)
 	protocolHint = CanonicalProtocol(protocolHint)
@@ -105,37 +103,6 @@ func ProtocolFamily(providerCode, protocolHint string) (string, bool) {
 		return route.Protocol, true
 	}
 	protocols := Routes().ProtocolsForProvider(providerCode)
-	// 2026-08-25 (custom third-party providers — bugfix
-	// 2026-08-25-custom-provider-protocolfamily-failclosed-502): a provider with
-	// ZERO matrix rows is a console-registered custom provider ("第三方供应商",
-	// e.g. an OpenAI-compatible relay or a local Ollama/vLLM). The matrix has no
-	// opinion about it, and master's validateProviderProtocol deliberately waves
-	// it through on exactly that reasoning ("custom — can't validate, allow",
-	// aikey-control-master service/internal/provider/service.go). Failing closed
-	// here made every such credential create+sync fine and then 502 on the
-	// member's first request. Trust the EXPLICITLY declared protocol instead —
-	// but only when it belongs to the table's protocol vocabulary, so a
-	// garbage/typo hint still fails closed rather than reaching the adapter
-	// registry as an unroutable protocol. Known providers are untouched: an
-	// illegal (known provider, protocol) pair still fails right here.
-	if len(protocols) == 0 && protocolHint != "" &&
-		len(Routes().ProvidersForProtocol(protocolHint)) > 0 {
-		return protocolHint, true
-	}
-	// 2026-08-25 (bugfix 2026-08-25-protocolfamily-swallows-wrong-nonempty-hint):
-	// everything below this gate is LEGACY fallback for credentials whose
-	// protocol_type predates the two-axis model and is therefore EMPTY. A
-	// non-empty hint that reaches here was just REFUSED by the table (illegal
-	// pair for a known provider, or vocabulary-unknown protocol for a custom
-	// one). Silently "correcting" it — single-protocol providers via the len==1
-	// branch, multi-protocol providers via the bare-host legacy answer — is the
-	// same silent-misroute class the 2026-07-24 axes split exists to kill: the
-	// binding SAYS one wire dialect and the proxy would speak another. Fail
-	// closed instead; the caller's error names the declared protocol so the
-	// operator fixes the credential, not the symptom.
-	if protocolHint != "" {
-		return "", false
-	}
 	if len(protocols) == 1 {
 		return protocols[0], true
 	}
@@ -158,6 +125,79 @@ func ProtocolFamily(providerCode, protocolHint string) (string, bool) {
 	// a provider with no protocol-less era should surface the bug rather than
 	// have one guessed for it.
 	return Routes().LegacyProtocolForProvider(providerCode)
+}
+
+// ProtocolFamilyForCredential answers a DIFFERENT question from ProtocolFamily,
+// which is why it is a second function and not a flag on the first one.
+//
+//	ProtocolFamily              — "what protocol does the routing table say this
+//	                               provider speaks?"
+//	ProtocolFamilyForCredential — "this credential DECLARES a protocol; may that
+//	                               declaration stand as the answer?"
+//
+// # Why this exists (2026-08-25)
+//
+// The console's third-party mode lets an administrator register a custom
+// provider code with a hand-typed base_url (that dialog's own help text
+// recommends it for Ollama / LM Studio / vLLM), and master deliberately waves
+// such a provider through — see aikey-control-master
+// internal/provider/service.go validateProviderProtocol, whose test asserts
+// "custom provider absent from matrix — allowed". The Rust CLI agrees:
+// client_route_for_binding falls back to the protocol's client surface for an
+// unknown provider. The proxy was the only one of the three that failed closed,
+// so every such credential could be created, displayed as a working channel,
+// and then answered 502 on the first request.
+//
+// The requirement spec never said which of the two behaviours was right —
+// see 「自定义第三方供应商」 in
+// workflow/CI/requirements/2026-07-18-provider-protocol-compatibility-and-baseurl.md,
+// added with this change. The rule it now states: a provider ABSENT from the
+// routing table has no table row to contradict it, so its credential's own
+// protocol_type is the truth.
+//
+// bugfix: workflow/CI/bugfix/20260825-custom-thirdparty-provider-axes-rejected.md (regression: make -C aikey-proxy test-bugfix-custom-provider-axes)
+//
+// # Why widening here is not a hole in the compatibility matrix
+//
+// Three conditions must all hold, and each one closes a distinct escape:
+//
+//  1. the provider must be ABSENT from the table — a provider that HAS rows is
+//     still judged by them, so zhipu+gemini stays rejected;
+//  2. the declaration must be non-empty — an empty protocol_type carries no
+//     information, so it keeps failing closed exactly as before;
+//  3. the declared protocol must be one the table's rows actually use, so a
+//     typo or an invented protocol is refused here rather than deeper in.
+//
+// ⚠️ Condition 3 is a VOCABULARY check, not an "an adapter exists" check — the
+// two are not the same. `gemini` is in the vocabulary (google has rows) while
+// the proxy ships no gemini adapter, so a custom provider declaring `gemini` is
+// admitted here and then refused by Registry.Get with
+// `unknown provider protocol "gemini"`. That is deliberate: it is EXACTLY what
+// `google` + `gemini` does today, and making custom providers stricter than the
+// vendor whose protocol they borrow would be its own inconsistency. See the
+// gemini note in provider_registry.yaml for why the row outlives the adapter.
+//
+// 🚫 Do NOT use this for the client-route half of an axes check. That question
+// is "can this client surface carry this protocol", and answering it with the
+// caller's own declaration makes it self-satisfying — see the note at the
+// second ProtocolFamily call in proxy/binding_axes.go.
+func ProtocolFamilyForCredential(providerCode, declaredProtocol string) (string, bool) {
+	if fam, ok := ProtocolFamily(providerCode, declaredProtocol); ok {
+		// Known provider: byte-identical to the strict path, including its
+		// legacy/single-protocol fallbacks.
+		return fam, true
+	}
+	protocol := CanonicalProtocol(declaredProtocol)
+	if protocol == "" {
+		return "", false // condition 2
+	}
+	if len(Routes().ProtocolsForProvider(CanonicalCode(providerCode))) > 0 {
+		return "", false // condition 1: the table has rows for it, so the table decides
+	}
+	if len(Routes().ProvidersForProtocol(protocol)) == 0 {
+		return "", false // condition 3: no row anywhere speaks it, so no adapter does either
+	}
+	return protocol, true
 }
 
 // FamilyOf exposes the registry's provider family (e.g. kimi_code and

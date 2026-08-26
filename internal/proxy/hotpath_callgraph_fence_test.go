@@ -60,9 +60,9 @@ const hotPathEntry = "internal/proxy::Proxy.Handle"
 // package names teaches nobody why they are on it.
 var forbiddenImports = map[string]string{
 	"github.com/AiKeyLabs/aikey-license-core": "PLANE-01 / MOD-16: 热路径无 licensing import. " +
-		"A license evaluation on the forwarding path means every request pays for it, and a " +
+		"A licence evaluation on the forwarding path means every request pays for it, and a " +
 		"licensing failure becomes a forwarding outage — design D3.1 puts authorization off " +
-		"this path precisely so that a license problem degrades the control plane and not the " +
+		"this path precisely so that a licence problem degrades the control plane and not the " +
 		"customer's traffic",
 }
 
@@ -170,35 +170,71 @@ const dbReason = "PLANE-01: 热路径无 DB 调用. A query per request couples 
 // conservatism is the point — it is what keeps the crash-dump and WAL lines
 // above visible too. Whoever adjudicates PLANE-01 should decide these three as a
 // group with them, not wave them through on the goroutine alone.
+// # 🔴 The 2026-08-25 adjudication: six lines out, five in
+//
+// Two commits moved file I/O around without touching this baseline and the fence
+// went red on the difference. Every one of the five new entries was traced to the
+// chain the walk actually takes BEFORE it was written down here; the notes below
+// are what that tracing found, not what the names suggest.
+//
+// OUT — `signalReporter.persistAuthFailuresLocked|os.{MkdirAll,Remove,WriteFile}`.
+// The function is GONE (57109b7, 2026-08-19, OAuth 401-storm closure). The
+// auth-failure state it persisted moved into poolCooldownStore and now rides that
+// store's file as `poolCooldownFileBody.AuthFailedTokens`. Nothing in the module
+// declares it any more, so the three lines described code that does not exist.
+//
+// OUT — `poolCooldownStore.persistLocked|os.{MkdirAll,Remove,WriteFile}`, and this
+// one is a real IMPROVEMENT, not a rename. The same commit turned persistLocked
+// into a debounce: it bumps a revision, arms a 5 ms time.AfterFunc, and performs no
+// file I/O whatsoever. The write moved to writePersistenceSnapshot, which runs on
+// the timer goroutine. persistLocked is still reachable per request (Handle →
+// handleOauthGroupRoute → authFailureSkipSet → persistLocked); it simply no longer
+// touches the disk there. 🚫 Do NOT read the three lines added below as "the same
+// calls under a new name" — the request goroutine stopped writing, which is the
+// remedy PLANE-01 asks for.
+//
+// IN — `poolCooldownStore.writePersistenceSnapshot|os.{MkdirAll,Remove,WriteFile}`.
+// Its only production caller is OAuthPoolRuntimeState.Close
+// (internal/proxy/process_runtime_state.go), i.e. process shutdown, and
+// flushPersistence in between documents itself as a lifecycle/test barrier that may
+// block "because callers are process shutdown or persistence assertions, never
+// inference requests". The walk reaches it solely through the name-resolved `Close`
+// over-approximation: handleProbePipeline closes a response body, and every Close
+// METHOD in the module is a candidate. Recorded because the fence must account for
+// everything it finds — 🚫 not because a shutdown write is a request-path write.
+//
+// IN — `internal/events::LaneAllocator.For|os.Stat` and
+// `internal/events::loadSeqState|os.ReadFile`. These two are unlike everything
+// above: they ARE genuinely on the forwarding path. 769f0b1 (2026-08-22, usage-seq
+// lane split) made the sequence allocator per-recipient, and
+// events_and_helpers.go:607 calls `p.seqAlloc.Next(events.LaneOfOrg(route.OrgID))`
+// while serving a request. (The shortest chain the walk prints arrives via
+// `rows.Next()` in the vault reader — another name over-approximation — but the
+// real edge exists, and it is the one that decides this.)
+//
+// Their cost is bounded, and the bound is why they are recorded rather than
+// escalated: LaneAllocator.For caches allocators in `l.lanes`, so the Stat, the
+// legacy ReadFile and the seeding write run ONCE PER LANE — on the first request
+// that names a new org — not once per request. Their sibling on that same
+// cache-miss branch, `writeSeqStateAtomic|os.Remove`, has been in this list since
+// the fence was written (19f7360, 2026-08-11); the lane split simply added the two
+// halves that were missing.
+//
+// 🔴 Moving them off the request is a design change, not a cleanup: lanes are keyed
+// by org and orgs are discovered from traffic, so pre-warming means enumerating
+// orgs at start-up — a control-plane read this proxy deliberately does not do — or
+// accepting that the first request per org pays for its lane. That trade belongs to
+// whoever owns PLANE-01, which is exactly why this stays a record and not an
+// approval.
 var hotPathFileCalls = map[string]struct{}{
-	"internal/apphook::ChildHook.spawnLocked|os.Stat":        {},
-	"internal/events::ContentWAL.ensureFile|os.OpenFile":     {},
-	"internal/events::ContentWAL.evictBeyondCap|os.Remove":   {},
-	"internal/events::WALWriter.ensureFile|os.OpenFile":      {},
-	"internal/events::Reporter.deadLetterCompliance|os.Stat": {},
-	"internal/events::deadLetterWriter.counts|os.ReadFile":   {},
-	"internal/events::deadLetterWriter.write|os.OpenFile":    {},
-	// ── seq lane allocator (769f0b1 "usage-seq stream split by recipient") ──
-	//
-	// 🚫 Recorded, not approved — like every other line here.
-	//
-	// Both sit BEHIND a cache-miss guard: LaneAllocator.For returns the memoized
-	// *SeqAllocator on every hit and only reaches os.Stat / loadSeqState the FIRST
-	// time a given lane is seen in this process. Lanes are bounded and few (the
-	// method's own doc contrasts the personal lane with the team lane), so the
-	// disk cost is once per lane per process, not once per request. The walk
-	// cannot see that guard — it answers "can a request reach this code", not
-	// "does a request block on it" — which is the same conservatism that keeps the
-	// crash-dump and WAL lines visible, and the reason these are RECORDED here
-	// rather than waved through.
-	//
-	// ⚠️ FOR WHOEVER ADJUDICATES: LaneAllocator.For holds l.mu across that I/O
-	// (os.Stat + loadSeqState + writeSeqStateAtomic + NewSeqAllocator). A first-
-	// sighting of one lane therefore blocks allocation on EVERY other lane,
-	// including cache hits. Bounded by the lane count, so it is not a per-request
-	// cost — but it is a lock-scope question that came in with this change and has
-	// not been reviewed by its author.
+	"internal/apphook::ChildHook.spawnLocked|os.Stat":                         {},
+	"internal/events::ContentWAL.ensureFile|os.OpenFile":                      {},
+	"internal/events::ContentWAL.evictBeyondCap|os.Remove":                    {},
+	"internal/events::WALWriter.ensureFile|os.OpenFile":                       {},
 	"internal/events::LaneAllocator.For|os.Stat":                              {},
+	"internal/events::Reporter.deadLetterCompliance|os.Stat":                  {},
+	"internal/events::deadLetterWriter.counts|os.ReadFile":                    {},
+	"internal/events::deadLetterWriter.write|os.OpenFile":                     {},
 	"internal/events::loadSeqState|os.ReadFile":                               {},
 	"internal/events::writeSeqStateAtomic|os.Remove":                          {},
 	"internal/observability::writeCrashDump|os.MkdirAll":                      {},
@@ -492,8 +528,8 @@ func TestThisModuleDoesNotDependOnLicensingAtAll(t *testing.T) {
 	for banned := range forbiddenImports {
 		if strings.Contains(body, banned) {
 			t.Errorf("🔴 go.mod requires %q. MOD-16 and PLANE-01 both rest on the forwarding "+
-				"process not knowing what a license is; once the module can resolve it, only "+
-				"the call-graph walk stands between a license check and the request path.", banned)
+				"process not knowing what a licence is; once the module can resolve it, only "+
+				"the call-graph walk stands between a licence check and the request path.", banned)
 		}
 	}
 	// 🔴 NON-VACUITY: the file really was read and really is a go.mod.
@@ -633,15 +669,6 @@ func receiverType(expr ast.Expr) string {
 
 // reachableFrom walks the call graph, following every callee NAME it can resolve
 // inside this module.
-//
-// entry stays a parameter even though every current caller passes hotPathEntry:
-// the entry point is the axis this walker exists to model, and the fences below
-// read as "what is reachable FROM x" precisely because x is named at the call
-// site. Collapsing it to the constant to satisfy unparam would hard-wire the
-// walker to one entry and delete the knob a future second plane (supervisor,
-// admin surface) needs.
-//
-//nolint:unparam // deliberate: see above
 func (g *moduleGraph) reachableFrom(entry string) map[string]struct{} {
 	reached := map[string]struct{}{}
 	queue := []string{entry}

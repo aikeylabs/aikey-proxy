@@ -47,19 +47,21 @@ func normalizeBindingForClientRoute(binding *vault.ProviderBinding, requestedCli
 		return nil, fmt.Errorf("binding has no upstream provider")
 	}
 
+	// 2026-08-25: ForCredential, not the strict ProtocolFamily. This binding is a
+	// STORED CREDENTIAL, so a provider the routing table has never heard of is a
+	// custom third-party provider the console deliberately allowed (its own
+	// third-party dialog recommends the flow for Ollama / LM Studio / vLLM), and
+	// its declared protocol_type is the only truth there is. The strict function
+	// rejected every one of them, which is why such a credential could be created
+	// and shown as a live channel yet 502 on the first request. See the long note
+	// on ProtocolFamilyForCredential for the three conditions that keep this from
+	// widening the matrix for providers the table DOES know.
+	// bugfix: workflow/CI/bugfix/20260825-custom-thirdparty-provider-axes-rejected.md (regression: make -C aikey-proxy test-bugfix-custom-provider-axes)
 	protocolHint := provider.CanonicalProtocol(resolved.ProtocolType)
-	protocolType, ok := provider.ProtocolFamily(resolved.ProviderCode, protocolHint)
+	protocolType, ok := provider.ProtocolFamilyForCredential(resolved.ProviderCode, protocolHint)
 	if !ok {
 		if protocolHint == "" {
 			return nil, fmt.Errorf("provider %q requires an explicit protocol_type", resolved.ProviderCode)
-		}
-		// Distinguish the two remaining fail-closed shapes so the error points at
-		// what the operator can actually change (2026-08-25): a KNOWN provider
-		// carrying a protocol the matrix declares illegal for it, vs a CUSTOM
-		// provider (zero matrix rows) whose declared protocol is not a protocol
-		// this build recognizes at all.
-		if len(provider.Routes().ProtocolsForProvider(provider.CanonicalCode(resolved.ProviderCode))) == 0 {
-			return nil, fmt.Errorf("custom provider %q declares unrecognized protocol_type %q; register the credential with a supported protocol (e.g. openai_compatible, anthropic)", resolved.ProviderCode, resolved.ProtocolType)
 		}
 		return nil, fmt.Errorf("provider %q does not support protocol_type %q", resolved.ProviderCode, resolved.ProtocolType)
 	}
@@ -68,6 +70,12 @@ func normalizeBindingForClientRoute(binding *vault.ProviderBinding, requestedCli
 	// A client route selects a wire contract, not the physical provider. This
 	// is what makes anthropic -> mock -> anthropic legal while still rejecting
 	// an OpenAI model routed into a Mock-Anthropic credential.
+	//
+	// 🚫 This half MUST keep using the strict ProtocolFamily. The question here is
+	// "does the CLIENT SURFACE carry this protocol", and the answer has to come
+	// from the table. Answering it with ProtocolFamilyForCredential would let an
+	// unknown client route confirm whatever protocol was handed to it — the check
+	// would return true for every input and stop rejecting anything.
 	if requested != "" {
 		requestedProtocol, routeOK := provider.ProtocolFamily(requested, protocolType)
 		if !routeOK || !strings.EqualFold(requestedProtocol, protocolType) {

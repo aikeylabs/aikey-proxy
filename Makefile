@@ -71,7 +71,7 @@ AIKEY_REQUIRE_NO_TEST_SKIPS ?= $(if $(ACD_PRESENT),1,0)
 # would skip them.
 PROXY_TEST_PKGS := ./internal/... ./cmd/aikey-proxy/
 
-.PHONY: build test test-bugfix-provider-routing test-bugfix-apphook-write-deadline test-pathprefix-matrix run install uninstall restart clean lint lint-full cross-compile sync-fingerprint sync-provider-registry sync-provider-data chaos-gap7 chaos-gap8 chaos filter-integration detector-sibling-build detector-sibling-absent-notice
+.PHONY: build test test-bugfix-provider-routing test-bugfix-custom-provider-axes test-bugfix-apphook-write-deadline test-pathprefix-matrix run install uninstall restart clean lint lint-full cross-compile sync-fingerprint sync-provider-registry sync-provider-data chaos-gap7 chaos-gap8 chaos filter-integration detector-sibling-build detector-sibling-absent-notice
 
 # v4.3 (2026-05-01): aikey-cli/data/provider_fingerprint.yaml is the single
 # source of truth for provider routing. The pkg/providerroutes Go package
@@ -144,6 +144,21 @@ test-bugfix-provider-routing: ## regression: OAuth Stitch + App/Probe axes + hea
 	go test -v -count=1 ./internal/supervisor/ -run 'Test(OAuthTokenToRoute_SetsOAuthSource|BuildManagedRoutes_PreservesBothMockProtocolBindings)'
 	go test -v -count=1 ./internal/admin/ -run 'TestProbeKey_UsesProviderRouteStitchForEveryVersionShape'
 	go test -v -count=1 ./internal/proxy/ -run 'Test(StitchOAuthRequestURL_OneProviderTableRule|Fence_OAuthBinding|Fence_Tier1OAuthRouteStitchesVersionExactlyOnce|Fence_CodexOAuth|GroupServe_(OAuthAccountInjectsBearer|MockCodexOAuthUsesRuntimeRailAndFingerprintVersion|MockOAuthMissingBaseURLFailsClosed|EmptyRouteProviderUsesAccountProvider)|AppPipeline_PreservesProviderAndUsesProtocolAdapter|ProbePipeline_PreservesProviderAndUsesProtocolAdapter|NormalizeBindingForClientRouteKeepsIndependentAxes)'
+
+# Regression fence for the 2026-08-25 defect: a CUSTOM third-party provider
+# (console → Provider Accounts → third-party mode, provider code typed by the
+# administrator) could be created and shown as a live channel, then answered
+# 502 `does not support protocol_type` on its first request. master and the Rust
+# CLI both allow such a provider on purpose; only the proxy failed closed, from
+# a7de5ac (2026-07-24) onward. The integration half drives the REAL handler
+# against an httptest upstream on the exact reported path (/openai/responses),
+# because the unit matrix alone cannot show the request reaching an upstream.
+# Evidence + root cause:
+# ../workflow/CI/bugfix/20260825-custom-thirdparty-provider-axes-rejected.md
+test-bugfix-custom-provider-axes: ## regression: custom third-party provider must route + probe (20260825)
+	go test -v -count=1 ./internal/provider/ -run 'TestProtocolFamilyForCredential'
+	go test -v -count=1 ./internal/proxy/ -run 'Test(NormalizeBindingForClientRouteKeepsIndependentAxes|CustomThirdPartyProvider)'
+	go test -v -count=1 ./internal/admin/ -run 'TestProbeKey_(CustomThirdPartyProviderIsProbeable|CustomProviderRejectsInventedProtocolAndMissingAddress|UsesProviderRouteStitchForEveryVersionShape)'
 
 # Registry-derived path-prefix routing matrix (2026-08-08). Every picker:true
 # provider in provider_registry.yaml is driven through the REAL proxy handler and
