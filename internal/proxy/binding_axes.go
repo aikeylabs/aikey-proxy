@@ -2,7 +2,6 @@ package proxy
 
 import (
 	"fmt"
-	"strings"
 
 	"github.com/AiKeyLabs/aikey-proxy/internal/provider"
 	"github.com/AiKeyLabs/aikey-proxy/internal/vault"
@@ -68,9 +67,16 @@ func normalizeBindingForClientRoute(binding *vault.ProviderBinding, requestedCli
 	// A client route selects a wire contract, not the physical provider. This
 	// is what makes anthropic -> mock -> anthropic legal while still rejecting
 	// an OpenAI model routed into a Mock-Anthropic credential.
+	//
+	// 🔴 2026-08-25: ClientRouteSupportsProtocol, NOT ProtocolFamily. Since
+	// ProtocolFamily learned to trust a custom provider's declared protocol, using
+	// it here would let a client route the table has never heard of confirm
+	// whatever protocol it was handed — the check would return true for every
+	// input and quietly stop rejecting anything. The relaxation belongs to the
+	// CREDENTIAL axis; the client surface is still the table's question alone.
+	// 需求规格 §11.4.
 	if requested != "" {
-		requestedProtocol, routeOK := provider.ProtocolFamily(requested, protocolType)
-		if !routeOK || !strings.EqualFold(requestedProtocol, protocolType) {
+		if !provider.ClientRouteSupportsProtocol(requested, protocolType) {
 			return nil, fmt.Errorf("client route %q does not support binding protocol_type %q", requested, protocolType)
 		}
 	}

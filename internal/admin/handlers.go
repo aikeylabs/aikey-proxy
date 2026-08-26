@@ -976,6 +976,26 @@ func newProviderProbeRequest(ctx context.Context, baseURL, providerCode, protoco
 	if err != nil {
 		return nil, err
 	}
+	// 🔴 2026-08-25: a CUSTOM third-party provider has no (provider, protocol)
+	// row, so the explicit stitch has no version segment to take and refuses
+	// outright — which is how a fully specified relay target still failed the
+	// probe after ProtocolFamily had already accepted its protocol. `aikey test`
+	// then reported a configuration error for an upstream the proxy can reach.
+	//
+	// Falling back to the degraded literal-prepend Stitch is not a workaround: it
+	// is what StitchForProviderProtocol's own contract prescribes for a private
+	// third-party gateway, and it is byte-identical to what serveRoute composes
+	// when it FORWARDS the same credential. 需求规格 2026-07-18 §上游地址单一解析
+	// 规则 2（展示=执行）requires exactly that agreement between the probe and the
+	// forward path; refusing here broke it in the most misleading direction.
+	// Fence: TestProbeKey_CustomThirdPartyProviderIsProbeable
+	//        (make -C aikey-proxy test-bugfix-custom-provider-axes)
+	if _, rowKnown := providerreg.Routes().ByProviderProtocol(providerCode, protocolType); !rowKnown {
+		if err := providerreg.Routes().Stitch(req, baseURL); err != nil {
+			return nil, err
+		}
+		return req, nil
+	}
 	if err := providerreg.Routes().StitchForProviderProtocol(req, baseURL, providerCode, protocolType); err != nil {
 		return nil, err
 	}
