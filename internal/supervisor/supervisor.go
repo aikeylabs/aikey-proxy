@@ -1103,6 +1103,14 @@ func (s *Supervisor) syncManagedKeys() {
 	}
 
 	totalRoutes := s.rebuildRouteRegistry(gen)
+	// A Cluster material-only refresh advances vault.change_seq and replaces
+	// group_runtime, but legitimately leaves assignment_override unchanged.
+	// refreshClusterRoutingOverrides therefore has no assignment change to wake
+	// the projection worker for. Re-stamp after every consumed vault snapshot so
+	// the externally visible current_routed flag is rebuilt from the same fresh
+	// material, assignment and process-wide cooldown/tombstone truth as the hot
+	// path. The kick is non-blocking; SQLite work never joins this sync caller.
+	s.requestCurrentRoutedRestamp()
 
 	// Quota rules ride the same vault-seq advance (design §0.5/§5.2). This is
 	// strictly after the managed-key path above and fully fault-isolated (gated
