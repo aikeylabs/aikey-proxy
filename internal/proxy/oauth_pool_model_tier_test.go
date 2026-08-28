@@ -50,8 +50,8 @@ func TestAnthropicTierOnlyLimit(t *testing.T) {
 
 	// tier window exhausted alone → tier-only, cooled until the 7d_oi reset.
 	h := http.Header{
-		"Anthropic-Ratelimit-Unified-7d_oi-Status": {"rejected"},
-		"Anthropic-Ratelimit-Unified-7d_oi-Reset":  {strconv.FormatInt(reset.Unix(), 10)},
+		"Anthropic-Ratelimit-Unified-7d_oi-Status":   {"rejected"},
+		"Anthropic-Ratelimit-Unified-7d_oi-Reset":    {strconv.FormatInt(reset.Unix(), 10)},
 		"Anthropic-Ratelimit-Unified-5h-Utilization": {"0.4"},
 	}
 	until, tier, ok := anthropicTierOnlyLimit(h, now)
@@ -92,9 +92,9 @@ func TestAnthropicTierOnlyLimit(t *testing.T) {
 
 func TestUnknownExhaustedWindows(t *testing.T) {
 	h := http.Header{
-		"Anthropic-Ratelimit-Unified-5h-Utilization":   {"1.0"},   // known
-		"Anthropic-Ratelimit-Unified-7d_oi-Status":     {"rejected"}, // known tier
-		"Anthropic-Ratelimit-Unified-9d_x-Utilization": {"1.0"},   // future window → surfaced
+		"Anthropic-Ratelimit-Unified-5h-Utilization":   {"1.0"},          // known
+		"Anthropic-Ratelimit-Unified-7d_oi-Status":     {"rejected"},     // known tier
+		"Anthropic-Ratelimit-Unified-9d_x-Utilization": {"1.0"},          // future window → surfaced
 		"Anthropic-Ratelimit-Unified-Status":           {"rate_limited"}, // aggregate → ignored
 	}
 	got := unknownExhaustedWindows(h)

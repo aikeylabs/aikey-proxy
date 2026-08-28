@@ -198,21 +198,16 @@ var hotPathFileCalls = map[string]struct{}{
 	// including cache hits. Bounded by the lane count, so it is not a per-request
 	// cost — but it is a lock-scope question that came in with this change and has
 	// not been reviewed by its author.
-	"internal/events::LaneAllocator.For|os.Stat":                              {},
-	"internal/events::loadSeqState|os.ReadFile":                               {},
-	"internal/events::writeSeqStateAtomic|os.Remove":                          {},
-	"internal/observability::writeCrashDump|os.MkdirAll":                      {},
-	"internal/observability::writeCrashDump|os.WriteFile":                     {},
-	"internal/proxy::groupLoginStateStore.Clear|os.Remove":                    {},
-	"internal/proxy::groupLoginStateStore.Write|os.MkdirAll":                  {},
-	"internal/proxy::groupLoginStateStore.Write|os.WriteFile":                 {},
-	"internal/proxy::lastErrorsRing.persist|os.MkdirAll":                      {},
-	"internal/proxy::lastErrorsRing.persist|os.WriteFile":                     {},
-	"internal/proxy::poolCooldownStore.writePersistenceSnapshot|os.MkdirAll":  {},
-	"internal/proxy::poolCooldownStore.writePersistenceSnapshot|os.Remove":    {},
-	"internal/proxy::poolCooldownStore.writePersistenceSnapshot|os.WriteFile": {},
-	"internal/proxy::writeCodexLastModel|os.MkdirAll":                         {},
-	"internal/proxy::writeCodexLastModel|os.Remove":                           {},
+	"internal/events::LaneAllocator.For|os.Stat":              {},
+	"internal/events::loadSeqState|os.ReadFile":               {},
+	"internal/events::writeSeqStateAtomic|os.Remove":          {},
+	"internal/observability::writeCrashDump|os.MkdirAll":      {},
+	"internal/observability::writeCrashDump|os.WriteFile":     {},
+	"internal/proxy::groupLoginStateStore.Clear|os.Remove":    {},
+	"internal/proxy::groupLoginStateStore.Write|os.MkdirAll":  {},
+	"internal/proxy::groupLoginStateStore.Write|os.WriteFile": {},
+	"internal/proxy::writeCodexLastModel|os.MkdirAll":         {},
+	"internal/proxy::writeCodexLastModel|os.Remove":           {},
 }
 
 // TestTheForwardingHotPathTouchesNoLicensingFileOrDatabase is MOD-16 + PLANE-01.

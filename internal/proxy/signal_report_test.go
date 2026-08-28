@@ -549,6 +549,47 @@ func TestEnableOrgSignalReporting_UsesClusterServiceEndpointAndToken(t *testing.
 	}
 }
 
+func TestEnableOrgSignalReporting_PostsObservedResetSnapshotOnShutdown(t *testing.T) {
+	t.Setenv("AIKEY_RUN_DIR", t.TempDir())
+	posted := make(chan []byte, 1)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+		body, _ := io.ReadAll(req.Body)
+		posted <- body
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer srv.Close()
+	p := &Proxy{sourceID: "cluster-node-1", poolCooldown: newPoolCooldownStore(), poolObservedResets: newPoolResetStore()}
+	p.poolObservedResets.recordRoute("account-1", "credential-1", ObservedWindowResets{FiveHour: 2_000, SevenDay: 8_000})
+	p.EnableOrgSignalReporting(srv.URL, "org-1", "svc-token")
+	p.StopSignalReporting()
+
+	select {
+	case body := <-posted:
+		var decoded struct {
+			Observed []observedWindowResetSample `json:"observed_window_resets"`
+		}
+		if err := json.Unmarshal(body, &decoded); err != nil {
+			t.Fatal(err)
+		}
+		want := observedWindowResetSample{CredentialID: "credential-1", WindowResetAt: 2_000, Window7dResetAt: 8_000}
+		if len(decoded.Observed) != 1 || decoded.Observed[0] != want {
+			t.Fatalf("Cluster observed reset wire drifted: body=%s decoded=%+v", body, decoded.Observed)
+		}
+	default:
+		t.Fatal("shutdown reconcile did not post Cluster observed reset snapshot")
+	}
+}
+
+func TestEnableSignalReporting_DoesNotDuplicateMemberPathZResetWriter(t *testing.T) {
+	t.Setenv("AIKEY_RUN_DIR", t.TempDir())
+	p := &Proxy{sourceID: "member-proxy", poolCooldown: newPoolCooldownStore(), poolObservedResets: newPoolResetStore()}
+	p.EnableSignalReporting("https://control.example.test", func(context.Context) (string, error) { return "jwt", nil })
+	defer p.StopSignalReporting()
+	if got := p.signalReporter.snapshotObservedWindowResets(); got != nil {
+		t.Fatalf("member reporter gained a second Path-Z writer: %+v", got)
+	}
+}
+
 func TestSignalReportingHealthSnapshotSurfacesMissingWiring(t *testing.T) {
 	p := &Proxy{}
 	health := p.SignalReportingHealthSnapshot()
@@ -705,6 +746,65 @@ func TestSignalPostSendsRateLimits(t *testing.T) {
 	}
 	if len(decoded.RateLimits) != 1 || decoded.RateLimits[0] != (rateLimitSample{CredentialID: "c3", Count: 5, WindowSecs: 30}) {
 		t.Fatalf("decoded rate_limits = %+v, want one {c3,5,30}", decoded.RateLimits)
+	}
+}
+
+func TestSignalPostSendsWindowStatusSnapshot(t *testing.T) {
+	got := make(chan []byte, 1)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+		body, _ := io.ReadAll(req.Body)
+		got <- body
+	}))
+	defer srv.Close()
+
+	r := newSignalReporterEndpoint(srv.URL, "worker-1", func(context.Context) (string, error) {
+		return "test-token", nil
+	}, nil)
+	defer func() { _ = r.Close() }()
+	windows := []windowStatusSample{{
+		CredentialID: "cred-1", WindowStatus: windowStatusExhausted, WindowResetAt: 1_900_000_000,
+		Window7dStatus: windowStatusExhausted, Window7dResetAt: 1_900_500_000,
+	}}
+	if ok, detail := r.uploadAll(nil, nil, nil, nil, nil, nil, windows); !ok {
+		t.Fatalf("window status upload failed: %s", detail)
+	}
+	var decoded struct {
+		WindowStatuses []windowStatusSample `json:"window_statuses"`
+	}
+	if err := json.Unmarshal(<-got, &decoded); err != nil {
+		t.Fatal(err)
+	}
+	if len(decoded.WindowStatuses) != 1 || decoded.WindowStatuses[0] != windows[0] {
+		t.Fatalf("window status wire drifted: %+v", decoded.WindowStatuses)
+	}
+}
+
+func TestSignalReporter_WindowSnapshotSuccessIsNotPendingWork(t *testing.T) {
+	posted := make(chan struct{}, 1)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+		posted <- struct{}{}
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer srv.Close()
+
+	r := newSignalReporterEndpoint(srv.URL, "worker-1", func(context.Context) (string, error) {
+		return "test-token", nil
+	}, nil)
+	r.setWindowStatusSource(func() []windowStatusSample {
+		return []windowStatusSample{{
+			CredentialID: "cred-1", WindowStatus: windowStatusExhausted, WindowResetAt: time.Now().Add(time.Hour).Unix(),
+		}}
+	})
+	if err := r.Close(); err != nil {
+		t.Fatalf("close reporter: %v", err)
+	}
+	select {
+	case <-posted:
+	default:
+		t.Fatal("shutdown flush did not post the live window snapshot")
+	}
+	if health := r.healthSnapshot(); health.PendingSignals != 0 || health.Status != "healthy" {
+		t.Fatalf("successful reconcile snapshot remained pending: %+v", health)
 	}
 }
 

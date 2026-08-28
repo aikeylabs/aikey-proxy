@@ -138,7 +138,7 @@ func MaterialUsable(mat GroupRuntimeAccount, nowUnix int64) bool {
 	if mat.ExpiresAt > 0 && mat.ExpiresAt <= nowUnix {
 		return false // access_token expired (refresh is master's job — N7b)
 	}
-	if MaterialWindowExhausted(mat) {
+	if MaterialWindowBlockedAt(mat, nowUnix) {
 		return false // oauth-group quota window used up — route around it
 	}
 	return true
@@ -153,6 +153,26 @@ func WindowExhausted(status string) bool {
 
 func MaterialWindowExhausted(mat GroupRuntimeAccount) bool {
 	return WindowExhausted(mat.WindowStatus) || WindowExhausted(mat.Window7dStatus)
+}
+
+// MaterialWindowBlockedAt applies an exhausted status only until that same
+// window's authoritative reset. Master snapshots are eventually consistent:
+// after reset_at, the old exhausted value can still be present in a Worker's
+// group_runtime cache. Allowing one lazy half-open request at that boundary is
+// what observes the provider's new window and lets Path Z converge Master back
+// to active. A legacy exhausted value without a reset stays fail-closed.
+//
+// Contract: workflow/CI/bugfix/2026-08-27-oauth-pool-quota-state-convergence.md
+func MaterialWindowBlockedAt(mat GroupRuntimeAccount, nowUnix int64) bool {
+	return exhaustedWindowBlocksAt(mat.WindowStatus, mat.WindowResetAt, nowUnix) ||
+		exhaustedWindowBlocksAt(mat.Window7dStatus, mat.Window7dResetAt, nowUnix)
+}
+
+func exhaustedWindowBlocksAt(status string, resetAt *int64, nowUnix int64) bool {
+	if !WindowExhausted(status) {
+		return false
+	}
+	return resetAt == nil || *resetAt <= 0 || nowUnix < *resetAt
 }
 
 // MaterialExpired reports whether an OAuth account's material is stale

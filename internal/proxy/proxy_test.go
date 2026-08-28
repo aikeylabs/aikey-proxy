@@ -103,10 +103,28 @@ func setupTestProxyWithStore(t *testing.T, upstreamURL string, store events.Even
 	t.Cleanup(func() { collector.Close() })
 
 	p := New(v, registry, providers, collector, context.Background())
-	// poolCooldown persistence is intentionally asynchronous in production.
-	// Drain it before t.TempDir cleanup so a late atomic rename cannot recreate a
-	// file while the testing package removes the per-test run directory.
-	t.Cleanup(func() { p.poolCooldown.flushPersistence() })
+	// poolCooldown persistence is intentionally asynchronous in production, so
+	// teardown has to RETIRE the writer, not just flush it (2026-08-28).
+	// flushPersistence() writes once and leaves the construction-time
+	// persistenceLoop goroutine alive; a switch inside the test arms persistWake,
+	// the loop's coalescing window expires AFTER the test body returns, and its
+	// atomic rename recreates a file inside the directory testing is already
+	// removing → "TempDir RemoveAll cleanup: directory not empty", a 10-20%
+	// flake in TestGroupServe_FallbackAttributesToServedAccount.
+	// closePersistence is what production's OAuthPoolRuntimeState.Shutdown uses:
+	// stop the loop, wait for persistDone, then flush. It is idempotent
+	// (sync.Once), so it is safe here even if the proxy shut itself down first.
+	// poolCooldown persistence is intentionally asynchronous in production: a
+	// construction-time writer goroutine coalesces mutations and does the file
+	// I/O. flushPersistence() only does ONE synchronous write — it does NOT stop
+	// that goroutine, so a mark late in the test body leaves the writer inside its
+	// 5ms coalescing window; its atomic rename then fires DURING t.TempDir's
+	// RemoveAll and recreates the file → "unlinkat … directory not empty" teardown
+	// flake (~10-20%, 2026-08-28). closePersistence() retires the writer (waits
+	// persistDone) THEN flushes, so no write can race the run-dir removal. Every
+	// group/window/fallback test funnels through here, so this one line fixes them
+	// all. Ref: bugfix/2026-08-28-pool-cooldown-persist-goroutine-tempdir-teardown-race.md
+	t.Cleanup(func() { p.poolCooldown.closePersistence() })
 	return p
 }
 

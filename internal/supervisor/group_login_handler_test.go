@@ -476,7 +476,7 @@ func TestPoolSessionKey_CancelZerosAndRemovesPendingToken(t *testing.T) {
 	}
 }
 
-func TestPoolSessionKey_IdentityMismatchRequiresSecondConfirmationBeforeWriteback(t *testing.T) {
+func TestPoolSessionKey_IdentityMismatchFailsClosedWithoutWriteback(t *testing.T) {
 	var (
 		gotWB      memberTokenWriteback
 		writebacks atomic.Int32
@@ -509,45 +509,44 @@ func TestPoolSessionKey_IdentityMismatchRequiresSecondConfirmationBeforeWritebac
 	}
 	const operationID = "99998888777766665555444433332222"
 	w := doJSON(h.sessionKey, `{"credential_id":"c1","session_key":"sk-ant-sid02-fixture-value-long-enough","operation_id":"`+operationID+`"}`)
-	if w.Code != http.StatusOK || !strings.Contains(w.Body.String(), `"status":"pending"`) || !strings.Contains(w.Body.String(), `"identity_mismatch":true`) {
+	if w.Code != http.StatusConflict || !strings.Contains(w.Body.String(), broker.ErrCodeSessionKeyIdentityMismatch) {
 		t.Fatalf("identity mismatch: %d %s", w.Code, w.Body.String())
 	}
-	if token.AccessToken == "" || token.RefreshToken == "" {
-		t.Fatal("first warning must retain token only in the pending in-memory operation")
+	if token.AccessToken != "" || token.RefreshToken != "" {
+		t.Fatal("rejected mismatch must zero exchanged token material immediately")
 	}
-	if _, ok := h.sessionKeyPending.Load(operationID); !ok {
-		t.Fatal("identity mismatch must create a confirmable pending operation")
+	if _, ok := h.sessionKeyPending.Load(operationID); ok {
+		t.Fatal("identity mismatch must not create a confirmable pending operation")
 	}
 	if writebacks.Load() != 0 {
 		t.Fatalf("first warning must not write to master, got %d", writebacks.Load())
 	}
 
-	confirm := doJSON(h.sessionKey, `{"credential_id":"c1","operation_id":"`+operationID+`","confirm":true}`)
-	if confirm.Code != http.StatusConflict || !strings.Contains(confirm.Body.String(), broker.ErrCodeSessionKeyIdentityMismatch) {
-		t.Fatalf("first confirm without mismatch acknowledgement: %d %s", confirm.Code, confirm.Body.String())
+	if gotWB.CredentialID != "" {
+		t.Fatalf("mismatch reached Master writeback: %+v", gotWB)
 	}
-	if writebacks.Load() != 0 {
-		t.Fatalf("unacknowledged mismatch must not write to master, got %d", writebacks.Load())
-	}
-	if _, ok := h.sessionKeyPending.Load(operationID); !ok {
-		t.Fatal("unacknowledged mismatch must remain retryable")
-	}
+}
 
-	confirmed := doJSON(h.sessionKey, `{"credential_id":"c1","operation_id":"`+operationID+`","confirm":true,"identity_mismatch_confirmed":true}`)
-	if confirmed.Code != http.StatusOK || !strings.Contains(confirmed.Body.String(), `"identity_mismatch":true`) {
-		t.Fatalf("second confirm: %d %s", confirmed.Code, confirmed.Body.String())
+func TestPoolBrowserOAuth_IdentityMismatchFailsClosedWithoutWriteback(t *testing.T) {
+	ex := &fakePoolExchanger{
+		accountID: "provider-account", access: "ACCESS", refresh: "REFRESH", expiresAt: 100,
+		externalID: "wrong-uuid", identity: "wrong@team.com",
 	}
-	if writebacks.Load() != 1 {
-		t.Fatalf("second confirm must write exactly once, got %d", writebacks.Load())
+	h := newPoolHandler(t, ex, "http://master.invalid")
+	h.sessions.Store("sess-1", poolSession{
+		credentialID: "c1", oauthGroupID: "g1", accountID: "a1",
+		providerCode: "anthropic", protocolType: "anthropic",
+		expectedIdentity: "member@team.com", externalID: "expected-uuid", createdAt: time.Now(),
+	})
+	w := doJSON(h.submitCode, `{"session_id":"sess-1","code":"one-shot-code","confirm":false}`)
+	if w.Code != http.StatusConflict || !strings.Contains(w.Body.String(), broker.ErrCodeSessionKeyIdentityMismatch) {
+		t.Fatalf("browser mismatch: %d %s", w.Code, w.Body.String())
 	}
-	if gotWB.ExternalID != "wrong-uuid" || gotWB.Identity != "wrong@team.com" || !gotWB.IdentityMismatch {
-		t.Fatalf("writeback must carry actual provider identity and mismatch acknowledgement: %+v", gotWB)
+	if ex.forgotN != 1 || ex.forgotSess != "sess-1" || ex.forgotAcct != "provider-account" {
+		t.Fatalf("mismatched browser token not consumed: %+v", ex)
 	}
-	if token.AccessToken != "" || token.RefreshToken != "" {
-		t.Fatal("successful writeback must zero held token material")
-	}
-	if _, ok := h.sessionKeyPending.Load(operationID); ok {
-		t.Fatal("successful writeback must consume the pending operation")
+	if _, ok := h.sessions.Load("sess-1"); ok {
+		t.Fatal("mismatched browser session remained confirmable")
 	}
 }
 

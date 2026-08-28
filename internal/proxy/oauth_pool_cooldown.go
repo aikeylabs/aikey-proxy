@@ -76,6 +76,7 @@ const (
 	poolRouteRateLimited         = "rate_limited"
 	poolRouteAuthFailed          = "auth_failed"
 	poolRouteUpstreamUnavailable = "upstream_unavailable"
+	windowStatusExhausted        = "exhausted_current_window"
 )
 
 // PoolAccountRouteState is the display-safe projection of one whole-account
@@ -93,10 +94,13 @@ type PoolAccountRouteState struct {
 // lazily on read.
 type poolCooldownStore struct {
 	mu sync.Mutex
-	// persistTimer coalesces a burst of route-state mutations into one
-	// background snapshot. persistIO serializes timer and shutdown flushes. No
-	// filesystem operation is permitted while a request holds mu.
-	persistTimer      *time.Timer
+	// persistWake crosses the request/background boundary. Request-path
+	// mutations only publish a coalesced, non-blocking wake-up; the writer loop
+	// is started at construction and owns every scheduled filesystem call.
+	persistWake       chan struct{}
+	persistStop       chan struct{}
+	persistDone       chan struct{}
+	persistCloseOnce  sync.Once
 	persistWriting    bool
 	persistRevision   uint64
 	persistIO         sync.Mutex
@@ -104,7 +108,11 @@ type poolCooldownStore struct {
 	persistPath       string
 	m                 map[string]time.Time             // accountID → avoid-until (whole account)
 	meta              map[string]PoolAccountRouteState // accountID → display reason/recovery
-	now               func() time.Time                 // injectable clock (tests)
+	// windowStatuses is the replayable control-plane projection keyed by the
+	// local account id. It is persisted with the cooldown and re-reported while
+	// the provider reset is still in the future; routing never depends on it.
+	windowStatuses map[string]windowStatusSample
+	now            func() time.Time // injectable clock (tests)
 	// onAccountSetChanged is a best-effort notification that the WHOLE-ACCOUNT
 	// skip-set membership changed (enter cooldown or expire). The callback must be
 	// non-blocking: mark() runs on the request hot path. It is copied under mu and
@@ -161,7 +169,8 @@ type PoolAuthFailureState struct {
 func newPoolCooldownStore() *poolCooldownStore {
 	s := &poolCooldownStore{m: make(map[string]time.Time), now: time.Now,
 		meta: make(map[string]PoolAccountRouteState), serverErrStreak: make(map[string]int), tierM: make(map[string]time.Time),
-		authFailedTokens: make(map[string]string), lapsed: make(map[string]struct{})}
+		authFailedTokens: make(map[string]string), windowStatuses: make(map[string]windowStatusSample), lapsed: make(map[string]struct{}),
+		persistWake: make(chan struct{}, 1), persistStop: make(chan struct{}), persistDone: make(chan struct{})}
 	s.persistPath, _ = poolCooldownPath()
 	// Cross-restart persistence (2026-07-04 self-heal, §S4): without it a proxy
 	// restart forgot every cooldown and could immediately route traffic back
@@ -169,6 +178,7 @@ func newPoolCooldownStore() *poolCooldownStore {
 	// never a dependency (owner constraint): a missing/corrupt/unreadable file
 	// falls back to an empty store and the main link proceeds untouched.
 	s.hydrateFromFile()
+	go s.persistenceLoop()
 	return s
 }
 
@@ -202,6 +212,9 @@ type poolCooldownFileBody struct {
 	// The authoritative avoid-until remains Accounts; old files without this map
 	// continue to route correctly and simply render no explanatory status.
 	AccountStates map[string]PoolAccountRouteState `json:"account_states,omitempty"`
+	// WindowStatuses is an additive replay snapshot. Older proxies ignore it;
+	// upgraded proxies hydrate it only while the matching cooldown/reset is live.
+	WindowStatuses map[string]windowStatusSample `json:"window_statuses,omitempty"`
 	// AuthFailedTokens maps "oauthGroupID|seatID|accountID" to the fingerprint
 	// of the exact OAuth access token rejected as hard-revoked.
 	AuthFailedTokens map[string]string `json:"auth_failed_tokens,omitempty"`
@@ -249,6 +262,17 @@ func (s *poolCooldownStore) hydrateFromFile() {
 			loaded++
 		}
 	}
+	for accountID, state := range body.WindowStatuses {
+		until, cooling := s.m[accountID]
+		if !cooling || !now.Before(until) || state.CredentialID == "" {
+			continue
+		}
+		state = activeWindowStatusSample(state, now)
+		if state.WindowStatus == "" && state.Window7dStatus == "" {
+			continue
+		}
+		s.windowStatuses[accountID] = state
+	}
 	for key, untilUnix := range body.TierAccounts {
 		until := time.Unix(untilUnix, 0)
 		if key != "" && now.Before(until) {
@@ -269,34 +293,65 @@ func (s *poolCooldownStore) hydrateFromFile() {
 	}
 }
 
-// persistLocked schedules a coalesced snapshot and returns immediately. The
-// caller holds s.mu, often on the request path; it must never encode JSON or
-// touch the filesystem here. A 300-member 401 burst therefore creates one
-// background snapshot instead of 300 serialized temp-file rewrites.
+// persistLocked publishes one coalesced wake-up and returns immediately. The
+// caller holds s.mu, often on the request path; it must never encode JSON,
+// create a timer callback that reaches the writer, or touch the filesystem.
+// The construction-time writer loop is the explicit async boundary, so both
+// runtime behavior and the PLANE-01 call graph keep file I/O off Proxy.Handle.
 func (s *poolCooldownStore) persistLocked() {
 	s.persistRevision++
-	if s.persistTimer == nil && !s.persistWriting {
-		s.persistTimer = time.AfterFunc(5*time.Millisecond, s.persistScheduledSnapshot)
+	select {
+	case s.persistWake <- struct{}{}:
+	default:
+		// One pending wake already represents every newer in-memory revision.
 	}
 }
 
+func (s *poolCooldownStore) persistenceLoop() {
+	defer close(s.persistDone)
+	for {
+		select {
+		case <-s.persistWake:
+		case <-s.persistStop:
+			return
+		}
+
+		// Bound coalescing latency from the first mutation. Further wakes are
+		// drained during this window; a mutation after snapshot capture remains
+		// buffered and drives exactly one follow-up write.
+		timer := time.NewTimer(5 * time.Millisecond)
+	coalesce:
+		for {
+			select {
+			case <-s.persistWake:
+			case <-timer.C:
+				break coalesce
+			case <-s.persistStop:
+				if !timer.Stop() {
+					select {
+					case <-timer.C:
+					default:
+					}
+				}
+				return
+			}
+		}
+		s.persistScheduledSnapshot()
+	}
+}
+
+// persistScheduledSnapshot is called only by persistenceLoop, never by the
+// forwarding graph. It copies state under mu, then performs file I/O unlocked.
 func (s *poolCooldownStore) persistScheduledSnapshot() {
 	s.mu.Lock()
-	s.persistTimer = nil
 	s.persistWriting = true
 	revision := s.persistRevision
 	body := s.persistenceSnapshotLocked()
 	s.mu.Unlock()
 	s.writePersistenceSnapshot(body, revision)
 
-	// Mutations that arrive during a blocked write only advance the revision;
-	// they never spawn more writers. Once this write finishes, schedule exactly
-	// one coalesced snapshot for the newest state.
 	s.mu.Lock()
 	s.persistWriting = false
-	if s.persistRevision != revision && s.persistTimer == nil {
-		s.persistTimer = time.AfterFunc(5*time.Millisecond, s.persistScheduledSnapshot)
-	}
 	s.mu.Unlock()
 }
 
@@ -323,12 +378,21 @@ func (s *poolCooldownStore) persistenceSnapshotLocked() poolCooldownFileBody {
 			states[id] = state
 		}
 	}
+	windows := make(map[string]windowStatusSample, len(accounts))
+	for id := range accounts {
+		if state, ok := s.windowStatuses[id]; ok {
+			state = activeWindowStatusSample(state, now)
+			if state.WindowStatus != "" || state.Window7dStatus != "" {
+				windows[id] = state
+			}
+		}
+	}
 	authFailedTokens := make(map[string]string, len(s.authFailedTokens))
 	for id, fingerprint := range s.authFailedTokens {
 		authFailedTokens[id] = fingerprint
 	}
 	return poolCooldownFileBody{
-		Accounts: accounts, AccountStates: states, TierAccounts: tierAccounts,
+		Accounts: accounts, AccountStates: states, WindowStatuses: windows, TierAccounts: tierAccounts,
 		AuthFailedTokens: authFailedTokens, WrittenAt: time.Now().UnixMilli(),
 	}
 }
@@ -348,7 +412,7 @@ func (s *poolCooldownStore) writePersistenceSnapshot(body poolCooldownFileBody, 
 		return
 	}
 	var err error
-	if len(body.Accounts) == 0 && len(body.TierAccounts) == 0 && len(body.AuthFailedTokens) == 0 {
+	if len(body.Accounts) == 0 && len(body.TierAccounts) == 0 && len(body.AuthFailedTokens) == 0 && len(body.WindowStatuses) == 0 {
 		if rmErr := os.Remove(path); rmErr != nil && !os.IsNotExist(rmErr) {
 			slog.Warn("pool cooldown state file remove failed",
 				"event.name", observability.EventProxyGroupAccountCooldown, "error", rmErr.Error())
@@ -385,14 +449,24 @@ func (s *poolCooldownStore) flushPersistence() {
 		return
 	}
 	s.mu.Lock()
-	if s.persistTimer != nil {
-		s.persistTimer.Stop()
-		s.persistTimer = nil
-	}
 	body := s.persistenceSnapshotLocked()
 	revision := s.persistRevision
 	s.mu.Unlock()
 	s.writePersistenceSnapshot(body, revision)
+}
+
+// closePersistence retires the construction-time writer before the final
+// snapshot. Process shutdown is the only production caller; no request is
+// permitted beyond this lifecycle boundary.
+func (s *poolCooldownStore) closePersistence() {
+	if s == nil {
+		return
+	}
+	s.persistCloseOnce.Do(func() {
+		close(s.persistStop)
+		<-s.persistDone
+		s.flushPersistence()
+	})
 }
 
 // oauthTokenFingerprint returns a non-reversible identifier for one delivered
@@ -606,6 +680,13 @@ func (s *poolCooldownStore) mark(accountID string, until time.Time) {
 // account was already cooling, so a transient limit that becomes confirmed
 // window exhaustion is reflected without waiting for the next material pull.
 func (s *poolCooldownStore) markWithState(accountID string, until time.Time, state PoolAccountRouteState) {
+	s.markWithStateAndWindows(accountID, until, state, windowStatusSample{})
+}
+
+// markWithStateAndWindows atomically records routing cooldown, display cause
+// and the replayable Master projection under one local lock. The extra state is
+// best-effort metadata: request routing still depends only on m/accountID.
+func (s *poolCooldownStore) markWithStateAndWindows(accountID string, until time.Time, state PoolAccountRouteState, windows windowStatusSample) {
 	if accountID == "" {
 		return
 	}
@@ -618,6 +699,7 @@ func (s *poolCooldownStore) markWithState(accountID string, until time.Time, sta
 	cur, existed := s.m[accountID]
 	wasCooling := existed && now.Before(cur)
 	metaChanged := false
+	windowChanged := false
 	if !existed || until.After(cur) {
 		s.m[accountID] = until
 	}
@@ -630,14 +712,89 @@ func (s *poolCooldownStore) markWithState(accountID string, until time.Time, sta
 			metaChanged = true
 		}
 	}
-	if !existed || until.After(cur) || metaChanged {
+	if windows.CredentialID != "" {
+		windows = activeWindowStatusSample(windows, now)
+		if windows.WindowStatus != "" || windows.Window7dStatus != "" {
+			if s.windowStatuses == nil {
+				s.windowStatuses = make(map[string]windowStatusSample)
+			}
+			merged := mergeWindowStatusSample(s.windowStatuses[accountID], windows)
+			if prior, ok := s.windowStatuses[accountID]; !ok || prior != merged {
+				s.windowStatuses[accountID] = merged
+				windowChanged = true
+			}
+		}
+	}
+	if !existed || until.After(cur) || metaChanged || windowChanged {
 		s.persistLocked()
 	}
 	hook := s.onAccountSetChanged
 	s.mu.Unlock()
-	if (!wasCooling || metaChanged) && hook != nil {
+	if (!wasCooling || metaChanged || windowChanged) && hook != nil {
 		hook()
 	}
+}
+
+func activeWindowStatusSample(sample windowStatusSample, now time.Time) windowStatusSample {
+	if sample.WindowResetAt <= now.Unix() {
+		sample.WindowStatus = ""
+		sample.WindowResetAt = 0
+	}
+	if sample.Window7dResetAt <= now.Unix() {
+		sample.Window7dStatus = ""
+		sample.Window7dResetAt = 0
+	}
+	return sample
+}
+
+func mergeWindowStatusSample(current, incoming windowStatusSample) windowStatusSample {
+	if current.CredentialID == "" || current.CredentialID != incoming.CredentialID {
+		current = windowStatusSample{CredentialID: incoming.CredentialID}
+	}
+	if incoming.WindowStatus != "" && incoming.WindowResetAt >= current.WindowResetAt {
+		current.WindowStatus = incoming.WindowStatus
+		current.WindowResetAt = incoming.WindowResetAt
+	}
+	if incoming.Window7dStatus != "" && incoming.Window7dResetAt >= current.Window7dResetAt {
+		current.Window7dStatus = incoming.Window7dStatus
+		current.Window7dResetAt = incoming.Window7dResetAt
+	}
+	return current
+}
+
+// windowStatusSnapshot is the reporter's idempotent reconcile read. It emits
+// active persisted facts on every low-frequency tick and prunes expired window
+// fields, so an outage/restart cannot strand Master behind the local truth.
+func (s *poolCooldownStore) windowStatusSnapshot() []windowStatusSample {
+	if s == nil {
+		return nil
+	}
+	s.mu.Lock()
+	now := s.now()
+	out := make([]windowStatusSample, 0, len(s.windowStatuses))
+	changed := false
+	for accountID, sample := range s.windowStatuses {
+		active := activeWindowStatusSample(sample, now)
+		if active.WindowStatus == "" && active.Window7dStatus == "" {
+			delete(s.windowStatuses, accountID)
+			changed = true
+			continue
+		}
+		if active != sample {
+			s.windowStatuses[accountID] = active
+			changed = true
+		}
+		out = append(out, active)
+	}
+	if changed {
+		s.persistLocked()
+	}
+	s.mu.Unlock()
+	if len(out) == 0 {
+		return nil
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].CredentialID < out[j].CredentialID })
+	return out
 }
 
 // skipSet returns the accounts currently cooling down, for the resolver's `skip`
@@ -657,6 +814,7 @@ func (s *poolCooldownStore) skipSet() map[string]bool {
 		} else {
 			delete(s.m, id)
 			delete(s.meta, id)
+			delete(s.windowStatuses, id)
 			if s.lapsed == nil {
 				s.lapsed = make(map[string]struct{})
 			}
@@ -730,6 +888,7 @@ func (s *poolCooldownStore) routeStateSnapshot() map[string]PoolAccountRouteStat
 		if !ok || !now.Before(until) {
 			delete(s.meta, id)
 			delete(s.m, id)
+			delete(s.windowStatuses, id)
 			pruned = true
 			continue
 		}
@@ -838,6 +997,7 @@ func (s *poolCooldownStore) snapshot() map[string]int {
 		} else {
 			delete(s.m, id)
 			delete(s.meta, id)
+			delete(s.windowStatuses, id)
 			if s.lapsed == nil {
 				s.lapsed = make(map[string]struct{})
 			}
@@ -886,14 +1046,22 @@ func cooldownDecisionWithTemporaryFallback(resp *http.Response, now time.Time, t
 			temporaryFallback = poolCooldown429NoReset
 		}
 		d := temporaryFallback
+		authoritativeWindowReset := false
 		if cx := codexRateLimitReset(resp.Header); cx > 0 {
 			d = cx
 		} else if ar := anthropicExhaustedWindowResetDuration(resp.Header, now); ar > 0 {
 			d = ar
+			authoritativeWindowReset = true
 		} else if ra := retryAfterDuration(resp.Header); ra > 0 {
 			d = ra
 		}
-		if d > poolCooldownMax {
+		// The one-hour ceiling still applies to Codex reset-after durations and
+		// generic Retry-After values. Only Anthropic's independently classified
+		// concrete 5h/7d exhaustion carries an authoritative multi-day wall here;
+		// treating every Codex reset header as that class bypassed the established
+		// safety cap and broke TestCooldownDecision_CodexRateLimit.
+		// Ref: workflow/CI/bugfix/2026-08-27-oauth-pool-quota-state-convergence.md.
+		if !authoritativeWindowReset && d > poolCooldownMax {
 			d = poolCooldownMax
 		}
 		return now.Add(d), true

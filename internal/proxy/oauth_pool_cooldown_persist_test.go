@@ -34,6 +34,22 @@ func TestPoolCooldown_PersistAndHydrateAcrossRestart(t *testing.T) {
 	}
 }
 
+func TestPoolCooldown_ShutdownFlushesPendingWake(t *testing.T) {
+	t.Setenv("AIKEY_RUN_DIR", t.TempDir())
+
+	s := newPoolCooldownStore()
+	s.mark("acc-pending-at-shutdown", time.Now().Add(30*time.Minute))
+	// Do not wait for the 5 ms background coalescing window. Shutdown owns the
+	// barrier and must persist the newest in-memory revision before returning.
+	s.closePersistence()
+
+	restarted := newPoolCooldownStore()
+	defer restarted.closePersistence()
+	if !restarted.skipSet()["acc-pending-at-shutdown"] {
+		t.Fatal("shutdown returned before the pending cooldown reached durable state")
+	}
+}
+
 func TestPoolCooldown_ErrorCauseSurvivesRestart(t *testing.T) {
 	t.Setenv("AIKEY_RUN_DIR", t.TempDir())
 
@@ -53,6 +69,41 @@ func TestPoolCooldown_ErrorCauseSurvivesRestart(t *testing.T) {
 	}
 	if state.Status != poolRouteUpstreamUnavailable || state.ErrorCode != observability.ErrCodeAccountEgressProxy {
 		t.Fatalf("hydrated cooldown lost its cause: %+v", state)
+	}
+}
+
+func TestPoolCooldown_WindowStatusReconcilesAcrossRestart(t *testing.T) {
+	t.Setenv("AIKEY_RUN_DIR", t.TempDir())
+	now := time.Unix(1_800_000_000, 0)
+	reset5h := now.Add(4 * time.Hour)
+	reset7d := now.Add(72 * time.Hour)
+
+	s1 := newPoolCooldownStore()
+	s1.now = func() time.Time { return now }
+	s1.markWithStateAndWindows("acc-window", reset7d, PoolAccountRouteState{
+		Status: poolRouteWindowExhausted, RetryAt: reset7d.Unix(),
+	}, windowStatusSample{
+		CredentialID: "cred-window", WindowStatus: windowStatusExhausted, WindowResetAt: reset5h.Unix(),
+		Window7dStatus: windowStatusExhausted, Window7dResetAt: reset7d.Unix(),
+	})
+	s1.flushPersistence()
+
+	s2 := newPoolCooldownStore()
+	s2.now = func() time.Time { return now }
+	got := s2.windowStatusSnapshot()
+	if len(got) != 1 || got[0].CredentialID != "cred-window" ||
+		got[0].WindowResetAt != reset5h.Unix() || got[0].Window7dResetAt != reset7d.Unix() {
+		t.Fatalf("restart lost replayable window status: %+v", got)
+	}
+
+	now = reset5h.Add(time.Second)
+	got = s2.windowStatusSnapshot()
+	if len(got) != 1 || got[0].WindowStatus != "" || got[0].Window7dStatus != windowStatusExhausted {
+		t.Fatalf("5h expiry must not clear the later weekly report: %+v", got)
+	}
+	now = reset7d.Add(time.Second)
+	if got := s2.windowStatusSnapshot(); got != nil {
+		t.Fatalf("all expired window reports must be pruned, got %+v", got)
 	}
 }
 

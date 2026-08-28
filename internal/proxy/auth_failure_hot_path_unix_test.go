@@ -61,6 +61,7 @@ func TestAuthFailureRoutingPersistenceCannotBlockRequestPath(t *testing.T) {
 	}
 
 	store := newPoolCooldownStore()
+	defer store.closePersistence()
 	done := make(chan struct{})
 	go func() {
 		store.markAuthFailedToken("group-1", "seat-1", "account-1", "fingerprint-1")
@@ -89,17 +90,14 @@ func TestAuthFailureRoutingPersistenceCannotBlockRequestPath(t *testing.T) {
 	for i := 0; i < 300; i++ {
 		store.markAuthFailedToken("group-1", fmt.Sprintf("seat-%03d", i), "account-1", fmt.Sprintf("fingerprint-%03d", i))
 	}
-	store.mu.Lock()
-	queuedWriter := store.persistTimer != nil
-	store.mu.Unlock()
-	if queuedWriter {
-		t.Fatal("blocked cooldown disk write spawned another writer during the 401 burst")
+	if queued := len(store.persistWake); queued != 1 {
+		t.Fatalf("blocked cooldown disk write queued %d follow-ups, want exactly one coalesced wake", queued)
 	}
 
 	// Release the intentionally blocked writer. Its atomic rename moves the FIFO
 	// to the final path, so the one coalesced dirty follow-up creates a regular
 	// temp file and completes normally. A regression that creates more work will
-	// leave persistWriting/persistTimer non-idle below.
+	// leave persistWriting/persistWake non-idle below.
 	readerDone := make(chan error, 1)
 	go func() {
 		f, err := os.Open(legacyTemp)
@@ -126,7 +124,7 @@ func TestAuthFailureRoutingPersistenceCannotBlockRequestPath(t *testing.T) {
 	deadline = time.Now().Add(time.Second)
 	for {
 		store.mu.Lock()
-		idle := !store.persistWriting && store.persistTimer == nil
+		idle := !store.persistWriting && len(store.persistWake) == 0
 		store.mu.Unlock()
 		if idle {
 			break

@@ -14,10 +14,10 @@ import "testing"
 // refused every /moonshot/v1 request while /kimi/v1 on the SAME key worked.
 func TestActiveKeyEntryMatches_BothAxes(t *testing.T) {
 	cases := []struct {
-		name         string
-		entry        string // what active_key_providers holds
-		requestCode  string // provider derived from the request path
-		wantMatch    bool
+		name        string
+		entry       string // what active_key_providers holds
+		requestCode string // provider derived from the request path
+		wantMatch   bool
 	}{
 		{"supplier entry, same supplier", "moonshot", "moonshot", true},
 		{"supplier entry, sibling supplier", "moonshot", "kimi_code", false},

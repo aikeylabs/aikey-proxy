@@ -218,12 +218,16 @@ func (p *Proxy) recordEvent(req *http.Request, resp *http.Response, startTime ti
 	// body. incrRateLimit is nil-safe (reporter off → no-op) and non-blocking (a
 	// short map lock, reset every flush bounds it); an empty CredentialID (no route)
 	// is dropped inside.
-	if resp.StatusCode == http.StatusTooManyRequests || resp.StatusCode == http.StatusForbidden {
+	if resp.StatusCode == http.StatusForbidden ||
+		(resp.StatusCode == http.StatusTooManyRequests && hasRateLimitSignal(resp.Header)) {
 		// 🔴 F-12b = C: fed, but MARKED. Upstream fallback makes one client request
 		// touch several credentials. Those refusals are real visibility evidence,
 		// but are correlated in a way the allocation engine's model does not assume
 		// (one request, not independent traffic). The reporter excludes marked
-		// counts from Risk429Count.
+		// counts from Risk429Count. A headerless/WAF 429 is deliberately omitted:
+		// it is evidence about this request persona, not account health, and must not
+		// poison the allocation engine's account-level risk score.
+		// Ref: workflow/CI/bugfix/2026-08-27-oauth-pool-quota-state-convergence.md.
 		p.signalReporter.incrRateLimitHop(route.CredentialID, route.FallbackAttempt > 1,
 			resp.StatusCode == http.StatusForbidden)
 	}
@@ -880,4 +884,3 @@ func stashExtractedFields(r *http.Request, model, promptCacheKey string) {
 		r.Header.Set("x-aikey-kimi-session", promptCacheKey)
 	}
 }
-

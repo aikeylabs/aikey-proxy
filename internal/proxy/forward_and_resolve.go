@@ -839,7 +839,7 @@ func (p *Proxy) serveRoute(w http.ResponseWriter, r *http.Request, route *vkeys.
 				// account's window_max_util_pct when a new window starts. Present on
 				// 200s too. Observability-only side effect; never blocks the request.
 				if resets, ok := observedWindowResetEpochs(resp.Header); ok {
-					p.poolObservedResets.record(route.AccountID, resets)
+					p.poolObservedResets.recordRoute(route.AccountID, route.CredentialID, resets)
 				}
 				// P1-C tier-first guard (2026-07-19, sub2api "must not fall through"):
 				// a 429 whose SOLE trigger is a premium-model window (Fable 7d_oi)
@@ -886,7 +886,8 @@ func (p *Proxy) serveRoute(w http.ResponseWriter, r *http.Request, route *vkeys.
 					// claimed by the cooldown decision before the WAF branch can see it).
 					switch {
 					case ok:
-						p.poolCooldown.markWithState(route.AccountID, until, cooldownRouteState(resp, nowT, until))
+						windows := windowStatusSampleForResets(route.CredentialID, exhaustedWindowResets(resp.Header, nowT))
+						p.poolCooldown.markWithStateAndWindows(route.AccountID, until, cooldownRouteState(resp, nowT, until), windows)
 						logger.Warn("pool account cooled down after upstream failure",
 							"event.name", observability.EventProxyGroupAccountCooldown,
 							"oauth_group_id", route.OauthGroupID,
@@ -943,11 +944,13 @@ func (p *Proxy) serveRoute(w http.ResponseWriter, r *http.Request, route *vkeys.
 				// are owned by the reactive classifier above; an exhaustion 429 often
 				// carries the same 100%-used headers and must retain its precise state.
 				if caps, ok := windowCapsFromContext(resp.Request); ok {
-					if until, hit := successfulDualWindowPreCutDecision(resp, caps, time.Now()); hit {
+					nowT := time.Now()
+					if until, hit := successfulDualWindowPreCutDecision(resp, caps, nowT); hit {
 						retryAt := until.Unix()
-						p.poolCooldown.markWithState(route.AccountID, until, PoolAccountRouteState{
+						windows, _ := windowPreCutResets(resp.Header, caps, nowT)
+						p.poolCooldown.markWithStateAndWindows(route.AccountID, until, PoolAccountRouteState{
 							Status: poolRouteWindowProtected, RetryAt: retryAt,
-						})
+						}, windowStatusSampleForResets(route.CredentialID, windows))
 						logger.Warn("pool account pre-cut at window cap",
 							"event.name", observability.EventProxyGroupWindowPrecut,
 							"oauth_group_id", route.OauthGroupID,
@@ -1502,4 +1505,3 @@ func accountEgressErrorMessage(route *vkeys.ResolvedRoute, detail string) string
 	}
 	return "AiKey: " + subject + " is signed in, but " + detail
 }
-

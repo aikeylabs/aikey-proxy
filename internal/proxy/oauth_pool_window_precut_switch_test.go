@@ -125,6 +125,12 @@ func TestGroupServe_WindowUtilHeaderPreCutsSwitchesAndUplinks(t *testing.T) {
 	if !p.poolCooldown.skipSet()[served1] {
 		t.Fatalf("util 0.98 ≥ cap 0.97 must PRE-CUT (cool) the served account %s (防封, before it hits 100%%)", served1)
 	}
+	windowStatuses := p.poolCooldown.windowStatusSnapshot()
+	if len(windowStatuses) != 1 || windowStatuses[0].CredentialID != credOf[served1] ||
+		windowStatuses[0].WindowStatus != windowStatusExhausted || windowStatuses[0].WindowResetAt != reset ||
+		windowStatuses[0].Window7dStatus != "" {
+		t.Fatalf("pre-cut must persist only the affected 5h Master reconcile fact: %+v", windowStatuses)
+	}
 	// (b) ENGINE uplink: the same util must be enqueued to the signal reporter (I5 →
 	// collector → master; the 动态决策引擎 reads the util trend from it).
 	if !drainForUtil(rep.in, credOf[served1], 0.98) {
@@ -167,6 +173,9 @@ func TestGroupServe_WindowUtilBelowCapNoPreCut(t *testing.T) {
 	served1 := tokToAcct[strings.TrimPrefix(tr.auth, "Bearer ")]
 	if p.poolCooldown.skipSet()[served1] {
 		t.Fatalf("util 0.50 < cap 0.97 must NOT pre-cut account %s (no needless churn)", served1)
+	}
+	if got := p.poolCooldown.windowStatusSnapshot(); got != nil {
+		t.Fatalf("below-cap utilization must not create a false Master window status: %+v", got)
 	}
 
 	req2, w2 := groupReq(groupBody)

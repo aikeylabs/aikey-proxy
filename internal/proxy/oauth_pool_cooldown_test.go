@@ -165,11 +165,12 @@ func TestCooldownDecision_GeneralWeekly7d(t *testing.T) {
 		t.Fatalf("dual exhaustion must cool to the later (5h) wall, got until=%v ok=%v", until, ok)
 	}
 
-	// A realistic 7d reset sits DAYS ahead: the whole-account reactive cooldown
-	// deliberately caps at poolCooldownMax (the next 429 re-confirms; only the
-	// tier-scoped path may hold a multi-day wall).
-	if until, _ := cooldownDecision(resp(429, dual(sooner, now.Add(72*time.Hour))), now); !until.Equal(now.Add(poolCooldownMax)) { //nolint:bodyclose // synthetic response: no Body, no transport — nothing to close
-		t.Fatalf("multi-day 7d wall must cap at poolCooldownMax, got %v", until)
+	// A concrete exhausted-window reset is authoritative even when it sits days
+	// ahead. Re-admitting after a generic one-hour safety cap would contradict the
+	// displayed provider reset and immediately re-hit the still-exhausted window.
+	weeklyWall := now.Add(72 * time.Hour)
+	if until, _ := cooldownDecision(resp(429, dual(sooner, weeklyWall)), now); !until.Equal(weeklyWall) { //nolint:bodyclose // synthetic response: no Body, no transport — nothing to close
+		t.Fatalf("multi-day 7d wall must remain authoritative, got %v want %v", until, weeklyWall)
 	}
 }
 
@@ -403,7 +404,13 @@ func TestAuthFailureTombstone_IsolatedByGroupAndSeat(t *testing.T) {
 	key := grKey()
 	accountID := "shared-pool-account"
 	store := newPoolCooldownStore()
-	t.Cleanup(store.flushPersistence)
+	// Retire the writer, do not merely flush it — see proxy_test.go's cleanup for
+	// why a surviving persistenceLoop races t.TempDir removal (2026-08-28).
+	// closePersistence, NOT flushPersistence: this test sets its own per-test
+	// AIKEY_RUN_DIR and mutates (markAuthFailedToken → persistWake), so a flush
+	// that leaves the writer goroutine alive races t.TempDir teardown — the same
+	// race that surfaced in the group/fallback tests (2026-08-28).
+	t.Cleanup(store.closePersistence)
 	store.markAuthFailedToken("group-1", "seat-a", accountID, oauthTokenFingerprint("seat-a-old-token"))
 
 	seatARuntime := mustJSON(t, map[string]vkeys.GroupRuntimeAccount{

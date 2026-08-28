@@ -122,3 +122,56 @@ func TestPickRoutedAccount(t *testing.T) {
 		}
 	})
 }
+
+// Fence for quota-state convergence: a stale Master exhausted snapshot must
+// block before reset, but must not deadlock the first recovery probe at reset.
+// The sibling window remains an independent gate, and reset-less legacy state
+// remains fail-closed.
+func TestMaterialUsable_ExhaustedWindowResetBoundary(t *testing.T) {
+	now := int64(1_000_000)
+	future := now + 1
+	past := now - 1
+	fresh := GroupRuntimeAccount{CredentialType: "oauth_account", ExpiresAt: now + 3600}
+
+	tests := []struct {
+		name string
+		mat  GroupRuntimeAccount
+		want bool
+	}{
+		{
+			name: "5h exhausted blocks before reset",
+			mat:  withWindowState(fresh, "exhausted_current_window", &future, "active", nil),
+			want: false,
+		},
+		{
+			name: "5h exhausted admits half-open probe exactly at reset",
+			mat:  withWindowState(fresh, "exhausted_current_window", &now, "active", nil),
+			want: true,
+		},
+		{
+			name: "expired 5h does not override live 7d exhaustion",
+			mat:  withWindowState(fresh, "exhausted_current_window", &past, "exhausted_current_window", &future),
+			want: false,
+		},
+		{
+			name: "legacy exhausted without reset stays fail closed",
+			mat:  withWindowState(fresh, "exhausted", nil, "active", nil),
+			want: false,
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := MaterialUsable(tc.mat, now); got != tc.want {
+				t.Fatalf("MaterialUsable()=%v, want %v; material=%+v", got, tc.want, tc.mat)
+			}
+		})
+	}
+}
+
+func withWindowState(mat GroupRuntimeAccount, status5h string, reset5h *int64, status7d string, reset7d *int64) GroupRuntimeAccount {
+	mat.WindowStatus = status5h
+	mat.WindowResetAt = reset5h
+	mat.Window7dStatus = status7d
+	mat.Window7dResetAt = reset7d
+	return mat
+}

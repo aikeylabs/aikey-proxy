@@ -245,7 +245,7 @@ func resolveGroupCredential(route *vkeys.ResolvedRoute, derivedKey []byte, nowUn
 			// expired request-level fallback to LOGIN_REQUIRED.
 			if !localSkip[assigned] {
 				m, ok := material[assigned]
-				if ok && vkeys.MaterialExpired(m, nowUnix) && !vkeys.MaterialWindowExhausted(m) {
+				if ok && vkeys.MaterialExpired(m, nowUnix) && !vkeys.MaterialWindowBlockedAt(m, nowUnix) {
 					return nil, &groupResolveError{Code: groupErrLoginRequired,
 						Reason: "member token for the routed account expired — re-login required", Account: assigned}
 				}

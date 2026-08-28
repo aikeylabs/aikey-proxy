@@ -521,7 +521,7 @@ func New(cfg *config.Config, configPath, password, version string) (*Supervisor,
 	s.railset = newRailSet(s.groupRuntimeRail(), s.routingOverrideRail(), s.fallbackPolicyRail(), s.keyRevocationRail())
 	gen, err := s.buildGeneration()
 	if err != nil {
-		_ = s.oauthPoolRuntime.Close()
+		_ = s.oauthPoolRuntime.Shutdown()
 		return nil, fmt.Errorf("initial generation failed: %w", err)
 	}
 	s.activateGeneration(gen)
@@ -1885,7 +1885,7 @@ func (s *Supervisor) Shutdown(timeout time.Duration) {
 	go func() {
 		gen.close()
 		if s.oauthPoolRuntime != nil {
-			_ = s.oauthPoolRuntime.Close()
+			_ = s.oauthPoolRuntime.Shutdown()
 		}
 		close(closed)
 	}()

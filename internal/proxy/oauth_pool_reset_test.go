@@ -35,6 +35,22 @@ func TestPoolResetStore_RecordKeepsMaxAndSnapshotIsCopy(t *testing.T) {
 	}
 }
 
+func TestPoolResetStore_ClusterSignalKeepsCredentialAndIndependentMaxima(t *testing.T) {
+	s := newPoolResetStore()
+	s.recordRoute("acc-1", "cred-1", ObservedWindowResets{FiveHour: 100, SevenDay: 1000})
+	s.recordRoute("acc-1", "cred-1", ObservedWindowResets{FiveHour: 200, SevenDay: 900})
+	s.recordRoute("acc-2", "cred-1", ObservedWindowResets{FiveHour: 150, SevenDay: 1100})
+	s.recordRoute("acc-3", "", ObservedWindowResets{FiveHour: 999})
+
+	got := s.signalSnapshot()
+	if len(got) != 1 {
+		t.Fatalf("signal snapshot=%+v, want one credential-coalesced item", got)
+	}
+	if got[0] != (observedWindowResetSample{CredentialID: "cred-1", WindowResetAt: 200, Window7dResetAt: 1100}) {
+		t.Fatalf("signal snapshot lost route identity or independent maxima: %+v", got[0])
+	}
+}
+
 func TestObservedWindowResetEpochsAreIndependent(t *testing.T) {
 	h := http.Header{}
 	h.Set(hdrReset5h, "1750000500")

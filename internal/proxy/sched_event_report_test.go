@@ -57,7 +57,7 @@ func flushSchedEvents(t *testing.T, r *signalReporter) {
 	if len(events) == 0 {
 		return
 	}
-	ok, detail := r.uploadAll(nil, nil, nil, nil, nil, events)
+	ok, detail := r.uploadAll(nil, nil, nil, nil, nil, events, nil)
 	if !ok {
 		t.Fatalf("uploadAll failed: %s", detail)
 	}

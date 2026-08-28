@@ -256,6 +256,11 @@ func TestGroupFailover_Fallback429IsVisibleButExcludedFromRisk(t *testing.T) {
 func TestGroupFailover_WAF429DoesNotRetry(t *testing.T) {
 	p, tr, tokToAcct := twoAccountPool(t)
 	_, ptok := probePrimary(t, p, tr, tokToAcct)
+	p.signalReporter = &signalReporter{
+		rlCounts:   make(map[string]int),
+		rlRisk:     make(map[string]int),
+		rlPrevious: make(map[string]struct{}),
+	}
 
 	tr.statusByAuth = map[string]int{"Bearer " + ptok: http.StatusTooManyRequests}
 	req, w := groupReq(groupBody)
@@ -268,6 +273,9 @@ func TestGroupFailover_WAF429DoesNotRetry(t *testing.T) {
 	}
 	if len(p.poolCooldown.skipSet()) != 0 {
 		t.Fatalf("WAF 429 must not cool anyone, got %v", p.poolCooldown.skipSet())
+	}
+	if samples := p.signalReporter.snapshotRateLimits(); len(samples) != 0 {
+		t.Fatalf("WAF/business 429 is request evidence, not account risk; got rate samples %+v", samples)
 	}
 }
 

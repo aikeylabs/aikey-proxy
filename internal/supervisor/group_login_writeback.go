@@ -1,7 +1,7 @@
 // group_login_writeback.go — RW8 (Path α, proxy-orchestrated): after the proxy's
-// broker exchanges a member's per-account OAuth login, the resulting token is
-// written BACK to master (RW10 POST /accounts/me/oauth-member-token) so it lands
-// in oauth_member_token — NOT in the proxy's personal vault, and NEVER returned to
+// broker exchanges a pool-account OAuth login, the resulting token is written
+// BACK to master (RW10 POST /accounts/me/oauth-member-token) so it replaces the
+// shared managed_credential_oauth token — NOT the proxy's personal vault, and NEVER returned to
 // any HTTP caller. The proxy is the only local component that holds the team
 // account-JWT (RefreshableJWT) + reaches master, so it owns this writeback.
 //
@@ -41,17 +41,14 @@ type memberTokenWriteback struct {
 	// master backfills it on first login (Claude metadata.user_id).
 	ExternalID string `json:"external_id,omitempty"`
 	// ProviderCode and Identity come from the immutable login session context.
-	// Master re-validates ProviderCode before persistence; Identity stays advisory
-	// under the availability-first mismatch policy but is never inferred later.
+	// Master re-validates provider binding and identity before persistence.
 	ProviderCode string `json:"provider_code,omitempty"`
 	ProtocolType string `json:"protocol_type,omitempty"`
 	OauthGroupID string `json:"oauth_group_id,omitempty"`
 	AccountID    string `json:"account_id,omitempty"`
 	Identity     string `json:"identity,omitempty"`
-	// IdentityMismatch is set only after the member explicitly confirms a
-	// Session Key whose provider identity differs from the selected pool slot.
-	// Master persists the token's provider account ID per member and must not
-	// backfill that ID onto the shared account in this case.
+	// IdentityMismatch is retained on the wire for compatibility. New clients
+	// fail closed before writeback and Master rejects true unconditionally.
 	IdentityMismatch bool `json:"identity_mismatch,omitempty"`
 }
 

@@ -13,13 +13,14 @@ import (
 // The hot path (resolveGroupCredential) and the display stamp
 // (supervisor.computeRoutedAccountID) BOTH read RoutingOverrideCache.Assignment ?? seat-
 // assign rank-0, so:
-//   (1) an engine override → the proxy FORWARDS to the override account, and it FOLLOWS
-//       override changes on the very next request (RoutingOverrideCache is read live). This
-//       is the display↔actual CONSISTENCY the user asked about — confirmed.
-//   (2) BUT when the routed account is COOLED (N8c skip) the hot path falls through to the
-//       next usable candidate, while the display stamp has no cooling input and keeps
-//       naming rank-0 → display can diverge from actual. Companion (display side):
-//       supervisor.TestComputeRoutedAccountID_DisplayIsOverrideOnly_NoCoolingAwareness.
+//
+//	(1) an engine override → the proxy FORWARDS to the override account, and it FOLLOWS
+//	    override changes on the very next request (RoutingOverrideCache is read live). This
+//	    is the display↔actual CONSISTENCY the user asked about — confirmed.
+//	(2) BUT when the routed account is COOLED (N8c skip) the hot path falls through to the
+//	    next usable candidate, while the display stamp has no cooling input and keeps
+//	    naming rank-0 → display can diverge from actual. Companion (display side):
+//	    supervisor.TestComputeRoutedAccountID_DisplayIsOverrideOnly_NoCoolingAwareness.
 func TestResolveGroup_RoutedFollowsOverride_AndCoolingFallsThrough(t *testing.T) {
 	key := grKey()
 	seat := "seat-routed-1"

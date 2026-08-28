@@ -90,11 +90,7 @@ func (h *poolLoginHandler) sessionKey(w http.ResponseWriter, r *http.Request) {
 		SessionKey   string `json:"session_key,omitempty"`
 		OperationID  string `json:"operation_id"`
 		Confirm      bool   `json:"confirm"`
-		// IdentityMismatchConfirmed is a separate acknowledgement from Confirm.
-		// It prevents an older or scripted client from silently saving a token
-		// after the server has discovered that it belongs to another account.
-		IdentityMismatchConfirmed bool `json:"identity_mismatch_confirmed"`
-		Cancel                    bool `json:"cancel"`
+		Cancel       bool   `json:"cancel"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		poolErr(w, http.StatusBadRequest, "BAD_BODY", "invalid or oversized request body")
@@ -175,6 +171,14 @@ func (h *poolLoginHandler) sessionKey(w http.ResponseWriter, r *http.Request) {
 				"event.name", observability.EventProxyPoolSessionKeyIdentityMismatch,
 				"error.code", broker.ErrCodeSessionKeyIdentityMismatch, "credential_id", req.CredentialID,
 				"request_id", trace.RequestID, "trace_id", trace.TraceID, "span_id", trace.SpanID)
+			// The token would become the shared account login for every member.
+			// There is no safe "confirm into my private slot" path anymore: fail
+			// closed, zero plaintext immediately, and perform no Master writeback.
+			token.AccessToken = ""
+			token.RefreshToken = ""
+			poolErr(w, http.StatusConflict, broker.ErrCodeSessionKeyIdentityMismatch,
+				"The Session Key belongs to a different account. Select the matching pool account and try again.")
+			return
 		}
 		exchangedAt := time.Now()
 		pending = &poolSessionKeyPending{
@@ -213,9 +217,10 @@ func (h *poolLoginHandler) sessionKey(w http.ResponseWriter, r *http.Request) {
 		})
 		return
 	}
-	if pending.identityMismatch && !req.IdentityMismatchConfirmed {
+	if pending.identityMismatch {
+		h.forgetSessionKeyOperation(req.OperationID, pending)
 		poolErrWithMeta(w, http.StatusConflict, broker.ErrCodeSessionKeyIdentityMismatch,
-			"The Session Key belongs to a different account. Review the warning and confirm again to save it to the selected pool account.", req.OperationID)
+			"The Session Key belongs to a different account; no shared token was changed.", req.OperationID)
 		return
 	}
 

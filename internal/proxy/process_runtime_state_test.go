@@ -11,7 +11,7 @@ import (
 func TestOAuthPoolRuntimeStateIsSharedAcrossProxyGenerations(t *testing.T) {
 	t.Setenv("AIKEY_RUN_DIR", t.TempDir())
 	runtime := NewOAuthPoolRuntimeState()
-	t.Cleanup(func() { _ = runtime.Close() })
+	t.Cleanup(func() { _ = runtime.Shutdown() })
 
 	ctx, cancel := context.WithCancel(context.Background())
 	t.Cleanup(cancel)
@@ -23,6 +23,9 @@ func TestOAuthPoolRuntimeStateIsSharedAcrossProxyGenerations(t *testing.T) {
 	}
 	if oldProxy.signalReporter != newProxy.signalReporter || oldProxy.signalReporter != runtime.signalReporter {
 		t.Fatal("hot-reload generations do not share one process signal reporter/outbox")
+	}
+	if oldProxy.poolObservedResets != newProxy.poolObservedResets || oldProxy.poolObservedResets != runtime.poolObservedResets {
+		t.Fatal("hot-reload generations do not share one observed-reset reconcile snapshot")
 	}
 
 	oldProxy.poolCooldown.mark("account-late-429", time.Now().Add(time.Minute))
@@ -44,6 +47,15 @@ func TestOAuthPoolRuntimeStateIsSharedAcrossProxyGenerations(t *testing.T) {
 	if got[0].TokenFingerprint != "fingerprint-v1" {
 		t.Fatalf("active generation cannot see draining generation's durable signal: %+v", got)
 	}
+
+	// A cooldown-expiry restamp can activate a replacement generation while the
+	// draining generation is still receiving the first post-reset Provider
+	// response. The new generation's reporter source must see that late R3.
+	oldProxy.poolObservedResets.recordRoute("account-1", "credential-1", ObservedWindowResets{FiveHour: 2_000})
+	resets := newProxy.poolObservedResets.signalSnapshot()
+	if len(resets) != 1 || resets[0].WindowResetAt != 2_000 {
+		t.Fatalf("active generation lost draining generation reset observation: %+v", resets)
+	}
 }
 
 func TestGenerationStopDoesNotCloseProcessSignalReporter(t *testing.T) {
@@ -58,17 +70,17 @@ func TestGenerationStopDoesNotCloseProcessSignalReporter(t *testing.T) {
 	default:
 	}
 
-	if err := runtime.Close(); err != nil {
-		t.Fatalf("close process runtime: %v", err)
+	if err := runtime.Shutdown(); err != nil {
+		t.Fatalf("shutdown process runtime: %v", err)
 	}
 	select {
 	case <-runtime.signalReporter.stop:
 	case <-time.After(time.Second):
-		t.Fatal("process runtime close did not stop the signal reporter")
+		t.Fatal("process runtime shutdown did not stop the signal reporter")
 	}
 }
 
-func TestProcessRuntimeCloseDrainsAuthFailureToJournal(t *testing.T) {
+func TestProcessRuntimeShutdownDrainsAuthFailureToJournal(t *testing.T) {
 	t.Setenv("AIKEY_RUN_DIR", t.TempDir())
 	runtime := NewOAuthPoolRuntimeState()
 	runtime.signalReporter.enqueueAuthFailure("credential-1", "group-1", "seat-1", "fingerprint-v1")
@@ -76,8 +88,8 @@ func TestProcessRuntimeCloseDrainsAuthFailureToJournal(t *testing.T) {
 	// Close immediately: the request-side handoff may still be buffered. The
 	// process lifecycle owner must wait until the reporter has durably drained
 	// it, otherwise a restart directly after a 401 can forget the revocation.
-	if err := runtime.Close(); err != nil {
-		t.Fatalf("close process runtime: %v", err)
+	if err := runtime.Shutdown(); err != nil {
+		t.Fatalf("shutdown process runtime: %v", err)
 	}
 	path, err := signalAuthFailurePath()
 	if err != nil {
@@ -95,7 +107,7 @@ func TestProcessRuntimeCloseDrainsAuthFailureToJournal(t *testing.T) {
 func TestProcessSignalReporterReconfiguresWithoutLosingPendingAuthFailure(t *testing.T) {
 	t.Setenv("AIKEY_RUN_DIR", t.TempDir())
 	runtime := NewOAuthPoolRuntimeState()
-	t.Cleanup(func() { _ = runtime.Close() })
+	t.Cleanup(func() { _ = runtime.Shutdown() })
 
 	oldProxy := NewWithOAuthPoolRuntime(nil, nil, nil, nil, context.Background(), runtime)
 	newProxy := NewWithOAuthPoolRuntime(nil, nil, nil, nil, context.Background(), runtime)
@@ -136,7 +148,7 @@ func waitForAuthFailureSnapshot(t *testing.T, reporter *signalReporter, want int
 func TestDormantProcessSignalReporterRetainsPendingWithoutFalseFailure(t *testing.T) {
 	t.Setenv("AIKEY_RUN_DIR", t.TempDir())
 	runtime := NewOAuthPoolRuntimeState()
-	t.Cleanup(func() { _ = runtime.Close() })
+	t.Cleanup(func() { _ = runtime.Shutdown() })
 
 	runtime.signalReporter.enqueueAuthFailure("credential-1", "group-1", "seat-1", "fingerprint-v1")
 	deadline := time.Now().Add(time.Second)

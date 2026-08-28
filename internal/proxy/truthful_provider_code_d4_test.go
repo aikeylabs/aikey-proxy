@@ -35,11 +35,11 @@ import (
 //   - always return `declared` → the mislabel rows fail.
 func TestD4_MislabelStillCorrectedAndDeclarationNoLongerOverruled(t *testing.T) {
 	cases := []struct {
-		name             string
-		baseURL          string
-		declared         string
-		want             string
-		why              string
+		name     string
+		baseURL  string
+		declared string
+		want     string
+		why      string
 	}{
 		{
 			name:     "mislabel: declared a known vendor, calling another known vendor",

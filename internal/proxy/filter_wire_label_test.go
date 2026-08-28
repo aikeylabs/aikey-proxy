@@ -419,4 +419,3 @@ func funcBody(t *testing.T, src, decl string) string {
 	}
 	return rest
 }
-

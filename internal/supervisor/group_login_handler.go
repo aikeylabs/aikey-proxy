@@ -381,6 +381,18 @@ func (h *poolLoginHandler) submitCode(w http.ResponseWriter, r *http.Request) {
 		poolErr(w, http.StatusBadGateway, "EXCHANGE_FAILED", err.Error())
 		return
 	}
+	if (strings.TrimSpace(identity) != "" || strings.TrimSpace(externalID) != "") &&
+		!sessionKeyIdentityMatches(poolLoginContext{ExpectedIdentity: sess.expectedIdentity, ExternalID: sess.externalID},
+			broker.IdentityInfo{Email: identity, ExternalID: externalID}) {
+		// Browser OAuth and Session Key are equal writers of one shared account
+		// token. A mismatched provider identity cannot be reviewed into a private
+		// member slot, so consume the broker token and perform zero writeback.
+		h.ex.Forget(r.Context(), req.SessionID, accountID)
+		h.sessions.Delete(req.SessionID)
+		poolErr(w, http.StatusConflict, broker.ErrCodeSessionKeyIdentityMismatch,
+			"The OAuth login belongs to a different account. Select the matching pool account and try again.")
+		return
+	}
 
 	// Step 1 (confirm=false): the code is exchanged and the resolved account returned
 	// for the member to review — but NOTHING is written to master yet. The token is

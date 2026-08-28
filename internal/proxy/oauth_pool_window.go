@@ -87,28 +87,38 @@ func windowPreCutDecision(h http.Header, capPct int, now time.Time) (time.Time, 
 func validWindowCap(capPct int) bool { return capPct > 0 && capPct < 100 }
 
 func dualWindowPreCutDecision(h http.Header, caps poolWindowCaps, now time.Time) (time.Time, bool) {
+	resets, hit := windowPreCutResets(h, caps, now)
+	return laterTime(resets.FiveHour, resets.SevenDay), hit
+}
+
+type windowResetObservation struct {
+	FiveHour time.Time
+	SevenDay time.Time
+}
+
+func windowPreCutResets(h http.Header, caps poolWindowCaps, now time.Time) (windowResetObservation, bool) {
 	// Anthropic path (byte-identical to before): the two unified-utilization
 	// headers ride on every response including 200s.
 	u5h, has5h := parseUtil(h, hdrUtil5h)
 	u7d, has7d := parseUtil(h, hdrUtil7d)
 	if has5h || has7d {
-		var until time.Time
+		var resets windowResetObservation
 		hit := false
 		if has5h && validWindowCap(caps.FiveHour) && u5h >= float64(caps.FiveHour)/100 {
 			hit = true
-			until = laterTime(until, windowSpecificReset(h, hdrReset5h, now))
+			resets.FiveHour = windowSpecificReset(h, hdrReset5h, now)
 		}
 		if has7d && validWindowCap(caps.SevenDay) && u7d >= float64(caps.SevenDay)/100 {
 			hit = true
-			until = laterTime(until, windowSpecificReset(h, hdrReset7d, now))
+			resets.SevenDay = windowSpecificReset(h, hdrReset7d, now)
 		}
-		return until, hit
+		return resets, hit
 	}
 	// Codex path: same anti-ban cap, Codex's own X-Codex-* util/reset headers
 	// (verified live on the /responses 200, 2026-07-06). The two header families
 	// are mutually exclusive (an account is Anthropic OR Codex), so header-sniff
 	// dispatch mirrors R34's reactive layer — no provider_code branch.
-	return codexDualWindowPreCut(h, caps, now)
+	return codexPreCutResets(h, caps, now)
 }
 
 // successfulWindowPreCutDecision applies the anti-ban cap only to a successful
@@ -161,8 +171,13 @@ func windowSpecificReset(h http.Header, specific string, now time.Time) time.Tim
 }
 
 func codexDualWindowPreCut(h http.Header, caps poolWindowCaps, now time.Time) (time.Time, bool) {
+	resets, hit := codexPreCutResets(h, caps, now)
+	return laterTime(resets.FiveHour, resets.SevenDay), hit
+}
+
+func codexPreCutResets(h http.Header, caps poolWindowCaps, now time.Time) (windowResetObservation, bool) {
 	primaryIs5h := codexPrimaryIs5h(h)
-	var until time.Time
+	var resets windowResetObservation
 	hit := false
 	consider := func(is5h bool, usedHdr, resetAtHdr, resetAfterHdr string) {
 		capPct := caps.SevenDay
@@ -174,11 +189,57 @@ func codexDualWindowPreCut(h http.Header, caps poolWindowCaps, now time.Time) (t
 			return
 		}
 		hit = true
-		until = laterTime(until, codexWindowReset(h.Get(resetAtHdr), h.Get(resetAfterHdr), now))
+		reset := codexWindowReset(h.Get(resetAtHdr), h.Get(resetAfterHdr), now)
+		if is5h {
+			resets.FiveHour = reset
+		} else {
+			resets.SevenDay = reset
+		}
 	}
 	consider(primaryIs5h, "X-Codex-Primary-Used-Percent", "X-Codex-Primary-Reset-At", "X-Codex-Primary-Reset-After-Seconds")
 	consider(!primaryIs5h, "X-Codex-Secondary-Used-Percent", "X-Codex-Secondary-Reset-At", "X-Codex-Secondary-Reset-After-Seconds")
-	return until, hit
+	return resets, hit
+}
+
+func exhaustedWindowResets(h http.Header, now time.Time) windowResetObservation {
+	var resets windowResetObservation
+	if anthropicWindowExhausted(h, "5h") {
+		resets.FiveHour = anthropicWindowResetTime(h, "5h", now)
+	}
+	if anthropicWindowExhausted(h, "7d") {
+		resets.SevenDay = anthropicWindowResetTime(h, "7d", now)
+	}
+	if !resets.FiveHour.IsZero() || !resets.SevenDay.IsZero() {
+		return resets
+	}
+	primaryIs5h := codexPrimaryIs5h(h)
+	consider := func(is5h bool, usedHdr, resetAtHdr, resetAfterHdr string) {
+		if codexHeaderFloat(h, usedHdr) < 100 {
+			return
+		}
+		reset := codexWindowReset(h.Get(resetAtHdr), h.Get(resetAfterHdr), now)
+		if is5h {
+			resets.FiveHour = reset
+		} else {
+			resets.SevenDay = reset
+		}
+	}
+	consider(primaryIs5h, "X-Codex-Primary-Used-Percent", "X-Codex-Primary-Reset-At", "X-Codex-Primary-Reset-After-Seconds")
+	consider(!primaryIs5h, "X-Codex-Secondary-Used-Percent", "X-Codex-Secondary-Reset-At", "X-Codex-Secondary-Reset-After-Seconds")
+	return resets
+}
+
+func windowStatusSampleForResets(credentialID string, resets windowResetObservation) windowStatusSample {
+	sample := windowStatusSample{CredentialID: credentialID}
+	if !resets.FiveHour.IsZero() {
+		sample.WindowStatus = windowStatusExhausted
+		sample.WindowResetAt = resets.FiveHour.Unix()
+	}
+	if !resets.SevenDay.IsZero() {
+		sample.Window7dStatus = windowStatusExhausted
+		sample.Window7dResetAt = resets.SevenDay.Unix()
+	}
+	return sample
 }
 
 func codexPrimaryIs5h(h http.Header) bool {

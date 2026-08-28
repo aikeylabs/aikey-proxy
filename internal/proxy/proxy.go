@@ -479,12 +479,15 @@ func NewWithOAuthPoolRuntime(v VaultGetter, reg *vkeys.Registry, prov *provider.
 
 func newProxy(v VaultGetter, reg *vkeys.Registry, prov *provider.Registry, coll *events.Collector, ctx context.Context, runtime *OAuthPoolRuntimeState) *Proxy {
 	var poolCooldown *poolCooldownStore
+	var poolObservedResets *poolResetStore
 	var signalReporter *signalReporter
 	if runtime != nil {
 		poolCooldown = runtime.poolCooldown
+		poolObservedResets = runtime.poolObservedResets
 		signalReporter = runtime.signalReporter
 	} else {
 		poolCooldown = newPoolCooldownStore()
+		poolObservedResets = newPoolResetStore()
 	}
 	p := &Proxy{
 		vault:              v,
@@ -501,9 +504,12 @@ func newProxy(v VaultGetter, reg *vkeys.Registry, prov *provider.Registry, coll 
 		bindingCooldown:    newBindingCooldownStore(),
 		chainActivity:      newChainActivityStore(),
 		pathHealth:         NewProviderPathHealthManager(),
-		poolObservedResets: newPoolResetStore(),
+		poolObservedResets: poolObservedResets,
 		groupLoginState:    newGroupLoginStateStore(),
 		signalReporter:     signalReporter,
+	}
+	if p.signalReporter != nil {
+		p.signalReporter.setWindowStatusSource(p.poolCooldown.windowStatusSnapshot)
 	}
 	if ar, ok := v.(ActiveKeyReader); ok {
 		p.activeReader = ar
@@ -881,6 +887,11 @@ func (p *Proxy) EnableSignalReporting(controlURL string, bearer func(ctx context
 		endpoint = strings.TrimRight(controlURL, "/") + "/accounts/me/signals"
 	}
 	p.configureSignalReporting(endpoint, bearer)
+	if p != nil && p.signalReporter != nil {
+		// The member group-runtime pull already owns Path Z. Keeping this source
+		// Cluster-only avoids a second recovery writer in Production/Trial.
+		p.signalReporter.setObservedWindowResetSource(nil)
+	}
 }
 
 // EnableOrgSignalReporting is the Cluster-worker sibling of
@@ -897,6 +908,9 @@ func (p *Proxy) EnableOrgSignalReporting(controlURL, orgID, serviceToken string)
 	p.configureSignalReporting(endpoint, func(context.Context) (string, error) {
 		return serviceToken, nil
 	})
+	if p.signalReporter != nil && p.poolObservedResets != nil {
+		p.signalReporter.setObservedWindowResetSource(p.poolObservedResets.signalSnapshot)
+	}
 }
 
 func (p *Proxy) configureSignalReporting(endpoint string, bearer func(context.Context) (string, error)) {
@@ -906,6 +920,9 @@ func (p *Proxy) configureSignalReporting(endpoint string, bearer func(context.Co
 	if p.signalReporter == nil {
 		p.signalReporter = newSignalReporterEndpoint(endpoint, p.sourceID, bearer, slog.Default())
 		p.ownsSignalReporter = p.signalReporter != nil
+		if p.signalReporter != nil {
+			p.signalReporter.setWindowStatusSource(p.poolCooldown.windowStatusSnapshot)
+		}
 		return
 	}
 	p.signalReporter.configure(endpoint, p.sourceID, bearer)

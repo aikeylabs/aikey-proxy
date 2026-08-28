@@ -162,6 +162,21 @@ type rateLimitSample struct {
 	Risk429Count int `json:"risk_429_count"`
 }
 
+// windowStatusSample is the low-frequency, replayable projection of quota
+// protection held by the local cooldown store. It rides the existing signal
+// endpoint so utilization, risk and window availability share authentication
+// and retry health. The status fields use Master's existing persisted enum;
+// reset epochs identify the window and make duplicate/out-of-order reports
+// idempotent. Empty window fields are omitted for rolling compatibility.
+// Ref: workflow/CI/bugfix/2026-08-27-oauth-pool-quota-state-convergence.md.
+type windowStatusSample struct {
+	CredentialID    string `json:"credential_id"`
+	WindowStatus    string `json:"window_status,omitempty"`
+	WindowResetAt   int64  `json:"window_reset_at,omitempty"`
+	Window7dStatus  string `json:"window_7d_status,omitempty"`
+	Window7dResetAt int64  `json:"window_7d_reset_at,omitempty"`
+}
+
 type signalReporter struct {
 	configMu  sync.RWMutex
 	url       string
@@ -213,13 +228,16 @@ type signalReporter struct {
 	// condition on every request, and the LOG needs the transition, not the storm.
 	// Reset every ticker flush, so a condition persisting across windows re-logs
 	// at most once per 30s — bounded, and still visibly "ongoing" on the page.
-	evIn        chan schedulingEventSample
-	evSupMu     sync.Mutex
-	evSuppress  map[string]struct{}
-	logger      *slog.Logger
-	healthMu    sync.Mutex
-	health      SignalReportingHealth
-	dropSinceOK bool
+	evIn         chan schedulingEventSample
+	evSupMu      sync.Mutex
+	evSuppress   map[string]struct{}
+	windowMu     sync.RWMutex
+	windowSource func() []windowStatusSample
+	resetSource  func() []observedWindowResetSample
+	logger       *slog.Logger
+	healthMu     sync.Mutex
+	health       SignalReportingHealth
+	dropSinceOK  bool
 
 	// stop terminates loop() on Close so the goroutine + ticker don't leak. The
 	// Supervisor owns one reporter for the full process lifetime; hot-reload
@@ -227,6 +245,54 @@ type signalReporter struct {
 	stop     chan struct{}
 	done     chan struct{}
 	stopOnce sync.Once
+}
+
+// setWindowStatusSource installs the process-owned cooldown snapshot reader.
+// The callback performs no I/O and returns a detached slice. Keeping the source
+// outside the reporter avoids a second window-state truth while still letting
+// every ticker retry the current snapshot after Control outages.
+func (r *signalReporter) setWindowStatusSource(source func() []windowStatusSample) {
+	if r == nil {
+		return
+	}
+	r.windowMu.Lock()
+	r.windowSource = source
+	r.windowMu.Unlock()
+}
+
+func (r *signalReporter) snapshotWindowStatuses() []windowStatusSample {
+	if r == nil {
+		return nil
+	}
+	r.windowMu.RLock()
+	source := r.windowSource
+	r.windowMu.RUnlock()
+	if source == nil {
+		return nil
+	}
+	return source()
+}
+
+func (r *signalReporter) setObservedWindowResetSource(source func() []observedWindowResetSample) {
+	if r == nil {
+		return
+	}
+	r.windowMu.Lock()
+	r.resetSource = source
+	r.windowMu.Unlock()
+}
+
+func (r *signalReporter) snapshotObservedWindowResets() []observedWindowResetSample {
+	if r == nil {
+		return nil
+	}
+	r.windowMu.RLock()
+	source := r.resetSource
+	r.windowMu.RUnlock()
+	if source == nil {
+		return nil
+	}
+	return source()
 }
 
 // SignalReportingHealth is the developer-facing /status projection for the
@@ -1176,7 +1242,7 @@ func (r *signalReporter) deliverAuthFailureChunk(failures []authFailureSample) (
 	if len(failures) == 0 {
 		return false, true, ""
 	}
-	result := r.uploadAllResult(nil, nil, failures, nil, nil, nil)
+	result := r.uploadAllResult(nil, nil, failures, nil, nil, nil, nil)
 	if result.ok {
 		r.acknowledgeAuthFailures(failures)
 		return true, true, ""
@@ -1204,11 +1270,12 @@ func (r *signalReporter) loop() {
 	defer ticker.Stop()
 	defer close(r.done)
 	pending := newSignalTrendAccumulator()
-	flush := func(rate []rateLimitSample, conc []concurrencySample) {
+	flush := func(rate []rateLimitSample, conc []concurrencySample, windows []windowStatusSample) {
 		r.recordSignalDrop(pending.mergeRate(rate) + pending.mergeConcurrency(conc))
 		authFailures := r.snapshotAuthFailures()
-		r.setPendingSignals(pending.count() + len(authFailures) + len(r.authIn))
-		if pending.count() == 0 && len(authFailures) == 0 {
+		resets := r.snapshotObservedWindowResets()
+		r.setPendingSignals(pending.count() + len(authFailures) + len(r.authIn) + len(windows) + len(resets))
+		if pending.count() == 0 && len(authFailures) == 0 && len(windows) == 0 && len(resets) == 0 {
 			return
 		}
 		// A disabled reporter retains its bounded trend accumulator and durable
@@ -1221,12 +1288,19 @@ func (r *signalReporter) loop() {
 		attempted := false
 		allOK := true
 		detail := ""
-		if pending.count() > 0 {
+		windowPending := len(windows)
+		resetPending := len(resets)
+		if pending.count() > 0 || len(windows) > 0 || len(resets) > 0 {
 			util, revoked, rates, concurrency, events := pending.slices()
-			ok, uploadDetail := r.uploadAll(util, revoked, nil, rates, concurrency, events)
+			ok, uploadDetail := r.uploadAllWithObservedResets(util, revoked, nil, rates, concurrency, events, windows, resets)
 			attempted = true
 			if ok {
 				pending = newSignalTrendAccumulator()
+				// Window states are a reconcile snapshot, not a queued event. A
+				// successful POST leaves no pending work even though the same live
+				// snapshot is intentionally re-sent on the next cadence.
+				windowPending = 0
+				resetPending = 0
 			} else {
 				allOK = false
 				detail = uploadDetail
@@ -1246,7 +1320,7 @@ func (r *signalReporter) loop() {
 		if attempted {
 			r.recordSignalUpload(allOK, detail)
 		}
-		r.setPendingSignals(pending.count() + len(r.snapshotAuthFailures()) + len(r.authIn))
+		r.setPendingSignals(pending.count() + len(r.snapshotAuthFailures()) + len(r.authIn) + windowPending + resetPending)
 	}
 	for {
 		select {
@@ -1264,17 +1338,17 @@ func (r *signalReporter) loop() {
 			}
 		case sample := <-r.authIn:
 			r.ingestAuthFailures(r.drainAuthFailures(sample))
-			flush(nil, nil)
+			flush(nil, nil, nil)
 		case <-r.authWake:
-			flush(nil, nil)
+			flush(nil, nil, nil)
 		case <-ticker.C:
 			r.clearSchedulingEventSuppression()
-			flush(r.snapshotRateLimits(), r.snapshotConcurrency())
+			flush(r.snapshotRateLimits(), r.snapshotConcurrency(), r.snapshotWindowStatuses())
 		case <-r.stop:
 			for len(r.authIn) > 0 {
 				r.ingestAuthFailures(r.drainAuthFailures(<-r.authIn))
 			}
-			flush(r.snapshotRateLimits(), r.snapshotConcurrency())
+			flush(r.snapshotRateLimits(), r.snapshotConcurrency(), r.snapshotWindowStatuses())
 			return
 		}
 	}
@@ -1285,13 +1359,17 @@ func (r *signalReporter) post(samples []signalSample, revoked []revokedSample, r
 }
 
 func (r *signalReporter) postAll(samples []signalSample, revoked []revokedSample, authFailures []authFailureSample, rateLimits []rateLimitSample, concurrency []concurrencySample) bool {
-	ok, detail := r.uploadAll(samples, revoked, authFailures, rateLimits, concurrency, nil)
+	ok, detail := r.uploadAll(samples, revoked, authFailures, rateLimits, concurrency, nil, nil)
 	r.recordSignalUpload(ok, detail)
 	return ok
 }
 
-func (r *signalReporter) uploadAll(samples []signalSample, revoked []revokedSample, authFailures []authFailureSample, rateLimits []rateLimitSample, concurrency []concurrencySample, events []schedulingEventSample) (ok bool, detail string) {
-	result := r.uploadAllResult(samples, revoked, authFailures, rateLimits, concurrency, events)
+func (r *signalReporter) uploadAll(samples []signalSample, revoked []revokedSample, authFailures []authFailureSample, rateLimits []rateLimitSample, concurrency []concurrencySample, events []schedulingEventSample, windows []windowStatusSample) (ok bool, detail string) {
+	return r.uploadAllWithObservedResets(samples, revoked, authFailures, rateLimits, concurrency, events, windows, nil)
+}
+
+func (r *signalReporter) uploadAllWithObservedResets(samples []signalSample, revoked []revokedSample, authFailures []authFailureSample, rateLimits []rateLimitSample, concurrency []concurrencySample, events []schedulingEventSample, windows []windowStatusSample, resets []observedWindowResetSample) (ok bool, detail string) {
+	result := r.uploadAllResultWithObservedResets(samples, revoked, authFailures, rateLimits, concurrency, events, windows, resets)
 	return result.ok, result.detail
 }
 
@@ -1301,7 +1379,11 @@ type signalUploadResult struct {
 	statusCode int
 }
 
-func (r *signalReporter) uploadAllResult(samples []signalSample, revoked []revokedSample, authFailures []authFailureSample, rateLimits []rateLimitSample, concurrency []concurrencySample, events []schedulingEventSample) signalUploadResult {
+func (r *signalReporter) uploadAllResult(samples []signalSample, revoked []revokedSample, authFailures []authFailureSample, rateLimits []rateLimitSample, concurrency []concurrencySample, events []schedulingEventSample, windows []windowStatusSample) signalUploadResult {
+	return r.uploadAllResultWithObservedResets(samples, revoked, authFailures, rateLimits, concurrency, events, windows, nil)
+}
+
+func (r *signalReporter) uploadAllResultWithObservedResets(samples []signalSample, revoked []revokedSample, authFailures []authFailureSample, rateLimits []rateLimitSample, concurrency []concurrencySample, events []schedulingEventSample, windows []windowStatusSample, resets []observedWindowResetSample) signalUploadResult {
 	r.configMu.RLock()
 	endpoint := r.url
 	sourceID := r.sourceID
@@ -1310,10 +1392,9 @@ func (r *signalReporter) uploadAllResult(samples []signalSample, revoked []revok
 	if endpoint == "" || bearer == nil {
 		return signalUploadResult{detail: "signal reporting disabled"}
 	}
-	// All arrays are optional: marshal only the non-empty ones so an all-samples,
-	// all-revoked, all-rate_limits, or all-concurrency flush still posts a valid
-	// body the master can decode.
-	payload := make(map[string]any, 6)
+	// All arrays are optional: marshal only the non-empty ones so any single
+	// signal family still posts a valid body the master can decode.
+	payload := make(map[string]any, 9)
 	if sourceID != "" {
 		payload["source_id"] = sourceID
 	}
@@ -1334,6 +1415,12 @@ func (r *signalReporter) uploadAllResult(samples []signalSample, revoked []revok
 	}
 	if len(events) > 0 {
 		payload["events"] = events
+	}
+	if len(windows) > 0 {
+		payload["window_statuses"] = windows
+	}
+	if len(resets) > 0 {
+		payload["observed_window_resets"] = resets
 	}
 	if len(payload) == 0 || (len(payload) == 1 && sourceID != "") {
 		return signalUploadResult{ok: true}

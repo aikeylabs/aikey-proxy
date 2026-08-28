@@ -106,8 +106,8 @@ func TestSignalReporterLifecycleMatchesProcessOwnership(t *testing.T) {
 	}
 
 	shutdown := funcNamed(t, "supervisor.go", "Shutdown")
-	if !callsMethodOn(shutdown, "oauthPoolRuntime", "Close") {
-		t.Error("Supervisor.Shutdown must close oauthPoolRuntime so the shared " +
+	if !callsMethodOn(shutdown, "oauthPoolRuntime", "Shutdown") {
+		t.Error("Supervisor.Shutdown must retire oauthPoolRuntime so the shared " +
 			"signal reporter loop and ticker do not leak at process exit")
 	}
 }
