@@ -368,6 +368,15 @@ type Proxy struct {
 	// filterHook (dispatcher present) OR filterStub501 (declared but no
 	// working dispatcher), never both.
 	filterStub501 *FilterStubCause
+	// licensePlane is the deployment's forwarding gate (2026-08-27). nil on a
+	// build or harness that wired none, which ALLOWS — see
+	// LicensePlaneCache.ForwardingAllowed for why every unknown answer here
+	// allows rather than denies.
+	//
+	// 🔴 The pointer is to a SUPERVISOR-scoped cache shared by every generation,
+	// not a per-generation value. A gate that reset on reload would be cleared by
+	// the next `aikey key sync`.
+	licensePlane *LicensePlaneCache
 	// filterIncremental, when true, makes the inbound filter scan ONLY the
 	// latest user turn (the new content) instead of re-scanning system + the
 	// whole conversation history every request. WHY: clients like OpenClaw
@@ -735,6 +744,18 @@ const (
 // Called once at generation build; must not be flipped at runtime.
 func (p *Proxy) SetFilterStub501(cause *FilterStubCause) {
 	p.filterStub501 = cause
+}
+
+// SetLicensePlane is the supervisor wiring entry for the licence forwarding
+// gate. nil leaves the proxy ungated, which is what a harness that wired no
+// cache gets.
+//
+// 🔴 The cache handed in here is supervisor-scoped and is the SAME instance
+// across generations, so a reload re-points the proxy at state that already
+// exists rather than starting a fresh one. See
+// workflow/CI/bugfix/20260827-forwarding-gate-was-never-wired.md.
+func (p *Proxy) SetLicensePlane(cache *LicensePlaneCache) {
+	p.licensePlane = cache
 }
 
 // FilterStub501Cause returns the active fail-loud cause, or nil when the proxy

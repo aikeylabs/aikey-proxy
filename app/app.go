@@ -521,6 +521,20 @@ func Run() {
 	if lp := sup.LicensePlaneCache(); lp != nil {
 		adminHandler.LicensePlaneFn = func() any { return lp.Health() }
 	}
+	// 🔴 NOT decoration, and 🚫 not safe to drop. Two jobs:
+	//
+	//  1. an operator can see that this proxy consumes the licence gate at all,
+	//     rather than inferring it from the absence of refusals;
+	//  2. it ANCHORS LicenseConsumerMarker into the binary. The marker is a const,
+	//     and a const nothing references can be dropped by the linker — a dropped
+	//     marker reads to the release gate as "this build does not consume the
+	//     gate" and gets a perfectly good release refused.
+	//
+	// See internal/proxy/license_capability.go.
+	slog.Info("licence gate capabilities compiled into this build",
+		"event.name", observability.EventProxyLicensePlaneCapabilities,
+		"capabilities", strings.Join(proxy.SupportedLicenseCapabilities, ","),
+		"marker", proxy.LicenseConsumerMarker)
 	adminHandler.SyncHealthFn = func() map[string]admin.SyncRailStatus {
 		snap := sup.ControlPlaneSyncSnapshot()
 		if len(snap) == 0 {

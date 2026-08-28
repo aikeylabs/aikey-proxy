@@ -2015,6 +2015,10 @@ func (s *Supervisor) buildGeneration() (*generation, error) {
 	// Unconditional + nil-safe: an empty cache (no team cred / control URL / poll
 	// not landed) just means every request uses the local seatassign pick.
 	p.SetRoutingOverrides(s.routingOverrides)
+	// The licence forwarding gate. Supervisor-scoped on purpose: handing each
+	// generation a fresh cache would let every reload forward again for one poll
+	// interval, and `aikey key sync` triggers reloads.
+	p.SetLicensePlane(s.licensePlane)
 	// Whole-account cooldown changes happen on the request hot path. The hook is
 	// deliberately a non-blocking channel kick; SQLite restamping runs in the
 	// supervisor-owned worker and can never delay the upstream response.

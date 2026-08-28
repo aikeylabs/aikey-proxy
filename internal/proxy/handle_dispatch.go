@@ -77,6 +77,51 @@ func (p *Proxy) Handle(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// 0-license. The deployment's licence forwarding gate.
+	//
+	// 🔴 WHY THIS IS HERE AT ALL (2026-08-27,
+	// workflow/CI/bugfix/20260827-forwarding-gate-was-never-wired.md). The control
+	// plane has always computed this verdict — licstate gives `expired`,
+	// `grace_exhausted`, `revoked` and `stale` a `Forwarding: deny`, and serves the
+	// projection on /v1/license/plane under a comment naming the proxy as its
+	// reader. Nothing read it. An expired deployment's console correctly went
+	// read-only while every virtual key it had already issued kept forwarding, for
+	// ever. This line is the consumer that was missing.
+	//
+	// 🔴 WHY AFTER 0-diag AND BEFORE EVERY ROUTING BRANCH. After, because
+	// read-only diagnostics must survive a refusal — R8 makes read/export `allow`
+	// on every row of the plane table, including the ones that deny forwarding, so
+	// an operator diagnosing the refusal must not be locked out by it. Before,
+	// because Handle is the single per-request entry the supervisor calls, and
+	// putting the gate above probe / app / path-prefix / token routing is what
+	// makes one placement cover all four rather than four placements covering
+	// three. hotpath_license_gate_fence_test.go asserts this position by
+	// reachability rather than trusting the comment.
+	//
+	// Cost: one atomic load. No file read, no database query, no signature check,
+	// no synchronous control call — specs/edition-entitlement requires all five of
+	// those absences on the forwarding path, and the cache exists to provide them.
+	if !p.licensePlane.ForwardingAllowed() {
+		p.errors.Add(1)
+		// Logged per REQUEST would be a mistake: a denied deployment is denied for
+		// every call, and a per-request line is how a developer machine once
+		// accumulated a 466 MB log. The transition is logged by the rail instead.
+		writeJSONErrorDetails(w, http.StatusPaymentRequired, "license_error",
+			observability.ErrCodeLicenseForwardingDenied, licenseForwardingDeniedMessage,
+			map[string]any{
+				// 🔴 Stated in the refusal itself, because the first thing anyone asks
+				// is whether their data is stuck. It is not: R10 takes nothing back and
+				// read/export stay available on every plane row.
+				"read_and_export_unaffected": true,
+				"next_step": map[string]any{
+					"code":     "check_license",
+					"summary":  licenseForwardingDeniedNextStep,
+					"surfaces": []string{"console:/master/license", "cli:aikey license status"},
+				},
+			})
+		return
+	}
+
 	// 0a-prime. Probe pipeline path: /probe/<alias>/v1/... (mode C, SPEC
 	// 2026-05-23-credential-mode-architecture §1.3).
 	//
@@ -353,6 +398,26 @@ func (p *Proxy) Handle(w http.ResponseWriter, r *http.Request) {
 	p.serveRouteWithObserver(w, r, route, prov, realKey, token, startTime, logger,
 		observer.StreamUserChat, tc.TraceID)
 }
+
+// The refusal text for the licence forwarding gate.
+//
+// 🔴 It names the CAUSE and a step the reader can take, because the reader is a
+// developer whose `claude` command just stopped working and who has no idea their
+// company's deployment has a licence at all. "Forbidden" or "unauthorized" would
+// send them to check their API key, which is fine — that is the whole reason this
+// is a 402 and not a 403.
+//
+// 🚫 No expiry date, no company name, no state name. The person seeing this is a
+// member, and PRD §6.4 keeps the deployment's commercial standing off member
+// surfaces; the administrator gets the full story on the console page named
+// below. It is also why the wire projection this gate reads carries one word.
+const (
+	licenseForwardingDeniedMessage = "This deployment's AiKey licence does not currently permit " +
+		"AI request forwarding. Your existing keys and data are untouched, and reading and " +
+		"exporting still work."
+	licenseForwardingDeniedNextStep = "Ask an administrator to open the licence page in the AiKey " +
+		"console, or run `aikey license status` to see this deployment's licence state."
+)
 
 // filterStub501Message renders the fail-loud 501 body for one FilterStubCause.
 // Contract (bugfix 2026-08-19 filterpipe-501-stale-copy): every branch states
