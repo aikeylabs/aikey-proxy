@@ -17,8 +17,8 @@ const (
 	// were dumped to stderr. Exit still completes — this is forensic evidence,
 	// not a hang (bugfix 2026-08-19-proxy-shutdown-unbounded-close).
 	EventProxyShutdownWatchdogTimeout = "proxy.shutdown.watchdog_timeout"
-	EventProxyConfigLoaded   = "proxy.config.loaded"
-	EventProxyListenerBound  = "proxy.listener.bound"
+	EventProxyConfigLoaded            = "proxy.config.loaded"
+	EventProxyListenerBound           = "proxy.listener.bound"
 )
 
 // Browserless pool-login events. These never carry a session key or token;
@@ -126,6 +126,15 @@ const (
 	EventProxyKeyRevocationMalformed = "proxy.key_revocation.snapshot_malformed"
 	EventProxyKeyRevocationRefused   = "proxy.key_revocation.request_refused"
 	EventProxySyncHealthFileFailed   = "proxy.sync.health_file_failed"
+	// Licence forwarding gate — the RAIL's events (2026-08-27). The control plane
+	// has always computed a forwarding verdict for expired / grace-exhausted /
+	// revoked / stale deployments and nothing on the data path read it. This
+	// change makes the verdict observable; refusing on it is a separate change.
+	// See supervisor/license_plane_rail.go and
+	// workflow/CI/bugfix/20260827-forwarding-gate-was-never-wired.md.
+	EventProxyLicensePlaneChanged    = "proxy.license.plane_changed"
+	EventProxyLicensePlaneUnreadable = "proxy.license.plane_unreadable"
+	EventProxyLicensePlaneFileFailed = "proxy.license.plane_file_failed"
 	// EventReporterDeadLetterReplayed: the automatic dead-letter replay ran
 	// after the upload pipe recovered (2026-07-04 self-heal) — carries
 	// scanned/replayed/still-failing counts, or the error when the pass failed.
@@ -393,10 +402,10 @@ const (
 // ---- Error code constants ----
 
 const (
-	ErrCodeTokenMissing                   = "TOKEN_MISSING"
-	ErrCodeTokenInvalid                   = "TOKEN_INVALID"
-	ErrCodePolicyModelForbidden           = "POLICY_MODEL_FORBIDDEN"
-	ErrCodeSecretNotConfigured            = "SECRET_NOT_CONFIGURED"
+	ErrCodeTokenMissing         = "TOKEN_MISSING"
+	ErrCodeTokenInvalid         = "TOKEN_INVALID"
+	ErrCodePolicyModelForbidden = "POLICY_MODEL_FORBIDDEN"
+	ErrCodeSecretNotConfigured  = "SECRET_NOT_CONFIGURED"
 	// ErrCodeUpstreamBaseURLMissing (2026-08-25, bugfix
 	// 2026-08-25-empty-upstream-base-url-unhelpful-error): the resolved route
 	// carries no upstream base URL — a configuration gap (custom provider with

@@ -102,6 +102,18 @@ type Handler struct {
 	// package — the same layering posture ResponseTransform and ObserverRegistry
 	// already use in vkeys.
 	UpstreamFallbackFn func() any
+	// LicensePlaneFn supplies the deployment's forwarding gate for /status.
+	//
+	// 🔴 Required by the health-signal-surface rule, and not optional commentary:
+	// this verdict decides whether a deployment may forward, and until now its
+	// whole mechanism was unobservable from outside the process — which is a
+	// large part of why nobody noticed the consumer had never been written.
+	// `control_plane_sync` reports whether the rail is polling; only this reports
+	// what the answer was.
+	//
+	// Typed `any` for the same layering reason as UpstreamFallbackFn: internal/
+	// admin does not import internal/proxy.
+	LicensePlaneFn func() any
 	// SyncHealthFn supplies the SyncRail per-rail health map for /status. Nil or
 	// an empty map → the control_plane_sync field is omitted.
 	SyncHealthFn func() map[string]SyncRailStatus
@@ -335,6 +347,15 @@ type statusResponse struct {
 	// "I set it to 10 seconds in the console" — without a source, the next two
 	// hours are mutual disbelief.
 	UpstreamFallback any `json:"upstream_fallback,omitempty"`
+	// LicensePlane reports the deployment's forwarding gate: the value in force,
+	// where it came from, and how old it is. Omitted when the capability is not
+	// wired.
+	//
+	// 🔴 `source` is the load-bearing field. A `deny` obtained from the control
+	// plane a minute ago and a `deny` inherited from a file written by a process
+	// that exited last month need completely different responses, and an operator
+	// cannot tell them apart from the verdict alone.
+	LicensePlane any `json:"license_plane,omitempty"`
 }
 
 // SyncRailStatus mirrors supervisor.RailSyncStatus for the /status wire (built
@@ -419,6 +440,10 @@ func (h *Handler) Status(w http.ResponseWriter, r *http.Request) {
 	if h.UpstreamFallbackFn != nil {
 		upstreamFallback = h.UpstreamFallbackFn()
 	}
+	var licensePlane any
+	if h.LicensePlaneFn != nil {
+		licensePlane = h.LicensePlaneFn()
+	}
 
 	writeJSON(w, http.StatusOK, statusResponse{
 		Status:           "ok",
@@ -433,6 +458,7 @@ func (h *Handler) Status(w http.ResponseWriter, r *http.Request) {
 		PoolRouting:      poolRouting,
 		ControlPlaneSync: syncHealth,
 		UpstreamFallback: upstreamFallback,
+		LicensePlane:     licensePlane,
 	})
 }
 
