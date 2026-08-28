@@ -102,8 +102,11 @@ func TestRenumberRestorables_MultiEntityNumberingAndRestore(t *testing.T) {
 	ctx := context.WithValue(context.Background(), ctxKeyMaskRestore, st)
 	body := []byte(`{"content":[{"type":"text","text":"寄到{{ADDR_1}}，打{{PHONE_2}}，抄送{{EMAIL_3}}"}]}`)
 	out := string(restoreMaskedResponseBody(ctx, body, discardLogger()))
-	if !strings.Contains(out, addr) || !strings.Contains(out, phone) || !strings.Contains(out, email) {
-		t.Fatalf("multi-entity restore incomplete: %s", out)
+	// The WHOLE phrase, not three presence checks: "all three originals appear"
+	// stays green if two labels trade values, which is the one multi-entity
+	// failure a user would actually be harmed by (they read someone else's PII).
+	if want := "寄到" + addr + "，打" + phone + "，抄送" + email; !strings.Contains(out, want) {
+		t.Fatalf("multi-entity restore did not put each label back in its OWN place\n got: %s\nwant substring: %s", out, want)
 	}
 	if strings.Contains(out, "{{") {
 		t.Fatalf("placeholder survived restore: %s", out)
@@ -196,8 +199,8 @@ func TestRenumberRestorables_SubstringTokenTrapCountsAlign(t *testing.T) {
 	ctx := context.WithValue(context.Background(), ctxKeyMaskRestore, st)
 	out := string(restoreMaskedResponseBody(ctx,
 		[]byte(`{"t":"甲<<A#1>>乙<A#2>"}`), discardLogger()))
-	if !strings.Contains(out, outer) || !strings.Contains(out, inner) {
-		t.Fatalf("counts-align trap restore wrong: %s", out)
+	if want := "甲" + outer + "乙" + inner; !strings.Contains(out, want) {
+		t.Fatalf("counts-align trap restore wrong — each label must restore to ITS OWN original\n got: %s\nwant substring: %s", out, want)
 	}
 }
 
@@ -221,8 +224,8 @@ func TestRenumberRestorables_TokenLooksLikeAnotherNumberedForm(t *testing.T) {
 	}
 	ctx := context.WithValue(context.Background(), ctxKeyMaskRestore, st)
 	out := string(restoreMaskedResponseBody(ctx, []byte(`{"t":"甲{{A_1}}乙{{A_1_2}}"}`), discardLogger()))
-	if !strings.Contains(out, v1) || !strings.Contains(out, v2) {
-		t.Fatalf("numbered-form collision restore wrong: %s", out)
+	if want := "甲" + v1 + "乙" + v2; !strings.Contains(out, want) {
+		t.Fatalf("numbered-form collision restore wrong — the two labels traded originals\n got: %s\nwant substring: %s", out, want)
 	}
 }
 
@@ -650,8 +653,8 @@ func TestApplyInboundFilter_MultiEntityEndToEndWithFidelity(t *testing.T) {
 	// The model answers with cosmetic drift on both — L3 has to carry them.
 	out := string(restoreMaskedResponseBody(r.Context(),
 		[]byte(`{"content":[{"type":"text","text":"寄到{{ addr_1 }}，拨打{ PHONE_2 }"}]}`), discardLogger()))
-	if !strings.Contains(out, addr) || !strings.Contains(out, phone) {
-		t.Fatalf("tolerant end-to-end restore failed: %s", out)
+	if want := "寄到" + addr + "，拨打" + phone; !strings.Contains(out, want) {
+		t.Fatalf("tolerant end-to-end restore failed — drift tolerance must not cost pairing\n got: %s\nwant substring: %s", out, want)
 	}
 	if h := p.maskRestoreHealth(); h.Restored != 2 || h.FidelityPct != 100 {
 		t.Fatalf("fidelity after a fully-restored answer = %+v, want 2/2", h)

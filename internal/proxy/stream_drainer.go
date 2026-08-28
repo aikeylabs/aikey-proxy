@@ -143,13 +143,32 @@ func newStreamDrainer(
 			// Proxy shutdown or client disconnect: abort between reads.
 			select {
 			case <-proxyCtx.Done():
+				// 🔴 RECORD WHAT WAS ALREADY EARNED (2026-08-28 拍板: 方向 B).
+				// This used to `return` here, discarding the accumulator — while
+				// the OTHER shutdown exit (the watcher closes upstream, Read
+				// fails, `break outer` below) fell through to collector.Record.
+				// One shutdown, two opposite outcomes decided by scheduling: the
+				// flake in TestStreamDrainer_ProxyContextAbort was that race made
+				// visible. Both paths now record.
+				//
+				// Why record rather than discard: a stream cut by OUR shutdown
+				// may already have delivered thousands of tokens the upstream
+				// will bill us for. Dropping them makes the customer's ledger
+				// disagree with the provider's, and this is a to-B product where
+				// that ledger is the deliverable. A zero-token row is the lesser
+				// evil and the projector already expects it — see
+				// collector-service/internal/projector/generation_scope.go: a
+				// zero-token row on a GENERATION path (which this always is)
+				// "stays visible — failed generation is part of the audit trail".
+				// The 2026-07-15 zero-token flood it filters came from
+				// /v1/models probes, a non-generation path; this is not that.
+				//
+				// 🚫 Do NOT "simplify" this back to an early return: that
+				// reinstates the split-brain, and the fence below will go red.
+				// bugfix/2026-08-24-stream-drainer-emits-phantom-event-on-proxy-shutdown.md
 				pw.CloseWithError(proxyCtx.Err())
-				if onComplete != nil {
-					// Early exit without token recording — still emit a
-					// callback so callers know the request never finished.
-					onComplete(provider.TokenBreakdown{}, "interrupted")
-				}
-				return
+				completion = "interrupted"
+				break outer
 			case <-reqCtx.Done():
 				// Client disconnected between reads.
 				completion = "partial"

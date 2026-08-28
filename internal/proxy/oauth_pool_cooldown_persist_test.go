@@ -14,10 +14,26 @@ import (
 // blocks on it. 能红: drop hydrateFromFile from newPoolCooldownStore and the
 // restart test fails; drop the corrupt-fallback and the corrupt test panics.
 
+// 🔴 EVERY store in this file is retired with t.Cleanup(closePersistence)
+// (2026-08-28). newPoolCooldownStore starts a persistenceLoop goroutine at
+// construction; these tests all point AIKEY_RUN_DIR at their own t.TempDir(),
+// so a loop still alive when the test returns races the testing package's
+// RemoveAll and recreates a file inside the directory being deleted →
+// "TempDir RemoveAll cleanup: directory not empty". That is a teardown failure,
+// not an assertion failure, and it presents as a low-frequency flake that only
+// shows up under the parallel load of a release build (it cost round 90).
+//
+// 🚫 Do NOT "fix" only the test that happened to go red: the leak is per-STORE,
+// so the fix has to cover every construction site or the next one flakes next.
+// t.Cleanup runs AFTER the test body, so it cannot affect what any of these
+// assert — including OlderBackgroundSnapshotCannotOverwriteNewerFlush, which
+// models the stale-writer race with direct synchronous writePersistenceSnapshot
+// calls and never depends on the background loop being alive.
 func TestPoolCooldown_PersistAndHydrateAcrossRestart(t *testing.T) {
 	t.Setenv("AIKEY_RUN_DIR", t.TempDir())
 
 	s1 := newPoolCooldownStore()
+	t.Cleanup(s1.closePersistence)
 	until := time.Now().Add(30 * time.Minute)
 	s1.mark("acc-cooled", until)
 	s1.flushPersistence()
@@ -28,6 +44,7 @@ func TestPoolCooldown_PersistAndHydrateAcrossRestart(t *testing.T) {
 
 	// "Restart": a fresh store hydrates the same skip view.
 	s2 := newPoolCooldownStore()
+	t.Cleanup(s2.closePersistence)
 	skip := s2.skipSet()
 	if !skip["acc-cooled"] {
 		t.Fatalf("hydrated store must keep cooling acc-cooled, skip=%v", skip)
@@ -54,6 +71,7 @@ func TestPoolCooldown_ErrorCauseSurvivesRestart(t *testing.T) {
 	t.Setenv("AIKEY_RUN_DIR", t.TempDir())
 
 	s1 := newPoolCooldownStore()
+	t.Cleanup(s1.closePersistence)
 	s1.markWithState("acc-egress", time.Now().Add(30*time.Minute), PoolAccountRouteState{
 		Status:    poolRouteUpstreamUnavailable,
 		ErrorCode: observability.ErrCodeAccountEgressProxy,
@@ -63,6 +81,7 @@ func TestPoolCooldown_ErrorCauseSurvivesRestart(t *testing.T) {
 	// "Restart": routing and its public failure reason must hydrate together;
 	// otherwise the first post-restart request regresses to a fake quota 429.
 	s2 := newPoolCooldownStore()
+	t.Cleanup(s2.closePersistence)
 	state, ok := s2.routeStateSnapshot()["acc-egress"]
 	if !ok {
 		t.Fatal("hydrated store must retain the active egress cooldown")
@@ -79,6 +98,7 @@ func TestPoolCooldown_WindowStatusReconcilesAcrossRestart(t *testing.T) {
 	reset7d := now.Add(72 * time.Hour)
 
 	s1 := newPoolCooldownStore()
+	t.Cleanup(s1.closePersistence)
 	s1.now = func() time.Time { return now }
 	s1.markWithStateAndWindows("acc-window", reset7d, PoolAccountRouteState{
 		Status: poolRouteWindowExhausted, RetryAt: reset7d.Unix(),
@@ -89,6 +109,7 @@ func TestPoolCooldown_WindowStatusReconcilesAcrossRestart(t *testing.T) {
 	s1.flushPersistence()
 
 	s2 := newPoolCooldownStore()
+	t.Cleanup(s2.closePersistence)
 	s2.now = func() time.Time { return now }
 	got := s2.windowStatusSnapshot()
 	if len(got) != 1 || got[0].CredentialID != "cred-window" ||
@@ -111,11 +132,13 @@ func TestPoolCooldown_ExpiredEntriesNotHydrated(t *testing.T) {
 	t.Setenv("AIKEY_RUN_DIR", t.TempDir())
 
 	s1 := newPoolCooldownStore()
+	t.Cleanup(s1.closePersistence)
 	s1.mark("acc-expired", time.Now().Add(50*time.Millisecond))
 	s1.flushPersistence()
 	time.Sleep(80 * time.Millisecond)
 
 	s2 := newPoolCooldownStore()
+	t.Cleanup(s2.closePersistence)
 	if skip := s2.skipSet(); skip != nil {
 		t.Fatalf("expired persisted entries must not hydrate, skip=%v", skip)
 	}
@@ -126,6 +149,7 @@ func TestPoolCooldown_CorruptOrMissingFileFallsBackEmpty(t *testing.T) {
 
 	// Missing file → empty store, no error.
 	s := newPoolCooldownStore()
+	t.Cleanup(s.closePersistence)
 	if skip := s.skipSet(); skip != nil {
 		t.Fatalf("missing file must yield empty store, skip=%v", skip)
 	}
@@ -136,6 +160,7 @@ func TestPoolCooldown_CorruptOrMissingFileFallsBackEmpty(t *testing.T) {
 		t.Fatal(err)
 	}
 	s2 := newPoolCooldownStore()
+	t.Cleanup(s2.closePersistence)
 	if skip := s2.skipSet(); skip != nil {
 		t.Fatalf("corrupt file must yield empty store, skip=%v", skip)
 	}
@@ -146,6 +171,7 @@ func TestPoolCooldown_CorruptOrMissingFileFallsBackEmpty(t *testing.T) {
 	}
 	// The next mark overwrote the corrupt file with valid content.
 	s3 := newPoolCooldownStore()
+	t.Cleanup(s3.closePersistence)
 	if !s3.skipSet()["acc-new"] {
 		t.Fatal("corrupt file must be replaced by the next persist")
 	}
@@ -155,6 +181,7 @@ func TestPoolCooldown_AllExpiredRemovesFile(t *testing.T) {
 	t.Setenv("AIKEY_RUN_DIR", t.TempDir())
 
 	s := newPoolCooldownStore()
+	t.Cleanup(s.closePersistence)
 	s.mark("acc-1", time.Now().Add(40*time.Millisecond))
 	s.flushPersistence()
 	time.Sleep(60 * time.Millisecond)
@@ -175,6 +202,7 @@ func TestPoolCooldown_AllExpiredRemovesFile(t *testing.T) {
 func TestPoolCooldown_OlderBackgroundSnapshotCannotOverwriteNewerFlush(t *testing.T) {
 	t.Setenv("AIKEY_RUN_DIR", t.TempDir())
 	s := newPoolCooldownStore()
+	t.Cleanup(s.closePersistence)
 	until := time.Now().Add(time.Hour).Unix()
 
 	s.writePersistenceSnapshot(poolCooldownFileBody{
@@ -189,6 +217,7 @@ func TestPoolCooldown_OlderBackgroundSnapshotCannotOverwriteNewerFlush(t *testin
 	}, 1)
 
 	restarted := newPoolCooldownStore()
+	t.Cleanup(restarted.closePersistence)
 	skip := restarted.skipSet()
 	if !skip["acc-new"] || skip["acc-stale"] {
 		t.Fatalf("stale writer replaced newer shutdown snapshot: %v", skip)

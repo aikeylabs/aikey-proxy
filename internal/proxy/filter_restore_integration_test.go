@@ -147,8 +147,12 @@ func TestFilterIntegration_AddressMaskLadderEndToEnd(t *testing.T) {
 	// 响应侧 (non-streaming): the LLM echoes both placeholders → restored.
 	respBody := []byte(`{"id":"msg_1","content":[{"type":"text","text":"好的，主件送到{{ADDR_1}}，发票寄{{ADDR_2}}。"}],"usage":{"input_tokens":10,"output_tokens":20}}`)
 	restored := string(restoreMaskedResponseBody(r.Context(), respBody, discardLogger()))
-	if !strings.Contains(restored, e2eAddr1) || !strings.Contains(restored, e2eAddr2) {
-		t.Fatalf("response restore failed: %s", restored)
+	// SAME family, two values — the only shape where a swap is expressible, so
+	// the assertion has to be positional. Presence-only ("both addresses appear")
+	// is green whether or not {{ADDR_1}} and {{ADDR_2}} traded originals, which
+	// would show the user the wrong address with full confidence.
+	if want := "好的，主件送到" + e2eAddr1 + "，发票寄" + e2eAddr2 + "。"; !strings.Contains(restored, want) {
+		t.Fatalf("response restore did not pair each label with its OWN address\n got: %s\nwant substring: %s", restored, want)
 	}
 	if strings.Contains(restored, "{{ADDR") {
 		t.Fatalf("placeholder left in restored response: %s", restored)

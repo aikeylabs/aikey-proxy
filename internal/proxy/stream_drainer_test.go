@@ -244,10 +244,28 @@ func TestStreamDrainer_ProxyContextAbort(t *testing.T) {
 		t.Fatal("drainer goroutine did not exit after proxy context canceled")
 	}
 
-	// No event should be recorded (proxy aborted cleanly, collector is also closing).
-	time.Sleep(50 * time.Millisecond)
-	if store.count() != 0 {
-		t.Errorf("expected 0 events on proxy abort, got %d", store.count())
+	// 🔴 CONTRACT FLIPPED 2026-08-28 (拍板: 方向 B —— 关闭时尽量记).
+	// This used to assert ZERO events. That contract was never actually held:
+	// the drainer had two shutdown exits and only one of them skipped
+	// recording, so the same abort produced an event or not depending on
+	// scheduling — this very test flaked at ~10%. Rather than pick the
+	// discarding branch, the decision was to record on BOTH: a stream cut by
+	// our own shutdown may already have earned tokens the upstream bills for,
+	// and a customer ledger that silently drops them is worse than a
+	// zero-token row (which the projector already expects on a generation
+	// path — generation_scope.go: "failed generation is part of the audit
+	// trail"). bugfix/2026-08-24-stream-drainer-emits-phantom-event-on-proxy-shutdown.md
+	//
+	// Wait on the COUNT, not on a sleep: the recording happens on the drainer
+	// goroutine after the pipe closes, so a fixed 50ms was a bet on the
+	// scheduler — exactly the kind of bet that made this test flake under a
+	// loaded release build.
+	deadline := time.Now().Add(2 * time.Second)
+	for store.count() == 0 && time.Now().Before(deadline) {
+		time.Sleep(2 * time.Millisecond)
+	}
+	if got := store.count(); got != 1 {
+		t.Errorf("proxy abort must record exactly one event (方向 B), got %d", got)
 	}
 }
 
