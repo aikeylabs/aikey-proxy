@@ -126,7 +126,7 @@ const (
 	EventProxyKeyRevocationMalformed = "proxy.key_revocation.snapshot_malformed"
 	EventProxyKeyRevocationRefused   = "proxy.key_revocation.request_refused"
 	EventProxySyncHealthFileFailed   = "proxy.sync.health_file_failed"
-	// Licence forwarding gate — the RAIL's events (2026-08-27). The control plane
+	// License forwarding gate — the RAIL's events (2026-08-27). The control plane
 	// has always computed a forwarding verdict for expired / grace-exhausted /
 	// revoked / stale deployments and nothing on the data path read it. This
 	// change makes the verdict observable; refusing on it is a separate change.
@@ -431,7 +431,7 @@ const (
 	ErrCodeProviderError                  = "PROVIDER_ERROR"
 	ErrCodeUsageExtractionFailed          = "USAGE_EXTRACTION_FAILED"
 	ErrCodeClusterVaultAssignmentsCorrupt = "CLUSTER_VAULT_ASSIGNMENTS_CORRUPT"
-	// ErrCodeLicenseForwardingDenied: this deployment's licence does not currently
+	// ErrCodeLicenseForwardingDenied: this deployment's license does not currently
 	// permit AI forwarding (expired, never activated past its grace deadline,
 	// revoked, or bound to a different machine). Carried on a 402, NOT a 403:
 	// 403 is what an SDK and a user both read as "your key is wrong", which sends

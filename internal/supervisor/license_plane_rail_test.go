@@ -1,11 +1,11 @@
 package supervisor
 
-// license_plane_rail_test.go — fences under the licence rail's GATE.
+// license_plane_rail_test.go — fences under the license rail's GATE.
 //
 // The gate decides which deployments this rail runs on, and getting it wrong is
 // invisible in opposite ways on either side: too open and every Personal install
 // grows a permanently red rail that means nothing; too closed and a team install
-// silently stops learning its licence state. Both were observed live on
+// silently stops learning its license state. Both were observed live on
 // 2026-08-27 (see workflow/CI/bugfix/20260827-forwarding-gate-was-never-wired.md).
 
 import (
@@ -22,7 +22,7 @@ import (
 // for rails that only exist on team installs. This rail runs everywhere, so
 // without its own gate it would count a failure every 60s on Personal and settle
 // into STALE and then OFFLINE in /status — a red signal whose actual meaning is
-// "this edition has no licence to check". Measured live before the gate existed:
+// "this edition has no license to check". Measured live before the gate existed:
 // fails=1 and climbing on a freshly started Personal proxy.
 func TestTheRailIdlesWithNoControlPlane(t *testing.T) {
 	t.Setenv("AIKEY_HUB_CONTROL_URL", "")
@@ -30,7 +30,7 @@ func TestTheRailIdlesWithNoControlPlane(t *testing.T) {
 
 	s := &Supervisor{licensePlane: proxy.NewLicensePlaneCache()}
 	if s.licensePlaneRail().gate(nil) {
-		t.Fatal("the licence rail is armed on a deployment with no control plane. " +
+		t.Fatal("the license rail is armed on a deployment with no control plane. " +
 			"Personal has none by design, so every Personal install would carry a " +
 			"licensing rail that fails forever and reports itself OFFLINE.")
 	}
@@ -46,8 +46,8 @@ func TestTheRailRunsWhenThereIsAControlPlane(t *testing.T) {
 
 	s := &Supervisor{licensePlane: proxy.NewLicensePlaneCache()}
 	if !s.licensePlaneRail().gate(nil) {
-		t.Fatal("the licence rail is idle on a deployment that HAS a control plane; " +
-			"the gate would never learn this deployment's licence state")
+		t.Fatal("the license rail is idle on a deployment that HAS a control plane; " +
+			"the gate would never learn this deployment's license state")
 	}
 }
 
@@ -71,7 +71,7 @@ func TestTheRailIsIdleWithoutACache(t *testing.T) {
 // `newRailSet(..., s.licensePlaneRail())` and asserted the rail was in it, which
 // is a tautology: it proved that a list this test wrote contains an element this
 // test put there. Deleting the rail from supervisor.go left it GREEN. That is
-// the same "reads as coverage" failure the licence gate itself was found in, so
+// the same "reads as coverage" failure the license gate itself was found in, so
 // it is recorded here rather than quietly corrected.
 //
 // 🚫 The scan is anchored to supervisor.go specifically, not a package-wide
@@ -103,9 +103,9 @@ func TestTheRailIsRegisteredInSupervisorGo(t *testing.T) {
 	}
 
 	if !strings.Contains(call, "licensePlaneRail()") {
-		t.Fatalf("supervisor.go does not register the licence rail:\n  %s\n\n"+
+		t.Fatalf("supervisor.go does not register the license rail:\n  %s\n\n"+
 			"Without it the forwarding gate is never populated, every deployment "+
-			"forwards regardless of its licence, and nothing else goes red — which "+
+			"forwards regardless of its license, and nothing else goes red — which "+
 			"is the exact defect of 2026-08-27.", call)
 	}
 }

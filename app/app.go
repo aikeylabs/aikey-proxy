@@ -513,7 +513,7 @@ func Run() {
 			return fp.HealthWithCooling(sup.BindingCooldownSnapshot(), sup.FallbackSwitches())
 		}
 	}
-	// The licence forwarding gate (2026-08-27). 🔴 Always wired when the cache
+	// The license forwarding gate (2026-08-27). 🔴 Always wired when the cache
 	// exists, including on Personal — there it reports never_synced/allow, which
 	// is the honest answer. Hiding the block on Personal would leave "no licensing
 	// here" and "the rail is broken" looking identical, which is the class of
@@ -523,7 +523,7 @@ func Run() {
 	}
 	// 🔴 NOT decoration, and 🚫 not safe to drop. Two jobs:
 	//
-	//  1. an operator can see that this proxy consumes the licence gate at all,
+	//  1. an operator can see that this proxy consumes the license gate at all,
 	//     rather than inferring it from the absence of refusals;
 	//  2. it ANCHORS LicenseConsumerMarker into the binary. The marker is a const,
 	//     and a const nothing references can be dropped by the linker — a dropped
@@ -531,7 +531,7 @@ func Run() {
 	//     gate" and gets a perfectly good release refused.
 	//
 	// See internal/proxy/license_capability.go.
-	slog.Info("licence gate capabilities compiled into this build",
+	slog.Info("license gate capabilities compiled into this build",
 		"event.name", observability.EventProxyLicensePlaneCapabilities,
 		"capabilities", strings.Join(proxy.SupportedLicenseCapabilities, ","),
 		"marker", proxy.LicenseConsumerMarker)

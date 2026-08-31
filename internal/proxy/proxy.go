@@ -752,7 +752,7 @@ func (p *Proxy) SetFilterStub501(cause *FilterStubCause) {
 	p.filterStub501 = cause
 }
 
-// SetLicensePlane is the supervisor wiring entry for the licence forwarding
+// SetLicensePlane is the supervisor wiring entry for the license forwarding
 // gate. nil leaves the proxy ungated, which is what a harness that wired no
 // cache gets.
 //

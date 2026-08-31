@@ -77,7 +77,7 @@ func (p *Proxy) Handle(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// 0-license. The deployment's licence forwarding gate.
+	// 0-license. The deployment's license forwarding gate.
 	//
 	// 🔴 WHY THIS IS HERE AT ALL (2026-08-27,
 	// workflow/CI/bugfix/20260827-forwarding-gate-was-never-wired.md). The control
@@ -399,11 +399,11 @@ func (p *Proxy) Handle(w http.ResponseWriter, r *http.Request) {
 		observer.StreamUserChat, tc.TraceID)
 }
 
-// The refusal text for the licence forwarding gate.
+// The refusal text for the license forwarding gate.
 //
 // 🔴 It names the CAUSE and a step the reader can take, because the reader is a
 // developer whose `claude` command just stopped working and who has no idea their
-// company's deployment has a licence at all. "Forbidden" or "unauthorized" would
+// company's deployment has a license at all. "Forbidden" or "unauthorized" would
 // send them to check their API key, which is fine — that is the whole reason this
 // is a 402 and not a 403.
 //
@@ -412,11 +412,11 @@ func (p *Proxy) Handle(w http.ResponseWriter, r *http.Request) {
 // surfaces; the administrator gets the full story on the console page named
 // below. It is also why the wire projection this gate reads carries one word.
 const (
-	licenseForwardingDeniedMessage = "This deployment's AiKey licence does not currently permit " +
+	licenseForwardingDeniedMessage = "This deployment's AiKey license does not currently permit " +
 		"AI request forwarding. Your existing keys and data are untouched, and reading and " +
 		"exporting still work."
-	licenseForwardingDeniedNextStep = "Ask an administrator to open the licence page in the AiKey " +
-		"console, or run `aikey license status` to see this deployment's licence state."
+	licenseForwardingDeniedNextStep = "Ask an administrator to open the license page in the AiKey " +
+		"console, or run `aikey license status` to see this deployment's license state."
 )
 
 // filterStub501Message renders the fail-loud 501 body for one FilterStubCause.

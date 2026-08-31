@@ -27,7 +27,7 @@ var testNow = time.Date(2026, 8, 27, 12, 0, 0, 0, time.UTC)
 
 // TestNeverSyncedAllows is the fence under the one fail-open that must survive.
 //
-// 🔴 Personal has no control plane and no licence, and every deployment passes
+// 🔴 Personal has no control plane and no license, and every deployment passes
 // through this state between process start and the rail's first cycle. A cache
 // that denied here would be a licensing mechanism that stops correctly licensed
 // deployments — R8's "读不到不停服", and the reason PlaneGate on the control side
@@ -70,7 +70,7 @@ func TestObservedGateIsHonoured(t *testing.T) {
 // TestStaleCeilingDenies is the fence under the owner decision of 2026-08-27.
 //
 // 🔴 Keep-last-known with NO ceiling is the obvious design and it makes the whole
-// gate theatre: a customer who firewalls their own control plane the day before
+// gate theater: a customer who firewalls their own control plane the day before
 // expiry keeps the last `allow` for ever. This asserts the bound exists, that it
 // is the documented seven days, and — the half that is easy to get wrong — that
 // it applies to a stale ALLOW rather than only to a stale deny.
@@ -80,8 +80,8 @@ func TestStaleCeilingDenies(t *testing.T) {
 	c.Observe(licenseGateAllow, observed)
 
 	if c.ForwardingAllowed() {
-		t.Fatalf("an `allow` observed %v ago was still honoured. Without this bound, "+
-			"disconnecting the control plane is an unlimited licence.",
+		t.Fatalf("an `allow` observed %v ago was still honored. Without this bound, "+
+			"disconnecting the control plane is an unlimited license.",
 			testNow.Sub(observed))
 	}
 	h := c.Health()
@@ -95,7 +95,7 @@ func TestStaleCeilingDenies(t *testing.T) {
 	}
 
 	// 🔴 And the other side of the boundary, so the fence cannot pass by denying
-	// everything. Just inside the ceiling must still be honoured.
+	// everything. Just inside the ceiling must still be honored.
 	fresh := atClock(t, testNow)
 	fresh.Observe(licenseGateAllow, testNow.Add(-LicensePlaneStaleCeiling).Add(time.Minute))
 	if !fresh.ForwardingAllowed() {
@@ -106,7 +106,7 @@ func TestStaleCeilingDenies(t *testing.T) {
 
 // TestStaleCeilingIsSevenDays pins the number itself.
 //
-// A separate assertion from the behaviour above because the behaviour would keep
+// A separate assertion from the behavior above because the behavior would keep
 // passing if somebody widened the constant to a year — which is precisely the
 // change that would quietly restore the bypass.
 func TestStaleCeilingIsSevenDays(t *testing.T) {

@@ -7,14 +7,14 @@
 // `grace_exhausted`, `revoked` and `stale` all carry `Forwarding: deny`, the
 // control service projects that verdict, and it serves it on
 // `GET /v1/license/plane` under a comment that names the proxy as its reader.
-// The proxy never read it, so a customer whose licence expired kept forwarding
+// The proxy never read it, so a customer whose license expired kept forwarding
 // every request indefinitely while their console correctly showed `expired`.
 //
 // 🔴 Why nobody noticed, which is the part worth keeping: every layer of this
 // mechanism fails OPEN on purpose, and correctly so — PlaneGate starts `allow`
 // so licensing can never stop a healthy deployment at start-up. The consequence
 // is that "the consumer was never written" and "everything is licensed" produce
-// identical observable behaviour. There was no red to see. aikey-proxy even had a
+// identical observable behavior. There was no red to see. aikey-proxy even had a
 // green fence asserting the hot path does not import licensing, which was true
 // for the wrong reason. The replacement is a POSITIVE fence — see
 // internal/proxy/hotpath_license_gate_fence_test.go.
@@ -100,7 +100,7 @@ var licensePlaneHTTPClient = httpx.NewSwappableDirect(10 * time.Second)
 // licensePlaneWire is the slice of the projection this rail reads.
 //
 // 🔴 Deliberately NOT the whole projection, even for the Cluster path where the
-// whole thing is available. Deserialising `state` would put the licence state
+// whole thing is available. Deserialising `state` would put the license state
 // machine's vocabulary inside the proxy, and the next person to touch this file
 // would find it sitting there looking usable. The data path gets one word.
 type licensePlaneWire struct {
@@ -130,7 +130,7 @@ func (s *Supervisor) licensePlaneRail() railSpec {
 		// everywhere: Personal has no control plane by design, so without this the
 		// rail would count a failure every 60s and settle into a permanently STALE
 		// then OFFLINE entry in /status on every Personal machine — a red signal
-		// that means "this edition has no licence", which is not a fault.
+		// that means "this edition has no license", which is not a fault.
 		//
 		// 🚫 Nothing is lost on a team install whose control URL really was wiped:
 		// the cache keeps its last known gate, its age keeps growing in /status,
@@ -222,7 +222,7 @@ func (s *Supervisor) syncLicensePlane(ctx context.Context, _ *generation, master
 		return fmt.Errorf("decode license plane: %w", err)
 	}
 
-	// 🔴 An unrecognised gate is a FAILED cycle, not a guess.
+	// 🔴 An unrecognized gate is a FAILED cycle, not a guess.
 	//
 	// Mapping an unknown value to `allow` would silently disable the gate the
 	// first time the wire format moved; mapping it to `deny` would stop a paying
@@ -231,10 +231,10 @@ func (s *Supervisor) syncLicensePlane(ctx context.Context, _ *generation, master
 	// the staleness ceiling still applies. This is also what lets the cache assume
 	// it only ever holds one of two values.
 	if wire.Forwarding != licenseGateAllow && wire.Forwarding != licenseGateDeny {
-		slog.Warn("license plane returned a forwarding value this build does not recognise; keeping the last known gate",
+		slog.Warn("license plane returned a forwarding value this build does not recognize; keeping the last known gate",
 			"event.name", observability.EventProxyLicensePlaneUnreadable,
 			"forwarding", wire.Forwarding, "url", url)
-		return fmt.Errorf("license plane: unrecognised forwarding value %q", wire.Forwarding)
+		return fmt.Errorf("license plane: unrecognized forwarding value %q", wire.Forwarding)
 	}
 
 	before, _, hadBefore := cache.Snapshot()
@@ -244,7 +244,7 @@ func (s *Supervisor) syncLicensePlane(ctx context.Context, _ *generation, master
 		// 🔴 Logged on the TRANSITION only. A per-cycle line would write once a
 		// minute for ever, and a per-REQUEST line on a denied deployment is how a
 		// developer machine once accumulated a 466 MB log.
-		slog.Warn("the deployment's licence forwarding gate changed",
+		slog.Warn("the deployment's license forwarding gate changed",
 			"event.name", observability.EventProxyLicensePlaneChanged,
 			"from", before, "to", wire.Forwarding)
 	}
@@ -302,19 +302,19 @@ func (s *Supervisor) hydrateLicensePlane(_ *generation) {
 	raw, err := os.ReadFile(path) // #nosec G304 -- path is derived from the run dir, not from input
 	if err != nil {
 		if !os.IsNotExist(err) {
-			slog.Warn("the last known licence gate could not be read; this proxy starts without one",
+			slog.Warn("the last known license gate could not be read; this proxy starts without one",
 				"event.name", observability.EventProxyLicensePlaneFileFailed, "error", err.Error())
 		}
 		return
 	}
 	var st licensePlaneStateFile
 	if err := json.Unmarshal(raw, &st); err != nil {
-		slog.Warn("the last known licence gate file is unreadable; this proxy starts without one",
+		slog.Warn("the last known license gate file is unreadable; this proxy starts without one",
 			"event.name", observability.EventProxyLicensePlaneFileFailed, "error", err.Error())
 		return
 	}
 	if st.ObservedAt <= 0 || (st.Forwarding != licenseGateAllow && st.Forwarding != licenseGateDeny) {
-		slog.Warn("the last known licence gate file holds no usable value; this proxy starts without one",
+		slog.Warn("the last known license gate file holds no usable value; this proxy starts without one",
 			"event.name", observability.EventProxyLicensePlaneFileFailed, "forwarding", st.Forwarding)
 		return
 	}
@@ -354,7 +354,7 @@ func (s *Supervisor) persistLicensePlane() {
 		return os.Rename(tmp, path)
 	}()
 	if err != nil {
-		slog.Warn("the licence gate state file could not be written; a restart will start without a last known gate",
+		slog.Warn("the license gate state file could not be written; a restart will start without a last known gate",
 			"event.name", observability.EventProxyLicensePlaneFileFailed, "error", err.Error())
 	}
 }

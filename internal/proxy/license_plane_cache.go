@@ -11,7 +11,7 @@ package proxy
 // comment naming the proxy as its consumer.
 //
 // Nothing read it. Not this repository, not any other: `ForwardingAllowed()` had
-// exactly one caller and it was a test. So a deployment whose licence had expired
+// exactly one caller and it was a test. So a deployment whose license had expired
 // kept forwarding every request, for ever, while the console correctly reported
 // `expired` and correctly froze control-plane writes. For a product sold by seat
 // that is the difference between an expiry date and a suggestion.
@@ -31,7 +31,7 @@ package proxy
 // 🚫 No licensing logic, and 🚫 no import of aikey-license-core. The whole
 // authorization state machine stays in the control plane; what crosses to the
 // data path is one word. specs/edition-entitlement requires a forwarding request
-// to perform "no licence file read, database query, signature check or
+// to perform "no license file read, database query, signature check or
 // synchronous control call", and hotpath_callgraph_fence_test.go enforces the
 // import half of that. A read here is one atomic load.
 //
@@ -52,7 +52,7 @@ import (
 //
 // 🔴 Restating a contract is normally how two implementations drift. It is
 // tolerable here only because the rail REFUSES any third value rather than
-// guessing (see supervisor.syncLicensePlane): an unrecognised gate is a failed
+// guessing (see supervisor.syncLicensePlane): an unrecognized gate is a failed
 // cycle, which makes the rail go stale in /status and eventually trips the
 // staleness ceiling below. A silent mapping of "unknown" to either answer is the
 // thing that must not happen — allow would disable the gate on a wire change,
@@ -62,12 +62,12 @@ const (
 	licenseGateDeny  = "deny"
 )
 
-// LicensePlaneStaleCeiling bounds how long this proxy keeps honouring a gate
+// LicensePlaneStaleCeiling bounds how long this proxy keeps honoring a gate
 // value it can no longer refresh.
 //
 // 🔴 Seven days, and the number is a licensing decision rather than a timeout
 // (owner decision 2026-08-27). Keep-last-known with NO ceiling is the obvious
-// design and it is the one that makes the whole gate theatre: a customer who
+// design and it is the one that makes the whole gate theater: a customer who
 // firewalls their own control plane the day before expiry keeps the last `allow`
 // for ever. The ceiling is the proxy-side half of the same idea licstate already
 // applies to the vendor relationship, where `stale` — an online deployment past
@@ -117,7 +117,7 @@ type LicensePlaneCache struct {
 // 🔴 It starts ALLOWING, and this is the one fail-open that must survive review.
 // Three populations sit in this state and none of them may be refused:
 //
-//   - Personal, which has no control plane to ask and no licence to ask about;
+//   - Personal, which has no control plane to ask and no license to ask about;
 //   - every deployment during the moments between process start and the rail's
 //     first cycle;
 //   - a freshly installed proxy that has not yet reached its control plane.
@@ -166,7 +166,7 @@ func (c *LicensePlaneCache) Hydrate(forwarding string, observedAt time.Time) {
 // ForwardingAllowed is the one question the request path asks.
 //
 // 🚫 Do not add a second question here. The narrowness is the contract: a
-// consumer that branched on a state name would have re-implemented the licence
+// consumer that branched on a state name would have re-implemented the license
 // state machine on the hot path, which is what specs/edition-entitlement forbids
 // and what keeping only two values on the wire is meant to make impossible.
 func (c *LicensePlaneCache) ForwardingAllowed() bool {
@@ -214,7 +214,7 @@ const (
 	// and not yet refreshed by a live cycle.
 	LicensePlaneSourceHydrated = "hydrated"
 	// LicensePlaneSourceStaleCeiling — a value exists but is older than the
-	// ceiling, so it is no longer honoured and forwarding is refused.
+	// ceiling, so it is no longer honored and forwarding is refused.
 	LicensePlaneSourceStaleCeiling = "stale_ceiling"
 )
 

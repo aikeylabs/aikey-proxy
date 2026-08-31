@@ -1,7 +1,7 @@
 package proxy
 
 // license_capability.go — the marker this binary carries so a release pipeline
-// can read back, out of the built file, whether this proxy consumes the licence
+// can read back, out of the built file, whether this proxy consumes the license
 // forwarding gate.
 //
 // # The failure this exists to catch
@@ -25,15 +25,15 @@ package proxy
 // TestThisModuleDoesNotDependOnLicensingAtAll asserts it for the whole module.
 // Importing a shared constant to satisfy a release check would break the very
 // property the forwarding gate was designed around: the data path knows one
-// word, not a licence state machine. Two short literals in two repositories is
+// word, not a license state machine. Two short literals in two repositories is
 // the correct cost.
 
-// The licence-consumer capabilities a proxy built from THIS source has.
+// The license-consumer capabilities a proxy built from THIS source has.
 const (
 	// CapPlaneRail: this proxy polls the control plane for the forwarding gate
 	// and refuses requests while it says deny. Its absence is the whole defect.
 	CapPlaneRail = "plane-rail"
-	// CapPlaneCeiling: this proxy stops honouring a gate value it can no longer
+	// CapPlaneCeiling: this proxy stops honoring a gate value it can no longer
 	// refresh (LicensePlaneStaleCeiling). Declared separately from the rail
 	// because a build could plausibly have one without the other, and a rail
 	// without a ceiling is bypassed by unplugging the control plane.

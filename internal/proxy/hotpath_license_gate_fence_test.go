@@ -1,6 +1,6 @@
 package proxy
 
-// hotpath_license_gate_fence_test.go — the POSITIVE fence under the licence
+// hotpath_license_gate_fence_test.go — the POSITIVE fence under the license
 // forwarding gate.
 //
 // # 🔴 Why a positive fence, and why that word is the whole point
@@ -8,23 +8,23 @@ package proxy
 // This repository already had a fence about licensing on the request path:
 // hotpath_callgraph_fence_test.go asserts that nothing reachable from
 // Proxy.Handle imports aikey-license-core. It was green. It had always been
-// green. It was green because the proxy did not consult the licence AT ALL —
+// green. It was green because the proxy did not consult the license AT ALL —
 // the control plane computed a forwarding verdict, projected it, and served it
 // on /v1/license/plane with a comment naming this process as its reader, and
-// nothing here ever asked. A deployment whose licence had expired kept
+// nothing here ever asked. A deployment whose license had expired kept
 // forwarding every request indefinitely.
 //
 // So the existing fence proved "we did not do the wrong thing" while the actual
 // defect was "we did not do the thing". Those are different assertions and a
 // negative fence cannot make the second one. Every guard in this mechanism also
 // fails OPEN by design and correctly so — an unwired consumer and a fully
-// licensed deployment produce identical observable behaviour, which is why this
+// licensed deployment produce identical observable behavior, which is why this
 // survived review, release and a live E2E.
 //
 // The tests below therefore assert PRESENCE:
 //
 //	1. the gate is REACHABLE from Proxy.Handle (call-graph)
-//	2. a denied gate actually refuses, on every routing branch (behaviour)
+//	2. a denied gate actually refuses, on every routing branch (behavior)
 //	3. the fences themselves can go red (vacuity)
 //
 // See workflow/CI/bugfix/20260827-forwarding-gate-was-never-wired.md.
@@ -59,7 +59,7 @@ func TestTheLicenceGateIsReachedFromTheHotPath(t *testing.T) {
 	}
 	if _, ok := reached[licenseGateFunc]; !ok {
 		t.Fatalf("%s is NOT reachable from %s.\n\n"+
-			"The deployment's licence forwarding gate is not consulted on the request "+
+			"The deployment's license forwarding gate is not consulted on the request "+
 			"path, so an expired, revoked or never-activated deployment forwards "+
 			"normally — which is the exact defect of 2026-08-27 "+
 			"(workflow/CI/bugfix/20260827-forwarding-gate-was-never-wired.md).\n\n"+
@@ -108,7 +108,7 @@ func deniedGate(t *testing.T) *LicensePlaneCache {
 	return c
 }
 
-// TestADeniedGateRefusesEveryRoutingBranch is the behavioural half.
+// TestADeniedGateRefusesEveryRoutingBranch is the behavioral half.
 //
 // 🔴 The call-graph fence proves the gate is consulted; it cannot prove it is
 // consulted BEFORE the routing branches. Handle dispatches to four different
@@ -191,7 +191,7 @@ func TestAnAllowedGateDoesNotRefuse(t *testing.T) {
 			p.Handle(rec, httptest.NewRequest(http.MethodPost, "/v1/messages", strings.NewReader(`{}`)))
 
 			if rec.Code == http.StatusPaymentRequired {
-				t.Fatalf("a %s gate refused forwarding with 402. Personal has no licence "+
+				t.Fatalf("a %s gate refused forwarding with 402. Personal has no license "+
 					"to check and every edition is unsynced at start-up; refusing here "+
 					"stops deployments that have done nothing wrong.", tc.name)
 			}
@@ -212,7 +212,7 @@ func TestTheDiagnosticsBranchSurvivesADeniedGate(t *testing.T) {
 	p.Handle(rec, httptest.NewRequest(http.MethodGet, "/v1/diagnostics/pipeline", nil))
 
 	if rec.Code == http.StatusPaymentRequired {
-		t.Fatal("the licence gate refused the read-only diagnostics endpoint. R8 makes " +
+		t.Fatal("the license gate refused the read-only diagnostics endpoint. R8 makes " +
 			"read/export `allow` on every plane row, including the ones that deny " +
 			"forwarding: an operator diagnosing the refusal must not be locked out " +
 			"by it. Move the gate below the 0-diag branch in Handle.")
