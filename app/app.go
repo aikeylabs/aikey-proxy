@@ -513,6 +513,14 @@ func Run() {
 			return fp.HealthWithCooling(sup.BindingCooldownSnapshot(), sup.FallbackSwitches())
 		}
 	}
+	// The licence forwarding gate (2026-08-27). 🔴 Always wired when the cache
+	// exists, including on Personal — there it reports never_synced/allow, which
+	// is the honest answer. Hiding the block on Personal would leave "no licensing
+	// here" and "the rail is broken" looking identical, which is the class of
+	// ambiguity that let the missing consumer survive in the first place.
+	if lp := sup.LicensePlaneCache(); lp != nil {
+		adminHandler.LicensePlaneFn = func() any { return lp.Health() }
+	}
 	adminHandler.SyncHealthFn = func() map[string]admin.SyncRailStatus {
 		snap := sup.ControlPlaneSyncSnapshot()
 		if len(snap) == 0 {

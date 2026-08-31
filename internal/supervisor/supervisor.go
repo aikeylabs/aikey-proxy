@@ -381,6 +381,11 @@ type Supervisor struct {
 	// it — keep-last-known is the point: a control-plane blip must not re-time
 	// requests across the fleet.
 	fallbackPolicy *proxy.FallbackPolicyCache
+	// licensePlane is the deployment's forwarding gate (2026-08-27).
+	// Supervisor-scoped for the same reason as fallbackPolicy: a generation
+	// reload must not lose it. Nothing REFUSES on it yet — this change makes the
+	// verdict observable; the request path consumes it separately.
+	licensePlane *proxy.LicensePlaneCache
 	// lastRoutingMismatchVersion throttles the proxy.routing_override.format_mismatch
 	// WARN (non-empty routes, zero matching a local (seat,group)) to once per
 	// routing_version — the 60s ticker would otherwise repeat it every cycle.
@@ -507,6 +512,7 @@ func New(cfg *config.Config, configPath, password, version string) (*Supervisor,
 		// deliberately have no local knob — see LocalOverrides for why widening it
 		// would recreate the four-source base_url drift.
 		fallbackPolicy:           proxy.NewFallbackPolicyCache(localAttemptTimeoutMs(cfg)),
+		licensePlane:             proxy.NewLicensePlaneCache(),
 		pathHealth:               proxy.NewProviderPathHealthManager(),
 		oauthPoolRuntime:         proxy.NewOAuthPoolRuntimeState(),
 		signalRefreshToken:       newRuntimeRefreshTokenSource(cfg.Vault.Path, password),
@@ -518,7 +524,11 @@ func New(cfg *config.Config, configPath, password, version string) (*Supervisor,
 	// key_revocation (2026-08-26) rides the same framework so a control-plane
 	// suspension reaches a running proxy within one cycle instead of waiting for
 	// the member to type an aikey command (which may never happen).
-	s.railset = newRailSet(s.groupRuntimeRail(), s.routingOverrideRail(), s.fallbackPolicyRail(), s.keyRevocationRail())
+	// license_plane (2026-08-27) is the seventh rail. It carries the deployment's
+	// forwarding gate, which the control plane had been computing and serving all
+	// along with nothing on this side reading it — see license_plane_rail.go.
+	s.railset = newRailSet(s.groupRuntimeRail(), s.routingOverrideRail(), s.fallbackPolicyRail(),
+		s.keyRevocationRail(), s.licensePlaneRail())
 	gen, err := s.buildGeneration()
 	if err != nil {
 		_ = s.oauthPoolRuntime.Shutdown()
