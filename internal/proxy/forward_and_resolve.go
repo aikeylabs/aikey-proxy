@@ -1303,6 +1303,22 @@ func (p *Proxy) serveRoute(w http.ResponseWriter, r *http.Request, route *vkeys.
 		ErrorHandler: func(w http.ResponseWriter, r *http.Request, err error) {
 			p.errors.Add(1)
 			latencyMs := time.Since(startTime).Milliseconds()
+			// 🔴 ONE EXIT for a refusal. Every branch below writes its
+			// client-facing error through `refuse`, so the JSON the client reads
+			// and the usage row the ledger keeps can never disagree about the
+			// status or the error code — and a request that never reached an
+			// upstream stops being invisible to everyone but journald (see
+			// reportUpstreamRefusal for why that mattered and what it does NOT
+			// report).
+			//
+			// 🚫 Do not add a branch that calls writeJSONError directly here: it
+			// would answer the client and drop the event, which is the exact
+			// state this replaced. TestEveryUpstreamRefusalReachesTheLedger is
+			// the fence.
+			refuse := func(status int, code, publicMsg string) {
+				writeJSONError(w, status, "server_error", code, publicMsg)
+				p.reportUpstreamRefusal(r, route, realKey, bearerToken, startTime, status, code, err)
+			}
 			var egErr *EgressDialError
 			isEgressDialFailure := errors.As(err, &egErr)
 			if route.OauthGroupID != "" {
@@ -1364,7 +1380,7 @@ func (p *Proxy) serveRoute(w http.ResponseWriter, r *http.Request, route *vkeys.
 					"latency_ms", latencyMs,
 					"account_id", route.AccountID,
 				)
-				writeJSONError(w, http.StatusServiceUnavailable, "server_error", observability.ErrCodeAccountEgressProxy,
+				refuse(http.StatusServiceUnavailable, observability.ErrCodeAccountEgressProxy,
 					accountEgressErrorMessage(route,
 						"its configured egress upstream is unreachable. Run `aikey doctor` and check this account's egress setting."))
 				return
@@ -1384,7 +1400,7 @@ func (p *Proxy) serveRoute(w http.ResponseWriter, r *http.Request, route *vkeys.
 					"latency_ms", latencyMs,
 				)
 				w.Header().Set(HeaderAikeyErrorSource, observability.ErrCodeNodeEgressEngine)
-				writeJSONError(w, http.StatusServiceUnavailable, "server_error", observability.ErrCodeNodeEgressEngine,
+				refuse(http.StatusServiceUnavailable, observability.ErrCodeNodeEgressEngine,
 					"This node's configured egress proxy could not be started, so the request was refused "+
 						"instead of being sent out the node's own address. Fix the node's upstream_proxy setting, "+
 						"or install the enterprise package if the spec is a multi-protocol fragment.")
@@ -1404,8 +1420,7 @@ func (p *Proxy) serveRoute(w http.ResponseWriter, r *http.Request, route *vkeys.
 					"latency_ms", latencyMs,
 				)
 				w.Header().Set(HeaderAikeyErrorSource, observability.ErrCodeUpstreamPrivateViaEgress)
-				writeJSONError(w, http.StatusBadGateway, "server_error",
-					observability.ErrCodeUpstreamPrivateViaEgress,
+				refuse(http.StatusBadGateway, observability.ErrCodeUpstreamPrivateViaEgress,
 					"The provider address "+privErr.Host+" is an intranet-only address, but this node has an "+
 						"upstream egress proxy configured, so the request was dialed from the far end of that "+
 						"tunnel — where this address does not exist. Either declare the address in the node's "+
@@ -1420,8 +1435,7 @@ func (p *Proxy) serveRoute(w http.ResponseWriter, r *http.Request, route *vkeys.
 					"error.message", err.Error(),
 					"latency_ms", latencyMs,
 				)
-				writeJSONError(w, http.StatusServiceUnavailable, "server_error",
-					observability.ErrCodeGroupUpstreamUnavailable,
+				refuse(http.StatusServiceUnavailable, observability.ErrCodeGroupUpstreamUnavailable,
 					groupDegradeMessage(observability.ErrCodeGroupUpstreamUnavailable))
 				return
 			}
@@ -1431,7 +1445,7 @@ func (p *Proxy) serveRoute(w http.ResponseWriter, r *http.Request, route *vkeys.
 				"error.message", err.Error(),
 				"latency_ms", latencyMs,
 			)
-			writeJSONError(w, http.StatusBadGateway, "server_error", "UPSTREAM_ERROR",
+			refuse(http.StatusBadGateway, observability.ErrCodeUpstreamError,
 				"Failed to connect to upstream provider.")
 		},
 		FlushInterval: -1, // Flush immediately for SSE streaming.

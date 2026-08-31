@@ -27,6 +27,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"io"
 	"log/slog"
 	"net/http"
@@ -677,6 +678,83 @@ func (p *Proxy) reportUsage(route *vkeys.ResolvedRoute, bearerToken, model strin
 	// Offline path: no collector_url, but WAL is still desired so local
 	// statusline / watch can consume it.
 	p.wal.Append(&ev)
+}
+
+// reportUpstreamRefusal records a request that NEVER RECEIVED AN UPSTREAM
+// RESPONSE — a dial refusal, a DNS/TLS failure, a timeout before the first byte,
+// or a local egress engine that would not start.
+//
+// # 🔴 Why this exists (2026-08-31)
+//
+// Requests whose upstream ANSWERED with an error were already in the ledger:
+// recordEvent → reportUsage stamps request_status=error with the upstream status
+// and its error envelope, and the projector writes a usage_fact_dwd row with
+// request_count=1, zero tokens and zero billable_amount. A request that never
+// reached an upstream produced ONLY a proxy ERROR log, so a customer console
+// could not answer "how many of our requests never went out at all?" — the
+// failure was visible to whoever was tailing journald and to nobody else.
+// Found by live E2E on a cluster node; see
+// workflow/CI/e2e/cases/2026-08-31-cluster-node-forward-lands-in-usage-ledger.md
+//
+// # 🔴 It invents no second accounting convention
+//
+// Same shape as the answered-error path: one request, zero tokens, zero cost.
+// 🚫 Do NOT give these rows a synthetic token count or a cost — usage_fact_dwd
+// feeds billing views, and a failed dial has consumed nothing. The read side
+// separates them with request_status, which it already carries.
+//
+// # 🚫 Two things are deliberately NOT reported
+//
+//   - context.Canceled: httputil.ReverseProxy routes a client that hung up into
+//     the SAME ErrorHandler. Counting those as upstream failures would fill the
+//     failure view with the customer's own disconnects, which is precisely the
+//     number an operator would act on.
+//   - probe traffic: excluded exactly as the answered-error path excludes it
+//     (isAikeyProbe), so a self-test can never look like a customer outage.
+func (p *Proxy) reportUpstreamRefusal(r *http.Request, route *vkeys.ResolvedRoute,
+	realKey, bearerToken string, startTime time.Time, statusCode int, errorCode string, cause error) {
+
+	if route == nil || cause == nil {
+		return
+	}
+	if errors.Is(cause, context.Canceled) || isAikeyProbe(r) {
+		return
+	}
+	// Bounded with the same cap the answered-error path uses on the upstream
+	// body, so one pathological transport error cannot inflate an ODS row.
+	msg := cause.Error()
+	if len(msg) > errorBodyCap {
+		msg = msg[:errorBodyCap] + "…"
+	}
+	// resp is nil on purpose: there is no upstream response. buildBaseEvent is
+	// documented nil-resp-safe for exactly this caller, and it is what carries
+	// the trace/request ids and the client-requested model.
+	ev := p.buildBaseEvent(r, nil, startTime, route, false)
+	// 🔴 The model, from the value extractModel already CACHED on the context.
+	//
+	// buildBaseEvent reads `x-aikey-model`, and this handler is handed the
+	// OUTBOUND request, whose header set the director rebuilt — so on the refusal
+	// path that header is routinely absent and the row landed with an empty
+	// model. Live on a cluster node (2026-08-31) that made every refusal
+	// unattributable in per-model views AND priced it as UNPRICED
+	// (billable_amount NULL) instead of zero — i.e. the two kinds of failure
+	// still did not look alike in the ledger, which is what this whole path
+	// exists to fix.
+	//
+	// 🚫 Never call extractModel here. It READS AND RE-BUFFERS THE BODY, and this
+	// runs after the body has already been streamed at an upstream that refused
+	// it. Only the cached value is safe; when nothing cached one (a body that was
+	// not JSON we understand) an empty model is the honest answer.
+	model := ev.Model
+	if model == "" {
+		if cached, ok := r.Context().Value(ctxKeyExtractedModel).(string); ok {
+			model = cached
+		}
+	}
+	p.reportUsage(route, bearerToken, model, startTime, statusCode,
+		provider.TokenBreakdown{}, errorCode, msg, realKey,
+		resolveSessionID(r, route.ProtocolType, route.ProviderCode),
+		"interrupted", "", r.URL.Path, ev.RequestID, ev.TraceID)
 }
 
 // routeBaseURL returns the resolved upstream base URL, nil-safe.
