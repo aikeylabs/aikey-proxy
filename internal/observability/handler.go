@@ -135,6 +135,11 @@ const (
 	EventProxyLicensePlaneChanged    = "proxy.license.plane_changed"
 	EventProxyLicensePlaneUnreadable = "proxy.license.plane_unreadable"
 	EventProxyLicensePlaneFileFailed = "proxy.license.plane_file_failed"
+	// EventProxyLicensePlaneCapabilities: logged once at start-up. It is also what
+	// anchors internal/proxy.LicenseConsumerMarker into the shipped binary — a
+	// const nothing references can be dropped by the linker, and the release gate
+	// reads that marker out of the file.
+	EventProxyLicensePlaneCapabilities = "proxy.license.capabilities"
 	// EventReporterDeadLetterReplayed: the automatic dead-letter replay ran
 	// after the upload pipe recovered (2026-07-04 self-heal) — carries
 	// scanned/replayed/still-failing counts, or the error when the pass failed.
@@ -426,6 +431,16 @@ const (
 	ErrCodeProviderError                  = "PROVIDER_ERROR"
 	ErrCodeUsageExtractionFailed          = "USAGE_EXTRACTION_FAILED"
 	ErrCodeClusterVaultAssignmentsCorrupt = "CLUSTER_VAULT_ASSIGNMENTS_CORRUPT"
+	// ErrCodeLicenseForwardingDenied: this deployment's licence does not currently
+	// permit AI forwarding (expired, never activated past its grace deadline,
+	// revoked, or bound to a different machine). Carried on a 402, NOT a 403:
+	// 403 is what an SDK and a user both read as "your key is wrong", which sends
+	// them to rotate a credential that is perfectly fine. The control plane's own
+	// write freeze uses 403 with LICENSE_CONTROL_PLANE_FROZEN, and the asymmetry
+	// is deliberate — that surface is an admin API read by a person, this one is
+	// the data path read by an SDK.
+	// bugfix: workflow/CI/bugfix/20260827-forwarding-gate-was-never-wired.md
+	ErrCodeLicenseForwardingDenied = "LICENSE_FORWARDING_DENIED"
 	// Enterprise quota (Phase 2, design §5.5). Stage 3 wires the token code;
 	// USD + degraded-block are reserved for later stages ($ enforcement / §8).
 	ErrCodeQuotaExceededToken = "QUOTA_EXCEEDED_TOKEN"
