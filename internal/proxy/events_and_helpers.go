@@ -207,8 +207,11 @@ func (p *Proxy) recordEvent(req *http.Request, resp *http.Response, startTime ti
 	// routable. The reporter persists this signal until accepted because local
 	// exact-token blocking prevents an endless 401 re-emission loop.
 	if isHardRevoked(resp.StatusCode, errType, errMsg) {
+		// 状态码 + 解析出的错误类型随信号上行（有界证据，不带响应体/消息原文）——
+		// 否则「为什么被拒」在 Master 侧永远无从归因。
 		p.signalReporter.enqueueAuthFailure(
-			route.CredentialID, route.OauthGroupID, route.SeatID, route.OAuthTokenFingerprint)
+			route.CredentialID, route.OauthGroupID, route.SeatID, route.OAuthTokenFingerprint,
+			resp.StatusCode, errType)
 	}
 	// Rate-limit-feed emit (best-effort, OFF the hot path, mirrors the revoked
 	// hook above): the proxy sees every upstream 429 (rate limit) / 403 (forbidden);

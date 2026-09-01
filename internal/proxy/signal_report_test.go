@@ -240,7 +240,7 @@ func TestSignalReporterLoopIsolatesRejectedAuthFailureFromTrend(t *testing.T) {
 	if len(r.in) > 0 {
 		t.Fatal("trend was not consumed into the retry accumulator")
 	}
-	r.enqueueAuthFailure("cred-bad", "group-1", "seat-1", "fingerprint-1")
+	r.enqueueAuthFailure("cred-bad", "group-1", "seat-1", "fingerprint-1", 401, "token_revoked")
 
 	nextBody := func() []byte {
 		t.Helper()
@@ -368,11 +368,11 @@ func TestAuthFailureSignalIsVersionedDurableAndRetriedUntilAccepted(t *testing.T
 	}
 	// Missing token version is unsafe: a delayed signal could invalidate a new
 	// re-login, so it must not enter the outbox.
-	r.enqueueAuthFailure("c1", "g1", "s1", "")
+	r.enqueueAuthFailure("c1", "g1", "s1", "", 401, "token_revoked")
 	if len(r.snapshotAuthFailures()) != 0 {
 		t.Fatal("unversioned auth failure entered outbox")
 	}
-	r.enqueueAuthFailure("c1", "g1", "s1", "fingerprint-1")
+	r.enqueueAuthFailure("c1", "g1", "s1", "fingerprint-1", 401, "token_revoked")
 	r.ingestAuthFailures([]authFailureSample{<-r.authIn})
 	pending := r.snapshotAuthFailures()
 	if len(pending) != 1 || pending[0].TokenFingerprint != "fingerprint-1" {
@@ -425,7 +425,7 @@ func TestAuthFailureOutboxHydratesOnlyVersionedEntries(t *testing.T) {
 		authFailures: make(map[string]authFailureSample), authIn: make(chan authFailureSample, 1),
 		authWake: make(chan struct{}, 1), logger: slog.Default(),
 	}
-	writer.enqueueAuthFailure("c1", "g1", "s1", "fp-1")
+	writer.enqueueAuthFailure("c1", "g1", "s1", "fp-1", 401, "token_revoked")
 	writer.ingestAuthFailures([]authFailureSample{<-writer.authIn})
 
 	reader := &signalReporter{authFailures: make(map[string]authFailureSample), logger: slog.Default()}
@@ -442,7 +442,7 @@ func TestAuthFailureBurstDeduplicatesBeforeBoundedWriter(t *testing.T) {
 		health: SignalReportingHealth{Status: "starting"},
 	}
 	for i := 0; i < 3000; i++ {
-		r.enqueueAuthFailure("c1", "g1", "s1", "fp-1")
+		r.enqueueAuthFailure("c1", "g1", "s1", "fp-1", 401, "token_revoked")
 	}
 	if got := len(r.authIn); got != 1 {
 		t.Fatalf("duplicate 401 burst queued=%d records, want one route+token observation", got)

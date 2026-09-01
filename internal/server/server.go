@@ -17,6 +17,9 @@ import (
 type Server struct {
 	ln         net.Listener
 	httpServer *http.Server
+	// sb is non-nil only for NewStarting servers: the switchboard Promote
+	// swaps the real mux into.
+	sb *Switchboard
 }
 
 // New creates a new Server.
@@ -33,6 +36,32 @@ type RouteRegistrar interface {
 }
 
 func New(ln net.Listener, dataHandler http.Handler, adminHandler *admin.Handler, gate AdminGate, extraHandlers ...RouteRegistrar) *Server {
+	return newServer(ln, recoverMiddleware(buildMux(dataHandler, adminHandler, gate, extraHandlers...)), nil)
+}
+
+// NewStarting binds the full server SHELL to the listener before init has
+// anything real to serve: every request is answered with an honest "starting"
+// (see starting.go) until Promote swaps in the real mux. This is what makes a
+// slow start distinguishable from a dead process from the very first second
+// the port is owned (2026-09-01).
+func NewStarting(ln net.Listener, phase func() string) *Server {
+	sb := NewSwitchboard(startingHandler(phase, time.Now()))
+	return newServer(ln, recoverMiddleware(sb), sb)
+}
+
+// Promote swaps the starting surface for the real handler set. Only servers
+// built with NewStarting can be promoted; calling it on a classic New server
+// is a wiring bug and panics loudly rather than silently doing nothing — a
+// proxy that LOOKS promoted but still answers "starting" forever would be the
+// exact silence this file exists to remove.
+func (s *Server) Promote(dataHandler http.Handler, adminHandler *admin.Handler, gate AdminGate, extraHandlers ...RouteRegistrar) {
+	if s.sb == nil {
+		panic("server.Promote called on a server without a starting switchboard")
+	}
+	s.sb.Swap(buildMux(dataHandler, adminHandler, gate, extraHandlers...))
+}
+
+func buildMux(dataHandler http.Handler, adminHandler *admin.Handler, gate AdminGate, extraHandlers ...RouteRegistrar) *http.ServeMux {
 	mux := http.NewServeMux()
 
 	// Data plane: catch-all — forwards every request not claimed by the admin routes
@@ -118,15 +147,20 @@ func New(ln net.Listener, dataHandler http.Handler, adminHandler *admin.Handler,
 		h.RegisterRoutes(mux)
 	}
 
+	return mux
+}
+
+func newServer(ln net.Listener, handler http.Handler, sb *Switchboard) *Server {
 	return &Server{
 		ln: ln,
+		sb: sb,
 		httpServer: &http.Server{
-			// Wrap the mux with a panic-recover middleware so one bad handler
-			// cannot take down the whole proxy. net/http's default recover
-			// silently swallows panics without logging or crash-dump — that
-			// made the 2026-04-22 stream-drainer nil-collector crash
+			// The handler arrives already wrapped in recoverMiddleware so one
+			// bad handler cannot take down the whole proxy. net/http's default
+			// recover silently swallows panics without logging or crash-dump —
+			// that made the 2026-04-22 stream-drainer nil-collector crash
 			// undiagnosable from logs alone.
-			Handler:           recoverMiddleware(mux),
+			Handler:           handler,
 			ReadHeaderTimeout: 30 * time.Second,
 			// Bound idle keep-alive connections so slow/abandoned clients cannot
 			// pin sockets/file descriptors indefinitely. NOT Read/WriteTimeout:

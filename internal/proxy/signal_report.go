@@ -78,6 +78,19 @@ type authFailureSample struct {
 	SeatID           string `json:"seat_id"`
 	TokenFingerprint string `json:"token_fingerprint"`
 	Reason           string `json:"reason"`
+	// UpstreamStatus / UpstreamErrorType（2026-09-01）：上游那次拒绝的**有界证据**。
+	//
+	// 🔴 为什么必须带：此前 Reason 恒为 "token_revoked"，上游的状态码与错误分类
+	// **一个字都不留** ⇒ 「一把 exp 还有 7 天的 token 为什么被拒」这类事故
+	// **事后无法归因**（2026-08-31 客户现场：登录成功→一会儿变登录失效，
+	// 只能靠猜）。带上这两个字段后，同类事故直接可判：
+	// invalid_token=被作废 / 权限类=账号问题 / 挑战类=出口风控。
+	//
+	// 保密纪律（与 2026-08-19 Claude 分类器同一条）：只带**状态码 + 解析出的
+	// provider 错误类型**这类有界标识；响应体、错误消息原文、token 一律不带。
+	// omitempty：老 Master 忽略未知字段，wire 兼容。
+	UpstreamStatus    int    `json:"upstream_status,omitempty"`
+	UpstreamErrorType string `json:"upstream_error_type,omitempty"`
 }
 
 // schedulingEventSample is one scheduling STATE-CHANGE event shipped to the
@@ -544,6 +557,16 @@ func authFailureKey(s authFailureSample) string {
 	return s.CredentialID + "|" + s.OAuthGroupID + "|" + s.SeatID
 }
 
+// boundedErrorType 把 provider 错误类型收敛成安全可携带的形态：
+// 只保留短小的标识符样式内容，防止把整段响应体或用户文本当成"类型"带走。
+func boundedErrorType(v string) string {
+	v = strings.TrimSpace(v)
+	if len(v) > 64 {
+		return v[:64]
+	}
+	return v
+}
+
 func authFailureQueueKey(s authFailureSample) string {
 	return authFailureKey(s) + "|" + s.TokenFingerprint
 }
@@ -568,13 +591,15 @@ func (r *signalReporter) authFailurePath() (string, error) {
 // writer. Duplicate observations for the same route+token collapse before they
 // consume queue capacity; a truly full queue degrades /status instead of
 // delaying the developer's inference response.
-func (r *signalReporter) enqueueAuthFailure(credentialID, oauthGroupID, seatID, tokenFingerprint string) {
+func (r *signalReporter) enqueueAuthFailure(credentialID, oauthGroupID, seatID, tokenFingerprint string,
+	upstreamStatus int, upstreamErrType string) {
 	if r == nil || credentialID == "" || oauthGroupID == "" || seatID == "" || tokenFingerprint == "" {
 		return
 	}
 	sample := authFailureSample{
 		CredentialID: credentialID, OAuthGroupID: oauthGroupID, SeatID: seatID,
 		TokenFingerprint: tokenFingerprint, Reason: "token_revoked",
+		UpstreamStatus: upstreamStatus, UpstreamErrorType: boundedErrorType(upstreamErrType),
 	}
 	queuedKey := authFailureQueueKey(sample)
 	if _, duplicate := r.authQueued.LoadOrStore(queuedKey, struct{}{}); duplicate {

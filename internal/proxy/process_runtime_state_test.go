@@ -42,7 +42,7 @@ func TestOAuthPoolRuntimeStateIsSharedAcrossProxyGenerations(t *testing.T) {
 		t.Fatalf("active generation tombstone fingerprint = %q, want fingerprint-v1", got)
 	}
 
-	oldProxy.signalReporter.enqueueAuthFailure("credential-1", "group-1", "seat-1", "fingerprint-v1")
+	oldProxy.signalReporter.enqueueAuthFailure("credential-1", "group-1", "seat-1", "fingerprint-v1", 401, "token_revoked")
 	got := waitForAuthFailureSnapshot(t, newProxy.signalReporter, 1)
 	if got[0].TokenFingerprint != "fingerprint-v1" {
 		t.Fatalf("active generation cannot see draining generation's durable signal: %+v", got)
@@ -83,7 +83,7 @@ func TestGenerationStopDoesNotCloseProcessSignalReporter(t *testing.T) {
 func TestProcessRuntimeShutdownDrainsAuthFailureToJournal(t *testing.T) {
 	t.Setenv("AIKEY_RUN_DIR", t.TempDir())
 	runtime := NewOAuthPoolRuntimeState()
-	runtime.signalReporter.enqueueAuthFailure("credential-1", "group-1", "seat-1", "fingerprint-v1")
+	runtime.signalReporter.enqueueAuthFailure("credential-1", "group-1", "seat-1", "fingerprint-v1", 401, "token_revoked")
 
 	// Close immediately: the request-side handoff may still be buffered. The
 	// process lifecycle owner must wait until the reporter has durably drained
@@ -115,7 +115,7 @@ func TestProcessSignalReporterReconfiguresWithoutLosingPendingAuthFailure(t *tes
 	newProxy.SetDeliveryIntegrity("worker-1", nil)
 
 	oldProxy.EnableSignalReporting("http://old-control.invalid", func(context.Context) (string, error) { return "old", nil })
-	oldProxy.signalReporter.enqueueAuthFailure("credential-1", "group-1", "seat-1", "fingerprint-v1")
+	oldProxy.signalReporter.enqueueAuthFailure("credential-1", "group-1", "seat-1", "fingerprint-v1", 401, "token_revoked")
 	newProxy.EnableSignalReporting("http://new-control.invalid", func(context.Context) (string, error) { return "new", nil })
 
 	got := waitForAuthFailureSnapshot(t, newProxy.signalReporter, 1)
@@ -150,7 +150,7 @@ func TestDormantProcessSignalReporterRetainsPendingWithoutFalseFailure(t *testin
 	runtime := NewOAuthPoolRuntimeState()
 	t.Cleanup(func() { _ = runtime.Shutdown() })
 
-	runtime.signalReporter.enqueueAuthFailure("credential-1", "group-1", "seat-1", "fingerprint-v1")
+	runtime.signalReporter.enqueueAuthFailure("credential-1", "group-1", "seat-1", "fingerprint-v1", 401, "token_revoked")
 	deadline := time.Now().Add(time.Second)
 	for time.Now().Before(deadline) {
 		health := runtime.signalReporter.healthSnapshot()

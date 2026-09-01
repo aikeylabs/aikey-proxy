@@ -242,7 +242,16 @@ func (s *Supervisor) installFilterHook(p *proxy.Proxy, vaultReader *vault.Reader
 	privacyTierEnv := "AIKEY_COMPLIANCE_PRIVACY_TIER=" +
 		strconv.FormatInt(s.masterPrivacyTier.Load(), 10)
 
-	extraEnv := []string{recordAllowEnv, maxActionEnv, localIntakeEnv, privacyTierEnv}
+	// Same fence as the privacy tier: READ THE ATOMIC, no local override — the
+	// org's force must not be defeatable by a member machine's environment. ""
+	// (no force) leaves the detector on its own level (override file, else the
+	// factory simple default). spec: R-credential-password-tier-4
+	passwordTierEnv := "AIKEY_COMPLIANCE_PASSWORD_TIER="
+	if s.masterPasswordTierAdvanced.Load() {
+		passwordTierEnv += "advanced"
+	}
+
+	extraEnv := []string{recordAllowEnv, maxActionEnv, localIntakeEnv, privacyTierEnv, passwordTierEnv}
 	// Resolve the pack-pull backend + tenant for the detector. Personal/Trial read
 	// the team URL from the CLI's config.json (no tenant scoping — one user, one
 	// view). A CLUSTER node has no CLI config.json; its control URL + org come from

@@ -31,7 +31,7 @@ func TestAuthFailureSignalPersistenceCannotBlockRequestPath(t *testing.T) {
 	defer r.Close()
 	done := make(chan struct{})
 	go func() {
-		r.enqueueAuthFailure("credential-1", "group-1", "seat-1", "fingerprint-1")
+		r.enqueueAuthFailure("credential-1", "group-1", "seat-1", "fingerprint-1", 401, "token_revoked")
 		close(done)
 	}()
 

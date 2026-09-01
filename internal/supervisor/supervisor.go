@@ -446,6 +446,12 @@ type Supervisor struct {
 	// local filter_stages is NULL (master mandate); the user's local toggle still
 	// governs when this is false. Polled by pollComplianceMasterPolicy.
 	masterCompliance atomic.Bool
+	// masterPasswordTierAdvanced mirrors masterPrivacyTier for the password
+	// lane (阶段8/合规密码档分级): true ⇒ the org forces the detector's
+	// CREDENTIAL_PASSWORD lane to advanced (full enforcement), baked into the
+	// child env at spawn; false ⇒ no force, the machine's own level governs.
+	// Polled by pollComplianceMasterPolicy from the same policy endpoint.
+	masterPasswordTierAdvanced atomic.Bool
 	// masterPrivacyTier is the org-level compliance PRIVACY TIER polled from the
 	// same endpoint as masterCompliance (1 metadata / 2 + masked snippet / 3 +
 	// RAW snippet). It decides how much of this user's own text the detector may
@@ -1033,6 +1039,16 @@ func filterSigWithPrivacyTier(base string, tier int64) string {
 	return base + "|tier:" + strconv.FormatInt(tier, 10)
 }
 
+// filterSigWithPasswordTier appends the org password-lane force to the filter
+// signature, for the same reason as the privacy tier above: the value is baked
+// into the detector child's ENV at spawn, so only a re-spawn can change what a
+// running detector enforces. Dropping this term means an admin forcing
+// `advanced` changes the policy server-side and nothing on members' machines
+// until an unrelated reload. spec: R-credential-password-tier-4.S1
+func filterSigWithPasswordTier(base string, advanced bool) string {
+	return base + "|pwtier:" + strconv.FormatBool(advanced)
+}
+
 // syncManagedKeys checks the vault change_seq and, if it has advanced since
 // the active generation was built, merges current active managed keys into the
 // live registry.
@@ -1090,7 +1106,7 @@ func (s *Supervisor) syncManagedKeys() {
 	if baseSig, ok := computeFilterSig(gen.vault); ok {
 		// Fold in the org privacy tier: it is baked into the detector child's env
 		// at spawn, so only a re-spawn can change what a running detector sends.
-		newSig := filterSigWithPrivacyTier(baseSig, s.masterPrivacyTier.Load())
+		newSig := filterSigWithPasswordTier(filterSigWithPrivacyTier(baseSig, s.masterPrivacyTier.Load()), s.masterPasswordTierAdvanced.Load())
 		if prev := s.lastFilterSig.Load(); prev == nil || *prev != newSig {
 			// R5: record the attempted signature BEFORE the reload so a
 			// persistently-failing Reload (e.g. transient build error) does NOT
@@ -2100,7 +2116,7 @@ func (s *Supervisor) buildGeneration() (*generation, error) {
 	// Record the filter-app signature this generation was built with so
 	// syncManagedKeys can detect a later enable/disable and trigger a reload.
 	if baseSig, ok := computeFilterSig(vaultReader); ok {
-		sig := filterSigWithPrivacyTier(baseSig, s.masterPrivacyTier.Load())
+		sig := filterSigWithPasswordTier(filterSigWithPrivacyTier(baseSig, s.masterPrivacyTier.Load()), s.masterPasswordTierAdvanced.Load())
 		s.lastFilterSig.Store(&sig)
 	}
 

@@ -82,7 +82,7 @@ func TestFetchCompliancePolicy_TierFromServer(t *testing.T) {
 			}))
 			defer srv.Close()
 
-			_, tier, ok := fetchComplianceMasterPolicy(t.Context(), srv.URL, "org-1")
+			_, tier, _, ok := fetchComplianceMasterPolicy(t.Context(), srv.URL, "org-1")
 			if ok != c.wantOK {
 				t.Fatalf("ok = %v, want %v", ok, c.wantOK)
 			}

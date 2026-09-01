@@ -99,7 +99,7 @@ func (s *Supervisor) syncComplianceMasterPolicy(ctx context.Context) {
 	if masterURL == "" || orgID == "" {
 		return // no team / no org → no mandate; local toggle governs (Personal)
 	}
-	enabled, tier, ok := fetchComplianceMasterPolicy(ctx, masterURL, orgID)
+	enabled, tier, passwordAdvanced, ok := fetchComplianceMasterPolicy(ctx, masterURL, orgID)
 	if !ok {
 		return // unreachable → keep last known (don't flap on a transient miss)
 	}
@@ -111,7 +111,14 @@ func (s *Supervisor) syncComplianceMasterPolicy(ctx context.Context) {
 	// 🔴 Writing it here does NOT make it settable locally: nothing reads this key
 	// back to decide anything — the detector env comes from the atomic below, and
 	// the master re-checks its own column at ingest. This value is for display.
-	policy := fmt.Sprintf(`{"enabled":%t,"locked":%t,"privacy_tier":%d}`, enabled, enabled, tier)
+	// password_tier rides along for DISPLAY as well (same 🔴 note as privacy_tier:
+	// nothing reads this key back to decide anything — the detector env comes
+	// from the atomic below).
+	passwordTier := ""
+	if passwordAdvanced {
+		passwordTier = "advanced"
+	}
+	policy := fmt.Sprintf(`{"enabled":%t,"locked":%t,"privacy_tier":%d,"password_tier":%q}`, enabled, enabled, tier, passwordTier)
 	if s.cfg != nil {
 		_ = vault.WriteConfigString(s.cfg.Vault.Path, complianceMasterPolicyKey, policy)
 	}
@@ -122,8 +129,12 @@ func (s *Supervisor) syncComplianceMasterPolicy(ctx context.Context) {
 	// tier would change what the server stores while employees' machines kept
 	// sending raw text over the network until something else forced a reload.
 	tierChanged := s.masterPrivacyTier.Swap(int64(tier)) != int64(tier)
+	// Same reload-worthiness reasoning as the privacy tier: the level is baked
+	// into the child env at spawn, so a force flip must re-spawn or members
+	// keep the enforcement they were born with. spec: R-credential-password-tier-4.S1
+	passwordChanged := s.masterPasswordTierAdvanced.Swap(passwordAdvanced) != passwordAdvanced
 	enabledChanged := s.masterCompliance.Swap(enabled) != enabled
-	if enabledChanged || tierChanged {
+	if enabledChanged || tierChanged || passwordChanged {
 		slog.Info("compliance master policy changed",
 			"event.name", "proxy.compliance.policy_changed",
 			"enabled", enabled, "privacy_tier", tier)
@@ -143,30 +154,34 @@ func (s *Supervisor) syncComplianceMasterPolicy(ctx context.Context) {
 // that is not an understood rung must land on the safe one: a field the server
 // did not send (an older master) decodes to 0, and 0/negative/out-of-range all
 // clamp to 1 (metadata only). The failure direction is always "carry less".
-func fetchComplianceMasterPolicy(ctx context.Context, masterURL, orgID string) (enabled bool, privacyTier int, ok bool) {
+func fetchComplianceMasterPolicy(ctx context.Context, masterURL, orgID string) (enabled bool, privacyTier int, passwordAdvanced bool, ok bool) {
 	u := masterURL + "/v1/compliance/policy?tenant=" + url.QueryEscape(orgID)
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u, http.NoBody)
 	if err != nil {
-		return false, privacyTierMetadataOnly, false
+		return false, privacyTierMetadataOnly, false, false
 	}
 	resp, err := complianceHTTPClient.Get().Do(req)
 	if err != nil {
-		return false, privacyTierMetadataOnly, false
+		return false, privacyTierMetadataOnly, false, false
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
-		return false, privacyTierMetadataOnly, false
+		return false, privacyTierMetadataOnly, false, false
 	}
 	var body struct {
 		Enabled bool `json:"enabled"`
 		// Absent on a master older than 2026-08-11 ⇒ 0 ⇒ clamped to 1. An old
 		// server must never be read as permission.
 		PrivacyTier int `json:"privacy_tier"`
+		// Absent on a master older than 2026-08-31 ⇒ "" ⇒ no force: the
+		// machine's own password-lane level governs (factory simple). Only the
+		// exact value "advanced" forces; anything else is not a third state.
+		PasswordTier string `json:"password_tier"`
 	}
 	if err := json.NewDecoder(resp.Body).Decode(&body); err != nil {
-		return false, privacyTierMetadataOnly, false
+		return false, privacyTierMetadataOnly, false, false
 	}
-	return body.Enabled, clampPrivacyTier(body.PrivacyTier), true
+	return body.Enabled, clampPrivacyTier(body.PrivacyTier), body.PasswordTier == "advanced", true
 }
 
 // Privacy tier ladder, mirrored from the control-master org domain. Named

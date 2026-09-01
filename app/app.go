@@ -249,6 +249,28 @@ func Run() {
 		"addr", actualAddr,
 	)
 
+	// 4a. Serve an honest "starting" surface from the FIRST moment the port is
+	// owned (2026-09-01, bugfix proxy-slow-start-killed-by-5s-deadline).
+	//
+	// Init below (vault Argon2, egress engine, broker, observers) takes
+	// seconds — 3.9s measured warm on a healthy Windows box — and used to run
+	// with the listener bound but nothing serving: the kernel accepted
+	// connections into the backlog and nobody answered, so a slow start was
+	// INDISTINGUISHABLE from a dead process. The CLI's health wait killed
+	// almost-ready children; the tray showed "unresponsive"; curl hung.
+	// Now /health answers 503 {"status":"starting","phase":…} immediately,
+	// data-plane requests get an immediate honest refusal instead of hanging,
+	// and Promote() swaps in the real handlers when init completes. One
+	// http.Server, one listener, graceful shutdown unchanged.
+	startupPhase := server.NewStartupPhase("supervisor")
+	srv := server.NewStarting(ln, startupPhase.Get)
+	observability.GoSafe("main.server.serve", observability.Fatal, func() {
+		if err := srv.Serve(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+			slog.Error("server error", "error", err)
+			os.Exit(1)
+		}
+	})
+
 	// 4b. Write the runtime snapshot so CLI / web can discover the actual
 	// bound port. Per 20260428 ownership: the proxy process is the sole
 	// writer of its runtime state; install-state.json is desired/configured
@@ -280,6 +302,7 @@ func Run() {
 	proxy.SetErrorOriginComponent(cfg.Cluster.NodeID)
 
 	sup, err := supervisor.New(cfg, resolvedPath, password, buildinfo.Get().Version)
+	startupPhase.Set("egress")
 	if err != nil {
 		slog.Error("failed to start supervisor", "error", err)
 		if rmErr := proxyruntime.Remove(); rmErr != nil {
@@ -379,6 +402,7 @@ func Run() {
 		}
 	}
 
+	startupPhase.Set("broker")
 	// 5b. Build OAuth broker (embedded, uses vault stores).
 	//     Reuse the supervisor's vault connection to avoid double-open conflicts.
 	brokerVault := sup.VaultReader()
@@ -751,19 +775,12 @@ func Run() {
 	// cluster-install already writes into this node's config; a non-cluster
 	// (Personal/Trial) install leaves it empty, which is correct — those editions
 	// only ever reach /admin/* over loopback, and remote access should be refused.
-	srv := server.New(ln, dataHandler, adminHandler,
+	// The serve goroutine has been running since the listener was bound (4a);
+	// promotion atomically swaps the "starting" surface for the real handlers.
+	srv.Promote(dataHandler, adminHandler,
 		server.AdminGate{Token: cfg.Cluster.ControlServiceToken}, extraRegistrars...)
-
-	// Fatal: server.Serve is the process's reason for being. If it dies the
-	// proxy cannot serve requests, so exit(2) and let the OS supervisor
-	// restart us rather than lingering as a zombie that accepts nothing.
-	observability.GoSafe("main.server.serve", observability.Fatal, func() {
-		fmt.Fprintf(os.Stderr, "\naikey-proxy %s listening on %s\n\n", buildinfo.Get().String(), ln.Addr())
-		if err := srv.Serve(); err != nil && !errors.Is(err, http.ErrServerClosed) {
-			slog.Error("server error", "error", err)
-			os.Exit(1)
-		}
-	})
+	startupPhase.Set("ready")
+	fmt.Fprintf(os.Stderr, "\naikey-proxy %s listening on %s\n\n", buildinfo.Get().String(), ln.Addr())
 
 	// Start the master-policy pollers (compliance / quota / group_runtime rails)
 	// only AFTER the serve goroutine is launched, so their first-sync reloads —
