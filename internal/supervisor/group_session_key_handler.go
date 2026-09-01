@@ -91,6 +91,11 @@ func (h *poolLoginHandler) sessionKey(w http.ResponseWriter, r *http.Request) {
 		OperationID  string `json:"operation_id"`
 		Confirm      bool   `json:"confirm"`
 		Cancel       bool   `json:"cancel"`
+		// IdentityMismatchConfirmed is the member's explicit second acknowledgement
+		// for a cross-account Session Key (拍板 2026-09-01, supersedes the 08-27
+		// fail-closed rule for THIS member entry). Ignored unless Confirm is set and
+		// the pending operation is actually mismatched.
+		IdentityMismatchConfirmed bool `json:"identity_mismatch_confirmed"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		poolErr(w, http.StatusBadRequest, "BAD_BODY", "invalid or oversized request body")
@@ -167,18 +172,21 @@ func (h *poolLoginHandler) sessionKey(w http.ResponseWriter, r *http.Request) {
 		}
 		identityMismatch := !sessionKeyIdentityMatches(loginCtx, token.Identity)
 		if identityMismatch {
-			slog.Warn("Session key identity does not match the selected account",
+			// spec: R-oauth-token-mint-12.S1 不匹配成为待确认审阅态，零写入
+			// Cross-account Session Key (拍板 2026-09-01, supersedes the 2026-08-27
+			// immediate fail-closed): the exchange result stays a SHORT-LIVED pending
+			// operation and the member must explicitly acknowledge the mismatch on
+			// confirm. Safe because the v3.1 mint model writeback is SEAT-scoped
+			// (R-oauth-token-mint-9.S1): the token + its ACTUAL provider account id
+			// land on the member's own seat row only — the shared account row,
+			// its identity (email/external_id), and other members are untouched.
+			// The runtime rail prefers the seat row's provider_account_id, so the
+			// injected upstream identity always matches this token.
+			// 变更记录: 技术实现/update/20260901-SessionKey跨账号登录-确认后绑定本人seat行.md
+			slog.Warn("Session key identity does not match the selected account; awaiting explicit member confirmation",
 				"event.name", observability.EventProxyPoolSessionKeyIdentityMismatch,
 				"error.code", broker.ErrCodeSessionKeyIdentityMismatch, "credential_id", req.CredentialID,
 				"request_id", trace.RequestID, "trace_id", trace.TraceID, "span_id", trace.SpanID)
-			// The token would become the shared account login for every member.
-			// There is no safe "confirm into my private slot" path anymore: fail
-			// closed, zero plaintext immediately, and perform no Master writeback.
-			token.AccessToken = ""
-			token.RefreshToken = ""
-			poolErr(w, http.StatusConflict, broker.ErrCodeSessionKeyIdentityMismatch,
-				"The Session Key belongs to a different account. Select the matching pool account and try again.")
-			return
 		}
 		exchangedAt := time.Now()
 		pending = &poolSessionKeyPending{
@@ -217,10 +225,14 @@ func (h *poolLoginHandler) sessionKey(w http.ResponseWriter, r *http.Request) {
 		})
 		return
 	}
-	if pending.identityMismatch {
-		h.forgetSessionKeyOperation(req.OperationID, pending)
+	if pending.identityMismatch && !req.IdentityMismatchConfirmed {
+		// spec: R-oauth-token-mint-12.S2 普通 confirm 不能一键写入跨账号 token
+		// Confirm without the explicit mismatch acknowledgement: keep the pending
+		// operation (the member can re-confirm with the acknowledgement or cancel);
+		// nothing is written. An accidental one-click confirm can never bind a
+		// cross-account token.
 		poolErrWithMeta(w, http.StatusConflict, broker.ErrCodeSessionKeyIdentityMismatch,
-			"The Session Key belongs to a different account; no shared token was changed.", req.OperationID)
+			"The Session Key belongs to a different account. Re-confirm with the mismatch acknowledgement to bind it to your seat, or cancel.", req.OperationID)
 		return
 	}
 
@@ -380,8 +392,18 @@ func sessionKeyIdentityMatches(loginCtx poolLoginContext, identity broker.Identi
 		return expectedExternalID == strings.TrimSpace(identity.ExternalID)
 	}
 	expectedEmail := strings.TrimSpace(loginCtx.ExpectedIdentity)
+	if expectedEmail == "" {
+		// spec: R-oauth-token-mint-12.S5 期望身份为空 = 首登，proxy 不得比 Master 严
+		// No expected identity at all: a newly provisioned pool row awaiting its
+		// first login. Master's own writeback matcher (membertoken.identityMismatch)
+		// accepts this and C5-backfills the identity, so the proxy must not be
+		// stricter — a 409 here made first logins impossible (08-27 评审 P1,
+		// aligned 2026-09-01).
+		// bugfix: workflow/CI/bugfix/2026-09-01-sessionkey-cross-account-login-blocked.md
+		return true
+	}
 	actualEmail := strings.TrimSpace(identity.Email)
-	return expectedEmail != "" && actualEmail != "" && strings.EqualFold(expectedEmail, actualEmail)
+	return actualEmail != "" && strings.EqualFold(expectedEmail, actualEmail)
 }
 
 // acquireSessionKeyOperation keeps one mutex per in-flight operation. The

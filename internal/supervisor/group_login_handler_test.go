@@ -476,7 +476,14 @@ func TestPoolSessionKey_CancelZerosAndRemovesPendingToken(t *testing.T) {
 	}
 }
 
-func TestPoolSessionKey_IdentityMismatchFailsClosedWithoutWriteback(t *testing.T) {
+// TestPoolSessionKey_IdentityMismatchRequiresExplicitAcknowledgement pins the
+// 2026-09-01 拍板 (supersedes the 2026-08-27 immediate fail-closed): a
+// cross-account Session Key becomes a reviewable pending operation; an ordinary
+// confirm still refuses; only the explicit identity_mismatch_confirmed
+// acknowledgement writes back — carrying identity_mismatch=true and the ACTUAL
+// provider account id so master binds the member's own seat row only.
+// spec: R-oauth-token-mint-12.S1 (Step 1) / .S2 (Step 2) / .S3 (Step 3)
+func TestPoolSessionKey_IdentityMismatchRequiresExplicitAcknowledgement(t *testing.T) {
 	var (
 		gotWB      memberTokenWriteback
 		writebacks atomic.Int32
@@ -508,22 +515,51 @@ func TestPoolSessionKey_IdentityMismatchFailsClosedWithoutWriteback(t *testing.T
 		return token, nil
 	}
 	const operationID = "99998888777766665555444433332222"
+
+	// Step 1: exchange → reviewable pending with the mismatch surfaced, zero writeback.
 	w := doJSON(h.sessionKey, `{"credential_id":"c1","session_key":"sk-ant-sid02-fixture-value-long-enough","operation_id":"`+operationID+`"}`)
-	if w.Code != http.StatusConflict || !strings.Contains(w.Body.String(), broker.ErrCodeSessionKeyIdentityMismatch) {
-		t.Fatalf("identity mismatch: %d %s", w.Code, w.Body.String())
+	if w.Code != http.StatusOK || !strings.Contains(w.Body.String(), `"identity_mismatch":true`) {
+		t.Fatalf("mismatch review state: %d %s", w.Code, w.Body.String())
 	}
-	if token.AccessToken != "" || token.RefreshToken != "" {
-		t.Fatal("rejected mismatch must zero exchanged token material immediately")
+	if strings.Contains(w.Body.String(), "ACCESS-SECRET") || strings.Contains(w.Body.String(), "REFRESH-SECRET") {
+		t.Fatal("token material leaked into the review response")
 	}
-	if _, ok := h.sessionKeyPending.Load(operationID); ok {
-		t.Fatal("identity mismatch must not create a confirmable pending operation")
+	if _, ok := h.sessionKeyPending.Load(operationID); !ok {
+		t.Fatal("mismatch must create a confirmable pending operation")
 	}
 	if writebacks.Load() != 0 {
-		t.Fatalf("first warning must not write to master, got %d", writebacks.Load())
+		t.Fatalf("review step must not write to master, got %d", writebacks.Load())
 	}
 
-	if gotWB.CredentialID != "" {
-		t.Fatalf("mismatch reached Master writeback: %+v", gotWB)
+	// Step 2: ordinary confirm WITHOUT the acknowledgement → refused, pending kept.
+	w = doJSON(h.sessionKey, `{"credential_id":"c1","operation_id":"`+operationID+`","confirm":true}`)
+	if w.Code != http.StatusConflict || !strings.Contains(w.Body.String(), broker.ErrCodeSessionKeyIdentityMismatch) {
+		t.Fatalf("unacknowledged confirm: %d %s", w.Code, w.Body.String())
+	}
+	if _, ok := h.sessionKeyPending.Load(operationID); !ok {
+		t.Fatal("unacknowledged confirm must keep the pending operation for re-confirm/cancel")
+	}
+	if writebacks.Load() != 0 {
+		t.Fatalf("unacknowledged confirm must not write to master, got %d", writebacks.Load())
+	}
+
+	// Step 3: explicit acknowledgement → exactly one writeback with the mismatch
+	// declared and the ACTUAL identity (master stores it on the seat row).
+	w = doJSON(h.sessionKey, `{"credential_id":"c1","operation_id":"`+operationID+`","confirm":true,"identity_mismatch_confirmed":true}`)
+	if w.Code != http.StatusOK || !strings.Contains(w.Body.String(), `"identity_mismatch":true`) {
+		t.Fatalf("acknowledged confirm: %d %s", w.Code, w.Body.String())
+	}
+	if writebacks.Load() != 1 {
+		t.Fatalf("acknowledged confirm must write exactly once, got %d", writebacks.Load())
+	}
+	if !gotWB.IdentityMismatch || gotWB.ExternalID != "wrong-uuid" || gotWB.Identity != "wrong@team.com" {
+		t.Fatalf("writeback must declare the mismatch with the actual identity: %+v", gotWB)
+	}
+	if gotWB.AccessToken != "ACCESS-SECRET" {
+		t.Fatalf("writeback must carry the exchanged token: %+v", gotWB)
+	}
+	if _, ok := h.sessionKeyPending.Load(operationID); ok {
+		t.Fatal("completed operation must be forgotten")
 	}
 }
 
@@ -551,8 +587,12 @@ func TestPoolBrowserOAuth_IdentityMismatchFailsClosedWithoutWriteback(t *testing
 }
 
 func TestSessionKeyIdentityMatches_FailsClosedWithoutExpectedIdentity(t *testing.T) {
-	if sessionKeyIdentityMatches(poolLoginContext{}, broker.IdentityInfo{Email: "member@team.com", ExternalID: "claude-user"}) {
-		t.Fatal("account without an expected identity must not accept an exchanged token")
+	// spec: R-oauth-token-mint-12.S5 期望身份为空 = 首登，proxy 不得比 Master 严
+	// 2026-09-01 alignment with master's membertoken.identityMismatch: a pool row
+	// with NO expected identity at all is a first login — master accepts it and
+	// C5-backfills, so the proxy must not 409 it (08-27 评审 P1).
+	if !sessionKeyIdentityMatches(poolLoginContext{}, broker.IdentityInfo{Email: "member@team.com", ExternalID: "claude-user"}) {
+		t.Fatal("first login onto an identity-less account must pass for master-side backfill")
 	}
 	if sessionKeyIdentityMatches(
 		poolLoginContext{ExternalID: "expected-uuid", ExpectedIdentity: "member@team.com"},

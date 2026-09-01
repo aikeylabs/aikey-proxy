@@ -601,6 +601,7 @@ func (r *signalReporter) enqueueAuthFailure(credentialID, oauthGroupID, seatID, 
 		TokenFingerprint: tokenFingerprint, Reason: "token_revoked",
 		UpstreamStatus: upstreamStatus, UpstreamErrorType: boundedErrorType(upstreamErrType),
 	}
+
 	queuedKey := authFailureQueueKey(sample)
 	if _, duplicate := r.authQueued.LoadOrStore(queuedKey, struct{}{}); duplicate {
 		return
@@ -620,6 +621,19 @@ func (r *signalReporter) enqueueAuthFailure(credentialID, oauthGroupID, seatID, 
 func (r *signalReporter) ingestAuthFailures(samples []authFailureSample) {
 	if len(samples) == 0 {
 		return
+	}
+	// 本地留痕（auth-demotions.json，`aikey doctor` 收集）。放在**这里**而不是
+	// enqueueAuthFailure：enqueue 在请求路径上、按约定 O(1) 非阻塞（PLANE-01
+	// 热路径无文件调用——第一版就放错了位置，被 hotpath 围栏当场拦下）；
+	// ingest 属于 loop() 单写者，本来就负责落盘。
+	// 没有这一笔，上报 outbox 被 Master 接受后即清除，客户机器上查不到
+	// "何时因何判死了哪把 token"，远程诊断只能靠猜。
+	for _, sample := range samples {
+		authDemotions.record(authDemotionEntry{
+			AtMs: authDemotions.nowMs(), CredentialID: sample.CredentialID, SeatID: sample.SeatID,
+			UpstreamStatus: sample.UpstreamStatus, UpstreamErrorType: sample.UpstreamErrorType,
+			FingerprintPrefix: fingerprintPrefix(sample.TokenFingerprint),
+		})
 	}
 	records := make([]authFailureJournalRecord, 0, len(samples))
 	var dropped int64
