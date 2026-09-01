@@ -45,7 +45,18 @@ func (s *Switchboard) Swap(h http.Handler) { s.h.Store(h) }
 
 // ServeHTTP delegates to the current target.
 func (s *Switchboard) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	s.h.Load().(http.Handler).ServeHTTP(w, r)
+	// 🔴 Comma-ok, and it still panics — deliberately identical to the bare
+	// assertion this replaces. Nothing but NewSwitchboard and Swap ever stores
+	// here and both take an http.Handler, so !ok is unreachable; if it ever
+	// happens it is a programming error, and swallowing it would leave the port
+	// answering with an empty 200, which is the failure this whole file exists
+	// to make impossible. errcheck (check-type-assertions) wants the assertion
+	// written out; it does not want the failure hidden.
+	h, ok := s.h.Load().(http.Handler)
+	if !ok {
+		panic("switchboard: no http.Handler stored")
+	}
+	h.ServeHTTP(w, r)
 }
 
 // StartupPhase is a tiny thread-safe label of how far init has come. app.Run
@@ -66,7 +77,15 @@ func NewStartupPhase(initial string) *StartupPhase {
 func (p *StartupPhase) Set(label string) { p.v.Store(label) }
 
 // Get returns the current label.
-func (p *StartupPhase) Get() string { return p.v.Load().(string) }
+//
+// 🔴 Comma-ok for errcheck, and the empty string is the right fallback rather
+// than a panic: this value only ever reaches a diagnostic field ("phase") in the
+// starting response. A health probe must not be turned into a crash by a
+// diagnostic. NewStartupPhase always stores a string, so !ok is unreachable.
+func (p *StartupPhase) Get() string {
+	label, _ := p.v.Load().(string)
+	return label
+}
 
 // startingHandler answers for the whole surface while init runs.
 //
