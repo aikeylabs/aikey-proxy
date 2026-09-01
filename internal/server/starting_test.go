@@ -34,7 +34,16 @@ func TestStartingSurface_AnswersFromBindAndPromotesInPlace(t *testing.T) {
 	get := func(path string) (int, []byte) {
 		t.Helper()
 		c := http.Client{Timeout: 3 * time.Second}
-		resp, err := c.Get(base + path)
+		// 🔴 NewRequestWithContext, not c.Get: the request must die with the test.
+		// c.Get carries no context, so a hung pre-init surface — exactly the bug
+		// this file pins — would block until the client's own timeout rather than
+		// until `go test` gives up on the case, and the failure would be reported
+		// against whatever ran next. noctx enforces this.
+		req, err := http.NewRequestWithContext(t.Context(), http.MethodGet, base+path, http.NoBody)
+		if err != nil {
+			t.Fatalf("build GET %s: %v", path, err)
+		}
+		resp, err := c.Do(req)
 		if err != nil {
 			t.Fatalf("GET %s: %v — the pre-init surface is the whole point; "+
 				"a hang here IS the bug this file fixes", path, err)

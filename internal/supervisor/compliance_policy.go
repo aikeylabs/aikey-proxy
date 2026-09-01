@@ -154,7 +154,7 @@ func (s *Supervisor) syncComplianceMasterPolicy(ctx context.Context) {
 // that is not an understood rung must land on the safe one: a field the server
 // did not send (an older master) decodes to 0, and 0/negative/out-of-range all
 // clamp to 1 (metadata only). The failure direction is always "carry less".
-func fetchComplianceMasterPolicy(ctx context.Context, masterURL, orgID string) (enabled bool, privacyTier int, passwordAdvanced bool, ok bool) {
+func fetchComplianceMasterPolicy(ctx context.Context, masterURL, orgID string) (enabled bool, privacyTier int, passwordAdvanced, ok bool) {
 	u := masterURL + "/v1/compliance/policy?tenant=" + url.QueryEscape(orgID)
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u, http.NoBody)
 	if err != nil {
