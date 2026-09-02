@@ -17,48 +17,45 @@ import (
 	"github.com/AiKeyLabs/aikey-proxy/internal/observability"
 )
 
-type poolSessionKeyAdapter func(context.Context, poolLoginContext, broker.SessionKeyExchangeOptions) (*broker.SessionKeyToken, error)
-
 type poolSessionKeyAdapterKey struct {
 	providerCode string
 	protocolType string
 }
 
-var poolSessionKeyAdapters = map[poolSessionKeyAdapterKey]poolSessionKeyAdapter{
-	{providerCode: "anthropic", protocolType: "anthropic"}: func(ctx context.Context, _ poolLoginContext, opts broker.SessionKeyExchangeOptions) (*broker.SessionKeyToken, error) {
-		return broker.ExchangeClaudeSessionKey(ctx, opts)
-	},
-	{providerCode: "openai", protocolType: "openai_compatible"}: func(ctx context.Context, _ poolLoginContext, opts broker.SessionKeyExchangeOptions) (*broker.SessionKeyToken, error) {
-		return broker.ExchangeCodexSessionKey(ctx, opts)
-	},
-	{providerCode: "mock", protocolType: "anthropic"}: func(ctx context.Context, loginCtx poolLoginContext, opts broker.SessionKeyExchangeOptions) (*broker.SessionKeyToken, error) {
-		return broker.ExchangeMockSessionKey(ctx, broker.MockSessionKeyExchangeOptions{
-			SessionKey: opts.SessionKey,
-			ProxyURL:   opts.ProxyURL,
-			TokenURL:   loginCtx.OAuthTokenURL,
-		})
-	},
-	{providerCode: "mock", protocolType: "openai_compatible"}: func(ctx context.Context, loginCtx poolLoginContext, opts broker.SessionKeyExchangeOptions) (*broker.SessionKeyToken, error) {
-		return broker.ExchangeMockCodexSessionKey(ctx, broker.MockSessionKeyExchangeOptions{
-			SessionKey: opts.SessionKey,
-			ProxyURL:   opts.ProxyURL,
-			TokenURL:   loginCtx.OAuthTokenURL,
-		})
-	},
+// poolSessionKeyRoute wires one provider/protocol pair to its broker login
+// capability. Exactly one of exchange / mockExchange is set; the mock option
+// assembly happens once in exchangePoolSessionKey so the table holds the
+// broker functions THEMSELVES. That is what lets the dispatch fence
+// (TestPoolSessionKeyRoutes_CodexRoutesAreAtomic) assert function identity
+// instead of trusting a closure to call the verified capability — the same
+// fence shape as Master's BrokerSessionKeyExchanger routes().
+type poolSessionKeyRoute struct {
+	exchange     func(context.Context, broker.SessionKeyExchangeOptions) (*broker.SessionKeyToken, error)
+	mockExchange func(context.Context, broker.MockSessionKeyExchangeOptions) (*broker.SessionKeyToken, error)
 }
 
-func poolSessionKeyAdapterFor(loginCtx poolLoginContext) (poolSessionKeyAdapter, bool) {
+var poolSessionKeyRoutes = map[poolSessionKeyAdapterKey]poolSessionKeyRoute{
+	{providerCode: "anthropic", protocolType: "anthropic"}: {exchange: broker.ExchangeClaudeSessionKey},
+	// spec: R-sessionkey-login-safety-1.S1 Production Codex routes must use the
+	// atomic exchange-and-verify capability so an unverified bearer never
+	// reaches pending/writeback.
+	{providerCode: "openai", protocolType: "openai_compatible"}: {exchange: broker.ExchangeAndVerifyCodexSessionKey},
+	{providerCode: "mock", protocolType: "anthropic"}:           {mockExchange: broker.ExchangeMockSessionKey},
+	{providerCode: "mock", protocolType: "openai_compatible"}:   {mockExchange: broker.ExchangeAndVerifyMockCodexSessionKey},
+}
+
+func poolSessionKeyRouteFor(loginCtx poolLoginContext) (poolSessionKeyRoute, bool) {
 	provider := strings.ToLower(strings.TrimSpace(loginCtx.ProviderCode))
 	protocol := strings.ToLower(strings.TrimSpace(loginCtx.ProtocolType))
-	adapter, ok := poolSessionKeyAdapters[poolSessionKeyAdapterKey{providerCode: provider, protocolType: protocol}]
+	route, ok := poolSessionKeyRoutes[poolSessionKeyAdapterKey{providerCode: provider, protocolType: protocol}]
 	if !ok || (provider == "mock" && strings.TrimSpace(loginCtx.OAuthTokenURL) == "") {
-		return nil, false
+		return poolSessionKeyRoute{}, false
 	}
-	return adapter, true
+	return route, true
 }
 
 func poolSessionKeyProviderSupported(loginCtx poolLoginContext) bool {
-	_, ok := poolSessionKeyAdapterFor(loginCtx)
+	_, ok := poolSessionKeyRouteFor(loginCtx)
 	return ok
 }
 
@@ -67,7 +64,7 @@ func poolSessionKeyProviderSupported(loginCtx poolLoginContext) bool {
 // an endpoint or provider. Mock credentials use their resident token endpoint;
 // real Session Keys enter only their provider's fixed broker implementation.
 func exchangePoolSessionKey(ctx context.Context, loginCtx poolLoginContext, opts broker.SessionKeyExchangeOptions) (*broker.SessionKeyToken, error) {
-	adapter, ok := poolSessionKeyAdapterFor(loginCtx)
+	route, ok := poolSessionKeyRouteFor(loginCtx)
 	if !ok {
 		return nil, &broker.OAuthError{
 			Code:    broker.ErrCodeSessionKeyProviderUnsupported,
@@ -75,7 +72,14 @@ func exchangePoolSessionKey(ctx context.Context, loginCtx poolLoginContext, opts
 			Hint:    "Choose a supported Anthropic or OpenAI-compatible OAuth account.",
 		}
 	}
-	return adapter(ctx, loginCtx, opts)
+	if route.mockExchange != nil {
+		return route.mockExchange(ctx, broker.MockSessionKeyExchangeOptions{
+			SessionKey: opts.SessionKey,
+			ProxyURL:   opts.ProxyURL,
+			TokenURL:   loginCtx.OAuthTokenURL,
+		})
+	}
+	return route.exchange(ctx, opts)
 }
 
 // sessionKey signs a supported pool account in without opening a browser. It

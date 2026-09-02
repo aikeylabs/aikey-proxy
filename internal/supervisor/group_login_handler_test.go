@@ -10,6 +10,7 @@ import (
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"reflect"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -119,22 +120,35 @@ func TestExchangePoolSessionKeyUsesResidentMockCodexContext(t *testing.T) {
 		t.Fatal(err)
 	}
 	accessToken := header + "." + base64.RawURLEncoding.EncodeToString(payload) + ".fixture"
+	var sawExchange, sawVerify bool
 	provider := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Path != "/oauth/openai_compatible/token" || r.Method != http.MethodPost {
+		switch r.URL.Path {
+		case "/oauth/openai_compatible/token":
+			sawExchange = true
+			if r.Method != http.MethodPost {
+				t.Fatalf("unexpected mock Codex exchange method: %s", r.Method)
+			}
+			if err := r.ParseForm(); err != nil {
+				t.Fatal(err)
+			}
+			if r.Form.Get("grant_type") != "session_key" || !strings.HasPrefix(r.Form.Get("session_key"), "mock-chatgpt-session-") {
+				t.Fatalf("unexpected mock Codex grant: %v", r.Form)
+			}
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"access_token": accessToken,
+				"token_type":   "Bearer",
+				"expires_in":   3600,
+			})
+		case "/openai/v1/responses":
+			sawVerify = true
+			if r.Method != http.MethodPost || r.Header.Get("Authorization") != "Bearer "+accessToken {
+				t.Fatalf("unexpected mock Codex verification request: %s auth=%t", r.Method, r.Header.Get("Authorization") != "")
+			}
+			_, _ = io.WriteString(w, `{"status":"completed"}`)
+		default:
 			t.Fatalf("unexpected mock Codex request: %s %s", r.Method, r.URL.Path)
 		}
-		if err := r.ParseForm(); err != nil {
-			t.Fatal(err)
-		}
-		if r.Form.Get("grant_type") != "session_key" || !strings.HasPrefix(r.Form.Get("session_key"), "mock-chatgpt-session-") {
-			t.Fatalf("unexpected mock Codex grant: %v", r.Form)
-		}
-		w.Header().Set("Content-Type", "application/json")
-		_ = json.NewEncoder(w).Encode(map[string]any{
-			"access_token": accessToken,
-			"token_type":   "Bearer",
-			"expires_in":   3600,
-		})
 	}))
 	defer provider.Close()
 
@@ -151,6 +165,12 @@ func TestExchangePoolSessionKeyUsesResidentMockCodexContext(t *testing.T) {
 	if token.AccessToken != accessToken || token.RefreshToken != "" ||
 		token.Identity.ExternalID != "cred-mock-codex" || token.Identity.Email != "mock-codex@example.test" {
 		t.Fatalf("unexpected mock Codex token metadata: %+v", token)
+	}
+	// spec: R-sessionkey-login-safety-1.S1 success must close BOTH provider
+	// legs; a dispatch regression to the exchange-only capability would skip
+	// the verification leg and stay green without this assertion.
+	if !sawExchange || !sawVerify {
+		t.Fatalf("atomic mock Codex login missed a provider leg: exchange=%t verify=%t", sawExchange, sawVerify)
 	}
 }
 
@@ -220,6 +240,24 @@ func TestExchangePoolSessionKeyRoutesRealOpenAIToCodexExchanger(t *testing.T) {
 	}
 	if strings.Contains(oauthErr.Message, "Mock Provider") {
 		t.Fatalf("real OpenAI account entered the Mock Provider adapter: %v", err)
+	}
+}
+
+// spec: R-sessionkey-login-safety-1.S1 the Codex routes may only wire the
+// atomic exchange-and-verify broker capabilities. The real chatgpt.com verify
+// leg cannot be exercised hermetically, so this fence asserts function
+// identity on the dispatch table itself — an exchange-only entry would let an
+// unverified bearer reach member pending/writeback.
+func TestPoolSessionKeyRoutes_CodexRoutesAreAtomic(t *testing.T) {
+	codex := poolSessionKeyRoutes[poolSessionKeyAdapterKey{providerCode: "openai", protocolType: "openai_compatible"}]
+	if codex.exchange == nil || reflect.ValueOf(codex.exchange).Pointer() !=
+		reflect.ValueOf(broker.ExchangeAndVerifyCodexSessionKey).Pointer() {
+		t.Fatal("openai/openai_compatible route bypasses the atomic Codex login capability")
+	}
+	mockCodex := poolSessionKeyRoutes[poolSessionKeyAdapterKey{providerCode: "mock", protocolType: "openai_compatible"}]
+	if mockCodex.mockExchange == nil || reflect.ValueOf(mockCodex.mockExchange).Pointer() !=
+		reflect.ValueOf(broker.ExchangeAndVerifyMockCodexSessionKey).Pointer() {
+		t.Fatal("mock/openai_compatible route bypasses the atomic Codex login capability")
 	}
 }
 
