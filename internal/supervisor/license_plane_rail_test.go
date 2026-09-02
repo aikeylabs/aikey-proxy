@@ -102,9 +102,21 @@ func TestTheRailIsRegisteredInSupervisorGo(t *testing.T) {
 		}
 	}
 
-	if !strings.Contains(call, "licensePlaneRail()") {
-		t.Fatalf("supervisor.go does not register the license rail:\n  %s\n\n"+
-			"Without it the forwarding gate is never populated, every deployment "+
+	// 🔴 The registration site names licenseRails(), not licensePlaneRail(), since
+	// 2026-09-02: the licensing rails became build-tag split so a
+	// -tags aikey_license_off build does not poll a control plane that serves no
+	// /v1/license/* (it logged a 404 WARN several times a minute, for ever).
+	//
+	// 🚫 That indirection is exactly how this fence could go quietly vacuous, so
+	// the property is now asserted in TWO places and this is only the first:
+	// here, that supervisor.go still registers whatever licenseRails() returns;
+	// and BEHAVIORALLY in license_rail_on_fence_test.go, that a normal build's
+	// licenseRails() actually contains the license_plane rail. Text alone can no
+	// longer prove the gate has a carrier — a stub returning nil would satisfy it
+	// — which is why the second half is not optional.
+	if !strings.Contains(call, "licenseRails()") {
+		t.Fatalf("supervisor.go does not register the license rails:\n  %s\n\n"+
+			"Without them the forwarding gate is never populated, every deployment "+
 			"forwards regardless of its license, and nothing else goes red — which "+
 			"is the exact defect of 2026-08-27.", call)
 	}

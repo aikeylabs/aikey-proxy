@@ -533,8 +533,10 @@ func New(cfg *config.Config, configPath, password, version string) (*Supervisor,
 	// license_plane (2026-08-27) is the seventh rail. It carries the deployment's
 	// forwarding gate, which the control plane had been computing and serving all
 	// along with nothing on this side reading it — see license_plane_rail.go.
-	s.railset = newRailSet(s.groupRuntimeRail(), s.routingOverrideRail(), s.fallbackPolicyRail(),
-		s.keyRevocationRail(), s.licensePlaneRail())
+	// licenseRails() is build-tag split: the licensing rails in a normal build,
+	// none in a -tags aikey_license_off build (see license_rail_off.go — the gate
+	// they feed is compiled out, so a running rail could only log 404s forever).
+	s.railset = newRailSet(append([]railSpec{s.groupRuntimeRail(), s.routingOverrideRail(), s.fallbackPolicyRail(), s.keyRevocationRail()}, s.licenseRails()...)...)
 	gen, err := s.buildGeneration()
 	if err != nil {
 		_ = s.oauthPoolRuntime.Shutdown()
