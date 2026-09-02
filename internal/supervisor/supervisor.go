@@ -2045,6 +2045,12 @@ func (s *Supervisor) buildGeneration() (*generation, error) {
 	// (20260703 update). Explicitly-empty (cluster/server configs) → URL-less
 	// fallback; absent key (pre-20260703 preserved configs) → default 8090.
 	p.SetConsoleURL(s.cfg.ResolvedConsoleURL())
+	// 🔴 A cluster NODE must not serve the path-prefix branch to a caller that
+	// names no virtual key. Wired from cluster.enabled — the same single value
+	// config.validate() uses to lift the loopback rail, so the two decisions can
+	// never disagree about what this process is. See proxy.SetClusterNode and
+	// workflow/CI/bugfix/2026-09-02-集群节点代理是一个公网开放中继.md.
+	p.SetClusterNode(s.cfg.Cluster.Enabled)
 	// SyncRail §5.4: let the 401 wording distinguish "you need to sign in" from
 	// "the assignment rail is unreachable so this pick may be misdirected".
 	p.SetRoutingRailHealth(func() (string, int64) { return s.railHealthFor("routing_override") })
