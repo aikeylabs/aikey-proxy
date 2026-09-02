@@ -1,3 +1,12 @@
+//go:build !aikey_license_off
+
+// 🔴 Tagged !aikey_license_off so a licensing-off build carries NO consumer
+// marker. That absence is load-bearing: release.sh Step 8.9a INVERTS on it —
+// a licensing-off build must not carry the marker (proving the tag took
+// effect), and a normal build must (proving the gate is wired). Leaving the
+// marker declared here for both builds would make the two indistinguishable
+// in the artifact, which is the whole thing the marker exists to prevent.
+
 package proxy
 
 // license_capability.go — the marker this binary carries so a release pipeline

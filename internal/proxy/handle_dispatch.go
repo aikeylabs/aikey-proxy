@@ -101,7 +101,7 @@ func (p *Proxy) Handle(w http.ResponseWriter, r *http.Request) {
 	// Cost: one atomic load. No file read, no database query, no signature check,
 	// no synchronous control call — specs/edition-entitlement requires all five of
 	// those absences on the forwarding path, and the cache exists to provide them.
-	if !p.licensePlane.ForwardingAllowed() {
+	if !licenseForwardingAllowed(p.licensePlane) {
 		p.errors.Add(1)
 		// Logged per REQUEST would be a mistake: a denied deployment is denied for
 		// every call, and a per-request line is how a developer machine once

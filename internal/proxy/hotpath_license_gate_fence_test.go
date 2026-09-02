@@ -1,3 +1,12 @@
+//go:build !aikey_license_off
+
+// 🔴 Tagged: this whole fence asserts the gate REFUSES. A -tags aikey_license_off
+// build compiles the gate out on purpose, so every assertion here is false there
+// by design. The inverse fence for that build is
+// hotpath_license_gate_off_fence_test.go, and it is not optional — untagging this
+// file without adding that one would leave the licensing-off build with NO
+// coverage of the property that matters most about it.
+
 package proxy
 
 // hotpath_license_gate_fence_test.go — the POSITIVE fence under the license
@@ -42,14 +51,14 @@ import (
 // Keyed the same way the module graph keys everything else.
 const licenseGateFunc = "internal/proxy::LicensePlaneCache.ForwardingAllowed"
 
-// TestTheLicenceGateIsReachedFromTheHotPath is the fence whose absence allowed
+// TestTheLicenseGateIsReachedFromTheHotPath is the fence whose absence allowed
 // the defect.
 //
 // 🚫 Do not "simplify" this into a grep for the call. A grep matches a line in a
 // comment, a line in dead code, and a line in a function nothing calls — all
 // three of which are exactly the failure being fenced. Reachability from the real
 // per-request entry point is the only assertion that means what it says.
-func TestTheLicenceGateIsReachedFromTheHotPath(t *testing.T) {
+func TestTheLicenseGateIsReachedFromTheHotPath(t *testing.T) {
 	g := loadModuleGraph(t)
 	reached := g.reachableFrom(hotPathEntry)
 
@@ -72,7 +81,7 @@ func TestTheLicenceGateIsReachedFromTheHotPath(t *testing.T) {
 	}
 }
 
-// TestTheLicenceGateFenceGoesRedWhenTheGateIsRemoved is the vacuity check for the
+// TestTheLicenseGateFenceGoesRedWhenTheGateIsRemoved is the vacuity check for the
 // test above.
 //
 // 🔴 A reachability fence has a specific way of silently rotting: rename the
@@ -81,7 +90,7 @@ func TestTheLicenceGateIsReachedFromTheHotPath(t *testing.T) {
 // "not reached" rather than "not measured". This asserts the walk is real by
 // checking it finds things it must, and that the key it looks for names a
 // function that actually exists.
-func TestTheLicenceGateFenceGoesRedWhenTheGateIsRemoved(t *testing.T) {
+func TestTheLicenseGateFenceGoesRedWhenTheGateIsRemoved(t *testing.T) {
 	g := loadModuleGraph(t)
 
 	if _, ok := g.funcs[licenseGateFunc]; !ok {

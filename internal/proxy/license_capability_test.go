@@ -1,3 +1,5 @@
+//go:build !aikey_license_off
+
 package proxy
 
 // license_capability_test.go — fences under the release-gate marker.
