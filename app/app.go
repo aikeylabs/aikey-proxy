@@ -265,8 +265,12 @@ func Run() {
 	startupPhase := server.NewStartupPhase("supervisor")
 	srv := server.NewStarting(ln, startupPhase.Get)
 	observability.GoSafe("main.server.serve", observability.Fatal, func() {
-		if err := srv.Serve(); err != nil && !errors.Is(err, http.ErrServerClosed) {
-			slog.Error("server error", "error", err)
+		// serveErr, not err: govet's shadow check flags the inner `err` as
+		// shadowing the config-load `err` far above. Renaming is the fix rather
+		// than reusing the outer one — this runs in a goroutine, and writing to a
+		// variable the main path also uses would be a data race.
+		if serveErr := srv.Serve(); serveErr != nil && !errors.Is(serveErr, http.ErrServerClosed) {
+			slog.Error("server error", "error", serveErr)
 			os.Exit(1)
 		}
 	})
