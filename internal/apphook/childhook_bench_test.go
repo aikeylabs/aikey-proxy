@@ -36,6 +36,16 @@ func TestChildHookFullStackLatency(t *testing.T) {
 
 	binary, sealed := requireSealedDetector(t)
 
+	// The dev_with_creds_ner probe is an NER-liveness canary (P0-4): a dead
+	// token-CRF layer returns Allow. Since the password tier landed, the
+	// FACTORY default (simple tier) caps NER-inferred CREDENTIAL_PASSWORD at
+	// audit — a legitimate Allow — so at the default tier the canary cannot
+	// tell "NER dead" from "tier working" (R-credential-password-tier-2).
+	// Forcing advanced restores the discriminating signal: dead NER = Allow,
+	// live NER = warn/mask. The env is read by the spawned child at boot and
+	// only affects CREDENTIAL_PASSWORD; the other scenarios are untouched.
+	t.Setenv("AIKEY_COMPLIANCE_PASSWORD_TIER", "advanced")
+
 	h := NewChildHook(&ChildHookConfig{
 		Name:         "ai-compliance-detector-bench",
 		BinaryPath:   binary,

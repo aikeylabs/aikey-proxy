@@ -425,6 +425,24 @@ func (c *Config) validate() error {
 	// network-reachable). A CLUSTER node, by design, IS network-reachable (clients
 	// + nginx connect to it) and is protected by VK-token auth + the internal
 	// network / mTLS instead — so cluster mode lifts this restriction.
+	//
+	// 🔴 2026-09-02: "protected by VK-token auth" was NOT TRUE when this was
+	// written, and that is worth leaving on the record rather than quietly
+	// correcting. Handle dispatches the provider path-prefix branch
+	// (/anthropic/v1/...) before virtual-key extraction, so a request on that URL
+	// shape carrying no aikey token resolved from the default binding — and a
+	// node's default binding is the ORGANISATION's key. Measured from the public
+	// internet against a real node: 200, billed to a member's seat.
+	//
+	// What makes the sentence true today is proxy.SetClusterNode + the guard at
+	// the top of handlePathPrefixRoute, fenced in
+	// internal/proxy/cluster_node_requires_a_virtual_key_fence_test.go and
+	// internal/supervisor/cluster_node_wiring_fence_test.go.
+	//
+	// 🚫 If that guard is ever removed, this exemption must go with it. They are
+	// one decision written in two files: this line makes the node reachable, that
+	// one makes reachability survivable. Neither is safe alone.
+	// bugfix: workflow/CI/bugfix/2026-09-02-集群节点代理是一个公网开放中继.md
 	if !c.Cluster.Enabled &&
 		c.Listen.Host != "127.0.0.1" && c.Listen.Host != "localhost" && c.Listen.Host != "::1" {
 		return fmt.Errorf("listen.host must be a loopback address (127.0.0.1, localhost, ::1) outside cluster mode, got %q", c.Listen.Host)

@@ -896,6 +896,54 @@ func (p *Proxy) handlePathPrefixRoute(w http.ResponseWriter, r *http.Request, pr
 	// snapshot; leaving it set is harmless (no event field is populated).
 	inboundClientUA := r.Header.Get("User-Agent")
 
+	// 🔴 CLUSTER NODE: this branch requires a virtual key.
+	//
+	// The fall-through below resolves a request that names no aikey token from
+	// the DEFAULT BINDING. On a developer's own machine that is the whole point
+	// — Claude CLI / Cursor send their own credential to a loopback proxy and it
+	// is substituted. On a cluster NODE the same code is an unauthenticated
+	// relay over the organisation's virtual keys, reachable from wherever the
+	// node is reachable, because config.validate() lifts the loopback rail for
+	// cluster.enabled and cluster-install.sh binds 0.0.0.0.
+	//
+	// Measured 2026-09-02 on a real node, from the public internet with no
+	// credential at all: 200, served by a member's virtual key, and recorded in
+	// usage_fact_dwd against that member's SEAT. Not "unmetered forwarding" —
+	// metered to the wrong person, spending their quota, in their audit trail.
+	//
+	// 🔴 Tier3Native covers BOTH "no Authorization/x-api-key at all" and "a
+	// native provider token", and both must be refused here: the observed
+	// request that succeeded carried a syntactically fine but entirely made-up
+	// `x-api-key`. Tier3ActiveSentinel is refused for the same reason in a
+	// different dress — "use whatever is active" names no key, and a node has no
+	// single user whose active key that could mean.
+	//
+	// 🚫 It is NOT a general "path-prefix routing is off in cluster mode". A
+	// request carrying a real aikey_team_* / aikey_personal_* key falls straight
+	// through to the Tier1 handling below and is served exactly as before —
+	// which is how every legitimate cluster client reaches this proxy. Turning
+	// the route off instead would break them, and a fence that only asserted the
+	// refusal would not notice.
+	//
+	// The refusal is byte-identical to the one Handle's step 1 gives a
+	// token-less request on any other URL shape, because from the caller's side
+	// it is the same mistake.
+	//
+	// bugfix: workflow/CI/bugfix/2026-09-02-集群节点代理是一个公网开放中继.md
+	if p.clusterNode {
+		switch ClassifyToken(extractRawAuthValue(r)) {
+		case Tier3Native, Tier3ActiveSentinel:
+			p.errors.Add(1)
+			logger.Warn("authentication failed: missing virtual key on a cluster node",
+				"event.name", observability.EventProxyRequestAuthFailed,
+			)
+			writeJSONError(w, http.StatusUnauthorized, "authentication_error", "TOKEN_MISSING",
+				"Missing virtual key. Expected token with 'aikey_team_' or 'aikey_personal_' "+
+					"prefix in Authorization or x-api-key header.")
+			return
+		}
+	}
+
 	// 2026-04-29 namespace-authority early hard-fail. Run BEFORE the
 	// activeReader nil check so malformed `aikey_*` tokens always fail
 	// loud with TOKEN_INVALID — independent of vault wiring state. This

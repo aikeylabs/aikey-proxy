@@ -21,6 +21,8 @@ package proxy
 
 import (
 	"net/http"
+	"os"
+	"strings"
 	"testing"
 )
 
@@ -101,6 +103,46 @@ func TestIsHardRevoked_A403WithoutAMarkerNeverQuarantines(t *testing.T) {
 			t.Errorf("a bare 403 quarantined the account (body %q). Every 403 we have actually "+
 				"observed carries no revocation marker, so a blanket rule would evict healthy "+
 				"accounts from the pool — strictly worse than the retry loop O23 describes", body)
+		}
+	}
+}
+
+// 调用点围栏：硬吊销上报**必须**把上游状态码与错误类型传下去。
+//
+// 🔴 为什么单独守调用点：wire 侧的断言（signal_report_test.go）直接调
+// enqueueAuthFailure，**绕过了 recordEvent 这个真实调用点**。实测把
+// `resp.StatusCode, errType` 改回 `0, ""` 之后，那条 wire 断言**仍然全绿**——
+// 概念有两个出口（装载 + 传参），只守一个等于没守。这与 G30 是同一个陷阱。
+//
+// 守的东西很朴素：`isHardRevoked` 判定用的那两个值，必须原样交给上报，
+// 而不是在旁边被丢掉。丢掉的后果是「为什么被拒」在 Master 侧无从归因
+// （2026-08-31 客户现场：登录成功→一会儿变登录失效，只能靠猜）。
+func TestHardRevokedReportPassesUpstreamEvidenceFromTheCallSite(t *testing.T) {
+	src, err := os.ReadFile("events_and_helpers.go")
+	if err != nil {
+		t.Fatalf("read call site: %v", err)
+	}
+	text := string(src)
+	idx := strings.Index(text, "isHardRevoked(resp.StatusCode, errType, errMsg)")
+	if idx < 0 {
+		t.Fatal("找不到硬吊销判定——调用点改了形状，这条围栏要跟着改，不能默默失效")
+	}
+	// ⚠️ 窗口必须从 enqueueAuthFailure **本身**开始截，不能从判定行开始：
+	// 判定行 `isHardRevoked(resp.StatusCode, errType, errMsg)` 自己就含这两个
+	// 字符串，从它起算的窗口**恒为真**——第一版就是这么写的，de-fix 打不红。
+	call := strings.Index(text[idx:], "enqueueAuthFailure(")
+	if call < 0 {
+		t.Fatal("硬吊销判定后没有上报调用")
+	}
+	window := text[idx+call:]
+	if end := strings.Index(window, ")\n"); end > 0 {
+		window = window[:end]
+	}
+	for _, arg := range []string{"resp.StatusCode", "errType"} {
+		if !strings.Contains(window, arg) {
+			t.Errorf("硬吊销上报没有把 %s 传给 enqueueAuthFailure。\n"+
+				"判定这一步已经拿到了它，却在上报时丢掉——Master 侧只会收到一个"+
+				"恒定的 token_revoked，「为什么被拒」永远查不出来。", arg)
 		}
 	}
 }

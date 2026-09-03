@@ -17,48 +17,45 @@ import (
 	"github.com/AiKeyLabs/aikey-proxy/internal/observability"
 )
 
-type poolSessionKeyAdapter func(context.Context, poolLoginContext, broker.SessionKeyExchangeOptions) (*broker.SessionKeyToken, error)
-
 type poolSessionKeyAdapterKey struct {
 	providerCode string
 	protocolType string
 }
 
-var poolSessionKeyAdapters = map[poolSessionKeyAdapterKey]poolSessionKeyAdapter{
-	{providerCode: "anthropic", protocolType: "anthropic"}: func(ctx context.Context, _ poolLoginContext, opts broker.SessionKeyExchangeOptions) (*broker.SessionKeyToken, error) {
-		return broker.ExchangeClaudeSessionKey(ctx, opts)
-	},
-	{providerCode: "openai", protocolType: "openai_compatible"}: func(ctx context.Context, _ poolLoginContext, opts broker.SessionKeyExchangeOptions) (*broker.SessionKeyToken, error) {
-		return broker.ExchangeCodexSessionKey(ctx, opts)
-	},
-	{providerCode: "mock", protocolType: "anthropic"}: func(ctx context.Context, loginCtx poolLoginContext, opts broker.SessionKeyExchangeOptions) (*broker.SessionKeyToken, error) {
-		return broker.ExchangeMockSessionKey(ctx, broker.MockSessionKeyExchangeOptions{
-			SessionKey: opts.SessionKey,
-			ProxyURL:   opts.ProxyURL,
-			TokenURL:   loginCtx.OAuthTokenURL,
-		})
-	},
-	{providerCode: "mock", protocolType: "openai_compatible"}: func(ctx context.Context, loginCtx poolLoginContext, opts broker.SessionKeyExchangeOptions) (*broker.SessionKeyToken, error) {
-		return broker.ExchangeMockCodexSessionKey(ctx, broker.MockSessionKeyExchangeOptions{
-			SessionKey: opts.SessionKey,
-			ProxyURL:   opts.ProxyURL,
-			TokenURL:   loginCtx.OAuthTokenURL,
-		})
-	},
+// poolSessionKeyRoute wires one provider/protocol pair to its broker login
+// capability. Exactly one of exchange / mockExchange is set; the mock option
+// assembly happens once in exchangePoolSessionKey so the table holds the
+// broker functions THEMSELVES. That is what lets the dispatch fence
+// (TestPoolSessionKeyRoutes_CodexRoutesAreAtomic) assert function identity
+// instead of trusting a closure to call the verified capability — the same
+// fence shape as Master's BrokerSessionKeyExchanger routes().
+type poolSessionKeyRoute struct {
+	exchange     func(context.Context, broker.SessionKeyExchangeOptions) (*broker.SessionKeyToken, error)
+	mockExchange func(context.Context, broker.MockSessionKeyExchangeOptions) (*broker.SessionKeyToken, error)
 }
 
-func poolSessionKeyAdapterFor(loginCtx poolLoginContext) (poolSessionKeyAdapter, bool) {
+var poolSessionKeyRoutes = map[poolSessionKeyAdapterKey]poolSessionKeyRoute{
+	{providerCode: "anthropic", protocolType: "anthropic"}: {exchange: broker.ExchangeClaudeSessionKey},
+	// spec: R-sessionkey-login-safety-1.S1 Production Codex routes must use the
+	// atomic exchange-and-verify capability so an unverified bearer never
+	// reaches pending/writeback.
+	{providerCode: "openai", protocolType: "openai_compatible"}: {exchange: broker.ExchangeAndVerifyCodexSessionKey},
+	{providerCode: "mock", protocolType: "anthropic"}:           {mockExchange: broker.ExchangeMockSessionKey},
+	{providerCode: "mock", protocolType: "openai_compatible"}:   {mockExchange: broker.ExchangeAndVerifyMockCodexSessionKey},
+}
+
+func poolSessionKeyRouteFor(loginCtx poolLoginContext) (poolSessionKeyRoute, bool) {
 	provider := strings.ToLower(strings.TrimSpace(loginCtx.ProviderCode))
 	protocol := strings.ToLower(strings.TrimSpace(loginCtx.ProtocolType))
-	adapter, ok := poolSessionKeyAdapters[poolSessionKeyAdapterKey{providerCode: provider, protocolType: protocol}]
+	route, ok := poolSessionKeyRoutes[poolSessionKeyAdapterKey{providerCode: provider, protocolType: protocol}]
 	if !ok || (provider == "mock" && strings.TrimSpace(loginCtx.OAuthTokenURL) == "") {
-		return nil, false
+		return poolSessionKeyRoute{}, false
 	}
-	return adapter, true
+	return route, true
 }
 
 func poolSessionKeyProviderSupported(loginCtx poolLoginContext) bool {
-	_, ok := poolSessionKeyAdapterFor(loginCtx)
+	_, ok := poolSessionKeyRouteFor(loginCtx)
 	return ok
 }
 
@@ -67,7 +64,7 @@ func poolSessionKeyProviderSupported(loginCtx poolLoginContext) bool {
 // an endpoint or provider. Mock credentials use their resident token endpoint;
 // real Session Keys enter only their provider's fixed broker implementation.
 func exchangePoolSessionKey(ctx context.Context, loginCtx poolLoginContext, opts broker.SessionKeyExchangeOptions) (*broker.SessionKeyToken, error) {
-	adapter, ok := poolSessionKeyAdapterFor(loginCtx)
+	route, ok := poolSessionKeyRouteFor(loginCtx)
 	if !ok {
 		return nil, &broker.OAuthError{
 			Code:    broker.ErrCodeSessionKeyProviderUnsupported,
@@ -75,7 +72,14 @@ func exchangePoolSessionKey(ctx context.Context, loginCtx poolLoginContext, opts
 			Hint:    "Choose a supported Anthropic or OpenAI-compatible OAuth account.",
 		}
 	}
-	return adapter(ctx, loginCtx, opts)
+	if route.mockExchange != nil {
+		return route.mockExchange(ctx, broker.MockSessionKeyExchangeOptions{
+			SessionKey: opts.SessionKey,
+			ProxyURL:   opts.ProxyURL,
+			TokenURL:   loginCtx.OAuthTokenURL,
+		})
+	}
+	return route.exchange(ctx, opts)
 }
 
 // sessionKey signs a supported pool account in without opening a browser. It
@@ -91,6 +95,11 @@ func (h *poolLoginHandler) sessionKey(w http.ResponseWriter, r *http.Request) {
 		OperationID  string `json:"operation_id"`
 		Confirm      bool   `json:"confirm"`
 		Cancel       bool   `json:"cancel"`
+		// IdentityMismatchConfirmed is the member's explicit second acknowledgement
+		// for a cross-account Session Key (拍板 2026-09-01, supersedes the 08-27
+		// fail-closed rule for THIS member entry). Ignored unless Confirm is set and
+		// the pending operation is actually mismatched.
+		IdentityMismatchConfirmed bool `json:"identity_mismatch_confirmed"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		poolErr(w, http.StatusBadRequest, "BAD_BODY", "invalid or oversized request body")
@@ -167,18 +176,21 @@ func (h *poolLoginHandler) sessionKey(w http.ResponseWriter, r *http.Request) {
 		}
 		identityMismatch := !sessionKeyIdentityMatches(loginCtx, token.Identity)
 		if identityMismatch {
-			slog.Warn("Session key identity does not match the selected account",
+			// spec: R-oauth-token-mint-12.S1 不匹配成为待确认审阅态，零写入
+			// Cross-account Session Key (拍板 2026-09-01, supersedes the 2026-08-27
+			// immediate fail-closed): the exchange result stays a SHORT-LIVED pending
+			// operation and the member must explicitly acknowledge the mismatch on
+			// confirm. Safe because the v3.1 mint model writeback is SEAT-scoped
+			// (R-oauth-token-mint-9.S1): the token + its ACTUAL provider account id
+			// land on the member's own seat row only — the shared account row,
+			// its identity (email/external_id), and other members are untouched.
+			// The runtime rail prefers the seat row's provider_account_id, so the
+			// injected upstream identity always matches this token.
+			// 变更记录: 技术实现/update/20260901-SessionKey跨账号登录-确认后绑定本人seat行.md
+			slog.Warn("Session key identity does not match the selected account; awaiting explicit member confirmation",
 				"event.name", observability.EventProxyPoolSessionKeyIdentityMismatch,
 				"error.code", broker.ErrCodeSessionKeyIdentityMismatch, "credential_id", req.CredentialID,
 				"request_id", trace.RequestID, "trace_id", trace.TraceID, "span_id", trace.SpanID)
-			// The token would become the shared account login for every member.
-			// There is no safe "confirm into my private slot" path anymore: fail
-			// closed, zero plaintext immediately, and perform no Master writeback.
-			token.AccessToken = ""
-			token.RefreshToken = ""
-			poolErr(w, http.StatusConflict, broker.ErrCodeSessionKeyIdentityMismatch,
-				"The Session Key belongs to a different account. Select the matching pool account and try again.")
-			return
 		}
 		exchangedAt := time.Now()
 		pending = &poolSessionKeyPending{
@@ -217,10 +229,14 @@ func (h *poolLoginHandler) sessionKey(w http.ResponseWriter, r *http.Request) {
 		})
 		return
 	}
-	if pending.identityMismatch {
-		h.forgetSessionKeyOperation(req.OperationID, pending)
+	if pending.identityMismatch && !req.IdentityMismatchConfirmed {
+		// spec: R-oauth-token-mint-12.S2 普通 confirm 不能一键写入跨账号 token
+		// Confirm without the explicit mismatch acknowledgement: keep the pending
+		// operation (the member can re-confirm with the acknowledgement or cancel);
+		// nothing is written. An accidental one-click confirm can never bind a
+		// cross-account token.
 		poolErrWithMeta(w, http.StatusConflict, broker.ErrCodeSessionKeyIdentityMismatch,
-			"The Session Key belongs to a different account; no shared token was changed.", req.OperationID)
+			"The Session Key belongs to a different account. Re-confirm with the mismatch acknowledgement to bind it to your seat, or cancel.", req.OperationID)
 		return
 	}
 
@@ -380,8 +396,18 @@ func sessionKeyIdentityMatches(loginCtx poolLoginContext, identity broker.Identi
 		return expectedExternalID == strings.TrimSpace(identity.ExternalID)
 	}
 	expectedEmail := strings.TrimSpace(loginCtx.ExpectedIdentity)
+	if expectedEmail == "" {
+		// spec: R-oauth-token-mint-12.S5 期望身份为空 = 首登，proxy 不得比 Master 严
+		// No expected identity at all: a newly provisioned pool row awaiting its
+		// first login. Master's own writeback matcher (membertoken.identityMismatch)
+		// accepts this and C5-backfills the identity, so the proxy must not be
+		// stricter — a 409 here made first logins impossible (08-27 评审 P1,
+		// aligned 2026-09-01).
+		// bugfix: workflow/CI/bugfix/2026-09-01-sessionkey-cross-account-login-blocked.md
+		return true
+	}
 	actualEmail := strings.TrimSpace(identity.Email)
-	return expectedEmail != "" && actualEmail != "" && strings.EqualFold(expectedEmail, actualEmail)
+	return actualEmail != "" && strings.EqualFold(expectedEmail, actualEmail)
 }
 
 // acquireSessionKeyOperation keeps one mutex per in-flight operation. The
