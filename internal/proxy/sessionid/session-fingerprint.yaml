@@ -89,6 +89,33 @@ rules:
       - { type: "header", name: "X-Aikey-Session-Id" }
       - { type: "body_json_field", path: "conversation_id" }
 
+  # ── MCP gateway plane (阶段8 P7 task 7.5b) ──────────────────────
+  # The CONVERSATION this tool call belongs to, if the client tells us.
+  #
+  # 🔴 This is NOT Mcp-Session-Id. That one is minted by OUR gateway at
+  # `initialize` and identifies the transport connection; it can never
+  # join a tool call to an LLM conversation, because the client chooses
+  # the conversation id and we choose that one. The two live in two
+  # columns for exactly that reason.
+  #
+  # 🔴 Claude Code — the main client — sends NEITHER of these headers on
+  # its MCP requests today. So for the dominant client this extraction
+  # returns "" and the join key is structurally absent. That is the
+  # EXPECTED result, not a defect to go fix: the conversation-audit
+  # design (P13 leg B) treats an absent key as a first-class state and
+  # explicitly forbids guessing it back with a time-window or seat
+  # heuristic — a plausible-but-wrong audit row is worse than no row,
+  # because with no row the reader knows they do not know.
+  #
+  # 🔴 A rule here rather than relying on common_fallback: when the MCP
+  # spec eventually defines a standard correlation field, or a client
+  # starts forwarding one, this is the two-line edit that connects it —
+  # which is the entire reason this table is config and not Go.
+  - match: { protocol: "mcp" }
+    sources:
+      - { type: "header", name: "X-Aikey-Session-Id" }
+      - { type: "header", name: "X-Claude-Code-Session-Id" }
+
   # ── GLM / Zhipu (openai_compatible) ─────────────────────────────
   # GLM uses request_id as the per-request correlation; not strictly
   # a session but the closest practical handle. Third-party agents

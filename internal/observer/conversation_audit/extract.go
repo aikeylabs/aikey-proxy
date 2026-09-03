@@ -66,30 +66,76 @@ func extractAssistantDelta(protocolFamily, eventType string, payload []byte) str
 	if len(payload) == 0 {
 		return ""
 	}
+	txt, _ := extractFrame(protocolFamily, eventType, payload, 0)
+	return txt
+}
+
+// anthropicFrame is ONE Anthropic SSE frame, decoded once.
+//
+// 🔴 One struct for both concerns — assistant text and tool calls — because
+// they arrive in the same frames. A second Unmarshal per frame would double the
+// cost of the hot path and, worse, create a second place where "what does this
+// frame mean" is decided. Same parse-once rule extractPrompt already follows.
+type anthropicFrame struct {
+	Type  string `json:"type"`
+	Index int    `json:"index"`
+	Delta struct {
+		Type string `json:"type"`
+		Text string `json:"text"`
+		// PartialJSON carries tool-argument bytes on input_json_delta frames.
+		PartialJSON string `json:"partial_json"`
+	} `json:"delta"`
+	ContentBlock struct {
+		Type string `json:"type"`
+		ID   string `json:"id"`
+		Name string `json:"name"`
+	} `json:"content_block"`
+}
+
+// extractFrame reads ONE upstream SSE frame for everything the audit needs:
+// the assistant text increment and any tool-call signal.
+//
+// 🔴 `seenTools` is how many tool calls the turn has already collected. Only
+// Gemini needs it — it carries no per-call index, so position within the turn
+// is the only key available.
+//
+// 🔴 The text half is byte-for-byte the behaviour extractAssistantDelta had
+// before tool calls existed. The existing fixture tests are the fence on that
+// (task 13.1d): they were green before this change and must stay green.
+func extractFrame(protocolFamily, eventType string, payload []byte, seenTools int) (string, []toolFrame) { //nolint:unparam // eventType kept for symmetry with isCompletionMarker
+	if len(payload) == 0 {
+		return "", nil
+	}
 	switch protocolFamily {
 	case protoAnthropic:
-		var f struct {
-			Type  string `json:"type"`
-			Delta struct {
-				Type string `json:"type"`
-				Text string `json:"text"`
-			} `json:"delta"`
+		var f anthropicFrame
+		if json.Unmarshal(payload, &f) != nil {
+			return "", nil
 		}
-		if json.Unmarshal(payload, &f) == nil && f.Type == "content_block_delta" && f.Delta.Type == "text_delta" {
-			return f.Delta.Text
+		var tools []toolFrame
+		if tf := anthropicToolFrame(&f); tf.kind != toolFrameNone {
+			tools = append(tools, tf)
 		}
-		return ""
+		if f.Type == "content_block_delta" && f.Delta.Type == "text_delta" {
+			return f.Delta.Text, tools
+		}
+		return "", tools
 	case protoOpenAI:
-		// Probe table (see openaiWireFormats): the two formats' frame shapes
-		// are disjoint, so first non-empty wins and Chat Completions keeps
-		// first-probe priority.
+		// 🔴 Tool calls are probed across BOTH OpenAI wire formats, for the same
+		// reason the text probe table exists: missing the Responses API silently
+		// skipped every Codex turn from the audit once already (2026-07-07).
+		tools := openAIChatToolFrames(payload)
+		if tf := openAIResponsesToolFrame(payload); tf.kind != toolFrameNone {
+			tools = append(tools, tf)
+		}
 		for _, wf := range openaiWireFormats {
 			if txt := wf.delta(payload); txt != "" {
-				return txt
+				return txt, tools
 			}
 		}
-		return ""
+		return "", tools
 	case protoGemini:
+		tools := geminiToolFrames(payload, seenTools)
 		var f struct {
 			Candidates []struct {
 				Content struct {
@@ -98,11 +144,11 @@ func extractAssistantDelta(protocolFamily, eventType string, payload []byte) str
 			} `json:"candidates"`
 		}
 		if json.Unmarshal(payload, &f) == nil && len(f.Candidates) > 0 {
-			return joinParts(f.Candidates[0].Content.Parts)
+			return joinParts(f.Candidates[0].Content.Parts), tools
 		}
-		return ""
+		return "", tools
 	default:
-		return ""
+		return "", nil
 	}
 }
 
