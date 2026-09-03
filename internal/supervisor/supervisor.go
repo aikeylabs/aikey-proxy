@@ -45,6 +45,7 @@ import (
 	"github.com/AiKeyLabs/aikey-proxy/internal/config"
 	"github.com/AiKeyLabs/aikey-proxy/internal/events"
 	"github.com/AiKeyLabs/aikey-proxy/internal/httpx"
+	"github.com/AiKeyLabs/aikey-proxy/internal/mcp"
 	"github.com/AiKeyLabs/aikey-proxy/internal/observability"
 	"github.com/AiKeyLabs/aikey-proxy/internal/observer/conversation_audit"
 	"github.com/AiKeyLabs/aikey-proxy/internal/provider"
@@ -306,7 +307,29 @@ func (g *generation) drain(timeout time.Duration, reloadID string) {
 
 // Supervisor manages the proxy lifecycle and exposes the data-plane handler.
 type Supervisor struct {
-	startedAt time.Time
+	// mcpRail follows the org's MCP policy (backends / toolsets / grants).
+	//
+	// 🔴 nil on a node with no control plane (Personal): the whole rail is then
+	// bypassed rather than logging an error every 60 seconds, which would train
+	// operators to ignore the log — and Personal genuinely has no org to follow.
+	mcpRail *MCPPolicyRail
+	// mcpCredentials holds this proxy's MCP backend credential material —
+	// plaintext in memory, sealed under the vault key on disk.
+	//
+	// 🔴 nil on a node that has no MCP plane. A nil store makes every backend
+	// that declares a credential answer MCP_CREDENTIAL_MISSING, which is the
+	// truthful answer: nothing can resolve it here.
+	mcpCredentials *mcp.CredentialStore
+	// mcpLocalPolicy / mcpLocalSyncer are Personal edition's equivalents of the
+	// rail and its syncer: a policy built from this machine's own mcp.json
+	// rather than delivered by a control plane. 🔴 Mutually exclusive with
+	// mcpRail — see EnableLocalMCPPolicy.
+	mcpLocalPolicy *mcp.PolicyStore
+	// mcpLocalPublisher turns this node's own observations into its policy.
+	// Personal only; nil wherever a control plane owns that verdict.
+	mcpLocalPublisher *mcp.LocalPublisher
+	mcpLocalSyncer    *mcp.ManifestSyncer
+	startedAt         time.Time
 	// transport is the optional upstream-proxy RoundTripper applied to every
 	// generation's proxy (nil = default). atomic.Pointer so an egress hot-swap
 	// (SetTransport, 2026-06-30) can't race the gen-build read in applyToProxy.
@@ -533,10 +556,27 @@ func New(cfg *config.Config, configPath, password, version string) (*Supervisor,
 	// license_plane (2026-08-27) is the seventh rail. It carries the deployment's
 	// forwarding gate, which the control plane had been computing and serving all
 	// along with nothing on this side reading it — see license_plane_rail.go.
+	// mcp_credentials (P4) is the eighth. It is the authenticated half of MCP
+	// credential custody: the policy rail carries a backend's credential_id but
+	// deliberately carries no material, so without this rail a hosted backend
+	// can be configured perfectly and can never authenticate.
+	//
 	// licenseRails() is build-tag split: the licensing rails in a normal build,
 	// none in a -tags aikey_license_off build (see license_rail_off.go — the gate
 	// they feed is compiled out, so a running rail could only log 404s forever).
-	s.railset = newRailSet(append([]railSpec{s.groupRuntimeRail(), s.routingOverrideRail(), s.fallbackPolicyRail(), s.keyRevocationRail()}, s.licenseRails()...)...)
+	//
+	// 🔴 mcpCredentialRail is appended OUTSIDE that splice, not inside it. MCP
+	// custody has nothing to do with licensing, so a licensing-off build must
+	// still run it — folding it into licenseRails() would silently drop MCP
+	// authentication from exactly the builds we hand to staging clusters.
+	// Merge of 2026-09-02: this branch listed licensePlaneRail() directly; that
+	// call moved behind licenseRails() on develop-v1.0.6 while this branch was open.
+	//
+	// 🔴 Keep this on ONE line. fallback_policy_rail_test.go and its siblings match
+	// `newRailSet\((.*)$` — to end of LINE — so wrapping the argument list hides
+	// every rail from those fences and they go red against correct source. That is
+	// exactly what happened while resolving this merge.
+	s.railset = newRailSet(append(append([]railSpec{s.groupRuntimeRail(), s.routingOverrideRail(), s.fallbackPolicyRail(), s.keyRevocationRail()}, s.licenseRails()...), s.mcpCredentialRail())...)
 	gen, err := s.buildGeneration()
 	if err != nil {
 		_ = s.oauthPoolRuntime.Shutdown()
@@ -754,6 +794,12 @@ func (s *Supervisor) StartPolicyPollers() {
 	// SyncRail (2026-07-03): group_runtime (N7c-2 channel ③ material) + routing_override
 	// (I-side §6.5 engine assignments) rails. One GoSafe/Isolated goroutine per rail.
 	s.railset.start(s)
+	// 阶段8: the MCP policy rail — an admin's grant or revoke reaches the
+	// enforcement point within one interval without the developer running any
+	// command. Same placement as the quota poller and for the same reason: its
+	// first sync must not race the pre-serve setup. No-op when the node has no
+	// control plane.
+	observability.GoSafe("supervisor.mcp_policy_poll", observability.Isolated, func() { s.pollMCPPolicy(s.ctx) })
 }
 
 // seedQuotaSig primes lastQuotaSig from the quota_rules_cache that the initial
@@ -1438,6 +1484,54 @@ func (s *Supervisor) FilterPerformanceSnapshot() proxy.FilterPerformanceSnapshot
 // (the new generation will repopulate as traffic flows). Persisting
 // across reloads would require either a sidecar store or copying the map
 // — neither warranted for "list-page health badge".
+// FilterHook returns THIS generation's DLP filter child, or nil when no filter
+// app is installed.
+//
+// 🔴 Read from the ACTIVE generation on every call, never captured. The child
+// belongs to a config generation: a caller that captured it would keep talking
+// to the previous generation's (shut down) child after the first reload, and
+// every scan would come back degraded on a proxy whose filter is running fine.
+//
+// 🔴 Returns the apphook.Hook facet, not FilterTarget: callers scan payloads,
+// they do not manage the child's lifecycle, and handing out Shutdown would let
+// a scan path stop the filter.
+func (s *Supervisor) FilterHook() apphook.Hook {
+	gen := s.active.Load()
+	if gen == nil || gen.filterHook == nil {
+		return nil
+	}
+	return gen.filterHook
+}
+
+// UploadComplianceEvents delivers filter-produced audit events to the control
+// plane, on the SAME rail the LLM path uses.
+//
+// 🔴 Fail-loud, never silent: a compliance event with nowhere to go is an audit
+// gap. It is logged rather than returned as an error, because the tool call's
+// outcome has already been decided and turning a reporting failure into a
+// user-visible error would make the audit trail an availability dependency of
+// the main path.
+func (s *Supervisor) UploadComplianceEvents(ctx context.Context, events [][]byte) {
+	if len(events) == 0 {
+		return
+	}
+	gen := s.active.Load()
+	if gen == nil || gen.reporter == nil {
+		slog.Warn("MCP compliance events dropped — no reporter is configured on this node",
+			"event.name", observability.EventProxyMCPComplianceDegraded, "count", len(events))
+		return
+	}
+	// 🔴 Route class "team": these events describe an organisation's traffic and
+	// belong in the administrator's audit log, which is the same destination the
+	// LLM path's team-routed findings use. The MCP plane only mounts on a node
+	// that follows a control plane, so there is no personal case here.
+	if err := gen.reporter.UploadComplianceEvents(ctx, "team", events); err != nil {
+		slog.Warn("MCP compliance event upload failed; the events were conserved in the dead letter "+
+			"and will be re-delivered by the existing replay pass",
+			"event.name", observability.EventProxyMCPComplianceDegraded, "error", err, "count", len(events))
+	}
+}
+
 func (s *Supervisor) AppHealthSnapshot() []apppipe.AppHealth {
 	return s.active.Load().proxy.AppHealthSnapshot()
 }
@@ -1914,6 +2008,30 @@ func (s *Supervisor) Shutdown(timeout time.Duration) {
 		gen.close()
 		if s.oauthPoolRuntime != nil {
 			_ = s.oauthPoolRuntime.Shutdown()
+		}
+		// 🔴 Reap hosted stdio MCP backends and every process they started
+		// (P5 task 5.2). This is INSIDE the watchdogged stage on purpose: it
+		// involves signalling other processes, which is exactly the class of
+		// work that can hang, and the watchdog above is what keeps a wedged
+		// backend from holding a drained proxy hostage until systemd SIGKILLs
+		// it.
+		//
+		// 🔴 On Unix this is the ONLY thing that reaps them: a process group is
+		// an id, not a handle, so nothing happens automatically when we exit.
+		// Windows has KILL_ON_JOB_CLOSE as a kernel-level backstop; Unix has
+		// this line. Fence: TestStdio_ShutdownReapsTheChildAndItsDescendants.
+		if t, ok := mcp.LookupTransport(mcp.TransportStdio); ok {
+			if st, ok := t.(*mcp.StdioTransport); ok {
+				// 🔴 A FRESH bounded context, not s.ctx. s.ctx was cancelled at
+				// the top of Shutdown, and handing a cancelled context to code
+				// whose job is "give the child a moment to exit cleanly" reads
+				// as asking for zero grace. It happens to work today only
+				// because the grace is derived from a DEADLINE and a cancelled
+				// context carries none — a coincidence, not a decision.
+				reapCtx, cancelReap := context.WithTimeout(context.Background(), 10*time.Second)
+				st.Shutdown(reapCtx)
+				cancelReap()
+			}
 		}
 		close(closed)
 	}()
@@ -2550,4 +2668,79 @@ func (s *Supervisor) FallbackSwitches() int64 {
 		return 0
 	}
 	return gen.proxy.FallbackSwitches()
+}
+
+// MCPPolicyStore exposes the live MCP policy snapshot to the plane that serves
+// it. nil when this node has no control plane.
+//
+// 🔴 Returns the STORE, not a copy of the policy: the plane must read the
+// current snapshot on every request. Handing out a copy would freeze whatever
+// was current at wiring time, which is the same class of bug as caching a grant
+// decision onto a session (R8).
+func (s *Supervisor) MCPPolicyStore() *mcp.PolicyStore {
+	if s.mcpRail == nil {
+		// Personal: the locally-built snapshot, or nil when this machine has no
+		// mcp.json. 🔴 Returning it HERE rather than adding an edition branch in
+		// the plane means Personal and Production reach the same catalog, the
+		// same grant evaluation and the same freeze rules — only the producer of
+		// the snapshot differs (internal/mcp/localconfig.go).
+		return s.mcpLocalPolicy
+	}
+	return s.mcpRail.Store()
+}
+
+// EnableMCPPolicyRail installs the rail. Called by app wiring when the node has
+// a control plane; leaving it uncalled keeps the whole subsystem inert.
+func (s *Supervisor) EnableMCPPolicyRail(rail *MCPPolicyRail) { s.mcpRail = rail }
+
+// EnableMCPCredentialStore installs the credential store and, with it, the
+// credential rail's gate. Called by app wiring alongside EnableMCPPolicyRail.
+//
+// 🔴 Two calls rather than one, because the two are independently absent in
+// real deployments: a Personal node has a local MCP plane with no policy rail
+// at all, and a control-plane deployment with no MASTER_KEY has a policy but no
+// credential material to deliver. Folding them together would make one of those
+// silently disable the other.
+func (s *Supervisor) EnableMCPCredentialStore(store *mcp.CredentialStore) { s.mcpCredentials = store }
+
+// MCPCredentialStore exposes the store to the MCP plane, which uses it as its
+// CredentialResolver. nil when this node resolves no credentials.
+func (s *Supervisor) MCPCredentialStore() *mcp.CredentialStore { return s.mcpCredentials }
+
+// VaultSecretLookup resolves a vault alias to its plaintext, through the CURRENT
+// generation.
+//
+// 🔴 Returns nil when there is no vault to read — and nil is meaningful: the
+// local-config translator publishes the affected backend DISABLED and says so,
+// rather than starting a server that will fail every call with the backend's
+// own authentication error. Handing back a lookup that always errors would
+// produce the same outcome with a worse message.
+func (s *Supervisor) VaultSecretLookup() mcp.SecretLookup {
+	gen := s.active.Load()
+	if gen == nil || gen.vault == nil {
+		return nil
+	}
+	// Resolved per call rather than captured: a vault reload replaces the
+	// generation, and a captured reader would keep answering from the old one.
+	return func(alias string) (string, error) {
+		cur := s.active.Load()
+		if cur == nil || cur.vault == nil {
+			return "", errors.New("supervisor: no vault is loaded")
+		}
+		return cur.vault.GetSecret(alias)
+	}
+}
+
+// VaultDerivedKey returns the CURRENT generation's vault key, or nil.
+//
+// 🔴 Read through the live generation on every call rather than captured once.
+// The vault is unlocked and re-keyed independently of anything that holds this,
+// and a captured key would keep sealing with a key the vault no longer uses —
+// a cache that writes successfully forever and can never be read back.
+func (s *Supervisor) VaultDerivedKey() []byte {
+	gen := s.active.Load()
+	if gen == nil || gen.vault == nil {
+		return nil
+	}
+	return gen.vault.DerivedKey()
 }
