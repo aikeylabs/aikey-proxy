@@ -24,6 +24,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"log/slog"
 	"net"
 	"net/http"
@@ -303,6 +304,17 @@ func (p *Proxy) serveGroupAttempt(
 		// Without this defer, that optional side path pins the process budget forever.
 		defer r.Body.Close()
 		r.ContentLength = int64(replay.Len())
+		// GetBody (2026-09-03): the body is ALREADY buffered for failover replay,
+		// so handing net/http a re-opener costs nothing — and without it an HTTP/2
+		// stream error from the peer (PROTOCOL_ERROR / REFUSED_STREAM / GOAWAY)
+		// that arrives after the body was written is unretryable by design:
+		// "cannot retry err … after Request.Body was written; define
+		// Request.GetBody to avoid this error". Field evidence (PC2 2026-09-03
+		// 04:03): one such transient became a hard UPSTREAM_ERROR after 39.5s.
+		// Each call opens a fresh reader against the same buffer; the transport
+		// closes what it opened, so the replay budget is released as before.
+		// bugfix: workflow/CI/bugfix/2026-09-03-h2流错误无法重放请求体.md
+		r.GetBody = func() (io.ReadCloser, error) { return replay.Open(), nil }
 	} else {
 		r.Body = http.NoBody
 		r.ContentLength = 0
@@ -710,11 +722,20 @@ const groupLoginConsolePath = "/user/team-oauth"
 //     ConsoleURL (cluster node / server-side proxy) degrades to URL-less wording.
 func (p *Proxy) respondLoginRequired(w http.ResponseWriter, logger *slog.Logger, route *vkeys.ResolvedRoute, accountID string) {
 	loginURL := p.groupLoginURL()
+	// Name the account (2026-09-03). accountID is an opaque UUID; the member has
+	// no way to map it to a row on the team-oauth page. The identity was in hand
+	// all along — GroupRuntimeAccount.Identity rides the same material the
+	// resolver just picked from — and both the log and the message dropped it.
+	// Field evidence: a member whose pool held several accounts signed in twice,
+	// each time into the wrong one, because "this shared account" named nothing.
+	// bugfix: workflow/CI/bugfix/2026-09-03-登录提示不说是哪个账号.md
+	identity := groupAccountIdentity(route.GroupRuntime, accountID)
 	logger.Info("group route requires member login",
 		"event.name", observability.EventProxyGroupLoginRequired,
 		"oauth_group_id", route.OauthGroupID,
 		"virtual_key_id", route.VirtualKeyID,
 		"account_id", accountID,
+		"account_identity", identity,
 		"login_url", loginURL,
 	)
 	// Bypass statusline hint (决策3): best-effort, never blocks the response.
@@ -723,12 +744,19 @@ func (p *Proxy) respondLoginRequired(w http.ResponseWriter, logger *slog.Logger,
 		route.OauthGroupID, "", accountID, route.SeatID, "",
 		map[string]any{"virtual_key_id": route.VirtualKeyID})
 
-	message := "AiKey: log in to this shared account before use. " +
-		"Open your local AiKey console (" + groupLoginConsolePath + " page), complete sign-in, then retry."
-	if loginURL != "" {
-		message = "AiKey: log in to this shared account before use. " +
-			"Open " + loginURL + " and complete sign-in, then retry."
+	// The account clause degrades honestly: an older master that omits identity
+	// leaves it empty, and we say "this shared account" as before rather than
+	// printing a raw UUID the member cannot act on.
+	subject := "this shared account"
+	if identity != "" {
+		subject = "shared account " + identity
 	}
+	where := "your local AiKey console (" + groupLoginConsolePath + " page)"
+	if loginURL != "" {
+		where = loginURL
+	}
+	message := "AiKey: " + subject + " is not signed in yet. Open " + where +
+		", sign in to THAT account (the row marked as currently routed), then retry."
 
 	// SyncRail truthful wording (§5.4, 2026-07-03 incident): when the engine's
 	// assignment rail is stale/offline, THIS pick came from the local ranked
@@ -930,8 +958,20 @@ func (p *Proxy) degradeGroupWithRetry(w http.ResponseWriter, logger *slog.Logger
 	p.errors.Add(1)
 	status, errType := groupDegradeStatus(code)
 	message := groupDegradeMessage(code)
+	// Per-account detail (2026-09-03): "all accounts unavailable … retried in N
+	// seconds" told the member neither WHICH accounts nor WHY. The proxy holds
+	// every fact — cooldown reason + retry time per account, the auth tombstone,
+	// the account identity — and used to keep all of it to itself. Same defect
+	// shape as the token-expiry column and the unnamed login prompt earlier the
+	// same day: data in hand, never told. Bounded: identity + reason + retry_at
+	// only; never a token, never a fingerprint.
+	// bugfix: workflow/CI/bugfix/2026-09-03-池全部不可用不说哪个账号为什么.md
+	accounts := p.poolCooldown.routeAccountStates(route, groupRouteAccountIDs(route))
 	if advice != nil {
 		message = fmt.Sprintf("All accounts in this credential-sharing group are currently unavailable. The earliest account will be retried in %d seconds.", advice.Seconds)
+	}
+	if detail := describePoolAccountStates(accounts); detail != "" {
+		message += " " + detail
 	}
 	logger.Warn("group route degraded",
 		"event.name", observability.EventProxyGroupRouteDegraded,
@@ -949,7 +989,43 @@ func (p *Proxy) degradeGroupWithRetry(w http.ResponseWriter, logger *slog.Logger
 		"retry_after_seconds": advice.Seconds,
 		"retry_at":            advice.RetryAt,
 		"retry_reason":        advice.Reason,
+		"accounts":            accounts,
 	})
+}
+
+// poolAccountStateView is the member-facing per-account line behind a
+// GROUP_ALL_UNUSABLE answer. Identity is display+audit material by contract
+// (GroupRuntimeAccount.Identity); no token, no fingerprint ever rides here.
+type poolAccountStateView struct {
+	AccountID string `json:"account_id"`
+	Identity  string `json:"identity,omitempty"`
+	// Status mirrors PoolAccountRouteState.Status (auth_failed / rate_limited /
+	// window_exhausted / …) or "revoked_token" for a local auth tombstone.
+	Status  string `json:"status"`
+	RetryAt int64  `json:"retry_at,omitempty"`
+}
+
+// describePoolAccountStates renders the human clause appended to the 429 text.
+func describePoolAccountStates(states []poolAccountStateView) string {
+	if len(states) == 0 {
+		return ""
+	}
+	parts := make([]string, 0, len(states))
+	for _, st := range states {
+		who := st.Identity
+		if who == "" {
+			who = st.AccountID
+		}
+		switch {
+		case st.Status == "revoked_token":
+			parts = append(parts, who+": token rejected upstream — sign out of the provider and sign in again to get a NEW token")
+		case st.RetryAt > 0:
+			parts = append(parts, fmt.Sprintf("%s: %s (retry at %s)", who, st.Status, time.Unix(st.RetryAt, 0).UTC().Format(time.RFC3339)))
+		default:
+			parts = append(parts, who+": "+st.Status)
+		}
+	}
+	return "Accounts: " + strings.Join(parts, "; ") + "."
 }
 
 // degradeGroup fails a group request loudly (never silently routes it to a wrong

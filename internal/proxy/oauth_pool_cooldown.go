@@ -1323,3 +1323,43 @@ func (s *poolCooldownStore) consumeLapsed(accountID string) bool {
 	}
 	return false
 }
+
+// routeAccountStates lists, for one route's candidate accounts, why each one is
+// currently not serving: the timed cooldown (status + retry_at from meta/m) or
+// a local auth tombstone ("revoked_token"). Accounts with no local verdict are
+// omitted — an absent line means "nothing local blocks it". Identity comes from
+// the delivered material so the member can act on a name, not a UUID.
+// Read-only; secrets never leave the material map.
+func (s *poolCooldownStore) routeAccountStates(route *vkeys.ResolvedRoute, routeIDs map[string]bool) []poolAccountStateView {
+	if route == nil || len(routeIDs) == 0 {
+		return nil
+	}
+	tombPrefix := route.OauthGroupID + "|" + route.SeatID + "|"
+	s.mu.Lock()
+	now := s.now()
+	out := make([]poolAccountStateView, 0, len(routeIDs))
+	for id := range routeIDs {
+		view := poolAccountStateView{AccountID: id}
+		if until, ok := s.m[id]; ok && now.Before(until) {
+			view.RetryAt = until.Unix()
+			if meta, ok := s.meta[id]; ok && meta.Status != "" {
+				view.Status = meta.Status
+			} else {
+				view.Status = "cooldown"
+			}
+		}
+		if _, ok := s.authFailedTokens[tombPrefix+id]; ok {
+			view.Status = "revoked_token"
+			view.RetryAt = 0
+		}
+		if view.Status != "" {
+			out = append(out, view)
+		}
+	}
+	s.mu.Unlock()
+	for i := range out {
+		out[i].Identity = groupAccountIdentity(route.GroupRuntime, out[i].AccountID)
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].AccountID < out[j].AccountID })
+	return out
+}

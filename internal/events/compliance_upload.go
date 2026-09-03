@@ -90,6 +90,56 @@ func (r *Reporter) UploadComplianceEvents(ctx context.Context, routeSource strin
 // the outcome. It deliberately does NOT touch the dead letter, so
 // ReplayDeadLetter can reuse it to re-deliver an entry without re-appending
 // that entry to the file it is currently rewriting.
+// MirrorComplianceEventsLocally delivers a best-effort COPY of team-routed
+// compliance events to this host's LOCAL self-view store (the "personal"
+// collector route — the local-server on a member's machine), stamped with
+// route_source so the local page can label them.
+//
+// WHY (user decision 2026-09-03: 「团队和个人的账号都需要记录本地的合规检测，并且
+// 显示到本地 web」): the 2026-05-10 personal↔team isolation rule sent team-routed
+// events to master ONLY. That rule was written for USAGE (billing projection /
+// enrichment, bugfix 2026-08-20); applied to compliance events it left a
+// member's own machine with no record of a detection it performed, and the
+// local page at 127.0.0.1:8090/user/compliance empty (winpc2 report). The
+// isolation is reversed for compliance events only; usage routing is untouched.
+//
+// Contract, deliberately weaker than UploadComplianceEvents:
+//   - no "personal" route on this host (Cluster node / server-side proxy — no
+//     local self-view store) → nil, nothing sent, nothing logged: not a gap;
+//   - failure → returned to the caller for a WARN, NEVER dead-lettered: the
+//     master copy is the record of truth and is conserved by the primary
+//     upload; replaying a mirror would double the dead-letter store for a
+//     store that is not authoritative;
+//   - the stamped copy is a fresh JSON encoding (key order may differ); the
+//     event_id is unchanged, so the local store's ON CONFLICT DO NOTHING keeps
+//     a retry idempotent.
+func (r *Reporter) MirrorComplianceEventsLocally(ctx context.Context, routeSource string, eventJSONs [][]byte) error {
+	if r.urlForRouteSource("personal") == "" || len(eventJSONs) == 0 {
+		return nil
+	}
+	stamped := make([][]byte, 0, len(eventJSONs))
+	for _, ev := range eventJSONs {
+		var m map[string]any
+		if err := json.Unmarshal(ev, &m); err != nil {
+			// Not JSON we can annotate — the primary upload had the same bytes;
+			// mirror them unlabelled rather than drop the record.
+			stamped = append(stamped, ev)
+			continue
+		}
+		m["route_source"] = routeSource
+		b, err := json.Marshal(m)
+		if err != nil {
+			stamped = append(stamped, ev)
+			continue
+		}
+		stamped = append(stamped, b)
+	}
+	if upErr := r.postComplianceEvents(ctx, "personal", stamped); upErr != nil {
+		return upErr
+	}
+	return nil
+}
+
 func (r *Reporter) postComplianceEvents(ctx context.Context, routeSource string, eventJSONs [][]byte) *uploadError {
 	base := r.urlForRouteSource(routeSource)
 	if base == "" {

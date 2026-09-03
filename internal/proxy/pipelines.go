@@ -931,7 +931,7 @@ func (p *Proxy) handlePathPrefixRoute(w http.ResponseWriter, r *http.Request, pr
 	//
 	// bugfix: workflow/CI/bugfix/2026-09-02-集群节点代理是一个公网开放中继.md
 	if p.clusterNode {
-		switch ClassifyToken(extractRawAuthValue(r)) {
+		switch ClassifyToken(extractRawAuthValue(r)) { //nolint:exhaustive // only the two Tier3 (no-VK) shapes are refused here; every other class names a virtual key and is resolved below
 		case Tier3Native, Tier3ActiveSentinel:
 			p.errors.Add(1)
 			logger.Warn("authentication failed: missing virtual key on a cluster node",

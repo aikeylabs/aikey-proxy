@@ -3,7 +3,7 @@ package supervisor
 // cluster_node_wiring_fence_test.go — the fence that the cluster-node
 // authentication guard is actually TURNED ON.
 //
-// internal/proxy owns the guard and fences its behaviour. It cannot fence the
+// internal/proxy owns the guard and fences its behavior. It cannot fence the
 // wiring: a Proxy built by a test sets clusterNode itself, so those fences stay
 // green even if the supervisor never tells a real node what it is — and a guard
 // nobody switches on is a guard that does not exist. This is the other half.
@@ -71,7 +71,7 @@ func TestTheGuardIsNotWiredBehindAnotherCondition(t *testing.T) {
 		if !strings.Contains(line, "SetClusterNode(") {
 			continue
 		}
-		// The call must sit at the same nesting depth as its neighbours in the
+		// The call must sit at the same nesting depth as its neighbors in the
 		// generation-build block, i.e. one tab. A deeper indent means a
 		// conditional was wrapped around it.
 		indent := len(line) - len(strings.TrimLeft(line, "\t"))

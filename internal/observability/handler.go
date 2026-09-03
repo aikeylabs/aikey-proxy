@@ -242,6 +242,19 @@ const (
 	// debugging "why is there no compliance event for this request" can see the
 	// reason instead of inferring it from silence. Carries no content.
 	EventProxyFilterProbeExcluded = "proxy.filter.probe_excluded"
+	// EventProxyFilterNoBody: a routed request carried NO body (GET/HEAD/OPTIONS,
+	// http.NoBody, or Content-Length 0) and was passed to the upstream without a
+	// scan — because there is nothing to scan. DEBUG, deliberately NOT the WARN
+	// "forwarded UNFILTERED" (proxy.filter.skipped): that message means "content
+	// went upstream unmasked", which is false here and was read as a PII leak
+	// on winpc2 2026-09-03 (three team-oauth group requests, body_bytes=0).
+	EventProxyFilterNoBody = "proxy.filter.no_body"
+	// EventProxyFilterComplianceLocalMirrorFailed: the best-effort copy of a
+	// TEAM-routed compliance event to the LOCAL self-view store (2026-09-03
+	// user decision: both team and personal detections are recorded on the
+	// machine and shown on the local page) could not be delivered. The master
+	// upload is unaffected; this copy is not dead-lettered.
+	EventProxyFilterComplianceLocalMirrorFailed = "proxy.filter.compliance_local_mirror_failed"
 	// EventProxyFilterInputTruncated: one or more content pieces in THIS request
 	// were longer than the detector's input cap (proxy pipeInputCap, 16 KiB), so
 	// only their leading bytes were scanned and the remaining tail was forwarded

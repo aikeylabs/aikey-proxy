@@ -793,7 +793,7 @@ func (p *Proxy) SetClusterNode(on bool) {
 }
 
 // IsClusterNode reports what SetClusterNode was told. Exists for the fences —
-// asserting the wiring by behaviour rather than by reading supervisor.go's text.
+// asserting the wiring by behavior rather than by reading supervisor.go's text.
 func (p *Proxy) IsClusterNode() bool { return p.clusterNode }
 
 // FilterStub501Cause returns the active fail-loud cause, or nil when the proxy

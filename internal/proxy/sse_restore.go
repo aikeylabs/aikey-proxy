@@ -25,8 +25,14 @@
 //     is flushed FIRST as a synthesized text-delta frame cloned from the last
 //     text frame (same index/框架 → SSE 帧结构与事件顺序保持合法), so the
 //     client receives every byte in order before the boundary event.
-//   - Recognized text channels: Anthropic content_block_delta text_delta and
-//     OpenAI chat-completions choices.0.delta.content. Frames of any
+//   - Recognized text channels: Anthropic content_block_delta text_delta,
+//     OpenAI chat-completions choices.0.delta.content, and OpenAI Responses
+//     API response.output_text.delta (top-level `delta`; codex /
+//     chatgpt.com/backend-api/codex speaks ONLY this dialect). The Responses
+//     `response.output_text.done` frame is the fourth case but not a delta: it
+//     carries the item's COMPLETE text in one frame, so it is restored whole
+//     in place (no carry prepended, no holdback) after the delta carry is
+//     flushed — see processFrame. Frames of any
 //     other shape pass through byte-verbatim (with a carry flush before them);
 //     placeholders split across frames of unrecognized shapes are NOT restored
 //     (fail-open: the client sees the placeholder — degraded, never corrupted).
@@ -161,6 +167,36 @@ func isBlankSSELine(line []byte) bool {
 func (r *ssePlaceholderRestorer) processFrame(frame []byte) {
 	payload, lineStart, lineEnd, ok := sseDataPayload(frame)
 	if ok {
+		// OpenAI Responses API `response.output_text.done`: the item's COMPLETE
+		// text in one frame. Not a delta, so none of the cross-frame machinery
+		// applies — no carry prepended (carry belongs to the delta channel and
+		// is flushed first to keep text order), no holdback (nothing can be
+		// split), and it is never adopted as the carry-flush template (wrong
+		// shape to clone a delta from). Restored whole, in place. A client that
+		// renders its final text from .done rather than from the deltas would
+		// otherwise flash the restored original and then revert to the
+		// placeholder. Same incident as the .delta case in sseTextFieldPath.
+		if gjson.GetBytes(payload, "type").String() == "response.output_text.done" {
+			if tx := gjson.GetBytes(payload, "text"); tx.Exists() && tx.Type == gjson.String {
+				r.flushCarry()
+				restored := r.st.restore(tx.String())
+				if restored == tx.String() {
+					r.out.Write(frame)
+					return
+				}
+				if patched, err := sjson.SetBytes(bytes.Clone(payload), "text", restored); err == nil {
+					r.out.Write(frame[:lineStart])
+					r.out.Write([]byte("data: "))
+					r.out.Write(patched)
+					r.out.Write(frameLineTerminator(frame[lineStart:lineEnd]))
+					r.out.Write(frame[lineEnd:])
+					return
+				}
+				// sjson failure: forward untouched — degraded, never corrupted.
+				r.out.Write(frame)
+				return
+			}
+		}
 		if path := sseTextFieldPath(payload); path != "" {
 			text := gjson.GetBytes(payload, path).String()
 			combined := r.carry + text
@@ -292,9 +328,32 @@ func frameLineTerminator(line []byte) []byte {
 // `choices.0.delta.reasoning_content` (a sibling of the `content` field this
 // looks up) all already pass through untouched.
 func sseTextFieldPath(payload []byte) string {
-	if gjson.GetBytes(payload, "type").String() == "content_block_delta" {
+	switch gjson.GetBytes(payload, "type").String() {
+	case "content_block_delta":
 		if gjson.GetBytes(payload, "delta.type").String() == "text_delta" {
 			return "delta.text"
+		}
+		return ""
+	case "response.output_text.delta":
+		// OpenAI Responses API (codex). The text is the TOP-LEVEL `delta`
+		// string — not choices[], not delta.text.
+		//
+		// 🔴 Why this case exists (live incident 2026-09-03, winpc2 codex):
+		// the request leg masked 13812345678 → {{PHONE_1}}, the model echoed
+		// the placeholder, and the CLIENT rendered "{{PHONE_1}}" — diagnostics
+		// read placeholders_issued=11 / restored=0. Without this case every
+		// Responses text frame was a "non-text frame" and passed through
+		// verbatim: forward leg correct, response leg silently absent, HTTP 200
+		// all the way. Third file in this wire-format family to miss Responses
+		// (usage extractor knew it 07-06; conversation_audit fixed 07-07 —
+		// workflow/CI/bugfix/2026-07-07-conversation-audit-codex-responses-api-not-captured.md).
+		// bugfix: workflow/CI/bugfix/2026-09-03-codex-responses-sse-placeholder-not-restored.md
+		// Fenced by TestSSERestore_ResponsesAPIDeltaSplit (unit, RED before this
+		// case existed) and pipe-wire E2E leg E (real proxy + detector + HTTP).
+		// Keyed on the exact `type` so response.reasoning_summary_text.delta
+		// (also a top-level `delta`) stays excluded, per the S3 rule above.
+		if d := gjson.GetBytes(payload, "delta"); d.Exists() && d.Type == gjson.String {
+			return "delta"
 		}
 		return ""
 	}

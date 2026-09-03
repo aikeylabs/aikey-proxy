@@ -43,7 +43,7 @@ import (
 // mode and returns the status and the error code the client would switch on.
 //
 // 🔴 licensePlane is left nil on purpose: ForwardingAllowed() is true for a nil
-// cache, so the licence gate cannot mask the authentication decision under test.
+// cache, so the license gate cannot mask the authentication decision under test.
 // A denied gate answers 402 before ever reaching this branch — which is exactly
 // what made the defect survivable in the field, and must not make it survivable
 // here.
