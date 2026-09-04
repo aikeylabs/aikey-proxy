@@ -556,12 +556,26 @@ func New(cfg *config.Config, configPath, password, version string) (*Supervisor,
 	// license_plane (2026-08-27) is the seventh rail. It carries the deployment's
 	// forwarding gate, which the control plane had been computing and serving all
 	// along with nothing on this side reading it — see license_plane_rail.go.
-	// mcp_credentials (P4) is the eighth. It is the authenticated half of MCP
-	// credential custody: the policy rail carries a backend's credential_id but
-	// deliberately carries no material, so without this rail a hosted backend
-	// can be configured perfectly and can never authenticate.
-	s.railset = newRailSet(s.groupRuntimeRail(), s.routingOverrideRail(), s.fallbackPolicyRail(),
-		s.keyRevocationRail(), s.licensePlaneRail(), s.mcpCredentialRail())
+	// mcp_credentials (P4) is the authenticated half of MCP credential custody:
+	// the policy rail carries a backend's credential_id but deliberately carries
+	// no material, so without this rail a hosted backend can be configured
+	// perfectly and can never authenticate.
+	//
+	// licenseRails() is build-tag split: the licensing rails in a normal build,
+	// none in a -tags aikey_license_off build (see license_rail_off.go — the gate
+	// they feed is compiled out, so a running rail could only log 404s forever).
+	//
+	// 🔴 Merge note (2026-09-04): these two arrived on different branches and
+	// both are kept. Taking either side alone silently drops a rail — the MCP
+	// one leaves credentialled backends unable to authenticate, the license one
+	// re-links licensing into a build that compiles the gate out.
+	//
+	// 🔴 Kept on ONE line on purpose: fallback_policy_rail_test.go matches
+	// `newRailSet\(` to END OF LINE, so wrapping the argument list makes that
+	// fence read only `append([]railSpec{` and report every rail as
+	// unregistered. Splitting this across lines fails a real fence for a
+	// formatting reason — which is how a good fence gets deleted.
+	s.railset = newRailSet(append([]railSpec{s.groupRuntimeRail(), s.routingOverrideRail(), s.fallbackPolicyRail(), s.keyRevocationRail(), s.mcpCredentialRail()}, s.licenseRails()...)...)
 	gen, err := s.buildGeneration()
 	if err != nil {
 		_ = s.oauthPoolRuntime.Shutdown()
@@ -2148,6 +2162,12 @@ func (s *Supervisor) buildGeneration() (*generation, error) {
 	// (20260703 update). Explicitly-empty (cluster/server configs) → URL-less
 	// fallback; absent key (pre-20260703 preserved configs) → default 8090.
 	p.SetConsoleURL(s.cfg.ResolvedConsoleURL())
+	// 🔴 A cluster NODE must not serve the path-prefix branch to a caller that
+	// names no virtual key. Wired from cluster.enabled — the same single value
+	// config.validate() uses to lift the loopback rail, so the two decisions can
+	// never disagree about what this process is. See proxy.SetClusterNode and
+	// workflow/CI/bugfix/2026-09-02-集群节点代理是一个公网开放中继.md.
+	p.SetClusterNode(s.cfg.Cluster.Enabled)
 	// SyncRail §5.4: let the 401 wording distinguish "you need to sign in" from
 	// "the assignment rail is unreachable so this pick may be misdirected".
 	p.SetRoutingRailHealth(func() (string, int64) { return s.railHealthFor("routing_override") })

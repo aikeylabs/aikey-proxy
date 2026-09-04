@@ -425,7 +425,10 @@ func TestGroupServe_LoginRequiredReturns401(t *testing.T) {
 	if !strings.Contains(body, "acc-1") {
 		t.Fatalf("body must name the account to log into: %s", body)
 	}
-	if !strings.Contains(body, "sign-in") {
+	// Wording adapted 2026-09-03 ("sign-in" → "sign in to THAT account"): the
+	// prompt now names WHICH account when the material carries an identity.
+	// Semantics unchanged — the body must still carry a human sign-in prompt.
+	if !strings.Contains(body, "sign in") {
 		t.Fatalf("body must carry the human sign-in prompt claude will display: %s", body)
 	}
 	// Must NOT be mistaken for the transient "still syncing" degrade, and must not
@@ -1047,7 +1050,7 @@ func TestGroupServe_LoginRequiredRailStateWording(t *testing.T) {
 		t.Fatalf("status=%d body=%s", w.Code, w.Body.String())
 	}
 	msg, reason := decode(w)
-	if !strings.Contains(msg, "sign-in") || reason != "" {
+	if !strings.Contains(msg, "sign in") || reason != "" { // wording 2026-09-03; see above
 		t.Fatalf("healthy rail must keep the sign-in prompt with no reason: msg=%q reason=%q", msg, reason)
 	}
 
@@ -1081,7 +1084,7 @@ func TestGroupServe_LoginRequiredRailStateWording(t *testing.T) {
 	req3, w3 := groupReq(groupBody)
 	p3.Handle(w3, req3)
 	msg3, reason3 := decode(w3)
-	if !strings.Contains(msg3, "sign-in") || reason3 != "" {
+	if !strings.Contains(msg3, "sign in") || reason3 != "" { // wording 2026-09-03; see above
 		t.Fatalf("nil probe must behave as healthy: msg=%q reason=%q", msg3, reason3)
 	}
 }

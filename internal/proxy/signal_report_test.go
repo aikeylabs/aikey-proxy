@@ -372,7 +372,7 @@ func TestAuthFailureSignalIsVersionedDurableAndRetriedUntilAccepted(t *testing.T
 	if len(r.snapshotAuthFailures()) != 0 {
 		t.Fatal("unversioned auth failure entered outbox")
 	}
-	r.enqueueAuthFailure("c1", "g1", "s1", "fingerprint-1", 401, "token_revoked")
+	r.enqueueAuthFailure("c1", "g1", "s1", "fingerprint-1", 403, "oauth_token_revoked")
 	r.ingestAuthFailures([]authFailureSample{<-r.authIn})
 	pending := r.snapshotAuthFailures()
 	if len(pending) != 1 || pending[0].TokenFingerprint != "fingerprint-1" {
@@ -416,6 +416,12 @@ func TestAuthFailureSignalIsVersionedDurableAndRetriedUntilAccepted(t *testing.T
 	}
 	if got := decoded.AuthFailures[0]; got.CredentialID != "c1" || got.OAuthGroupID != "g1" || got.SeatID != "s1" || got.TokenFingerprint != "fingerprint-1" {
 		t.Fatalf("auth failure route/version lost on wire: %+v", got)
+	}
+	// 上游证据必须原样过 wire——否则 Master 侧「为什么被拒」照样无从归因。
+	// 2026-09-01：加这两个字段就是为了让「登录成功→一会儿变登录失效」可诊断。
+	if got := decoded.AuthFailures[0]; got.UpstreamStatus != 403 || got.UpstreamErrorType != "oauth_token_revoked" {
+		t.Fatalf("upstream evidence dropped on wire: status=%d type=%q (want 403 / oauth_token_revoked)",
+			got.UpstreamStatus, got.UpstreamErrorType)
 	}
 }
 

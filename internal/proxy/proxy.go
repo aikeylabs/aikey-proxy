@@ -377,6 +377,11 @@ type Proxy struct {
 	// not a per-generation value. A gate that reset on reload would be cleared by
 	// the next `aikey key sync`.
 	licensePlane *LicensePlaneCache
+	// clusterNode is true when this process is a cluster NODE (config
+	// cluster.enabled). It makes the path-prefix branch require a virtual key;
+	// see SetClusterNode for the whole argument. Written once at generation
+	// build, read on the request path.
+	clusterNode bool
 	// filterIncremental, when true, makes the inbound filter scan ONLY the
 	// latest user turn (the new content) instead of re-scanning system + the
 	// whole conversation history every request. WHY: clients like OpenClaw
@@ -763,6 +768,33 @@ func (p *Proxy) SetFilterStub501(cause *FilterStubCause) {
 func (p *Proxy) SetLicensePlane(cache *LicensePlaneCache) {
 	p.licensePlane = cache
 }
+
+// SetClusterNode tells this proxy it is running as a CLUSTER NODE.
+//
+// 🔴 What it changes, and why only here. A cluster node binds a routable
+// address (config.validate() lifts the loopback rail for `cluster.enabled`) and
+// its vault holds the ORGANISATION's virtual keys, synced down by the cluster
+// daemon. Both of those are false for Personal / Trial / Production, where the
+// proxy binds loopback and the vault holds one person's own keys.
+//
+// The path-prefix branch (`/anthropic/v1/...`) resolves a request that carries
+// no aikey token from the default binding — which is exactly right on a
+// developer's own machine, and is an unauthenticated relay over the company's
+// credentials on a node. See handlePathPrefixRoute.
+//
+// 🔴 Driven by config.Cluster.Enabled and nothing else. It is NOT inferred from
+// "does this proxy have a service token" or "is listen.host non-loopback": a
+// switch decided by several values is one nobody can predict from reading any of
+// them, and this one gates an authentication decision.
+//
+// bugfix: workflow/CI/bugfix/2026-09-02-集群节点代理是一个公网开放中继.md
+func (p *Proxy) SetClusterNode(on bool) {
+	p.clusterNode = on
+}
+
+// IsClusterNode reports what SetClusterNode was told. Exists for the fences —
+// asserting the wiring by behavior rather than by reading supervisor.go's text.
+func (p *Proxy) IsClusterNode() bool { return p.clusterNode }
 
 // FilterStub501Cause returns the active fail-loud cause, or nil when the proxy
 // is serving normally. The supervisor polls it to know whether it is currently

@@ -113,6 +113,79 @@ func newComplianceReporter(t *testing.T, dir, url string) *Reporter {
 	return r
 }
 
+// spec: R-compliance-local-ledger-completeness-1.S2 镜像是旁路——无本机库静默、失败不进 dead-letter
+// (workflow/CI/requirements/2026-09-03-compliance-local-ledger-completeness.md)
+//
+// MirrorComplianceEventsLocally (2026-09-03, user decision: team AND personal
+// detections are recorded on the machine and shown on the local page). Three
+// properties, each a distinct failure the primary-upload contract would get
+// wrong if reused verbatim:
+//  1. the copy reaches the "personal" (local) route stamped route_source;
+//  2. a host with no "personal" route (Cluster node / server) is silently a
+//     no-op — not an error, not a dead letter;
+//  3. a failed mirror is REPORTED but NOT dead-lettered — the master copy is
+//     the record of truth and the primary upload already conserves it.
+func TestMirrorComplianceEventsLocally_StampsRouteSource_NoDeadLetter(t *testing.T) {
+	var gotBody []byte
+	local := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotBody, _ = io.ReadAll(r.Body)
+		_ = json.NewEncoder(w).Encode(map[string][]string{"accepted_ids": {"e1"}})
+	}))
+	defer local.Close()
+
+	dir := t.TempDir()
+	r, err := NewReporter(&ReporterConfig{
+		CollectorRoutes:           map[string]string{"team": "http://127.0.0.1:1", "personal": local.URL},
+		CollectorRouteCredentials: map[string]Credential{"team": &StaticTokenCredential{Token: "member-jwt-x"}},
+		WALDir:                    dir,
+		DBPath:                    filepath.Join(dir, "events.db"),
+	})
+	if err != nil {
+		t.Fatalf("NewReporter: %v", err)
+	}
+	t.Cleanup(func() { r.Close() })
+	ctx := context.Background()
+	evs := [][]byte{[]byte(`{"event_id":"e1","action_taken":"mask","tenant_id":"t"}`)}
+
+	// 1. delivered to the local route, stamped.
+	if err := r.MirrorComplianceEventsLocally(ctx, "team", evs); err != nil {
+		t.Fatalf("mirror: %v", err)
+	}
+	var envelope struct {
+		Events []map[string]any `json:"events"`
+	}
+	if err := json.Unmarshal(gotBody, &envelope); err != nil || len(envelope.Events) != 1 {
+		t.Fatalf("local route got an unexpected envelope: %v %s", err, gotBody)
+	}
+	if envelope.Events[0]["event_id"] != "e1" || envelope.Events[0]["route_source"] != "team" {
+		t.Fatalf("mirrored event not stamped route_source=team (event_id preserved): %v", envelope.Events[0])
+	}
+
+	// 2. no local route → no-op, no error, no dead letter.
+	r2 := newComplianceReporter(t, t.TempDir(), "http://127.0.0.1:1")
+	if err := r2.MirrorComplianceEventsLocally(ctx, "team", evs); err != nil {
+		t.Fatalf("a host without a local store must be a silent no-op, got: %v", err)
+	}
+
+	// 3. local route unreachable → error returned, NOTHING dead-lettered.
+	dir3 := t.TempDir()
+	r3, err := NewReporter(&ReporterConfig{
+		CollectorRoutes: map[string]string{"team": "http://127.0.0.1:1", "personal": "http://127.0.0.1:1"},
+		WALDir:          dir3,
+		DBPath:          filepath.Join(dir3, "events.db"),
+	})
+	if err != nil {
+		t.Fatalf("NewReporter: %v", err)
+	}
+	t.Cleanup(func() { r3.Close() })
+	if err := r3.MirrorComplianceEventsLocally(ctx, "team", evs); err == nil {
+		t.Fatal("an unreachable local store must be reported to the caller (WARN), not swallowed")
+	}
+	if got := readDeadLetterEntries(t, dir3); len(got) != 0 {
+		t.Fatalf("a failed MIRROR must not be dead-lettered (the master copy is the record of truth); got %d entries", len(got))
+	}
+}
+
 // A 400 from an older master must CONSERVE the batch, not drop it. 400 is
 // "terminal" only in the sense of "do not hot-retry" — the same bytes succeed
 // after the master upgrades, so discarding them is wrong.

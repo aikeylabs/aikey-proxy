@@ -10,8 +10,10 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/AiKeyLabs/aikey-proxy/internal/apphook"
+	"github.com/AiKeyLabs/aikey-proxy/internal/events"
 )
 
 // stubHook is a configurable apphook.Hook for testing applyInboundFilter's
@@ -31,6 +33,120 @@ func (h *stubHook) Detect(ctx context.Context, req *apphook.Request) *apphook.Re
 	return h.resp
 }
 func (h *stubHook) Status() *apphook.Status { return &apphook.Status{Healthy: true} }
+
+// TestApplyInboundFilter_TeamEventIsMirroredToLocalStore — a TEAM-routed
+// compliance event must reach BOTH the team server (existing behavior) AND
+// the local self-view store.
+//
+// spec: R-compliance-local-ledger-completeness-1.S1 团队路由事件同时到达团队服务端与本机库
+// (workflow/CI/requirements/2026-09-03-compliance-local-ledger-completeness.md)
+//
+// 🔴 Why (user decision 2026-09-03, 「团队和个人的账号都需要记录本地的合规检测，
+// 并且显示到本地 web」): until now team-routed events went to master only —
+// the 2026-05-10 personal↔team isolation rule, written for USAGE data (billing
+// projection). Applied to compliance events it produced a page at
+// 127.0.0.1:8090/user/compliance with NOTHING on it while the member's own
+// machine had detected and masked their phone number (winpc2 report). The
+// isolation rule is reversed for compliance events only: the local copy is a
+// best-effort mirror, stamped route_source=team, never dead-lettered, and its
+// failure never touches the master upload. RED before the mirror existed:
+// the local sink timed out.
+func TestApplyInboundFilter_TeamEventIsMirroredToLocalStore(t *testing.T) {
+	sink := func(ch chan<- []byte) *httptest.Server {
+		return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			b, _ := io.ReadAll(r.Body)
+			ch <- b
+			_, _ = w.Write([]byte(`{"accepted_ids":["e-team-1"]}`))
+		}))
+	}
+	teamCh, localCh := make(chan []byte, 1), make(chan []byte, 1)
+	teamSink, localSink := sink(teamCh), sink(localCh)
+	defer teamSink.Close()
+	defer localSink.Close()
+
+	rep, err := events.NewReporter(&events.ReporterConfig{
+		CollectorRoutes: map[string]string{"team": teamSink.URL, "personal": localSink.URL},
+		CollectorRouteCredentials: map[string]events.Credential{
+			"team":     &events.StaticTokenCredential{Token: "member-jwt"},
+			"personal": &events.StaticTokenCredential{Token: "local-token"},
+		},
+	})
+	if err != nil {
+		t.Fatalf("NewReporter: %v", err)
+	}
+	hook := &stubHook{resp: &apphook.Response{
+		Action: apphook.ActionAllow,
+		Event:  []byte(`{"event_id":"e-team-1","action_taken":"allow","prompt_length":10,"findings":[]}`),
+	}}
+	p := &Proxy{filterHook: hook, reporter: rep}
+	r := newReq(`{"model":"m","messages":[{"role":"user","content":"hello team"}]}`)
+	if !p.applyInboundFilter(httptest.NewRecorder(), r, "m", "team", "org", "vk", "seat", "", "", discardLogger()) {
+		t.Fatal("expected proceed")
+	}
+
+	select {
+	case b := <-teamCh:
+		if !strings.Contains(string(b), "e-team-1") {
+			t.Fatalf("team sink got an envelope without the event: %s", b)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("team sink never received the event (existing behavior regressed)")
+	}
+	select {
+	case b := <-localCh:
+		if !strings.Contains(string(b), "e-team-1") {
+			t.Fatalf("local store got an envelope without the event: %s", b)
+		}
+		if !strings.Contains(string(b), `"route_source":"team"`) {
+			t.Fatalf("mirrored event is not stamped route_source=team (the page cannot label it): %s", b)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("local store never received the mirrored team event — the member's own machine has no record of a detection it performed")
+	}
+}
+
+// TestApplyInboundFilter_BodilessRequestIsNotAnUnfilteredForward — a request
+// with NO body (GET / HEAD / OPTIONS, http.NoBody, Content-Length: 0) has
+// nothing to scan. It must pass through without calling the detector and
+// WITHOUT the WARN "no filterable content extracted; forwarded UNFILTERED".
+//
+// 🔴 Why (winpc2 2026-09-03): three team-oauth group-lane requests logged
+// exactly that WARN with reason=body_not_json body_bytes=0 content_type="".
+// The wording says "content went upstream unmasked" — read as a P0 PII leak
+// during triage — while the truth was an empty request. A diagnostic that
+// cries wolf on empty bodies hides the day it is right. RED before the
+// short-circuit in applyInboundFilter: the old path ReadAll'd 0 bytes, failed
+// the JSON parse, and emitted the WARN.
+func TestApplyInboundFilter_BodilessRequestIsNotAnUnfilteredForward(t *testing.T) {
+	cases := []struct {
+		name string
+		mk   func() *http.Request
+	}{
+		{"GET nil body", func() *http.Request { return httptest.NewRequest(http.MethodGet, "/v1/models", nil) }},
+		{"POST http.NoBody", func() *http.Request { return httptest.NewRequest(http.MethodPost, "/v1/messages", http.NoBody) }},
+		{"POST Content-Length 0", func() *http.Request {
+			r := httptest.NewRequest(http.MethodPost, "/v1/messages", bytes.NewReader(nil))
+			r.ContentLength = 0
+			return r
+		}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			hook := &stubHook{resp: &apphook.Response{Action: apphook.ActionAllow}}
+			p := &Proxy{filterHook: hook}
+			logger, buf := captureLogger()
+			if proceed := p.applyInboundFilter(httptest.NewRecorder(), tc.mk(), "m", "team", "", "", "", "", "", logger); !proceed {
+				t.Fatal("expected proceed for a bodiless request")
+			}
+			if hook.called != 0 {
+				t.Fatalf("detector invoked %d time(s) for a bodiless request", hook.called)
+			}
+			if strings.Contains(buf.String(), "UNFILTERED") {
+				t.Fatalf("bodiless request reported as an unfiltered forward:\n%s", buf.String())
+			}
+		})
+	}
+}
 
 func newReq(body string) *http.Request {
 	r := httptest.NewRequest("POST", "/v1/messages", bytes.NewBufferString(body))

@@ -141,6 +141,28 @@ func (p *Proxy) applyInboundFilter(
 	if r.Body == nil {
 		return true
 	}
+	// No body → nothing to scan → pass through QUIETLY (2026-09-03).
+	//
+	// net/http hands a bodiless request (GET / HEAD / OPTIONS, or a POST with
+	// Content-Length: 0) to us as http.NoBody, not nil, so the nil check above
+	// never fired and the request fell through to io.ReadAll → 0 bytes → JSON
+	// parse failure → the WARN "no filterable content extracted; forwarded
+	// UNFILTERED" (proxy.filter.skipped). That sentence means "user content
+	// went upstream unmasked". For an empty request it is false — and on
+	// winpc2 it was read as a P0 PII leak during triage (three team-oauth
+	// group-lane requests, reason=body_not_json body_bytes=0 content_type="").
+	// A diagnostic that cries wolf on empty bodies hides the day it is right.
+	// Content-Length is -1 for chunked/unknown-length bodies, so a real body
+	// is never mistaken for an empty one here.
+	// Fence: TestApplyInboundFilter_BodilessRequestIsNotAnUnfilteredForward.
+	// bugfix: workflow/CI/bugfix/2026-09-03-bodiless-request-logged-as-unfiltered-forward.md
+	if r.Body == http.NoBody || r.ContentLength == 0 ||
+		r.Method == http.MethodGet || r.Method == http.MethodHead || r.Method == http.MethodOptions {
+		logger.Debug("filter: request carries no body; nothing to scan",
+			"event.name", observability.EventProxyFilterNoBody,
+			"method", r.Method, "content_length", r.ContentLength, "route_source", routeSource)
+		return true
+	}
 
 	// 🔴 PROBE EXCLUSION — the Probe pipeline is never touched by compliance.
 	//
@@ -217,6 +239,27 @@ func (p *Proxy) applyInboundFilter(
 			if err := p.reporter.UploadComplianceEvents(ctx, routeSource, evs); err != nil {
 				logger.Warn("filter: team compliance upload failed",
 					"event.name", "proxy.filter.compliance_upload_failed",
+					"error", err, "count", len(evs))
+			}
+		})
+		// LOCAL MIRROR (2026-09-03, user decision: 「团队和个人的账号都需要记录本地的
+		// 合规检测，并且显示到本地 web」). A best-effort COPY of the same events to
+		// this machine's self-view store, so 127.0.0.1:8090/user/compliance is
+		// the machine's complete record. Reverses, for COMPLIANCE EVENTS ONLY,
+		// the 2026-05-10 personal↔team isolation rule (written for usage data);
+		// usage routing is untouched. Separate goroutine, separate contract:
+		// never dead-lettered, and its failure never touches the master upload
+		// above (see Reporter.MirrorComplianceEventsLocally). Silent no-op on a
+		// host with no local store (Cluster node / server-side proxy).
+		// Fence: TestApplyInboundFilter_TeamEventIsMirroredToLocalStore (RED
+		// before this block: local sink timed out).
+		// update: roadmap20260320/技术实现/update/20260903-合规事件团队路由本机镜像与本机页面全集显示.md
+		observability.GoSafe("proxy.filter.compliance_local_mirror", observability.Isolated, func() {
+			ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+			defer cancel()
+			if err := p.reporter.MirrorComplianceEventsLocally(ctx, routeSource, evs); err != nil {
+				logger.Warn("filter: team compliance event local mirror failed (master upload unaffected)",
+					"event.name", observability.EventProxyFilterComplianceLocalMirrorFailed,
 					"error", err, "count", len(evs))
 			}
 		})

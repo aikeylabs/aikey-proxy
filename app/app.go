@@ -25,6 +25,7 @@ import (
 	"github.com/AiKeyLabs/aikey-proxy/internal/apphook"
 	"github.com/AiKeyLabs/aikey-proxy/internal/config"
 	"github.com/AiKeyLabs/aikey-proxy/internal/events"
+	"github.com/AiKeyLabs/aikey-proxy/internal/licenseoff"
 	"github.com/AiKeyLabs/aikey-proxy/internal/mcp"
 	"github.com/AiKeyLabs/aikey-proxy/internal/observability"
 	"github.com/AiKeyLabs/aikey-proxy/internal/proxy"
@@ -113,6 +114,14 @@ func Run() {
 	// install, so this is a no-op outside the test harness — see
 	// supervisor.ParentWatchEnv for why a leaked proxy cost ten days once.
 	supervisor.WatchParent(nil)
+
+	// 🔴 Before anything else this process might do. In a normal build this is a
+	// no-op; in a -tags aikey_license_off build it REFUSES TO START unless the
+	// operator acknowledged it. The gate being compiled out is precisely why the
+	// gate cannot report its own absence — a licensing-off proxy presents as a
+	// perfectly healthy one, so the refusal has to happen at boot.
+	// See internal/licenseoff.
+	licenseoff.RefuseUnlessAcknowledged(slog.Default())
 
 	// Handle "version" subcommand before flag parsing (flags expect --config etc.)
 	if len(os.Args) > 1 && os.Args[1] == "version" {
@@ -268,8 +277,12 @@ func Run() {
 	startupPhase := server.NewStartupPhase("supervisor")
 	srv := server.NewStarting(ln, startupPhase.Get)
 	observability.GoSafe("main.server.serve", observability.Fatal, func() {
-		if err := srv.Serve(); err != nil && !errors.Is(err, http.ErrServerClosed) {
-			slog.Error("server error", "error", err)
+		// serveErr, not err: govet's shadow check flags the inner `err` as
+		// shadowing the config-load `err` far above. Renaming is the fix rather
+		// than reusing the outer one — this runs in a goroutine, and writing to a
+		// variable the main path also uses would be a data race.
+		if serveErr := srv.Serve(); serveErr != nil && !errors.Is(serveErr, http.ErrServerClosed) {
+			slog.Error("server error", "error", serveErr)
 			os.Exit(1)
 		}
 	})
@@ -571,10 +584,7 @@ func Run() {
 	//     gate" and gets a perfectly good release refused.
 	//
 	// See internal/proxy/license_capability.go.
-	slog.Info("license gate capabilities compiled into this build",
-		"event.name", observability.EventProxyLicensePlaneCapabilities,
-		"capabilities", strings.Join(proxy.SupportedLicenseCapabilities, ","),
-		"marker", proxy.LicenseConsumerMarker)
+	announceLicenseCapabilities()
 	adminHandler.SyncHealthFn = func() map[string]admin.SyncRailStatus {
 		snap := sup.ControlPlaneSyncSnapshot()
 		if len(snap) == 0 {

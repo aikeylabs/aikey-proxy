@@ -83,11 +83,12 @@ func TestChildHook_ListPacks(t *testing.T) {
 	// and names this file if it goes stale. Wave5 -> Wave6 (2026-08-17) is
 	// exactly the miss that fence exists to make impossible.
 	//
-	// SpikeBaselinePreserved is FALSE for Wave6 on purpose: Wave6 departs from
-	// the frozen Candidate-v9 stage set and carries its own measured safety
+	// SpikeBaselinePreserved is FALSE for Wave6/Wave7 on purpose: both depart
+	// from the frozen Candidate-v9 stage set (Wave7 admits the two anchored
+	// password-prefix rules at ordinal 3) and carry their own measured safety
 	// delta (SafetyDeltaVerified) instead. actionpolicy/bundle.go pins that
 	// per-wave; asserting the value here proves it survives the IPC hop.
-	if rep.ActionPolicy.BundleSHA256 != "49011cd2c80d606a75a796df6b54f9c83113ff26b39fc790fd64acc5af27e9ea" ||
+	if rep.ActionPolicy.BundleSHA256 != "6a31d257f08d4d18689f656bf3cb957867c4c5e93677d56ab1aaf4b87bc36a04" ||
 		rep.ActionPolicy.CandidateBehaviorSHA256 != "da0553054ef45f1aa95aacddfcbbf7ae5c3933d662568aaf29e92c09ea2bd632" ||
 		rep.ActionPolicy.IntegrationBehaviorSHA256 != "1da55d2cc3130de7bea5cbf8dafdd1cffd46048e3f3d9e0eba7394c9a0df8d60" ||
 		rep.ActionPolicy.HistoryEvidenceSHA256 != "68d8f134f80af7c31916e2a2e62651a667bee3a6463b61fc025e12f61408c4a3" ||

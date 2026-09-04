@@ -221,6 +221,97 @@ func TestSSERestore_OpenAIDeltaSplit(t *testing.T) {
 	}
 }
 
+// spec: R-compliance-filter-direction-and-scope-2 响应方向唯一例外：占位符→原文还原
+// (workflow/CI/requirements/2026-06-04-compliance-filter-direction-and-scope.md, 规则 2)
+//
+// OpenAI Responses API wire shape (codex, chatgpt.com/backend-api/codex):
+// text streams as `response.output_text.delta` frames whose text is the
+// TOP-LEVEL `delta` string — not choices[].delta.content, not
+// content_block_delta. A placeholder split across two such frames must be
+// restored exactly like the two older channels.
+//
+// 🔴 Live incident 2026-09-03 (winpc2, codex): request leg masked
+// 13812345678 → {{PHONE_1}} correctly, the model echoed the placeholder, and
+// the CLIENT rendered "{{PHONE_1}}" — diagnostics read
+// placeholders_issued=11 / placeholders_restored=0. sseTextFieldPath knew only
+// the Anthropic and chat-completions channels, so every Responses frame was a
+// "non-text frame" and passed through verbatim. Third file in the same
+// wire-format family to miss Responses: usage extractor knew it (07-06),
+// conversation_audit was fixed for it (bugfix
+// 2026-07-07-conversation-audit-codex-responses-api-not-captured.md), the
+// restorer did not. This test is RED against the pre-fix sseTextFieldPath.
+func TestSSERestore_ResponsesAPIDeltaSplit(t *testing.T) {
+	orig := "13812345678"
+	st := sseTestState(map[string]string{"{{PHONE_1}}": orig})
+	in := "event: response.created\n" +
+		"data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_1\",\"status\":\"in_progress\"}}\n\n" +
+		"event: response.output_text.delta\n" +
+		"data: {\"type\":\"response.output_text.delta\",\"delta\":\"记下 {{PHO\"}\n\n" +
+		"event: response.output_text.delta\n" +
+		"data: {\"type\":\"response.output_text.delta\",\"delta\":\"NE_1}} 了\"}\n\n" +
+		"event: response.completed\n" +
+		"data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_1\",\"status\":\"completed\"}}\n\n"
+	out := drainAll(t, newSSEPlaceholderRestorer(&chunkReader{data: []byte(in), chunk: 4}, st))
+	if got := concatTextDeltas(t, out); got != "记下 "+orig+" 了" {
+		t.Fatalf("responses-api delta restore failed: %q\nstream:\n%s", got, out)
+	}
+	if !strings.Contains(out, `"type":"response.completed"`) {
+		t.Fatalf("response.completed frame lost: %s", out)
+	}
+	// The placeholder must not survive anywhere on the client-facing wire.
+	if strings.Contains(out, "{{PHONE_1}}") || strings.Contains(out, "{{PHO") {
+		t.Fatalf("placeholder leaked to client: %s", out)
+	}
+}
+
+// `response.output_text.done` carries the COMPLETE text of the item in one
+// frame (the real chatgpt.com backend emits it after the deltas; the in-repo
+// mock does not). It is restored whole, with no carry prepended (carry belongs
+// to the delta channel and is flushed first to keep text order), and it is
+// never used as the carry-flush template (wrong shape to clone a delta from).
+// A client that renders the final text from `.done` instead of from the deltas
+// would otherwise flash the restored number and then revert to the placeholder.
+func TestSSERestore_ResponsesAPIDoneFrameRestoredWhole(t *testing.T) {
+	orig := "13812345678"
+	st := sseTestState(map[string]string{"{{PHONE_1}}": orig})
+	in := "data: {\"type\":\"response.output_text.delta\",\"delta\":\"记下 {{PHO\"}\n\n" +
+		"data: {\"type\":\"response.output_text.done\",\"text\":\"记下 {{PHONE_1}} 了\"}\n\n" +
+		"data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_1\",\"status\":\"completed\"}}\n\n"
+	out := drainAll(t, newSSEPlaceholderRestorer(&chunkReader{data: []byte(in), chunk: 4}, st))
+
+	// Locate the .done frame at its LINE start (the type string sits mid-line;
+	// slicing at the raw index would hand the parsers a line with no `data: `
+	// prefix and read back an empty text — which is exactly the mistake the
+	// first draft of this test made).
+	typeIdx := strings.Index(out, `"response.output_text.done"`)
+	if typeIdx < 0 {
+		t.Fatalf(".done frame lost: %s", out)
+	}
+	doneLineStart := strings.LastIndex(out[:typeIdx], "\n") + 1
+	// 1. The withheld delta carry ("{{PHO") is flushed BEFORE the .done frame.
+	if got := concatTextDeltas(t, out[:doneLineStart]); got != "记下 {{PHO" {
+		// Nothing to restore in the delta channel here (placeholder never
+		// completed), so the carry is flushed verbatim — but it must be
+		// flushed, and before .done.
+		t.Fatalf("delta carry not flushed before .done: %q\nstream:\n%s", got, out)
+	}
+	// 2. The .done text is restored whole and in place.
+	var doneText string
+	for _, line := range strings.Split(out[doneLineStart:], "\n") {
+		line = strings.TrimSuffix(line, "\r")
+		if strings.HasPrefix(line, "data: ") && strings.Contains(line, `"response.output_text.done"`) {
+			doneText = gjson.Get(line[len("data: "):], "text").String()
+			break
+		}
+	}
+	if doneText != "记下 "+orig+" 了" {
+		t.Fatalf(".done text not restored whole: %q\nstream:\n%s", doneText, out)
+	}
+	if strings.Contains(out[doneLineStart:], "{{PHONE_1}}") {
+		t.Fatalf("placeholder leaked in/after .done: %s", out)
+	}
+}
+
 // Multiple placeholders in one stream (multi-address request).
 func TestSSERestore_MultiplePlaceholders(t *testing.T) {
 	a1, a2 := "地址一号", "地址二号"

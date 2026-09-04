@@ -24,6 +24,7 @@ package proxy
 import (
 	"encoding/base64"
 	"encoding/json"
+	"strings"
 
 	"github.com/AiKeyLabs/aikey-proxy/internal/vault"
 	"github.com/AiKeyLabs/aikey-proxy/internal/vkeys"
@@ -324,4 +325,27 @@ func buildGroupResolution(accountID string, ref vkeys.GroupAccountRef, mat vkeys
 		ExpiresAt:   mat.ExpiresAt,
 	}
 	return res
+}
+
+// groupAccountIdentity returns the human-facing identity (email / alias) of one
+// account in the delivered group runtime material, or "" when the material is
+// absent, unparseable, or carries no identity for that account.
+//
+// Why it exists (2026-09-03): every user-facing "you must sign in" surface named
+// the account by UUID or not at all, while `identity` — explicitly documented as
+// "display + audit only" — was sitting in the very material the resolver had just
+// read. Returning "" rather than a placeholder keeps the caller honest: an older
+// master that omits identity produces the previous generic wording instead of a
+// confident-looking but useless UUID.
+//
+// bugfix: workflow/CI/bugfix/2026-09-03-登录提示不说是哪个账号.md
+func groupAccountIdentity(groupRuntime, accountID string) string {
+	if groupRuntime == "" || accountID == "" {
+		return ""
+	}
+	var material map[string]vkeys.GroupRuntimeAccount
+	if err := json.Unmarshal([]byte(groupRuntime), &material); err != nil {
+		return ""
+	}
+	return strings.TrimSpace(material[accountID].Identity)
 }
