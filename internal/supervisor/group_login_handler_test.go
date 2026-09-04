@@ -601,26 +601,89 @@ func TestPoolSessionKey_IdentityMismatchRequiresExplicitAcknowledgement(t *testi
 	}
 }
 
-func TestPoolBrowserOAuth_IdentityMismatchFailsClosedWithoutWriteback(t *testing.T) {
+// TestPoolBrowserOAuth_IdentityMismatchRequiresExplicitAcknowledgement reverses
+// the 2026-08-27 fail-closed fence (拍板 2026-09-04, extending the 2026-09-01
+// sessionKEY ruling to the browser-OAuth entry): a cross-account login stays a
+// REVIEWABLE session, an unacknowledged confirm still refuses AND KEEPS the
+// session (the old behavior consumed it, forcing a full re-authorization), and
+// only the acknowledged confirm writes back — declaring the mismatch with the
+// ACTUAL provider account id so master binds the member's own seat row.
+// spec: R-oauth-token-mint-12.S1 (step 1) / .S2 (step 2) / .S3 (step 3)
+func TestPoolBrowserOAuth_IdentityMismatchRequiresExplicitAcknowledgement(t *testing.T) {
+	var (
+		gotWB      memberTokenWriteback
+		writebacks atomic.Int32
+	)
+	master := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		writebacks.Add(1)
+		if err := json.NewDecoder(r.Body).Decode(&gotWB); err != nil {
+			t.Errorf("decode writeback: %v", err)
+		}
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{"status":"ok"}`))
+	}))
+	defer master.Close()
+
 	ex := &fakePoolExchanger{
 		accountID: "provider-account", access: "ACCESS", refresh: "REFRESH", expiresAt: 100,
 		externalID: "wrong-uuid", identity: "wrong@team.com",
 	}
-	h := newPoolHandler(t, ex, "http://master.invalid")
-	h.sessions.Store("sess-1", poolSession{
-		credentialID: "c1", oauthGroupID: "g1", accountID: "a1",
-		providerCode: "anthropic", protocolType: "anthropic",
-		expectedIdentity: "member@team.com", externalID: "expected-uuid", createdAt: time.Now(),
-	})
-	w := doJSON(h.submitCode, `{"session_id":"sess-1","code":"one-shot-code","confirm":false}`)
-	if w.Code != http.StatusConflict || !strings.Contains(w.Body.String(), broker.ErrCodeSessionKeyIdentityMismatch) {
-		t.Fatalf("browser mismatch: %d %s", w.Code, w.Body.String())
+	h := newPoolHandler(t, ex, master.URL)
+	h.client = master.Client()
+	store := func() {
+		h.sessions.Store("sess-1", poolSession{
+			credentialID: "c1", oauthGroupID: "g1", accountID: "a1",
+			providerCode: "anthropic", protocolType: "anthropic",
+			expectedIdentity: "member@team.com", externalID: "expected-uuid", createdAt: time.Now(),
+		})
 	}
-	if ex.forgotN != 1 || ex.forgotSess != "sess-1" || ex.forgotAcct != "provider-account" {
-		t.Fatalf("mismatched browser token not consumed: %+v", ex)
+	store()
+
+	// Step 1: exchange → reviewable pending carrying the mismatch, zero writeback.
+	w := doJSON(h.submitCode, `{"session_id":"sess-1","code":"one-shot-code","confirm":false}`)
+	if w.Code != http.StatusOK || !strings.Contains(w.Body.String(), `"identity_mismatch":true`) {
+		t.Fatalf("browser mismatch review state: %d %s", w.Code, w.Body.String())
+	}
+	if strings.Contains(w.Body.String(), "ACCESS") || strings.Contains(w.Body.String(), "REFRESH") {
+		t.Fatal("token material leaked into the review response")
+	}
+	if _, ok := h.sessions.Load("sess-1"); !ok {
+		t.Fatal("mismatched browser session must stay confirmable")
+	}
+	if writebacks.Load() != 0 {
+		t.Fatalf("review step must not write to master, got %d", writebacks.Load())
+	}
+
+	// Step 2: confirm WITHOUT the acknowledgement → refused, session KEPT (the
+	// member can re-confirm; the one-shot code must not have to be re-spent).
+	w = doJSON(h.submitCode, `{"session_id":"sess-1","code":"one-shot-code","confirm":true}`)
+	if w.Code != http.StatusConflict || !strings.Contains(w.Body.String(), broker.ErrCodeSessionKeyIdentityMismatch) {
+		t.Fatalf("unacknowledged confirm: %d %s", w.Code, w.Body.String())
+	}
+	if _, ok := h.sessions.Load("sess-1"); !ok {
+		t.Fatal("unacknowledged confirm must keep the session — destroying it forces a full re-authorization")
+	}
+	if ex.forgotN != 0 || writebacks.Load() != 0 {
+		t.Fatalf("unacknowledged confirm must neither consume the token nor write: forgot=%d writebacks=%d", ex.forgotN, writebacks.Load())
+	}
+
+	// Step 3: acknowledged confirm → exactly one writeback declaring the mismatch
+	// with the ACTUAL identity; master binds it to this member's seat row only.
+	w = doJSON(h.submitCode, `{"session_id":"sess-1","code":"one-shot-code","confirm":true,"identity_mismatch_confirmed":true}`)
+	if w.Code != http.StatusOK || !strings.Contains(w.Body.String(), `"identity_mismatch":true`) {
+		t.Fatalf("acknowledged confirm: %d %s", w.Code, w.Body.String())
+	}
+	if writebacks.Load() != 1 {
+		t.Fatalf("acknowledged confirm must write exactly once, got %d", writebacks.Load())
+	}
+	if !gotWB.IdentityMismatch || gotWB.ExternalID != "wrong-uuid" || gotWB.Identity != "wrong@team.com" {
+		t.Fatalf("writeback must declare the mismatch with the actual identity: %+v", gotWB)
+	}
+	if gotWB.AccessToken != "ACCESS" {
+		t.Fatalf("writeback must carry the exchanged token: %+v", gotWB)
 	}
 	if _, ok := h.sessions.Load("sess-1"); ok {
-		t.Fatal("mismatched browser session remained confirmable")
+		t.Fatal("completed session must be dropped")
 	}
 }
 

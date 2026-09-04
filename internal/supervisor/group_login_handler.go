@@ -27,6 +27,7 @@ import (
 	"time"
 
 	broker "github.com/AiKeyLabs/aikey-auth-broker"
+	"github.com/AiKeyLabs/aikey-proxy/internal/observability"
 )
 
 // poolSessionTTL bounds how long a started-but-uncompleted pool login session is
@@ -353,7 +354,12 @@ func (h *poolLoginHandler) submitCode(w http.ResponseWriter, r *http.Request) {
 		// Confirm gates the WRITEBACK. false (step 1) = exchange only + return the
 		// resolved account for review; true (step 2) = write the reviewed token back.
 		Confirm bool `json:"confirm"`
+		// IdentityMismatchConfirmed is the member's explicit second acknowledgement
+		// for a cross-account browser OAuth login (拍板 2026-09-04). Ignored unless
+		// Confirm is set and the exchanged identity actually differs.
+		IdentityMismatchConfirmed bool `json:"identity_mismatch_confirmed"`
 	}
+	trace := observability.ExtractOrCreate(r)
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		poolErr(w, http.StatusBadRequest, "BAD_BODY", "invalid request body")
 		return
@@ -381,17 +387,24 @@ func (h *poolLoginHandler) submitCode(w http.ResponseWriter, r *http.Request) {
 		poolErr(w, http.StatusBadGateway, "EXCHANGE_FAILED", err.Error())
 		return
 	}
-	if (strings.TrimSpace(identity) != "" || strings.TrimSpace(externalID) != "") &&
+	// spec: R-oauth-token-mint-12.S1 不匹配成为待确认审阅态，零写入
+	// Cross-account browser OAuth (拍板 2026-09-04 — extends the 2026-09-01
+	// sessionKEY ruling to this entry; the 2026-08-27 change had closed BOTH).
+	// Identity evidence present but different: keep the exchanged token as a
+	// REVIEWABLE session instead of consuming it, and require the member's
+	// explicit acknowledgement on confirm. Safe for the same reason as the
+	// sessionKEY entry: the writeback is seat-scoped (R-oauth-token-mint-9.S1)
+	// and carries the ACTUAL provider account id, so the shared pool account row
+	// (email / external_id / token) and every other member stay untouched.
+	// bugfix: workflow/CI/bugfix/2026-09-04-browser-oauth-cross-account-confirm-disabled.md
+	identityMismatch := (strings.TrimSpace(identity) != "" || strings.TrimSpace(externalID) != "") &&
 		!sessionKeyIdentityMatches(poolLoginContext{ExpectedIdentity: sess.expectedIdentity, ExternalID: sess.externalID},
-			broker.IdentityInfo{Email: identity, ExternalID: externalID}) {
-		// Browser OAuth and Session Key are equal writers of one shared account
-		// token. A mismatched provider identity cannot be reviewed into a private
-		// member slot, so consume the broker token and perform zero writeback.
-		h.ex.Forget(r.Context(), req.SessionID, accountID)
-		h.sessions.Delete(req.SessionID)
-		poolErr(w, http.StatusConflict, broker.ErrCodeSessionKeyIdentityMismatch,
-			"The OAuth login belongs to a different account. Select the matching pool account and try again.")
-		return
+			broker.IdentityInfo{Email: identity, ExternalID: externalID})
+	if identityMismatch {
+		slog.Warn("Browser OAuth identity does not match the selected account; awaiting explicit member confirmation",
+			"event.name", observability.EventProxyPoolSessionKeyIdentityMismatch,
+			"error.code", broker.ErrCodeSessionKeyIdentityMismatch, "credential_id", credentialID,
+			"request_id", trace.RequestID, "trace_id", trace.TraceID, "span_id", trace.SpanID)
 	}
 
 	// Step 1 (confirm=false): the code is exchanged and the resolved account returned
@@ -403,7 +416,19 @@ func (h *poolLoginHandler) submitCode(w http.ResponseWriter, r *http.Request) {
 		poolJSON(w, map[string]any{
 			"status": "pending", "identity": identity,
 			"expected_identity": sess.expectedIdentity, "provider_code": sess.providerCode,
+			"identity_mismatch": identityMismatch,
 		})
+		return
+	}
+
+	// spec: R-oauth-token-mint-12.S2 普通 confirm 不能一键写入跨账号 token
+	// The session AND the held token are deliberately kept: the member can
+	// re-confirm with the acknowledgement, or cancel. Destroying them here (the
+	// pre-2026-09-04 behavior) forced a full re-authorization just to answer the
+	// warning, which is why the page disabled its own confirm button instead.
+	if identityMismatch && !req.IdentityMismatchConfirmed {
+		poolErr(w, http.StatusConflict, broker.ErrCodeSessionKeyIdentityMismatch,
+			"The OAuth login belongs to a different account. Re-confirm with the mismatch acknowledgement to bind it to your seat, or cancel.")
 		return
 	}
 
@@ -422,6 +447,8 @@ func (h *poolLoginHandler) submitCode(w http.ResponseWriter, r *http.Request) {
 		CredentialID: credentialID, AccessToken: access, RefreshToken: refresh, ExpiresAt: exp,
 		ExternalID: externalID, ProviderCode: sess.providerCode, ProtocolType: sess.protocolType,
 		OauthGroupID: sess.oauthGroupID, AccountID: sess.accountID, Identity: identity,
+		// spec: R-oauth-token-mint-12.S3 显式确认后绑定本人 seat 行，账号行零变更
+		IdentityMismatch: identityMismatch,
 	}); err != nil {
 		// DELIBERATELY keep the session (do NOT delete here): the code was already
 		// spent, so the member must be able to retry just the writeback. SubmitCode is
@@ -460,7 +487,8 @@ func (h *poolLoginHandler) submitCode(w http.ResponseWriter, r *http.Request) {
 	// shows which Claude account was actually logged into and can warn (yellow) if it
 	// doesn't match the team account this slot expects. Email is not a secret (already
 	// shown as the account identity); the token still never leaves the proxy.
-	resp := map[string]any{"status": "ok", "identity": identity, "sync_status": syncStatus}
+	resp := map[string]any{"status": "ok", "identity": identity, "sync_status": syncStatus,
+		"identity_mismatch": identityMismatch}
 	if syncError != "" {
 		resp["sync_error"] = syncError
 	}
