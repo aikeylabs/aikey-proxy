@@ -15,6 +15,7 @@ import (
 
 	"github.com/AiKeyLabs/aikey-proxy/internal/config"
 	"github.com/AiKeyLabs/aikey-proxy/internal/events"
+	"github.com/AiKeyLabs/aikey-proxy/internal/mcp"
 	"github.com/AiKeyLabs/aikey-proxy/internal/observability"
 	providerreg "github.com/AiKeyLabs/aikey-proxy/internal/provider"
 	"github.com/AiKeyLabs/aikey-proxy/internal/proxy/apppipe"
@@ -69,6 +70,9 @@ type Handler struct {
 	ReplayDeadLetterFn func(ctx context.Context) (events.ReplayDeadLetterResult, error)
 	// CanaryResultFn returns the latest canary probe result (nil = canary disabled).
 	CanaryResultFn func() *events.CanaryResult
+	// MCPMetricsFn returns the MCP plane's counters, or nil when this node has
+	// no MCP plane mounted.
+	MCPMetricsFn func() *mcp.CallMetrics
 
 	// DebugUpstreamHeadersStateFn / DebugUpstreamHeadersSetFn drive the
 	// /admin/debug/upstream-headers endpoints. State returns the resolved
@@ -134,6 +138,20 @@ type Handler struct {
 	// (re-send WAL-present gaps, confirm WAL-absent gaps lost now). nil → 503.
 	AuditStatusFn   func() *events.AuditStatus
 	ReconcileGapsFn func(ctx context.Context) (events.ReconcileResult, error)
+
+	// MCPLocalReviewFn / MCPLocalAcceptFn / MCPLocalWriteOpFn drive
+	// `aikey mcp review` on Personal edition (阶段8 P14 task 14.3). All three
+	// are nil on a node that follows a control plane, where reviewing a tool is
+	// the console's job — and the handlers say exactly that rather than
+	// reporting a generic misconfiguration.
+	MCPLocalReviewFn  func() ([]mcp.ReviewBackend, string)
+	MCPLocalAcceptFn  func(backendID string, exclude []string) (mcp.AcceptResult, error)
+	MCPLocalWriteOpFn func(backendID, tool string, writeOp bool) error
+	// MCPLocalRefreshFn re-reads mcp.json and probes every backend NOW.
+	// 🔴 Its absence was a real gap, not a convenience: `mountLocalMCP` runs
+	// only at start-up, so a server registered by `aikey mcp add` did nothing
+	// until the proxy was restarted and nothing said so.
+	MCPLocalRefreshFn func() error
 
 	// GetUpstreamProxyFn / SetUpstreamProxyFn back the GET/PUT /admin/upstream-proxy
 	// endpoints that the local web "Settings → Upstream proxy" card relays to. Get
@@ -473,8 +491,18 @@ type metricsResponse struct {
 	Reporter          *events.ReporterMetrics  `json:"reporter,omitempty"`
 	Collector         *events.CollectorMetrics `json:"collector,omitempty"`
 	Canary            *events.CanaryResult     `json:"canary,omitempty"`
-	TotalRequests     int64                    `json:"total_requests"`
-	TotalErrors       int64                    `json:"total_errors"`
+	// MCP is the MCP gateway plane's counters. Omitted entirely on a node with
+	// no MCP plane, rather than rendered as a block of zeros — 🔴 "this build
+	// has no MCP gateway" and "it has one and nobody has used it" are different
+	// facts, and a dashboard cannot tell them apart from zeros.
+	//
+	// 🔴 These are TRENDS for the customer's monitoring system. The release
+	// gate's health assertions read GET /health/mcp instead: a counter cannot
+	// say "the policy rail has been unreachable for 40 minutes", and this
+	// endpoint's numbers keep looking fine while it is (task 7.6a / 7.6b).
+	MCP           *mcp.CallMetrics `json:"mcp,omitempty"`
+	TotalRequests int64            `json:"total_requests"`
+	TotalErrors   int64            `json:"total_errors"`
 }
 
 // Metrics returns aggregated usage metrics.
@@ -509,6 +537,10 @@ func (h *Handler) Metrics(w http.ResponseWriter, r *http.Request) {
 	if h.CanaryResultFn != nil {
 		canaryResult = h.CanaryResultFn()
 	}
+	var mcpMetrics *mcp.CallMetrics
+	if h.MCPMetricsFn != nil {
+		mcpMetrics = h.MCPMetricsFn()
+	}
 
 	writeJSON(w, http.StatusOK, metricsResponse{
 		TotalRequests:      totalReqs,
@@ -519,6 +551,7 @@ func (h *Handler) Metrics(w http.ResponseWriter, r *http.Request) {
 		Reporter:           reporterMetrics,
 		Collector:          collectorMetrics,
 		Canary:             canaryResult,
+		MCP:                mcpMetrics,
 	})
 }
 
@@ -1596,5 +1629,164 @@ func (h *Handler) DebugUpstreamHeadersClear(w http.ResponseWriter, r *http.Reque
 	writeJSON(w, http.StatusOK, map[string]any{
 		"enabled": enabled,
 		"source":  source,
+	})
+}
+
+// ---------------------------------------------------------------------------
+// Personal edition's tool-approval review (阶段8 P14, task 14.3)
+// ---------------------------------------------------------------------------
+//
+// # Why these live on the proxy rather than in the CLI
+//
+// The approval record is the proxy's: it is the proxy that reaches the backend,
+// computes the fingerprint and serves the toolset. Letting `aikey mcp review`
+// edit the file directly would give one document two writers in two languages —
+// the exact shape that made `mcp.json` need a cross-language contract fence, but
+// worse, because here the two writers would race on a live security decision.
+//
+// So the CLI asks the running proxy, the same way `aikey mcp test` already does.
+// 🔴 That also keeps `review` zero-password: the proxy already holds everything
+// needed, and nothing here touches the vault.
+//
+// These routes carry no secret and are loopback-open like every other /admin
+// route (a remote caller needs the control service token). What they DO expose
+// is the full text of every tool description — which is the point: a poisoned
+// description is the attack, and showing only the tool name is the same as
+// showing nothing (14.3d).
+
+// MCPLocalManifest serves GET /admin/mcp/local-manifest.
+func (h *Handler) MCPLocalManifest(w http.ResponseWriter, _ *http.Request) {
+	if h.MCPLocalReviewFn == nil {
+		// 🔴 A distinct message, not a generic 503. This node follows a control
+		// plane, where reviewing is the console's job — telling the user "not
+		// configured" would send them to look for a setting that should not
+		// exist here.
+		writeJSON(w, http.StatusServiceUnavailable, map[string]string{
+			"error": "this node follows a control plane; tool review happens in the console, not on the proxy",
+		})
+		return
+	}
+	backends, loadErr := h.MCPLocalReviewFn()
+	if backends == nil {
+		backends = []mcp.ReviewBackend{}
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"backends": backends,
+		// 🔴 Surfaced, never omitted when set: an unreadable approval record
+		// means every tool is being served at whatever the upstream says today.
+		"approvals_unreadable": loadErr,
+	})
+}
+
+// MCPLocalManifestAccept serves POST /admin/mcp/local-manifest/accept.
+func (h *Handler) MCPLocalManifestAccept(w http.ResponseWriter, r *http.Request) {
+	if h.MCPLocalAcceptFn == nil {
+		writeJSON(w, http.StatusServiceUnavailable, map[string]string{
+			"error": "this node follows a control plane; tool review happens in the console, not on the proxy",
+		})
+		return
+	}
+	var body struct {
+		Backend string `json:"backend"`
+		// Exclude is the deselection. 🔴 Absent means "all of it", which is the
+		// adoption default (14.3c): the human looks for anything obviously
+		// wrong rather than ticking forty boxes.
+		Exclude []string `json:"exclude"`
+	}
+	if err := json.NewDecoder(io.LimitReader(r.Body, 64<<10)).Decode(&body); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "body must be {\"backend\":\"<name>\",\"exclude\":[..]}"})
+		return
+	}
+	if strings.TrimSpace(body.Backend) == "" {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "backend must not be empty"})
+		return
+	}
+	res, err := h.MCPLocalAcceptFn(strings.TrimSpace(body.Backend), body.Exclude)
+	if err != nil {
+		// 🔴 404, not 500: "there is nothing waiting for you" is a fact about
+		// the request, and reporting it as a server fault would send the user to
+		// read proxy logs for a state that is entirely normal.
+		writeJSON(w, http.StatusNotFound, map[string]string{"error": err.Error()})
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"backend":      body.Backend,
+		"first_review": res.FirstReview,
+		"published":    res.Published,
+		"rejected":     res.Rejected,
+		"repinned":     res.Repinned,
+	})
+}
+
+// MCPLocalToolWriteOp serves POST /admin/mcp/local-manifest/write-op.
+//
+// 🔴 This is what makes the review gate substantive rather than ceremonial
+// (14.3e): the human's answer to "does this tool make changes" is the input the
+// freeze rule grades on. 🚫 It is never taken from the upstream's own
+// readOnlyHint — the upstream is the party being guarded against (I4c).
+func (h *Handler) MCPLocalToolWriteOp(w http.ResponseWriter, r *http.Request) {
+	if h.MCPLocalWriteOpFn == nil {
+		writeJSON(w, http.StatusServiceUnavailable, map[string]string{
+			"error": "this node follows a control plane; tool review happens in the console, not on the proxy",
+		})
+		return
+	}
+	var body struct {
+		Backend string `json:"backend"`
+		Tool    string `json:"tool"`
+		// 🔴 A POINTER. A missing bool decodes to false, and false is the
+		// DANGEROUS direction here — it would mark a write tool read-only, which
+		// is precisely the mistake the default-true rule exists to prevent.
+		WriteOp *bool `json:"write_op"`
+	}
+	if err := json.NewDecoder(io.LimitReader(r.Body, 4<<10)).Decode(&body); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "body must be {\"backend\":..,\"tool\":..,\"write_op\":true|false}"})
+		return
+	}
+	if strings.TrimSpace(body.Backend) == "" || strings.TrimSpace(body.Tool) == "" {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "backend and tool must not be empty"})
+		return
+	}
+	if body.WriteOp == nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{
+			"error": "write_op must be given explicitly as true or false; omitting it would be read as read-only, which is the dangerous direction",
+		})
+		return
+	}
+	if err := h.MCPLocalWriteOpFn(strings.TrimSpace(body.Backend), strings.TrimSpace(body.Tool), *body.WriteOp); err != nil {
+		writeJSON(w, http.StatusNotFound, map[string]string{"error": err.Error()})
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"backend": body.Backend, "tool": body.Tool, "write_op": *body.WriteOp,
+	})
+}
+
+// MCPLocalRefresh serves POST /admin/mcp/local-manifest/refresh: re-read
+// mcp.json and probe every backend in it, now.
+//
+// 🔴 The response is the REVIEW DOCUMENT, not an acknowledgement. The caller
+// registered a server a moment ago and its next question is always "what did
+// you find" — answering it in the same round trip is what lets `aikey mcp adopt`
+// show the human their new tools instead of telling them to come back when a
+// five-minute timer next fires.
+func (h *Handler) MCPLocalRefresh(w http.ResponseWriter, _ *http.Request) {
+	if h.MCPLocalRefreshFn == nil || h.MCPLocalReviewFn == nil {
+		writeJSON(w, http.StatusServiceUnavailable, map[string]string{
+			"error": "this node follows a control plane; its tool inventory comes from there, not from a local config file",
+		})
+		return
+	}
+	if err := h.MCPLocalRefreshFn(); err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+		return
+	}
+	backends, loadErr := h.MCPLocalReviewFn()
+	if backends == nil {
+		backends = []mcp.ReviewBackend{}
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"backends":             backends,
+		"approvals_unreadable": loadErr,
 	})
 }

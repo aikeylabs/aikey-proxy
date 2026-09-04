@@ -171,6 +171,66 @@ const dbReason = "PLANE-01: 热路径无 DB 调用. A query per request couples 
 // above visible too. Whoever adjudicates PLANE-01 should decide these three as a
 // group with them, not wave them through on the goroutine alone.
 var hotPathFileCalls = map[string]struct{}{
+	// ── MCP policy cache (阶段8 P2) ─────────────────────────────────────────
+	//
+	// 🔴 A FALSE POSITIVE of this fence's deliberate name-based resolution, and
+	// recorded here rather than "fixed" because the over-approximation is the
+	// design (see this file's header).
+	//
+	// PolicyCache.Load is reached only because the walk follows every method
+	// named `Load` from any `x.Load()` on the hot path — of which there are many
+	// (atomic.Value, atomic.Int64, sync.Map). Its REAL call sites are two, both
+	// in internal/supervisor/mcp_policy.go and neither on a request:
+	//
+	//	NewMCPPolicyRail   once, at process start, before the listener serves
+	//	syncMCPPolicy      once per 60s poll tick, on the poller goroutine
+	//
+	// The MCP plane does not run inside (*Proxy).Handle at all: it is a separate
+	// RouteRegistrar mounted on the shared mux (app.buildMCPPlane), so an MCP
+	// request never enters this entry point, and an LLM request never enters the
+	// MCP plane.
+	//
+	// 🔴 If that stops being true — if anything ever calls PolicyCache.Load from
+	// a request — this line becomes a lie rather than a false positive. The
+	// verification is one grep: `PolicyCache` must appear in no file reachable
+	// from Proxy.Handle.
+	"internal/mcp::PolicyCache.Load|os.ReadFile": {},
+	// ── MCP credential store (阶段8 P4) ─────────────────────────────────────
+	//
+	// 🔴 The SAME false positive as PolicyCache.Load above, via a different
+	// colliding name, and recorded rather than "fixed" for the same reason.
+	//
+	// The edge is `CredentialStore.Replace`. The hot path calls `strings.Replace`
+	// (among others), the walk resolves callees by NAME, and so every method
+	// named `Replace` in the module joins the graph — including this one, which
+	// then reaches writeSealedCache → atomicWriteFile. VERIFIED, not assumed:
+	// a probe over this same graph showed Replace/writeSealedCache/atomicWriteFile
+	// reachable while RestoreFromCache (which nothing on the hot path names) is
+	// not — exactly the signature of a name collision rather than a real path.
+	//
+	// The REAL call sites of CredentialStore.Replace are one, and it is not a
+	// request:
+	//
+	//	Supervisor.syncMCPCredentials   once per 60s poll tick, on the rail
+	//	                                goroutine (internal/supervisor/
+	//	                                mcp_credential_rail.go)
+	//
+	// The MCP plane does not run inside (*Proxy).Handle at all — it is a
+	// separate RouteRegistrar on the shared mux (app.buildMCPPlane) — and even
+	// an MCP tool call only ever READS this store (CredentialStore.Resolve,
+	// which touches no file).
+	//
+	// 🔴 If that stops being true — if anything ever writes the credential cache
+	// from a request — this becomes a lie rather than a false positive. The
+	// verification is one grep: `CredentialStore.Replace` and
+	// `RestoreFromCache` must have no caller reachable from a request handler.
+	// 🚫 A colliding method name is not a reason to rename a good one; the
+	// previous `persist` WAS renamed (to writeSealedCache) because it collided
+	// with internal/proxy's own lastErrorsRing.persist and dragged an unrelated
+	// package's file writes into this list, which would have made the baseline
+	// describe something it does not.
+	"internal/mcp::atomicWriteFile|os.MkdirAll":              {},
+	"internal/mcp::atomicWriteFile|os.Remove":                {},
 	"internal/apphook::ChildHook.spawnLocked|os.Stat":        {},
 	"internal/events::ContentWAL.ensureFile|os.OpenFile":     {},
 	"internal/events::ContentWAL.evictBeyondCap|os.Remove":   {},

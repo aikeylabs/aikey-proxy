@@ -22,9 +22,11 @@ import (
 	"golang.org/x/term"
 
 	"github.com/AiKeyLabs/aikey-proxy/internal/admin"
+	"github.com/AiKeyLabs/aikey-proxy/internal/apphook"
 	"github.com/AiKeyLabs/aikey-proxy/internal/config"
 	"github.com/AiKeyLabs/aikey-proxy/internal/events"
 	"github.com/AiKeyLabs/aikey-proxy/internal/licenseoff"
+	"github.com/AiKeyLabs/aikey-proxy/internal/mcp"
 	"github.com/AiKeyLabs/aikey-proxy/internal/observability"
 	"github.com/AiKeyLabs/aikey-proxy/internal/proxy"
 	proxyruntime "github.com/AiKeyLabs/aikey-proxy/internal/runtime"
@@ -39,6 +41,7 @@ import (
 	"github.com/AiKeyLabs/pkg/aikeycompat"
 	"github.com/AiKeyLabs/pkg/buildinfo"
 	"github.com/AiKeyLabs/pkg/egress"
+	"github.com/AiKeyLabs/pkg/fallbackpolicy"
 
 	// Protocol-translator pair registrations (Phase 2). Each blank-import
 	// fires the pair package's init() which registers (from, to) transforms
@@ -484,6 +487,19 @@ func Run() {
 	adminHandler.ReporterMetricsFn = sup.ReporterMetrics
 	adminHandler.CollectorMetricsFn = sup.CollectorMetrics
 	adminHandler.ReplayDeadLetterFn = sup.ReplayDeadLetter
+	// 阶段8 P14 task 14.3 — Personal edition's review surface. 🔴 Wired through
+	// a nil check on the publisher, not on the supervisor: on a node with a
+	// control plane the publisher does not exist, and the admin routes must then
+	// say "review happens in the console" rather than answer with an empty list
+	// that reads as "nothing to review".
+	if pub := sup.MCPLocalPublisher(); pub != nil {
+		adminHandler.MCPLocalReviewFn = func() ([]mcp.ReviewBackend, string) {
+			return pub.Review(), pub.LoadError()
+		}
+		adminHandler.MCPLocalAcceptFn = pub.Accept
+		adminHandler.MCPLocalWriteOpFn = pub.SetWriteOp
+		adminHandler.MCPLocalRefreshFn = sup.RefreshLocalMCP
+	}
 	adminHandler.CanaryResultFn = sup.CanaryResult
 	adminHandler.DebugUpstreamHeadersStateFn = proxy.UpstreamHeadersDebugState
 	adminHandler.DebugUpstreamHeadersSetFn = proxy.SetUpstreamHeadersDebugAPIOverride
@@ -774,12 +790,51 @@ func Run() {
 	// 7. Build and start the HTTP server. Only non-nil registrars are passed
 	// (server.New does not nil-guard; oauthHandler/poolHandler are nil when the
 	// vault/broker is unavailable).
-	extraRegistrars := make([]server.RouteRegistrar, 0, 2)
+	extraRegistrars := make([]server.RouteRegistrar, 0, 3)
 	if oauthHandler != nil {
 		extraRegistrars = append(extraRegistrars, oauthHandler)
 	}
 	if poolHandler != nil {
 		extraRegistrars = append(extraRegistrars, poolHandler)
+	}
+	// 阶段8: install the MCP policy rail before building the plane. The rail
+	// restores the on-disk cache at construction, so a proxy starting while the
+	// control plane is down serves its last known policy immediately instead of
+	// serving nothing until the control plane returns.
+	//
+	// 🔴 Two producers, one snapshot. A node WITH a control plane follows the
+	// rail; a node WITHOUT one (Personal) builds the same snapshot from its own
+	// mcp.json. Before P5 the second case simply did not mount the plane, which
+	// was correct while there was nothing to authorise against and wrong for the
+	// edition the design calls stdio hosting's primary form.
+	if orgID := sup.MCPPolicyOrgID(); orgID == "" {
+		// Personal edition (P5, design §5.3): no control plane, so the policy
+		// comes from this machine's own mcp.json. 🔴 The plane, the catalog, the
+		// grant evaluation and the freeze rules are IDENTICAL to Production —
+		// only the producer of the snapshot differs. Personal gets less
+		// configuration, never fewer checks.
+		mountLocalMCP(sup)
+	} else {
+		sup.EnableMCPPolicyRail(supervisor.NewMCPPolicyRail(orgID, slog.Default()))
+		// P4: the credential store, installed alongside the policy rail because
+		// the two answer the same question from opposite sides — the policy says
+		// WHICH credential a backend uses, this holds WHAT it is.
+		//
+		// 🔴 The seal key is resolved per use through the supervisor, never
+		// captured here: this runs before the first generation is necessarily
+		// stable, and a captured key would keep sealing with a key the vault no
+		// longer uses. The failure mode of getting that wrong is silent —
+		// writes keep succeeding and reads always come back empty.
+		sup.EnableMCPCredentialStore(mcp.NewCredentialStore(
+			mcpRunDir(), sup.VaultDerivedKey, slog.Default()))
+	}
+	if mcpHandler := buildMCPPlane(sup, ln.Addr().String()); mcpHandler != nil {
+		extraRegistrars = append(extraRegistrars, mcpHandler)
+		// 🔴 TRENDS for the customer's monitoring system. The release gate reads
+		// GET /health/mcp instead — a counter cannot say "the policy rail has
+		// been unreachable for 40 minutes", and these numbers keep looking fine
+		// while it is (task 7.6a/7.6b).
+		adminHandler.MCPMetricsFn = mcpHandler.CallMetrics
 	}
 	// Control-plane gate. The token is the cluster's control service token, which
 	// cluster-install already writes into this node's config; a non-cluster
@@ -799,6 +854,21 @@ func Run() {
 	// /health gate. See Supervisor.StartPolicyPollers. Bugfix
 	// 20260725-proxy-startup-reload-storm-5s-health-fail.
 	sup.StartPolicyPollers()
+	// 阶段8 P3: probe each MCP backend's tools/list on its own (slower) timer and
+	// report what we saw. 🔴 Started AFTER the policy rail, because it probes the
+	// backends the policy names — starting it first would give it nothing to do
+	// and make its first useful round five minutes late.
+	sup.StartMCPManifestSync()
+	// Personal's equivalent: probe the locally hosted backends so their tools are
+	// discovered. 🔴 Both are called unconditionally and each is a no-op on the
+	// edition it does not belong to — an `if edition ==` here would be a third
+	// place that has to know which producer is active.
+	sup.StartLocalMCPManifestSync()
+	// 阶段8 P7: ship recorded tool calls to the control plane. 🔴 A no-op on a
+	// node that follows none — Personal's record is the LOCAL table, read by the
+	// CLI, and a loop that could never succeed would WARN every thirty seconds
+	// until operators learned to ignore WARNs.
+	sup.StartMCPCallRail()
 
 	// Wait for either an OS shutdown signal OR a graceful self-restart request
 	// from the control-plane healer (selfheal.go): the proxy went stale after a
@@ -1425,4 +1495,308 @@ func (a *brokerAdapter) ResolveCredential(ctx context.Context, accountID string)
 func (a *brokerAdapter) GetAccountStatus(ctx context.Context, accountID string) (string, error) {
 	status, err := a.inner.GetAccountStatus(ctx, accountID)
 	return string(status), err
+}
+
+// mcpPlaneDeps is the slice of the supervisor the MCP plane needs.
+//
+// An interface rather than *supervisor.Supervisor so the WIRING fence can call
+// this exact function with a fake. Testing a copy of the wiring proves nothing
+// about the wiring — "built, tested, never mounted" is precisely the failure
+// this seam exists to make catchable.
+type mcpPlaneDeps interface {
+	Registry() *vkeys.Registry
+	FallbackPolicyCache() *proxy.FallbackPolicyCache
+	// MCPPolicyStore returns the live policy snapshot, or nil on a node with no
+	// control plane. 🔴 The STORE, not a copy: the plane reads the current
+	// snapshot on every request, and a copy would freeze whatever was current at
+	// wiring time.
+	MCPPolicyStore() *mcp.PolicyStore
+	// MCPCredentialStore supplies backend credential material. nil on a node
+	// that resolves no credentials.
+	MCPCredentialStore() *mcp.CredentialStore
+	// MCPManifestSyncer supplies backend health and circuit cooldowns. nil on a
+	// node with no control plane, or before the sync starts.
+	MCPManifestSyncer() *mcp.ManifestSyncer
+	// MCPLocalPublisher is Personal edition's approval state. nil on a node
+	// that follows a control plane, where reviewing is the console's job.
+	MCPLocalPublisher() *mcp.LocalPublisher
+	// FilterHook is the DLP filter child. 🔴 A method, called per request, for
+	// the same reason the syncer is: the child belongs to a config generation.
+	FilterHook() apphook.Hook
+	// UploadComplianceEvents delivers filter-produced audit events.
+	UploadComplianceEvents(ctx context.Context, events [][]byte)
+	// EventStore is where a finished tool call is recorded. 🔴 A getter, not a
+	// value: the store is rebuilt on config reload, and a captured handle would
+	// be closed from the first reload onward — so every call would be dropped
+	// from then on, on a proxy that looks entirely healthy.
+	EventStore() *events.Store
+}
+
+// buildMCPPlane wires the MCP gateway onto the shared listener.
+//
+// # What is mounted, stated plainly
+//
+// Endpoints, virtual-key authentication, protocol negotiation, sessions, the
+// isolation shell, and — as of P2 — the real tool catalog: toolsets, per-seat
+// grants and the manifest-freeze rule, all driven by the control plane's 60s
+// policy rail.
+//
+// 🔴 The P1 placeholder catalog and its startup WARN were removed TOGETHER.
+// Removing the warning while leaving the fixture would have turned a loudly
+// declared gap into a silent tenancy hole, which is exactly what the warning
+// existed to prevent.
+//
+// # What is still NOT here
+//
+// Tool EXECUTION. A grant is enforced and a call is authorised, but the upstream
+// connection (P3) and managed backend credentials (P4) do not exist yet, so an
+// authorised call answers MCP_BACKEND_UNAVAILABLE and says so in as many words.
+// 🔴 Deliberately a truthful refusal rather than a passthrough: a half-built
+// execution path would start working one day and skip the checks that had not
+// been written when it was wired.
+//
+// spec: workflow/CI/requirements/2026-08-20-mcp-gateway.md
+// design: roadmap20260320/技术实现/阶段8-平台化/MCP网关/
+// 🔴 It returns the CONCRETE handler, not the RouteRegistrar interface. The
+// caller needs both facets — mount the routes AND read the plane's counters for
+// /metrics — and returning the interface would force either a type assertion at
+// the call site or a package-level counter set shared by every plane in a test
+// binary. A concrete nil also keeps the caller's `!= nil` check honest, which an
+// interface holding a typed nil would not.
+func buildMCPPlane(sup mcpPlaneDeps, listenAddr string) *mcp.Handler {
+	if sup == nil || sup.Registry() == nil {
+		// 🔴 No key registry means no way to authenticate anyone. Mounting
+		// anyway would answer every request 503 from inside the plane, which
+		// reads to a client as "the gateway is broken" rather than "this node
+		// has no keys". Not mounting yields a plain 404, which is the truth.
+		slog.Debug("MCP gateway not mounted: the virtual-key registry is unavailable")
+		return nil
+	}
+
+	policyStore := sup.MCPPolicyStore()
+	if policyStore == nil {
+		// 🔴 No control plane on this node (Personal). There is no org to hold
+		// grants, so there is nothing to authorise against — and a gateway that
+		// cannot authorise must not serve. Personal's own MCP story is local
+		// stdio backends (P5), which mounts through a different path.
+		slog.Debug("MCP gateway not mounted: this node follows no control plane, so it has no tool grants")
+		return nil
+	}
+
+	// 🔴 The timeout is READ LIVE from the same fallback-policy cache the LLM
+	// path uses (pkg/fallbackpolicy three-state resolution), not snapshotted
+	// here: the org policy arrives on the 60s poll, which starts only after this
+	// function has returned.
+	var resolve func() fallbackpolicy.Effective
+	if policyCache := sup.FallbackPolicyCache(); policyCache != nil {
+		resolve = policyCache.Snapshot
+	}
+
+	base := mcpExternalBaseURL(listenAddr)
+	callStats := mcp.NewCallStats()
+	h := mcp.NewHandler(mcp.Config{
+		// 🔴 The policy-backed catalog applies grants AND the freeze rule at READ
+		// time, per requester. Nothing here caches an authorisation decision, and
+		// nothing may learn to (R8).
+		//
+		// seatGroups is nil today: group grants resolve once the proxy carries a
+		// seat→group map. Passing nil is the SAFE direction — a missing resolver
+		// can only fail to grant, never grant something extra.
+		Catalog: mcp.NewPolicyCatalog(policyStore, nil),
+		// 🔴 Reusing the SAME vkeys registry as LLM forwarding is decision D-2:
+		// no second credential system, and MCP inherits key revocation for free —
+		// the supervisor drops a revoked token and the next MCP request simply
+		// fails to resolve, with no MCP-specific code involved.
+		Resolver:        sup.Registry(),
+		Isolation:       mcp.NewIsolation(mcp.DefaultPlaneConcurrency, resolve, slog.Default()),
+		ExternalBaseURL: base,
+		Logger:          slog.Default(),
+		// PolicyStore lets /health/mcp report how long since the control plane
+		// was last reached — the single most useful thing that endpoint says
+		// during an incident.
+		PolicyStore: policyStore,
+		// 🔴 Through a nil-safe helper, NOT `sup.MCPLocalPublisher()` directly:
+		// a nil *LocalPublisher stored in a non-nil interface passes every
+		// `!= nil` check downstream and panics on first use — on a Personal node
+		// serving a health request, which is to say in front of a user.
+		LocalApprovals: localApprovals(sup),
+		// Syncer supplies per-backend health and the circuit cooldown, so a
+		// refusal can carry a NUMBER rather than "try again later".
+		// 🔴 A getter, read per request. The sync starts after this function
+		// returns, so capturing the value here would pin nil forever and every
+		// cooldown would silently read as zero.
+		Syncer: sup.MCPManifestSyncer,
+		// P4: backend credential material, resolved from the proxy's own store.
+		//
+		// 🔴 Still nil on a node that has no store, and nil keeps the P3
+		// behaviour: a backend that declares a credential is REFUSED rather than
+		// tried unauthenticated — a bare request to an endpoint expecting auth
+		// yields a 401 that reads like the customer's token is wrong.
+		//
+		// 🔴 Assigned through a typed local, never `sup.MCPCredentialStore()`
+		// straight into the interface field: a nil *CredentialStore inside a
+		// non-nil interface passes every `== nil` guard downstream and panics on
+		// first use, on exactly the nodes that have credentialled backends.
+		Credentials: credentialResolver(sup),
+		// P7: every tools/call is recorded locally, refusals included (R10).
+		//
+		// 🔴 LOCAL FIRST, shipped afterwards by the drain rail. Recording through
+		// an HTTP call to the control plane would put a customer's tool call
+		// behind our availability — precisely the coupling the isolation shell
+		// exists to prevent — and would lose the record outright whenever we were
+		// unreachable. The local row IS the queue.
+		Calls:     events.NewMCPCallRecorder(sup.EventStore, slog.Default(), callStats.NoteDropped),
+		CallStats: callStats,
+		// P7 task 7.3: tool arguments and tool RESULTS go past the SAME DLP
+		// filter the LLM path uses — the same child, the same rule packs.
+		//
+		// 🔴 A getter, read per request: the filter child belongs to a config
+		// generation, and a captured value would make every scan report
+		// "degraded" after the first reload on a proxy whose filter is fine.
+		//
+		// 🔴 nil when no filter app is installed, which is the common default.
+		// The plane still serves — a gateway that refused every tool call
+		// because no optional DLP app was present would make the option
+		// mandatory by accident.
+		Compliance: sup.FilterHook,
+		// The MCP plane only mounts on a node that follows a control plane, so
+		// its findings are always team-routed.
+		ComplianceRouteClass: apphook.RouteClassTeam,
+		ComplianceEvents:     sup.UploadComplianceEvents,
+	})
+
+	slog.Info("MCP gateway mounted",
+		"endpoint", base+"/mcp/{toolset}",
+		"capabilities", base+"/mcp/capabilities",
+		"health", base+"/health/mcp")
+	return h
+}
+
+// mountLocalMCP builds Personal edition's MCP policy from ~/.aikey/mcp.json.
+//
+// 🔴 Every failure here is NON-FATAL and LOUD. This runs during startup of a
+// proxy whose main job is forwarding LLM traffic; a malformed MCP config must
+// never stop that. But it must also never be silent — a user who ran
+// `aikey mcp add` and then finds no tools needs the reason in the log, not an
+// endpoint that 404s with no explanation.
+func mountLocalMCP(sup *supervisor.Supervisor) {
+	path, err := mcp.LocalConfigPath()
+	if err != nil {
+		slog.Warn("MCP local config: cannot resolve the config directory; no local tools will be served",
+			"error", err)
+		return
+	}
+	cfg, err := mcp.LoadLocalConfig(path)
+	if errors.Is(err, mcp.ErrNoLocalConfig) {
+		// The normal state for a user who has never run `aikey mcp add`.
+		// 🔴 Debug, not Warn: this is the majority of installs, and warning here
+		// would train every Personal user to ignore MCP log lines.
+		slog.Debug("MCP local config: none present; the MCP gateway is not mounted", "path", path)
+		return
+	}
+	if err != nil {
+		slog.Error("MCP local config is unusable; no local tools will be served until it is fixed",
+			"event.name", observability.EventProxyMCPLocalConfigInvalid,
+			"path", path, "error", err)
+		return
+	}
+
+	// The identity a locally-issued key resolves to. Personal has no org and no
+	// seat, so both are empty — and the grant the policy carries names exactly
+	// that, so the SAME grant evaluator that runs on Production is what admits
+	// the call here. 🚫 No bypass branch in the evaluator.
+	const localOrg, localSeat = "", ""
+
+	lookup := sup.VaultSecretLookup()
+	policy, problems := mcp.BuildLocalPolicy(cfg, localOrg, localSeat, lookup)
+	for _, p := range problems {
+		// Each one names a specific backend and what to run to fix it.
+		slog.Error("MCP local backend is misconfigured and has been disabled",
+			"event.name", observability.EventProxyMCPLocalConfigInvalid, "error", p.Error())
+	}
+
+	store := mcp.NewPolicyStore()
+	store.Store(policy)
+	if err := sup.EnableLocalMCPPolicy(store); err != nil {
+		slog.Warn("MCP local config ignored", "error", err)
+		return
+	}
+
+	// Credentials take the SAME store, the same resolver and the same
+	// never-in-argv injection path as a control-plane backend (P4). 🔴 A
+	// separate "local credential" path would be a second place for the
+	// redaction and env-injection rules to live, and the second one is the one
+	// that gets them wrong.
+	credStore := mcp.NewCredentialStore(mcpRunDir(), sup.VaultDerivedKey, slog.Default())
+	material, credProblems := mcp.LocalCredentialMaterial(cfg, lookup)
+	for _, p := range credProblems {
+		slog.Error("MCP local backend credential could not be read",
+			"event.name", observability.EventProxyMCPLocalConfigInvalid, "error", p.Error())
+	}
+	credStore.Replace(context.Background(), material)
+	sup.EnableMCPCredentialStore(credStore)
+
+	slog.Info("MCP local config loaded",
+		"event.name", observability.EventProxyMCPLocalConfigLoaded,
+		"path", path, "backends", len(policy.Backends), "credentials", len(material))
+}
+
+// mcpRunDir mirrors the policy cache's directory rule: $AIKEY_RUN_DIR when set
+// (which is how tests and the packaged services relocate state), else
+// ~/.aikey/run. An unresolvable home yields "", which the store treats as
+// "memory only" rather than as a startup failure — a disposable cache must
+// never be able to stop the proxy from serving.
+func mcpRunDir() string {
+	if dir := os.Getenv("AIKEY_RUN_DIR"); dir != "" {
+		return dir
+	}
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return ""
+	}
+	return filepath.Join(home, ".aikey", "run")
+}
+
+// localApprovals converts Personal's concrete publisher into the interface the
+// health surface wants, WITHOUT creating a typed nil. Same trap as
+// credentialResolver below, and the same three lines avoid it.
+func localApprovals(sup mcpPlaneDeps) mcp.LocalApprovals {
+	if p := sup.MCPLocalPublisher(); p != nil {
+		return p
+	}
+	return nil
+}
+
+// credentialResolver converts the supervisor's concrete store into the
+// interface the MCP plane wants, WITHOUT creating a typed nil.
+//
+// 🔴 The three lines are not ceremony. `var i I = (*T)(nil)` produces an
+// interface that is not nil, so every `if x != nil` downstream passes and the
+// first method call panics — on a node that has credentialled backends, which
+// is to say in front of a customer rather than in a test.
+func credentialResolver(sup mcpPlaneDeps) mcp.CredentialResolver {
+	if store := sup.MCPCredentialStore(); store != nil {
+		return store
+	}
+	return nil
+}
+
+// mcpExternalBaseURL is how MCP clients address this proxy.
+//
+// Derived from the bound listener rather than from a new config key.
+//
+// 🔴 No new configuration field on purpose: this value only affects two
+// DOCUMENTS — the RFC 9728 metadata and the WWW-Authenticate hint — and never
+// routing. A wrong value sends a STUCK client to the wrong metadata URL; it
+// cannot break working traffic. That is nowhere near enough benefit to justify
+// a permanent config-schema key every deployment would then have to be told
+// about (careful-api-creation). If a reverse-proxied deployment later needs an
+// override, add it then, with that deployment as the evidence.
+func mcpExternalBaseURL(listenAddr string) string {
+	// listenAddr may be ":27200" or "127.0.0.1:27200"; normalise the first form
+	// to loopback, which is what a Personal-edition client actually dials.
+	if strings.HasPrefix(listenAddr, ":") {
+		listenAddr = "127.0.0.1" + listenAddr
+	}
+	return "http://" + listenAddr
 }
