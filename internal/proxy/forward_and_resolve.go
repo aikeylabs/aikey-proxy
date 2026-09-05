@@ -1046,6 +1046,41 @@ func (p *Proxy) serveRoute(w http.ResponseWriter, r *http.Request, route *vkeys.
 				p.recordEvent(r, resp, startTime, route, bearerToken, streaming)
 				return nil
 			}
+			// A 2xx carrying a web page is not an API response. The classic
+			// cause is a base_url pointing at a gateway's SITE instead of its
+			// API root (`https://gw.example` vs `.../v1`): the SPA catch-all
+			// answers 200 text/html to every path, and relaying that page as
+			// if it were JSON/SSE made clients fail with opaque errors
+			// ("stream closed before response.completed") while probes
+			// showed green. Fail loudly with a structured 502 that names the
+			// likely cause; the event is recorded like any other upstream
+			// error. Bugfix: 2026-09-05-add-key-dialog-draft-probe-sends-
+			// unresolvable-source-ref.md (part C).
+			if upstreamAnsweredHTML(resp) {
+				logger.Warn("upstream answered 2xx with an HTML page — base_url likely points at a website, not the API root",
+					"event.name", "proxy.response.upstream_html",
+					"error.code", errCodeUpstreamReturnedHTML,
+					"status_code", resp.StatusCode,
+					"provider", route.ProviderCode,
+					"request_path", r.URL.Path,
+					"response_content_type", resp.Header.Get("Content-Type"),
+				)
+				_ = resp.Body.Close()
+				resp.StatusCode = http.StatusBadGateway
+				resp.Status = "502 Bad Gateway"
+				resp.Header.Del("Content-Length")
+				resp.Header.Del("Content-Encoding")
+				resp.Header.Del("Transfer-Encoding")
+				resp.Header.Set("Content-Type", "application/json")
+				errBody := []byte(`{"error":{"type":"server_error","code":"` + errCodeUpstreamReturnedHTML +
+					`","message":"Upstream answered with an HTML page instead of an API response. ` +
+					`The key's base_url probably points at a website, not the API root — ` +
+					`OpenAI-compatible gateways usually need a /v1 suffix (e.g. https://host/v1)."}}`)
+				resp.Body = io.NopCloser(bytes.NewReader(errBody))
+				resp.ContentLength = int64(len(errBody))
+				p.recordEvent(r, resp, startTime, route, bearerToken, streaming)
+				return nil
+			}
 			// Reverse tool-name rewrite — runs only when forward (in oauth_inject)
 			// stored a mapping on the request context. Real Claude CLI traffic
 			// has no mapping → no-op. See oauth_tool_rewrite.go.

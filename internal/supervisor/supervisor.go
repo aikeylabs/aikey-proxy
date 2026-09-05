@@ -622,7 +622,7 @@ func New(cfg *config.Config, configPath, password, version string) (*Supervisor,
 			s.cfg.Cluster.NodeAddr,
 			s.cfg.Cluster.Weight,
 			s.cfg.Cluster.ServiceToken,
-		)
+		).WithInternalAddr(s.cfg.Cluster.InternalAddr)
 		// Health piggyback (P0-B): forward the co-located cluster-daemon's
 		// status file + proxy-own metrics + usage-pipeline canary verdict on
 		// every heartbeat so node health is externally readable. Pure

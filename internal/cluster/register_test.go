@@ -2,6 +2,7 @@ package cluster
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"net/http"
@@ -89,5 +90,35 @@ func TestRegistrar_RunReRegistersAfterHubForgets(t *testing.T) {
 	if atomic.LoadInt32(&registers) < 2 {
 		t.Fatalf("expected re-registration after 409 heartbeats, registers=%d heartbeats=%d",
 			registers, heartbeats)
+	}
+}
+
+// Fence (update 20260905-集群节点内部地址-ingress走内网): the register payload
+// carries internal_addr only when configured — a fleet without the setting is
+// wire-identical to before the field existed (mixed-version rolling upgrades).
+func TestRegistrar_RegisterPayloadCarriesInternalAddrOnlyWhenSet(t *testing.T) {
+	var got []map[string]any
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var m map[string]any
+		_ = json.NewDecoder(r.Body).Decode(&m)
+		got = append(got, m)
+		_, _ = w.Write([]byte(`{"registered":true,"heartbeat_interval_secs":1}`))
+	}))
+	defer srv.Close()
+
+	if err := NewRegistrar(srv.URL, "n1", "8.235.78.176:27200", 1, "").register(context.Background()); err != nil {
+		t.Fatalf("register (no internal): %v", err)
+	}
+	if err := NewRegistrar(srv.URL, "n1", "8.235.78.176:27200", 1, "").WithInternalAddr(" 10.0.0.11:27200 ").register(context.Background()); err != nil {
+		t.Fatalf("register (internal): %v", err)
+	}
+	if len(got) != 2 {
+		t.Fatalf("captured %d register bodies, want 2", len(got))
+	}
+	if _, present := got[0]["internal_addr"]; present {
+		t.Fatalf("no internal address configured → key must be absent: %v", got[0])
+	}
+	if got[1]["internal_addr"] != "10.0.0.11:27200" || got[1]["addr"] != "8.235.78.176:27200" {
+		t.Fatalf("internal_addr must ride beside addr (trimmed): %v", got[1])
 	}
 }

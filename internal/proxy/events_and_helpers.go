@@ -965,3 +965,24 @@ func stashExtractedFields(r *http.Request, model, promptCacheKey string) {
 		r.Header.Set("x-aikey-kimi-session", promptCacheKey)
 	}
 }
+
+// errCodeUpstreamReturnedHTML is the structured code the proxy answers with
+// when a 2xx upstream response is a web page (see upstreamAnsweredHTML).
+const errCodeUpstreamReturnedHTML = "UPSTREAM_RETURNED_HTML"
+
+// upstreamAnsweredHTML reports whether a successful upstream response is an
+// HTML document rather than an API payload. Decided on the Content-Type
+// only: peeking at the body would have to buffer a stream, and every SPA /
+// web server that serves a page labels it text/html. A JSON or SSE body with
+// a wrong content-type is a different (rarer) failure and is not this guard's
+// business.
+func upstreamAnsweredHTML(resp *http.Response) bool {
+	if resp == nil || resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return false
+	}
+	ct := resp.Header.Get("Content-Type")
+	if i := strings.IndexByte(ct, ';'); i >= 0 {
+		ct = ct[:i]
+	}
+	return strings.EqualFold(strings.TrimSpace(ct), "text/html")
+}

@@ -1117,9 +1117,20 @@ type ProbePingRequest struct {
 
 // ProbePingResponse is what the CLI reads back. `OK` is true iff the TCP
 // handshake completed within the timeout — no HTTP call, no authentication.
+// ProbePingErrCodeUpstreamUnresolved is the stable ErrorCode for "the
+// source_ref could not be resolved to an upstream". The CLI keys its verdict
+// off this code (aggregate_test_outcome → PROBE_UPSTREAM_UNRESOLVED) instead
+// of parsing the human Error text. Bugfix: 2026-09-05-add-key-dialog-draft-
+// probe-sends-unresolvable-source-ref.md (part 2, wire contract).
+const ProbePingErrCodeUpstreamUnresolved = "PROBE_UPSTREAM_UNRESOLVED"
+
 type ProbePingResponse struct {
-	Host      string `json:"host,omitempty"` // echoed back for debugging
-	Error     string `json:"error,omitempty"`
+	Host  string `json:"host,omitempty"` // echoed back for debugging
+	Error string `json:"error,omitempty"`
+	// ErrorCode is the machine-readable reason on OK:false. Additive (older
+	// CLIs ignore it); empty for transport-level failures where the human
+	// Error is all we have.
+	ErrorCode string `json:"error_code,omitempty"`
 	LatencyMs int64  `json:"latency_ms"`
 	OK        bool   `json:"ok"`
 	// ResolvedUpstream is the address actually dialed, echoed back so the
@@ -1210,13 +1221,14 @@ func (h *Handler) ProbePing(w http.ResponseWriter, r *http.Request) {
 			// it is the whole point. 「回落路径必须配告警，🚫 不静默」.
 			logger.Warn("probe ping: cannot resolve the upstream for this credential — refusing to probe a guessed address",
 				"event.name", observability.EventProxyProbeUpstreamUnresolved,
-				"error.code", "PROBE_UPSTREAM_UNRESOLVED",
+				"error.code", ProbePingErrCodeUpstreamUnresolved,
 				"source_ref", req.SourceRef,
 				"provider", req.Provider,
 				"error.message", probeResolveErrText(rerr),
 			)
 			writeJSON(w, http.StatusOK, ProbePingResponse{
-				OK: false,
+				OK:        false,
+				ErrorCode: ProbePingErrCodeUpstreamUnresolved,
 				Error: "cannot resolve the upstream address for '" + req.SourceRef +
 					"'. The credential may be missing from the vault, or the proxy may not have it loaded — run `aikey list` to confirm it exists, then `aikey proxy restart`.",
 			})

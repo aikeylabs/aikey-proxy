@@ -572,6 +572,13 @@ func TestProbePing_UnresolvableSourceRefRefusesInsteadOfGuessing(t *testing.T) {
 			if resp.Error == "" {
 				t.Error("refusal carried no explanation; 失败要显眼 requires an actionable reason")
 			}
+			// Wire contract (2026-09-05): the refusal must carry a stable code.
+			// The CLI keys PROBE_UPSTREAM_UNRESOLVED off this field so users
+			// are told "the proxy could not resolve this key" rather than
+			// "upstream unreachable — check your network".
+			if resp.ErrorCode != ProbePingErrCodeUpstreamUnresolved {
+				t.Errorf("error_code = %q, want %q", resp.ErrorCode, ProbePingErrCodeUpstreamUnresolved)
+			}
 		})
 	}
 }

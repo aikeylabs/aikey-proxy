@@ -36,6 +36,7 @@ type Registrar struct {
 	hubURL       string
 	nodeID       string
 	nodeAddr     string
+	internalAddr string // cluster-internal dial address (optional; see config.ClusterConfig.InternalAddr)
 	serviceToken string // R1: Bearer token for the hub's gated /cluster/* endpoints
 	weight       int
 	interval     time.Duration // adopted from the hub's register response
@@ -58,6 +59,14 @@ func NewRegistrar(hubURL, nodeID, nodeAddr string, weight int, serviceToken stri
 	}
 }
 
+// WithInternalAddr sets the cluster-internal address registered alongside the
+// public node address. Empty leaves the register payload unchanged, so a fleet
+// without the setting is wire-identical to before the field existed.
+func (r *Registrar) WithInternalAddr(addr string) *Registrar {
+	r.internalAddr = strings.TrimSpace(addr)
+	return r
+}
+
 // SetHealthSource installs the health collector (see Registrar.healthFn).
 // Call before Run; the collector runs once per heartbeat/register.
 func (r *Registrar) SetHealthSource(fn func() map[string]any) { r.healthFn = fn }
@@ -76,11 +85,15 @@ func (r *Registrar) withHealth(payload map[string]any) map[string]any {
 
 // register POSTs /cluster/register and adopts the hub's heartbeat interval.
 func (r *Registrar) register(ctx context.Context) error {
-	body, _ := json.Marshal(r.withHealth(map[string]any{
+	payload := map[string]any{
 		"node_id": r.nodeID,
 		"addr":    r.nodeAddr,
 		"weight":  r.weight,
-	}))
+	}
+	if r.internalAddr != "" {
+		payload["internal_addr"] = r.internalAddr
+	}
+	body, _ := json.Marshal(r.withHealth(payload))
 	resp, err := r.post(ctx, "/cluster/register", body)
 	if err != nil {
 		return err
