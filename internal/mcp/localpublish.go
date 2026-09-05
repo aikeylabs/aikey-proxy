@@ -221,6 +221,24 @@ func NewLocalPublisher(path string, store *PolicyStore, logger *slog.Logger) *Lo
 		observed: map[string]map[string]ObservedTool{},
 	}
 	p.load()
+	// 🔴 RESTORE, before any probe has run. Mirrors NewMCPPolicyRail's cache
+	// restore and exists for the same reason: without it every proxy restart
+	// dropped the Agent's tools until the first probe landed ~15-20s later.
+	//
+	// bugfix: workflow/CI/bugfix/20260904-approved-tools-vanish-until-the-first-probe.md
+	// fence: TestLocalPublisher_ApprovedToolsAreServedBeforeTheFirstProbe
+	//
+	// What is restored is the APPROVED definition — the text the user accepted —
+	// never anything the upstream says today, which has not been read yet. So a
+	// poisoned update that landed while the proxy was stopped is still not
+	// adopted here; it is detected by the first probe and frozen exactly as
+	// before.
+	p.mu.Lock()
+	restored := p.rebuildLocked()
+	p.mu.Unlock()
+	if restored != nil {
+		p.store.Store(restored)
+	}
 	return p
 }
 
@@ -383,7 +401,11 @@ func (p *LocalPublisher) rebuildLocked() *Policy {
 			// tools/list all agree without any of them learning about drafts.
 			continue
 		}
-		obs := p.observed[b.ID]
+		// 🔴 THREE states, not two. `probed` distinguishes "we asked and it was
+		// not there" from "we have not asked yet". Collapsing them made every
+		// approved tool read as withdrawn during the startup window — see
+		// the `stillThere` check below.
+		obs, probed := p.observed[b.ID]
 		pend := p.pending[b.ID]
 		names := make([]string, 0, len(ab.Tools))
 		for n := range ab.Tools {
@@ -396,11 +418,21 @@ func (p *LocalPublisher) rebuildLocked() *Policy {
 				// stays out on every future probe.
 				continue
 			}
-			if _, stillThere := obs[n]; !stillThere {
+			if _, stillThere := obs[n]; probed && !stillThere {
 				// 🔴 A tool that stopped arriving is a FACT, not a verdict: it
 				// is simply not served. Its approval row is kept, so if the same
 				// definition comes back it is not re-admitted as though it were
 				// new.
+				//
+				// 🔴 Guarded by `probed`. Before the first probe there is no
+				// fact yet, and treating the absence of an observation as an
+				// observation of absence is what emptied the toolset on every
+				// restart. Unprobed backends serve their last APPROVED
+				// definition — the same "stale keeps serving" rule the control-
+				// plane policy rail states explicitly, for the same reason:
+				// reverting to "no tools" disconnects the Agent every time the
+				// process restarts. The uncertainty is reported where it
+				// belongs, in /health/mcp's per-backend status (`unknown`).
 				continue
 			}
 			at := ab.Tools[n]
@@ -580,8 +612,16 @@ func (p *LocalPublisher) Review() []ReviewBackend {
 				// CLI come to disagree about what a user is looking at.
 				row.State = ToolStateDraft
 			}
-			if _, ok := p.observed[id][n]; !ok {
-				row.NotServed = true
+			// 🔴 Same three-state rule as rebuildLocked. NotServed is rendered
+			// by the CLI as "its server no longer offers it", which is a claim
+			// about the upstream — so it may only be made after the upstream has
+			// actually been read. Before the first probe every one of these rows
+			// IS being served (from its approved definition), so the flag would
+			// have been false as well as unfounded.
+			if obs, probed := p.observed[id]; probed {
+				if _, ok := obs[n]; !ok {
+					row.NotServed = true
+				}
 			}
 			if ch, drifted := p.pending[id][n]; drifted {
 				row.State = ToolStateNeedsReview

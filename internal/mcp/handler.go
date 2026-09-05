@@ -94,6 +94,9 @@ type Handler struct {
 	policyStore *PolicyStore
 	// localApprovals supplies Personal edition's approval state. nil elsewhere.
 	localApprovals LocalApprovals
+	// policySource names the producer that owns this node's policy. See the
+	// PolicySource* constants in health.go.
+	policySource string
 }
 
 // Config is the plane's wiring.
@@ -151,6 +154,14 @@ type Config struct {
 	// health endpoint that can only describe one implementation is a health
 	// endpoint that goes quiet exactly when the implementation changes.
 	PolicyStore *PolicyStore
+	// PolicySource names which producer owns this node's policy, for
+	// /health/mcp. One of the PolicySource* constants; see them for why this is
+	// carried explicitly instead of being derived from whether LocalApprovals
+	// happens to be nil.
+	//
+	// 🔴 Fixed for the life of the process: the producer is chosen once at
+	// start-up and EnableLocalMCPPolicy refuses to install a second one.
+	PolicySource string
 	// LocalApprovals supplies Personal edition's approval state to /health/mcp.
 	// Optional and nil wherever a control plane owns that verdict.
 	//
@@ -191,6 +202,7 @@ func NewHandler(cfg Config) *Handler {
 		startedAt:      time.Now(),
 		policyStore:    cfg.PolicyStore,
 		localApprovals: cfg.LocalApprovals,
+		policySource:   cfg.PolicySource,
 		syncer:         cfg.Syncer,
 		credentials:    cfg.Credentials,
 		calls:          cfg.Calls,
@@ -772,10 +784,22 @@ func (h *Handler) executeUpstream(w http.ResponseWriter, r *http.Request, ident 
 		return
 	}
 
+	// 🔴 Which INSTANCE of the backend, before anything is resolved and before
+	// anything is dialled (task 6.4 / R5). It is placed here — after the
+	// transport check, before the credential is resolved — because a session
+	// pinned to an instance that has gone away must fail without a secret being
+	// decrypted into this process's memory for a call that cannot happen.
+	endpoint, selErr := selectInstance(h.sessions, r.Header.Get(mcpwire.HeaderSessionID), backend)
+	if selErr != nil {
+		writeRPCError(w, env.ID, selErr.Code, selErr.Detail, nil)
+		return
+	}
+
 	up := UpstreamBackend{
 		ID: backend.ID, Name: backend.Name, Transport: backend.Transport,
-		EndpointURL: backend.EndpointURL, Command: backend.Command, Args: backend.Args,
+		EndpointURL: endpoint, Command: backend.Command, Args: backend.Args,
 		EnvKeys: backend.EnvKeys, CredentialID: backend.CredentialID,
+		MTLSCertAlias: backend.MTLSCertAlias,
 		// P9: how to turn this call into an HTTP request, for a backend that is a
 		// REST API rather than an MCP server. Empty for everything else.
 		RESTBinding: tool.HTTPBinding,
@@ -802,6 +826,34 @@ func (h *Handler) executeUpstream(w http.ResponseWriter, r *http.Request, ident 
 			return
 		}
 		up.Credential = cred
+	}
+
+	// 🔴 The client certificate is a SECOND resolution, not an alternative to the
+	// one above: a backend can need mutual TLS to get the connection AND a bearer
+	// token on the request. Resolved through the same store and the same custody
+	// (D-10) — the alias is just another credential id.
+	if backend.MTLSCertAlias != "" {
+		if h.credentials == nil {
+			writeRPCError(w, env.ID, mcpwire.ErrCredentialMissing,
+				"Backend \""+backend.Name+"\" requires a client certificate, but this gateway build "+
+					"cannot resolve credentials. Bind it in the console (Keys → MCP credentials).", nil)
+			return
+		}
+		cert, err := h.credentials.Resolve(r.Context(), ident.OrgID, backend.MTLSCertAlias)
+		if err != nil {
+			h.logger.ErrorContext(r.Context(), "MCP backend client certificate could not be resolved",
+				"event.name", observability.EventProxyMCPCredentialResolveFailed,
+				"backend_id", backend.ID, "mtls_cert_alias", backend.MTLSCertAlias, "error", err)
+			// 🔴 Refused rather than dialled without the certificate. A plain
+			// connection to a backend that demands mutual TLS is rejected during
+			// the handshake, and that rejection reads like the backend is down —
+			// sending the administrator to debug a network they have not broken.
+			writeRPCError(w, env.ID, mcpwire.ErrCredentialMissing,
+				"Backend \""+backend.Name+"\" requires a client certificate but it could not be "+
+					"decrypted. Re-upload it in the console (Keys → MCP credentials).", nil)
+			return
+		}
+		up.MTLSCert = cert
 	}
 
 	// 🔴 The UPSTREAM name, not the alias. An alias is our renaming of the tool

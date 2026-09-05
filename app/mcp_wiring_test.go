@@ -26,6 +26,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"strings"
 	"testing"
 
@@ -195,6 +196,14 @@ func (fakeMCPDeps) FallbackPolicyCache() *proxy.FallbackPolicyCache { return nil
 func (fakeMCPDeps) MCPManifestSyncer() *mcp.ManifestSyncer { return nil }
 func (fakeMCPDeps) MCPLocalPublisher() *mcp.LocalPublisher { return nil }
 
+// MCPPolicySource reports the control-plane producer: this fake supplies a
+// policy store, which on a real node only the rail does. 🔴 It is a real value
+// rather than "" because /health/mcp's policy_source is what `aikey mcp add`
+// reads to decide whether ~/.aikey/mcp.json will ever be honoured, and a fake
+// that answered "" would let the plane mount without the discriminator and keep
+// this fence green while that answer went missing.
+func (fakeMCPDeps) MCPPolicySource() string { return mcp.PolicySourceControlPlane }
+
 // EventStore returns nil — a node whose local store is not open. 🔴 That is the
 // interesting case for this fence: the plane must still MOUNT and still SERVE.
 // A gateway that refused to start because its audit sink was missing would take
@@ -241,4 +250,80 @@ func (f fakeMCPDeps) MCPPolicyStore() *mcp.PolicyStore {
 		Grants: []mcp.PolicyGrant{{SubjectKind: "seat", SubjectID: "seat_wiring", VirtualServerID: "ts1"}},
 	})
 	return store
+}
+
+// ---------------------------------------------------------------------------
+// The producer must exist before the consumer captures it (P14.3 review surface)
+// ---------------------------------------------------------------------------
+
+// TestLocalPublisherExistsBeforeAdminWiring — an ORDERING fence over Run().
+//
+// # Why this is a source-order assertion and not a behavioural one
+//
+// bugfix: workflow/CI/bugfix/20260904-personal-mcp-review-surface-was-never-wired.md
+//
+// The defect was not in any component. Every unit test of internal/mcp passed,
+// the publisher worked, the admin handler worked, and the two were joined by a
+// single line in Run() that read the publisher 380 lines BEFORE anything created
+// it. On a Personal node the capture therefore saw nil, `MCPLocalReviewFn` was
+// never set, and `aikey mcp review --accept` — the only way to release a hosted
+// server's tools past the first-review gate — answered 503 "this node follows a
+// control plane" on the one edition that has none. A Personal install could host
+// a backend and serve zero tools forever.
+//
+// Reproducing that behaviourally means booting Run(): a listener, a vault, a
+// supervisor generation and a real child process. This fence instead asserts the
+// one property that was wrong, directly — and it is not vacuous: it names two
+// specific call sites and goes red if EITHER is deleted or if they swap order.
+//
+// 🚫 Do NOT "fix" a failure here by deleting an anchor. If the wiring genuinely
+// moves, move both and update this test with the reason.
+//
+// 能红:
+//   - move the `sup.EnableLocalMCPPublisher()` call back below the admin handler
+//   - delete either anchor
+func TestLocalPublisherExistsBeforeAdminWiring(t *testing.T) {
+	src, err := os.ReadFile("app.go")
+	if err != nil {
+		t.Fatalf("read app.go: %v", err)
+	}
+	text := string(src)
+
+	// The line that CREATES Personal's approval state.
+	const producer = "sup.EnableLocalMCPPublisher()"
+	// The line that CAPTURES it into the admin handler, once, by value.
+	const consumer = "if pub := sup.MCPLocalPublisher(); pub != nil {"
+	// The line that installs the local policy the publisher is built from.
+	const policy = "mountLocalMCP(sup)"
+
+	for name, anchor := range map[string]string{
+		"producer": producer,
+		"consumer": consumer,
+		"policy":   policy,
+	} {
+		if n := strings.Count(text, anchor); n != 1 {
+			t.Fatalf("%s anchor %q appears %d times in app.go, want exactly 1 — "+
+				"this fence can no longer tell the ordering; fix the anchor, do not delete the test",
+				name, anchor, n)
+		}
+	}
+
+	iPolicy := strings.Index(text, policy)
+	iProducer := strings.Index(text, producer)
+	iConsumer := strings.Index(text, consumer)
+
+	if iProducer > iConsumer {
+		t.Fatalf("🔴 app.go creates Personal's MCP approval state (%s, offset %d) AFTER the "+
+			"admin handler captures it (%s, offset %d). The capture is by value and happens "+
+			"once, so it will see nil on every Personal node: `aikey mcp review --accept` "+
+			"then answers 503 \"this node follows a control plane\" on the edition that has "+
+			"none, and no hosted tool can ever be released past the first-review gate.",
+			producer, iProducer, consumer, iConsumer)
+	}
+	if iPolicy > iProducer {
+		t.Fatalf("🔴 app.go builds the publisher (offset %d) before installing the local policy "+
+			"it reads from (%s, offset %d), so EnableLocalMCPPublisher returns nil and the "+
+			"review surface is dead for the same reason as above.",
+			iProducer, policy, iPolicy)
+	}
 }

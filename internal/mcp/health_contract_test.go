@@ -58,6 +58,7 @@ const healthContractDocument = `{
   "call_records_dropped": 0,
   "tools_added_since_setup": 1,
   "tool_approvals_unreadable": "unexpected end of JSON input",
+  "policy_source": "control_plane",
   "review_backlog_state": "warn"
 }`
 
@@ -76,7 +77,12 @@ func TestHealthDocumentMatchesTheDocumentTheCLIParses(t *testing.T) {
 		CallRecording:           "on",
 		ToolsAddedSinceSetup:    &added,
 		ToolApprovalsUnreadable: "unexpected end of JSON input",
-		ReviewBacklogState:      "warn",
+		// 🔴 Present in the fixture ON PURPOSE. An `omitempty` field left unset
+		// here would keep this fence green while the Rust half never learned the
+		// field exists — which is the whole failure mode this file was written
+		// for, one level subtler.
+		PolicySource:       PolicySourceControlPlane,
+		ReviewBacklogState: "warn",
 	}
 	got, err := json.MarshalIndent(doc, "", "  ")
 	if err != nil {

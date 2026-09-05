@@ -262,25 +262,35 @@ func (s *Supervisor) EnableLocalMCPPolicy(store *mcp.PolicyStore) error {
 	return nil
 }
 
-// StartLocalMCPManifestSync probes the locally hosted backends so their tools
-// are discovered, exactly as they are for a remote backend, and PUBLISHES what
-// it finds into this node's own policy.
+// EnableLocalMCPPublisher creates Personal edition's approval state, WITHOUT
+// starting the prober.
 //
-// 🔴 The syncer runs with a nil REPORTER (there is no control plane to report
-// to) and a non-nil PUBLISHER. Before P14 it had neither, so the observation
-// was discarded and `/mcp/local` served an empty tool list on every Personal
-// install — see internal/mcp/localpublish.go, task 14.0.
+// 🔴 WHY THIS IS SEPARATE FROM StartLocalMCPManifestSync (bugfix
+// workflow/CI/bugfix/20260904-personal-mcp-review-surface-was-never-wired.md,
+// fence: TestLocalPublisherExistsBeforeAdminWiring):
+// the admin handler captures `MCPLocalPublisher()` ONCE, while it is being
+// built. The prober, however, can only start after the listener is serving.
+// While creation lived inside the prober, the publisher was therefore ALWAYS
+// nil at capture time on a Personal node, so `MCPLocalReviewFn` was never set
+// and `aikey mcp review` answered 503 "this node follows a control plane" — on
+// the one edition that has no control plane. Since the first-review gate holds
+// every tool back until someone accepts it, and accepting was the thing that
+// 503'd, a Personal install could host a backend and serve zero tools forever.
 //
-// The publisher is returned so the admin surface can render and accept reviews;
-// nil when the approval path could not be resolved, which is reported by the
-// caller rather than swallowed.
-func (s *Supervisor) StartLocalMCPManifestSync() {
-	if s.mcpLocalPolicy == nil {
-		return
+// Creation is cheap, has no goroutine and touches nothing outside the process,
+// so it belongs with the POLICY (which is also installed pre-serve). Only the
+// prober needs to wait.
+//
+// Idempotent, and safe to call from either side: whichever of the two runs
+// first creates the publisher, the other reuses it. That is deliberate — an
+// ordering constraint that a caller can silently get wrong is what produced the
+// bug above.
+func (s *Supervisor) EnableLocalMCPPublisher() *mcp.LocalPublisher {
+	if s.mcpLocalPublisher != nil {
+		return s.mcpLocalPublisher
 	}
-	var credResolver mcp.CredentialResolver
-	if s.mcpCredentials != nil {
-		credResolver = s.mcpCredentials
+	if s.mcpLocalPolicy == nil {
+		return nil
 	}
 	path, err := mcp.LocalManifestPath()
 	if err != nil {
@@ -290,8 +300,30 @@ func (s *Supervisor) StartLocalMCPManifestSync() {
 		slog.Error("MCP local manifest approvals have no resolvable path; approvals will not survive a restart",
 			"event.name", observability.EventProxyMCPLocalManifestUnwritable, "error", err)
 	}
-	publisher := mcp.NewLocalPublisher(path, s.mcpLocalPolicy, slog.Default())
-	s.mcpLocalPublisher = publisher
+	s.mcpLocalPublisher = mcp.NewLocalPublisher(path, s.mcpLocalPolicy, slog.Default())
+	return s.mcpLocalPublisher
+}
+
+// StartLocalMCPManifestSync probes the locally hosted backends so their tools
+// are discovered, exactly as they are for a remote backend, and PUBLISHES what
+// it finds into this node's own policy.
+//
+// 🔴 The syncer runs with a nil REPORTER (there is no control plane to report
+// to) and a non-nil PUBLISHER. Before P14 it had neither, so the observation
+// was discarded and `/mcp/local` served an empty tool list on every Personal
+// install — see internal/mcp/localpublish.go, task 14.0.
+func (s *Supervisor) StartLocalMCPManifestSync() {
+	if s.mcpLocalPolicy == nil {
+		return
+	}
+	var credResolver mcp.CredentialResolver
+	if s.mcpCredentials != nil {
+		credResolver = s.mcpCredentials
+	}
+	// 🔴 Reuses the publisher the pre-serve path already created. It is created
+	// here too when that path did not run, so this function stays total rather
+	// than depending on a call order nothing enforces.
+	publisher := s.EnableLocalMCPPublisher()
 	syncer := mcp.NewManifestSyncer("", s.mcpLocalPolicy, nil, publisher, credResolver, slog.Default())
 	s.mcpLocalSyncer = syncer
 	observability.GoSafe("supervisor.mcp_local_manifest_sync", observability.Isolated,
@@ -375,6 +407,26 @@ func (s *Supervisor) RefreshLocalMCP() error {
 
 	s.mcpLocalSyncer.SyncOnce(s.ctx)
 	return nil
+}
+
+// MCPPolicySource names which producer owns this node's MCP policy.
+//
+// 🔴 Derived from the SAME two fields MCPPolicyStore() switches on, so the
+// health surface cannot disagree with the code that actually serves. Deriving it
+// beats a flag set alongside the branch: a flag is a second thing to keep in
+// step, and the day the two disagree is the day this answer is worth nothing.
+//
+// Returns "" when neither producer is installed — the plane is not mounted at
+// all then, so nothing reads it; an empty value must never be read as a default.
+func (s *Supervisor) MCPPolicySource() string {
+	switch {
+	case s.mcpRail != nil:
+		return mcp.PolicySourceControlPlane
+	case s.mcpLocalPolicy != nil:
+		return mcp.PolicySourceLocalConfig
+	default:
+		return ""
+	}
 }
 
 // MCPPolicyOrgID returns the organisation this node follows, or "" when it

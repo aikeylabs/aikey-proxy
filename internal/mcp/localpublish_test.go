@@ -600,3 +600,103 @@ func TestGate_AnOlderApprovalRecordIsMigratedRatherThanGated(t *testing.T) {
 		t.Fatalf("the migrated backend stopped serving: %+v", view.Tools)
 	}
 }
+
+// ---------------------------------------------------------------------------
+// The startup window: "not probed yet" is not "withdrawn"
+// ---------------------------------------------------------------------------
+
+// TestLocalPublisher_ApprovedToolsAreServedBeforeTheFirstProbe.
+//
+// bugfix: workflow/CI/bugfix/20260904-approved-tools-vanish-until-the-first-probe.md
+//
+// 🔴 The failure this locks down was observed live, not derived: for the ~15-20
+// seconds between a proxy restart and the first manifest probe, `tools/list`
+// returned nothing, `aikey mcp try` said "the toolset 'local' exposes no tools",
+// and the review screen told the user their server "no longer offers" every tool
+// it had. Every restart disconnected the Agent, and the explanation the product
+// gave was false.
+//
+// The rule restored here is the one the control-plane policy rail states
+// explicitly ("stale keeps serving"): the absence of an observation is not an
+// observation of absence.
+//
+// 能红: drop the `probed` guard on the `stillThere` check in rebuildLocked.
+func TestLocalPublisher_ApprovedToolsAreServedBeforeTheFirstProbe(t *testing.T) {
+	store, pub, dir := localFixture(t)
+	NewManifestSyncer("", store, nil, pub, nil, discardLogger()).SyncOnce(context.Background())
+	reviewed(t, pub, "localpg")
+
+	served, _ := NewPolicyCatalog(store, nil).Toolset(context.Background(), "", "", LocalToolsetSlug)
+	if len(served.Tools) == 0 {
+		t.Fatal("fixture is not exercising anything: nothing was served even after a probe")
+	}
+	want := len(served.Tools)
+
+	// Restart: a brand-new store and publisher over the SAME approval record,
+	// with NO probe. This is the state a proxy is in for its first ~20 seconds.
+	restartStore := NewPolicyStore()
+	policy, _ := BuildLocalPolicy(mustLoadLocalConfig(t, filepath.Join(dir, LocalConfigFilename)), "", "", nil)
+	restartStore.Store(policy)
+	reborn := NewLocalPublisher(filepath.Join(dir, LocalManifestFilename), restartStore, discardLogger())
+
+	got, _ := NewPolicyCatalog(restartStore, nil).Toolset(context.Background(), "", "", LocalToolsetSlug)
+	if len(got.Tools) != want {
+		t.Fatalf("🔴 %d of %d approved tools disappeared between the restart and the first "+
+			"probe. Every restart therefore leaves the Agent with no tools for as long as "+
+			"the probe takes, and `aikey mcp try` reports the toolset as empty.",
+			want-len(got.Tools), want)
+	}
+	// 🔴 And the review screen must not claim the upstream withdrew them: that
+	// is a statement about a server nobody has contacted yet.
+	for _, rb := range reborn.Review() {
+		for _, tool := range rb.Tools {
+			if tool.NotServed {
+				t.Fatalf("🔴 %q is reported as no longer offered by its server, before that "+
+					"server has been read even once — the CLI renders this as a fact about "+
+					"the upstream", tool.Name)
+			}
+		}
+	}
+}
+
+// TestLocalPublisher_AProbeThatFindsNothingStillWithdrawsTheTools — the other
+// direction, so the fix above cannot be satisfied by never withdrawing anything.
+//
+// 能红: make the `probed` guard unconditional (i.e. never withdraw).
+func TestLocalPublisher_AProbeThatFindsNothingStillWithdrawsTheTools(t *testing.T) {
+	store, pub, dir := localFixture(t)
+	NewManifestSyncer("", store, nil, pub, nil, discardLogger()).SyncOnce(context.Background())
+	reviewed(t, pub, "localpg")
+
+	restartStore := NewPolicyStore()
+	policy, _ := BuildLocalPolicy(mustLoadLocalConfig(t, filepath.Join(dir, LocalConfigFilename)), "", "", nil)
+	restartStore.Store(policy)
+	reborn := NewLocalPublisher(filepath.Join(dir, LocalManifestFilename), restartStore, discardLogger())
+
+	// The probe runs and the backend offers nothing.
+	reborn.Publish(context.Background(), ObservedManifest{BackendID: "localpg", Tools: nil})
+
+	got, _ := NewPolicyCatalog(restartStore, nil).Toolset(context.Background(), "", "", LocalToolsetSlug)
+	if len(got.Tools) != 0 {
+		t.Fatalf("🔴 the upstream was read and offered nothing, yet %d tool(s) are still "+
+			"served. Restoring the last approved list must be a STARTUP bridge, never a "+
+			"reason to keep serving what the server has actually withdrawn.", len(got.Tools))
+	}
+	for _, rb := range reborn.Review() {
+		for _, tool := range rb.Tools {
+			if !tool.NotServed {
+				t.Fatalf("%q should be marked not-served once the upstream has been read "+
+					"and did not offer it", tool.Name)
+			}
+		}
+	}
+}
+
+func mustLoadLocalConfig(t *testing.T, path string) *LocalConfig {
+	t.Helper()
+	cfg, err := LoadLocalConfig(path)
+	if err != nil {
+		t.Fatalf("load %s: %v", path, err)
+	}
+	return cfg
+}

@@ -73,3 +73,71 @@ func TestLocalManifestSyncIsANoOpWithoutALocalPolicy(t *testing.T) {
 		t.Fatal("a syncer was created with no local policy to probe")
 	}
 }
+
+// TestLocalPublisherIsCreatedWithoutStartingTheProber — the split that P14.3's
+// review surface depends on.
+//
+// # Why this fence exists
+//
+// bugfix: workflow/CI/bugfix/20260904-personal-mcp-review-surface-was-never-wired.md
+//
+// The admin handler captures MCPLocalPublisher() ONCE, while it is being built,
+// which is before the listener serves. The prober can only start after. While
+// publisher creation lived inside StartLocalMCPManifestSync, the capture always
+// saw nil on a Personal node, so `aikey mcp review --accept` — the only way to
+// release a hosted server's tools — answered 503 "this node follows a control
+// plane" on the edition that has none.
+//
+// 能红: fold the NewLocalPublisher call back into StartLocalMCPManifestSync (or
+// make EnableLocalMCPPublisher start the prober), and this goes red on the
+// second assertion.
+func TestLocalPublisherIsCreatedWithoutStartingTheProber(t *testing.T) {
+	s := &Supervisor{}
+	if err := s.EnableLocalMCPPolicy(mcp.NewPolicyStore()); err != nil {
+		t.Fatalf("Personal must accept a local policy: %v", err)
+	}
+
+	pub := s.EnableLocalMCPPublisher()
+	if pub == nil || s.MCPLocalPublisher() == nil {
+		t.Fatal("🔴 a Personal node has no approval state before the prober starts, so the " +
+			"admin handler captures nil and `aikey mcp review --accept` refuses — leaving " +
+			"every hosted tool unreleasable")
+	}
+	// 🔴 The negative half: creation must NOT drag the prober in. If it did, the
+	// call would move back behind "the listener is serving" and the capture
+	// would be nil again for a different reason.
+	if s.MCPManifestSyncer() != nil {
+		t.Fatal("creating the publisher started the manifest prober; the two must stay separable")
+	}
+}
+
+// TestLocalPublisherIsIdempotent — both call sites may run, in either order.
+//
+// 能红: drop the early return in EnableLocalMCPPublisher, so the prober replaces
+// the publisher the admin handler already holds a pointer to (accepting a tool
+// would then write into an object nothing serves from).
+func TestLocalPublisherIsIdempotent(t *testing.T) {
+	s := &Supervisor{}
+	if err := s.EnableLocalMCPPolicy(mcp.NewPolicyStore()); err != nil {
+		t.Fatalf("Personal must accept a local policy: %v", err)
+	}
+	first := s.EnableLocalMCPPublisher()
+	if second := s.EnableLocalMCPPublisher(); second != first {
+		t.Fatal("🔴 the second call replaced the publisher. The admin handler captured the " +
+			"first one, so reviews would be accepted into an object the gateway no longer reads")
+	}
+}
+
+// TestLocalPublisherIsAbsentWithoutALocalPolicy — a node that follows a control
+// plane must NOT get one, because that is what makes the admin surface answer
+// "review happens in the console" instead of an empty list.
+//
+// 能红: remove the `s.mcpLocalPolicy == nil` guard.
+func TestLocalPublisherIsAbsentWithoutALocalPolicy(t *testing.T) {
+	s := &Supervisor{}
+	s.mcpRail = NewMCPPolicyRail("org-1", nil)
+	if pub := s.EnableLocalMCPPublisher(); pub != nil || s.MCPLocalPublisher() != nil {
+		t.Fatal("a control-plane node grew a local approval surface; reviewing there is the " +
+			"console's job and a local one is a second, unaudited approver")
+	}
+}

@@ -44,6 +44,28 @@ const (
 	PlaneUnknown PlaneStatus = "unknown"
 )
 
+// Which producer owns this node's MCP policy.
+//
+// 🔴 An EXPLICIT discriminator, reported rather than inferred. Two producers can
+// fill the same snapshot — a control plane's rail, or this machine's own
+// mcp.json — and exactly one of them is authoritative on any given node
+// ("the control plane wins by existing", EnableLocalMCPPolicy). Nothing on any
+// surface used to say WHICH, so every tool that needed to know guessed from a
+// side effect: an empty backend list, a 503 message, the absence of a field.
+// Each of those guesses was wrong somewhere, and the user-visible result was
+// `aikey mcp add` reporting success on a node that would never read the file it
+// had just written.
+//
+// This is the same rule as the gateway's local_bypass principle: judge scope
+// with a named discriminator, never by inferring it from an unrelated signal.
+const (
+	// PolicySourceControlPlane — an organisation's console decides. ~/.aikey/mcp.json
+	// is NOT read on this node.
+	PolicySourceControlPlane = "control_plane"
+	// PolicySourceLocalConfig — this machine's own mcp.json decides (Personal).
+	PolicySourceLocalConfig = "local_config"
+)
+
 // HealthDocument is the endpoint's response.
 //
 // Fields are additive across phases: P1 fills the plane and protocol sections,
@@ -125,6 +147,14 @@ type HealthDocument struct {
 	// upstream serves next — is exactly the state an attacker would engineer,
 	// so it is on the health surface and not only in a log line.
 	ToolApprovalsUnreadable string `json:"tool_approvals_unreadable,omitempty"`
+	// PolicySource names the producer that owns this node's toolsets:
+	// `control_plane` or `local_config`. See the constants for why it is
+	// reported rather than left to be inferred.
+	//
+	// 🔴 Omitted when the plane is mounted with neither producer, which is not a
+	// state any shipped edition reaches — an empty value must therefore read as
+	// "this build did not say", never as a default.
+	PolicySource string `json:"policy_source,omitempty"`
 	// ReviewBacklogState escalates a persistent review backlog.
 	//
 	// 🔴 Task 7.7b: "tools awaiting review" must not sit at WARN forever. A
@@ -147,6 +177,7 @@ func (h *Handler) handleHealth(w http.ResponseWriter, r *http.Request) {
 	doc := HealthDocument{
 		Status:           PlaneHealthy,
 		Plane:            stats,
+		PolicySource:     h.policySource,
 		ProtocolVersions: mcpProtocolStrings(),
 		ToolsetCount:     len(h.catalog.Slugs(r.Context())),
 		SessionCount:     h.sessions.Count(),
@@ -184,9 +215,18 @@ func (h *Handler) handleHealth(w http.ResponseWriter, r *http.Request) {
 		}
 		if unhealthy > 0 && doc.Status == PlaneHealthy {
 			doc.Status = PlaneDegraded
+			// 🔴 "calls may fail", NOT "tools are unavailable". Since
+			// 20260904-approved-tools-vanish-until-the-first-probe.md an
+			// `unknown` backend still SERVES its approved tools (the "stale
+			// keeps serving" rule), so the old wording became false in exactly
+			// the window it is read most: the first seconds after a restart.
+			// A health line that contradicts what tools/list just returned is
+			// worse than a vague one — it sends the reader to debug the wrong
+			// thing.
 			doc.Reason = itoa(unhealthy) + " of " + itoa(len(status)) +
-				" MCP backend(s) are not healthy (circuit-open or unknown). " +
-				"Tools behind them are unavailable; see the backends map."
+				" MCP backend(s) have not answered yet or are in cooldown " +
+				"(circuit-open or unknown). Their tools are still listed from the " +
+				"last approved definition, but calls to them may fail; see the backends map."
 		}
 	}
 

@@ -477,6 +477,55 @@ func Run() {
 		slog.Warn("OAuth broker disabled: vault not available")
 	}
 
+	// 阶段8: choose the MCP POLICY PRODUCER. 🔴 This runs BEFORE the admin
+	// handler is built (step 6) and before the plane is built (step 7), because
+	// both of them capture what it installs.
+	//
+	// 🔴 It used to sit in step 7, after the admin handler. On a Personal node
+	// that made `sup.MCPLocalPublisher()` nil at the moment step 6 read it, so
+	// the review routes were never wired and `aikey mcp review --accept` — the
+	// only way to release a hosted server's tools — answered 503 "this node
+	// follows a control plane" on the one edition that has none. See
+	// workflow/CI/bugfix/20260904-personal-mcp-review-surface-was-never-wired.md
+	// and the fence TestLocalPublisherExistsBeforeAdminWiring. 🚫 Do not move it
+	// back below step 6.
+	//
+	// The rail
+	// restores the on-disk cache at construction, so a proxy starting while the
+	// control plane is down serves its last known policy immediately instead of
+	// serving nothing until the control plane returns.
+	//
+	// 🔴 Two producers, one snapshot. A node WITH a control plane follows the
+	// rail; a node WITHOUT one (Personal) builds the same snapshot from its own
+	// mcp.json. Before P5 the second case simply did not mount the plane, which
+	// was correct while there was nothing to authorise against and wrong for the
+	// edition the design calls stdio hosting's primary form.
+	if orgID := sup.MCPPolicyOrgID(); orgID == "" {
+		// Personal edition (P5, design §5.3): no control plane, so the policy
+		// comes from this machine's own mcp.json. 🔴 The plane, the catalog, the
+		// grant evaluation and the freeze rules are IDENTICAL to Production —
+		// only the producer of the snapshot differs. Personal gets less
+		// configuration, never fewer checks.
+		mountLocalMCP(sup)
+		// Personal's approval state. 🔴 Created here rather than with the prober
+		// (which can only start once the listener serves) precisely so it exists
+		// before step 6 captures it. Idempotent; the prober reuses it.
+		sup.EnableLocalMCPPublisher()
+	} else {
+		sup.EnableMCPPolicyRail(supervisor.NewMCPPolicyRail(orgID, slog.Default()))
+		// P4: the credential store, installed alongside the policy rail because
+		// the two answer the same question from opposite sides — the policy says
+		// WHICH credential a backend uses, this holds WHAT it is.
+		//
+		// 🔴 The seal key is resolved per use through the supervisor, never
+		// captured here: this runs before the first generation is necessarily
+		// stable, and a captured key would keep sealing with a key the vault no
+		// longer uses. The failure mode of getting that wrong is silent —
+		// writes keep succeeding and reads always come back empty.
+		sup.EnableMCPCredentialStore(mcp.NewCredentialStore(
+			mcpRunDir(), sup.VaultDerivedKey, slog.Default()))
+	}
+
 	// 6. Build the admin handler, wiring Supervisor callbacks.
 	adminHandler := admin.NewHandler(cfg, sup.Registry(), sup.EventStore())
 	adminHandler.TotalRequestsFn = sup.TotalRequests
@@ -500,6 +549,12 @@ func Run() {
 		adminHandler.MCPLocalWriteOpFn = pub.SetWriteOp
 		adminHandler.MCPLocalRefreshFn = sup.RefreshLocalMCP
 	}
+	// P15 · delegation boundary. 🔴 Wired UNCONDITIONALLY, unlike the review
+	// surface above: the gate must answer on every edition, and on a node with no
+	// policy at all it answers ALLOW+stale rather than being absent — an absent
+	// route would make the CLI shell print "proxy does not support this", which
+	// reads as breakage on exactly the machines that never configured anything.
+	adminHandler.MCPDelegationFn = sup.MCPDelegationDecision
 	adminHandler.CanaryResultFn = sup.CanaryResult
 	adminHandler.DebugUpstreamHeadersStateFn = proxy.UpstreamHeadersDebugState
 	adminHandler.DebugUpstreamHeadersSetFn = proxy.SetUpstreamHeadersDebugAPIOverride
@@ -796,37 +851,6 @@ func Run() {
 	}
 	if poolHandler != nil {
 		extraRegistrars = append(extraRegistrars, poolHandler)
-	}
-	// 阶段8: install the MCP policy rail before building the plane. The rail
-	// restores the on-disk cache at construction, so a proxy starting while the
-	// control plane is down serves its last known policy immediately instead of
-	// serving nothing until the control plane returns.
-	//
-	// 🔴 Two producers, one snapshot. A node WITH a control plane follows the
-	// rail; a node WITHOUT one (Personal) builds the same snapshot from its own
-	// mcp.json. Before P5 the second case simply did not mount the plane, which
-	// was correct while there was nothing to authorise against and wrong for the
-	// edition the design calls stdio hosting's primary form.
-	if orgID := sup.MCPPolicyOrgID(); orgID == "" {
-		// Personal edition (P5, design §5.3): no control plane, so the policy
-		// comes from this machine's own mcp.json. 🔴 The plane, the catalog, the
-		// grant evaluation and the freeze rules are IDENTICAL to Production —
-		// only the producer of the snapshot differs. Personal gets less
-		// configuration, never fewer checks.
-		mountLocalMCP(sup)
-	} else {
-		sup.EnableMCPPolicyRail(supervisor.NewMCPPolicyRail(orgID, slog.Default()))
-		// P4: the credential store, installed alongside the policy rail because
-		// the two answer the same question from opposite sides — the policy says
-		// WHICH credential a backend uses, this holds WHAT it is.
-		//
-		// 🔴 The seal key is resolved per use through the supervisor, never
-		// captured here: this runs before the first generation is necessarily
-		// stable, and a captured key would keep sealing with a key the vault no
-		// longer uses. The failure mode of getting that wrong is silent —
-		// writes keep succeeding and reads always come back empty.
-		sup.EnableMCPCredentialStore(mcp.NewCredentialStore(
-			mcpRunDir(), sup.VaultDerivedKey, slog.Default()))
 	}
 	if mcpHandler := buildMCPPlane(sup, ln.Addr().String()); mcpHandler != nil {
 		extraRegistrars = append(extraRegistrars, mcpHandler)
@@ -1520,6 +1544,9 @@ type mcpPlaneDeps interface {
 	// MCPLocalPublisher is Personal edition's approval state. nil on a node
 	// that follows a control plane, where reviewing is the console's job.
 	MCPLocalPublisher() *mcp.LocalPublisher
+	// MCPPolicySource names which producer owns this node's policy, so
+	// /health/mcp can state it instead of leaving every caller to infer it.
+	MCPPolicySource() string
 	// FilterHook is the DLP filter child. 🔴 A method, called per request, for
 	// the same reason the syncer is: the child belongs to a config generation.
 	FilterHook() apphook.Hook
@@ -1620,6 +1647,10 @@ func buildMCPPlane(sup mcpPlaneDeps, listenAddr string) *mcp.Handler {
 		// `!= nil` check downstream and panics on first use — on a Personal node
 		// serving a health request, which is to say in front of a user.
 		LocalApprovals: localApprovals(sup),
+		// 🔴 Stated, not inferred. `aikey mcp add` needs to know whether the file
+		// it just wrote will ever be read, and until this field existed there was
+		// nothing on any surface that said so — see the PolicySource constants.
+		PolicySource: sup.MCPPolicySource(),
 		// Syncer supplies per-backend health and the circuit cooldown, so a
 		// refusal can carry a NUMBER rather than "try again later".
 		// 🔴 A getter, read per request. The sync starts after this function
