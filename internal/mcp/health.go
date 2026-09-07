@@ -90,6 +90,16 @@ type HealthDocument struct {
 	UptimeSeconds int64 `json:"uptime_seconds"`
 	// Backends is filled from P3. Nil until then — see the type comment.
 	Backends map[string]string `json:"backends,omitempty"`
+	// MTLSCertificates maps a client-certificate alias to its validity state:
+	// "ok", "expires_in_<N>d", or "expired" (task 4.8c).
+	//
+	// 🔴 Absent, not empty, when this process has resolved no mTLS certificate.
+	// Absence therefore means "no mTLS certificate has been used here", NOT
+	// "every certificate is valid" — an alias only appears once something has
+	// dialled the backend that names it. The distinction is the same one
+	// Backends draws, and it matters more here: a certificate nobody has used
+	// yet is exactly the one that expires unnoticed.
+	MTLSCertificates map[string]string `json:"mtls_certificates,omitempty"`
 	// ToolsNeedingReview is filled from P3. A pointer so "none" (0) is
 	// distinguishable from "not tracked yet" (absent).
 	ToolsNeedingReview *int `json:"tools_needing_review,omitempty"`
@@ -183,6 +193,11 @@ func (h *Handler) handleHealth(w http.ResponseWriter, r *http.Request) {
 		SessionCount:     h.sessions.Count(),
 		UptimeSeconds:    int64(time.Since(h.startedAt).Seconds()),
 	}
+
+	// mTLS certificate validity (4.8c). nil when nothing has used a client
+	// certificate on this process; see the field comment for why that is not the
+	// same as "all fine".
+	doc.MTLSCertificates = mtlsCertHealth()
 
 	// 🔴 Per-backend health, from the manifest prober. Absent (not empty) when
 	// no prober is installed: "we do not track backend health on this build" and
