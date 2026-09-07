@@ -102,7 +102,7 @@ type ClusterConfig struct {
 	// hub host's OAuth-routing ingress). Separate from NodeAddr because the two
 	// consumers sit on different networks: NodeAddr is handed to employees
 	// outside the VPC (public), the ingress is next to the node. Optional; when
-	// empty the hub/ingress fall back to NodeAddr (pre-2026-09-05 behaviour).
+	// empty the hub/ingress fall back to NodeAddr (pre-2026-09-05 behavior).
 	// update: roadmap20260320/技术实现/update/20260905-集群节点内部地址-ingress走内网.md
 	InternalAddr string `yaml:"internal_addr,omitempty"`
 	// ServiceToken authenticates this node to the hub's gated /cluster/* endpoints

@@ -123,7 +123,7 @@ func TestUpstreamAnsweredHTML_OnlyOn2xxTextHTML(t *testing.T) {
 		{502, "text/html", false},
 	}
 	for _, c := range cases {
-		if got := upstreamAnsweredHTML(mk(c.status, c.ct)); got != c.want {
+		if got := upstreamAnsweredHTML(mk(c.status, c.ct)); got != c.want { //nolint:bodyclose // synthetic response: no Body, no transport — nothing to close
 			t.Errorf("status=%d ct=%q: got %v want %v", c.status, c.ct, got, c.want)
 		}
 	}
