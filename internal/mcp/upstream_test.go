@@ -148,12 +148,55 @@ func TestFence_3F2_TheHealthProbeCallsToolsListAndNothingElse(t *testing.T) {
 	if len(methods) == 0 {
 		t.Fatal("the syncer never contacted the backend")
 	}
+
+	// The mandatory Streamable HTTP handshake is permitted; nothing else is.
+	//
+	// 🔴 This allowlist was widened on 2026-09-07, and the reason matters because
+	// the naive reading of the widening is "the fence was relaxed". It was not.
+	// The invariant this fence protects — stated in its own doc comment above —
+	// is that a probe must not INVOKE A TOOL on a timer. `initialize` and
+	// `notifications/initialized` invoke nothing: they are protocol setup with no
+	// side effects, in the same category as the TCP and TLS handshakes this fence
+	// has always allowed without listing them.
+	//
+	// What the fence previously encoded was the ASSUMPTION that tools/list could
+	// be sent cold. It cannot — a compliant server answers a cold tools/list with
+	// `HTTP 400 "Bad Request: Server not initialized"`, which is why every
+	// backend sat at `unknown` and no tool was ever discovered. Keeping the
+	// literal one-method rule would have meant keeping a probe that cannot probe.
+	// Bug: workflow/CI/bugfix/20260907-mcp-http-transport-never-initialized.md
+	handshake := map[string]bool{
+		mcpwire.MethodInitialize:  true,
+		mcpwire.MethodInitialized: true,
+	}
+	sawToolsList := false
 	for _, m := range methods {
-		if m != mcpwire.MethodToolsList {
-			t.Errorf("the manifest probe called %q. It may call tools/list and NOTHING else — "+
-				"a probe runs on a timer, so any other method installs a machine that acts on "+
-				"the customer's systems forever, unattributed.", m)
+		if m == mcpwire.MethodToolsList {
+			sawToolsList = true
+			continue
 		}
+		if handshake[m] {
+			continue
+		}
+		t.Errorf("the manifest probe called %q. It may perform the mandatory MCP handshake and "+
+			"tools/list, and NOTHING else — a probe runs on a timer, so any other method installs "+
+			"a machine that acts on the customer's systems forever, unattributed.", m)
+	}
+
+	// 🔴 The teeth. The allowlist above is a list of names and will be tempting to
+	// extend; this assertion is about the actual danger and must never be relaxed.
+	// A probe that calls tools/call is the exact failure the fence exists for,
+	// whatever the allowlist happens to say.
+	for _, m := range methods {
+		if m == mcpwire.MethodToolsCall {
+			t.Fatalf("the manifest probe invoked a TOOL (%q). This is the thing the probe may "+
+				"never do: it runs on a timer, so it would execute a real action on the "+
+				"customer's systems forever, attributed to nobody.", m)
+		}
+	}
+	if !sawToolsList {
+		t.Error("the probe never called tools/list, so it discovered nothing — a handshake " +
+			"that reaches no manifest is not a probe")
 	}
 }
 

@@ -262,7 +262,55 @@ const (
 // stream for server-initiated messages, which we do not consume (we never ask a
 // backend to call us). Two files here would be two copies of the same request
 // builder, and the copies would drift.
-type httpTransport struct{ name string }
+type httpTransport struct {
+	name string
+
+	// sessions caches the MCP session established with each backend.
+	//
+	// 🔴 Streamable HTTP is a SESSION protocol: the spec requires `initialize`
+	// (and the `notifications/initialized` that follows it) before any other
+	// request, and a compliant server refuses everything else until then —
+	// measured against the reference server, a bare tools/list answers
+	// `HTTP 400 {"code":-32000,"message":"Bad Request: Server not initialized"}`.
+	// This transport used to send tools/list cold, so EVERY probe and EVERY tool
+	// call against a compliant backend failed, the backend never left `unknown`,
+	// and no tool was ever discovered.
+	//
+	// Cached rather than per-request because a handshake is two extra round
+	// trips and a server-side session allocation; doing it per call would triple
+	// the traffic and leak a session per request on servers that track them.
+	// Bug: workflow/CI/bugfix/20260907-mcp-http-transport-never-initialized.md
+	mu       sync.Mutex
+	sessions map[string]*httpSession
+}
+
+// httpSession is one backend's handshake state. Its own mutex serialises the
+// handshake so a burst of concurrent calls performs ONE, not one each.
+type httpSession struct {
+	mu sync.Mutex
+	// id is the Mcp-Session-Id the server assigned. EMPTY IS VALID and is not
+	// the same as "no handshake": a stateless server completes initialize and
+	// assigns nothing, and `established` is what distinguishes the two.
+	id          string
+	established bool
+}
+
+func (t *httpTransport) sessionFor(b UpstreamBackend) *httpSession {
+	// Keyed by endpoint as well as id: repointing a backend at a different URL
+	// must not inherit the old server's session.
+	key := b.ID + "\x1f" + b.EndpointURL
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if t.sessions == nil {
+		t.sessions = map[string]*httpSession{}
+	}
+	s, ok := t.sessions[key]
+	if !ok {
+		s = &httpSession{}
+		t.sessions[key] = s
+	}
+	return s
+}
 
 func (t *httpTransport) Name() string { return t.name }
 
@@ -365,37 +413,52 @@ func (t *httpTransport) CallTool(ctx context.Context, b UpstreamBackend, name st
 	return &res, nil
 }
 
-// rpc performs one JSON-RPC round trip.
-func (t *httpTransport) rpc(ctx context.Context, b UpstreamBackend, method string, params json.RawMessage) (*mcpwire.Envelope, error) {
+// roundTrip performs ONE JSON-RPC round trip, with no session management of its
+// own. `sessionID` is attached when non-empty; `notification` marks a message
+// that carries no id and whose reply is legitimately 202 with an empty body (the
+// returned envelope is then nil).
+//
+// 🔴 Callers other than the handshake must go through rpc, which establishes the
+// session first. See httpTransport.sessions.
+func (t *httpTransport) roundTrip(ctx context.Context, b UpstreamBackend, method string, params json.RawMessage, sessionID string, notification bool) (*mcpwire.Envelope, http.Header, error) {
 	if b.EndpointURL == "" {
-		return nil, &UpstreamError{Code: mcpwire.ErrBackendUnavailable, Detail: "backend has no endpoint_url"}
+		return nil, nil, &UpstreamError{Code: mcpwire.ErrBackendUnavailable, Detail: "backend has no endpoint_url"}
 	}
 	// 🔴 A backend that declares a credential but has none resolved is refused
 	// BEFORE the request. Sending a bare request to an endpoint that expects
 	// auth yields a 401 that reads like "the customer's token is wrong", which
 	// sends them to rotate a credential that was never the problem.
 	if b.CredentialID != "" && b.Credential.Secret == "" {
-		return nil, ErrCredentialMissing
+		return nil, nil, ErrCredentialMissing
 	}
 
-	body, err := json.Marshal(mcpwire.Envelope{
+	// 🔴 A notification carries NO id. Giving one an id turns it into a request,
+	// and a server that answers requests will either error on the unknown id or
+	// leave the caller waiting for a reply the spec says never comes.
+	env := mcpwire.Envelope{
 		JSONRPC: mcpwire.JSONRPCVersion,
-		ID:      json.RawMessage(`1`),
 		Method:  method,
 		Params:  params,
-	})
+	}
+	if !notification {
+		env.ID = json.RawMessage(`1`)
+	}
+	body, err := json.Marshal(env)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, b.EndpointURL, bytes.NewReader(body))
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	req.Header.Set("Content-Type", "application/json")
 	// Both content types, per the Streamable HTTP spec: the server chooses.
 	req.Header.Set("Accept", "application/json, text/event-stream")
 	req.Header.Set("MCP-Protocol-Version", string(mcpwire.SupportedProtocolVersions[0]))
+	if sessionID != "" {
+		req.Header.Set("Mcp-Session-Id", sessionID)
+	}
 	applyCredential(req, b.Credential)
 
 	// Belt and braces: the transport strips again as the genuine last step.
@@ -410,12 +473,12 @@ func (t *httpTransport) rpc(ctx context.Context, b UpstreamBackend, method strin
 			// connection; the tool may be running right now. This is the single
 			// most important line for R4 — flipping it would make every timed-out
 			// non-idempotent call eligible for a second execution.
-			return nil, &UpstreamError{Code: mcpwire.ErrUpstreamTimeout, Detail: "upstream did not respond in time"}
+			return nil, nil, &UpstreamError{Code: mcpwire.ErrUpstreamTimeout, Detail: "upstream did not respond in time"}
 		}
 		// 🔴 The error string is NOT echoed to the client: a dial error can
 		// contain internal hostnames and addresses. It is logged by the caller,
 		// which has the request id to correlate with.
-		return nil, &UpstreamError{
+		return nil, nil, &UpstreamError{
 			Code: mcpwire.ErrUpstream5XX, Detail: "upstream is unreachable",
 			NotAccepted: neverAccepted(err),
 		}
@@ -423,7 +486,7 @@ func (t *httpTransport) rpc(ctx context.Context, b UpstreamBackend, method strin
 	defer func() { _ = resp.Body.Close() }()
 
 	if resp.StatusCode >= 500 {
-		return nil, &UpstreamError{
+		return nil, nil, &UpstreamError{
 			Code: mcpwire.ErrUpstream5XX, Status: resp.StatusCode,
 			Detail: fmt.Sprintf("upstream returned HTTP %d", resp.StatusCode),
 		}
@@ -432,13 +495,13 @@ func (t *httpTransport) rpc(ctx context.Context, b UpstreamBackend, method strin
 		// 🔴 Reported as a CREDENTIAL problem, not a generic upstream error: it
 		// is the one upstream status with an action the customer can take, and
 		// the message names it.
-		return nil, &UpstreamError{
+		return nil, nil, &UpstreamError{
 			Code: mcpwire.ErrCredentialMissing, Status: resp.StatusCode,
 			Detail: fmt.Sprintf("the backend rejected our credential (HTTP %d)", resp.StatusCode),
 		}
 	}
 	if resp.StatusCode >= 400 {
-		return nil, &UpstreamError{
+		return nil, nil, &UpstreamError{
 			Code: mcpwire.ErrUpstream5XX, Status: resp.StatusCode,
 			Detail: fmt.Sprintf("upstream returned HTTP %d", resp.StatusCode),
 		}
@@ -446,23 +509,38 @@ func (t *httpTransport) rpc(ctx context.Context, b UpstreamBackend, method strin
 
 	raw, err := io.ReadAll(io.LimitReader(resp.Body, maxUpstreamResponse+1))
 	if err != nil {
-		return nil, &UpstreamError{Code: mcpwire.ErrUpstream5XX, Detail: "could not read the upstream response"}
+		return nil, nil, &UpstreamError{Code: mcpwire.ErrUpstream5XX, Detail: "could not read the upstream response"}
 	}
 	if len(raw) > maxUpstreamResponse {
-		return nil, &UpstreamError{
+		return nil, nil, &UpstreamError{
 			Code:   mcpwire.ErrUpstream5XX,
 			Detail: fmt.Sprintf("upstream response exceeds the %d MiB ceiling", maxUpstreamResponse>>20),
 		}
 	}
 
+	// A notification is answered with 202 and (usually) nothing at all. An empty
+	// body is the SUCCESS case here, not a parse failure.
+	if notification && len(bytes.TrimSpace(raw)) == 0 {
+		return nil, resp.Header, nil
+	}
+
 	if strings.HasPrefix(resp.Header.Get("Content-Type"), "text/event-stream") {
-		return parseSSEEnvelope(raw)
+		parsed, pErr := parseSSEEnvelope(raw)
+		if pErr != nil {
+			if notification {
+				// Same reasoning as above: a stream that carried only an ack is
+				// a completed notification.
+				return nil, resp.Header, nil
+			}
+			return nil, nil, pErr
+		}
+		return parsed, resp.Header, nil
 	}
-	var env mcpwire.Envelope
-	if err := json.Unmarshal(raw, &env); err != nil {
-		return nil, &UpstreamError{Code: mcpwire.ErrUpstream5XX, Detail: "upstream reply is not JSON-RPC"}
+	var out mcpwire.Envelope
+	if err := json.Unmarshal(raw, &out); err != nil {
+		return nil, nil, &UpstreamError{Code: mcpwire.ErrUpstream5XX, Detail: "upstream reply is not JSON-RPC"}
 	}
-	return &env, nil
+	return &out, resp.Header, nil
 }
 
 // parseSSEEnvelope extracts the JSON-RPC response from an SSE reply.
