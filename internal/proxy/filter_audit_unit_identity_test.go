@@ -60,6 +60,13 @@ func auditProxy(t *testing.T, hook apphook.Hook, cacheOn bool) (*Proxy, <-chan [
 	return p, sink
 }
 
+// content stays a parameter although every call site currently passes the same
+// string: this file's subject is that the audit-unit ID is derived FROM THE
+// CONTENT (commit 2548671), so "same content → same id, different content →
+// different id" is the next assertion anyone adds here. Collapsing it to a
+// constant now would have to be undone to write that test.
+//
+//nolint:unparam // deliberate: see above
 func auditSendTurn(t *testing.T, p *Proxy, sessionID, content string) {
 	t.Helper()
 	r := newReq(fmt.Sprintf(`{"messages":[{"role":"user","content":%q}]}`, content))

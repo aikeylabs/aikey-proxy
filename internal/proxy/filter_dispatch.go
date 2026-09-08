@@ -900,11 +900,11 @@ func injectSeat(eventJSON []byte, seatID string) []byte {
 // handed one content piece and nothing else). Deriving the id therefore has to
 // happen wherever BOTH halves exist, and that is here. The alternative (adding a
 // session scope to the pipe request so the detector could derive it) costs a
-// proto bump and a cross-repo lockstep for zero behavioural gain.
+// proto bump and a cross-repo lockstep for zero behavioral gain.
 //
 // Fail-safe: an unparseable event or an empty id leaves the bytes untouched, so
 // the detector's own id survives and the worst case degrades to the pre-fix
-// behaviour (a possible duplicate row) rather than to a 400 for an empty id.
+// behavior (a possible duplicate row) rather than to a 400 for an empty id.
 func injectEventID(eventJSON []byte, eventID string) []byte {
 	if eventID == "" {
 		return eventJSON
