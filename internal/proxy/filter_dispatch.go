@@ -377,7 +377,12 @@ func (p *Proxy) applyInboundFilter(
 	// for real rather than replay verdicts that may have been minted under a
 	// ruleset the admin has since deleted. 宁可多扫,不可用陈旧规则.
 	cache := p.filterCache
-	var cacheScopeKey, detectorVer, contentVer string
+	// 审计单元作用域(2026-09-08):与缓存桶用同一个 scope,但**无条件计算** —— 审计
+	// 去重的正确性绝不能寄生在"缓存开没开"上。cache==nil(未装)或 SUSPENDED(detector
+	// 说不清自己的规则集)时,每片都会真扫,而真扫正是重复审计行的来源,所以恰恰是这两
+	// 种情况下最需要去重键。见 auditUnitID 的不变量注释。
+	auditScopeKey := cacheScope(sessionID, parsed, virtualKeyID)
+	var detectorVer, contentVer string
 	if cache != nil {
 		epoch, cacheable := apphook.CacheEpoch(hook)
 		// Transition-only observability for the fail-safe branch (2026-08-13,
@@ -389,7 +394,6 @@ func (p *Proxy) applyInboundFilter(
 		if !cacheable {
 			cache = nil // both the read and the write below are skipped
 		} else {
-			cacheScopeKey = cacheScope(sessionID, parsed, virtualKeyID)
 			detectorVer = hook.Status().Version
 			contentVer = epoch
 		}
@@ -424,16 +428,23 @@ func (p *Proxy) applyInboundFilter(
 		// content-hash 缓存:历史里逐字未变的内容(每轮重发)命中缓存即复用判定、
 		// 跳过 detector IPC;只有新增/被改写(miss)才真扫。命中时合成一个等价 resp,
 		// 走下面同一套处理(mask/allow/...)。缓存关闭/不可用(cache==nil)则直接真扫。
+		// 内容身份:**无条件计算**(sha256 于 16KB ≈ 8µs,相对 detector 的毫秒级可忽略;
+		// 设计文档 §4.1 实测 hash 合计 0.18ms vs detect 4822ms)。它同时是两件事的判据:
+		//   ① 缓存命中判据(这段内容扫过没有)
+		//   ② 审计单元去重键(这段内容记过账没有)
+		// 两者必须同源 —— 分家就是 2026-06-17~2026-09-08 那个 BUG 的全部根因。
+		// 见 auditUnitID 的不变量注释。
+		contentID := hashHead(head)
 		var resp *apphook.Response
 		var ckey string
 		if cache != nil {
-			ckey = cacheKey(detectorVer, contentVer, hashHead(head)) // level-2 key (scope is separate)
+			ckey = cacheKey(detectorVer, contentVer, contentID) // level-2 key (scope is separate)
 			// 读侧 block 守卫(用户拍板 2026-08-08,与写侧不入缓存配套):即便缓存里
 			// 残留了历史 block verdict(理论上写侧已不再写入;此处兜底进程内 pre-fix
 			// 污染 + 防写侧未来回归),也当作 miss、落到下方真扫按最新策略重判 —— block
 			// 是安全决策不复用陈旧拒绝。仅精确排除 ActionBlock,mask/warn/allow 命中路径
 			// 逐字不变(它们 action != ActionBlock,条件恒真)。
-			if v, ok := cache.Get(cacheScopeKey, ckey); ok && v.action != apphook.ActionBlock {
+			if v, ok := cache.Get(auditScopeKey, ckey); ok && v.action != apphook.ActionBlock {
 				// Restorables replay from cache (offsets only): the hash-matched head
 				// is byte-identical, so the same spans slice the same originals.
 				// Event replays too (2026-08-08 审计缺口修复): a flagged piece resent
@@ -487,7 +498,7 @@ func (p *Proxy) applyInboundFilter(
 				// maskVerdict.event). Stored as handed over — never mutated in place
 				// (injectTenant/VirtualKey/Seat/Session all return fresh slices), so the
 				// async uploader and the cache can share the bytes read-only.
-				cache.Put(cacheScopeKey, ckey, maskVerdict{
+				cache.Put(auditScopeKey, ckey, maskVerdict{
 					action:      resp.Action,
 					maskedHead:  string(resp.MutatedPayload),
 					reason:      resp.Reason,
@@ -585,6 +596,14 @@ func (p *Proxy) applyInboundFilter(
 			// keeps producing. The event still exists (that is the point of 方案②);
 			// only its verdict is corrected to what actually happened.
 			ev := injectTraceID(injectSession(injectSeat(injectVirtualKey(injectTenant(resp.Event, orgID), virtualKeyID), seatID), sessionID), traceID)
+			// event_id 改写为内容派生的审计单元 id(用户拍板 2026-09-08,反转 2026-08-08
+			// 「event_id 归 detector 所有,proxy 无权铸造」条款)。原条款的理由是"不得虚构
+			// detector 的身份";这里不是虚构,是从 detector 判定的**那段内容**确定性派生,
+			// 语义不同。反转的必要性:detector 的 CSPRNG id 让"同一段内容重扫一次"= 一条
+			// 新审计行,而两条入库路径的 ON CONFLICT (event_id) 只能吸收重放、吸收不了重扫。
+			// spec: R-compliance-filter-scope-2(审计单元 = 一个会话内的一段违规内容)
+			// bugfix: workflow/CI/bugfix/2026-09-08-compliance-audit-unit-id-parasitic-on-cache.md
+			ev = injectEventID(ev, auditUnitID(auditScopeKey, contentID))
 			if capped {
 				ev = injectActionTaken(ev, pieces[i].ceiling.String())
 			}
@@ -865,6 +884,40 @@ func injectSeat(eventJSON []byte, seatID string) []byte {
 		return eventJSON
 	}
 	m["seat_id"] = q
+	out, err := json.Marshal(m)
+	if err != nil {
+		return eventJSON
+	}
+	return out
+}
+
+// injectEventID overwrites the event's id with the proxy-derived audit-unit id
+// (auditUnitID). It is the ONE place the proxy takes ownership of that field.
+//
+// WHY the proxy and not the detector (2026-09-08 拍板): the audit unit is
+// «a stretch of violating content WITHIN ONE SESSION», and the session is a
+// proxy-side concept — the detector runs with no session context at all (it is
+// handed one content piece and nothing else). Deriving the id therefore has to
+// happen wherever BOTH halves exist, and that is here. The alternative (adding a
+// session scope to the pipe request so the detector could derive it) costs a
+// proto bump and a cross-repo lockstep for zero behavioural gain.
+//
+// Fail-safe: an unparseable event or an empty id leaves the bytes untouched, so
+// the detector's own id survives and the worst case degrades to the pre-fix
+// behaviour (a possible duplicate row) rather than to a 400 for an empty id.
+func injectEventID(eventJSON []byte, eventID string) []byte {
+	if eventID == "" {
+		return eventJSON
+	}
+	var m map[string]json.RawMessage
+	if err := json.Unmarshal(eventJSON, &m); err != nil {
+		return eventJSON
+	}
+	q, err := json.Marshal(eventID)
+	if err != nil {
+		return eventJSON
+	}
+	m["event_id"] = q
 	out, err := json.Marshal(m)
 	if err != nil {
 		return eventJSON

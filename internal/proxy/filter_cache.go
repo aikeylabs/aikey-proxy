@@ -165,6 +165,49 @@ func cacheScope(sessionID string, parsed map[string]any, virtualKeyID string) st
 	return "global"
 }
 
+// auditUnitID derives the compliance audit event's identity from the SAME
+// content identity the verdict cache keys on: the session scope + the content
+// hash. It is the machine expression of the stable rule «审计单元 = "一个会话内
+// 的一段违规内容",不是"每个请求"» (spec: R-compliance-filter-scope-2, see
+// workflow/CI/requirements/2026-06-04-compliance-filter-direction-and-scope.md).
+//
+// WHY THIS EXISTS AT ALL (读这段就够,别再推一遍 — 已经推错三次):
+// the detector mints event_id with a CSPRNG (newEventID, cmd/detector/main.go),
+// so EVERY real scan of the SAME content yields a DIFFERENT id. Both ingest
+// paths dedupe with ON CONFLICT (event_id) DO NOTHING, which therefore only
+// absorbs REPLAYS of one already-minted event — never a RE-SCAN. Between
+// 2026-06-17 (incremental scan removed → history re-scanned every turn) and
+// 2026-09-08 the only thing keeping re-scans from minting duplicate audit rows
+// was the in-memory LRU: while it held, the cached event replayed verbatim and
+// deduped; the moment it lapsed (proxy/detector restart, pack swap, session-id
+// change, LRU eviction, 1h TTL, or the fail-safe cache SUSPEND) the whole
+// conversation history was re-scanned and every flagged piece produced a BRAND
+// NEW audit row for content already on record. That is precisely the failure
+// mode 2026-08-08 rejected in writing ("同一违规会在长对话里放大成几十上百行
+// 审计记录,把 dashboard 违规计数淹没") — it just needed a cache miss instead of
+// a cache hit to happen.
+//
+// 🔴 THE INVARIANT, in one line: the audit dedup key and the cache hit key must
+// be derived from the SAME content identity. A correctness property (how many
+// audit rows one violation produces) must never be parasitic on a volatile
+// performance cache. That is why this function takes exactly the two values
+// cacheScope/hashHead already produce, and why the caller computes the content
+// hash UNCONDITIONALLY — including when the cache is nil or SUSPENDED.
+// Pattern: workflow/CI/designpattern/content-derived-idempotency-key.md
+//
+// contentVersion is deliberately NOT folded in (用户拍板 2026-09-08): an admin
+// editing a rule pack must not re-mint every active conversation's history into
+// a second set of rows — that is the same flood under a different trigger. The
+// verdict's provenance travels in the event's own detector/content version
+// fields, not in a second row.
+//
+// The prefix keeps derived ids distinguishable from the detector's own random
+// ids in stored data (older rows keep theirs; there is no backfill).
+func auditUnitID(scopeKey, contentHash string) string {
+	sum := sha256.Sum256([]byte("aikey-audit-unit\x00" + scopeKey + "\x00" + contentHash))
+	return "au_" + hex.EncodeToString(sum[:16])
+}
+
 // cacheKey is the level-2 (within-session) key. THREE parts, each answering a
 // different "is this verdict still the answer?" question:
 //

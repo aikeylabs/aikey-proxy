@@ -20,6 +20,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 
@@ -119,8 +120,17 @@ func TestFilterCache_TeamEventReplayedOnCacheHit(t *testing.T) {
 
 	ev := second[0]
 	// 幂等依据:重放的是同一个 event_id,下游 ON CONFLICT (event_id) DO NOTHING 吸收重复。
-	if ev["event_id"] != "evt-fixed-1" {
-		t.Errorf("重放事件的 event_id 变了(%v)—— 下游按 event_id 去重,伪造新 id 会导致同一违规重复计数", ev["event_id"])
+	//
+	// 🔴 2026-09-08 断言反转(用户拍板,反转 2026-08-08「event_id 归 detector 所有」条款):
+	// 这里原来断言 event_id 必须**逐字等于 detector 铸的 "evt-fixed-1"**。现在 proxy 会把它
+	// 改写成内容派生的审计单元 id(auditUnitID = 会话作用域 + 内容哈希)。
+	// 反转的理由:detector 的 id 是 CSPRNG,只对"同一条事件被重放"幂等,对"同一段内容被重扫"
+	// 无效 —— 而缓存一失效就必然重扫。本用例的**本意**(两轮拿到同一个 id → 下游吸收成一行)
+	// 逐字未变,变的只是那个 id 由谁派生。缓存未命中侧的对应围栏见
+	// filter_audit_unit_identity_test.go。
+	if !strings.HasPrefix(ev["event_id"].(string), "au_") {
+		t.Errorf("重放事件的 event_id 不是派生的审计单元 id(%v)—— detector 的随机 id 漏了出去,"+
+			"重扫时下游就吸收不了", ev["event_id"])
 	}
 	if ev["event_id"] != first[0]["event_id"] {
 		t.Errorf("两轮 event_id 不一致:%v vs %v", first[0]["event_id"], ev["event_id"])

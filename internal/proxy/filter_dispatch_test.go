@@ -76,7 +76,10 @@ func TestApplyInboundFilter_TeamEventIsMirroredToLocalStore(t *testing.T) {
 	}
 	hook := &stubHook{resp: &apphook.Response{
 		Action: apphook.ActionAllow,
-		Event:  []byte(`{"event_id":"e-team-1","action_taken":"allow","prompt_length":10,"findings":[]}`),
+		// 标记字段用 scenario,不用 event_id:2026-09-08 起 proxy 会把 event_id 改写成
+		// 内容派生的审计单元 id(auditUnitID),detector 铸的原值不再出现在上报里,
+		// 拿它当"事件到了没有"的标记会误红。本用例断言的是**镜像链路**,与 id 无关。
+		Event: []byte(`{"event_id":"e-team-1","scenario":"mirror-marker","action_taken":"allow","prompt_length":10,"findings":[]}`),
 	}}
 	p := &Proxy{filterHook: hook, reporter: rep}
 	r := newReq(`{"model":"m","messages":[{"role":"user","content":"hello team"}]}`)
@@ -86,7 +89,7 @@ func TestApplyInboundFilter_TeamEventIsMirroredToLocalStore(t *testing.T) {
 
 	select {
 	case b := <-teamCh:
-		if !strings.Contains(string(b), "e-team-1") {
+		if !strings.Contains(string(b), "mirror-marker") {
 			t.Fatalf("team sink got an envelope without the event: %s", b)
 		}
 	case <-time.After(3 * time.Second):
@@ -94,7 +97,7 @@ func TestApplyInboundFilter_TeamEventIsMirroredToLocalStore(t *testing.T) {
 	}
 	select {
 	case b := <-localCh:
-		if !strings.Contains(string(b), "e-team-1") {
+		if !strings.Contains(string(b), "mirror-marker") {
 			t.Fatalf("local store got an envelope without the event: %s", b)
 		}
 		if !strings.Contains(string(b), `"route_source":"team"`) {
