@@ -555,6 +555,7 @@ func Run() {
 	// route would make the CLI shell print "proxy does not support this", which
 	// reads as breakage on exactly the machines that never configured anything.
 	adminHandler.MCPDelegationFn = sup.MCPDelegationDecision
+	adminHandler.MCPGuardSeenFn = sup.NoteMCPGuardSeen
 	adminHandler.CanaryResultFn = sup.CanaryResult
 	adminHandler.DebugUpstreamHeadersStateFn = proxy.UpstreamHeadersDebugState
 	adminHandler.DebugUpstreamHeadersSetFn = proxy.SetUpstreamHeadersDebugAPIOverride

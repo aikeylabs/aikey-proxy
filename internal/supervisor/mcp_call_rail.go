@@ -43,12 +43,23 @@ import (
 
 // MCPCallDrainInterval is how often undelivered records are shipped.
 //
-// 🔴 Thirty seconds, and deliberately NOT per-call. A tool call must not wait on
-// our control plane (the whole point of the local-first write), and a batched
-// drain also means a burst of 500 calls is one request rather than 500. It is
-// shorter than the manifest rail's five minutes because this is OUR control
-// plane, not a third party's server.
-const MCPCallDrainInterval = 30 * time.Second
+// 🔴 THE VALUE LIVES IN pkg/mcpwire, NOT HERE (moved 2026-09-02). This is an
+// alias, and it must stay one.
+//
+// The reason is a second reader of the same number: the conversation audit has
+// to decide, at drawer-render time, whether a tool call with no matching record
+// is merely late or actually absent — and that answer is only correct when it
+// is expressed in terms of THIS cadence (task 13.10b). That reader lives in
+// aikey-data, which cannot import this internal package, so the two sides meet
+// in pkg/mcpwire — already a dependency of the proxy, the control plane and the
+// query service.
+//
+// 🚫 Do not restore a literal here. Two independent copies drift silently and
+// in the worst direction: lengthen this one past the reader's window and every
+// in-flight tool call briefly renders as `bypassed`, which is a SECURITY
+// finding, until it lands. `TestCallRailUsesTheSharedDrainInterval` fails on a
+// re-declared literal; see pkg/mcpwire/linktiming.go for the full note.
+const MCPCallDrainInterval = mcpwire.CallRailDrainInterval
 
 // mcpCallBatchSize bounds one POST.
 //

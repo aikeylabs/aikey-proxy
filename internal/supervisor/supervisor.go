@@ -329,7 +329,24 @@ type Supervisor struct {
 	// Personal only; nil wherever a control plane owns that verdict.
 	mcpLocalPublisher *mcp.LocalPublisher
 	mcpLocalSyncer    *mcp.ManifestSyncer
-	startedAt         time.Time
+	// mcpGuardSeen records whether the delegation-boundary hook has reached this
+	// gateway since the process started (P15 · 15.16, ruling A-4 option (c)).
+	//
+	// # Why the gateway's own traffic is the signal, and not the settings file
+	//
+	// The hook lives in the developer's `~/.claude/settings.json`; this process
+	// has no business reading the developer's editor config, and a line in that
+	// file proves only that somebody wrote it — not that the harness invokes it.
+	// One real call to POST /admin/mcp/delegation proves BOTH: installed, and
+	// actually consulted.
+	//
+	// 🔴 It is deliberately "since this process started", not "ever": persisting
+	// it would make an operational number depend on a state file, and the honest
+	// reading of a fresh gateway is "not observed yet". The console renders that
+	// as an explicit third state and 🚫 never as "not installed" — see the
+	// three-state note on Supervisor.MCPGuardActivity.
+	mcpGuardSeen atomic.Bool
+	startedAt    time.Time
 	// transport is the optional upstream-proxy RoundTripper applied to every
 	// generation's proxy (nil = default). atomic.Pointer so an egress hot-swap
 	// (SetTransport, 2026-06-30) can't race the gen-build read in applyToProxy.
@@ -620,6 +637,13 @@ func New(cfg *config.Config, configPath, password, version string) (*Supervisor,
 					return g.eventStore
 				}
 				return nil
+			}, func() bool {
+				// 🔴 The same predicate StartMCPCallRail uses to decide whether
+				// there is anywhere to ship to. Answering it twice, in two
+				// places, is how the rail and the audit-gap warning end up
+				// disagreeing about what kind of node this is.
+				masterURL, orgID := s.mcpPolicyTarget()
+				return masterURL != "" && orgID != ""
 			})
 		})
 	}
@@ -1365,6 +1389,29 @@ func (s *Supervisor) reloadQuotaSnapshot(gen *generation) {
 	if err != nil {
 		slog.Warn("quota.snapshot.load_failed", "error", err.Error())
 		return
+	}
+	// 🔴 A delivered rule with a non-positive limit is DROPPED by enforcement,
+	// and that drop used to be silent — indistinguishable, from the outside, from
+	// a limit that is working: no counter, no block, no message.
+	//
+	// This is expected to find nothing. All three writers refuse a non-positive
+	// limit, so such a row can only come from a hand-edited database, a future
+	// importer, or a regression in that validation — and the delivery snapshot
+	// serves rules verbatim without re-checking them. Saying so once per snapshot
+	// costs one loop; not saying it costs an operator who believes a limit is in
+	// force and has nothing to look at.
+	//
+	// 🚫 Not logged inside bucketsForSeat: that runs per request, and this is a
+	// property of the snapshot, not of the request.
+	for _, u := range quota.UnenforceableRules(subjects) {
+		slog.Warn("a delivered quota rule has a limit of zero or less, so it is NOT being "+
+			"enforced and that subject is effectively unlimited for this metric and period. "+
+			"No supported path can store such a value, so this row was almost certainly written "+
+			"directly to the database. Next: re-save the subject from the console, which will "+
+			"reject the bad limit and replace it.",
+			"event.name", observability.EventProxyQuotaRuleUnenforceable,
+			"subject_id", u.SubjectID, "metric", u.Metric, "period", u.Period,
+			"limit_amount", u.LimitAmount)
 	}
 	s.quotaSnapshot.ReplaceAll(subjects)
 	// Stage 4 回填: seed each subject's counter from the control-reported

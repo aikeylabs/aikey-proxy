@@ -41,6 +41,18 @@ import (
 //go:embed session-fingerprint.yaml
 var embeddedFingerprintYAML []byte
 
+// 🔴 A SECOND table, parsed by the SAME code (阶段8 P15 · K3 · task 15.18).
+//
+// The actor table answers "which AGENT made this call"; the session table
+// answers "which CONVERSATION". Two files rather than more rules in one,
+// because one matcher returning "whichever of the two matched" is the exact
+// overload `session_id` / `conversation_session_id` already refused. What is
+// reused is the MECHANISM — this parser, this rule/source shape, this ordering
+// — which is what "reuse the shape, do not invent a mechanism" means.
+//
+//go:embed actor-fingerprint.yaml
+var embeddedActorYAML []byte
+
 // Source types — kept as string constants (not iota int) so yaml
 // validation errors quote the actual offending value, easier debugging.
 const (
@@ -303,6 +315,9 @@ func validateSource(s source) error {
 var (
 	defaultOnce sync.Once
 	defaultM    *Matcher
+
+	actorOnce sync.Once
+	actorM    *Matcher
 )
 
 // Default returns the process-wide Matcher built from the embedded
@@ -318,4 +333,28 @@ func Default() *Matcher {
 		defaultM = m
 	})
 	return defaultM
+}
+
+// DefaultActor returns the process-wide Matcher built from the embedded
+// actor-fingerprint.yaml (阶段8 P15 · K3).
+//
+// 🔴 A separate instance, not a mode flag on Default(). The two tables have
+// different contents and different rules about what may go in them — the actor
+// table forbids any source that is not something the client explicitly sent on
+// THIS request (I33) — and a shared instance would make "which table am I
+// reading" a runtime argument that a call site can get wrong silently.
+//
+// Panics on malformed embedded yaml (boot-time fail-loud, same policy as
+// Default): a governance signal whose extraction table did not parse would
+// otherwise degrade to "nothing is ever attributed", which looks exactly like
+// "no client supplies one".
+func DefaultActor() *Matcher {
+	actorOnce.Do(func() {
+		m, err := Load(embeddedActorYAML)
+		if err != nil {
+			panic(fmt.Sprintf("sessionid: embedded actor-fingerprint.yaml is invalid: %v", err))
+		}
+		actorM = m
+	})
+	return actorM
 }

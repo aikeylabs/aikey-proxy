@@ -69,6 +69,11 @@ func migrateMCPCalls(db *sql.DB) error {
 			session_id          TEXT NOT NULL DEFAULT '',
 			conversation_session_id TEXT NOT NULL DEFAULT '',
 			app_slug            TEXT NOT NULL DEFAULT '',
+			-- actor_id: WHICH AGENT, when the client names one (P15 · K3).
+			-- 🔴 '' here means an older proxy wrote the row before actor
+			-- collection existed; 'unknown-actor' means we looked and the client
+			-- named nobody. Two facts, never merged — see mcpwire.CallRecord.
+			actor_id            TEXT NOT NULL DEFAULT '',
 			origin              TEXT NOT NULL DEFAULT 'agent',
 			status              TEXT NOT NULL,
 			error_code          TEXT NOT NULL DEFAULT '',
@@ -90,6 +95,36 @@ func migrateMCPCalls(db *sql.DB) error {
 	`); err != nil {
 		return fmt.Errorf("migrate mcp_call_event: %w", err)
 	}
+
+	// 🔴 Columns added AFTER this table first shipped. `CREATE TABLE IF NOT
+	// EXISTS` above is a no-op on a db that already has the table, so a proxy
+	// upgrading over an existing local audit db would never get these — and the
+	// next INSERT would fail with "no such column", taking down the local rail
+	// for precisely the users who had been using it. SQLite has no
+	// `ADD COLUMN IF NOT EXISTS`, so probe pragma_table_info and skip, the same
+	// idempotent pattern usage_events already uses (store.go).
+	//
+	// 🚫 Do not fold these back into the CREATE above and delete the probe: a
+	// fresh db would still be correct, and every upgraded db would break. The
+	// two paths are not interchangeable.
+	laterCols := []struct{ name, ddl string }{
+		// P15 · K3 — WHICH AGENT made the call, when the client names one.
+		{"actor_id", "ALTER TABLE mcp_call_event ADD COLUMN actor_id TEXT NOT NULL DEFAULT ''"},
+	}
+	for _, c := range laterCols {
+		var count int
+		if err := db.QueryRow(
+			"SELECT COUNT(*) FROM pragma_table_info('mcp_call_event') WHERE name=?", c.name,
+		).Scan(&count); err != nil {
+			return fmt.Errorf("probe mcp_call_event.%s: %w", c.name, err)
+		}
+		if count > 0 {
+			continue
+		}
+		if _, err := db.Exec(c.ddl); err != nil {
+			return fmt.Errorf("add mcp_call_event.%s: %w", c.name, err)
+		}
+	}
 	return nil
 }
 
@@ -104,12 +139,12 @@ func (s *Store) InsertMCPCall(rec mcpwire.CallRecord) error {
 	res, err := s.db.Exec(`
 		INSERT OR IGNORE INTO mcp_call_event (
 			call_id, org_id, seat_id, virtual_server_id, tool_id, tool_name,
-			backend_id, session_id, conversation_session_id, app_slug, origin,
+			backend_id, session_id, conversation_session_id, app_slug, actor_id, origin,
 			status, error_code, duration_ms, args_digest, args_raw,
 			upstream_request_id, manifest_hash, created_at_ms, reported_at_ms
-		) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,0)`,
+		) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,0)`,
 		rec.CallID, rec.OrgID, rec.SeatID, rec.VirtualServerID, rec.ToolID, rec.ToolName,
-		rec.BackendID, rec.SessionID, rec.ConversationSessionID, rec.AppSlug, rec.Origin,
+		rec.BackendID, rec.SessionID, rec.ConversationSessionID, rec.AppSlug, rec.ActorID, rec.Origin,
 		rec.Status, rec.ErrorCode, rec.DurationMs, rec.ArgsDigest, argsRawValue(rec.ArgsRaw),
 		rec.UpstreamRequestID, rec.ManifestHash, rec.CreatedAtMs)
 	if err != nil {
@@ -145,7 +180,7 @@ func (s *Store) UnreportedMCPCalls(limit int) ([]mcpwire.CallRecord, error) {
 	}
 	rows, err := s.db.Query(`
 		SELECT call_id, org_id, seat_id, virtual_server_id, tool_id, tool_name,
-		       backend_id, session_id, conversation_session_id, app_slug, origin,
+		       backend_id, session_id, conversation_session_id, app_slug, actor_id, origin,
 		       status, error_code, duration_ms, args_digest, args_raw,
 		       upstream_request_id, manifest_hash, created_at_ms
 		FROM mcp_call_event
@@ -163,7 +198,7 @@ func (s *Store) UnreportedMCPCalls(limit int) ([]mcpwire.CallRecord, error) {
 		var raw sql.NullString
 		if err := rows.Scan(&rec.CallID, &rec.OrgID, &rec.SeatID, &rec.VirtualServerID,
 			&rec.ToolID, &rec.ToolName, &rec.BackendID, &rec.SessionID,
-			&rec.ConversationSessionID, &rec.AppSlug, &rec.Origin, &rec.Status,
+			&rec.ConversationSessionID, &rec.AppSlug, &rec.ActorID, &rec.Origin, &rec.Status,
 			&rec.ErrorCode, &rec.DurationMs, &rec.ArgsDigest,
 			&raw, &rec.UpstreamRequestID, &rec.ManifestHash, &rec.CreatedAtMs); err != nil {
 			return nil, fmt.Errorf("scan unreported mcp call: %w", err)

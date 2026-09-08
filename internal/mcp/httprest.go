@@ -132,11 +132,18 @@ func (t *httpRESTTransport) CallTool(
 	// states that rather than relying on it having stayed true.
 	stripAikeyHeaders(req.Header)
 
-	// 🔴 The SAME client the MCP upstreams use — one timeout, one transport, one
-	// place the header-stripping RoundTripper lives. A second client here would
-	// be a second set of those, and the one nobody remembered to configure is
-	// the one that leaks.
-	resp, err := upstreamHTTPClient.Do(req)
+	// 🔴 The SAME client selection the MCP upstreams use — one timeout, one place
+	// the header-stripping RoundTripper lives, and one place that decides whether
+	// this backend needs a client certificate. A second client built here would
+	// be a second set of those, and the one nobody remembered to configure is the
+	// one that leaks.
+	client, cErr := clientFor(b)
+	if cErr != nil {
+		return nil, &UpstreamError{
+			Code: mcpwire.ErrBackendUnavailable, Detail: cErr.Error(), NotAccepted: true,
+		}
+	}
+	resp, err := client.Do(req)
 	if err != nil {
 		if errors.Is(err, context.DeadlineExceeded) || isTimeout(err) {
 			// 🔴 A timeout is NOT NotAccepted. The request was handed over; the

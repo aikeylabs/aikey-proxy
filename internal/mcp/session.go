@@ -74,9 +74,15 @@ type Session struct {
 	ProtocolVersion mcpwire.ProtocolVersion
 	// ClientInfo is what the client called itself. Display only.
 	ClientInfo mcpwire.Implementation
-	// StickyBackends pins backend id → chosen upstream instance, so R5's
+	// stickyBackends pins backend id → chosen upstream instance, so R5's
 	// stickiness survives across the session.
-	StickyBackends map[string]string
+	//
+	// 🔴 UNEXPORTED and reachable only through SessionStore.StickyInstance /
+	// PinInstance, which take the store's mutex. A session pointer is handed to
+	// every concurrent request that presents its id, so an exported map here
+	// would be a data race that only appears under a client that pipelines tool
+	// calls — the exact client we cannot ask to reproduce it.
+	stickyBackends map[string]string
 
 	createdAt  time.Time
 	lastSeenAt time.Time
@@ -130,7 +136,7 @@ func (s *SessionStore) Create(toolsetSlug, orgID, seatID string, version mcpwire
 		SeatID:          seatID,
 		ProtocolVersion: version,
 		ClientInfo:      client,
-		StickyBackends:  make(map[string]string),
+		stickyBackends:  make(map[string]string),
 		createdAt:       now,
 		lastSeenAt:      now,
 	}
@@ -167,6 +173,48 @@ func (s *SessionStore) Get(id string) (*Session, bool) {
 	}
 	sess.lastSeenAt = now
 	return sess, true
+}
+
+// StickyInstance returns the upstream instance this session is pinned to for a
+// backend, if it has been pinned yet.
+//
+// 🔴 Read under the store's mutex, not off the returned *Session — see
+// Session.stickyBackends.
+func (s *SessionStore) StickyInstance(sessionID, backendID string) (string, bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	sess, ok := s.byID[sessionID]
+	if !ok {
+		return "", false
+	}
+	url, ok := sess.stickyBackends[backendID]
+	return url, ok
+}
+
+// PinInstance records the instance a session will use for a backend from now on.
+//
+// 🔴 First write WINS; a later call cannot re-point an existing pin. Two
+// concurrent first calls on one session would otherwise each allocate and the
+// loser would move a session that had already started somewhere else — which is
+// the silent reassignment R5 forbids, arriving by way of a race rather than a
+// decision. Returns the pin that is now in force, which may be another
+// goroutine's.
+//
+// Pinning an unknown (expired) session is a no-op: the call still proceeds
+// against the address it chose, and the client's next request gets
+// MCP_SESSION_NOT_FOUND from checkSession, which is the honest answer.
+func (s *SessionStore) PinInstance(sessionID, backendID, url string) string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	sess, ok := s.byID[sessionID]
+	if !ok {
+		return url
+	}
+	if existing, ok := sess.stickyBackends[backendID]; ok {
+		return existing
+	}
+	sess.stickyBackends[backendID] = url
+	return url
 }
 
 // Delete ends a session. Idempotent: deleting an unknown id is success, because

@@ -85,6 +85,17 @@ type UpstreamBackend struct {
 	CredentialID string
 	// Credential is the resolved material. Zero value = nothing resolved.
 	Credential UpstreamCredential
+	// MTLSCertAlias names the client certificate this backend must present, and
+	// MTLSCert is the resolved material for it (task 4.8 · D-10).
+	//
+	// 🔴 A SECOND credential slot rather than a reuse of Credential: a backend
+	// can legitimately need both — mutual TLS to get the connection, and a bearer
+	// token on the request — and they are consumed at different moments. One
+	// field holding "whichever was configured" would make "is this backend's auth
+	// on the connection or on the request" unanswerable exactly when somebody is
+	// debugging a 401.
+	MTLSCertAlias string
+	MTLSCert      UpstreamCredential
 	// RESTBinding is set for a http_rest backend and describes THIS CALL's
 	// mapping onto an HTTP request (P9).
 	//
@@ -332,6 +343,27 @@ var upstreamHTTPClient = &http.Client{
 	Transport: &headerStripper{},
 }
 
+// clientFor picks the outbound client for one backend: the shared one, or the
+// one that presents this backend's client certificate.
+//
+// 🔴 The choice is made HERE, once, rather than at each call site, so a new
+// transport cannot accidentally dial with the shared client and silently skip
+// mutual TLS — which would surface as the backend refusing the connection, i.e.
+// as "the gateway cannot reach it".
+func clientFor(b UpstreamBackend) (*http.Client, error) {
+	if b.MTLSCertAlias == "" {
+		return upstreamHTTPClient, nil
+	}
+	if b.MTLSCert.Secret == "" {
+		// 🔴 Refused, not attempted without the certificate. Dialling anyway
+		// produces a TLS alert from the backend that reads like an outage; this
+		// says which alias could not be resolved and where to fix it.
+		return nil, fmt.Errorf("backend %q requires a client certificate (alias %q) but it could "+
+			"not be resolved; bind it in the console (Keys → MCP credentials)", b.Name, b.MTLSCertAlias)
+	}
+	return mtlsClientFor(b.MTLSCertAlias, b.MTLSCert)
+}
+
 // headerStripper removes internal headers as the very last step before the wire.
 //
 // 🔴 It is a RoundTripper rather than a helper the request builder calls,
@@ -466,7 +498,11 @@ func (t *httpTransport) roundTrip(ctx context.Context, b UpstreamBackend, method
 	// a future direct dial) still gets the guarantee.
 	stripAikeyHeaders(req.Header)
 
-	resp, err := upstreamHTTPClient.Do(req)
+	client, cErr := clientFor(b)
+	if cErr != nil {
+		return nil, nil, &UpstreamError{Code: mcpwire.ErrBackendUnavailable, Detail: cErr.Error(), NotAccepted: true}
+	}
+	resp, err := client.Do(req)
 	if err != nil {
 		if errors.Is(err, context.DeadlineExceeded) || isTimeout(err) {
 			// 🔴 A timeout is NOT NotAccepted. The request was handed to the
@@ -608,10 +644,40 @@ func applyCredential(req *http.Request, c UpstreamCredential) {
 // forgotten is the one that goes out.
 func stripAikeyHeaders(h http.Header) {
 	for name := range h {
-		if strings.HasPrefix(strings.ToLower(name), "x-aikey-") {
+		lower := strings.ToLower(name)
+		if strings.HasPrefix(lower, "x-aikey-") || outboundBannedHeaders[lower] {
 			h.Del(name)
 		}
 	}
+}
+
+// outboundBannedHeaders are non-`X-Aikey-*` headers that must never reach a
+// third-party backend (I32 / R65 · task 15.F3).
+//
+// 🔴 Why trace context is on this list even though it is a W3C STANDARD header.
+// The rule `no-aikey-headers-to-llm-upstream` is not about naming conventions,
+// it is about persona signals: an unusual header set on a request to somebody
+// else's server is a fingerprint, and the incident that produced the rule was
+// Anthropic's OAuth WAF answering 429 with no `RateLimit-Reset` to requests that
+// carried our extra headers. `traceparent` from a client like ours is exactly
+// that kind of tell.
+//
+// 🔴 Added 2026-09-03 because fence TestOutbound_NoTraceHeadersToUpstream found
+// it missing. Nothing sets these today — the outbound request is built fresh
+// rather than copied from the inbound one — so this changes no live behaviour.
+// That is the point: it turns "nothing adds one today", which is a fact that can
+// silently stop being true, into "it cannot get out", which is a property. The
+// most plausible way this gets undone is somebody reasonably deciding to
+// propagate trace context to backends for debuggability.
+//
+// 🚫 Correlation with a backend call is done AFTER THE FACT, by joining on
+// `upstream_request_id` in our own storage — never by putting our identifiers on
+// the request. See the same reasoning in pkg/mcpwire/callrecord.go.
+var outboundBannedHeaders = map[string]bool{
+	"traceparent": true,
+	"tracestate":  true,
+	// b3 / X-B3-* are Zipkin's older propagation format; same reasoning.
+	"b3": true,
 }
 
 func isTimeout(err error) bool {

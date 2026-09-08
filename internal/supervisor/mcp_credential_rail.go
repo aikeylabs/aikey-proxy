@@ -41,11 +41,13 @@ import (
 	"io"
 	"log/slog"
 	"net/http"
+	"net/url"
 	"time"
 
 	"github.com/AiKeyLabs/aikey-proxy/internal/httpx"
 	"github.com/AiKeyLabs/aikey-proxy/internal/mcp"
 	"github.com/AiKeyLabs/aikey-proxy/internal/observability"
+	"github.com/AiKeyLabs/pkg/mcpwire"
 )
 
 // mcpCredentialPollInterval matches the policy rail's 60s.
@@ -109,7 +111,7 @@ func (s *Supervisor) syncMCPCredentials(ctx context.Context, _ *generation, mast
 	if masterURL == "" {
 		return nil // no control plane on this node; not an error.
 	}
-	materials, err := fetchMCPCredentials(ctx, masterURL, bearer)
+	materials, err := fetchMCPCredentials(ctx, masterURL, bearer, s.MCPGuardActivity())
 	if err != nil {
 		slog.Warn("MCP credential delivery failed; keeping the material this proxy already holds",
 			"event.name", observability.EventProxyMCPCredentialPollFailed,
@@ -134,8 +136,21 @@ func (s *Supervisor) syncMCPCredentials(ctx context.Context, _ *generation, mast
 // 🔴 The response body is never logged and never included in an error, at any
 // level. It is a list of plaintext secrets, and an error string is the
 // most-copied text in an incident.
-func fetchMCPCredentials(ctx context.Context, masterURL, bearer string) ([]mcp.Material, error) {
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, masterURL+"/accounts/me/mcp-credentials", http.NoBody)
+func fetchMCPCredentials(ctx context.Context, masterURL, bearer string, guard mcpwire.GuardActivity) ([]mcp.Material, error) {
+	// 🔴 The governance observation rides THIS rail (P15 · 15.16, ruling A-4).
+	// Not the policy rail: that one is unauthenticated and takes its
+	// organisation from a query parameter, so anyone could report governance
+	// state for anyone's organisation. Here the control plane derives org and
+	// seat from the caller's own seats — the identity is computed by the server,
+	// never claimed by us.
+	//
+	// 🚫 Do not make this conditional on "the gate is configured". A node that
+	// reports only when it has something to boast about leaves the interesting
+	// population — seats with no gate — indistinguishable from seats that are
+	// switched off entirely.
+	u := masterURL + "/accounts/me/mcp-credentials?" +
+		url.Values{mcpwire.GuardActivityParam: {string(guard)}}.Encode()
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u, http.NoBody)
 	if err != nil {
 		return nil, err
 	}

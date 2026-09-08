@@ -577,6 +577,9 @@ func TestPolicyWireShapeMatchesControlPlane(t *testing.T) {
 	              "description":"d","input_schema":"{}","manifest_hash":"h1",
 	              "state":"needs_review","write_op":true,"idempotent":false,"tool_group":"db"}]}],
 	  "grants":[{"subject_kind":"seat","subject_id":"seat_7","virtual_server_id":"ts1"}],
+	  "delegation":{"default_allow":true,"tiers":[
+	     {"name":"read-only","agent_types":["Explore"],"toolset_slugs":["devtools"],"max_depth":1},
+	     {"name":"no-delegation","agent_types":["*"],"toolset_slugs":null,"max_depth":0}]},
 	  "generated_at_ms":1700000000000}`
 
 	var p Policy
@@ -592,6 +595,29 @@ func TestPolicyWireShapeMatchesControlPlane(t *testing.T) {
 	if len(p.Toolsets) != 1 || len(p.Toolsets[0].Tools) != 1 {
 		t.Fatalf("toolset did not decode: %+v", p.Toolsets)
 	}
+	// P15 · the delegation段. 🔴 Three properties, each of which fails SILENTLY
+	// if the two sides drift: a renamed field decodes to a zero value, and every
+	// zero value here means something safe-looking and wrong.
+	if len(p.Delegation.Tiers) != 2 || !p.Delegation.DefaultAllow {
+		t.Fatalf("delegation did not decode: %+v", p.Delegation)
+	}
+	if p.Delegation.Tiers[0].Name != "read-only" || len(p.Delegation.Tiers[0].AgentTypes) != 1 {
+		t.Errorf("tier identity did not decode: %+v", p.Delegation.Tiers[0])
+	}
+	// 🔴 max_depth is a POINTER on purpose. A renamed field would leave it nil,
+	// which reads as "AiKey does not limit depth" — the permissive answer.
+	if p.Delegation.Tiers[0].MaxDepth == nil || *p.Delegation.Tiers[0].MaxDepth != 1 {
+		t.Errorf("max_depth did not decode: %v", p.Delegation.Tiers[0].MaxDepth)
+	}
+	if p.Delegation.Tiers[1].MaxDepth == nil || *p.Delegation.Tiers[1].MaxDepth != 0 {
+		t.Error("max_depth 0 decoded as nil; 0 forbids delegation and nil permits any depth")
+	}
+	// 🔴 An EXPLICIT null must stay nil, not become []. nil means "this tier does
+	// not narrow"; [] means "narrow to nothing". The gate branches on exactly that.
+	if p.Delegation.Tiers[1].ToolsetSlugs != nil {
+		t.Errorf("an explicit null toolset_slugs became %v", p.Delegation.Tiers[1].ToolsetSlugs)
+	}
+
 	tool := p.Toolsets[0].Tools[0]
 	// 🔴 These four carry the security decisions. A rename that silently zeroed
 	// any of them would make every tool look published, read-only and unaliased.

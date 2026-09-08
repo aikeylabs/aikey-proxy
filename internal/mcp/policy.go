@@ -80,10 +80,14 @@ type PolicyToolset struct {
 // PolicyBackend is a backend as the proxy needs it. No credential material —
 // only the id, which the proxy resolves against its own vault.
 type PolicyBackend struct {
-	ID              string   `json:"id"`
-	Name            string   `json:"name"`
-	Transport       string   `json:"transport"`
-	EndpointURL     string   `json:"endpoint_url,omitempty"`
+	ID          string `json:"id"`
+	Name        string `json:"name"`
+	Transport   string `json:"transport"`
+	EndpointURL string `json:"endpoint_url,omitempty"`
+	// Instances is every address a service registry advertises for this backend,
+	// EndpointURL first. Empty — the common case, and every release before
+	// alpha.12 — means "there is only EndpointURL". See instance.go.
+	Instances       []string `json:"instances,omitempty"`
 	Command         string   `json:"command,omitempty"`
 	Args            []string `json:"args,omitempty"`
 	EnvKeys         []string `json:"env_keys,omitempty"`
@@ -114,6 +118,20 @@ type Policy struct {
 	Toolsets      []PolicyToolset `json:"toolsets"`
 	Grants        []PolicyGrant   `json:"grants"`
 	GeneratedAtMs int64           `json:"generated_at_ms"`
+
+	// Delegation is the org's delegation-boundary configuration (K1, D-26).
+	//
+	// 🔴 It rides THIS payload rather than getting a table and a rail of its
+	// own: a tier is configuration, not an entity — no lifecycle, no second
+	// consumer, nothing ever queries "who is on tier X". Zero DDL.
+	//
+	// 🔴 The zero value is the SAFE one to omit. An older control plane that
+	// does not send this field leaves DefaultAllow=false — which would deny
+	// everything — so the gate treats "no tiers configured at all" as
+	// pass-through before it ever consults DefaultAllow. See
+	// TestZeroPolicyAllowsEverything; D-27 requires shipping day to change
+	// nothing.
+	Delegation mcpwire.DelegationPolicy `json:"delegation,omitempty"`
 }
 
 // Tool states as they arrive from the control plane.
@@ -287,6 +305,32 @@ func (s *PolicyStore) Synced() bool {
 // 🔴 -1 rather than a large number: "never" and "very stale" are different
 // facts, and a health endpoint that renders the first as the second sends an
 // operator to debug a network that was never configured.
+// StalerThan answers "is this snapshot older than d seconds?" — and it is the
+// ONLY correct way to ask, because AgeSeconds() returns a SENTINEL.
+//
+// 🔴 Why this exists rather than callers comparing AgeSeconds() themselves:
+// a store restored from the on-disk cache is `synced` (it has a policy) but has
+// NEVER polled, so AgeSeconds() reports -1. Written as `AgeSeconds() > d` that
+// reads as FRESH — the sentinel silently inverts. A gateway that had never once
+// reached the control plane therefore judged on an arbitrarily old cached
+// snapshot and reported itself not-stale: no event, no WARN, indistinguishable
+// from a healthy node. That is exactly the signal D-29 traded fail-open for.
+//
+// Never-polled is the STALEST state there is, not the freshest.
+// Bugfix: workflow/CI/bugfix/2026-09-08-delegation-never-polled-reads-as-fresh.md
+// Fence: TestNeverPolledIsMaximallyStale (and the delegation-side fence it names).
+//
+// 🚫 Do not re-introduce a raw `AgeSeconds() > n` comparison anywhere. health.go
+// may still READ AgeSeconds() because it reports the sentinel verbatim (a
+// pointer to -1), which is the honest thing for a diagnostic to do.
+func (s *PolicyStore) StalerThan(seconds int64) bool {
+	age := s.AgeSeconds()
+	if age < 0 {
+		return true // never polled — see the header.
+	}
+	return age > seconds
+}
+
 func (s *PolicyStore) AgeSeconds() int64 {
 	last := s.lastOKAt.Load()
 	if last == 0 {

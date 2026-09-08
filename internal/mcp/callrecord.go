@@ -112,6 +112,7 @@ func (h *Handler) beginCall(w http.ResponseWriter, r *http.Request, ident Identi
 			// Code, which sends neither convention header; see the yaml.
 			ConversationSessionID: sessionid.Default().Extract(r, MCPSessionProtocol, ""),
 			AppSlug:               h.appSlugFor(r),
+			ActorID:               h.actorIDFor(r),
 			Origin:                originFor(r),
 			ArgsDigest:            mcpwire.MarshalArgsDigest(nil),
 			CreatedAtMs:           now.UnixMilli(),
@@ -149,6 +150,52 @@ func (h *Handler) mintCallID(r *http.Request) string {
 // moment the row is built.
 func (h *Handler) appSlugFor(r *http.Request) string {
 	return uaattribution.Default().MatchOrLog(r.Header.Get("User-Agent"), h.logger)
+}
+
+// actorIDFor answers WHICH AGENT made this call (P15 · K3 · tasks 15.19/15.20).
+//
+// 🔴 Read straight off the inbound request, in the SAME breath as app_slug and
+// for the same reason. On the LLM plane the OAuth injector rewrites headers
+// before forwarding; an extraction taken after any such middleware reports
+// whatever that middleware stamped AND LOOKS ENTIRELY NORMAL DOING IT — the
+// app-attribution trap (task 7.5a1) that already cost this repo once. The MCP
+// plane has no rewriting middleware today. Taking the value at ingress is what
+// keeps that true if one is ever added, which is a thing nobody will remember
+// to check when they add it.
+//
+// 🔴 NEVER returns "". A client that supplies nothing gets mcpwire.UnknownActor
+// — a VERDICT ("we looked; the client named nobody"), not a gap. The empty
+// string is reserved, all the way down to the column default, for "this row was
+// written by a proxy that did not collect an actor at all". Two facts, two
+// values, kept apart from here to the console (task 15.21 / R52's shape).
+//
+// 🔴 The unresolved case is COUNTED, not silently accepted. On Claude Code it
+// is expected to be ~100% — PRD §0.7: its MCP requests carry no agent
+// identifier — so the counter is the coverage metric for a limitation we have
+// published, 🚫 not an error rate. Without it, "no client tells us" and "our
+// extractor broke" are the same picture.
+//
+// 🚫 There is deliberately no fallback that infers the actor from the seat, the
+// conversation, or a recent delegation event. See actor-fingerprint.yaml's
+// header and fence TestActor_NoHeuristicResolution.
+func (h *Handler) actorIDFor(r *http.Request) string {
+	if actor := sessionid.DefaultActor().Extract(r, MCPSessionProtocol, ""); actor != "" {
+		return actor
+	}
+	h.logger.DebugContext(r.Context(),
+		"MCP call carries no client-supplied actor id; recording unknown-actor. "+
+			"This is expected on clients that do not name the calling agent (Claude Code sends no "+
+			"agent identifier on MCP requests at all) and is not an error. Next: nothing — the "+
+			"count is the coverage metric for that published limitation.",
+		// 🔴 The event carries no other identifier from this request, and that
+		// is deliberate rather than terse: the fence below asserts this function
+		// touches nothing on the receiver except the logger, because the receiver
+		// is where a correlation heuristic would find its raw material
+		// (h.sessions, h.policyStore). The app slug is already on the same row in
+		// the database and on the same line in the console; putting it here too
+		// would buy nothing and cost the assertion.
+		"event.name", mcpwire.EventActorUnresolved)
+	return mcpwire.UnknownActor
 }
 
 // originFor separates a real Agent call from the console's "try it" panel.

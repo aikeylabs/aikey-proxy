@@ -124,6 +124,10 @@ func buildMux(dataHandler http.Handler, adminHandler *admin.Handler, gate AdminG
 	mux.HandleFunc("POST /admin/mcp/local-manifest/accept", gate.guard(adminHandler.MCPLocalManifestAccept))
 	mux.HandleFunc("POST /admin/mcp/local-manifest/write-op", gate.guard(adminHandler.MCPLocalToolWriteOp))
 	mux.HandleFunc("POST /admin/mcp/local-manifest/refresh", gate.guard(adminHandler.MCPLocalRefresh))
+	// P15 · the delegation boundary. Asked by the `aikey` hook shell on every
+	// sub-agent spawn, so it is on a HOT path — the handler does no I/O beyond
+	// reading the in-memory policy snapshot.
+	mux.HandleFunc("POST /admin/mcp/delegation", gate.guard(adminHandler.MCPDelegation))
 
 	mux.HandleFunc("GET /admin/audit/status", gate.guard(adminHandler.AuditStatus))
 	mux.HandleFunc("POST /admin/audit/reconcile", gate.guard(adminHandler.AuditReconcile))

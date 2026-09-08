@@ -200,6 +200,21 @@ const (
 	// token quota floor backstops it and the server baseline catches up on
 	// re-sync. Recurring hits signal a stale summary needing a price re-sync.
 	EventProxyQuotaModelUnpriced = "proxy.quota.model_unpriced"
+	// EventProxyQuotaRuleUnenforceable — a delivered quota rule carries a limit
+	// of zero or less, so enforcement skips it and that subject is effectively
+	// unlimited for that (metric, period).
+	//
+	// 🔴 Expected to NEVER fire. All three writers refuse a non-positive limit
+	// (the console form, the control API's validateSubject, and the directory
+	// projection which writes `rules='[]'` and never a rule). A row like this can
+	// therefore only come from a hand-edited database, a future importer, or a
+	// regression in that validation — and the delivery snapshot serves rules
+	// verbatim without re-checking them.
+	//
+	// It exists because the skip is otherwise SILENT: an operator who believes a
+	// limit is in force would see no counter, no block and no message. The
+	// logging conventions forbid falling back to a default without saying so.
+	EventProxyQuotaRuleUnenforceable = "proxy.quota.rule_unenforceable"
 	// Compliance restorable-mask chain (方案 20260808 占位符还原与全类型脱敏).
 	// EventProxyFilterRestoreAlignMismatch: the masked text and the detector's
 	// span metadata disagree for one placeholder family (user typed the literal

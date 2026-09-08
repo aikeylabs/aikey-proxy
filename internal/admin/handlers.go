@@ -21,6 +21,7 @@ import (
 	"github.com/AiKeyLabs/aikey-proxy/internal/proxy/apppipe"
 	"github.com/AiKeyLabs/aikey-proxy/internal/vkeys"
 	"github.com/AiKeyLabs/pkg/egress"
+	"github.com/AiKeyLabs/pkg/mcpwire"
 	"github.com/AiKeyLabs/pkg/providerroutes"
 )
 
@@ -144,6 +145,25 @@ type Handler struct {
 	// are nil on a node that follows a control plane, where reviewing a tool is
 	// the console's job — and the handlers say exactly that rather than
 	// reporting a generic misconfiguration.
+	// MCPDelegationFn answers the delegation boundary for THIS node's identity
+	// (P15 · 15.7). nil on a build without the MCP plane.
+	//
+	// 🔴 No org/seat parameter, on purpose — see internal/supervisor/mcp_delegation.go.
+	// 🔴 Returns the (org, seat) the decision was made WITH, so the record names
+	// the identity the rules were actually applied for. 🚫 Do not re-resolve the
+	// identity here for logging — two resolutions can disagree across a vault
+	// reload, and a record naming the wrong seat is worse than one naming none.
+	MCPDelegationFn func(agentType string, depth int) (d mcpwire.Decision, orgID, seatID string)
+
+	// MCPGuardSeenFn records that the delegation hook reached this gateway
+	// (P15 · 15.16). nil on a node that reports no governance state.
+	//
+	// 🔴 A separate function rather than a side effect of MCPDelegationFn: the
+	// decision function is also reachable from the console-preview path, and
+	// "what would happen if" must not be recorded as "the gate is in use".
+	// Same separation 15.12 made for the decision events.
+	MCPGuardSeenFn func()
+
 	MCPLocalReviewFn  func() ([]mcp.ReviewBackend, string)
 	MCPLocalAcceptFn  func(backendID string, exclude []string) (mcp.AcceptResult, error)
 	MCPLocalWriteOpFn func(backendID, tool string, writeOp bool) error
@@ -1760,6 +1780,125 @@ func (h *Handler) MCPLocalToolWriteOp(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{
 		"backend": body.Backend, "tool": body.Tool, "write_op": *body.WriteOp,
 	})
+}
+
+// MCPDelegation serves POST /admin/mcp/delegation — the delegation boundary
+// gate the CLI hook shell asks on every spawn (P15 · 15.7).
+//
+// 🔴 FAIL-OPEN on every path where we cannot answer, and the answer says so
+// (`stale: true`) rather than staying silent. D-29 ratified that direction: a
+// developer whose proxy is mid-reload must not lose the ability to delegate,
+// because their next move is to uninstall the hook — after which the
+// organisation has no gate AND no signal that it lost one.
+//
+// 🚫 Do not add a 503 here. The shell treats any non-answer as allow anyway
+// (fail-open all the way down), so a 503 would only cost a round trip and hide
+// the reason. Fence: TestDelegationEndpointNeverRefusesWhenItCannotDecide.
+func (h *Handler) MCPDelegation(w http.ResponseWriter, r *http.Request) {
+	// 🔴 FIRST, before parsing. Reaching this handler at all is the evidence
+	// 15.16 reports: the hook is installed and the harness invokes it. A request
+	// we cannot decode still proves that, and dropping the note on the malformed
+	// path would make an encoding bug look like an uninstalled gate.
+	if h.MCPGuardSeenFn != nil {
+		h.MCPGuardSeenFn()
+	}
+	var body struct {
+		AgentType string `json:"agent_type"`
+		// Depth is where the CHILD would sit. 🔴 The SHELL computes it from the
+		// harness event (main agent → 1); it is never taken from the model.
+		Depth int `json:"depth"`
+	}
+	if err := json.NewDecoder(io.LimitReader(r.Body, 16<<10)).Decode(&body); err != nil {
+		// 🔴 Even a malformed request is answered with ALLOW. The alternative —
+		// refusing on a body we could not parse — turns any encoding bug in the
+		// shell into "sub-agents stopped working", which is exactly the failure
+		// mode that gets the hook removed.
+		writeJSON(w, http.StatusOK, mcpwire.Decision{Verdict: mcpwire.VerdictAllow, Stale: true})
+		return
+	}
+	if h.MCPDelegationFn == nil {
+		writeJSON(w, http.StatusOK, mcpwire.Decision{Verdict: mcpwire.VerdictAllow, Stale: true})
+		return
+	}
+
+	agentType := strings.TrimSpace(body.AgentType)
+	d, orgID, seatID := h.MCPDelegationFn(agentType, body.Depth)
+
+	// 🔴 THE DECISION IS RECORDED HERE, and until 2026-09-03 it was not recorded
+	// anywhere at all (task 15.12). Five of the six delegation events in the
+	// central catalogue had zero call sites: the gate decided, answered, and left
+	// no trace, so a denial, a narrowing and a fail-open were indistinguishable
+	// from each other AND from a gate that was not installed.
+	//
+	// 🔴 That is not a cosmetic gap. D-29 ratified failing open when the policy
+	// cannot be refreshed, and the price of that bargain is the WARN — without
+	// it, a gateway deciding from a month-old snapshot looks exactly like a
+	// healthy one, which is how a control that is not controlling anything
+	// survives for months.
+	//
+	// Emission point: the CALLER, not `DelegationGate.Decide`. Decide is a pure
+	// function shared with the console preview (fence
+	// TestConsolePreviewAndHookShareTheEvaluator); giving it a logger would make
+	// a preview write events, and an administrator's "what would happen if"
+	// would pollute the record of what did happen.
+	tc := observability.ExtractOrCreate(r)
+	logger := slog.With("trace_id", tc.TraceID, "request_id", tc.RequestID)
+
+	// 🔴 org_id / seat_id are the identity the decision was MADE WITH (returned
+	// by MCPDelegationFn, 🚫 not re-resolved here) — that is what makes the
+	// three-hop assertion 15.A3 possible: the seat on the member's key, the seat
+	// in this record, and the seat the tier was applied for are one value from
+	// one resolution. Empty means this node could not identify itself, which is
+	// a fail-open the operator needs to see, 🚫 not a placeholder.
+	logger.InfoContext(r.Context(), "MCP delegation requested",
+		"event.name", mcpwire.EventDelegationRequested,
+		"org_id", orgID, "seat_id", seatID,
+		"agent_type", agentType, "depth", body.Depth)
+
+	// 🔴 A TABLE lookup, 🚫 not a switch with a default. `narrow` has its own
+	// event on purpose (15.13): "allowed, but with fewer toolsets than the
+	// parent" is the single thing a tier configuration exists to tell an
+	// administrator, and folding it into `allowed` shows them a wall of green
+	// while half their delegations are being quietly downgraded. A default
+	// branch would file a future verdict under whatever the fallback happened to
+	// be and nobody would find out.
+	if name, ok := mcpwire.EventForVerdict[d.Verdict]; ok {
+		// 🔴 `toolsets` carries the IDs, 🚫 not len(). A count answers "were any
+		// removed"; it cannot answer "removed down to WHICH set", and that is the
+		// only question a narrowing record exists to settle — 15.A3 asserts the
+		// delivered set equals the tier's set verbatim, which a number cannot
+		// support. The set is bounded by the tier document, which is itself
+		// bounded (maxDelegationTiers), so this cannot grow without limit.
+		logger.InfoContext(r.Context(), "MCP delegation decided",
+			"event.name", name,
+			"org_id", orgID, "seat_id", seatID,
+			"agent_type", agentType, "depth", body.Depth,
+			"verdict", string(d.Verdict), "tier", d.Tier,
+			"toolsets", strings.Join(d.Toolsets, ","), "code", string(d.Code))
+	} else {
+		// 🔴 Loud rather than silent: a verdict with no event means the closed
+		// set grew and this call site was not updated, and the symptom would
+		// otherwise be a decision that simply never appears in the record.
+		logger.WarnContext(r.Context(), "MCP delegation produced a verdict with no event name; "+
+			"the verdict set grew and EventForVerdict was not updated. Next: add the verdict to "+
+			"that table in pkg/mcpwire — the decision was still answered normally.",
+			"event.name", mcpwire.EventDelegationRequested,
+			"verdict", string(d.Verdict))
+	}
+
+	if d.Stale {
+		// 🔴 The other half of the D-29 bargain. 🚫 Do not downgrade this to INFO
+		// or make it conditional on a tier having matched: the whole point is
+		// that a fail-open is visible even when nothing was configured.
+		logger.WarnContext(r.Context(), "MCP delegation decided from a policy snapshot that could "+
+			"not be refreshed; the spawn was allowed on stale rules. Next: check that this node "+
+			"can reach the control plane (`aikey mcp guard status`).",
+			"event.name", mcpwire.EventPolicyStale,
+			"org_id", orgID, "seat_id", seatID,
+			"agent_type", agentType, "depth", body.Depth, "tier", d.Tier)
+	}
+
+	writeJSON(w, http.StatusOK, d)
 }
 
 // MCPLocalRefresh serves POST /admin/mcp/local-manifest/refresh: re-read
