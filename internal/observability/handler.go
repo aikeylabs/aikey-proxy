@@ -402,6 +402,212 @@ const (
 	EventProxyGroupLoginStateClearFailed = "proxy.group.login_state_clear_failed"
 )
 
+// MCP gateway events (freeze 0.16 / PRD §4.3).
+//
+// 🔴 Frozen 2026-09-01 alongside the endpoint shapes and error codes:
+// roadmap20260320/技术实现/阶段8-平台化/MCP网关/openspec/changes/aikey-mcp-gateway/baseline-forensics.md §二.
+// Names follow the repo convention <service>.<area>.<state>, lower-case and
+// dot-separated. 🚫 No string literals at call sites — the whole reason this
+// central enum exists is that an event name typed twice drifts once.
+//
+// Two of these carry a severity rule that is part of the contract, not a
+// stylistic preference:
+//
+//   - EventProxyMCPManifestDriftDetected is a SECURITY signal (an upstream
+//     changed the instructions the model reads), so it logs at WARN, never INFO.
+//   - EventProxyMCPRetrySuppressed exists so that "we deliberately did NOT
+//     retry" is observable. Without it, an operator investigating a failed tool
+//     call sees only the failure and reasonably concludes retry is broken.
+const (
+	// EventProxyMCPPolicyChanged: the 60s policy poll found a new MCP policy
+	// version and rewrote the local cache. Mirrors proxy.quota.policy_changed.
+	EventProxyMCPPolicyChanged = "proxy.mcp.policy_changed"
+	// EventProxyMCPManifestDriftDetected: an upstream tool's manifest_hash no
+	// longer matches the published one. 🔴 WARN — this is the poisoning signal.
+	EventProxyMCPManifestDriftDetected = "proxy.mcp.manifest_drift_detected"
+	// EventProxyMCPManifestAdopted: a human accepted the new manifest. Carries
+	// the actor resolved via auditactor (R25).
+	EventProxyMCPManifestAdopted = "proxy.mcp.manifest_adopted"
+	// EventProxyMCPCredentialResolveFailed: a backend credential could not be
+	// decrypted or is unbound. ERROR — the tool is unusable until fixed.
+	EventProxyMCPCredentialResolveFailed = "proxy.mcp.credential_resolve_failed"
+	// EventProxyMCPCredentialCacheUnavailable: this proxy has no vault key, so
+	// delivered credentials are held in memory only. 🔴 WARN, and the message
+	// must say the cache was skipped ON PURPOSE — the alternative (writing tool
+	// credentials unsealed to the run directory) would move the secret from
+	// ~/.claude.json to ~/.aikey/run/ and call it a feature.
+	EventProxyMCPCredentialCacheUnavailable = "proxy.mcp.credential_cache_unavailable"
+	// EventProxyMCPCredentialCacheWriteFailed: the sealed cache could not be
+	// written. WARN — memory is already correct; only the restart shortcut is
+	// lost.
+	EventProxyMCPCredentialCacheWriteFailed = "proxy.mcp.credential_cache_write_failed"
+	// EventProxyMCPCredentialCacheReadFailed: the sealed cache could not be read
+	// or opened (usually a re-keyed vault). WARN — the store starts empty and
+	// converges on the next poll.
+	EventProxyMCPCredentialCacheReadFailed = "proxy.mcp.credential_cache_read_failed"
+	// EventProxyMCPCredentialCacheExpired: the sealed cache was older than the
+	// trust bound and was discarded rather than used. 🔴 Its own event, not a
+	// read failure: "too old to trust" is a deliberate refusal and an operator
+	// chasing missing tools after a long shutdown needs to see exactly that.
+	EventProxyMCPCredentialCacheExpired = "proxy.mcp.credential_cache_expired"
+	// EventProxyMCPCredentialsDelivered: the credential rail delivered a fresh
+	// set. INFO — the one line that answers "did this proxy ever receive any
+	// credentials at all", which is the first question in every
+	// MCP_CREDENTIAL_MISSING investigation.
+	EventProxyMCPCredentialsDelivered = "proxy.mcp.credentials_delivered"
+	// EventProxyMCPCredentialPollFailed: the credential rail poll failed. WARN
+	// — the previous set stays in force (🚫 never blanked on a failed poll,
+	// which would turn a transient control-plane blip into a tool outage).
+	EventProxyMCPCredentialPollFailed = "proxy.mcp.credential_poll_failed"
+	// EventProxyMCPRetryAttempted: a tool call WAS retried, with the reason.
+	// INFO — the counterpart to the suppression below, so an operator can tell
+	// "it retried" from "it deliberately did not" without reading the code.
+	EventProxyMCPRetryAttempted = "proxy.mcp.retry_attempted"
+	// EventProxyMCPRetrySuppressed: a retryable-looking failure was NOT retried
+	// because the tool is not declared idempotent (R4, default false).
+	EventProxyMCPRetrySuppressed = "proxy.mcp.retry_suppressed_non_idempotent"
+	// EventProxyMCPResponseTooLarge: an upstream tool result exceeded the
+	// response ceiling and was cut off.
+	EventProxyMCPResponseTooLarge = "proxy.mcp.response_too_large"
+	// EventProxyMCPLocalConfigLoaded: Personal edition read its mcp.json. INFO —
+	// the line that answers "did this proxy see my config at all", which is the
+	// first question when `aikey mcp add` appears to have done nothing.
+	EventProxyMCPLocalConfigLoaded = "proxy.mcp.local_config_loaded"
+	// EventProxyMCPLocalConfigInvalid: the local config, or one backend in it,
+	// is unusable. 🔴 ERROR and non-fatal: a bad MCP config must never stop the
+	// proxy forwarding LLM traffic, and must never be silent either — the user
+	// ran a command and is waiting for tools that will not appear.
+	EventProxyMCPLocalConfigInvalid = "proxy.mcp.local_config_invalid"
+	// EventProxyMCPLocalManifestUnreadable: Personal edition could not read the
+	// record of which tool definitions the user has approved. 🔴 ERROR, not
+	// WARN, and non-fatal: continuing means re-admitting every tool at whatever
+	// the upstream serves next, which is the pre-P14 behaviour and therefore
+	// not a regression — but it is also precisely the state an attacker would
+	// want to engineer, so it must never happen quietly.
+	EventProxyMCPLocalManifestUnreadable = "proxy.mcp.local_manifest_unreadable"
+	// EventProxyMCPLocalManifestUnwritable: the approval record could not be
+	// saved. WARN: the policy in memory is already correct, so only the survival
+	// of the approvals across a restart is lost.
+	EventProxyMCPLocalManifestUnwritable = "proxy.mcp.local_manifest_unwritable"
+	// EventProxyMCPLocalManifestAccepted: the user accepted an upstream's
+	// changed manifest via `aikey mcp review --accept`. INFO — this is the
+	// audit line for a human decision, and on Personal it is the only place
+	// that decision is recorded.
+	EventProxyMCPLocalManifestAccepted = "proxy.mcp.local_manifest_accepted"
+	// EventProxyMCPLocalManifestPublished: a human completed the FIRST review of
+	// a backend, and its tools became available. INFO — on Personal this line is
+	// the whole audit trail for the one decision drift detection can never make
+	// for you: "was this server already poisoned when I brought it in" (D-20).
+	// It records how many tools were published and how many were turned down.
+	EventProxyMCPLocalManifestPublished = "proxy.mcp.local_manifest_published"
+	// EventProxyMCPLocalManifestMigrated: the approval record was upgraded to a
+	// newer on-disk schema. INFO — it says what was assumed about the old rows,
+	// which is the only way to check the assumption later.
+	EventProxyMCPLocalManifestMigrated = "proxy.mcp.local_manifest_migrated"
+	// EventProxyMCPLocalConfigReloaded: `aikey mcp add` / `adopt` changed
+	// mcp.json and the gateway re-read it without restarting. INFO — before
+	// P14.3 there was no such path at all and a newly registered server did
+	// nothing until the proxy was restarted, with nothing saying so.
+	EventProxyMCPLocalConfigReloaded = "proxy.mcp.local_config_reloaded"
+	// EventProxyMCPLocalToolNameCollision: two local backends expose the same
+	// tool name. WARN — the second is exposed under a qualified name, and a
+	// tool whose name changed is a tool the Agent can no longer call, so this
+	// cannot be silent.
+	EventProxyMCPLocalToolNameCollision = "proxy.mcp.local_tool_name_collision"
+	// EventProxyMCPChildStarted: a stdio backend child process came up and
+	// completed the MCP handshake. INFO — it is the line that answers "did this
+	// backend ever start", the first question in every local-backend problem.
+	EventProxyMCPChildStarted = "proxy.mcp.child_started"
+	// EventProxyMCPChildBadFrame: a stdio backend wrote a line to STDOUT that is
+	// not JSON-RPC. WARN — almost always a packaging mistake (a banner or a
+	// progress bar on stdout instead of stderr), and this is the only thing that
+	// will ever say so.
+	EventProxyMCPChildBadFrame = "proxy.mcp.child_bad_frame"
+	// EventProxyMCPChildStderr: a stdio backend child process wrote to stderr.
+	// Collected rather than discarded — for a local Server this is the only
+	// diagnostic channel that exists.
+	EventProxyMCPChildStderr = "proxy.mcp.child_stderr"
+	// EventProxyMCPChildStartFailed: a stdio backend has failed to start
+	// repeatedly. 🔴 ERROR, and emitted ONCE on the transition — this is the
+	// escalation that stops a broken backend sitting at WARN forever, which the
+	// project rule forbids. Repeating it per call would recreate the noise it
+	// exists to cut through.
+	EventProxyMCPChildStartFailed = "proxy.mcp.child_start_failed"
+	// EventProxyMCPChildReapFailed: a stdio backend survived SIGKILL to its
+	// process group and the shutdown gave up waiting. 🔴 ERROR: it means a
+	// process holding a decrypted credential is still running with no parent,
+	// which is the exact outcome the process-tree machinery exists to prevent —
+	// so if this ever appears, the reaping is broken, not merely slow.
+	EventProxyMCPChildReapFailed = "proxy.mcp.child_reap_failed"
+	// EventProxyMCPCallIDFallback: crypto/rand refused, so the call record's id
+	// came from the clock instead. WARN, not ERROR: the row is still written,
+	// and this id is a database key rather than a credential — losing the audit
+	// row would be the worse outcome, which is why the fallback exists at all.
+	EventProxyMCPCallIDFallback = "proxy.mcp.call_id_fallback"
+	// EventProxyMCPCallUnanswered: a tools/call returned without writing any
+	// JSON-RPC answer. 🔴 ERROR — the client is hanging, and it is OUR defect.
+	// The call is recorded as internal_error rather than guessed at.
+	EventProxyMCPCallUnanswered = "proxy.mcp.call_unanswered"
+	// EventProxyMCPCallStatusUnclassified: a tools/call ended with a frozen
+	// error code this build cannot map to a call status. WARN: it means a code
+	// was added without deciding how a call carrying it is recorded, and the row
+	// falls back to internal_error with the code preserved.
+	EventProxyMCPCallStatusUnclassified = "proxy.mcp.call_status_unclassified"
+	// EventProxyMCPCallRecordDropped: a finished call could not be persisted.
+	// 🔴 WARN with a running total: any non-zero count means the call log is a
+	// sample rather than a record, and an operator must be able to see that.
+	EventProxyMCPCallRecordDropped = "proxy.mcp.call_record_dropped"
+	// EventProxyMCPCallsUploaded: a batch of call records reached the control
+	// plane. INFO, and the counterpart to the drop event above: without it,
+	// "the console shows no calls" cannot be told apart from "nothing was
+	// called".
+	EventProxyMCPCallsUploaded = "proxy.mcp.calls_uploaded"
+	// EventProxyMCPComplianceDegraded: the DLP filter could not run, so an MCP
+	// payload was forwarded UNSCANNED. 🔴 WARN on every occurrence: a filter
+	// that is silently not running is worse than one that is loudly off.
+	EventProxyMCPComplianceDegraded = "proxy.mcp.compliance_degraded"
+	// EventProxyMCPComplianceTruncated: a payload exceeded the scan cap and was
+	// only partly scanned. WARN — a payload big enough to be truncated is the
+	// shape an exfiltration takes, so "we looked at the first 16 KiB" must be
+	// readable somewhere.
+	EventProxyMCPComplianceTruncated = "proxy.mcp.compliance_truncated"
+	// EventProxyMCPComplianceBlocked: the DLP filter refused a tool call. INFO —
+	// it is the system working, and the finding itself is the audit record.
+	EventProxyMCPComplianceBlocked = "proxy.mcp.compliance_blocked"
+	// EventProxyMCPCallsUploadFailed: the call-record rail could not deliver.
+	// WARN — the rows stay in the local store and are re-sent, so this is a
+	// delay rather than a loss, but a rail that stays down IS a coming audit gap.
+	EventProxyMCPCallsUploadFailed = "proxy.mcp.calls_upload_failed"
+	// EventProxyMCPChildRestarted: a stdio backend child crashed and was
+	// restarted with backoff. Escalates past WARN after repeated failures —
+	// 🚫 it must not sit at WARN forever.
+	EventProxyMCPChildRestarted = "proxy.mcp.child_restarted"
+	// EventProxyMCPPlaneRejected: the MCP plane's own concurrency budget was
+	// exhausted and a request was shed. 🔴 This is the observable half of the
+	// isolation bargain (D-1): shedding here is what keeps the LLM plane intact,
+	// so it must be visible rather than silent.
+	EventProxyMCPPlaneRejected = "proxy.mcp.plane_rejected"
+	// EventProxyMCPPanicRecovered: a panic escaped an MCP handler and was
+	// contained by the plane's own recovery. Distinct from proxy.http.panic so
+	// an operator can tell "the new MCP surface faulted" from "the LLM path
+	// faulted" without reading stack traces.
+	EventProxyMCPPanicRecovered = "proxy.mcp.panic_recovered"
+	// EventProxyMCPManifestReportFailed: the proxy observed a backend manifest
+	// but could not deliver it to the control plane. WARN, not ERROR: the next
+	// round re-sends it. 🔴 It must NOT look like a backend failure — the two
+	// send an operator to different places.
+	EventProxyMCPManifestReportFailed = "proxy.mcp.manifest_report_failed"
+	// EventProxyMCPPolicyDecodeFailed: the control plane answered 200 but the
+	// body could not be decoded, or named a different organization. 🔴 WARN, not
+	// silence: this is a version-skew (or tenancy) bug that would otherwise
+	// present as "the rail never updates" with nothing in the log to explain it.
+	EventProxyMCPPolicyDecodeFailed = "proxy.mcp.policy_decode_failed"
+	// EventProxyConversationToolUseParseFailed: a tool_use block was seen in a
+	// model response but no tool name could be parsed out of it. 🔴 WARN —
+	// 🚫 never silently treat it as "this turn had no tool calls" (tasks 13.6).
+	EventProxyConversationToolUseParseFailed = "proxy.conversation.tool_use_parse_failed"
+)
+
 // Usage extraction events.
 //
 // EventProxyExtractionMismatch fires when an extractor falls back to defaults

@@ -33,6 +33,8 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+
+	"github.com/AiKeyLabs/aikey-proxy/internal/observability"
 	"strings"
 	"time"
 )
@@ -55,6 +57,12 @@ type RetentionResult struct {
 	WALArchived    int
 	ArchiveDeleted int
 	EventsPruned   int64
+	// MCPCallsPruned is local MCP call records retired by this sweep.
+	MCPCallsPruned int64
+	// MCPCallsPrunedUndelivered is how many of those had NEVER reached the
+	// control plane. 🔴 Non-zero means an audit gap was just made permanent —
+	// see the sweep step that fills it.
+	MCPCallsPrunedUndelivered int64
 }
 
 // walFileTime parses the UTC hour embedded in a WAL filename
@@ -134,6 +142,27 @@ func RunRetentionSweep(cfg RetentionConfig, store *Store, now time.Time) Retenti
 		} else {
 			res.EventsPruned = n
 		}
+
+		// 4. Prune local MCP call records past the SAME retention window.
+		//
+		// 🔴 In the same sweep and on the same cutoff, deliberately: two
+		// retention policies for two tables in one database is two numbers an
+		// operator has to know, and the one they do not know about is the one
+		// that fills the disk.
+		//
+		// 🔴 UNDELIVERED rows are counted separately and reported. A row that
+		// aged out without ever reaching the control plane is an AUDIT GAP —
+		// the control plane has been unreachable for the whole retention window
+		// — and it must be a number somebody can see, not something that
+		// quietly did not happen. (稳定 > 延迟的审计记录: keeping it forever
+		// would trade the gap for a full disk on an employee laptop.)
+		pruned, undelivered, err := store.PruneMCPCallsOlderThan(retireBefore)
+		if err != nil {
+			res.Errors = append(res.Errors, fmt.Sprintf("prune mcp_call_event: %v", err))
+		} else {
+			res.MCPCallsPruned = pruned
+			res.MCPCallsPrunedUndelivered = undelivered
+		}
 	}
 	return res
 }
@@ -163,8 +192,19 @@ func RetentionLoop(ctx context.Context, cfg RetentionConfig, storeFn func() *Sto
 			"wal_archived", res.WALArchived,
 			"archive_deleted", res.ArchiveDeleted,
 			"events_pruned", res.EventsPruned,
+			"mcp_calls_pruned", res.MCPCallsPruned,
 			"retention_days", cfg.RetentionDays,
 			"archive_days", cfg.ArchiveDays)
+		// 🔴 A SEPARATE line at WARN, not a field on the INFO above. Records
+		// that aged out undelivered are an audit gap, and burying the number in
+		// a routine "sweep complete" line is how it goes unread for a month.
+		if res.MCPCallsPrunedUndelivered > 0 {
+			slog.Warn("MCP call records were deleted without ever reaching the control plane; "+
+				"the console's call log has a permanent gap for that period",
+				"event.name", observability.EventProxyMCPCallRecordDropped,
+				"records", res.MCPCallsPrunedUndelivered,
+				"retention_days", cfg.RetentionDays)
+		}
 	}
 	sweep()
 	for {

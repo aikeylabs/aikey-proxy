@@ -10,6 +10,7 @@ import (
 
 	"github.com/AiKeyLabs/aikey-proxy/internal/provider"
 	"github.com/AiKeyLabs/aikey-proxy/pkg/observer"
+	"github.com/AiKeyLabs/pkg/mcpwire"
 	"github.com/AiKeyLabs/pkg/aikeytime"
 )
 
@@ -64,6 +65,22 @@ type ConversationRecord struct {
 	// owner; audit views key on seat with owner fallback for legacy rows.
 	SeatID         string `json:"seat_id,omitempty"`
 	OwnerAccountID string `json:"owner_account_id"`
+	// ToolCalls is what the model asked to call in THIS turn (阶段8 P13 leg A).
+	//
+	// 🔴 One definition, three consumers — mcpwire.TurnToolCall is written here,
+	// projected by the collector and rendered by the console (task 13.5).
+	//
+	// 🔴 nil and empty mean different things downstream: a turn captured by a
+	// proxy that predates this feature carries NO field at all, and rendering
+	// that as "this turn made no tool calls" would be a false report (task 13.8).
+	// The distinction is preserved by omitempty plus the collector's nullable
+	// column — 🚫 never normalise nil to [] here.
+	// 🔴 NO omitempty. nil marshals to `null` and an empty slice to `[]`, and
+	// that difference is the feature: `null`/absent = this proxy does not
+	// collect tool calls, `[]` = it does and this turn called nothing. With
+	// omitempty both collapse to "absent" and the console can only guess.
+	ToolCalls []mcpwire.TurnToolCall `json:"tool_calls"`
+
 	SessionID                string           `json:"session_id"`
 	RequestStatus            string           `json:"request_status"`
 	OrgID                    string           `json:"org_id"`
@@ -119,8 +136,12 @@ type turnState struct {
 	systemText   string
 	model        string
 	assistant    strings.Builder
-	sawDone      bool
-	sawFrame     bool
+	// tools accumulates this turn's tool calls from the SAME frames the
+	// assistant text comes from (task 13.1c — one traversal, not a second
+	// observer).
+	tools    *toolCallAcc
+	sawDone  bool
+	sawFrame bool
 }
 
 // New builds the observer. Returns a typed *Observer (registration.go adapts it
@@ -157,7 +178,10 @@ func (o *Observer) OnRequestStart(_ context.Context, req *observer.RequestContex
 	if req.Stream == observer.StreamProbe {
 		return
 	}
-	st := &turnState{tokenAcc: provider.NewStreamAccumulatorForFamily(req.ProtocolFamily)}
+	st := &turnState{
+		tokenAcc: provider.NewStreamAccumulatorForFamily(req.ProtocolFamily),
+		tools:    newToolCallAcc(),
+	}
 	st.cacheEnabled = detectCacheEnabled(req.RequestBody)
 	if len(req.RequestBody) > 0 {
 		// Parse-once: prompt + system + model from a single Unmarshal (see
@@ -183,8 +207,16 @@ func (o *Observer) OnSSEEvent(_ context.Context, req *observer.RequestContext, e
 	if st.tokenAcc != nil {
 		st.tokenAcc.Feed(payload)
 	}
-	if delta := extractAssistantDelta(req.ProtocolFamily, eventType, payload); delta != "" {
+	// 🔴 ONE decode per frame for both concerns. extractFrame returns the text
+	// increment and any tool-call signal from the same parse; calling two
+	// extractors would double the hot path's cost and split "what does this
+	// frame mean" across two places.
+	delta, tools := extractFrame(req.ProtocolFamily, eventType, payload, len(st.tools.order))
+	if delta != "" {
 		st.assistant.WriteString(delta)
+	}
+	for _, tf := range tools {
+		st.tools.observe(tf)
 	}
 	if isCompletionMarker(req.ProtocolFamily, eventType, payload) {
 		st.sawDone = true
@@ -207,10 +239,31 @@ func (o *Observer) OnRequestEnd(_ context.Context, req *observer.RequestContext,
 	assistantText := capText(st.assistant.String(), maxB)
 	systemText := capText(st.systemText, maxB)
 
+	toolCalls := st.tools.result()
+
+	// 🔴 A frame that ANNOUNCED a tool call whose name we could not read is
+	// reported, never swallowed (task 13.6). "We could not parse the name" and
+	// "this turn made no tool calls" are opposite facts, and an auditor acts on
+	// the second one. Same shape as the empty-extract warning below.
+	if st.tools.unnamed > 0 {
+		o.logger.Warn("conversation audit: a tool_use block carried no readable tool name; "+
+			"that call is missing from this turn's tool list",
+			"event.name", "proxy.conversation.tool_use_parse_failed",
+			"error.code", "TOOL_USE_PARSE_FAILED",
+			"unnamed_blocks", st.tools.unnamed,
+			"protocol_family", req.ProtocolFamily, "trace_id", req.TraceID)
+	}
+
 	// Nothing conversational captured: skip the empty row, but WARN when frames
 	// did arrive — that means the protocol extractor missed text (a parse gap to
 	// investigate), not a genuinely empty turn.
-	if userText == "" && assistantText == "" {
+	//
+	// 🔴 A turn with tool calls and NO text is a real turn and is KEPT. Before
+	// P13 it was dropped here, which is the same silence this feature exists to
+	// end: a model that answers purely by calling a tool produced no record at
+	// all, so "who touched my production database" had nothing to read. The
+	// condition therefore asks about tool calls too, not only text.
+	if userText == "" && assistantText == "" && len(toolCalls) == 0 {
 		if st.sawFrame {
 			o.logger.Warn("conversation audit: frames seen but no text extracted; skipping record",
 				"event.name", "conversation.capture.empty_extract",
@@ -241,6 +294,7 @@ func (o *Observer) OnRequestEnd(_ context.Context, req *observer.RequestContext,
 		ProviderCode:   req.ProviderID,
 		UserText:       userText,
 		AssistantText:  assistantText,
+		ToolCalls:      toolCalls,
 		SystemText:     systemText,
 		DurationMs:     &latency,
 		RequestStatus:  status,
