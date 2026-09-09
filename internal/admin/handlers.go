@@ -15,11 +15,13 @@ import (
 
 	"github.com/AiKeyLabs/aikey-proxy/internal/config"
 	"github.com/AiKeyLabs/aikey-proxy/internal/events"
+	"github.com/AiKeyLabs/aikey-proxy/internal/mcp"
 	"github.com/AiKeyLabs/aikey-proxy/internal/observability"
 	providerreg "github.com/AiKeyLabs/aikey-proxy/internal/provider"
 	"github.com/AiKeyLabs/aikey-proxy/internal/proxy/apppipe"
 	"github.com/AiKeyLabs/aikey-proxy/internal/vkeys"
 	"github.com/AiKeyLabs/pkg/egress"
+	"github.com/AiKeyLabs/pkg/mcpwire"
 	"github.com/AiKeyLabs/pkg/providerroutes"
 )
 
@@ -69,6 +71,9 @@ type Handler struct {
 	ReplayDeadLetterFn func(ctx context.Context) (events.ReplayDeadLetterResult, error)
 	// CanaryResultFn returns the latest canary probe result (nil = canary disabled).
 	CanaryResultFn func() *events.CanaryResult
+	// MCPMetricsFn returns the MCP plane's counters, or nil when this node has
+	// no MCP plane mounted.
+	MCPMetricsFn func() *mcp.CallMetrics
 
 	// DebugUpstreamHeadersStateFn / DebugUpstreamHeadersSetFn drive the
 	// /admin/debug/upstream-headers endpoints. State returns the resolved
@@ -134,6 +139,39 @@ type Handler struct {
 	// (re-send WAL-present gaps, confirm WAL-absent gaps lost now). nil → 503.
 	AuditStatusFn   func() *events.AuditStatus
 	ReconcileGapsFn func(ctx context.Context) (events.ReconcileResult, error)
+
+	// MCPLocalReviewFn / MCPLocalAcceptFn / MCPLocalWriteOpFn drive
+	// `aikey mcp review` on Personal edition (阶段8 P14 task 14.3). All three
+	// are nil on a node that follows a control plane, where reviewing a tool is
+	// the console's job — and the handlers say exactly that rather than
+	// reporting a generic misconfiguration.
+	// MCPDelegationFn answers the delegation boundary for THIS node's identity
+	// (P15 · 15.7). nil on a build without the MCP plane.
+	//
+	// 🔴 No org/seat parameter, on purpose — see internal/supervisor/mcp_delegation.go.
+	// 🔴 Returns the (org, seat) the decision was made WITH, so the record names
+	// the identity the rules were actually applied for. 🚫 Do not re-resolve the
+	// identity here for logging — two resolutions can disagree across a vault
+	// reload, and a record naming the wrong seat is worse than one naming none.
+	MCPDelegationFn func(agentType string, depth int) (d mcpwire.Decision, orgID, seatID string)
+
+	// MCPGuardSeenFn records that the delegation hook reached this gateway
+	// (P15 · 15.16). nil on a node that reports no governance state.
+	//
+	// 🔴 A separate function rather than a side effect of MCPDelegationFn: the
+	// decision function is also reachable from the console-preview path, and
+	// "what would happen if" must not be recorded as "the gate is in use".
+	// Same separation 15.12 made for the decision events.
+	MCPGuardSeenFn func()
+
+	MCPLocalReviewFn  func() ([]mcp.ReviewBackend, string)
+	MCPLocalAcceptFn  func(backendID string, exclude []string) (mcp.AcceptResult, error)
+	MCPLocalWriteOpFn func(backendID, tool string, writeOp bool) error
+	// MCPLocalRefreshFn re-reads mcp.json and probes every backend NOW.
+	// 🔴 Its absence was a real gap, not a convenience: `mountLocalMCP` runs
+	// only at start-up, so a server registered by `aikey mcp add` did nothing
+	// until the proxy was restarted and nothing said so.
+	MCPLocalRefreshFn func() error
 
 	// GetUpstreamProxyFn / SetUpstreamProxyFn back the GET/PUT /admin/upstream-proxy
 	// endpoints that the local web "Settings → Upstream proxy" card relays to. Get
@@ -473,8 +511,18 @@ type metricsResponse struct {
 	Reporter          *events.ReporterMetrics  `json:"reporter,omitempty"`
 	Collector         *events.CollectorMetrics `json:"collector,omitempty"`
 	Canary            *events.CanaryResult     `json:"canary,omitempty"`
-	TotalRequests     int64                    `json:"total_requests"`
-	TotalErrors       int64                    `json:"total_errors"`
+	// MCP is the MCP gateway plane's counters. Omitted entirely on a node with
+	// no MCP plane, rather than rendered as a block of zeros — 🔴 "this build
+	// has no MCP gateway" and "it has one and nobody has used it" are different
+	// facts, and a dashboard cannot tell them apart from zeros.
+	//
+	// 🔴 These are TRENDS for the customer's monitoring system. The release
+	// gate's health assertions read GET /health/mcp instead: a counter cannot
+	// say "the policy rail has been unreachable for 40 minutes", and this
+	// endpoint's numbers keep looking fine while it is (task 7.6a / 7.6b).
+	MCP           *mcp.CallMetrics `json:"mcp,omitempty"`
+	TotalRequests int64            `json:"total_requests"`
+	TotalErrors   int64            `json:"total_errors"`
 }
 
 // Metrics returns aggregated usage metrics.
@@ -509,6 +557,10 @@ func (h *Handler) Metrics(w http.ResponseWriter, r *http.Request) {
 	if h.CanaryResultFn != nil {
 		canaryResult = h.CanaryResultFn()
 	}
+	var mcpMetrics *mcp.CallMetrics
+	if h.MCPMetricsFn != nil {
+		mcpMetrics = h.MCPMetricsFn()
+	}
 
 	writeJSON(w, http.StatusOK, metricsResponse{
 		TotalRequests:      totalReqs,
@@ -519,6 +571,7 @@ func (h *Handler) Metrics(w http.ResponseWriter, r *http.Request) {
 		Reporter:           reporterMetrics,
 		Collector:          collectorMetrics,
 		Canary:             canaryResult,
+		MCP:                mcpMetrics,
 	})
 }
 
@@ -1608,5 +1661,283 @@ func (h *Handler) DebugUpstreamHeadersClear(w http.ResponseWriter, r *http.Reque
 	writeJSON(w, http.StatusOK, map[string]any{
 		"enabled": enabled,
 		"source":  source,
+	})
+}
+
+// ---------------------------------------------------------------------------
+// Personal edition's tool-approval review (阶段8 P14, task 14.3)
+// ---------------------------------------------------------------------------
+//
+// # Why these live on the proxy rather than in the CLI
+//
+// The approval record is the proxy's: it is the proxy that reaches the backend,
+// computes the fingerprint and serves the toolset. Letting `aikey mcp review`
+// edit the file directly would give one document two writers in two languages —
+// the exact shape that made `mcp.json` need a cross-language contract fence, but
+// worse, because here the two writers would race on a live security decision.
+//
+// So the CLI asks the running proxy, the same way `aikey mcp test` already does.
+// 🔴 That also keeps `review` zero-password: the proxy already holds everything
+// needed, and nothing here touches the vault.
+//
+// These routes carry no secret and are loopback-open like every other /admin
+// route (a remote caller needs the control service token). What they DO expose
+// is the full text of every tool description — which is the point: a poisoned
+// description is the attack, and showing only the tool name is the same as
+// showing nothing (14.3d).
+
+// MCPLocalManifest serves GET /admin/mcp/local-manifest.
+func (h *Handler) MCPLocalManifest(w http.ResponseWriter, _ *http.Request) {
+	if h.MCPLocalReviewFn == nil {
+		// 🔴 A distinct message, not a generic 503. This node follows a control
+		// plane, where reviewing is the console's job — telling the user "not
+		// configured" would send them to look for a setting that should not
+		// exist here.
+		writeJSON(w, http.StatusServiceUnavailable, map[string]string{
+			"error": "this node follows a control plane; tool review happens in the console, not on the proxy",
+		})
+		return
+	}
+	backends, loadErr := h.MCPLocalReviewFn()
+	if backends == nil {
+		backends = []mcp.ReviewBackend{}
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"backends": backends,
+		// 🔴 Surfaced, never omitted when set: an unreadable approval record
+		// means every tool is being served at whatever the upstream says today.
+		"approvals_unreadable": loadErr,
+	})
+}
+
+// MCPLocalManifestAccept serves POST /admin/mcp/local-manifest/accept.
+func (h *Handler) MCPLocalManifestAccept(w http.ResponseWriter, r *http.Request) {
+	if h.MCPLocalAcceptFn == nil {
+		writeJSON(w, http.StatusServiceUnavailable, map[string]string{
+			"error": "this node follows a control plane; tool review happens in the console, not on the proxy",
+		})
+		return
+	}
+	var body struct {
+		Backend string `json:"backend"`
+		// Exclude is the deselection. 🔴 Absent means "all of it", which is the
+		// adoption default (14.3c): the human looks for anything obviously
+		// wrong rather than ticking forty boxes.
+		Exclude []string `json:"exclude"`
+	}
+	if err := json.NewDecoder(io.LimitReader(r.Body, 64<<10)).Decode(&body); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "body must be {\"backend\":\"<name>\",\"exclude\":[..]}"})
+		return
+	}
+	if strings.TrimSpace(body.Backend) == "" {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "backend must not be empty"})
+		return
+	}
+	res, err := h.MCPLocalAcceptFn(strings.TrimSpace(body.Backend), body.Exclude)
+	if err != nil {
+		// 🔴 404, not 500: "there is nothing waiting for you" is a fact about
+		// the request, and reporting it as a server fault would send the user to
+		// read proxy logs for a state that is entirely normal.
+		writeJSON(w, http.StatusNotFound, map[string]string{"error": err.Error()})
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"backend":      body.Backend,
+		"first_review": res.FirstReview,
+		"published":    res.Published,
+		"rejected":     res.Rejected,
+		"repinned":     res.Repinned,
+	})
+}
+
+// MCPLocalToolWriteOp serves POST /admin/mcp/local-manifest/write-op.
+//
+// 🔴 This is what makes the review gate substantive rather than ceremonial
+// (14.3e): the human's answer to "does this tool make changes" is the input the
+// freeze rule grades on. 🚫 It is never taken from the upstream's own
+// readOnlyHint — the upstream is the party being guarded against (I4c).
+func (h *Handler) MCPLocalToolWriteOp(w http.ResponseWriter, r *http.Request) {
+	if h.MCPLocalWriteOpFn == nil {
+		writeJSON(w, http.StatusServiceUnavailable, map[string]string{
+			"error": "this node follows a control plane; tool review happens in the console, not on the proxy",
+		})
+		return
+	}
+	var body struct {
+		Backend string `json:"backend"`
+		Tool    string `json:"tool"`
+		// 🔴 A POINTER. A missing bool decodes to false, and false is the
+		// DANGEROUS direction here — it would mark a write tool read-only, which
+		// is precisely the mistake the default-true rule exists to prevent.
+		WriteOp *bool `json:"write_op"`
+	}
+	if err := json.NewDecoder(io.LimitReader(r.Body, 4<<10)).Decode(&body); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "body must be {\"backend\":..,\"tool\":..,\"write_op\":true|false}"})
+		return
+	}
+	if strings.TrimSpace(body.Backend) == "" || strings.TrimSpace(body.Tool) == "" {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "backend and tool must not be empty"})
+		return
+	}
+	if body.WriteOp == nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{
+			"error": "write_op must be given explicitly as true or false; omitting it would be read as read-only, which is the dangerous direction",
+		})
+		return
+	}
+	if err := h.MCPLocalWriteOpFn(strings.TrimSpace(body.Backend), strings.TrimSpace(body.Tool), *body.WriteOp); err != nil {
+		writeJSON(w, http.StatusNotFound, map[string]string{"error": err.Error()})
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"backend": body.Backend, "tool": body.Tool, "write_op": *body.WriteOp,
+	})
+}
+
+// MCPDelegation serves POST /admin/mcp/delegation — the delegation boundary
+// gate the CLI hook shell asks on every spawn (P15 · 15.7).
+//
+// 🔴 FAIL-OPEN on every path where we cannot answer, and the answer says so
+// (`stale: true`) rather than staying silent. D-29 ratified that direction: a
+// developer whose proxy is mid-reload must not lose the ability to delegate,
+// because their next move is to uninstall the hook — after which the
+// organisation has no gate AND no signal that it lost one.
+//
+// 🚫 Do not add a 503 here. The shell treats any non-answer as allow anyway
+// (fail-open all the way down), so a 503 would only cost a round trip and hide
+// the reason. Fence: TestDelegationEndpointNeverRefusesWhenItCannotDecide.
+func (h *Handler) MCPDelegation(w http.ResponseWriter, r *http.Request) {
+	// 🔴 FIRST, before parsing. Reaching this handler at all is the evidence
+	// 15.16 reports: the hook is installed and the harness invokes it. A request
+	// we cannot decode still proves that, and dropping the note on the malformed
+	// path would make an encoding bug look like an uninstalled gate.
+	if h.MCPGuardSeenFn != nil {
+		h.MCPGuardSeenFn()
+	}
+	var body struct {
+		AgentType string `json:"agent_type"`
+		// Depth is where the CHILD would sit. 🔴 The SHELL computes it from the
+		// harness event (main agent → 1); it is never taken from the model.
+		Depth int `json:"depth"`
+	}
+	if err := json.NewDecoder(io.LimitReader(r.Body, 16<<10)).Decode(&body); err != nil {
+		// 🔴 Even a malformed request is answered with ALLOW. The alternative —
+		// refusing on a body we could not parse — turns any encoding bug in the
+		// shell into "sub-agents stopped working", which is exactly the failure
+		// mode that gets the hook removed.
+		writeJSON(w, http.StatusOK, mcpwire.Decision{Verdict: mcpwire.VerdictAllow, Stale: true})
+		return
+	}
+	if h.MCPDelegationFn == nil {
+		writeJSON(w, http.StatusOK, mcpwire.Decision{Verdict: mcpwire.VerdictAllow, Stale: true})
+		return
+	}
+
+	agentType := strings.TrimSpace(body.AgentType)
+	d, orgID, seatID := h.MCPDelegationFn(agentType, body.Depth)
+
+	// 🔴 THE DECISION IS RECORDED HERE, and until 2026-09-03 it was not recorded
+	// anywhere at all (task 15.12). Five of the six delegation events in the
+	// central catalogue had zero call sites: the gate decided, answered, and left
+	// no trace, so a denial, a narrowing and a fail-open were indistinguishable
+	// from each other AND from a gate that was not installed.
+	//
+	// 🔴 That is not a cosmetic gap. D-29 ratified failing open when the policy
+	// cannot be refreshed, and the price of that bargain is the WARN — without
+	// it, a gateway deciding from a month-old snapshot looks exactly like a
+	// healthy one, which is how a control that is not controlling anything
+	// survives for months.
+	//
+	// Emission point: the CALLER, not `DelegationGate.Decide`. Decide is a pure
+	// function shared with the console preview (fence
+	// TestConsolePreviewAndHookShareTheEvaluator); giving it a logger would make
+	// a preview write events, and an administrator's "what would happen if"
+	// would pollute the record of what did happen.
+	tc := observability.ExtractOrCreate(r)
+	logger := slog.With("trace_id", tc.TraceID, "request_id", tc.RequestID)
+
+	// 🔴 org_id / seat_id are the identity the decision was MADE WITH (returned
+	// by MCPDelegationFn, 🚫 not re-resolved here) — that is what makes the
+	// three-hop assertion 15.A3 possible: the seat on the member's key, the seat
+	// in this record, and the seat the tier was applied for are one value from
+	// one resolution. Empty means this node could not identify itself, which is
+	// a fail-open the operator needs to see, 🚫 not a placeholder.
+	logger.InfoContext(r.Context(), "MCP delegation requested",
+		"event.name", mcpwire.EventDelegationRequested,
+		"org_id", orgID, "seat_id", seatID,
+		"agent_type", agentType, "depth", body.Depth)
+
+	// 🔴 A TABLE lookup, 🚫 not a switch with a default. `narrow` has its own
+	// event on purpose (15.13): "allowed, but with fewer toolsets than the
+	// parent" is the single thing a tier configuration exists to tell an
+	// administrator, and folding it into `allowed` shows them a wall of green
+	// while half their delegations are being quietly downgraded. A default
+	// branch would file a future verdict under whatever the fallback happened to
+	// be and nobody would find out.
+	if name, ok := mcpwire.EventForVerdict[d.Verdict]; ok {
+		// 🔴 `toolsets` carries the IDs, 🚫 not len(). A count answers "were any
+		// removed"; it cannot answer "removed down to WHICH set", and that is the
+		// only question a narrowing record exists to settle — 15.A3 asserts the
+		// delivered set equals the tier's set verbatim, which a number cannot
+		// support. The set is bounded by the tier document, which is itself
+		// bounded (maxDelegationTiers), so this cannot grow without limit.
+		logger.InfoContext(r.Context(), "MCP delegation decided",
+			"event.name", name,
+			"org_id", orgID, "seat_id", seatID,
+			"agent_type", agentType, "depth", body.Depth,
+			"verdict", string(d.Verdict), "tier", d.Tier,
+			"toolsets", strings.Join(d.Toolsets, ","), "code", string(d.Code))
+	} else {
+		// 🔴 Loud rather than silent: a verdict with no event means the closed
+		// set grew and this call site was not updated, and the symptom would
+		// otherwise be a decision that simply never appears in the record.
+		logger.WarnContext(r.Context(), "MCP delegation produced a verdict with no event name; "+
+			"the verdict set grew and EventForVerdict was not updated. Next: add the verdict to "+
+			"that table in pkg/mcpwire — the decision was still answered normally.",
+			"event.name", mcpwire.EventDelegationRequested,
+			"verdict", string(d.Verdict))
+	}
+
+	if d.Stale {
+		// 🔴 The other half of the D-29 bargain. 🚫 Do not downgrade this to INFO
+		// or make it conditional on a tier having matched: the whole point is
+		// that a fail-open is visible even when nothing was configured.
+		logger.WarnContext(r.Context(), "MCP delegation decided from a policy snapshot that could "+
+			"not be refreshed; the spawn was allowed on stale rules. Next: check that this node "+
+			"can reach the control plane (`aikey mcp guard status`).",
+			"event.name", mcpwire.EventPolicyStale,
+			"org_id", orgID, "seat_id", seatID,
+			"agent_type", agentType, "depth", body.Depth, "tier", d.Tier)
+	}
+
+	writeJSON(w, http.StatusOK, d)
+}
+
+// MCPLocalRefresh serves POST /admin/mcp/local-manifest/refresh: re-read
+// mcp.json and probe every backend in it, now.
+//
+// 🔴 The response is the REVIEW DOCUMENT, not an acknowledgement. The caller
+// registered a server a moment ago and its next question is always "what did
+// you find" — answering it in the same round trip is what lets `aikey mcp adopt`
+// show the human their new tools instead of telling them to come back when a
+// five-minute timer next fires.
+func (h *Handler) MCPLocalRefresh(w http.ResponseWriter, _ *http.Request) {
+	if h.MCPLocalRefreshFn == nil || h.MCPLocalReviewFn == nil {
+		writeJSON(w, http.StatusServiceUnavailable, map[string]string{
+			"error": "this node follows a control plane; its tool inventory comes from there, not from a local config file",
+		})
+		return
+	}
+	if err := h.MCPLocalRefreshFn(); err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+		return
+	}
+	backends, loadErr := h.MCPLocalReviewFn()
+	if backends == nil {
+		backends = []mcp.ReviewBackend{}
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"backends":             backends,
+		"approvals_unreadable": loadErr,
 	})
 }

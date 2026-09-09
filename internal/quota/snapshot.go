@@ -302,3 +302,74 @@ func isMissingTableOrColumn(err error) bool {
 	m := err.Error()
 	return strings.Contains(m, "no such table") || strings.Contains(m, "no such column")
 }
+
+// ---------------------------------------------------------------------------
+// Unenforceable rules — the loud half of a deliberately quiet skip
+// ---------------------------------------------------------------------------
+
+// UnenforceableRule names one delivered rule that enforcement will ignore.
+type UnenforceableRule struct {
+	SubjectID   string
+	Metric      string
+	Period      string
+	LimitAmount float64
+}
+
+// UnenforceableRules returns every rule in a delivered snapshot whose limit is
+// not positive, i.e. every rule `bucketsForSeat` will silently skip.
+//
+// # 🔴 Why this exists (2026-09-04)
+//
+// `bucketsForSeat` drops any rule with `LimitAmount <= 0`. That skip is CORRECT
+// — a non-positive limit has no meaning the enforcer could act on — but it was
+// also completely SILENT, and a silent skip and a working limit look identical
+// from the outside: no counter, no block, no message. An operator who believed a
+// limit was in force would have had nothing to look at.
+//
+// # 🔴 This is expected to find nothing, and that is the point
+//
+// Measured 2026-09-04, all three writers refuse a non-positive limit:
+//
+//	console form  `if (!(limit > 0))` → quota.form.errLimit
+//	control API   validateSubject → "rules[i].limit_amount must be > 0"
+//	directory     writes `rules='[]'`, never a rule
+//
+// So zero is not reachable through any supported path. What is NOT checked is
+// the delivery snapshot: the control plane serves `subject.Rules` verbatim from
+// the database (internal/quota/storage.go), so a hand-edited row, a future
+// importer, or a regression in that validation would flow to every proxy and be
+// dropped without a word. This turns that one remaining path from silent into
+// noisy, at the cost of one loop per snapshot load.
+//
+// # 🚫 Why it is not called from the request path
+//
+// `bucketsForSeat` runs per request. Logging there would emit one line per call
+// for a condition that is a property of the SNAPSHOT, not of the request — the
+// classic way a real signal becomes noise nobody reads. The caller runs this
+// once, when a snapshot is loaded.
+//
+// 🔴 It REPORTS rather than logs, so the caller decides where the finding goes
+// and a test can read it directly. Same shape as the harness adapter's
+// SpawnRequest.warnings.
+//
+// Fence: TestUnenforceableRulesAreNamedNotSwallowed.
+func UnenforceableRules(subjects []Subject) []UnenforceableRule {
+	var out []UnenforceableRule
+	for _, sub := range subjects {
+		for _, r := range sub.Rules {
+			// 🔴 The SAME comparison bucketsForSeat uses. If the two ever
+			// diverge, this reports rules that are in fact enforced (noise) or
+			// stays quiet about rules that are in fact dropped (the original
+			// defect, restored). Keep them identical.
+			if r.LimitAmount <= 0 {
+				out = append(out, UnenforceableRule{
+					SubjectID:   sub.SubjectID,
+					Metric:      r.Metric,
+					Period:      r.Period,
+					LimitAmount: r.LimitAmount,
+				})
+			}
+		}
+	}
+	return out
+}

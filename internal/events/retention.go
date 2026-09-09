@@ -33,6 +33,8 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+
+	"github.com/AiKeyLabs/aikey-proxy/internal/observability"
 	"strings"
 	"time"
 )
@@ -55,6 +57,12 @@ type RetentionResult struct {
 	WALArchived    int
 	ArchiveDeleted int
 	EventsPruned   int64
+	// MCPCallsPruned is local MCP call records retired by this sweep.
+	MCPCallsPruned int64
+	// MCPCallsPrunedUndelivered is how many of those had NEVER reached the
+	// control plane. 🔴 Non-zero means an audit gap was just made permanent —
+	// see the sweep step that fills it.
+	MCPCallsPrunedUndelivered int64
 }
 
 // walFileTime parses the UTC hour embedded in a WAL filename
@@ -134,6 +142,27 @@ func RunRetentionSweep(cfg RetentionConfig, store *Store, now time.Time) Retenti
 		} else {
 			res.EventsPruned = n
 		}
+
+		// 4. Prune local MCP call records past the SAME retention window.
+		//
+		// 🔴 In the same sweep and on the same cutoff, deliberately: two
+		// retention policies for two tables in one database is two numbers an
+		// operator has to know, and the one they do not know about is the one
+		// that fills the disk.
+		//
+		// 🔴 UNDELIVERED rows are counted separately and reported. A row that
+		// aged out without ever reaching the control plane is an AUDIT GAP —
+		// the control plane has been unreachable for the whole retention window
+		// — and it must be a number somebody can see, not something that
+		// quietly did not happen. (稳定 > 延迟的审计记录: keeping it forever
+		// would trade the gap for a full disk on an employee laptop.)
+		pruned, undelivered, err := store.PruneMCPCallsOlderThan(retireBefore)
+		if err != nil {
+			res.Errors = append(res.Errors, fmt.Sprintf("prune mcp_call_event: %v", err))
+		} else {
+			res.MCPCallsPruned = pruned
+			res.MCPCallsPrunedUndelivered = undelivered
+		}
 	}
 	return res
 }
@@ -147,7 +176,19 @@ func RunRetentionSweep(cfg RetentionConfig, store *Store, now time.Time) Retenti
 // hot-reloads generations: the events Store handle is per-generation, and a
 // loop pinned to the first generation's handle would prune through a closed
 // DB after the first reload. May return nil (WAL-only sweep).
-func RetentionLoop(ctx context.Context, cfg RetentionConfig, storeFn func() *Store) {
+// hasControlPlaneFn answers "is there anywhere these records were supposed to
+// go". See the undelivered WARN below for why the sweep has to ask.
+//
+// 🔴 A FUNCTION, resolved at each sweep, for the same reason storeFn is: a node
+// can join or leave a control plane across a config reload, and a boolean
+// captured at start-up would keep answering with the shape the process had when
+// it booted — including on the machine that just joined an organisation.
+//
+// 🔴 nil means "assume there is one", i.e. warn. A caller that forgets to pass
+// it gets the LOUD behaviour; the quiet behaviour has to be asked for.
+type hasControlPlaneFn func() bool
+
+func RetentionLoop(ctx context.Context, cfg RetentionConfig, storeFn func() *Store, hasControlPlane hasControlPlaneFn) {
 	sweep := func() {
 		var store *Store
 		if storeFn != nil {
@@ -163,8 +204,42 @@ func RetentionLoop(ctx context.Context, cfg RetentionConfig, storeFn func() *Sto
 			"wal_archived", res.WALArchived,
 			"archive_deleted", res.ArchiveDeleted,
 			"events_pruned", res.EventsPruned,
+			"mcp_calls_pruned", res.MCPCallsPruned,
 			"retention_days", cfg.RetentionDays,
 			"archive_days", cfg.ArchiveDays)
+		// 🔴 A SEPARATE line at WARN, not a field on the INFO above. Records
+		// that aged out undelivered are an audit gap, and burying the number in
+		// a routine "sweep complete" line is how it goes unread for a month.
+		//
+		// 🔴 …but ONLY when there was somewhere for them to go. `reported_at_ms
+		// = 0` means "not delivered", and on a node that follows no control
+		// plane — Personal, the whole point of task 5.7 — that is the NORMAL and
+		// permanent state of every row: the local table is not an outbox there,
+		// it IS the audit. Warning anyway meant every Personal machine, once it
+		// had been running longer than the retention window, printed "the
+		// console's call log has a permanent gap" once a day forever — about a
+		// console that does not exist, describing a gap that is not one.
+		//
+		// The cost of getting this wrong is not noise, it is the signal: this
+		// line is deliberately the loudest thing the sweep can say, and a
+		// warning that is always wrong on the most common edition is how people
+		// learn to skip the one that is right in Production.
+		//
+		// 🔴 The answer comes from the SAME place that decides whether to start
+		// the shipping rail (Supervisor.mcpPolicyTarget). Two answers to "does
+		// this node follow a control plane" is the source-of-truth split that
+		// would put the rail and this warning permanently out of step.
+		//
+		// bugfix: workflow/CI/bugfix/20260903-personal-audit-gap-warning-about-a-console-that-does-not-exist.md
+		// fence:  TestRetentionLoop_NoControlPlaneDoesNotClaimAnAuditGap
+		delivers := hasControlPlane == nil || hasControlPlane()
+		if res.MCPCallsPrunedUndelivered > 0 && delivers {
+			slog.Warn("MCP call records were deleted without ever reaching the control plane; "+
+				"the console's call log has a permanent gap for that period",
+				"event.name", observability.EventProxyMCPCallRecordDropped,
+				"records", res.MCPCallsPrunedUndelivered,
+				"retention_days", cfg.RetentionDays)
+		}
 	}
 	sweep()
 	for {

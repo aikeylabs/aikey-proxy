@@ -1,0 +1,84 @@
+# Actor (agent) ID extraction fingerprint table.
+#
+# Why this file exists (阶段8 P15 · K3 · task 15.18). The MCP call log can say
+# WHICH SEAT called a tool. It cannot say WHICH AGENT: a main agent and every
+# sub-agent it spawns share one seat and one virtual key, so a task that ran ten
+# sub-agents is ten rows a reader cannot tell apart. When a client is willing to
+# name the caller, this table is where we read it from.
+#
+# 🔴 Why a SECOND yaml and not more rules in session-fingerprint.yaml.
+# That table answers "which CONVERSATION", this one answers "which AGENT". They
+# are different facts with different value domains and different lifetimes, and
+# one table returning "whichever of the two we matched" is precisely the
+# overload the `session_id` / `conversation_session_id` split already refused
+# once (see mcp_call_event's DDL). The MECHANISM is reused verbatim — same
+# parser, same rule/source shape, same ordering semantics, `sessionid.Load` —
+# which is what task 15.18 asks for ("reuse the shape, do not invent a
+# mechanism"). 🚫 Adding an actor rule to the session table would have been
+# reusing the FILE, not the shape.
+#
+# Trust model. 🔴 The value here is CLIENT-ASSERTED and spoofable, exactly like
+# app_slug and session_id. It is DISPLAY AND AUDIT ONLY: never authorization,
+# never routing, never billing, never rate-limiting (R62). A client that lies
+# about its actor changes what a human reads in the console; it must never
+# change what the gateway permits. The delegation gate's own depth counter is
+# kept by US for this reason and deliberately does not read anything from here.
+#
+# 🔴 What is NOT allowed in this file, ever. Only sources that read something
+# the client EXPLICITLY SENT on this request. There is no source type that could
+# express "the actor of the last call on this seat", "the agent that was spawned
+# within 5 seconds", or any other correlation — and none may be added (I33).
+# Attribution recovered by inference is a plausible-but-wrong audit row, and an
+# audit row that is wrong is worse than one that is admittedly blank, because a
+# blank one gets investigated and a wrong one gets acted on.
+# Fence: TestActor_NoHeuristicResolution.
+#
+# Matching order and source types are identical to session-fingerprint.yaml;
+# see that file's header for the parser contract.
+
+rules:
+  # ── MCP gateway plane ────────────────────────────────────────────
+  # 🔴 NO CLIENT SENDS EITHER OF THESE TODAY, and that is the honest
+  # starting state rather than an omission.
+  #
+  # Measured (baseline forensics §五): Claude Code's MCP requests carry
+  # no agent identifier at all — the same structural reason they carry
+  # no conversation id. The hook DOES know which agent it is (the
+  # delegation gate reads `agent_id` off the hook event), but that
+  # knowledge lives in a process on the developer's machine that never
+  # touches the MCP request. So on today's dominant client this table
+  # returns "" and the caller records `unknown-actor`.
+  #
+  # ⇒ The value of shipping the rule anyway is the same as the MCP
+  # session rule's: when a client starts forwarding an agent id — or
+  # when the MCP spec defines one — this is a two-line edit rather
+  # than a Go change, which is the entire reason the table is config.
+  #
+  # 🚫 Do NOT read `X-Claude-Code-Session-Id` here as a stand-in. It
+  # identifies the CONVERSATION, and every sub-agent in a task shares
+  # it — using it as the actor would attribute every sub-agent to the
+  # same value and look completely plausible while doing it. That is
+  # the failure mode this whole file is written against.
+  - match: { protocol: "mcp" }
+    sources:
+      # The cross-protocol convention header, for third-party agents and
+      # harnesses that choose to name themselves.
+      - { type: "header", name: "X-Aikey-Actor-Id" }
+      # The harness-side sub-agent id, if a client ever forwards it.
+      - { type: "header", name: "X-Aikey-Agent-Id" }
+
+# 🔴 EMPTY ON PURPOSE — 🚫 do not add a common_fallback here.
+#
+# In the session table a fallback is right: `X-Claude-Code-Session-Id` means the
+# same thing whatever upstream it is routed to, so matching it everywhere
+# recovers a real signal. There is no equivalent for the actor: nothing in a
+# generic request names the agent, so any fallback would have to be a proxy for
+# something else (the conversation, the seat, the app) — i.e. a guess wearing a
+# header's name. An empty result must stay empty so the caller can record
+# `unknown-actor` and the coverage metric can count it.
+common_fallback: []
+
+# Header-only table, so no body is ever read. The bound is declared anyway
+# because the parser requires it and because a future body source would
+# otherwise inherit an unbounded read.
+body_max_bytes: 65536

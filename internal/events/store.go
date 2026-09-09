@@ -117,6 +117,13 @@ func migrate(db *sql.DB) error {
 	if _, err := db.Exec(`CREATE INDEX IF NOT EXISTS idx_events_account ON usage_events(account_id) WHERE account_id != ''`); err != nil {
 		return err
 	}
+	// MCP tool calls (P7 task 7.1). A SEPARATE TABLE in the same file, never
+	// columns on usage_events: a tool call produces no tokens, and mixing the
+	// two would corrupt the cost vocabulary for everything that reads it. See
+	// mcp_call_store.go.
+	if err := migrateMCPCalls(db); err != nil {
+		return err
+	}
 	return nil
 }
 

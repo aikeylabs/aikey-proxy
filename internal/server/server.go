@@ -117,6 +117,18 @@ func buildMux(dataHandler http.Handler, adminHandler *admin.Handler, gate AdminG
 
 	// Delivery-integrity audit (D2.5 / D3): local client state + client-confirmed
 	// reconciliation (re-send WAL-present gaps, confirm WAL-absent gaps lost).
+	// Personal edition's tool-approval review (阶段8 P14 task 14.3). The CLI
+	// asks the RUNNING proxy rather than editing the approval record itself:
+	// one document, one writer, and `aikey mcp review` stays zero-password.
+	mux.HandleFunc("GET /admin/mcp/local-manifest", gate.guard(adminHandler.MCPLocalManifest))
+	mux.HandleFunc("POST /admin/mcp/local-manifest/accept", gate.guard(adminHandler.MCPLocalManifestAccept))
+	mux.HandleFunc("POST /admin/mcp/local-manifest/write-op", gate.guard(adminHandler.MCPLocalToolWriteOp))
+	mux.HandleFunc("POST /admin/mcp/local-manifest/refresh", gate.guard(adminHandler.MCPLocalRefresh))
+	// P15 · the delegation boundary. Asked by the `aikey` hook shell on every
+	// sub-agent spawn, so it is on a HOT path — the handler does no I/O beyond
+	// reading the in-memory policy snapshot.
+	mux.HandleFunc("POST /admin/mcp/delegation", gate.guard(adminHandler.MCPDelegation))
+
 	mux.HandleFunc("GET /admin/audit/status", gate.guard(adminHandler.AuditStatus))
 	mux.HandleFunc("POST /admin/audit/reconcile", gate.guard(adminHandler.AuditReconcile))
 

@@ -71,7 +71,7 @@ AIKEY_REQUIRE_NO_TEST_SKIPS ?= $(if $(ACD_PRESENT),1,0)
 # would skip them.
 PROXY_TEST_PKGS := ./internal/... ./cmd/aikey-proxy/
 
-.PHONY: build test test-bugfix-custom-provider-axes test-bugfix-provider-routing test-bugfix-apphook-write-deadline test-pathprefix-matrix run install uninstall restart clean lint lint-full cross-compile sync-fingerprint sync-provider-registry sync-provider-data chaos-gap7 chaos-gap8 chaos filter-integration detector-sibling-build detector-sibling-absent-notice
+.PHONY: drill-delegation drill-quota-limits drill-mtls build test test-bugfix-custom-provider-axes test-bugfix-provider-routing test-bugfix-apphook-write-deadline test-pathprefix-matrix run install uninstall restart clean lint lint-full cross-compile sync-fingerprint sync-provider-registry sync-provider-data chaos-gap7 chaos-gap8 chaos filter-integration detector-sibling-build detector-sibling-absent-notice
 
 # v4.3 (2026-05-01): aikey-cli/data/provider_fingerprint.yaml is the single
 # source of truth for provider routing. The pkg/providerroutes Go package
@@ -261,3 +261,39 @@ cross-compile: sync-provider-data
 	GOOS=linux   GOARCH=arm64 go build $(LDFLAGS) -o bin/aikey-proxy-linux-arm64   ./cmd/aikey-proxy
 	GOOS=windows GOARCH=amd64 go build $(LDFLAGS) -o bin/aikey-proxy-windows-amd64.exe ./cmd/aikey-proxy
 	@cp $(CONFIG) bin/$(CONFIG)
+
+# ─────────────────────────────────────────────────────────────────────────────
+# drill-delegation — prove the delegation-boundary fences can go RED (P15 · K1)
+# ─────────────────────────────────────────────────────────────────────────────
+#
+# A green fence proves nothing; it proves something only once you have watched
+# it fail for the defect it claims to guard. This target reintroduces each
+# defect in turn and requires the named test to fail.
+#
+# 🔴 It found two of its own fences VACUOUS on the first run (2026-09-03): both
+# scanned a marshalled zero value, where an `omitempty` field is invisible —
+# which is exactly how anybody would add the field they were meant to catch.
+# Both now reflect over the TYPE. Keep that shape when adding fences here.
+#
+# Registry: roadmap20260320/技术实现/阶段8-平台化/MCP网关/20260820-MCP网关-测试checklist.md §D
+drill-delegation:
+	@./scripts/drill-delegation-fences.sh
+
+# drill-quota-limits — prove the quota non-positive-limit fences can go RED.
+#
+# Two properties, two repos: the proxy must NAME a rule it drops (a silently
+# ignored limit is indistinguishable from a working one), and the control API
+# must REFUSE a non-positive limit — which is also the tripwire on the still-open
+# window in which limit_amount could gain a three-state encoding at zero
+# migration cost. See tasks.md § A 类阻塞项的裁决 § A-3.
+drill-quota-limits:
+	@./scripts/drill-quota-limit-fences.sh
+
+# drill-mtls — prove the mTLS fences can go RED (P4 · task 4.8 · D-10).
+#
+# Three properties: server verification is never skipped (4.F6), an untrusted
+# client certificate cannot connect (4.F7, against a REAL mutual-TLS server), and
+# every outbound client strips our internal headers — the last one being the
+# guarantee this feature nearly broke by adding a second http.Client.
+drill-mtls:
+	@./scripts/drill-mtls-fences.sh
