@@ -42,7 +42,6 @@
 package proxy
 
 import (
-	"bytes"
 	"context"
 	"io"
 	"log/slog"
@@ -424,25 +423,14 @@ func (p *Proxy) translateRequestLeg(
 	return out, nil
 }
 
-// setBridgedRequestBody installs the translated body plus the two things a
-// translated body needs beyond Body/ContentLength.
+// setBridgedRequestBody installs the translated body.
 //
-// It delegates the Body+ContentLength pairing to setRequestBody
-// (oauth_inject.go) rather than repeating it, and adds:
-//
-//   - GetBody. Without it net/http refuses to retry a request whose body was
-//     already written when the peer resets an HTTP/2 stream — the failure the
-//     2026-09-03 replay fix exists to avoid
-//     (workflow/CI/bugfix/2026-09-03-h2流错误无法重放请求体.md). A retry without
-//     a refreshed GetBody would re-send the PRE-translation bytes, i.e. the
-//     wrong dialect to an endpoint that only parses the other one.
-//   - Deleting the inbound Content-Length HEADER, a separate thing from the
-//     ContentLength FIELD, which would otherwise advertise the old byte count.
+// setRequestBody (oauth_inject.go) keeps Body, ContentLength and GetBody in
+// sync; the only thing left to do here is drop the inbound Content-Length
+// HEADER, which is a separate thing from the ContentLength FIELD and would
+// otherwise still advertise the untranslated body's byte count.
 func setBridgedRequestBody(r *http.Request, body []byte) {
 	setRequestBody(r, body)
-	r.GetBody = func() (io.ReadCloser, error) {
-		return io.NopCloser(bytes.NewReader(body)), nil
-	}
 	r.Header.Del("Content-Length")
 }
 

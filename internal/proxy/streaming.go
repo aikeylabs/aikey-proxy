@@ -18,8 +18,7 @@ func isStreamingRequest(req *http.Request) bool {
 		return false
 	}
 	// Re-buffer the body for upstream forwarding.
-	req.Body = io.NopCloser(bytes.NewReader(bodyBytes))
-	req.ContentLength = int64(len(bodyBytes))
+	setRequestBody(req, bodyBytes)
 
 	return bytes.Contains(bodyBytes, []byte(`"stream":true`)) ||
 		bytes.Contains(bodyBytes, []byte(`"stream": true`))
@@ -46,8 +45,7 @@ func injectStreamUsageOption(req *http.Request) {
 
 	// Skip if already present.
 	if bytes.Contains(bodyBytes, []byte(`"include_usage"`)) {
-		req.Body = io.NopCloser(bytes.NewReader(bodyBytes))
-		req.ContentLength = int64(len(bodyBytes))
+		setRequestBody(req, bodyBytes)
 		return
 	}
 
@@ -55,8 +53,7 @@ func injectStreamUsageOption(req *http.Request) {
 	var body map[string]json.RawMessage
 	if json.Unmarshal(bodyBytes, &body) != nil {
 		// Not valid JSON — leave as-is.
-		req.Body = io.NopCloser(bytes.NewReader(bodyBytes))
-		req.ContentLength = int64(len(bodyBytes))
+		setRequestBody(req, bodyBytes)
 		return
 	}
 
@@ -75,11 +72,9 @@ func injectStreamUsageOption(req *http.Request) {
 	newBody, err := json.Marshal(body)
 	if err != nil {
 		// Serialization failed — leave original body.
-		req.Body = io.NopCloser(bytes.NewReader(bodyBytes))
-		req.ContentLength = int64(len(bodyBytes))
+		setRequestBody(req, bodyBytes)
 		return
 	}
 
-	req.Body = io.NopCloser(bytes.NewReader(newBody))
-	req.ContentLength = int64(len(newBody))
+	setRequestBody(req, newBody)
 }

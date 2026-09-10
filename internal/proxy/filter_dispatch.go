@@ -800,8 +800,11 @@ func (p *Proxy) applyInboundFilter(
 			"event.name", "proxy.filter.remarshal_failed", "error", err)
 		return true
 	}
-	r.Body = io.NopCloser(bytes.NewReader(newBody))
-	r.ContentLength = int64(len(newBody))
+	// Through the chokepoint: it also refreshes GetBody, without which an
+	// HTTP/2 retry replays the ORIGINAL buffered request and sends the UNMASKED
+	// prompt upstream — a transport-level retry defeating DLP, with nothing
+	// anywhere reporting it. See setRequestBody (oauth_inject.go).
+	setRequestBody(r, newBody)
 	r.Header.Set("Content-Length", itoaInt64(int64(len(newBody))))
 	logger.Info("filter: request masked",
 		"event.name", "proxy.filter.masked",
