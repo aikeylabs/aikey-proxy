@@ -1392,7 +1392,13 @@ func (p *Proxy) serveRoute(w http.ResponseWriter, r *http.Request, route *vkeys.
 				//     response.output_text.delta explicitly.
 				// Everything downstream of this line is Chat Completions.
 				// No-op pass-through when the bridge did not engage.
-				resp.Body = newSSEChatCompletionsBridge(r.Context(), restored, resp.Header.Get("Content-Type"), logger)
+				//
+				// This is also where a request the CLIENT sent non-streaming is
+				// collapsed back into one JSON body: the Codex backend serves
+				// only stream:true, so such a request was sent upstream as a
+				// stream and has to be un-streamed here, on the client-facing
+				// side of the drainer. See chat_completions_bridge_destream.go.
+				resp.Body = newBridgedStreamingBody(r.Context(), resp, restored, logger)
 			}
 			return nil
 		},

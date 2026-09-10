@@ -235,12 +235,32 @@ type bridgeCtxKey struct{}
 type bridgeState struct {
 	from, to translator.Format
 	stream   *translator.StreamState
+
+	// deStream marks a request the CLIENT asked to answer in one piece that we
+	// had to send upstream as a stream anyway. The Codex backend serves only
+	// stream:true (measured: shape matrix S03/S06/S07 all answer 400 "Stream
+	// must be set to true"), so a plain `client.chat.completions.create(...)`
+	// — no stream= argument, the single most common call in the Chat
+	// Completions ecosystem — had nothing to be translated INTO. The response
+	// leg reads this and collapses the SSE back into one JSON body, so the
+	// client never learns the hop streamed.
+	deStream bool
 }
 
 func armBridge(r *http.Request, from, to translator.Format) *http.Request {
-	return r.WithContext(context.WithValue(r.Context(), bridgeCtxKey{}, &bridgeState{
-		from: from, to: to, stream: &translator.StreamState{},
-	}))
+	return armBridgeState(r, &bridgeState{from: from, to: to, stream: &translator.StreamState{}})
+}
+
+// armBridgeDeStreamed is armBridge for the case above: the upstream leg
+// streams, the client leg does not.
+func armBridgeDeStreamed(r *http.Request, from, to translator.Format) *http.Request {
+	return armBridgeState(r, &bridgeState{
+		from: from, to: to, stream: &translator.StreamState{}, deStream: true,
+	})
+}
+
+func armBridgeState(r *http.Request, st *bridgeState) *http.Request {
+	return r.WithContext(context.WithValue(r.Context(), bridgeCtxKey{}, st))
 }
 
 func bridgeFromContext(ctx context.Context) *bridgeState {
@@ -338,7 +358,7 @@ func (p *Proxy) bridgeOrRejectDialect(
 		}
 	}
 
-	out, refusal := p.translateRequestLeg(r, inbound, outbound, logger)
+	out, refusal := p.translateRequestLeg(r, inbound, outbound, rt.isCodexEndpoint(base), logger)
 	if refusal != nil {
 		return r, refusal
 	}
@@ -364,7 +384,7 @@ func dialectMismatchReason(inbound, outbound translator.Format, path string) str
 // translateRequestLeg converts the body, rewrites the path and arms the
 // response leg.
 func (p *Proxy) translateRequestLeg(
-	r *http.Request, inbound, outbound translator.Format, logger *slog.Logger,
+	r *http.Request, inbound, outbound translator.Format, codexUpstream bool, logger *slog.Logger,
 ) (*http.Request, *dialectRefusal) {
 	body, err := io.ReadAll(r.Body)
 	_ = r.Body.Close()
@@ -383,8 +403,19 @@ func (p *Proxy) translateRequestLeg(
 	model := gjson.GetBytes(body, "model").String()
 	streaming := gjson.GetBytes(body, "stream").Bool()
 
+	// De-streaming, and why it is keyed on the DESTINATION rather than on the
+	// outbound dialect: "only stream:true is served" is a measured property of
+	// the Codex backend, not of the Responses API. api.openai.com serves
+	// /responses non-streaming happily, and so does any relay an operator
+	// declares as Responses-speaking. Forcing the upstream to stream for those
+	// would buy nothing and would change a working request's wire form, so the
+	// rewrite is confined to the one host that requires it.
+	//
+	// The rewrite is upstream-only: the client is answered in the shape it
+	// asked for, by the response leg (chat_completions_bridge_destream.go).
+	deStream := !streaming && codexUpstream
 	translated, tErr := translator.DefaultRegistry().TranslateRequest(
-		r.Context(), inbound, outbound, model, body, streaming)
+		r.Context(), inbound, outbound, model, body, streaming || deStream)
 	if tErr != nil {
 		if logger != nil {
 			logger.Warn("dialect bridge: request translation refused",
@@ -404,6 +435,9 @@ func (p *Proxy) translateRequestLeg(
 	}
 
 	out := armBridge(r, inbound, outbound)
+	if deStream {
+		out = armBridgeDeStreamed(r, inbound, outbound)
+	}
 	// Rewrite BOTH Path and RawPath: a stale RawPath wins over Path when
 	// net/url re-encodes, which would forward the original dialect's route to an
 	// upstream that has no such route.
@@ -418,6 +452,7 @@ func (p *Proxy) translateRequestLeg(
 			"outbound_dialect", string(outbound),
 			"url.path", out.URL.Path,
 			"stream", streaming,
+			"de_streamed", deStream,
 		)
 	}
 	return out, nil

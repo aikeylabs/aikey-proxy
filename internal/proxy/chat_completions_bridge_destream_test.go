@@ -1,0 +1,293 @@
+package proxy
+
+import (
+	"io"
+	"net/http"
+	"strings"
+	"testing"
+
+	translator "github.com/AiKeyLabs/aikey-proxy/pkg/protocol-translator"
+	"github.com/tidwall/gjson"
+)
+
+// chat_completions_bridge_destream_test.go — fences for the non-streaming
+// client path.
+//
+// Why these matter more than their size suggests: the bridge exists to serve
+// Chat Completions clients, and the most common call in that ecosystem is the
+// non-streaming one. Before de-streaming, that exact call was the one shape the
+// bridge could not serve — measured cells S03/S06/S07 answer 400 "Stream must
+// be set to true" — so a deployment could pass every other test here and still
+// fail for most of its traffic.
+
+const responsesRelayHost = "resp-relay.corp.example"
+const responsesRelayBase = "https://resp-relay.corp.example/v1"
+
+// responsesRelayRules declares a NON-Codex host that speaks Responses. It is
+// what separates "Codex requires streaming" from "the Responses API requires
+// streaming" — only the first is true.
+func responsesRelayRules() []BridgeUpstreamRule {
+	return []BridgeUpstreamRule{{Host: responsesRelayHost, Dialect: "responses"}}
+}
+
+const nonStreamChatBody = `{"model":"gpt-5.4","messages":[{"role":"user","content":"hi"}]}`
+
+func armedState(t *testing.T, r *http.Request) *bridgeState {
+	t.Helper()
+	st := bridgeFromContext(r.Context())
+	if st == nil {
+		t.Fatal("bridge did not arm the response leg")
+	}
+	return st
+}
+
+// ── request leg ─────────────────────────────────────────────────────────────
+
+// TestDeStream_NonStreamChatClientIsSentUpstreamAsAStream is the fence for the
+// defect itself. `stream` is `omitempty`, so a non-streaming client used to
+// produce a body with NO stream field — cell S07, a hard 400.
+func TestDeStream_NonStreamChatClientIsSentUpstreamAsAStream(t *testing.T) {
+	p := &Proxy{}
+	p.SetChatCompletionsBridge(true, nil) // codex is always permitted
+
+	r := bridgeRequest(t, "/v1/chat/completions", nonStreamChatBody)
+	out, refusal := p.bridgeOrRejectDialect(r, "openai", "openai_compatible", "", quietLogger())
+	if refusal != nil {
+		t.Fatalf("non-streaming chat request was refused: %s", refusal.Message)
+	}
+
+	body, err := io.ReadAll(out.Body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := gjson.GetBytes(body, "stream"); !got.Exists() || !got.Bool() {
+		t.Fatalf("upstream body must say stream:true (Codex serves nothing else); got %s", body)
+	}
+	if !armedState(t, out).deStream {
+		t.Error("de-streaming was not armed, so the client would receive raw SSE for a non-streaming request")
+	}
+
+	// The pre-dial shape gate must now pass. If it still refuses, the client
+	// gets 422 and none of the above matters.
+	if reason := oauthUpstreamRejectsShape("openai", out); reason != "" {
+		t.Errorf("shape gate still refuses a de-streamed request: %s", reason)
+	}
+}
+
+// TestDeStream_StreamingClientIsUntouched — de-streaming must not reach the
+// clients that were already working.
+func TestDeStream_StreamingClientIsUntouched(t *testing.T) {
+	p := &Proxy{}
+	p.SetChatCompletionsBridge(true, nil)
+
+	r := bridgeRequest(t, "/v1/chat/completions",
+		`{"model":"gpt-5.4","stream":true,"messages":[{"role":"user","content":"hi"}]}`)
+	out, refusal := p.bridgeOrRejectDialect(r, "openai", "openai_compatible", "", quietLogger())
+	if refusal != nil {
+		t.Fatalf("refused: %s", refusal.Message)
+	}
+	if armedState(t, out).deStream {
+		t.Error("a client that asked to stream was de-streamed; it would get one blob instead of frames")
+	}
+}
+
+// TestDeStream_IsKeyedOnCodexNotOnTheResponsesDialect — the constraint belongs
+// to one BACKEND, not to the Responses API. api.openai.com and any relay an
+// operator declares serve /responses non-streaming perfectly well, and
+// rewriting their requests would change a working wire form for nothing.
+func TestDeStream_IsKeyedOnCodexNotOnTheResponsesDialect(t *testing.T) {
+	p := &Proxy{}
+	p.SetChatCompletionsBridge(true, responsesRelayRules())
+
+	r := bridgeRequest(t, "/v1/chat/completions", nonStreamChatBody)
+	out, refusal := p.bridgeOrRejectDialect(r, "openai", "openai_compatible", responsesRelayBase, quietLogger())
+	if refusal != nil {
+		t.Fatalf("refused: %s", refusal.Message)
+	}
+	if armedState(t, out).deStream {
+		t.Fatal("a declared Responses relay was treated as Codex; its requests were rewritten to stream for no reason")
+	}
+	body, _ := io.ReadAll(out.Body)
+	if gjson.GetBytes(body, "stream").Bool() {
+		t.Errorf("non-Codex upstream was forced to stream: %s", body)
+	}
+}
+
+// ── response leg ────────────────────────────────────────────────────────────
+
+func deStreamedBody(t *testing.T, sse string) (*http.Response, []byte) {
+	t.Helper()
+	r := armBridgeDeStreamed(
+		bridgeRequest(t, "/v1/chat/completions", nonStreamChatBody),
+		translator.FormatOpenAI, translator.FormatOpenAIResponses)
+	resp := &http.Response{Header: http.Header{}, StatusCode: 200}
+	resp.Header.Set("Content-Type", sseContentType)
+	resp.Header.Set("Content-Length", "999") // the upstream's count for a body we replace
+	body := newBridgedStreamingBody(r.Context(), resp, io.NopCloser(strings.NewReader(sse)), quietLogger())
+	out, err := io.ReadAll(body)
+	if err != nil {
+		t.Fatalf("reading the de-streamed body: %v", err)
+	}
+	return resp, out
+}
+
+const completedSSE = "event: response.created\n" +
+	`data: {"type":"response.created","response":{"id":"resp_1","status":"in_progress"}}` + "\n\n" +
+	"event: response.output_text.delta\n" +
+	`data: {"type":"response.output_text.delta","delta":"ok"}` + "\n\n" +
+	"event: response.completed\n" +
+	`data: {"type":"response.completed","response":{"id":"resp_1","status":"completed","model":"gpt-5.4",` +
+	`"output":[{"type":"message","role":"assistant","content":[{"type":"output_text","text":"ok"}]}],` +
+	`"usage":{"input_tokens":9,"output_tokens":2,"total_tokens":11}}}` + "\n\n" +
+	"data: [DONE]\n\n"
+
+func TestDeStream_StreamBecomesOneChatCompletionsBody(t *testing.T) {
+	resp, out := deStreamedBody(t, completedSSE)
+
+	if got := resp.Header.Get("Content-Type"); got != "application/json" {
+		t.Errorf("content-type = %q; a non-streaming client must not be told this is an event stream", got)
+	}
+	// A stale Content-Length is not cosmetic: ReverseProxy copies the header
+	// map verbatim, so it would advertise the upstream's byte count for a body
+	// we just replaced.
+	if got := resp.Header.Get("Content-Length"); got != "" {
+		t.Errorf("stale Content-Length %q survived the rewrite", got)
+	}
+	if got := gjson.GetBytes(out, "object").String(); got != "chat.completion" {
+		t.Fatalf("not a Chat Completions body (object=%q): %s", got, out)
+	}
+	if got := gjson.GetBytes(out, "choices.0.message.content").String(); got != "ok" {
+		t.Errorf("answer text lost: %s", out)
+	}
+	// Taken from the completed event rather than recounted from deltas — the
+	// backend already assembled it.
+	if got := gjson.GetBytes(out, "usage.total_tokens").Int(); got != 11 {
+		t.Errorf("usage.total_tokens = %d, want 11: %s", got, out)
+	}
+	if strings.Contains(string(out), "event:") || strings.Contains(string(out), "[DONE]") {
+		t.Errorf("SSE framing leaked into the client body: %s", out)
+	}
+}
+
+// TestDeStream_MultiLineDataPayloadIsNotTruncated — SSE lets one payload span
+// several `data:` lines, and a long completion is exactly when it does. A
+// line-wise reader would silently truncate the largest answers.
+func TestDeStream_MultiLineDataPayloadIsNotTruncated(t *testing.T) {
+	split := "event: response.completed\n" +
+		`data: {"type":"response.completed","response":{"id":"r","status":"completed",` + "\n" +
+		`data: "output":[{"type":"message","role":"assistant","content":[{"type":"output_text","text":"ok"}]}],` + "\n" +
+		`data: "usage":{"input_tokens":1,"output_tokens":1,"total_tokens":2}}}` + "\n\n"
+
+	_, out := deStreamedBody(t, split)
+	if got := gjson.GetBytes(out, "choices.0.message.content").String(); got != "ok" {
+		t.Fatalf("multi-line payload was truncated: %s", out)
+	}
+}
+
+// TestDeStream_InterruptedStreamIsVisibleNotEmpty — the client already has
+// HTTP 200 by the time we discover the stream never completed, so the failure
+// has to be stated in the body. Zero bytes would read as "the model said
+// nothing" while the request was billed.
+func TestDeStream_InterruptedStreamIsVisibleNotEmpty(t *testing.T) {
+	_, out := deStreamedBody(t,
+		"event: response.created\n"+
+			`data: {"type":"response.created","response":{"id":"r"}}`+"\n\n")
+
+	if len(out) == 0 {
+		t.Fatal("interrupted stream produced an empty body")
+	}
+	if got := gjson.GetBytes(out, "error.code").String(); got != "BRIDGE_DESTREAM_INCOMPLETE" {
+		t.Fatalf("interrupted stream did not name its failure (code=%q): %s", got, out)
+	}
+	if !strings.Contains(gjson.GetBytes(out, "error.message").String(), "billed") {
+		t.Errorf("failure message does not tell the caller the request was still billed: %s", out)
+	}
+}
+
+// TestDeStream_NonSSEUpstreamIsForwardedVerbatim — an upstream ERROR body is
+// JSON, not frames. Collapsing it would hand the client zero bytes and lose the
+// reason it failed, which is the same defect the streaming wrapper documents.
+func TestDeStream_NonSSEUpstreamIsForwardedVerbatim(t *testing.T) {
+	errEnvelope := `{"error":{"message":"upstream said no","type":"invalid_request_error"}}`
+	r := armBridgeDeStreamed(
+		bridgeRequest(t, "/v1/chat/completions", nonStreamChatBody),
+		translator.FormatOpenAI, translator.FormatOpenAIResponses)
+	resp := &http.Response{Header: http.Header{}, StatusCode: 400}
+	resp.Header.Set("Content-Type", "application/json")
+
+	body := newBridgedStreamingBody(r.Context(), resp, io.NopCloser(strings.NewReader(errEnvelope)), quietLogger())
+	out, err := io.ReadAll(body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(out) != errEnvelope {
+		t.Fatalf("upstream error body was not forwarded verbatim:\ngot  %s\nwant %s", out, errEnvelope)
+	}
+}
+
+// TestDeStream_UnarmedRequestIsUntouched — invariant 4: nothing the bridge did
+// not engage for may be rewritten.
+func TestDeStream_UnarmedRequestIsUntouched(t *testing.T) {
+	raw := "event: x\ndata: {\"a\":1}\n\n"
+	r := bridgeRequest(t, "/v1/chat/completions", nonStreamChatBody)
+	resp := &http.Response{Header: http.Header{}, StatusCode: 200}
+	resp.Header.Set("Content-Type", sseContentType)
+
+	out, err := io.ReadAll(newBridgedStreamingBody(r.Context(), resp, io.NopCloser(strings.NewReader(raw)), quietLogger()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(out) != raw {
+		t.Fatalf("unarmed body was rewritten:\ngot  %q\nwant %q", out, raw)
+	}
+	if got := resp.Header.Get("Content-Type"); got != sseContentType {
+		t.Errorf("unarmed response had its content-type changed to %q", got)
+	}
+}
+
+// TestDeStream_TextComesFromDeltasWhenTheEnvelopeHasNone is the fence for the
+// defect the E2E found and every unit test here missed.
+//
+// The resident codex fixture ends its stream with a completed event carrying
+// usage and NO output. Read the envelope alone and the client gets a
+// well-formed, correctly-billed chat.completion whose content is the empty
+// string — the model answered, the answer was billed, and it was dropped
+// between the drainer and the client.
+func TestDeStream_TextComesFromDeltasWhenTheEnvelopeHasNone(t *testing.T) {
+	thin := "event: response.output_text.delta\n" +
+		`data: {"type":"response.output_text.delta","delta":"partial "}` + "\n\n" +
+		"event: response.output_text.delta\n" +
+		`data: {"type":"response.output_text.delta","delta":"answer"}` + "\n\n" +
+		"event: response.completed\n" +
+		`data: {"type":"response.completed","response":{"id":"r","status":"completed",` +
+		`"usage":{"input_tokens":11,"output_tokens":4,"total_tokens":15}}}` + "\n\n"
+
+	_, out := deStreamedBody(t, thin)
+	if got := gjson.GetBytes(out, "choices.0.message.content").String(); got != "partial answer" {
+		t.Fatalf("content = %q, want the concatenated deltas — a streaming client would have "+
+			"rendered exactly that text:\n%s", got, out)
+	}
+	if got := gjson.GetBytes(out, "usage.total_tokens").Int(); got != 15 {
+		t.Errorf("usage lost while recovering the text: %s", out)
+	}
+}
+
+// TestDeStream_FatEnvelopeIsNotOverwrittenByDeltas — when the upstream DID send
+// a finished output array, it is authoritative. Flattening it to the delta
+// string would discard structure a flat string cannot carry: tool calls,
+// refusals, multi-part content.
+func TestDeStream_FatEnvelopeIsNotOverwrittenByDeltas(t *testing.T) {
+	// The deltas deliberately disagree with the envelope, so whichever wins is
+	// visible in the result.
+	fat := "event: response.output_text.delta\n" +
+		`data: {"type":"response.output_text.delta","delta":"DELTAS"}` + "\n\n" +
+		"event: response.completed\n" +
+		`data: {"type":"response.completed","response":{"id":"r","status":"completed","model":"m",` +
+		`"output":[{"type":"message","role":"assistant","content":[{"type":"output_text","text":"ENVELOPE"}]}],` +
+		`"usage":{"input_tokens":1,"output_tokens":1,"total_tokens":2}}}` + "\n\n"
+
+	_, out := deStreamedBody(t, fat)
+	if got := gjson.GetBytes(out, "choices.0.message.content").String(); got != "ENVELOPE" {
+		t.Fatalf("content = %q; the upstream's own assembled output must win over the deltas", got)
+	}
+}
