@@ -431,15 +431,50 @@ func oauthUpstreamRejectsPath(canonicalCode, urlPath string) string {
 	if canonicalCode != "openai" {
 		return ""
 	}
-	// The Responses API is the only dialect chatgpt.com/backend-api/codex serves.
-	// Match on suffix so both /v1/responses (legacy lane) and /responses (group
-	// lane, already stripped) pass.
-	if strings.HasSuffix(strings.TrimSuffix(urlPath, "/"), "/responses") {
+	// 🔴 Refuse the CHAT DIALECT, not every path that is not /responses
+	// (2026-09-10). The original rule was "allow /responses, refuse the rest",
+	// written when Responses was the only endpoint anyone had reason to call.
+	// chatgpt.com/backend-api/codex is a whole product surface, and it serves
+	// more than that — measured from a codex client's own request log, talking
+	// DIRECTLY to the upstream with the same kind of OAuth credential:
+	//
+	//     GET  /backend-api/codex/models        → 200   (340 calls, 333 KB body)
+	//     POST /backend-api/codex/responses     → 200   (52 calls)
+	//     POST /backend-api/codex/images/edits  → 200   (image generation)
+	//
+	// So the sentence this used to return — "whose upstream only serves the
+	// Responses API" — was simply FALSE for those paths, and the refusal was
+	// ours, not the upstream's. The cost was not cosmetic: codex probes
+	// /models before it will use a provider, so an OAuth credential behind
+	// AiKey was refused at discovery and never issued the /responses call it
+	// was perfectly able to make (measured on a live cluster: 7 /models
+	// attempts, 0 /responses). Image generation was blocked the same way.
+	//
+	// The gate keeps doing the job it was built for on 2026-07-13: a client
+	// that speaks Chat Completions (opencode, ai-sdk, LangChain) still gets a
+	// sentence naming the real problem instead of the upstream's misleading
+	// "invalid x-api-key". That is a claim about THREE known surfaces, so it is
+	// now written as those three rather than as "everything else".
+	//
+	// 🚫 Deliberately a DENYLIST of known-foreign dialects, not an allowlist of
+	// what codex serves. An allowlist would silently block every endpoint that
+	// backend grows next — which is exactly the failure being fixed here, one
+	// release later.
+	// Bugfix: workflow/CI/bugfix/20260910-oauth-gate-refused-endpoints-the-upstream-serves.md
+	trimmed := strings.TrimSuffix(urlPath, "/")
+	chatDialect := false
+	for _, suffix := range []string{"/chat/completions", "/completions", "/embeddings"} {
+		if strings.HasSuffix(trimmed, suffix) {
+			chatDialect = true
+			break
+		}
+	}
+	if !chatDialect {
 		return ""
 	}
-	return "This key is backed by a ChatGPT OAuth account, whose upstream only serves the Responses API (/responses). " +
-		"The client called " + urlPath + " (Chat Completions). Use an API-key credential for this client, " +
-		"or use a Responses-API client such as codex."
+	return "This key is backed by a ChatGPT OAuth account, whose upstream serves the Responses API (/responses), " +
+		"not the Chat Completions family. The client called " + urlPath + " (Chat Completions). " +
+		"Use an API-key credential for this client, or use a Responses-API client such as codex."
 }
 
 // testOnlyBaseURLAllowed gates the AIKEY_PROXY_TEST_* base-url hooks. Allowed:
