@@ -280,3 +280,16 @@ func (r *Registry) StreamEventName(from, to Format, payload []byte) string {
 	}
 	return p.response.EventName(payload)
 }
+
+// FlushStream asks the pair for any frames the target dialect still needs after
+// the upstream stream ended. Returns nothing when the pair registered no
+// StreamFlush, so callers can invoke it unconditionally at EOF.
+func (r *Registry) FlushStream(ctx context.Context, from, to Format, st *StreamState) ([][]byte, *TranslateError) {
+	r.mu.RLock()
+	p, ok := r.pairs[pairKey{From: from, To: to, Endpoint: EndpointDefault}]
+	r.mu.RUnlock()
+	if !ok || p == nil || p.response.StreamFlush == nil || st == nil {
+		return nil, nil
+	}
+	return p.response.StreamFlush(ctx, st)
+}

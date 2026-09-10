@@ -277,3 +277,29 @@ func chunkBytes(st *translator.StreamState, delta chatDelta, finish *string, usa
 	})
 	return b
 }
+
+// FlushStream closes a stream the upstream ended without terminating.
+//
+// A Chat Completions consumer waits for `[DONE]`; the upstream only makes us
+// emit one when it sends response.completed / .incomplete / .failed. An
+// upstream that is cut off, times out, or simply stops sends none of those, and
+// the client is then waiting on a connection that has already closed.
+//
+// finish_reason is "stop" rather than an error: nothing here knows WHY the
+// stream ended, and the bytes already delivered are real. Claiming an error we
+// cannot substantiate would be worse than closing the turn on what arrived.
+func FlushStream(ctx context.Context, st *translator.StreamState) ([][]byte, *translator.TranslateError) {
+	_ = ctx
+	sc := scratchOf(st)
+	if sc.doneSent {
+		return nil, nil
+	}
+	out := sc.openingChunk(st)
+	reason := "stop"
+	if sc.sawToolCall {
+		reason = "tool_calls"
+	}
+	out = append(out, chunkBytes(st, chatDelta{}, &reason, nil))
+	sc.doneSent = true
+	return append(out, doneSentinel), nil
+}

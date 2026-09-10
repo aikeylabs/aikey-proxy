@@ -1392,7 +1392,7 @@ func (p *Proxy) serveRoute(w http.ResponseWriter, r *http.Request, route *vkeys.
 				//     response.output_text.delta explicitly.
 				// Everything downstream of this line is Chat Completions.
 				// No-op pass-through when the bridge did not engage.
-				resp.Body = newSSEChatCompletionsBridge(r.Context(), restored, logger)
+				resp.Body = newSSEChatCompletionsBridge(r.Context(), restored, resp.Header.Get("Content-Type"), logger)
 			}
 			return nil
 		},

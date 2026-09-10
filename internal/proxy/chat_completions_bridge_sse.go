@@ -5,6 +5,7 @@ import (
 	"context"
 	"io"
 	"log/slog"
+	"strings"
 
 	"github.com/AiKeyLabs/aikey-proxy/internal/observability"
 	translator "github.com/AiKeyLabs/aikey-proxy/pkg/protocol-translator"
@@ -56,11 +57,37 @@ type sseChatCompletionsBridge struct {
 }
 
 // newSSEChatCompletionsBridge wraps body when the bridge is armed for this
-// request, and returns body unchanged otherwise — so a non-bridged stream pays
-// one nil check and keeps its existing code path exactly.
-func newSSEChatCompletionsBridge(ctx context.Context, body io.ReadCloser, logger *slog.Logger) io.ReadCloser {
+// request AND the upstream actually sent an event stream. Otherwise it returns
+// body unchanged.
+//
+// # Why contentType decides this, and why it is not optional
+//
+// Whether the response leg streams is decided from the REQUEST (`"stream":true`
+// in the body — isStreamingRequest), so a request that asked to stream takes
+// the streaming path no matter what came back. Two common cases come back NOT
+// as SSE:
+//
+//   - an upstream ERROR. 4xx/5xx bodies are JSON, and nothing above this point
+//     returns early for them.
+//   - a relay that ignores `stream:true` and answers with one whole JSON body.
+//
+// A frame reader finds no `data:` lines in either, so wrapping them
+// unconditionally DROPS the entire body and hands the client zero bytes — the
+// answer, or the reason it failed, silently gone while usage is still billed
+// (the drainer read it upstream of here). Every other wrapper in this chain is
+// a verbatim pass-through when it has nothing to do; this one has to be too.
+func newSSEChatCompletionsBridge(ctx context.Context, body io.ReadCloser, contentType string, logger *slog.Logger) io.ReadCloser {
 	st := bridgeFromContext(ctx)
 	if st == nil {
+		return body
+	}
+	if !strings.Contains(strings.ToLower(contentType), "text/event-stream") {
+		if logger != nil {
+			logger.Warn("dialect bridge: upstream answered a streaming request without an event stream; forwarding it untranslated",
+				"event.name", observability.EventProxyBridgeTranslateFailed,
+				"content_type", contentType,
+			)
+		}
 		return body
 	}
 	return &sseChatCompletionsBridge{
@@ -104,6 +131,12 @@ func (b *sseChatCompletionsBridge) Read(p []byte) (int, error) {
 				b.frame = nil
 			}
 			b.buf.Reset()
+			// Close the turn if the upstream never did. Both dialects have a
+			// mandatory terminator and a client that does not receive one waits
+			// on a connection that has already closed. No-op when the stream
+			// ended properly — the pair's flush is idempotent with its own
+			// terminal path.
+			b.flush()
 			break
 		}
 	}
@@ -167,21 +200,7 @@ func (b *sseChatCompletionsBridge) processFrame(frame []byte) {
 		}
 		return
 	}
-	for _, c := range chunks {
-		// A dialect whose clients register per-event listeners (the Responses
-		// API is one) delivers NOTHING to them without the `event:` line, so the
-		// name is asked of the pair rather than assumed absent. Dialects that
-		// stream unnamed frames (Chat Completions, Anthropic) return "" and the
-		// frame is written exactly as before.
-		if name := reg.StreamEventName(b.from, b.to, c); name != "" {
-			b.out.WriteString("event: ")
-			b.out.WriteString(name)
-			b.out.WriteString("\n")
-		}
-		b.out.WriteString("data: ")
-		b.out.Write(c)
-		b.out.WriteString("\n\n")
-	}
+	b.writeChunks(chunks)
 }
 
 // sseAnyDataPayload returns the payload of a frame's `data:` line.
@@ -208,4 +227,39 @@ func sseAnyDataPayload(frame []byte) ([]byte, bool) {
 		start = end
 	}
 	return nil, false
+}
+
+// flush asks the pair for any closing frames and appends them to out.
+func (b *sseChatCompletionsBridge) flush() {
+	chunks, tErr := translator.DefaultRegistry().FlushStream(b.ctx, b.from, b.to, b.state)
+	if tErr != nil {
+		if b.logger != nil {
+			b.logger.Warn("dialect bridge: could not close an interrupted stream",
+				"event.name", observability.EventProxyBridgeTranslateFailed,
+				"error.code", tErr.Code,
+			)
+		}
+		return
+	}
+	b.writeChunks(chunks)
+}
+
+// writeChunks renders converted payloads as SSE frames.
+//
+// A dialect whose clients register per-event listeners (the Responses API is
+// one) delivers NOTHING to them without the `event:` line, so the name is asked
+// of the pair rather than assumed absent. Dialects that stream unnamed frames
+// (Chat Completions, Anthropic) return "" and the frame is written bare.
+func (b *sseChatCompletionsBridge) writeChunks(chunks [][]byte) {
+	reg := translator.DefaultRegistry()
+	for _, c := range chunks {
+		if name := reg.StreamEventName(b.from, b.to, c); name != "" {
+			b.out.WriteString("event: ")
+			b.out.WriteString(name)
+			b.out.WriteString("\n")
+		}
+		b.out.WriteString("data: ")
+		b.out.Write(c)
+		b.out.WriteString("\n\n")
+	}
 }

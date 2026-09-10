@@ -20,8 +20,9 @@ func init() {
 		translator.FormatOpenAIResponses,
 		ConvertRequest,
 		translator.ResponseTransforms{
-			NonStream: ConvertNonStreamResponse,
-			Stream:    ConvertStreamChunk,
+			NonStream:   ConvertNonStreamResponse,
+			Stream:      ConvertStreamChunk,
+			StreamFlush: FlushStream,
 		},
 	)
 }

@@ -17,9 +17,10 @@ func init() {
 		translator.FormatOpenAI,
 		ConvertRequest,
 		translator.ResponseTransforms{
-			NonStream: ConvertNonStreamResponse,
-			Stream:    ConvertStreamChunk,
-			EventName: SSEEventName,
+			NonStream:   ConvertNonStreamResponse,
+			Stream:      ConvertStreamChunk,
+			StreamFlush: FlushStream,
+			EventName:   SSEEventName,
 		},
 	)
 }

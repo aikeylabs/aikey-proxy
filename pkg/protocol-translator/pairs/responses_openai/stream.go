@@ -372,3 +372,24 @@ func mustJSON(v map[string]any) []byte {
 	b, _ := json.Marshal(v)
 	return b
 }
+
+// FlushStream closes a stream the upstream ended without terminating.
+//
+// A Responses consumer keys on `response.completed`; the upstream only makes us
+// emit one when it sends a chunk carrying finish_reason. An upstream that is
+// cut off, times out, or simply stops sends none, and the client is then
+// waiting on a connection that has already closed — and unlike Chat
+// Completions there is no bare sentinel it could fall back to recognising.
+//
+// The frame carries the output accumulated so far, so a client that ignored
+// every delta still reads a complete answer. Status is "completed" for the same
+// reason the other direction reports "stop": nothing here knows why the stream
+// ended, and the bytes delivered are real.
+func FlushStream(ctx context.Context, st *translator.StreamState) ([][]byte, *translator.TranslateError) {
+	_ = ctx
+	sc := scratchOf(st)
+	if sc.finished {
+		return nil, nil
+	}
+	return sc.finish(st, "stop"), nil
+}

@@ -146,6 +146,22 @@ type ResponseTransforms struct {
 	// NonStream is the full-body response transform. REQUIRED for any
 	// pair that accepts non-stream requests (almost all pairs at MVP).
 	NonStream NonStreamTransform
+	// StreamFlush is called ONCE when the upstream stream ends, and returns any
+	// frames the target dialect still needs.
+	//
+	// It exists because a stream can end without the event that terminates it:
+	// an upstream can be cut off, time out, or simply stop. Both dialects in
+	// play have a mandatory terminator — Chat Completions ends at `[DONE]`,
+	// Responses at `response.completed` — and a client that does not receive one
+	// waits. Without this hook a transform can only emit a terminator when the
+	// upstream volunteers the event that triggers it, so an interrupted stream
+	// leaves the client hanging on a connection that already closed.
+	//
+	// Implementations MUST be idempotent with their own terminal path: a stream
+	// that DID end properly must not receive a second terminator.
+	//
+	// Nil means the dialect needs no closing frame.
+	StreamFlush func(ctx context.Context, st *StreamState) ([][]byte, *TranslateError)
 	// EventName names the SSE `event:` line for a payload Stream emits, or
 	// returns "" for an unnamed frame. Nil means the target dialect does not
 	// use named events, which is the common case (Chat Completions and

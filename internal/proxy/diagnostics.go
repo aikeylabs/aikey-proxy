@@ -507,8 +507,8 @@ type MaskRestoreHealth struct {
 	TruncatedPieces int64 `json:"scan_truncated_pieces"`
 	SkippedBytes    int64 `json:"scan_skipped_bytes"`
 	Issued          int64 `json:"placeholders_issued"`
-	Restored      int64  `json:"placeholders_restored"`
-	FidelityPct   int    `json:"fidelity_pct"`
+	Restored        int64 `json:"placeholders_restored"`
+	FidelityPct     int   `json:"fidelity_pct"`
 }
 
 // maskRestoreHealth is the ONE function every surface consults for placeholder

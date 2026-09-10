@@ -24,6 +24,8 @@ func bridgeRequest(t *testing.T, path, body string) *http.Request {
 	return r
 }
 
+const sseContentType = "text/event-stream"
+
 const (
 	simpleChatBody      = `{"model":"gpt-5.4","messages":[{"role":"user","content":"hi"}]}`
 	simpleResponsesBody = `{"model":"gpt-5.4","instructions":"be brief","input":"hi"}`
@@ -399,7 +401,7 @@ func TestBridge_SSEChatClientReceivesChatCompletionsFrames(t *testing.T) {
 
 	ctx := armBridge(httptest.NewRequest(http.MethodPost, "/v1/chat/completions", nil),
 		translator.FormatOpenAI, translator.FormatOpenAIResponses).Context()
-	got, err := io.ReadAll(newSSEChatCompletionsBridge(ctx, io.NopCloser(strings.NewReader(upstream)), quietLogger()))
+	got, err := io.ReadAll(newSSEChatCompletionsBridge(ctx, io.NopCloser(strings.NewReader(upstream)), sseContentType, quietLogger()))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -431,7 +433,7 @@ func TestBridge_SSEResponsesClientReceivesNamedEvents(t *testing.T) {
 
 	ctx := armBridge(httptest.NewRequest(http.MethodPost, "/v1/responses", nil),
 		translator.FormatOpenAIResponses, translator.FormatOpenAI).Context()
-	got, err := io.ReadAll(newSSEChatCompletionsBridge(ctx, io.NopCloser(strings.NewReader(upstream)), quietLogger()))
+	got, err := io.ReadAll(newSSEChatCompletionsBridge(ctx, io.NopCloser(strings.NewReader(upstream)), sseContentType, quietLogger()))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -460,7 +462,7 @@ func TestBridge_SSEResponsesClientReceivesNamedEvents(t *testing.T) {
 func TestBridge_SSEPassthroughWhenUnarmed(t *testing.T) {
 	raw := "event: message_start\ndata: {\"type\":\"message_start\"}\n\n"
 	got, _ := io.ReadAll(newSSEChatCompletionsBridge(context.Background(),
-		io.NopCloser(strings.NewReader(raw)), quietLogger()))
+		io.NopCloser(strings.NewReader(raw)), sseContentType, quietLogger()))
 	if string(got) != raw {
 		t.Errorf("unarmed stream rewritten:\n got: %q\nwant: %q", got, raw)
 	}
@@ -474,7 +476,7 @@ func TestBridge_SSEDropsMalformedFramesWithoutKillingTheStream(t *testing.T) {
 	}, "\n")
 	ctx := armBridge(httptest.NewRequest(http.MethodPost, "/v1/chat/completions", nil),
 		translator.FormatOpenAI, translator.FormatOpenAIResponses).Context()
-	got, err := io.ReadAll(newSSEChatCompletionsBridge(ctx, io.NopCloser(strings.NewReader(upstream)), quietLogger()))
+	got, err := io.ReadAll(newSSEChatCompletionsBridge(ctx, io.NopCloser(strings.NewReader(upstream)), sseContentType, quietLogger()))
 	if err != nil {
 		t.Fatalf("a malformed frame killed the stream: %v", err)
 	}
@@ -535,4 +537,103 @@ func TestBridge_VersionSegmentFollowsDeclarationNotAddress(t *testing.T) {
 			t.Errorf("path = %q; base already ends in /v1 so the client's copy must be deduped", out.URL.Path)
 		}
 	})
+}
+
+// ── sync/async mismatches ───────────────────────────────────────────────────
+
+// TestBridge_NonSSEBodyIsForwardedNotEaten is the fence for the worst failure
+// this file can produce.
+//
+// Whether the response leg streams is decided from the REQUEST, so a request
+// that asked to stream takes the streaming path no matter what came back — and
+// two very ordinary things come back NOT as SSE: an upstream error (4xx/5xx
+// bodies are JSON, and nothing above returns early for them) and a relay that
+// ignores `stream:true` and answers with one whole JSON body.
+//
+// A frame reader finds no `data:` lines in either. Before this guard the whole
+// body was dropped and the client received ZERO bytes — the answer, or the
+// reason it failed, silently gone while the usage was still billed, because the
+// drainer read it upstream of this wrapper.
+func TestBridge_NonSSEBodyIsForwardedNotEaten(t *testing.T) {
+	for _, tc := range []struct{ name, ct, body string }{
+		{"upstream error on a streaming request", "application/json",
+			`{"error":{"type":"rate_limit_error","message":"slow down"}}`},
+		{"relay ignored stream:true", "application/json",
+			`{"id":"resp_x","object":"response","status":"completed","output":[{"type":"message","role":"assistant","content":[{"type":"output_text","text":"whole answer"}]}]}`},
+		{"no content type at all", "",
+			`{"error":{"message":"boom"}}`},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx := armBridge(httptest.NewRequest(http.MethodPost, "/v1/chat/completions", nil),
+				translator.FormatOpenAI, translator.FormatOpenAIResponses).Context()
+			got, err := io.ReadAll(newSSEChatCompletionsBridge(ctx,
+				io.NopCloser(strings.NewReader(tc.body)), tc.ct, quietLogger()))
+			if err != nil {
+				t.Fatal(err)
+			}
+			if string(got) != tc.body {
+				t.Fatalf("body was not forwarded verbatim.\n got: %q\nwant: %q", got, tc.body)
+			}
+		})
+	}
+}
+
+// TestBridge_InterruptedStreamIsStillTerminated — an upstream can be cut off,
+// time out, or simply stop. Both dialects have a MANDATORY terminator, and a
+// client that never receives one waits on a connection that already closed.
+func TestBridge_InterruptedStreamIsStillTerminated(t *testing.T) {
+	t.Run("chat client, upstream stops before response.completed", func(t *testing.T) {
+		upstream := `data: {"type":"response.created","response":{"id":"resp_x","model":"m"}}` + "\n\n" +
+			`data: {"type":"response.output_text.delta","delta":"Hi"}` + "\n\n"
+		ctx := armBridge(httptest.NewRequest(http.MethodPost, "/v1/chat/completions", nil),
+			translator.FormatOpenAI, translator.FormatOpenAIResponses).Context()
+		got, _ := io.ReadAll(newSSEChatCompletionsBridge(ctx,
+			io.NopCloser(strings.NewReader(upstream)), sseContentType, quietLogger()))
+		text := string(got)
+		if !strings.Contains(text, `"content":"Hi"`) {
+			t.Fatalf("the bytes that DID arrive were lost:\n%s", text)
+		}
+		if !strings.Contains(text, `"finish_reason":"stop"`) {
+			t.Errorf("no closing finish_reason:\n%s", text)
+		}
+		if n := strings.Count(text, "data: [DONE]"); n != 1 {
+			t.Errorf("%d terminators, want exactly 1:\n%s", n, text)
+		}
+	})
+
+	t.Run("responses client, upstream stops before finish_reason", func(t *testing.T) {
+		upstream := `data: {"id":"chatcmpl-x","created":1,"model":"m","choices":[{"index":0,"delta":{"role":"assistant","content":""},"finish_reason":null}]}` + "\n\n" +
+			`data: {"id":"chatcmpl-x","created":1,"model":"m","choices":[{"index":0,"delta":{"content":"Hi"},"finish_reason":null}]}` + "\n\n"
+		ctx := armBridge(httptest.NewRequest(http.MethodPost, "/v1/responses", nil),
+			translator.FormatOpenAIResponses, translator.FormatOpenAI).Context()
+		got, _ := io.ReadAll(newSSEChatCompletionsBridge(ctx,
+			io.NopCloser(strings.NewReader(upstream)), sseContentType, quietLogger()))
+		text := string(got)
+		if !strings.Contains(text, `"delta":"Hi"`) {
+			t.Fatalf("the bytes that DID arrive were lost:\n%s", text)
+		}
+		if n := strings.Count(text, "event: response.completed"); n != 1 {
+			t.Fatalf("%d response.completed events, want exactly 1 — a Responses client has no "+
+				"bare sentinel to fall back on:\n%s", n, text)
+		}
+		if !strings.Contains(text, `"output_text":"Hi"`) {
+			t.Errorf("the terminal frame does not carry what arrived:\n%s", text)
+		}
+	})
+}
+
+// TestBridge_ProperlyTerminatedStreamGetsExactlyOneTerminator — the flush must
+// be idempotent with the pair's own terminal path.
+func TestBridge_ProperlyTerminatedStreamGetsExactlyOneTerminator(t *testing.T) {
+	upstream := `data: {"type":"response.created","response":{"id":"resp_x","model":"m"}}` + "\n\n" +
+		`data: {"type":"response.output_text.delta","delta":"Hi"}` + "\n\n" +
+		`data: {"type":"response.completed","response":{"id":"resp_x","status":"completed"}}` + "\n\n" +
+		"data: [DONE]\n\n"
+	ctx := armBridge(httptest.NewRequest(http.MethodPost, "/v1/chat/completions", nil),
+		translator.FormatOpenAI, translator.FormatOpenAIResponses).Context()
+	got, _ := io.ReadAll(newSSEChatCompletionsBridge(ctx,
+		io.NopCloser(strings.NewReader(upstream)), sseContentType, quietLogger()))
+	if n := strings.Count(string(got), "data: [DONE]"); n != 1 {
+		t.Fatalf("%d terminators after a clean stream, want 1:\n%s", n, got)
+	}
 }
