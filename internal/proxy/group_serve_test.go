@@ -166,7 +166,7 @@ func TestGroupServe_MockCodexOAuthUsesRuntimeRailAndFingerprintVersion(t *testin
 		GroupAccounts: mustJSON(t, refs), GroupRuntime: mustJSON(t, mat),
 	}
 	p, tr := setupGroupProxy(t, key, route)
-	req := httptest.NewRequest(http.MethodPost, "/responses", strings.NewReader(`{"model":"gpt-5-codex","input":"hi"}`))
+	req := httptest.NewRequest(http.MethodPost, "/responses", strings.NewReader(`{"model":"gpt-5-codex","input":"hi","stream":true}`))
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Authorization", "Bearer aikey_team_grouptest")
 	w := httptest.NewRecorder()

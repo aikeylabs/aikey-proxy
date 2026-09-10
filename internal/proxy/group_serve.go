@@ -391,8 +391,21 @@ func (p *Proxy) serveGroupAttempt(
 				"error.message", reason,
 				"url.path", r.URL.Path,
 			)
-			writeJSONError(w, http.StatusBadRequest, "invalid_request_error",
+			writeJSONError(w, oauthResponsesOnlyStatus, "invalid_request_error",
 				observability.ErrCodeOAuthResponsesOnly, reason)
+			return groupAttemptResult{done: true}
+		}
+		// Shape half of the same gate (2026-09-10 止血): a non-streaming body is
+		// refused for the whole pool, not failed over — no account can serve it.
+		if reason := oauthUpstreamRejectsShape(oauthCode, r); reason != "" {
+			logger.Warn("group route: OAuth upstream does not serve this request shape",
+				"event.name", observability.EventProxyRequestDialectUnsupported,
+				"error.code", observability.ErrCodeOAuthCodexShapeUnsupported,
+				"error.message", reason,
+				"url.path", r.URL.Path,
+			)
+			writeJSONError(w, oauthResponsesOnlyStatus, "invalid_request_error",
+				observability.ErrCodeOAuthCodexShapeUnsupported, reason)
 			return groupAttemptResult{done: true}
 		}
 		// B2 guard (2026-07-17, verify-first 红灯实证 group_serve_verify_b2_test.go):

@@ -281,9 +281,25 @@ func (p *Proxy) ResolveBindingCredential(
 				"protocol_type", protocolType,
 			)
 			return nil, r, &apppipe.BindingResolveError{
-				StatusCode: http.StatusBadRequest,
+				StatusCode: oauthResponsesOnlyStatus,
 				ErrorType:  "invalid_request_error",
 				ErrorCode:  observability.ErrCodeOAuthResponsesOnly,
+				Message:    reason,
+			}
+		}
+		if reason := oauthUpstreamRejectsShape(oauthCode, r); reason != "" {
+			logger.Warn("oauth: upstream does not serve this request shape",
+				"event.name", observability.EventProxyRequestDialectUnsupported,
+				"error.code", observability.ErrCodeOAuthCodexShapeUnsupported,
+				"error.message", reason,
+				"url.path", r.URL.Path,
+				"provider", upstreamProvider,
+				"protocol_type", protocolType,
+			)
+			return nil, r, &apppipe.BindingResolveError{
+				StatusCode: oauthResponsesOnlyStatus,
+				ErrorType:  "invalid_request_error",
+				ErrorCode:  observability.ErrCodeOAuthCodexShapeUnsupported,
 				Message:    reason,
 			}
 		}
@@ -826,6 +842,10 @@ func (p *Proxy) serveRoute(w http.ResponseWriter, r *http.Request, route *vkeys.
 			// ctxKeyCodexCandidateModel is only stashed inside the
 			// canonicalCode == "openai" OAuth branch above.
 			persistCodexLastModelIfSuccessful(resp.Request, resp.StatusCode)
+			// Codex shape normalization report (2026-09-10): surface the fields
+			// normalizeCodexRequest rewrote as X-Aikey-Normalized + one INFO line.
+			// No-op unless ctxKeyCodexNormalized was stashed on the request leg.
+			reportCodexNormalization(resp)
 
 			// N8c reactive fallback: if a pool account's upstream says it is
 			// broken (401) or its window is exhausted (rate-limit-signal 429),

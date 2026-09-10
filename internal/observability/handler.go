@@ -181,6 +181,13 @@ const (
 	// only). Rejected locally with ErrCodeOAuthResponsesOnly instead of letting
 	// ChatGPT's edge answer with a misleading "invalid x-api-key".
 	EventProxyRequestDialectUnsupported = "proxy.request.dialect_unsupported"
+	// EventProxyCodexRequestNormalized (2026-09-10): a Codex-bound Responses
+	// request was rewritten to the shape the ChatGPT Codex backend accepts
+	// (input string→list, store=false, unsupported parameters stripped). One
+	// INFO line per rewritten request naming the fields — never their values —
+	// so "why did this behave differently from api.openai.com" is answerable
+	// from the log. Rule table + evidence: proxy/codex_shape_normalize.go.
+	EventProxyCodexRequestNormalized = "proxy.codex.request_normalized"
 	// Fence I13 runtime guard (2026-07-21). EventProxyRequestIdentityScrubbed:
 	// an outbound header carried one of the control-plane member-identity shapes
 	// enumerated in proxy/member_identity_guard.go (that file is the only place
@@ -489,6 +496,19 @@ const (
 	// users hunting a key problem that did not exist. Fail fast with the real
 	// reason + the way out (use an API-key credential for this client). 400.
 	ErrCodeOAuthResponsesOnly = "OAUTH_RESPONSES_ONLY"
+	// ErrCodeOAuthCodexShapeUnsupported (2026-09-10): the request targets the
+	// Responses API the Codex backend does serve, but in a shape it rejects
+	// and aikey cannot normalize — today only a NON-STREAMING request
+	// (the backend answers "Stream must be set to true"; the SSE→JSON
+	// reassembly that would serve it is deferred, tokenhub-pool-fallback
+	// tasks.md 8⑤). Refused pre-dial with 422 so an external relay can move
+	// to a provider that serves the shape, instead of relaying the backend's
+	// 400 which nothing retries. ONE code for every unservable shape
+	// (慎重新建 API: alternatives were reusing OAUTH_RESPONSES_ONLY — a
+	// different fact, would mislead the operator — or relaying the 400 —
+	// the availability gap this exists to close). Rule table + evidence:
+	// proxy/codex_shape_normalize.go.
+	ErrCodeOAuthCodexShapeUnsupported = "OAUTH_CODEX_SHAPE_UNSUPPORTED"
 	// ErrCodeAccountEgressProxy (§11.7, P7): the resolved oauth-group account pins
 	// a per-account egress proxy whose already-constructed dial path is currently
 	// unreachable. 503; the request is REFUSED rather than sent out the node's IP

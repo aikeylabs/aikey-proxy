@@ -84,7 +84,7 @@ func TestGroupServe_ResidentMockBypassesNodeUpstreamProxy(t *testing.T) {
 	nodeUpstream.Proxy = http.ProxyURL(proxyURL)
 	p.SetTransport(nodeUpstream)
 
-	req := httptest.NewRequest(http.MethodPost, "/responses", strings.NewReader(`{"model":"gpt-5-codex","input":"hi"}`))
+	req := httptest.NewRequest(http.MethodPost, "/responses", strings.NewReader(`{"model":"gpt-5-codex","input":"hi","stream":true}`))
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Authorization", "Bearer aikey_team_grouptest")
 	w := httptest.NewRecorder()
@@ -174,7 +174,7 @@ func TestGroupServe_ResidentMockBypassesEngineShapedNodeUpstream(t *testing.T) {
 	}
 	p.SetTransport(engineShaped)
 
-	req := httptest.NewRequest(http.MethodPost, "/responses", strings.NewReader(`{"model":"gpt-5-codex","input":"hi"}`))
+	req := httptest.NewRequest(http.MethodPost, "/responses", strings.NewReader(`{"model":"gpt-5-codex","input":"hi","stream":true}`))
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Authorization", "Bearer aikey_team_grouptest")
 	w := httptest.NewRecorder()

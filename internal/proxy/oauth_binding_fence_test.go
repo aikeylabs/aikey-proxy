@@ -50,17 +50,29 @@ import (
 // Why not redirect to httptest.NewServer: redirection masks BaseURL choice
 // (proxy "hits the upstream" regardless of what it picked). Capture +
 // assert is the right semantics for fence tests of BaseURL selection.
+// Request bodies in these fences carry `"stream":true` (2026-09-10): the real
+// ChatGPT Codex backend rejects non-streaming Responses requests, and the
+// proxy now refuses them pre-dial (oauthUpstreamRejectsShape) — a fixture
+// without it never reaches the transport these fences observe. The
+// assertions themselves are unchanged.
 type capturingTransport struct {
 	host string
 	url  string
 	// codexModel proves provider setup's request-scoped context survives all
 	// the way to the outbound transport, not merely that the URL was rewritten.
 	codexModel string
+	// body is the outbound request body as the transport would send it —
+	// what the Codex shape normalizer fences assert on.
+	body []byte
 }
 
 func (c *capturingTransport) RoundTrip(req *http.Request) (*http.Response, error) {
 	c.host = req.URL.Host
 	c.url = req.URL.String()
+	if req.Body != nil {
+		c.body, _ = io.ReadAll(req.Body)
+		_ = req.Body.Close()
+	}
 	c.codexModel, _ = req.Context().Value(ctxKeyCodexCandidateModel).(string)
 	// Synthetic 200 — body shape mirrors a minimal upstream response so
 	// the proxy's downstream usage extractor doesn't WARN on shape mismatch.
@@ -386,7 +398,7 @@ func TestFence_OAuthBinding_OpenAICodexBaseURLOverride(t *testing.T) {
 	// the dialect codex actually speaks; its ASSERTION (the Codex base-URL override
 	// must beat the team key's BaseURL) is unchanged and still the point.
 	req := httptest.NewRequest(http.MethodPost, "/openai/v1/responses",
-		strings.NewReader(`{"model":"gpt-4o","input":"hi"}`))
+		strings.NewReader(`{"model":"gpt-4o","input":"hi","stream":true}`))
 	req.Header.Set("Content-Type", "application/json")
 	w := httptest.NewRecorder()
 	p.Handle(w, req)
@@ -450,7 +462,7 @@ func TestFence_CodexOAuthDispatchLanesUseSharedSetup(t *testing.T) {
 			p.SetTransport(transport)
 
 			req := httptest.NewRequest(http.MethodPost, "/openai/v1/responses",
-				strings.NewReader(`{"model":"gpt-5","input":"hi"}`))
+				strings.NewReader(`{"model":"gpt-5","input":"hi","stream":true}`))
 			req.Header.Set("Authorization", "Bearer "+tc.token)
 			req.Header.Set("Content-Type", "application/json")
 			w := httptest.NewRecorder()
@@ -488,7 +500,7 @@ func TestFence_CodexOAuthAppAndProbePipelinesPrepareRequestBeforeCredentialResol
 		p.SetTransport(transport)
 
 		req := httptest.NewRequest(http.MethodPost, "/apps/codex-agent/v1/responses",
-			strings.NewReader(`{"model":"gpt-5-app","input":"hi"}`))
+			strings.NewReader(`{"model":"gpt-5-app","input":"hi","stream":true}`))
 		req.Header.Set("Authorization", "Bearer "+testAppBearer)
 		req.Header.Set("Content-Type", "application/json")
 		w := httptest.NewRecorder()
@@ -516,7 +528,7 @@ func TestFence_CodexOAuthAppAndProbePipelinesPrepareRequestBeforeCredentialResol
 		p.SetTransport(transport)
 
 		req := httptest.NewRequest(http.MethodPost, "/probe/codex-oauth/v1/responses",
-			strings.NewReader(`{"model":"gpt-5-probe","input":"hi"}`))
+			strings.NewReader(`{"model":"gpt-5-probe","input":"hi","stream":true}`))
 		req.Header.Set("Authorization", "Bearer aikey_app_internal_degrade_detector_v1")
 		req.Header.Set("Content-Type", "application/json")
 		w := httptest.NewRecorder()

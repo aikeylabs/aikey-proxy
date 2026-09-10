@@ -1238,8 +1238,14 @@ func (p *Proxy) handlePathPrefixRoute(w http.ResponseWriter, r *http.Request, pr
 		if tokenRealKey == oauthSentinelKey && oauthAccountID != "" && p.broker != nil {
 			if reason := oauthUpstreamRejectsPath(canonicalCode, r.URL.Path); reason != "" {
 				p.errors.Add(1)
-				writeJSONError(w, http.StatusBadRequest, "invalid_request_error",
+				writeJSONError(w, oauthResponsesOnlyStatus, "invalid_request_error",
 					observability.ErrCodeOAuthResponsesOnly, reason)
+				return
+			}
+			if reason := oauthUpstreamRejectsShape(canonicalCode, r); reason != "" {
+				p.errors.Add(1)
+				writeJSONError(w, oauthResponsesOnlyStatus, "invalid_request_error",
+					observability.ErrCodeOAuthCodexShapeUnsupported, reason)
 				return
 			}
 			if err := p.broker.EnsureFresh(r.Context(), oauthAccountID); err != nil {
@@ -1358,8 +1364,14 @@ func (p *Proxy) handlePathPrefixRoute(w http.ResponseWriter, r *http.Request, pr
 				}
 				if reason := oauthUpstreamRejectsPath(canonicalCode, r.URL.Path); reason != "" {
 					p.errors.Add(1)
-					writeJSONError(w, http.StatusBadRequest, "invalid_request_error",
+					writeJSONError(w, oauthResponsesOnlyStatus, "invalid_request_error",
 						observability.ErrCodeOAuthResponsesOnly, reason)
+					return
+				}
+				if reason := oauthUpstreamRejectsShape(canonicalCode, r); reason != "" {
+					p.errors.Add(1)
+					writeJSONError(w, oauthResponsesOnlyStatus, "invalid_request_error",
+						observability.ErrCodeOAuthCodexShapeUnsupported, reason)
 					return
 				}
 				oauthBase, resolvedReq := resolveOAuthUpstream(canonicalCode, protocolType, "", r)

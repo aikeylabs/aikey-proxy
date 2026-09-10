@@ -39,6 +39,11 @@ const (
 	// otherwise wrote a permanent stale value that all later connectivity
 	// probes inherited.
 	ctxKeyCodexCandidateModel
+	// ctxKeyCodexNormalized carries the []string of request-shape rewrites
+	// normalizeCodexRequest applied to a Codex-bound Responses body (request
+	// leg), read by reportCodexNormalization in ModifyResponse to expose them
+	// as X-Aikey-Normalized + one INFO line. Absent = nothing was rewritten.
+	ctxKeyCodexNormalized
 	// ctxKeyExtractedModel caches the body.model parsed by the FIRST
 	// extractModel call this request, so the 2-3 later calls (model allowlist
 	// check, inbound filter, usage stash) reuse it instead of re-reading +
@@ -338,6 +343,13 @@ func resolveOAuthUpstream(canonicalCode, protocolType, existingBase string, r *h
 			req.URL.Path = strings.TrimPrefix(req.URL.Path, "/v1")
 			req.URL.RawPath = ""
 		}
+		// Shape normalization for the Codex backend (2026-09-10). Here and
+		// nowhere else: this branch is the single point every OAuth dispatch
+		// lane passes through once it knows the request is Codex-bound, so a
+		// lane cannot forget it. Runs after the path strip so its /responses
+		// check sees the upstream-shaped path.
+		// spec: R-tokenhub-pool-fallback-7.S1 非 Codex 形状的请求不得以 400 断掉兜底链
+		req = normalizeCodexRequest(req)
 		return codexUpstreamBaseURL(), req
 	default:
 		// A configured test-only override is the final upstream for hermetic
@@ -347,6 +359,18 @@ func resolveOAuthUpstream(canonicalCode, protocolType, existingBase string, r *h
 		// bypassed the hook and sent test traffic to the real provider edge.
 		// Production is unchanged: this branch is inert unless the explicit env
 		// value also passes the loopback / RFC 6761 .test safety gate.
+		//
+		// Codex-dialect normalization keys on the PERSONA, not the canonical code:
+		// the Resident Mock Provider simulating the Codex upstream (provider mock +
+		// protocol openai_compatible → persona "openai") enforces the same
+		// request-shape rules in strict mode, and the hermetic relay E2E only
+		// proves the Worker normalizes if this branch does it too (2026-09-10:
+		// the first run answered "400 Input must be a list" exactly because only
+		// the canonical "openai" branch above normalized).
+		// spec: R-tokenhub-pool-fallback-7.S1 非 Codex 形状的请求不得以 400 断掉兜底链
+		if persona, ok := oauthInjectionProvider(canonicalCode, protocolType); ok && persona == "openai" {
+			r = normalizeCodexRequest(r)
+		}
 		if testBase, ok := oauthTestBaseURL(canonicalCode, protocolType); ok {
 			return testBase, r
 		}
@@ -381,6 +405,21 @@ func resolveOAuthUpstream(canonicalCode, protocolType, existingBase string, r *h
 // /chat/completions) — this guard is only reached from the OAuth branches.
 //
 // Empty reason = allowed.
+//
+// oauthResponsesOnlyStatus is the HTTP status every lane answers with when the
+// gate rejects. 422, not 400 (changed 2026-09-10, user ruling proposal
+// tokenhub-pool-fallback 拍板点 8 ③): a 400 is a client error nothing retries,
+// so an external relay in front of a codex pool could never fall back to a
+// provider that does serve Chat Completions. 422 keeps the refusal visible to
+// a direct SDK (no automatic retry on 4xx other than 408/409/429) while
+// landing inside a relay's 401-599 retry range. The code stays
+// OAUTH_RESPONSES_ONLY — no new error code for the same fact. The same status
+// carries OAUTH_CODEX_SHAPE_UNSUPPORTED (oauthUpstreamRejectsShape): both are
+// "this OAuth upstream cannot serve this request, try another credential or
+// channel" refusals, and a relay must treat them alike.
+// spec: R-tokenhub-pool-fallback-7.S1 非 Codex 形状的请求不得以 400 断掉兜底链
+const oauthResponsesOnlyStatus = http.StatusUnprocessableEntity
+
 func oauthUpstreamRejectsPath(canonicalCode, urlPath string) string {
 	if canonicalCode != "openai" {
 		return ""
@@ -610,6 +649,11 @@ const (
 	// name (request-id vs openai-request-id vs x-request-id). RESPONSE direction
 	// only; the request-side strip removes any X-Aikey-* before the upstream.
 	HeaderAikeyUpstreamRequestID = "X-Aikey-Upstream-Request-Id"
+	// HeaderAikeyNormalized (2026-09-10) lists, comma-separated, the request
+	// fields aikey rewrote before forwarding to the ChatGPT Codex backend
+	// (`input`, `store`, `strip:<name>`). Field names only. Absent when the
+	// request was forwarded untouched. See proxy/codex_shape_normalize.go.
+	HeaderAikeyNormalized = "X-Aikey-Normalized"
 )
 
 // stripAikeyRequestHeaders removes the ENTIRE X-Aikey-* namespace from an
