@@ -2,6 +2,7 @@ package responses_openai
 
 import (
 	"context"
+	"strings"
 	"testing"
 
 	translator "github.com/AiKeyLabs/aikey-proxy/pkg/protocol-translator"
@@ -152,14 +153,18 @@ func TestRequest_ParallelToolCallsMergeIntoOneAssistantMessage(t *testing.T) {
 // TestRequest_NarrationThenToolCallShareOneMessage — the model may narrate
 // before calling; both belong to the same assistant turn.
 func TestRequest_NarrationThenToolCallShareOneMessage(t *testing.T) {
+	// The call carries its result: Chat Completions requires every tool call to
+	// be answered, so an unanswered one is refused (see the test below) and
+	// cannot be used to exercise the fold.
 	got := mustConvert(t, `{"model":"m","input":[
 		{"role":"user","content":"go"},
 		{"role":"assistant","content":[{"type":"output_text","text":"checking"}]},
-		{"type":"function_call","call_id":"c1","name":"f","arguments":"{}"}
+		{"type":"function_call","call_id":"c1","name":"f","arguments":"{}"},
+		{"type":"function_call_output","call_id":"c1","output":"done"}
 	]}`, "m", false)
 	msgs := got.Get("messages").Array()
-	if len(msgs) != 2 {
-		t.Fatalf("got %d messages, want 2 (user + one assistant carrying text AND the call):\n%s",
+	if len(msgs) != 3 {
+		t.Fatalf("got %d messages, want 3 (user + one assistant carrying text AND the call + the result):\n%s",
 			len(msgs), got.Get("messages").Raw)
 	}
 	if msgs[1].Get("content").String() != "checking" {
@@ -239,8 +244,13 @@ func TestRequest_ServerSideToolsAreRefused(t *testing.T) {
 func TestRequest_SamplingParamsAndReasoningEffort(t *testing.T) {
 	got := mustConvert(t, `{"model":"m","input":"x","max_output_tokens":64,
 		"temperature":0.3,"top_p":0.8,"parallel_tool_calls":true,"reasoning":{"effort":"high"}}`, "m", true)
-	if got.Get("max_tokens").Int() != 64 {
-		t.Errorf("max_output_tokens did not become max_tokens: %s", got.Raw)
+	// max_completion_tokens, not max_tokens: the latter is deprecated and the
+	// reasoning-model families reject it outright.
+	if got.Get("max_completion_tokens").Int() != 64 {
+		t.Errorf("max_output_tokens did not become max_completion_tokens: %s", got.Raw)
+	}
+	if got.Get("max_tokens").Exists() {
+		t.Error("emitted the deprecated max_tokens spelling, which reasoning models reject")
 	}
 	if got.Get("max_output_tokens").Exists() {
 		t.Error("the Responses spelling survived into the Chat Completions body")
@@ -287,5 +297,57 @@ func TestRequest_PairIsRegistered(t *testing.T) {
 	if n := reg.StreamEventName(translator.FormatOpenAI, translator.FormatOpenAIResponses,
 		[]byte(`{"object":"chat.completion.chunk"}`)); n != "" {
 		t.Errorf("forward pair reported an event name %q; Chat Completions streams unnamed frames", n)
+	}
+}
+
+// TestRequest_UnansweredToolCallIsRefused pins an asymmetry between the two
+// dialects that a differential test against sub2api's independent converter
+// (Wei-Shaw/sub2api, apicompat.ResponsesToChatCompletionsRequest) surfaced.
+//
+// The Responses API treats a function_call as just another item, so a client
+// may legitimately send one with no result yet. Chat Completions does NOT: an
+// assistant message carrying tool_calls must be followed by a `tool` message
+// per tool_call_id, and a compliant upstream answers anything else with
+// "An assistant message with 'tool_calls' must be followed by tool messages
+// responding to each 'tool_call_id'".
+//
+// So forwarding the pair verbatim produces a request the upstream rejects, and
+// its error names `tool_call_id` — a field the caller never wrote, since in the
+// Responses shape they wrote `call_id`. sub2api resolves this by DROPPING the
+// unanswered call; that trades a loud failure for a conversation the model
+// silently no longer sees. This refuses instead, naming the call, which is the
+// only outcome that leaves the caller able to fix it.
+func TestRequest_UnansweredToolCallIsRefused(t *testing.T) {
+	_, tErr := ConvertRequest(context.Background(), "m", []byte(`{"model":"m","input":[
+		{"role":"user","content":"go"},
+		{"type":"function_call","call_id":"c1","name":"f","arguments":"{}"}
+	]}`), false)
+	if tErr == nil {
+		t.Fatal("an unanswered function_call was forwarded; the upstream would reject the request " +
+			"with an error naming a field the caller never wrote")
+	}
+	if tErr.Param != "input" {
+		t.Errorf("refusal names param %q, want input", tErr.Param)
+	}
+	if !strings.Contains(tErr.Message, "c1") {
+		t.Errorf("refusal does not name the offending call: %s", tErr.Message)
+	}
+	if !strings.Contains(tErr.Message, "function_call_output") {
+		t.Errorf("refusal does not say what to add: %s", tErr.Message)
+	}
+}
+
+// TestRequest_AnsweredToolCallsPass — the paired case must stay accepted, in
+// both the one-call and the parallel-call shapes.
+func TestRequest_AnsweredToolCallsPass(t *testing.T) {
+	got := mustConvert(t, `{"model":"m","input":[
+		{"role":"user","content":"both"},
+		{"type":"function_call","call_id":"a","name":"w","arguments":"{}"},
+		{"type":"function_call","call_id":"b","name":"w","arguments":"{}"},
+		{"type":"function_call_output","call_id":"a","output":"18C"},
+		{"type":"function_call_output","call_id":"b","output":"9C"}
+	]}`, "m", false)
+	if n := len(got.Get("messages.1.tool_calls").Array()); n != 2 {
+		t.Fatalf("parallel answered calls collapsed to %d on the assistant turn", n)
 	}
 }

@@ -122,8 +122,17 @@ func TestRoundTrip_ChatCompletionsRequestSurvivesBothHops(t *testing.T) {
 	}
 
 	// ── sampling parameters ─────────────────────────────────────────────────
-	if got.Get("max_tokens").Int() != 256 {
-		t.Errorf("max_tokens = %d, want 256 (it becomes max_output_tokens mid-trip)", got.Get("max_tokens").Int())
+	// The value survives; the SPELLING is normalised. The request went in with
+	// the deprecated `max_tokens` and comes back as `max_completion_tokens`,
+	// because that is the only spelling the reasoning-model families accept —
+	// so a round trip through both pairs upgrades a legacy body rather than
+	// faithfully reproducing a form the upstream would now reject.
+	if got.Get("max_completion_tokens").Int() != 256 {
+		t.Errorf("max_completion_tokens = %d, want 256 (in as max_tokens, out normalised)",
+			got.Get("max_completion_tokens").Int())
+	}
+	if got.Get("max_tokens").Exists() {
+		t.Error("the round trip reproduced the deprecated max_tokens spelling")
 	}
 	if got.Get("temperature").Float() != 0.4 || got.Get("top_p").Float() != 0.9 {
 		t.Errorf("sampling params lost: %s", back)

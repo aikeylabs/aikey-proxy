@@ -13,14 +13,23 @@ type chatRequest struct {
 	Model    string        `json:"model"`
 	Messages []chatMessage `json:"messages"`
 
-	MaxTokens         *int       `json:"max_tokens,omitempty"`
-	Temperature       *float64   `json:"temperature,omitempty"`
-	TopP              *float64   `json:"top_p,omitempty"`
-	ParallelToolCalls *bool      `json:"parallel_tool_calls,omitempty"`
-	ReasoningEffort   string     `json:"reasoning_effort,omitempty"`
-	Tools             []chatTool `json:"tools,omitempty"`
-	ToolChoice        any        `json:"tool_choice,omitempty"`
-	Stream            bool       `json:"stream,omitempty"`
+	// MaxCompletionTokens, not the older max_tokens. OpenAI deprecated
+	// max_tokens for chat completions and the reasoning-model families REJECT
+	// it outright ("Unsupported parameter: 'max_tokens' is not supported with
+	// this model. Use 'max_completion_tokens' instead") — and those are exactly
+	// the models a Responses-speaking client is using, so the old spelling
+	// would turn a working request into a hard 400.
+	//
+	// Confirmed against an independent implementation: Wei-Shaw/sub2api's
+	// apicompat.ResponsesToChatCompletionsRequest emits the same field.
+	MaxCompletionTokens *int       `json:"max_completion_tokens,omitempty"`
+	Temperature         *float64   `json:"temperature,omitempty"`
+	TopP                *float64   `json:"top_p,omitempty"`
+	ParallelToolCalls   *bool      `json:"parallel_tool_calls,omitempty"`
+	ReasoningEffort     string     `json:"reasoning_effort,omitempty"`
+	Tools               []chatTool `json:"tools,omitempty"`
+	ToolChoice          any        `json:"tool_choice,omitempty"`
+	Stream              bool       `json:"stream,omitempty"`
 }
 
 // chatMessage is one Chat Completions message.
@@ -98,7 +107,7 @@ func ConvertRequest(ctx context.Context, model string, body []byte, stream bool)
 
 	if v := in.Get("max_output_tokens"); v.Exists() {
 		n := int(v.Int())
-		out.MaxTokens = &n
+		out.MaxCompletionTokens = &n
 	}
 	if v := in.Get("temperature"); v.Exists() {
 		f := v.Float()

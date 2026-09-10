@@ -82,10 +82,49 @@ func convertInputItems(items []gjson.Result) ([]chatMessage, *translator.Transla
 		out = append(out, chatMessage{Role: "assistant", Content: nil, ToolCalls: []chatToolCall{tc}})
 	}
 
+	// Chat Completions REQUIRES every tool call to be answered: an assistant
+	// message carrying tool_calls must be followed by a `tool` message per
+	// tool_call_id, and a compliant upstream rejects the request otherwise
+	// ("An assistant message with 'tool_calls' must be followed by tool
+	// messages responding to each 'tool_call_id'").
+	//
+	// The Responses API has no such rule — a function_call is just an item, and
+	// a client may legitimately send one with no result yet. So the asymmetry
+	// has to be resolved HERE, and there are only three ways to do it:
+	//
+	//   - forward it anyway → the upstream 400s, and its error talks about
+	//     `tool_call_id`, a field the caller never wrote (they wrote `call_id`
+	//     in the Responses shape). Confusing across the dialect boundary.
+	//   - drop the unanswered call → the model silently stops seeing that it
+	//     called the tool. Changes the conversation with nothing to show for it.
+	//   - refuse, naming the call.
+	//
+	// The third is the only one that leaves the caller able to act, so the
+	// pairing is checked up front rather than discovered downstream.
+	answered := make(map[string]struct{})
+	for _, it := range items {
+		if it.Get("type").String() == "function_call_output" {
+			answered[it.Get("call_id").String()] = struct{}{}
+		}
+	}
+
 	for _, it := range items {
 		switch it.Get("type").String() {
 
 		case "function_call":
+			callID := it.Get("call_id").String()
+			if _, ok := answered[callID]; !ok {
+				return nil, &translator.TranslateError{
+					Code:       translator.CodeBadRequest,
+					HTTPStatus: 400,
+					Param:      "input",
+					Message: "`input` carries a function_call (call_id " + callID + ", name " +
+						it.Get("name").String() + ") with no matching function_call_output. " +
+						"This credential's upstream speaks the Chat Completions API, which requires every " +
+						"tool call to be answered before the conversation can continue. Add the tool's " +
+						"result as a function_call_output item with the same call_id, or remove the call.",
+				}
+			}
 			attachToolCall(chatToolCall{
 				ID:   it.Get("call_id").String(),
 				Type: "function",
