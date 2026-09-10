@@ -29,8 +29,10 @@ const sseContentType = "text/event-stream"
 const (
 	simpleChatBody      = `{"model":"gpt-5.4","messages":[{"role":"user","content":"hi"}]}`
 	simpleResponsesBody = `{"model":"gpt-5.4","instructions":"be brief","input":"hi"}`
-	relayHost           = "relay.corp.example"
-	relayBase           = "https://relay.corp.example/v1"
+	// streamingResponsesBody is simpleResponsesBody as a codex client sends it.
+	streamingResponsesBody = `{"model":"gpt-5.4","instructions":"be brief","input":"hi","stream":true}`
+	relayHost              = "relay.corp.example"
+	relayBase              = "https://relay.corp.example/v1"
 )
 
 // relayRules declares a Chat Completions relay — the "both upstream kinds
@@ -83,7 +85,12 @@ func TestBridge_AgreeingDialectsArePassedThrough(t *testing.T) {
 		name, path, body, base string
 		rules                  []BridgeUpstreamRule
 	}{
-		{"responses client → codex", "/v1/responses", simpleResponsesBody, "", nil},
+		// stream:true on purpose. A codex client that asked for a whole body at
+		// once was never in the "already worked" set — the upstream serves
+		// streaming only, so that request was REFUSED (and is now de-streamed;
+		// see TestDeStream_NativeResponsesClient*). What must stay byte-identical
+		// here is the streaming request every real codex client actually sends.
+		{"responses client → codex", "/v1/responses", streamingResponsesBody, "", nil},
 		{"chat client → relay", "/v1/chat/completions", simpleChatBody, relayBase, relayRules()},
 	} {
 		for _, enabled := range []bool{false, true} {

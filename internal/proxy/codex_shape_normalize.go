@@ -34,9 +34,12 @@
 // keeps the pair of rewrites in one place where they cannot drift apart.
 //
 // oauthUpstreamRejectsShape below therefore still refuses a non-streaming
-// request, and that is not dead code: it is what a NATIVE /responses client
-// gets, having asked for a shape nobody translated. Only bridged Chat
-// Completions traffic arrives here already rewritten to stream:true.
+// request, and that is not dead code — it is the SWITCHED-OFF behaviour. With
+// the bridge enabled, both a bridged Chat Completions client and a native
+// /responses one arrive here already rewritten to stream:true and pass; with it
+// disabled nothing rewrites them and this refusal is what the caller gets,
+// unchanged since 2026-09-10. That is bridge invariant 1: a deployment that
+// never opted in behaves exactly as it did, refusal wording included.
 //
 // Every rewrite is visible: the field names travel to the client in the
 // X-Aikey-Normalized response header and to the operator in one INFO line per

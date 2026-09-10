@@ -291,3 +291,122 @@ func TestDeStream_FatEnvelopeIsNotOverwrittenByDeltas(t *testing.T) {
 		t.Fatalf("content = %q; the upstream's own assembled output must win over the deltas", got)
 	}
 }
+
+// ── native /responses clients (no dialect translation involved) ─────────────
+
+const nativeResponsesBody = `{"model":"gpt-5-codex","instructions":"be brief","input":"hi"}`
+
+// TestDeStream_NativeResponsesClientIsServedNonStreaming — a client speaking
+// exactly the dialect the upstream speaks, refused anyway because it wanted one
+// whole body. Nothing here needs translating; only the streaming has to be
+// reconciled.
+func TestDeStream_NativeResponsesClientIsServedNonStreaming(t *testing.T) {
+	p := &Proxy{}
+	p.SetChatCompletionsBridge(true, nil)
+
+	r := bridgeRequest(t, "/v1/responses", nativeResponsesBody)
+	out, refusal := p.bridgeOrRejectDialect(r, "openai", "openai_compatible", "", quietLogger())
+	if refusal != nil {
+		t.Fatalf("native non-streaming Responses request was refused: %s", refusal.Message)
+	}
+	if out.URL.Path != "/v1/responses" {
+		t.Errorf("path was rewritten to %q; the dialects agree, so the route must not move", out.URL.Path)
+	}
+	body, _ := io.ReadAll(out.Body)
+	if !gjson.GetBytes(body, "stream").Bool() {
+		t.Fatalf("upstream body must say stream:true (Codex serves nothing else): %s", body)
+	}
+	st := armedState(t, out)
+	if !st.deStream {
+		t.Error("de-streaming was not armed; the client would receive raw SSE for a non-streaming request")
+	}
+	if st.from != st.to {
+		t.Errorf("from=%s to=%s; a same-dialect request must not be marked for translation", st.from, st.to)
+	}
+	if reason := oauthUpstreamRejectsShape("openai", out); reason != "" {
+		t.Errorf("pre-dial shape gate still refuses it: %s", reason)
+	}
+}
+
+// TestDeStream_NativeResponsesUntouchedWithTheSwitchOff is invariant 1 for this
+// path: a deployment that never opted in keeps the old refusal, and the request
+// reaches the gate byte-for-byte as it was sent.
+func TestDeStream_NativeResponsesUntouchedWithTheSwitchOff(t *testing.T) {
+	p := &Proxy{} // zero value = the shipped default
+
+	r := bridgeRequest(t, "/v1/responses", nativeResponsesBody)
+	out, refusal := p.bridgeOrRejectDialect(r, "openai", "openai_compatible", "", quietLogger())
+	if refusal != nil {
+		t.Fatalf("the bridge itself refused; the pre-dial gate owns this refusal: %+v", refusal)
+	}
+	if bridgeFromContext(out.Context()) != nil {
+		t.Error("bridge armed with the switch off")
+	}
+	body, _ := io.ReadAll(out.Body)
+	if string(body) != nativeResponsesBody {
+		t.Errorf("body rewritten with the switch off:\n got: %s\nwant: %s", body, nativeResponsesBody)
+	}
+	// And the refusal that used to be the whole story still happens.
+	out.Body = io.NopCloser(strings.NewReader(string(body)))
+	if reason := oauthUpstreamRejectsShape("openai", out); reason == "" {
+		t.Error("with the switch off the non-streaming request must still be refused pre-dial")
+	}
+}
+
+// TestDeStream_SameDialectCollapseReturnsResponsesNotChatCompletions — the
+// collapsing is shared with the translated path, so the risk is that it also
+// translates. A native client must get its own dialect back.
+func TestDeStream_SameDialectCollapseReturnsResponsesNotChatCompletions(t *testing.T) {
+	r := armBridgeDeStreamed(
+		bridgeRequest(t, "/v1/responses", nativeResponsesBody),
+		translator.FormatOpenAIResponses, translator.FormatOpenAIResponses)
+	resp := &http.Response{Header: http.Header{}, StatusCode: 200}
+	resp.Header.Set("Content-Type", sseContentType)
+
+	body := newBridgedStreamingBody(r.Context(), resp, io.NopCloser(strings.NewReader(completedSSE)), quietLogger())
+	out, err := io.ReadAll(body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := resp.Header.Get("Content-Type"); got != "application/json" {
+		t.Errorf("content-type = %q, want application/json", got)
+	}
+	if got := gjson.GetBytes(out, "object").String(); got == "chat.completion" {
+		t.Fatalf("a native Responses client was handed a Chat Completions body: %s", out)
+	}
+	if got := gjson.GetBytes(out, "status").String(); got != "completed" {
+		t.Fatalf("not a Responses response object (status=%q): %s", got, out)
+	}
+	if got := gjson.GetBytes(out, "output.0.content.0.text").String(); got != "ok" {
+		t.Errorf("answer text lost: %s", out)
+	}
+	if got := gjson.GetBytes(out, "usage.input_tokens").Int(); got != 9 {
+		t.Errorf("Responses-native usage was renamed or lost: %s", out)
+	}
+}
+
+// TestDeStream_NativeResponsesToADeclaredRelayIsUntouched — the same-dialect
+// path must be keyed on the DESTINATION too, not merely on "the client did not
+// ask to stream".
+//
+// A relay an operator declared as Responses-speaking serves a non-streaming
+// request perfectly well, exactly as api.openai.com does. Rewriting it to
+// stream and collapsing the answer back would change a working wire form,
+// spend the round trip differently, and gain nothing.
+func TestDeStream_NativeResponsesToADeclaredRelayIsUntouched(t *testing.T) {
+	p := &Proxy{}
+	p.SetChatCompletionsBridge(true, responsesRelayRules())
+
+	r := bridgeRequest(t, "/v1/responses", nativeResponsesBody)
+	out, refusal := p.bridgeOrRejectDialect(r, "openai", "openai_compatible", responsesRelayBase, quietLogger())
+	if refusal != nil {
+		t.Fatalf("refused: %s", refusal.Message)
+	}
+	if bridgeFromContext(out.Context()) != nil {
+		t.Fatal("a declared Responses relay was treated as Codex; its request was rewritten to stream for no reason")
+	}
+	body, _ := io.ReadAll(out.Body)
+	if string(body) != nativeResponsesBody {
+		t.Errorf("body rewritten for an upstream that serves it as sent:\n got: %s\nwant: %s", body, nativeResponsesBody)
+	}
+}

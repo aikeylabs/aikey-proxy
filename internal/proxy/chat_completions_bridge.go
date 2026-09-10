@@ -54,6 +54,7 @@ import (
 	_ "github.com/AiKeyLabs/aikey-proxy/pkg/protocol-translator/pairs/openai_responses"
 	_ "github.com/AiKeyLabs/aikey-proxy/pkg/protocol-translator/pairs/responses_openai"
 	"github.com/tidwall/gjson"
+	"github.com/tidwall/sjson"
 )
 
 const (
@@ -328,9 +329,10 @@ func (p *Proxy) bridgeOrRejectDialect(
 	}
 
 	// Axes agree — the overwhelmingly common case, and the one that must stay
-	// free of any rewriting.
+	// free of any rewriting. The single exception is a request the destination
+	// cannot serve in ANY dialect; see deStreamSameDialect.
 	if inbound == outbound {
-		return r, nil
+		return p.deStreamSameDialect(r, inbound, rt, base, logger)
 	}
 
 	if !rt.enabled {
@@ -361,6 +363,89 @@ func (p *Proxy) bridgeOrRejectDialect(
 	out, refusal := p.translateRequestLeg(r, inbound, outbound, rt.isCodexEndpoint(base), logger)
 	if refusal != nil {
 		return r, refusal
+	}
+	return out, nil
+}
+
+// deStreamSameDialect is the one case where a request needs NO dialect
+// translation and still cannot be forwarded as it was sent.
+//
+// A native /responses client asking for a whole answer at once is speaking
+// exactly the dialect the Codex backend speaks — nothing to translate — and the
+// backend refuses it anyway, because it serves stream:true and nothing else
+// (measured: shape matrix 2026-09-10 cells S03, S06 and S07 all answer 400
+// "Stream must be set to true"). Until now that request was refused at the
+// pre-dial gate with a message telling the caller to change their client.
+//
+// # Why this lives in the bridge rather than in codex_shape_normalize.go
+//
+// Because it is two rewrites, not one. Asking the upstream to stream is only
+// half of it; the response has to be collapsed back into a single body, and the
+// normalizer only ever sees the request. Splitting the pair across two files is
+// how they drift apart. The bridge already owns exactly this pairing for
+// translated traffic, and the collapsing machinery is the same code — the only
+// difference here is that from and to are equal, so no dialect translation
+// happens on the way back.
+//
+// # Why it is behind the same switch
+//
+// Invariant 1 says a deployment that never opted in behaves byte-for-byte as it
+// did, refusal wording included. Serving a request that used to be refused is a
+// better outcome, but it is still a different one: it reaches the upstream, it
+// bills, and a relay that was retrying the 422 on another channel now stays on
+// this one. That belongs to the operator, and it leaves a kill switch if the
+// collapsing ever misbehaves.
+//
+// Returns the request unchanged — never a refusal — when this does not apply.
+// The pre-dial gate downstream still refuses the un-rewritten case, which is
+// what keeps the switched-off behaviour identical.
+func (p *Proxy) deStreamSameDialect(
+	r *http.Request, dialect translator.Format, rt *bridgeRuntime, base string, logger *slog.Logger,
+) (*http.Request, *dialectRefusal) {
+	// Cheapest checks first: the common case must not even read the body.
+	if !rt.enabled || dialect != translator.FormatOpenAIResponses || !rt.isCodexEndpoint(base) {
+		return r, nil
+	}
+	if r.Body == nil || r.Body == http.NoBody || r.Method != http.MethodPost {
+		return r, nil
+	}
+	body, err := io.ReadAll(r.Body)
+	_ = r.Body.Close()
+	if err != nil {
+		return r, &dialectRefusal{
+			Status:    http.StatusBadRequest,
+			ErrorType: "invalid_request_error",
+			Code:      "BRIDGE_REQUEST_READ_FAILED",
+			Message:   "Could not read the request body to check whether this credential's upstream can serve it: " + err.Error(),
+		}
+	}
+	// Already streaming, or not a JSON object we understand: put it back exactly
+	// as it came and leave it alone. setRequestBody rather than the bridged
+	// variant, so the inbound Content-Length header is not disturbed either.
+	if !gjson.ValidBytes(body) || gjson.GetBytes(body, "stream").Bool() {
+		setRequestBody(r, body)
+		return r, nil
+	}
+	rewritten, err := sjson.SetBytes(body, "stream", true)
+	if err != nil {
+		setRequestBody(r, body)
+		return r, nil // cannot rewrite: let the pre-dial gate refuse it as before
+	}
+
+	// from == to: the response leg collapses the stream but performs no dialect
+	// translation, because the terminal event's `response` object already IS the
+	// non-streaming body for this dialect.
+	out := armBridgeDeStreamed(r, dialect, dialect)
+	setBridgedRequestBody(out, rewritten)
+	if logger != nil {
+		logger.Info("dialect bridge: de-streaming a native Responses request the upstream cannot serve non-streaming",
+			"event.name", observability.EventProxyBridgeEngaged,
+			"inbound_dialect", string(dialect),
+			"outbound_dialect", string(dialect),
+			"url.path", out.URL.Path,
+			"stream", false,
+			"de_streamed", true,
+		)
 	}
 	return out, nil
 }
@@ -477,6 +562,13 @@ func setBridgedRequestBody(r *http.Request, body []byte) {
 func translateBridgedResponse(ctx context.Context, body []byte, logger *slog.Logger) ([]byte, *translator.TranslateError) {
 	st := bridgeFromContext(ctx)
 	if st == nil {
+		return body, nil
+	}
+	// Same dialect in and out: nothing to translate. This is the de-streamed
+	// native /responses client (deStreamSameDialect) — the collapsing already
+	// produced the body that dialect returns for a non-streaming call, and
+	// there is no (X -> X) pair registered to ask anyway.
+	if st.from == st.to {
 		return body, nil
 	}
 	out, tErr := translator.DefaultRegistry().TranslateNonStream(ctx, st.from, st.to, body)
