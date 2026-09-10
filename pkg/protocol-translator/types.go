@@ -146,6 +146,23 @@ type ResponseTransforms struct {
 	// NonStream is the full-body response transform. REQUIRED for any
 	// pair that accepts non-stream requests (almost all pairs at MVP).
 	NonStream NonStreamTransform
+	// EventName names the SSE `event:` line for a payload Stream emits, or
+	// returns "" for an unnamed frame. Nil means the target dialect does not
+	// use named events, which is the common case (Chat Completions and
+	// Anthropic both stream bare `data:` frames).
+	//
+	// Why the PAIR owns this rather than the IO layer: whether a dialect names
+	// its events, and what it names them, is part of that dialect's wire format
+	// — the same knowledge the transforms already encode. Putting it in the
+	// caller would mean every consumer of a named-event pair reimplements the
+	// naming rule, and the two copies would disagree the first time a pair
+	// added an event type.
+	//
+	// Why it is a function of the payload rather than a constant: the name
+	// varies per frame (response.created, response.output_text.delta, …), and
+	// for the dialects in play it is derivable from the payload itself, so the
+	// pair stays stateless here.
+	EventName func(payload []byte) string
 }
 
 // StreamState accumulates state across chunks of a single streaming

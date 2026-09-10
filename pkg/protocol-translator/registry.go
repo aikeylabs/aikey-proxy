@@ -209,3 +209,74 @@ func (r *Registry) translateNonStreamEndpoint(
 	}
 	return p.response.NonStream(ctx, body)
 }
+
+// TranslateStreamChunk converts one SSE data payload from the upstream's
+// dialect (`to`) back into the inbound dialect (`from`), returning zero or
+// more payloads. Like TranslateNonStream, the (from, to) key is the
+// REQUEST-side direction — the Registry handles the swap internally so a pair
+// author registers all three transforms under one tuple.
+//
+// `st` MUST be the same StreamState for every chunk of a single response, and
+// MUST NOT be shared across responses: it holds the per-stream identifiers and
+// tool-call indices that the target dialect repeats on every frame.
+//
+// Zero output chunks is a normal, expected result — most dialects emit events
+// that have no counterpart in the other. Callers write nothing and read on.
+//
+// Returns CodeTranslationFailed when the pair registered no Stream transform,
+// rather than passing the upstream frame through: a frame in the wrong dialect
+// reaching a client's SSE parser either throws or silently deserializes into
+// an empty chunk, and neither is better than a loud server-side error.
+func (r *Registry) TranslateStreamChunk(
+	ctx context.Context,
+	from, to Format,
+	st *StreamState,
+	chunk []byte,
+) ([][]byte, *TranslateError) {
+	r.mu.RLock()
+	p, ok := r.pairs[pairKey{From: from, To: to, Endpoint: EndpointDefault}]
+	r.mu.RUnlock()
+	if !ok || p == nil || p.response.Stream == nil {
+		return nil, &TranslateError{
+			Code:       CodeTranslationFailed,
+			HTTPStatus: 500,
+			Message: "No stream response translator for " + string(from) + " → " + string(to) +
+				". The pair may implement non-stream only; check the pair's init() registers ResponseTransforms.Stream.",
+		}
+	}
+	if st == nil {
+		return nil, &TranslateError{
+			Code:       CodeTranslationFailed,
+			HTTPStatus: 500,
+			Message: "TranslateStreamChunk called with a nil StreamState for " + string(from) + " → " + string(to) +
+				". Callers must allocate one StreamState per streaming response.",
+		}
+	}
+	return p.response.Stream(ctx, st, chunk)
+}
+
+// HasStreamPair reports whether the (from, to) pair can translate SSE. Callers
+// use it to decide between engaging translation and refusing a streaming
+// request up front, while the response headers can still say so.
+func (r *Registry) HasStreamPair(from, to Format) bool {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	p, ok := r.pairs[pairKey{From: from, To: to, Endpoint: EndpointDefault}]
+	return ok && p != nil && p.response.Stream != nil
+}
+
+// StreamEventName returns the SSE `event:` name a pair wants on the frame
+// carrying `payload`, or "" when the target dialect streams unnamed frames.
+//
+// Callers writing SSE MUST consult this rather than assuming bare `data:`
+// frames: a dialect whose clients register per-event listeners (the OpenAI
+// Responses API is one) delivers nothing to them without the name.
+func (r *Registry) StreamEventName(from, to Format, payload []byte) string {
+	r.mu.RLock()
+	p, ok := r.pairs[pairKey{From: from, To: to, Endpoint: EndpointDefault}]
+	r.mu.RUnlock()
+	if !ok || p == nil || p.response.EventName == nil {
+		return ""
+	}
+	return p.response.EventName(payload)
+}

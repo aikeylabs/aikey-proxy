@@ -83,9 +83,121 @@ type Config struct {
 	// Enabled, this proxy is a cluster node: it registers + heartbeats to the
 	// aikey-hub name service and (policy) only serves team/managed virtual keys.
 	Cluster ClusterConfig `yaml:"cluster,omitempty"`
-	Log     LogConfig     `yaml:"log"`
-	Listen  ListenConfig  `yaml:"listen"`
-	Events  EventsConfig  `yaml:"events"`
+	// ChatCompletionsBridge lets clients call /v1/chat/completions against a
+	// credential whose upstream serves ONLY the OpenAI Responses API — today
+	// that means a ChatGPT OAuth account, whose upstream
+	// (chatgpt.com/backend-api/codex) has exactly one route, /responses.
+	//
+	// Absent / Enabled=false is the default and reproduces the pre-bridge
+	// behaviour BYTE FOR BYTE: such a request is refused with the explicit
+	// OAUTH_RESPONSES_ONLY error, exactly as it has been since 2026-07-13.
+	// Nothing about the /responses path changes in either state.
+	//
+	// Why this is a switch rather than always-on: turning it on means AiKey
+	// starts REWRITING the customer's prompts and the model's answers between
+	// two dialects. That is a materially different product promise from
+	// forwarding bytes, it is not reversible for a request already served, and
+	// a translation defect shows up as a subtly wrong answer rather than an
+	// error. An operator should have to say yes to that.
+	//
+	// Why deployment-level rather than per-group: turning it on only ADDS an
+	// accepted inbound dialect — a client already speaking /responses is
+	// unaffected either way — so there is no group for which "on" is a
+	// regression, and per-group granularity would buy nothing while costing a
+	// schema column, an API field and a console control. If a deployment ever
+	// needs to expose the bridge to some groups and not others, that is a
+	// control-plane change with its own decision to make.
+	ChatCompletionsBridge ChatCompletionsBridgeConfig `yaml:"chat_completions_bridge,omitempty"`
+	Log                   LogConfig                   `yaml:"log"`
+	Listen                ListenConfig                `yaml:"listen"`
+	Events                EventsConfig                `yaml:"events"`
+}
+
+// ChatCompletionsBridgeConfig configures the Chat Completions ⇄ Responses
+// translation bridge. See Config.ChatCompletionsBridge for what it does and
+// why it is off by default.
+type ChatCompletionsBridgeConfig struct {
+	Enabled bool `yaml:"enabled"`
+	// Upstreams widens where an OAuth credential's traffic may go, and states
+	// what each destination speaks.
+	//
+	// # Why one list answers two questions
+	//
+	// "May an OAuth token be sent here?" and "what dialect does here speak?"
+	// are both properties of the SAME thing — the upstream host — so they share
+	// one entry. Splitting them into two config blocks would let a deployment
+	// answer one and forget the other, and the failure of each is different and
+	// silent (traffic refused vs. traffic translated the wrong way).
+	//
+	// # Why the default is empty, and what empty means
+	//
+	// Empty is the shipped default and reproduces today's behaviour exactly:
+	// an openai OAuth credential can reach ONE destination,
+	// chatgpt.com/backend-api/codex, which is compiled in. That hardcoding is
+	// not an implementation shortcut — it is a security property. An OAuth
+	// access token is not a key the customer can rotate cheaply; it IS the
+	// subscription, and a host that receives one holds the whole account. So
+	// widening is opt-in, enumerated, and has no wildcard form.
+	//
+	// API-key credentials are deliberately unaffected: they already reach any
+	// base_url, because there the secret is the customer's own key and the
+	// blast radius is theirs.
+	Upstreams []BridgeUpstream `yaml:"upstreams,omitempty"`
+}
+
+// BridgeUpstream is one permitted OAuth destination and the dialect it serves.
+type BridgeUpstream struct {
+	// Host is the destination hostname, matched case-insensitively against the
+	// upstream URL's host. No port, no scheme, no wildcard: a wildcard here
+	// would re-open exactly the hole the list exists to keep shut.
+	Host string `yaml:"host"`
+	// Dialect is what this host speaks: "responses" or "chat_completions".
+	//
+	// REQUIRED — there is deliberately no default. Guessing it wrong sends a
+	// well-formed request in the wrong shape, which most upstreams answer with
+	// a 404 or a confusing 400, and the operator has no way to tell that the
+	// proxy guessed. A missing value fails config validation at startup, where
+	// it is cheap to notice.
+	Dialect string `yaml:"dialect"`
+}
+
+// Bridge dialect vocabulary. These are the config-facing spellings; the
+// translator's own Format constants are an internal concern of the proxy.
+const (
+	BridgeDialectResponses       = "responses"
+	BridgeDialectChatCompletions = "chat_completions"
+)
+
+// Validate checks the bridge block. Called from Config.validate so a bad entry
+// stops the process at startup rather than at the first request that needs it.
+func (c ChatCompletionsBridgeConfig) Validate() error {
+	seen := make(map[string]struct{}, len(c.Upstreams))
+	for i, u := range c.Upstreams {
+		host := strings.ToLower(strings.TrimSpace(u.Host))
+		if host == "" {
+			return fmt.Errorf("chat_completions_bridge.upstreams[%d]: host is required", i)
+		}
+		if strings.ContainsAny(host, "*/ ") || strings.Contains(host, "://") {
+			return fmt.Errorf("chat_completions_bridge.upstreams[%d]: host %q must be a bare hostname "+
+				"(no scheme, no path, no wildcard)", i, u.Host)
+		}
+		if _, dup := seen[host]; dup {
+			return fmt.Errorf("chat_completions_bridge.upstreams[%d]: host %q is listed twice; "+
+				"two entries for one host would make the dialect ambiguous", i, u.Host)
+		}
+		seen[host] = struct{}{}
+		switch u.Dialect {
+		case BridgeDialectResponses, BridgeDialectChatCompletions:
+		case "":
+			return fmt.Errorf("chat_completions_bridge.upstreams[%d] (%s): dialect is required; "+
+				"set %q or %q — guessing it would send a well-shaped request in the wrong shape",
+				i, u.Host, BridgeDialectChatCompletions, BridgeDialectResponses)
+		default:
+			return fmt.Errorf("chat_completions_bridge.upstreams[%d] (%s): unknown dialect %q; "+
+				"expected %q or %q", i, u.Host, u.Dialect, BridgeDialectChatCompletions, BridgeDialectResponses)
+		}
+	}
+	return nil
 }
 
 // ClusterConfig configures cluster-node behavior (V3c). All fields are inert
@@ -428,6 +540,12 @@ func (c *Config) ResolvedConsoleURL() string {
 }
 
 func (c *Config) validate() error {
+	// Bridge upstreams are validated first: a bad entry there is a security
+	// question (where may an OAuth token be sent), and answering that at
+	// startup is much cheaper than at the first request that needs it.
+	if err := c.ChatCompletionsBridge.Validate(); err != nil {
+		return err
+	}
 	// Loopback-only is a Personal/Trial safety rail (the local proxy must not be
 	// network-reachable). A CLUSTER node, by design, IS network-reachable (clients
 	// + nginx connect to it) and is protected by VK-token auth + the internal

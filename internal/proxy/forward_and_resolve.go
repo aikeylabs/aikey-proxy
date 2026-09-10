@@ -271,20 +271,19 @@ func (p *Proxy) ResolveBindingCredential(
 				Message:    "OAuth binding has no supported provider persona for provider=" + upstreamProvider + " protocol_type=" + protocolType,
 			}
 		}
-		if reason := oauthUpstreamRejectsPath(oauthCode, r.URL.Path); reason != "" {
-			logger.Warn("oauth: upstream does not serve this endpoint",
-				"event.name", observability.EventProxyRequestDialectUnsupported,
-				"error.code", observability.ErrCodeOAuthResponsesOnly,
-				"error.message", reason,
-				"url.path", r.URL.Path,
-				"provider", upstreamProvider,
-				"protocol_type", protocolType,
-			)
+		// Bridge first, then the unchanged dialect gate. With the bridge off
+		// (the default) this is exactly the old refusal, wording included; with
+		// it on, a /chat/completions body is translated and the path rewritten
+		// to /responses, so the gate below passes. See chat_completions_bridge.go.
+		var refusal *dialectRefusal
+		r, refusal = p.bridgeOrRejectDialect(r, oauthCode, protocolType, "",
+			logger.With("provider", upstreamProvider, "protocol_type", protocolType))
+		if refusal != nil {
 			return nil, r, &apppipe.BindingResolveError{
-				StatusCode: oauthResponsesOnlyStatus,
-				ErrorType:  "invalid_request_error",
-				ErrorCode:  observability.ErrCodeOAuthResponsesOnly,
-				Message:    reason,
+				StatusCode: refusal.Status,
+				ErrorType:  refusal.ErrorType,
+				ErrorCode:  refusal.Code,
+				Message:    refusal.Message,
 			}
 		}
 		if reason := oauthUpstreamRejectsShape(oauthCode, r); reason != "" {
@@ -308,7 +307,7 @@ func (p *Proxy) ResolveBindingCredential(
 		// resolver — same source as the group route. Codex's chatgpt.com override +
 		// deferred model capture live in resolveOAuthUpstream; pinned by
 		// TestFence_OAuthBinding_OpenAICodexBaseURLOverride.
-		out.BaseURL, r = resolveOAuthUpstream(upstreamProvider, protocolType, "", r)
+		out.BaseURL, r = p.resolveOAuthUpstream(upstreamProvider, protocolType, "", r, logger)
 		oauthInject(r, cred, oauthCode)
 
 		identityTag := cred.Identity
@@ -1192,6 +1191,33 @@ func (p *Proxy) serveRoute(w http.ResponseWriter, r *http.Request, route *vkeys.
 					body = restoreMaskedResponseBody(r.Context(), body, logger)
 				}
 
+				// Chat Completions bridge (non-streaming leg). LAST of the
+				// response-body writers on purpose: restoreResponseModel and
+				// restoreMaskedResponseBody above were written against the
+				// upstream-native shape and are exercised against it, so the
+				// dialect boundary sits outside them — exactly as it does on the
+				// streaming leg, where the bridge wraps outside the placeholder
+				// restorer. No-op nil check when the bridge did not engage.
+				if bridged, tErr := translateBridgedResponse(r.Context(), body, logger); tErr != nil {
+					resp.StatusCode = http.StatusBadGateway
+					resp.Status = "502 Bad Gateway"
+					resp.Header.Del("Content-Length")
+					resp.Header.Del("Content-Encoding")
+					resp.Header.Del("Transfer-Encoding")
+					resp.Header.Set("Content-Type", "application/json")
+					errBody := []byte(`{"error":{"type":"server_error","code":"` + tErr.Code +
+						`","message":"` + jsonEscapeForError(tErr.Message) + `"}}`)
+					resp.Body = io.NopCloser(bytes.NewReader(errBody))
+					resp.ContentLength = int64(len(errBody))
+					// Record the event anyway: the upstream DID serve (and bill)
+					// this request, so a translation defect must not make the
+					// usage disappear from the ledger.
+					p.recordEvent(r, resp, startTime, route, bearerToken, streaming)
+					return nil
+				} else {
+					body = bridged
+				}
+
 				// Rebuffer with the FINAL body (post-translation if engaged,
 				// otherwise unchanged from upstream).
 				//
@@ -1357,7 +1383,16 @@ func (p *Proxy) serveRoute(w http.ResponseWriter, r *http.Request, route *vkeys.
 				// (mirrors the request side where audit sees the masked prompt);
 				// restored originals never flow toward collector/master. No-op
 				// pass-through (returns drained unchanged) without a mapping.
-				resp.Body = newSSEPlaceholderRestorer(drained, maskRestoreFromContext(r.Context()))
+				restored := newSSEPlaceholderRestorer(drained, maskRestoreFromContext(r.Context()))
+				// Chat Completions bridge (streaming leg) — the OUTERMOST
+				// wrapper, so every stage above it still reads the upstream's
+				// native Responses frames:
+				//   • the drainer's token extraction (usage / billing), and
+				//   • the placeholder restorer, which recognises
+				//     response.output_text.delta explicitly.
+				// Everything downstream of this line is Chat Completions.
+				// No-op pass-through when the bridge did not engage.
+				resp.Body = newSSEChatCompletionsBridge(r.Context(), restored, logger)
 			}
 			return nil
 		},

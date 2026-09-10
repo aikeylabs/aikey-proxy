@@ -1236,10 +1236,13 @@ func (p *Proxy) handlePathPrefixRoute(w http.ResponseWriter, r *http.Request, pr
 
 		// Handle OAuth credential injection if this is an OAuth route token.
 		if tokenRealKey == oauthSentinelKey && oauthAccountID != "" && p.broker != nil {
-			if reason := oauthUpstreamRejectsPath(canonicalCode, r.URL.Path); reason != "" {
+			// Bridge in front of the unchanged dialect gate (see
+			// chat_completions_bridge.go). Off by default ⇒ identical refusal.
+			var refusal *dialectRefusal
+			r, refusal = p.bridgeOrRejectDialect(r, canonicalCode, protocolType, tokenRoute.BaseURL, logger)
+			if refusal != nil {
 				p.errors.Add(1)
-				writeJSONError(w, oauthResponsesOnlyStatus, "invalid_request_error",
-					observability.ErrCodeOAuthResponsesOnly, reason)
+				writeJSONError(w, refusal.Status, refusal.ErrorType, refusal.Code, refusal.Message)
 				return
 			}
 			if reason := oauthUpstreamRejectsShape(canonicalCode, r); reason != "" {
@@ -1260,8 +1263,8 @@ func (p *Proxy) handlePathPrefixRoute(w http.ResponseWriter, r *http.Request, pr
 				writeJSONError(w, http.StatusServiceUnavailable, "server_error", "OAUTH_RESOLVE_FAILED", err.Error())
 				return
 			}
-			tokenRoute.BaseURL, r = resolveOAuthUpstream(
-				canonicalCode, protocolType, tokenRoute.BaseURL, r)
+			tokenRoute.BaseURL, r = p.resolveOAuthUpstream(
+				canonicalCode, protocolType, tokenRoute.BaseURL, r, logger)
 			oauthInject(r, cred, canonicalCode)
 		}
 
@@ -1362,19 +1365,29 @@ func (p *Proxy) handlePathPrefixRoute(w http.ResponseWriter, r *http.Request, pr
 				if r.URL.RawPath != "" {
 					r.URL.RawPath = strippedPath
 				}
-				if reason := oauthUpstreamRejectsPath(canonicalCode, r.URL.Path); reason != "" {
+				// Same bridge-then-gate order as every other OAuth lane. Probe
+				// traffic addresses /responses directly, so the bridge is inert
+				// here — wired anyway so a future probe that speaks Chat
+				// Completions cannot silently take a different path from
+				// production traffic.
+				var probeRefusal *dialectRefusal
+				r, probeRefusal = p.bridgeOrRejectDialect(r, canonicalCode, protocolType, "", logger)
+				if probeRefusal != nil {
 					p.errors.Add(1)
-					writeJSONError(w, oauthResponsesOnlyStatus, "invalid_request_error",
-						observability.ErrCodeOAuthResponsesOnly, reason)
+					writeJSONError(w, probeRefusal.Status, probeRefusal.ErrorType,
+						probeRefusal.Code, probeRefusal.Message)
 					return
 				}
+				// Body-shape half of the pre-dial gate. Runs AFTER the bridge on
+				// purpose: the bridge may have rewritten both the path and the
+				// body, and this guard judges what will actually be sent.
 				if reason := oauthUpstreamRejectsShape(canonicalCode, r); reason != "" {
 					p.errors.Add(1)
 					writeJSONError(w, oauthResponsesOnlyStatus, "invalid_request_error",
 						observability.ErrCodeOAuthCodexShapeUnsupported, reason)
 					return
 				}
-				oauthBase, resolvedReq := resolveOAuthUpstream(canonicalCode, protocolType, "", r)
+				oauthBase, resolvedReq := p.resolveOAuthUpstream(canonicalCode, protocolType, "", r, logger)
 				r = resolvedReq
 				oauthInject(r, cred, canonicalCode)
 

@@ -2051,6 +2051,22 @@ func (s *Supervisor) buildGeneration() (*generation, error) {
 	// never disagree about what this process is. See proxy.SetClusterNode and
 	// workflow/CI/bugfix/2026-09-02-集群节点代理是一个公网开放中继.md.
 	p.SetClusterNode(s.cfg.Cluster.Enabled)
+	// Dialect bridge (default off, empty allowlist). On, a client whose dialect
+	// differs from its credential's upstream gets its request translated in
+	// either direction instead of refused; the allowlist is also what permits an
+	// OAuth credential to reach any upstream beyond the compiled-in codex one.
+	// Wired from the single config block so every edition — personal, trial,
+	// production, cluster — reads the same switch; there is no per-edition
+	// default. See proxy/chat_completions_bridge.go.
+	//
+	// The config → proxy shape conversion lives here because the proxy package
+	// deliberately does not import internal/config: the supervisor is the wiring
+	// layer for every other proxy setting too (SetConsoleURL, SetClusterNode).
+	bridgeUpstreams := make([]proxy.BridgeUpstreamRule, 0, len(s.cfg.ChatCompletionsBridge.Upstreams))
+	for _, u := range s.cfg.ChatCompletionsBridge.Upstreams {
+		bridgeUpstreams = append(bridgeUpstreams, proxy.BridgeUpstreamRule{Host: u.Host, Dialect: u.Dialect})
+	}
+	p.SetChatCompletionsBridge(s.cfg.ChatCompletionsBridge.Enabled, bridgeUpstreams)
 	// SyncRail §5.4: let the 401 wording distinguish "you need to sign in" from
 	// "the assignment rail is unreachable so this pick may be misdirected".
 	p.SetRoutingRailHealth(func() (string, int64) { return s.railHealthFor("routing_override") })

@@ -154,7 +154,7 @@ func TestResolveOAuthUpstream_StripsV1ForCodex(t *testing.T) {
 	}
 	for _, c := range cases {
 		r := httptest.NewRequest("POST", c.inPath, strings.NewReader(`{"model":"gpt-5"}`))
-		base, out := resolveOAuthUpstream(c.code, "", c.existingBase, r)
+		base, out := (&Proxy{}).resolveOAuthUpstream(c.code, "", c.existingBase, r, quietLogger())
 		if base != c.wantBase {
 			t.Errorf("resolveOAuthUpstream(%q, %q): base = %q, want %q",
 				c.code, c.existingBase, base, c.wantBase)
@@ -174,7 +174,7 @@ func TestResolveOAuthUpstream_AnthropicTestOverrideWinsRuntimeDefault(t *testing
 	t.Setenv("AIKEY_PROXY_TEST_ANTHROPIC_BASE_URL", "http://mock.test:18080/anthropic")
 	r := httptest.NewRequest(http.MethodPost, "/v1/messages", strings.NewReader(`{"model":"claude-test"}`))
 
-	base, out := resolveOAuthUpstream("anthropic", "anthropic", "https://api.anthropic.com", r)
+	base, out := (&Proxy{}).resolveOAuthUpstream("anthropic", "anthropic", "https://api.anthropic.com", r, quietLogger())
 
 	if base != "http://mock.test:18080/anthropic" {
 		t.Fatalf("test override lost to delivered runtime default: base=%q", base)
@@ -188,7 +188,7 @@ func TestResolveOAuthUpstream_KimiTestOverrideWinsRuntimeDefault(t *testing.T) {
 	t.Setenv("AIKEY_PROXY_TEST_KIMI_BASE_URL", "http://127.0.0.1:18081/kimi")
 	r := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(`{"model":"kimi-test"}`))
 
-	base, out := resolveOAuthUpstream("kimi_code", "openai_compatible", "https://api.kimi.com/coding/v1", r)
+	base, out := (&Proxy{}).resolveOAuthUpstream("kimi_code", "openai_compatible", "https://api.kimi.com/coding/v1", r, quietLogger())
 
 	if base != "http://127.0.0.1:18081/kimi" {
 		t.Fatalf("Kimi test override lost to delivered runtime default: base=%q", base)
