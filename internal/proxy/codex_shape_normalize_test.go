@@ -94,7 +94,7 @@ func TestNormalizeCodexBody_RuleTable(t *testing.T) {
 }
 
 // Shapes the backend accepts must pass through byte-for-byte (B0, S02, S04,
-// S05, S12–S15, S18, S19) — a normalizer that re-serialises what it did not
+// S05, S12–S15, S18, S19) — a normalizer that re-serializes what it did not
 // change would silently reorder keys and defeat every "untouched" assertion.
 func TestNormalizeCodexBody_AcceptedShapesUntouched(t *testing.T) {
 	for _, in := range []string{

@@ -846,6 +846,12 @@ func (p *Proxy) serveRoute(w http.ResponseWriter, r *http.Request, route *vkeys.
 			// normalizeCodexRequest rewrote as X-Aikey-Normalized + one INFO line.
 			// No-op unless ctxKeyCodexNormalized was stashed on the request leg.
 			reportCodexNormalization(resp)
+			// Codex upstream re-labeling (2026-09-10, 拍板点 12): a 400 that means
+			// "this POOL cannot serve it" (measured: an unsupported model) becomes
+			// 422 so a relay fails over instead of handing the client a dead end.
+			// A genuine client-error 400 is forwarded byte for byte.
+			// spec: R-tokenhub-pool-fallback-7 池自身服务不了的请求 MUST NOT 以 400 出现
+			reclassifyCodexUpstream400(resp)
 
 			// N8c reactive fallback: if a pool account's upstream says it is
 			// broken (401) or its window is exhausted (rate-limit-signal 429),

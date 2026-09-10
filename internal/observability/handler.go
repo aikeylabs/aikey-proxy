@@ -188,6 +188,13 @@ const (
 	// so "why did this behave differently from api.openai.com" is answerable
 	// from the log. Rule table + evidence: proxy/codex_shape_normalize.go.
 	EventProxyCodexRequestNormalized = "proxy.codex.request_normalized"
+	// EventProxyCodexUpstreamReclassified (2026-09-10): the ChatGPT Codex
+	// backend answered 400 for something the POOL cannot serve (not something
+	// the client got wrong), and the proxy re-labeled the status so an
+	// external relay can fail over. Carries the matched rule id and the
+	// original status; an operator reading this line knows a channel is
+	// advertising a model its accounts cannot serve.
+	EventProxyCodexUpstreamReclassified = "proxy.codex.upstream_reclassified"
 	// Fence I13 runtime guard (2026-07-21). EventProxyRequestIdentityScrubbed:
 	// an outbound header carried one of the control-plane member-identity shapes
 	// enumerated in proxy/member_identity_guard.go (that file is the only place
@@ -509,6 +516,16 @@ const (
 	// the availability gap this exists to close). Rule table + evidence:
 	// proxy/codex_shape_normalize.go.
 	ErrCodeOAuthCodexShapeUnsupported = "OAUTH_CODEX_SHAPE_UNSUPPORTED"
+	// ErrCodeOAuthModelUnsupported (2026-09-10): the requested MODEL is not
+	// served by the ChatGPT Codex backend behind this OAuth credential — the
+	// upstream said so itself with a 400 ("The '<model>' model is not
+	// supported when using Codex with a ChatGPT account.", measured on the live
+	// pool 2026-09-10, spike cells M04s/M04n). It is returned as 422, not 400:
+	// a relay retries 422 and can serve the request from another channel that
+	// does carry the model, while 400 is outside every retry range and kills
+	// the fallback chain. Distinct from OAUTH_CODEX_SHAPE_UNSUPPORTED, which is
+	// about the request SHAPE and is decided before dialing.
+	ErrCodeOAuthModelUnsupported = "OAUTH_MODEL_UNSUPPORTED"
 	// ErrCodeAccountEgressProxy (§11.7, P7): the resolved oauth-group account pins
 	// a per-account egress proxy whose already-constructed dial path is currently
 	// unreachable. 503; the request is REFUSED rather than sent out the node's IP

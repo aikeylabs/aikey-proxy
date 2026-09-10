@@ -44,6 +44,13 @@ const (
 	// leg), read by reportCodexNormalization in ModifyResponse to expose them
 	// as X-Aikey-Normalized + one INFO line. Absent = nothing was rewritten.
 	ctxKeyCodexNormalized
+	// ctxKeyCodexUpstream marks a request the resolver has just pointed at the
+	// ChatGPT Codex backend (canonical openai, or a persona that simulates it).
+	// Read on the response leg by reclassifyCodexUpstream400, which may only
+	// judge a 400 body against Codex-derived rules when the 400 actually came
+	// from that backend. Set at the SAME single exit that normalizes the request
+	// shape, so a lane cannot pick up one behavior without the other.
+	ctxKeyCodexUpstream
 	// ctxKeyExtractedModel caches the body.model parsed by the FIRST
 	// extractModel call this request, so the 2-3 later calls (model allowlist
 	// check, inbound filter, usage stash) reuse it instead of re-reading +
@@ -350,7 +357,7 @@ func resolveOAuthUpstream(canonicalCode, protocolType, existingBase string, r *h
 		// check sees the upstream-shaped path.
 		// spec: R-tokenhub-pool-fallback-7.S1 非 Codex 形状的请求不得以 400 断掉兜底链
 		req = normalizeCodexRequest(req)
-		return codexUpstreamBaseURL(), req
+		return codexUpstreamBaseURL(), markCodexUpstream(req)
 	default:
 		// A configured test-only override is the final upstream for hermetic
 		// Anthropic E2Es, even when the member runtime carries the provider's
@@ -369,7 +376,7 @@ func resolveOAuthUpstream(canonicalCode, protocolType, existingBase string, r *h
 		// the canonical "openai" branch above normalized).
 		// spec: R-tokenhub-pool-fallback-7.S1 非 Codex 形状的请求不得以 400 断掉兜底链
 		if persona, ok := oauthInjectionProvider(canonicalCode, protocolType); ok && persona == "openai" {
-			r = normalizeCodexRequest(r)
+			r = markCodexUpstream(normalizeCodexRequest(r))
 		}
 		if testBase, ok := oauthTestBaseURL(canonicalCode, protocolType); ok {
 			return testBase, r
@@ -654,6 +661,12 @@ const (
 	// (`input`, `store`, `strip:<name>`). Field names only. Absent when the
 	// request was forwarded untouched. See proxy/codex_shape_normalize.go.
 	HeaderAikeyNormalized = "X-Aikey-Normalized"
+	// HeaderAikeyUpstreamStatus records the status the UPSTREAM actually
+	// returned when aikey re-labeled it (today: a Codex 400 the pool cannot
+	// serve, re-labeled 422 so a relay fails over). Absent when the status is
+	// the upstream's own. Response direction only — it never reaches an
+	// upstream (stripAikeyRequestHeaders removes every X-Aikey-* on the way out).
+	HeaderAikeyUpstreamStatus = "X-Aikey-Upstream-Status"
 )
 
 // stripAikeyRequestHeaders removes the ENTIRE X-Aikey-* namespace from an
@@ -740,11 +753,22 @@ func writeJSONErrorDetails(w http.ResponseWriter, statusCode int, errType, code,
 	// P1 error-origin: this component GENERATED the error → stamp origin + path.
 	setErrorOrigin(h, code)
 	w.WriteHeader(statusCode)
+	_, _ = w.Write(aikeyErrorEnvelope(errType, code, message, h.Get(HeaderAikeyErrorOrigin), details))
+}
+
+// aikeyErrorEnvelope builds the one AiKey error body shape. It exists as its own
+// function because there are now two producers: writeJSONErrorDetails (a locally
+// generated error, request leg) and reclassifyCodexUpstream400 (an upstream
+// status re-labeled on the response leg). Two hand-written encoders would drift
+// and a client would see two "AiKey" error shapes.
+//
+// origin (top-level) mirrors the header so a client that reads only the body
+// still learns who produced the error. json.Marshal keeps future detail values
+// correctly escaped instead of growing a second hand-written JSON encoder.
+func aikeyErrorEnvelope(errType, code, message, origin string, details map[string]any) []byte {
 	// 拍板 2026-08-18 #4: every aikey-GENERATED message carries the "AiKey: "
-	// prefix so a human reading the CLI output tells aikey's own errors from a
-	// provider's verbatim passthrough at a glance (the headers/origin field
-	// already give machines the same discriminator). Idempotent — messages
-	// already leading with "AiKey" are left alone.
+	// prefix so a human tells aikey's own errors from a provider passthrough at
+	// a glance. Idempotent — messages already leading with "AiKey" are left alone.
 	if !strings.HasPrefix(message, "AiKey") {
 		message = "AiKey: " + message
 	}
@@ -752,12 +776,6 @@ func writeJSONErrorDetails(w http.ResponseWriter, statusCode int, errType, code,
 	for key, value := range details {
 		errObj[key] = value
 	}
-	// origin (top-level) mirrors the header so a client that reads only the body
-	// still learns who produced the error. json.Marshal keeps future detail values
-	// correctly escaped instead of growing a second hand-written JSON encoder.
-	body, _ := json.Marshal(map[string]any{
-		"error":  errObj,
-		"origin": h.Get(HeaderAikeyErrorOrigin),
-	})
-	_, _ = w.Write(body)
+	body, _ := json.Marshal(map[string]any{"error": errObj, "origin": origin})
+	return body
 }

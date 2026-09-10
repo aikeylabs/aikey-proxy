@@ -19,7 +19,7 @@
 //	| `input` is a JSON string  | Input must be a list           | wrap as one user message (lossless)      | S01, S20, S21  |
 //	| `store` is not false      | Store must be set to false     | force false (the backend never stores)   | S08, S09       |
 //	| max_output_tokens /       | Unsupported parameter: <name>  | strip and RECORD (a fallback to another  | S10, S11,      |
-//	| temperature / truncation /|                                | Codex-backed relay would not honour them | S16, S17       |
+//	| temperature / truncation /|                                | Codex-backed relay would not honor them | S16, S17       |
 //	| metadata present          |                                | either; refusing only drops the traffic) |                |
 //
 // Deliberately NOT rewritten: `stream` (the backend requires stream:true; the
@@ -93,7 +93,10 @@ func normalizeCodexRequest(r *http.Request) *http.Request {
 
 // normalizeCodexBody applies the rule table to one JSON object body. A body
 // that is not a JSON object (or needs no change) is returned as-is with no
-// changes, so the caller never re-serialises what it did not touch.
+// changes, so the caller never re-serializes what it did not touch.
+// nolint:gocritic // unnamedResult: naming these collides with the function's
+// own `changes` local (tried 2026-09-10, build broke: "changes redeclared").
+// The doc comment above already says what both results are.
 func normalizeCodexBody(raw []byte) ([]byte, []string) {
 	var fields map[string]json.RawMessage
 	if err := json.Unmarshal(raw, &fields); err != nil || fields == nil {
