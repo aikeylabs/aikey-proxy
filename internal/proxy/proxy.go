@@ -120,11 +120,20 @@ type Proxy struct {
 	// cost (surfaced in the UI): while on, all OAuth accounts share this node's
 	// exit IP → single-IP-per-account anti-ban is temporarily off for this node.
 	oauthEgressOverride atomic.Bool
-	activeReader        ActiveKeyReader       // non-nil when vault implements ActiveKeyReader
-	appVault            apppipe.VaultReader   // non-nil when vault implements the App pipeline read surface (Phase 4)
-	probeVault          probepipe.VaultReader // non-nil when vault implements the Probe pipeline read surface (mode C, SPEC 2026-05-23)
-	broker              OAuthBroker           // OAuth credential provider (nil = OAuth not available)
-	vault               VaultGetter
+	// bridge holds the dialect-reconciliation settings (whether translation is
+	// permitted, and which upstream hosts an OAuth credential may reach with
+	// which dialect). See chat_completions_bridge.go.
+	//
+	// atomic.Pointer for the same reason oauthEgressOverride is an atomic.Bool:
+	// config is re-read on reload, and the whole rule set has to change at once
+	// — a half-swapped map would let a request read a host allowed under the
+	// new config with the dialect from the old one.
+	bridge       atomic.Pointer[bridgeRuntime]
+	activeReader ActiveKeyReader       // non-nil when vault implements ActiveKeyReader
+	appVault     apppipe.VaultReader   // non-nil when vault implements the App pipeline read surface (Phase 4)
+	probeVault   probepipe.VaultReader // non-nil when vault implements the Probe pipeline read surface (mode C, SPEC 2026-05-23)
+	broker       OAuthBroker           // OAuth credential provider (nil = OAuth not available)
+	vault        VaultGetter
 	// groupKey exposes the vault derived key for oauth-group material decryption
 	// (N8). nil when the injected vault doesn't implement DerivedKey() (tests) →
 	// group routing degrades to GROUP_KEY_UNAVAILABLE rather than panicking.

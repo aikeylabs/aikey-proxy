@@ -22,10 +22,24 @@
 //	| temperature / truncation /|                                | Codex-backed relay would not honor them | S16, S17       |
 //	| metadata present          |                                | either; refusing only drops the traffic) |                |
 //
-// Deliberately NOT rewritten: `stream` (the backend requires stream:true; the
-// non-stream client contract needs the SSE→JSON reassembly of tasks.md 8⑤,
-// which is deferred — until then a non-stream request keeps the backend's own
-// 400) and `instructions` (absent/empty is accepted upstream, spike S04/S05).
+// Deliberately NOT rewritten here: `stream` and `instructions`.
+//
+// `instructions` because absent/empty is accepted upstream (spike S04/S05).
+//
+// `stream` because the fix belongs one layer out, not in this table. The
+// backend requires stream:true, but honouring that for a client that asked for
+// one whole body is only half a rewrite: the RESPONSE has to be collapsed back
+// too, and this function cannot do that — it only ever sees the request. So the
+// dialect bridge owns both halves (chat_completions_bridge_destream.go), which
+// keeps the pair of rewrites in one place where they cannot drift apart.
+//
+// oauthUpstreamRejectsShape below therefore still refuses a non-streaming
+// request, and that is not dead code — it is the SWITCHED-OFF behaviour. With
+// the bridge enabled, both a bridged Chat Completions client and a native
+// /responses one arrive here already rewritten to stream:true and pass; with it
+// disabled nothing rewrites them and this refusal is what the caller gets,
+// unchanged since 2026-09-10. That is bridge invariant 1: a deployment that
+// never opted in behaves exactly as it did, refusal wording included.
 //
 // Every rewrite is visible: the field names travel to the client in the
 // X-Aikey-Normalized response header and to the operator in one INFO line per

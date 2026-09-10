@@ -1,0 +1,269 @@
+package proxy
+
+import (
+	"bufio"
+	"bytes"
+	"context"
+	"encoding/json"
+	"io"
+	"log/slog"
+	"net/http"
+	"strings"
+
+	"github.com/AiKeyLabs/aikey-proxy/internal/observability"
+	"github.com/tidwall/gjson"
+)
+
+// chat_completions_bridge_destream.go — answering a non-streaming client from
+// an upstream that only streams.
+//
+// # The problem
+//
+// The Codex backend serves ONLY stream:true. This is measured, not assumed:
+// the 2026-09-10 shape matrix (workflow/CI/research/codex-shape-matrix-2026-09,
+// rows results/20260910T021253Z.tsv) sent 25 shapes through a live account and
+// cells S03, S06 and S07 — stream:false, and stream absent — all came back
+// 400 "Stream must be set to true".
+//
+// That collides with the whole point of the dialect bridge. The bridge exists
+// to let Chat Completions clients use a ChatGPT OAuth credential, and the most
+// common call in that entire ecosystem is the non-streaming one:
+//
+//	client.chat.completions.create(model=..., messages=[...])   # no stream=True
+//
+// Worse, Go's `json:"stream,omitempty"` means such a request translates to a
+// Responses body with NO stream field at all — cell S07, the same 400.
+//
+// # What this does
+//
+// The request leg sends stream:true upstream regardless (translateRequestLeg,
+// keyed on the destination being Codex). This file is the other half: it reads
+// the whole event stream, takes the `response` object out of the terminal
+// `response.completed` event, and translates that one object back to a
+// non-streaming Chat Completions body. The client is answered in exactly the
+// shape it asked for and never learns the hop streamed.
+//
+// No delta concatenation is involved, and that is not an optimisation: the
+// `response.completed` event carries the FINAL assembled `output` and `usage`,
+// so rebuilding the text from response.output_text.delta frames would be a
+// second, weaker implementation of something the backend already sent us.
+//
+// # Why this is a lazy reader rather than an eager read in ModifyResponse
+//
+// Reading the body eagerly would let us set a proper status code when a stream
+// ends without its completed event. It would also move WHEN the body is
+// consumed relative to the stream drainer, which is what extracts usage and
+// bills the request. Bridge invariant 3 says a defect here may corrupt what a
+// client reads but must never change what is billed, and that property holds by
+// construction only while this stays a pass-through reader wrapped outside the
+// drainer. So an interrupted stream is reported in the body (and loudly in the
+// log) rather than in the status line — the cheaper of the two failures.
+
+// deStreamCompletedEvent is the terminal event whose payload carries the
+// finished response. Codex emits it as the last event before the stream closes.
+const (
+	deStreamCompletedEvent = "response.completed"
+	// deStreamDeltaEvent carries the text a streaming client actually renders.
+	deStreamDeltaEvent = "response.output_text.delta"
+)
+
+// newBridgedStreamingBody is the ONE client-facing wrapper for a bridged
+// streaming upstream: it picks between frame-granular translation (the client
+// asked to stream) and de-streaming (it did not), and adjusts resp's headers
+// when the wire form changes underneath them.
+//
+// Returns body untouched when the bridge did not engage.
+func newBridgedStreamingBody(
+	ctx context.Context, resp *http.Response, body io.ReadCloser, logger *slog.Logger,
+) io.ReadCloser {
+	st := bridgeFromContext(ctx)
+	contentType := resp.Header.Get("Content-Type")
+	if st == nil || !st.deStream {
+		return newSSEChatCompletionsBridge(ctx, body, contentType, logger)
+	}
+	// Not an event stream: an upstream error envelope, or a relay that ignored
+	// stream:true. Either way there are no frames to collapse, and consuming it
+	// as if there were would hand the client zero bytes — the same defect the
+	// sibling wrapper documents. Forward it verbatim, headers untouched.
+	if !strings.Contains(strings.ToLower(contentType), "text/event-stream") {
+		if logger != nil {
+			logger.Warn("dialect bridge: de-streamed request did not get an event stream; forwarding it untranslated",
+				"event.name", observability.EventProxyBridgeTranslateFailed,
+				"content_type", contentType,
+			)
+		}
+		return body
+	}
+	// The wire form changes here, so the headers describing it have to change
+	// with it. Content-Length would be the UPSTREAM's count for a body we are
+	// about to replace, and its length is not knowable until the stream ends.
+	resp.Header.Set("Content-Type", "application/json")
+	resp.Header.Del("Content-Length")
+	resp.Header.Del("Transfer-Encoding")
+	resp.ContentLength = -1
+	return &sseDeStreamer{upstream: body, ctx: ctx, logger: logger}
+}
+
+// sseDeStreamer collapses a Responses event stream into one Chat Completions
+// body on first read.
+type sseDeStreamer struct {
+	upstream io.ReadCloser
+	ctx      context.Context
+	logger   *slog.Logger
+
+	out  bytes.Buffer
+	done bool
+	err  error
+}
+
+func (d *sseDeStreamer) Read(p []byte) (int, error) {
+	if !d.done {
+		d.collapse()
+		d.done = true
+	}
+	if d.out.Len() > 0 {
+		return d.out.Read(p)
+	}
+	if d.err != nil {
+		return 0, d.err
+	}
+	return 0, io.EOF
+}
+
+func (d *sseDeStreamer) Close() error { return d.upstream.Close() }
+
+// collapse drains the stream and fills out with the client-facing body.
+func (d *sseDeStreamer) collapse() {
+	completed, deltaText, readErr := readCompletedResponse(d.upstream)
+	completed = fillOutputFromDeltas(completed, deltaText)
+
+	if completed == nil {
+		// The stream ended without its terminal event: upstream cut off, or a
+		// mid-stream error frame. Say so in the body — a client that gets 200
+		// and an unparseable completion has no way to tell this from a bug in
+		// its own code.
+		reason := "the upstream event stream ended without a " + deStreamCompletedEvent + " event"
+		if readErr != nil {
+			reason += " (" + readErr.Error() + ")"
+		}
+		if d.logger != nil {
+			d.logger.Error("dialect bridge: de-stream found no completed event",
+				"event.name", observability.EventProxyBridgeTranslateFailed,
+				"error.code", "BRIDGE_DESTREAM_INCOMPLETE",
+				"error.message", reason,
+			)
+		}
+		d.out.Write([]byte(`{"error":{"type":"server_error","code":"BRIDGE_DESTREAM_INCOMPLETE","message":"` +
+			jsonEscapeForError("AiKey could not assemble a non-streaming answer: "+reason+
+				". The request was served and billed upstream; retry, or send stream:true to receive the "+
+				"answer as it is produced.") + `"}}`))
+		return
+	}
+
+	// Same reversal the non-streaming leg performs, on the same pair — the
+	// terminal event's `response` object IS a complete Responses response.
+	body, tErr := translateBridgedResponse(d.ctx, completed, d.logger)
+	if tErr != nil {
+		d.out.Write([]byte(`{"error":{"type":"server_error","code":"` + tErr.Code +
+			`","message":"` + jsonEscapeForError(tErr.Message) + `"}}`))
+		return
+	}
+	d.out.Write(body)
+	if d.logger != nil {
+		d.logger.Info("dialect bridge: de-streamed upstream answer for a non-streaming client",
+			"event.name", observability.EventProxyBridgeEngaged,
+			"bytes", len(body),
+		)
+	}
+}
+
+// readCompletedResponse scans an SSE stream and returns the `response` object
+// from the last completed event (or nil) together with the text assembled from
+// the delta frames.
+//
+// Frames are accumulated rather than matched line-by-line because SSE permits a
+// payload to span several `data:` lines; a line-wise reader silently truncates
+// exactly the large responses this is most useful for.
+func readCompletedResponse(r io.Reader) ([]byte, string, error) {
+	var found []byte
+	var deltas strings.Builder
+	var data bytes.Buffer
+
+	flush := func() {
+		if data.Len() == 0 {
+			return
+		}
+		payload := data.Bytes()
+		switch gjson.GetBytes(payload, "type").String() {
+		case deStreamCompletedEvent:
+			if resp := gjson.GetBytes(payload, "response"); resp.Exists() {
+				found = []byte(resp.Raw)
+			}
+		case deStreamDeltaEvent:
+			deltas.WriteString(gjson.GetBytes(payload, "delta").String())
+		}
+		data.Reset()
+	}
+
+	sc := bufio.NewScanner(r)
+	// Responses payloads carry the whole assembled answer, so the default 64KB
+	// line cap is far too small: a long completion arrives as one `data:` line.
+	sc.Buffer(make([]byte, 0, 64*1024), 16*1024*1024)
+	for sc.Scan() {
+		line := strings.TrimRight(sc.Text(), "\r")
+		if line == "" {
+			flush()
+			continue
+		}
+		if v, ok := strings.CutPrefix(line, "data:"); ok {
+			data.WriteString(strings.TrimPrefix(v, " "))
+		}
+	}
+	flush() // a final frame with no terminating blank line is still a frame
+	return found, deltas.String(), sc.Err()
+}
+
+// fillOutputFromDeltas puts the streamed text into the envelope when the
+// envelope did not carry it.
+//
+// Why the deltas are the authority here, not a fallback bolted on: a STREAMING
+// client's answer is the concatenation of the delta frames — that is what the
+// text a user sees has always been. `response.completed` carrying a finished
+// `output` array is a convenience some upstreams offer and others do not, so
+// reading only the envelope makes the non-streaming client's answer depend on a
+// property of the upstream that the streaming client never depended on. Two
+// clients asking the same question of the same backend would then get different
+// answers, one of them empty.
+//
+// Found by the E2E, not by a unit test: the resident codex fixture emits a
+// completed event with usage and no output, so the de-streamed reply came back
+// well-formed, correctly billed, and with an empty string where the model's
+// answer should have been.
+//
+// No-op when the envelope already has text, so an upstream that sends a full
+// output array keeps ITS structure — tool calls, refusals and multi-part
+// content included, none of which a flat delta string can reconstruct.
+func fillOutputFromDeltas(completed []byte, deltaText string) []byte {
+	if completed == nil || deltaText == "" {
+		return completed
+	}
+	if gjson.GetBytes(completed, `output.#(type=="message")#|0`).Exists() ||
+		gjson.GetBytes(completed, "output_text").Exists() {
+		return completed
+	}
+	var envelope map[string]json.RawMessage
+	if err := json.Unmarshal(completed, &envelope); err != nil || envelope == nil {
+		return completed
+	}
+	text, err := json.Marshal(deltaText)
+	if err != nil {
+		return completed
+	}
+	envelope["output"] = json.RawMessage(`[{"type":"message","role":"assistant","content":[{"type":"output_text","text":` +
+		string(text) + `}]}]`)
+	merged, err := json.Marshal(envelope)
+	if err != nil {
+		return completed
+	}
+	return merged
+}

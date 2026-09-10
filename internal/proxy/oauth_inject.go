@@ -337,12 +337,38 @@ func setIfAbsent(req *http.Request, key, value string) {
 	}
 }
 
-// setRequestBody atomically replaces req.Body AND req.ContentLength,
-// guaranteeing they stay in sync. This is critical: a mismatch between
-// Body and ContentLength causes upstream to read partial/corrupt data.
+// setRequestBody atomically replaces req.Body, req.ContentLength AND
+// req.GetBody, guaranteeing all three stay in sync. This is the ONE place a
+// request body is swapped; every mutation site routes through it.
+//
+// Body + ContentLength: a mismatch makes the upstream read partial/corrupt data.
+//
+// 🔴 GetBody is the third one and the reason this became a chokepoint
+// (2026-09-10). net/http replays GetBody when it retries — an HTTP/2 GOAWAY or
+// REFUSED_STREAM, which the group lane deliberately makes retryable
+// (group_serve.go, bugfix 2026-09-03). GetBody there points at the ORIGINAL
+// buffered request. So any site that rewrote the body and left GetBody alone
+// was silently arranging for the retry to send the PRE-rewrite bytes:
+//
+//   - the compliance filter's mask write-back → the retry carries the
+//     UNMASKED prompt to the LLM upstream, i.e. a transport-level retry
+//     defeats DLP;
+//   - stream_options.include_usage injection → the retry reports no usage, so
+//     the request is served and not billed;
+//   - model mapping → the retry asks for the model the client named rather
+//     than the one the route maps it to.
+//
+// None of those surface as an error anywhere. Keeping the three in one function
+// is what makes "I rewrote the body" and "the retry sends what I wrote" the
+// same statement.
+//
+// Fence: TestSetRequestBody_GetBodyReplaysTheNewBytes.
 func setRequestBody(req *http.Request, bodyBytes []byte) {
 	req.Body = io.NopCloser(bytes.NewReader(bodyBytes))
 	req.ContentLength = int64(len(bodyBytes))
+	req.GetBody = func() (io.ReadCloser, error) {
+		return io.NopCloser(bytes.NewReader(bodyBytes)), nil
+	}
 }
 
 // injectMetadataUserIDIfAbsent reads the request body JSON and injects

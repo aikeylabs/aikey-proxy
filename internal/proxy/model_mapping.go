@@ -230,8 +230,11 @@ func (p *Proxy) applyModelMappingToRequest(w http.ResponseWriter, r *http.Reques
 	}
 
 	if res.NewBody != nil {
-		r.Body = io.NopCloser(bytes.NewReader(res.NewBody))
-		r.ContentLength = int64(len(res.NewBody))
+		// Through the chokepoint: it also refreshes GetBody, without which an
+		// HTTP/2 retry replays the ORIGINAL request and asks the upstream for
+		// the model the CLIENT named rather than the one this route maps it to.
+		// See setRequestBody (oauth_inject.go).
+		setRequestBody(r, res.NewBody)
 		r.Header.Set("Content-Length", itoaInt64(int64(len(res.NewBody))))
 		// Stash the client's ORIGINAL model (response restoration, D-5) and the
 		// EFFECTIVE upstream model (audit 双口径 / pricing, I2). *r mutation via

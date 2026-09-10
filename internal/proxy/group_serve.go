@@ -384,15 +384,26 @@ func (p *Proxy) serveGroupAttempt(
 		// Without this, a /chat/completions client's path got appended to
 		// chatgpt.com/backend-api/codex and ChatGPT's edge answered with a
 		// misleading "invalid x-api-key". Fail fast with the real reason.
-		if reason := oauthUpstreamRejectsPath(oauthCode, r.URL.Path); reason != "" {
-			logger.Warn("group route: OAuth upstream does not serve this endpoint",
-				"event.name", observability.EventProxyRequestDialectUnsupported,
-				"error.code", observability.ErrCodeOAuthResponsesOnly,
-				"error.message", reason,
-				"url.path", r.URL.Path,
-			)
-			writeJSONError(w, oauthResponsesOnlyStatus, "invalid_request_error",
-				observability.ErrCodeOAuthResponsesOnly, reason)
+		//
+		// The Chat Completions bridge runs in front of that gate and may
+		// rewrite the request to /responses first; with the bridge off (the
+		// default) the refusal below is byte-identical to the pre-bridge one.
+		// See chat_completions_bridge.go.
+		//
+		// Re-running per attempt is correct, not wasteful: the failover loop
+		// re-opens the ORIGINAL buffered body for each attempt, so each attempt
+		// must translate it again.
+		// The bridge needs the DESTINATION to know what dialect it speaks, so
+		// the account's resolved base is computed here rather than further down
+		// where it used to be. Same value, same precedence — only earlier.
+		resolvedBase := res.BaseURL
+		if strings.TrimSpace(resolvedBase) == "" {
+			resolvedBase = rc.BaseURL
+		}
+		var refusal *dialectRefusal
+		r, refusal = p.bridgeOrRejectDialect(r, oauthCode, protocolType, resolvedBase, logger)
+		if refusal != nil {
+			writeJSONError(w, refusal.Status, refusal.ErrorType, refusal.Code, refusal.Message)
 			return groupAttemptResult{done: true}
 		}
 		// Shape half of the same gate (2026-09-10 止血): a non-streaming body is
@@ -440,11 +451,7 @@ func (p *Proxy) serveGroupAttempt(
 				"Mock Provider account has no runtime base URL")
 			return groupAttemptResult{done: true}
 		}
-		resolvedBase := res.BaseURL
-		if strings.TrimSpace(resolvedBase) == "" {
-			resolvedBase = rc.BaseURL
-		}
-		rc.BaseURL, r = resolveOAuthUpstream(canonicalCode, protocolType, resolvedBase, r)
+		rc.BaseURL, r = p.resolveOAuthUpstream(canonicalCode, protocolType, resolvedBase, r, logger)
 		oauthInject(r, res.OAuth, oauthCode)
 		// Stash the window cap so ModifyResponse can pre-cut this account when the
 		// upstream's unified-utilization crosses it (N10 防封).
