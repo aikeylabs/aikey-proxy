@@ -22,7 +22,7 @@ import (
 //
 // So this is not a field rename per frame: it is a small state machine that
 // (a) remembers the response id / model / tool indices that Chat Completions
-// repeats on every chunk but Responses states once, (b) synthesises the two
+// repeats on every chunk but Responses states once, (b) synthesizes the two
 // frames Chat Completions requires and Responses never sends (the opening
 // role delta and the closing finish_reason chunk), and (c) drops the events
 // that have no counterpart rather than inventing one.
@@ -46,7 +46,7 @@ import (
 // streamScratch is this pair's slice of translator.StreamState.Extra.
 //
 // It lives in Extra rather than as new StreamState fields because StreamState
-// is shared by every pair, and its documented shape is Anthropic-flavoured
+// is shared by every pair, and its documented shape is Anthropic-flavored
 // (see its ToolCallsAccum comment). Growing the shared struct for one pair's
 // bookkeeping is how a "typed state" contract turns back into a bag of
 // loosely-related fields.

@@ -89,7 +89,7 @@ type Config struct {
 	// (chatgpt.com/backend-api/codex) has exactly one route, /responses.
 	//
 	// Absent / Enabled=false is the default and reproduces the pre-bridge
-	// behaviour BYTE FOR BYTE: such a request is refused with the explicit
+	// behavior BYTE FOR BYTE: such a request is refused with the explicit
 	// OAUTH_RESPONSES_ONLY error, exactly as it has been since 2026-07-13.
 	// Nothing about the /responses path changes in either state.
 	//
@@ -131,7 +131,7 @@ type ChatCompletionsBridgeConfig struct {
 	//
 	// # Why the default is empty, and what empty means
 	//
-	// Empty is the shipped default and reproduces today's behaviour exactly:
+	// Empty is the shipped default and reproduces today's behavior exactly:
 	// an openai OAuth credential can reach ONE destination,
 	// chatgpt.com/backend-api/codex, which is compiled in. That hardcoding is
 	// not an implementation shortcut — it is a security property. An OAuth

@@ -25,7 +25,7 @@
 //
 // # Invariants
 //
-//  1. With the bridge disabled (the default) behaviour is byte-for-byte what it
+//  1. With the bridge disabled (the default) behavior is byte-for-byte what it
 //     was before this file existed, refusal wording included.
 //  2. An OAuth credential can only reach the compiled-in codex upstream unless
 //     the operator enumerated another host. That hardcoding is a security
@@ -103,7 +103,7 @@ func newBridgeRuntime(enabled bool, rules []BridgeUpstreamRule) *bridgeRuntime {
 // SetChatCompletionsBridge injects the operator's bridge settings.
 //
 // Disabled with no upstreams — the shipped default — reproduces the pre-bridge
-// behaviour exactly. Safe to call on a live proxy: readers take the pointer.
+// behavior exactly. Safe to call on a live proxy: readers take the pointer.
 func (p *Proxy) SetChatCompletionsBridge(enabled bool, upstreams []BridgeUpstreamRule) {
 	p.bridge.Store(newBridgeRuntime(enabled, upstreams))
 }
@@ -220,6 +220,9 @@ func rewriteDialectPath(path string, to translator.Format) string {
 		return prefix + responsesSuffix
 	case translator.FormatOpenAI:
 		return prefix + chatCompletionsSuffix
+	case translator.FormatAnthropic, translator.FormatGemini, translator.FormatBedrock:
+		// Not an OpenAI-family chat surface: the bridge never rewrites to these.
+		return path
 	default:
 		return path
 	}
@@ -336,7 +339,7 @@ func (p *Proxy) bridgeOrRejectDialect(
 	}
 
 	if !rt.enabled {
-		reason := dialectMismatchReason(inbound, outbound, r.URL.Path)
+		reason := dialectMismatchReason(outbound, r.URL.Path)
 		if logger != nil {
 			logger.Warn("oauth upstream does not serve this endpoint",
 				"event.name", observability.EventProxyRequestDialectUnsupported,
@@ -398,7 +401,7 @@ func (p *Proxy) bridgeOrRejectDialect(
 //
 // Returns the request unchanged — never a refusal — when this does not apply.
 // The pre-dial gate downstream still refuses the un-rewritten case, which is
-// what keeps the switched-off behaviour identical.
+// what keeps the switched-off behavior identical.
 func (p *Proxy) deStreamSameDialect(
 	r *http.Request, dialect translator.Format, rt *bridgeRuntime, base string, logger *slog.Logger,
 ) (*http.Request, *dialectRefusal) {
@@ -457,7 +460,7 @@ func (p *Proxy) deStreamSameDialect(
 // is left exactly as it was: it is the message users have been acting on since
 // 2026-07-13, and its remedy ("use a Responses-API client such as codex") is
 // still the right one when the bridge is off.
-func dialectMismatchReason(inbound, outbound translator.Format, path string) string {
+func dialectMismatchReason(outbound translator.Format, path string) string {
 	if outbound == translator.FormatOpenAIResponses {
 		return oauthUpstreamRejectsPath("openai", path)
 	}

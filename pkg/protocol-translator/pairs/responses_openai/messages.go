@@ -164,7 +164,7 @@ func convertInputItems(items []gjson.Result) ([]chatMessage, *translator.Transla
 				continue
 			}
 			// developer is the Responses spelling of an instruction turn;
-			// system is what a Chat Completions upstream recognises.
+			// system is what a Chat Completions upstream recognizes.
 			if role == "developer" {
 				role = "system"
 			}
@@ -277,8 +277,9 @@ func convertTools(tools gjson.Result) ([]chatTool, *translator.TranslateError) {
 	if !tools.Exists() || !tools.IsArray() || len(tools.Array()) == 0 {
 		return nil, nil
 	}
-	var out []chatTool
-	for _, t := range tools.Array() {
+	arr := tools.Array()
+	out := make([]chatTool, 0, len(arr))
+	for _, t := range arr {
 		typ := t.Get("type").String()
 		if typ != "function" && typ != "" {
 			// web_search / file_search / computer_use are server-side tools the

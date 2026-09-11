@@ -433,9 +433,9 @@ func TestShippedDefaultConfigsActuallyLoad(t *testing.T) {
 			if cfg.ChatCompletionsBridge.Enabled {
 				t.Error("the shipped default enables the dialect bridge; it must be opt-in")
 			}
-			// And it must never arrive pre-authorising an OAuth destination.
+			// And it must never arrive pre-authorizing an OAuth destination.
 			if len(cfg.ChatCompletionsBridge.Upstreams) != 0 {
-				t.Errorf("the shipped default pre-authorises %d OAuth upstream(s); the allowlist "+
+				t.Errorf("the shipped default pre-authorizes %d OAuth upstream(s); the allowlist "+
 					"must start empty so only the compiled-in destination is reachable",
 					len(cfg.ChatCompletionsBridge.Upstreams))
 			}

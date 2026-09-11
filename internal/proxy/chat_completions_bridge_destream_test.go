@@ -115,7 +115,7 @@ func TestDeStream_IsKeyedOnCodexNotOnTheResponsesDialect(t *testing.T) {
 
 // ── response leg ────────────────────────────────────────────────────────────
 
-func deStreamedBody(t *testing.T, sse string) (*http.Response, []byte) {
+func deStreamedBody(t *testing.T, sse string) (http.Header, []byte) {
 	t.Helper()
 	r := armBridgeDeStreamed(
 		bridgeRequest(t, "/v1/chat/completions", nonStreamChatBody),
@@ -128,7 +128,7 @@ func deStreamedBody(t *testing.T, sse string) (*http.Response, []byte) {
 	if err != nil {
 		t.Fatalf("reading the de-streamed body: %v", err)
 	}
-	return resp, out
+	return resp.Header, out
 }
 
 const completedSSE = "event: response.created\n" +
@@ -142,15 +142,15 @@ const completedSSE = "event: response.created\n" +
 	"data: [DONE]\n\n"
 
 func TestDeStream_StreamBecomesOneChatCompletionsBody(t *testing.T) {
-	resp, out := deStreamedBody(t, completedSSE)
+	hdr, out := deStreamedBody(t, completedSSE)
 
-	if got := resp.Header.Get("Content-Type"); got != "application/json" {
+	if got := hdr.Get("Content-Type"); got != "application/json" {
 		t.Errorf("content-type = %q; a non-streaming client must not be told this is an event stream", got)
 	}
 	// A stale Content-Length is not cosmetic: ReverseProxy copies the header
 	// map verbatim, so it would advertise the upstream's byte count for a body
 	// we just replaced.
-	if got := resp.Header.Get("Content-Length"); got != "" {
+	if got := hdr.Get("Content-Length"); got != "" {
 		t.Errorf("stale Content-Length %q survived the rewrite", got)
 	}
 	if got := gjson.GetBytes(out, "object").String(); got != "chat.completion" {

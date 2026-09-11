@@ -26,7 +26,7 @@
 //     it is a DIFFERENT conversation: the model sees only the current turn.
 //     The request still succeeds and still returns prose, so nothing surfaces
 //     the truncation. It is refused here for exactly that reason.
-//   - `store`, `include` and `truncation` are likewise server-side behaviours
+//   - `store`, `include` and `truncation` are likewise server-side behaviors
 //     with no client-side equivalent.
 //
 // The forward direction has no equivalent hazard, because Chat Completions
@@ -36,7 +36,7 @@
 //
 // Chat Completions streams one frame type; Responses streams a typed lifecycle
 // (created → item added → content part added → deltas → done → completed).
-// Going this way means SYNTHESISING events the source never sent, which is why
+// Going this way means SYNTHESIZING events the source never sent, which is why
 // the stream transform is a state machine rather than a per-frame rewrite: the
 // opening lifecycle can only be emitted once the first chunk reveals the id and
 // model, and the closing `response.completed` has to carry the fully

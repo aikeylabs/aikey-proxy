@@ -44,7 +44,7 @@ const (
 )
 
 // TestStream_TextLifecycleOrder pins the lifecycle this direction has to
-// SYNTHESISE. Responses deltas are addressed to an item and a content part that
+// SYNTHESIZE. Responses deltas are addressed to an item and a content part that
 // must have been announced first; a client that receives a delta for an item it
 // was never told about treats the stream as malformed.
 func TestStream_TextLifecycleOrder(t *testing.T) {

@@ -146,7 +146,7 @@ func ConvertRequest(ctx context.Context, model string, body []byte, stream bool)
 }
 
 // rejectStatefulAndUnmappable refuses the Responses fields that a Chat
-// Completions upstream cannot honour.
+// Completions upstream cannot honor.
 //
 // The list is short and every entry earns its place by changing what comes
 // back, invisibly:

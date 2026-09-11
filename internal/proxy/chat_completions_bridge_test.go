@@ -41,7 +41,7 @@ func relayRules() []BridgeUpstreamRule {
 	return []BridgeUpstreamRule{{Host: relayHost, Dialect: "chat_completions"}}
 }
 
-// ── invariant 1: off is the old behaviour, byte for byte ────────────────────
+// ── invariant 1: off is the old behavior, byte for byte ────────────────────
 
 // TestBridge_OffKeepsTheOriginalRefusal is the most important fence here. The
 // switch defaulting to off is what makes shipping this safe: a deployment that

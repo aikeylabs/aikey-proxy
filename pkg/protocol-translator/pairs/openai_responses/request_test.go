@@ -9,9 +9,9 @@ import (
 	"github.com/tidwall/gjson"
 )
 
-func mustConvert(t *testing.T, body string, model string, stream bool) gjson.Result {
+func mustConvert(t *testing.T, body string, model string) gjson.Result {
 	t.Helper()
-	out, tErr := ConvertRequest(context.Background(), model, []byte(body), stream)
+	out, tErr := ConvertRequest(context.Background(), model, []byte(body), false)
 	if tErr != nil {
 		t.Fatalf("ConvertRequest returned %v", tErr)
 	}
@@ -29,7 +29,7 @@ func TestRequest_SystemBecomesInstructions(t *testing.T) {
 		"messages":[
 			{"role":"system","content":"be terse"},
 			{"role":"user","content":"hi"}
-		]}`, "gpt-5.4", false)
+		]}`, "gpt-5.4")
 
 	if got.Get("instructions").String() != "be terse" {
 		t.Errorf("instructions = %q, want %q", got.Get("instructions").String(), "be terse")
@@ -54,7 +54,7 @@ func TestRequest_MultipleSystemMessagesAreAllKept(t *testing.T) {
 		{"role":"system","content":"rule one"},
 		{"role":"developer","content":"rule two"},
 		{"role":"user","content":"go"}
-	]}`, "m", false)
+	]}`, "m")
 
 	want := "rule one\n\nrule two"
 	if got.Get("instructions").String() != want {
@@ -70,7 +70,7 @@ func TestRequest_AssistantTurnUsesOutputText(t *testing.T) {
 		{"role":"user","content":"a"},
 		{"role":"assistant","content":"b"},
 		{"role":"user","content":"c"}
-	]}`, "m", false)
+	]}`, "m")
 
 	if pt := got.Get("input.1.content.0.type").String(); pt != "output_text" {
 		t.Errorf("assistant content part type = %q, want output_text", pt)
@@ -91,7 +91,7 @@ func TestRequest_ToolCallRoundTrip(t *testing.T) {
 			{"id":"call_1","type":"function","function":{"name":"get_weather","arguments":"{\"city\":\"SF\"}"}}
 		]},
 		{"role":"tool","tool_call_id":"call_1","content":"18C"}
-	]}`, "m", false)
+	]}`, "m")
 
 	items := got.Get("input").Array()
 	if len(items) != 3 {
@@ -124,7 +124,7 @@ func TestRequest_ToolsAreFlattened(t *testing.T) {
 		"tools":[{"type":"function","function":{
 			"name":"f","description":"d","parameters":{"type":"object","properties":{"a":{"type":"string"}}}
 		}}],
-		"tool_choice":{"type":"function","function":{"name":"f"}}}`, "m", false)
+		"tool_choice":{"type":"function","function":{"name":"f"}}}`, "m")
 
 	tool := got.Get("tools.0")
 	if tool.Get("name").String() != "f" {
@@ -153,7 +153,7 @@ func TestRequest_MaxTokensSpellings(t *testing.T) {
 		{"both, newer wins", `{"model":"m","messages":[{"role":"user","content":"x"}],"max_tokens":64,"max_completion_tokens":128}`, 128},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			got := mustConvert(t, tc.body, "m", false)
+			got := mustConvert(t, tc.body, "m")
 			if v := got.Get("max_output_tokens").Int(); v != tc.want {
 				t.Errorf("max_output_tokens = %d, want %d", v, tc.want)
 			}
@@ -169,7 +169,7 @@ func TestRequest_StoreIsAlwaysFalse(t *testing.T) {
 		`{"model":"m","messages":[{"role":"user","content":"x"}]}`,
 		`{"model":"m","messages":[{"role":"user","content":"x"}],"store":true}`,
 	} {
-		got := mustConvert(t, body, "m", false)
+		got := mustConvert(t, body, "m")
 		if !got.Get("store").Exists() {
 			t.Fatal("store must always be emitted, never left to the upstream default")
 		}
@@ -182,7 +182,7 @@ func TestRequest_StoreIsAlwaysFalse(t *testing.T) {
 // TestRequest_ResolvedModelWinsOverBody pins the pair contract: the caller has
 // already applied route-level aliasing and re-reading the body would undo it.
 func TestRequest_ResolvedModelWinsOverBody(t *testing.T) {
-	got := mustConvert(t, `{"model":"from-body","messages":[{"role":"user","content":"x"}]}`, "from-caller", false)
+	got := mustConvert(t, `{"model":"from-body","messages":[{"role":"user","content":"x"}]}`, "from-caller")
 	if got.Get("model").String() != "from-caller" {
 		t.Errorf("model = %q, want from-caller", got.Get("model").String())
 	}
@@ -223,7 +223,7 @@ func TestRequest_UnsupportedParamsAreRejectedNotDropped(t *testing.T) {
 
 // TestRequest_ZeroValuedPenaltiesAreAccepted pins the other half of that
 // decision: several SDKs serialize their zero defaults, and refusing those
-// would block callers who never asked for the behaviour.
+// would block callers who never asked for the behavior.
 func TestRequest_ZeroValuedPenaltiesAreAccepted(t *testing.T) {
 	_, tErr := ConvertRequest(context.Background(), "m",
 		[]byte(`{"model":"m","messages":[{"role":"user","content":"x"}],
@@ -238,7 +238,7 @@ func TestRequest_MultimodalTextAndImage(t *testing.T) {
 	got := mustConvert(t, `{"model":"m","messages":[{"role":"user","content":[
 		{"type":"text","text":"what is this"},
 		{"type":"image_url","image_url":{"url":"https://example.test/a.png"}}
-	]}]}`, "m", false)
+	]}]}`, "m")
 
 	parts := got.Get("input.0.content").Array()
 	if len(parts) != 2 {

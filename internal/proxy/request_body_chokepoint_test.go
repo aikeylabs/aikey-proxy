@@ -29,7 +29,7 @@ func TestSetRequestBody_GetBodyReplaysTheNewBytes(t *testing.T) {
 	const original = `{"model":"m","messages":[{"role":"user","content":"SENSITIVE"}]}`
 	const rewritten = `{"model":"m","messages":[{"role":"user","content":"{{MASKED_1}}"}]}`
 
-	r, err := http.NewRequest(http.MethodPost, "http://x/v1/chat/completions", strings.NewReader(original))
+	r, err := http.NewRequestWithContext(t.Context(), http.MethodPost, "http://x/v1/chat/completions", strings.NewReader(original))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -65,7 +65,7 @@ func TestSetRequestBody_GetBodyReplaysTheNewBytes(t *testing.T) {
 // TestSetRequestBody_GetBodyIsRepeatable — net/http may call GetBody more than
 // once (redirect, then retry).
 func TestSetRequestBody_GetBodyIsRepeatable(t *testing.T) {
-	r, _ := http.NewRequest(http.MethodPost, "http://x/", strings.NewReader("old"))
+	r, _ := http.NewRequestWithContext(t.Context(), http.MethodPost, "http://x/", strings.NewReader("old"))
 	setRequestBody(r, []byte("new"))
 	for i := 0; i < 3; i++ {
 		rc, err := r.GetBody()

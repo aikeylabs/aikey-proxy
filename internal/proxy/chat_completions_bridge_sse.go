@@ -26,7 +26,7 @@ import (
 //   - the drainer's token extraction still reads upstream-native Responses
 //     frames (usage and billing untouched — bridge invariant 3), and
 //   - the placeholder restorer still sees the Responses dialect it was written
-//     and tested against (it recognises response.output_text.delta explicitly).
+//     and tested against (it recognizes response.output_text.delta explicitly).
 //
 // Everything downstream of this wrapper is Chat Completions; everything
 // upstream of it is Responses. One boundary, not two.
