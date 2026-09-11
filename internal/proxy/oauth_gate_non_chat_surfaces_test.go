@@ -15,7 +15,7 @@ import (
 // neither, and forwarding them hands the client the upstream's misleading
 // error instead of a sentence naming the real problem. #44 then put the dialect
 // bridge in front of the gate, and the bridge returns early for every path it
-// does not recognise as a chat dialect — so the gate was never consulted for
+// does not recognize as a chat dialect — so the gate was never consulted for
 // those two paths again, and both were forwarded upstream.
 //
 // TestOAuthUpstreamRejectsPath_CodexResponsesOnly stayed green throughout,
