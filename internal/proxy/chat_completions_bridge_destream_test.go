@@ -423,7 +423,7 @@ func TestDeStream_NativeResponsesToADeclaredRelayIsUntouched(t *testing.T) {
 // the bridge forward those responses untranslated.
 
 func responseWithoutContentType() *http.Response {
-	return &http.Response{Header: http.Header{}, StatusCode: http.StatusOK}
+	return &http.Response{Header: http.Header{}, StatusCode: http.StatusOK, Body: http.NoBody}
 }
 
 func TestDeStream_CodexStreamWithoutContentTypeIsStillCollapsed(t *testing.T) {
@@ -561,6 +561,7 @@ func TestDeStream_RealCodexStreamServesAllThreeClientShapes(t *testing.T) {
 		r := armBridgeDeStreamed(bridgeRequest(t, "/v1/chat/completions", nonStreamChatBody),
 			translator.FormatOpenAI, translator.FormatOpenAIResponses)
 		resp := responseWithoutContentType()
+		defer func() { _ = resp.Body.Close() }()
 		out, err := io.ReadAll(newBridgedStreamingBody(r.Context(), resp, io.NopCloser(bytes.NewReader(raw)), quietLogger()))
 		if err != nil {
 			t.Fatal(err)
@@ -583,6 +584,7 @@ func TestDeStream_RealCodexStreamServesAllThreeClientShapes(t *testing.T) {
 		r := armBridge(httptest.NewRequest(http.MethodPost, "/v1/chat/completions", nil),
 			translator.FormatOpenAI, translator.FormatOpenAIResponses)
 		resp := responseWithoutContentType()
+		defer func() { _ = resp.Body.Close() }()
 		out, err := io.ReadAll(newBridgedStreamingBody(r.Context(), resp, io.NopCloser(bytes.NewReader(raw)), quietLogger()))
 		if err != nil {
 			t.Fatal(err)
@@ -597,6 +599,7 @@ func TestDeStream_RealCodexStreamServesAllThreeClientShapes(t *testing.T) {
 		r := armBridgeDeStreamed(bridgeRequest(t, "/v1/responses", nativeResponsesBody),
 			translator.FormatOpenAIResponses, translator.FormatOpenAIResponses)
 		resp := responseWithoutContentType()
+		defer func() { _ = resp.Body.Close() }()
 		out, err := io.ReadAll(newBridgedStreamingBody(r.Context(), resp, io.NopCloser(bytes.NewReader(raw)), quietLogger()))
 		if err != nil {
 			t.Fatal(err)
