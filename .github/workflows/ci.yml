@@ -72,8 +72,8 @@ jobs:
         id: siblings
         run: |
           set -euo pipefail
-          repos="$(scripts/ci/siblings.sh repos go.mod | tr '\n' ' ')aikey-cli"
-          line="$(scripts/ci/siblings.sh release-line)"
+          repos="$(bash scripts/ci/siblings.sh repos go.mod | tr '\n' ' ')aikey-cli"
+          line="$(bash scripts/ci/siblings.sh release-line)"
           echo "repos=${repos}" >> "$GITHUB_OUTPUT"
           echo "release_line=${line}" >> "$GITHUB_OUTPUT"
           echo "::notice::sibling repositories: ${repos} · release line of this commit: ${line}"
@@ -102,7 +102,7 @@ jobs:
             if [ "$repo" = aikey-cli ]; then
               why="cross-language golden fixture (tests/fixtures/team_token_normalize.json)"
             else
-              why="go.mod replace → $(scripts/ci/siblings.sh modules "$repo" go.mod | sed -E 's#^github.com/[^/]+/##' | paste -sd, - | sed 's/,/, /g')"
+              why="go.mod replace → $(bash scripts/ci/siblings.sh modules "$repo" go.mod | sed -E 's#^github.com/[^/]+/##' | paste -sd, - | sed 's/,/, /g')"
             fi
             url="https://x-access-token:${TOKEN}@github.com/aikeylabs/${repo}.git"
             if heads="$(git ls-remote --heads "$url" 2>&1)"; then
