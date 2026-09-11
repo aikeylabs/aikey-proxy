@@ -535,7 +535,7 @@ func TestBridge_SniffDoesNotHoldBackAStreamThatPausesAfterItsFirstBytes(t *testi
 	select {
 	case isSSE := <-done:
 		if !isSSE {
-			t.Fatal("a stream opening with an SSE comment was not recognised as an event stream")
+			t.Fatal("a stream opening with an SSE comment was not recognized as an event stream")
 		}
 	case <-time.After(2 * time.Second):
 		t.Fatal("sniffing waited for more bytes than the upstream's first write; a slow stream would stall before the client sees anything")
