@@ -71,7 +71,7 @@ AIKEY_REQUIRE_NO_TEST_SKIPS ?= $(if $(ACD_PRESENT),1,0)
 # would skip them.
 PROXY_TEST_PKGS := ./internal/... ./cmd/aikey-proxy/
 
-.PHONY: build test test-bugfix-custom-provider-axes test-bugfix-provider-routing test-bugfix-apphook-write-deadline test-pathprefix-matrix run install uninstall restart clean lint lint-full cross-compile sync-fingerprint sync-provider-registry sync-provider-data chaos-gap7 chaos-gap8 chaos filter-integration detector-sibling-build detector-sibling-absent-notice
+.PHONY: build test test-bugfix-custom-provider-axes test-bugfix-provider-routing test-bugfix-apphook-write-deadline test-pathprefix-matrix run install uninstall restart clean lint lint-full cross-compile sync-fingerprint sync-provider-registry sync-provider-data chaos-gap7 chaos-gap8 chaos filter-integration detector-sibling-build detector-sibling-absent-notice install-lint test-ci-scripts
 
 # v4.3 (2026-05-01): aikey-cli/data/provider_fingerprint.yaml is the single
 # source of truth for provider routing. The pkg/providerroutes Go package
@@ -239,6 +239,21 @@ uninstall:
 
 clean:
 	rm -rf bin/
+
+# The golangci-lint the release host runs for release.sh Step 2 "Proxy lint".
+# CI installs exactly this version: a floating @latest would move the gate under
+# everyone without a commit saying so, and a different minor version reports a
+# different finding set against the same --new-from-rev baseline.
+GOLANGCI_LINT_VERSION ?= v1.64.8
+
+install-lint: ## install the pinned golangci-lint (the version `lint` is gated on)
+	go install github.com/golangci/golangci-lint/cmd/golangci-lint@$(GOLANGCI_LINT_VERSION)
+
+# CI's own helper scripts, tested hermetically with throwaway git repositories.
+# The release-line resolver decides which sibling branches every CI run compiles
+# against. It was wrong on every push for weeks before anyone noticed.
+test-ci-scripts: ## CI helpers: sibling repo list from go.mod + release-line resolver
+	@bash scripts/ci/siblings_test.sh
 
 lint:
 	@git cat-file -e "$(LINT_BASE_REV)^{commit}" 2>/dev/null || { \
