@@ -74,7 +74,18 @@ func ConvertNonStreamResponse(ctx context.Context, body []byte) ([]byte, *transl
 	// An upstream error body reaches this function unchanged (the proxy only
 	// translates 2xx). Pass it through rather than folding it into an empty
 	// completion, which would render an error as a successful empty answer.
-	if in.Get("error").Exists() {
+	//
+	// 🔴 An explicit `"error": null` is NOT an error. Every real Responses object
+	// carries that key (incomplete_details, user, previous_response_id … are null
+	// too), and gjson's Exists() is true for a JSON null. This check used to be
+	// `Exists()` alone, so it passed EVERY successful response through untranslated:
+	// on master2 staging (2026-09-11) a non-streaming Chat Completions client got
+	// the raw Responses object back, with no error and no log line. No fixture had
+	// the key, so no test saw it. Same null guard as messages.go uses for content.
+	// Bugfix: workflow/CI/bugfix/2026-09-11-bridge-error-null-treated-as-error-envelope.md
+	// Fences: TestConvertNonStreamResponse_ExplicitNullErrorIsASuccessNotAnErrorEnvelope,
+	//         TestDeStream_RealCodexStreamServesAllThreeClientShapes
+	if e := in.Get("error"); e.Exists() && e.Type != gjson.Null {
 		return body, nil
 	}
 
