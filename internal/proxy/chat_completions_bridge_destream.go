@@ -78,6 +78,44 @@ func newBridgedStreamingBody(
 ) io.ReadCloser {
 	st := bridgeFromContext(ctx)
 	contentType := resp.Header.Get("Content-Type")
+	// 🔴 An ABSENT Content-Type is not the same statement as a non-SSE one.
+	//
+	// Both wrappers below decide "is this an event stream?" from Content-Type,
+	// and for a header that is present that stays right: an explicit
+	// application/json is an error envelope or a relay that ignored stream:true,
+	// and must be forwarded verbatim. But the real ChatGPT Codex backend, reached
+	// through the cluster worker's group lane, answers its event stream with NO
+	// Content-Type header at all (measured on master2 staging 2026-09-11: the
+	// worker logged content_type="" on every bridge_translate_failed event while
+	// the body was a complete response.created → response.completed stream).
+	// Treating absence as "not SSE" forwarded every bridged response untranslated:
+	// a Chat Completions client received raw Responses frames, a non-streaming
+	// client received an event stream instead of one JSON body. Every local test
+	// missed it because every mock politely set text/event-stream.
+	//
+	// So only when the bridge is armed AND the header is absent, look at the first
+	// bytes. Unarmed responses are never touched (switch-off stays byte-identical),
+	// and an explicit Content-Type remains authoritative.
+	// Bugfix: workflow/CI/bugfix/2026-09-11-bridge-sse-without-content-type.md
+	// Fences: TestDeStream_CodexStreamWithoutContentTypeIsStillCollapsed,
+	//         TestBridge_StreamingClientGetsFramesWhenUpstreamOmitsContentType,
+	//         TestBridge_ContentTypeLessJSONErrorIsForwardedVerbatim,
+	//         TestBridge_ExplicitJSONContentTypeIsAuthoritative,
+	//         TestBridge_UnarmedResponseWithoutContentTypeIsUntouched
+	if st != nil && strings.TrimSpace(contentType) == "" {
+		var isSSE bool
+		isSSE, body = sniffEventStream(body)
+		if isSSE {
+			contentType = "text/event-stream"
+			resp.Header.Set("Content-Type", contentType)
+			if logger != nil {
+				logger.Info("dialect bridge: upstream sent an event stream without a Content-Type; treating it as one",
+					"event.name", observability.EventProxyBridgeContentTypeSniffed,
+					"de_streamed", st.deStream,
+				)
+			}
+		}
+	}
 	if st == nil || !st.deStream {
 		return newSSEChatCompletionsBridge(ctx, body, contentType, logger)
 	}
@@ -102,6 +140,43 @@ func newBridgedStreamingBody(
 	resp.Header.Del("Transfer-Encoding")
 	resp.ContentLength = -1
 	return &sseDeStreamer{upstream: body, ctx: ctx, logger: logger}
+}
+
+// sseFieldPrefixes are the ways a text/event-stream body can open: a field name
+// followed by a colon, or a comment line that begins with the colon itself.
+var sseFieldPrefixes = [][]byte{
+	[]byte("event:"), []byte("data:"), []byte("id:"), []byte("retry:"), []byte(":"),
+}
+
+// sniffEventStream reports whether body opens like an event stream and returns a
+// reader that still yields every byte — nothing peeked is consumed.
+//
+// It waits for exactly ONE upstream read, not for a fixed number of bytes: a
+// stream that opens with a short keep-alive and then pauses must not have its
+// first bytes held back while a larger peek window fills. A first chunk that is
+// only whitespace classifies as not-SSE, which is the pre-existing verbatim
+// forward, i.e. the safe default.
+func sniffEventStream(body io.ReadCloser) (bool, io.ReadCloser) {
+	br := bufio.NewReaderSize(body, 4096)
+	if _, err := br.Peek(1); err != nil {
+		return false, struct {
+			io.Reader
+			io.Closer
+		}{br, body}
+	}
+	head, _ := br.Peek(br.Buffered())
+	head = bytes.TrimLeft(head, "\ufeff \t\r\n")
+	isSSE := false
+	for _, prefix := range sseFieldPrefixes {
+		if bytes.HasPrefix(head, prefix) {
+			isSSE = true
+			break
+		}
+	}
+	return isSSE, struct {
+		io.Reader
+		io.Closer
+	}{br, body}
 }
 
 // sseDeStreamer collapses a Responses event stream into one Chat Completions

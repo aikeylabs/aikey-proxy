@@ -3,8 +3,10 @@ package proxy
 import (
 	"io"
 	"net/http"
+	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 
 	translator "github.com/AiKeyLabs/aikey-proxy/pkg/protocol-translator"
 	"github.com/tidwall/gjson"
@@ -408,5 +410,134 @@ func TestDeStream_NativeResponsesToADeclaredRelayIsUntouched(t *testing.T) {
 	body, _ := io.ReadAll(out.Body)
 	if string(body) != nativeResponsesBody {
 		t.Errorf("body rewritten for an upstream that serves it as sent:\n got: %s\nwant: %s", body, nativeResponsesBody)
+	}
+}
+
+// ── upstream event streams that arrive WITHOUT a Content-Type ───────────────
+//
+// The real ChatGPT Codex backend, behind the cluster worker's group lane, sends
+// its event stream with no Content-Type header (master2 staging, 2026-09-11).
+// Every mock above sets text/event-stream, which is exactly why none of them saw
+// the bridge forward those responses untranslated.
+
+func responseWithoutContentType() *http.Response {
+	return &http.Response{Header: http.Header{}, StatusCode: http.StatusOK}
+}
+
+func TestDeStream_CodexStreamWithoutContentTypeIsStillCollapsed(t *testing.T) {
+	r := armBridgeDeStreamed(
+		bridgeRequest(t, "/v1/chat/completions", nonStreamChatBody),
+		translator.FormatOpenAI, translator.FormatOpenAIResponses)
+	resp := responseWithoutContentType()
+
+	out, err := io.ReadAll(newBridgedStreamingBody(r.Context(), resp, io.NopCloser(strings.NewReader(completedSSE)), quietLogger()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := gjson.GetBytes(out, "object").String(); got != "chat.completion" {
+		t.Fatalf("a non-streaming client got the raw upstream stream instead of one body:\n%s", out)
+	}
+	if got := resp.Header.Get("Content-Type"); got != "application/json" {
+		t.Errorf("content-type = %q, want application/json", got)
+	}
+}
+
+func TestBridge_StreamingClientGetsFramesWhenUpstreamOmitsContentType(t *testing.T) {
+	upstream := strings.Join([]string{
+		"event: response.created",
+		`data: {"type":"response.created","response":{"id":"resp_n","model":"gpt-5.5"}}`,
+		"",
+		"event: response.output_text.delta",
+		`data: {"type":"response.output_text.delta","delta":"ok"}`,
+		"",
+		"event: response.completed",
+		`data: {"type":"response.completed","response":{"id":"resp_n","status":"completed","usage":{"input_tokens":3,"output_tokens":1}}}`,
+		"", "",
+	}, "\n")
+	r := armBridge(httptest.NewRequest(http.MethodPost, "/v1/chat/completions", nil),
+		translator.FormatOpenAI, translator.FormatOpenAIResponses)
+	resp := responseWithoutContentType()
+
+	out, err := io.ReadAll(newBridgedStreamingBody(r.Context(), resp, io.NopCloser(strings.NewReader(upstream)), quietLogger()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	text := string(out)
+	if strings.Contains(text, "event: response.") || !strings.Contains(text, `"chat.completion.chunk"`) {
+		t.Fatalf("a streaming Chat Completions client got untranslated Responses frames:\n%s", text)
+	}
+	if got := resp.Header.Get("Content-Type"); got != "text/event-stream" {
+		t.Errorf("client content-type = %q; the client must be told it is receiving an event stream", got)
+	}
+}
+
+func TestBridge_ContentTypeLessJSONErrorIsForwardedVerbatim(t *testing.T) {
+	const errBody = `{"error":{"code":"OAUTH_MODEL_UNSUPPORTED","message":"not entitled"}}`
+	r := armBridgeDeStreamed(
+		bridgeRequest(t, "/v1/chat/completions", nonStreamChatBody),
+		translator.FormatOpenAI, translator.FormatOpenAIResponses)
+	resp := responseWithoutContentType()
+
+	out, err := io.ReadAll(newBridgedStreamingBody(r.Context(), resp, io.NopCloser(strings.NewReader(errBody)), quietLogger()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(out) != errBody {
+		t.Fatalf("an error body without Content-Type was altered or swallowed:\n got: %q\nwant: %q", out, errBody)
+	}
+	if got := resp.Header.Get("Content-Type"); got != "" {
+		t.Errorf("content-type invented for a non-stream body: %q", got)
+	}
+}
+
+func TestBridge_ExplicitJSONContentTypeIsAuthoritative(t *testing.T) {
+	r := armBridgeDeStreamed(
+		bridgeRequest(t, "/v1/chat/completions", nonStreamChatBody),
+		translator.FormatOpenAI, translator.FormatOpenAIResponses)
+	resp := responseWithoutContentType()
+	resp.Header.Set("Content-Type", "application/json")
+
+	out, err := io.ReadAll(newBridgedStreamingBody(r.Context(), resp, io.NopCloser(strings.NewReader(completedSSE)), quietLogger()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(out) != completedSSE {
+		t.Fatalf("an explicit Content-Type was overridden by sniffing; body changed:\n%s", out)
+	}
+}
+
+func TestBridge_UnarmedResponseWithoutContentTypeIsUntouched(t *testing.T) {
+	r := bridgeRequest(t, "/v1/responses", nativeResponsesBody) // bridge never armed
+	resp := responseWithoutContentType()
+
+	out, err := io.ReadAll(newBridgedStreamingBody(r.Context(), resp, io.NopCloser(strings.NewReader(completedSSE)), quietLogger()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(out) != completedSSE {
+		t.Fatalf("an unarmed response was modified:\n%s", out)
+	}
+	if got := resp.Header.Get("Content-Type"); got != "" {
+		t.Errorf("an unarmed response gained a content-type: %q (switch-off must stay byte-identical)", got)
+	}
+}
+
+func TestBridge_SniffDoesNotHoldBackAStreamThatPausesAfterItsFirstBytes(t *testing.T) {
+	pr, pw := io.Pipe()
+	defer pw.Close()
+	go func() { _, _ = pw.Write([]byte(": keep-alive\n\n")) }() // then the upstream goes quiet
+
+	done := make(chan bool, 1)
+	go func() {
+		isSSE, _ := sniffEventStream(pr)
+		done <- isSSE
+	}()
+	select {
+	case isSSE := <-done:
+		if !isSSE {
+			t.Fatal("a stream opening with an SSE comment was not recognized as an event stream")
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("sniffing waited for more bytes than the upstream's first write; a slow stream would stall before the client sees anything")
 	}
 }

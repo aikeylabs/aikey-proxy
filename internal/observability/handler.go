@@ -205,6 +205,9 @@ const (
 	// could not convert back to the inbound dialect. Error, not Warn: the
 	// client receives a 502 instead of an answer.
 	EventProxyBridgeTranslateFailed = "proxy.response.bridge_translate_failed"
+	// EventProxyBridgeContentTypeSniffed: an armed bridge received an upstream
+	// body with NO Content-Type and classified it from its first bytes.
+	EventProxyBridgeContentTypeSniffed = "proxy.response.bridge_content_type_sniffed"
 	// Fence I13 runtime guard (2026-07-21). EventProxyRequestIdentityScrubbed:
 	// an outbound header carried one of the control-plane member-identity shapes
 	// enumerated in proxy/member_identity_guard.go (that file is the only place
