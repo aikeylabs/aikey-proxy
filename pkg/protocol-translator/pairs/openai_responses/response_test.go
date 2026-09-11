@@ -170,3 +170,27 @@ func TestResponse_MalformedUpstreamIsLoud(t *testing.T) {
 		t.Fatal("a malformed upstream body was accepted")
 	}
 }
+
+// Every real Responses object carries `"error": null`, alongside other null keys.
+// gjson's Exists() is true for an explicit null, so the error-envelope passthrough
+// used to swallow every successful response untranslated (master2 staging
+// 2026-09-11). The fixture keeps the real null keys on purpose.
+func TestConvertNonStreamResponse_ExplicitNullErrorIsASuccessNotAnErrorEnvelope(t *testing.T) {
+	in := `{"id":"resp_1","object":"response","created_at":1789104799,"status":"completed",` +
+		`"error":null,"incomplete_details":null,"previous_response_id":null,"user":null,"moderation":null,` +
+		`"model":"gpt-5.5","output":[{"type":"message","role":"assistant","content":[{"type":"output_text","text":"ok"}]}],` +
+		`"usage":{"input_tokens":18,"output_tokens":21,"total_tokens":39}}`
+	out, tErr := ConvertNonStreamResponse(context.Background(), []byte(in))
+	if tErr != nil {
+		t.Fatalf("unexpected translate error: %+v", tErr)
+	}
+	if got := gjson.GetBytes(out, "object").String(); got != "chat.completion" {
+		t.Fatalf("an explicit \"error\": null was treated as an error envelope; the body passed through untranslated:\n%s", out)
+	}
+	if got := gjson.GetBytes(out, "choices.0.message.content").String(); got != "ok" {
+		t.Errorf("content = %q, want ok\n%s", got, out)
+	}
+	if got := gjson.GetBytes(out, "usage.prompt_tokens").Int(); got != 18 {
+		t.Errorf("usage.prompt_tokens = %d, want 18", got)
+	}
+}

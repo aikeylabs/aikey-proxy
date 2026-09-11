@@ -1,6 +1,8 @@
 package proxy
 
 import (
+	"os"
+	"bytes"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -421,7 +423,7 @@ func TestDeStream_NativeResponsesToADeclaredRelayIsUntouched(t *testing.T) {
 // the bridge forward those responses untranslated.
 
 func responseWithoutContentType() *http.Response {
-	return &http.Response{Header: http.Header{}, StatusCode: http.StatusOK}
+	return &http.Response{Header: http.Header{}, StatusCode: http.StatusOK, Body: http.NoBody}
 }
 
 func TestDeStream_CodexStreamWithoutContentTypeIsStillCollapsed(t *testing.T) {
@@ -540,4 +542,73 @@ func TestBridge_SniffDoesNotHoldBackAStreamThatPausesAfterItsFirstBytes(t *testi
 	case <-time.After(2 * time.Second):
 		t.Fatal("sniffing waited for more bytes than the upstream's first write; a slow stream would stall before the client sees anything")
 	}
+}
+
+// The bytes the real ChatGPT Codex backend sent through the cluster worker's group
+// lane on master2 staging (2026-09-11, gpt-5.5, native /responses stream:true),
+// ids sanitized. They differ from every hand-written fixture in this file in three
+// ways, and each one hid a defect that only staging found: no Content-Type header,
+// a response.completed envelope whose "output" is [] (the text arrives only as
+// deltas), and an explicit "error": null among ~30 other keys.
+// Bugfix: workflow/CI/bugfix/2026-09-11-bridge-error-null-treated-as-error-envelope.md
+func TestDeStream_RealCodexStreamServesAllThreeClientShapes(t *testing.T) {
+	raw, err := os.ReadFile("testdata/codex_real_stream_2026-09-11.sse")
+	if err != nil {
+		t.Fatalf("fixture missing: %v", err)
+	}
+
+	t.Run("non-streaming Chat Completions client", func(t *testing.T) {
+		r := armBridgeDeStreamed(bridgeRequest(t, "/v1/chat/completions", nonStreamChatBody),
+			translator.FormatOpenAI, translator.FormatOpenAIResponses)
+		resp := responseWithoutContentType()
+		defer func() { _ = resp.Body.Close() }()
+		out, err := io.ReadAll(newBridgedStreamingBody(r.Context(), resp, io.NopCloser(bytes.NewReader(raw)), quietLogger()))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got := gjson.GetBytes(out, "object").String(); got != "chat.completion" {
+			t.Fatalf("object = %q, want chat.completion. The real envelope came back untranslated:\n%.400s", got, out)
+		}
+		if got := gjson.GetBytes(out, "choices.0.message.content").String(); got != "ok" {
+			t.Errorf("content = %q, want ok", got)
+		}
+		if gjson.GetBytes(out, "usage.prompt_tokens").Int() <= 0 {
+			t.Errorf("usage lost:\n%.400s", out)
+		}
+		if got := resp.Header.Get("Content-Type"); got != "application/json" {
+			t.Errorf("content-type = %q, want application/json", got)
+		}
+	})
+
+	t.Run("streaming Chat Completions client", func(t *testing.T) {
+		r := armBridge(httptest.NewRequest(http.MethodPost, "/v1/chat/completions", nil),
+			translator.FormatOpenAI, translator.FormatOpenAIResponses)
+		resp := responseWithoutContentType()
+		defer func() { _ = resp.Body.Close() }()
+		out, err := io.ReadAll(newBridgedStreamingBody(r.Context(), resp, io.NopCloser(bytes.NewReader(raw)), quietLogger()))
+		if err != nil {
+			t.Fatal(err)
+		}
+		text := string(out)
+		if strings.Contains(text, "event: response.") || !strings.Contains(text, "chat.completion.chunk") || !strings.Contains(text, "[DONE]") {
+			t.Fatalf("streaming client did not get translated frames:\n%.600s", text)
+		}
+	})
+
+	t.Run("native non-streaming Responses client", func(t *testing.T) {
+		r := armBridgeDeStreamed(bridgeRequest(t, "/v1/responses", nativeResponsesBody),
+			translator.FormatOpenAIResponses, translator.FormatOpenAIResponses)
+		resp := responseWithoutContentType()
+		defer func() { _ = resp.Body.Close() }()
+		out, err := io.ReadAll(newBridgedStreamingBody(r.Context(), resp, io.NopCloser(bytes.NewReader(raw)), quietLogger()))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if gjson.GetBytes(out, "status").String() != "completed" || strings.Contains(string(out), "chat.completion") {
+			t.Fatalf("native client did not get one Responses object:\n%.400s", out)
+		}
+		if got := gjson.GetBytes(out, "output.#(type==\"message\").content.0.text").String(); got != "ok" {
+			t.Errorf("answer not rebuilt from deltas: %q", got)
+		}
+	})
 }
