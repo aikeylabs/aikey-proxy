@@ -9,9 +9,9 @@ import (
 	"github.com/tidwall/gjson"
 )
 
-func mustConvert(t *testing.T, body, model string, stream bool) gjson.Result {
+func mustConvert(t *testing.T, body string, stream bool) gjson.Result {
 	t.Helper()
-	out, tErr := ConvertRequest(context.Background(), model, []byte(body), stream)
+	out, tErr := ConvertRequest(context.Background(), "m", []byte(body), stream)
 	if tErr != nil {
 		t.Fatalf("ConvertRequest returned %v", tErr)
 	}
@@ -67,7 +67,7 @@ func TestRequest_OtherStatefulParamsRefused(t *testing.T) {
 }
 
 // TestRequest_HarmlessStatefulFieldsPass — truncation:"disabled" and store are
-// not behaviour changes for this turn, so refusing them would block callers who
+// not behavior changes for this turn, so refusing them would block callers who
 // asked for nothing.
 func TestRequest_HarmlessStatefulFieldsPass(t *testing.T) {
 	if _, tErr := ConvertRequest(context.Background(), "m",
@@ -78,7 +78,7 @@ func TestRequest_HarmlessStatefulFieldsPass(t *testing.T) {
 
 // TestRequest_InstructionsBecomeLeadingSystemMessage
 func TestRequest_InstructionsBecomeLeadingSystemMessage(t *testing.T) {
-	got := mustConvert(t, `{"model":"m","instructions":"be terse","input":"hi"}`, "m", false)
+	got := mustConvert(t, `{"model":"m","instructions":"be terse","input":"hi"}`, false)
 	msgs := got.Get("messages").Array()
 	if len(msgs) != 2 {
 		t.Fatalf("got %d messages, want 2", len(msgs))
@@ -107,7 +107,7 @@ func TestRequest_ParallelToolCallsMergeIntoOneAssistantMessage(t *testing.T) {
 		{"type":"function_call","call_id":"c2","name":"w","arguments":"{\"city\":\"NY\"}"},
 		{"type":"function_call_output","call_id":"c1","output":"18C"},
 		{"type":"function_call_output","call_id":"c2","output":"9C"}
-	]}`, "m", false)
+	]}`, false)
 
 	msgs := got.Get("messages").Array()
 	if len(msgs) != 4 {
@@ -161,7 +161,7 @@ func TestRequest_NarrationThenToolCallShareOneMessage(t *testing.T) {
 		{"role":"assistant","content":[{"type":"output_text","text":"checking"}]},
 		{"type":"function_call","call_id":"c1","name":"f","arguments":"{}"},
 		{"type":"function_call_output","call_id":"c1","output":"done"}
-	]}`, "m", false)
+	]}`, false)
 	msgs := got.Get("messages").Array()
 	if len(msgs) != 3 {
 		t.Fatalf("got %d messages, want 3 (user + one assistant carrying text AND the call + the result):\n%s",
@@ -181,7 +181,7 @@ func TestRequest_NarrationThenToolCallShareOneMessage(t *testing.T) {
 func TestRequest_TextOnlyContentIsAPlainString(t *testing.T) {
 	got := mustConvert(t, `{"model":"m","input":[
 		{"role":"user","content":[{"type":"input_text","text":"a"},{"type":"input_text","text":"b"}]}
-	]}`, "m", false)
+	]}`, false)
 	c := got.Get("messages.0.content")
 	if c.Type != gjson.String {
 		t.Fatalf("text-only content emitted as %s, want a plain string: %s", c.Type, c.Raw)
@@ -197,7 +197,7 @@ func TestRequest_ImageForcesPartsArray(t *testing.T) {
 		{"role":"user","content":[
 			{"type":"input_text","text":"what is this"},
 			{"type":"input_image","image_url":"https://example.test/a.png"}]}
-	]}`, "m", false)
+	]}`, false)
 	parts := got.Get("messages.0.content")
 	if !parts.IsArray() {
 		t.Fatalf("multimodal content collapsed to a string, losing the image: %s", parts.Raw)
@@ -211,7 +211,7 @@ func TestRequest_ImageForcesPartsArray(t *testing.T) {
 func TestRequest_ToolsAreReNested(t *testing.T) {
 	got := mustConvert(t, `{"model":"m","input":"x","tools":[
 		{"type":"function","name":"f","description":"d","parameters":{"type":"object"}}],
-		"tool_choice":{"type":"function","name":"f"}}`, "m", false)
+		"tool_choice":{"type":"function","name":"f"}}`, false)
 	tool := got.Get("tools.0")
 	if tool.Get("function.name").String() != "f" {
 		t.Errorf("tool name not nested under `function`: %s", tool.Raw)
@@ -243,7 +243,7 @@ func TestRequest_ServerSideToolsAreRefused(t *testing.T) {
 
 func TestRequest_SamplingParamsAndReasoningEffort(t *testing.T) {
 	got := mustConvert(t, `{"model":"m","input":"x","max_output_tokens":64,
-		"temperature":0.3,"top_p":0.8,"parallel_tool_calls":true,"reasoning":{"effort":"high"}}`, "m", true)
+		"temperature":0.3,"top_p":0.8,"parallel_tool_calls":true,"reasoning":{"effort":"high"}}`, true)
 	// max_completion_tokens, not max_tokens: the latter is deprecated and the
 	// reasoning-model families reject it outright.
 	if got.Get("max_completion_tokens").Int() != 64 {
@@ -346,7 +346,7 @@ func TestRequest_AnsweredToolCallsPass(t *testing.T) {
 		{"type":"function_call","call_id":"b","name":"w","arguments":"{}"},
 		{"type":"function_call_output","call_id":"a","output":"18C"},
 		{"type":"function_call_output","call_id":"b","output":"9C"}
-	]}`, "m", false)
+	]}`, false)
 	if n := len(got.Get("messages.1.tool_calls").Array()); n != 2 {
 		t.Fatalf("parallel answered calls collapsed to %d on the assistant turn", n)
 	}

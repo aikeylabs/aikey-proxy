@@ -177,7 +177,7 @@ func ConvertRequest(ctx context.Context, model string, body []byte, stream bool)
 //
 // Penalties are only rejected when non-zero: several SDKs serialize their
 // zero-valued defaults, and refusing those would block callers who never
-// asked for the behaviour in the first place.
+// asked for the behavior in the first place.
 func rejectUnsupported(in gjson.Result) *translator.TranslateError {
 	unsupported := func(param, why string) *translator.TranslateError {
 		return &translator.TranslateError{
@@ -216,17 +216,21 @@ func rejectUnsupported(in gjson.Result) *translator.TranslateError {
 
 // isEmptyStop reports whether a `stop` value carries no actual sequence.
 // Clients serialize "unset" as null, "", or [] depending on the SDK, and none
-// of those change behaviour — only a real sequence does.
+// of those change behavior — only a real sequence does.
 func isEmptyStop(v gjson.Result) bool {
 	switch v.Type {
 	case gjson.Null:
 		return true
 	case gjson.String:
 		return v.String() == ""
-	default:
+	case gjson.JSON:
 		if v.IsArray() {
 			return len(v.Array()) == 0
 		}
+		return false
+	case gjson.False, gjson.Number, gjson.True:
+		return false
+	default:
 		return false
 	}
 }

@@ -1388,7 +1388,7 @@ func (p *Proxy) serveRoute(w http.ResponseWriter, r *http.Request, route *vkeys.
 				// wrapper, so every stage above it still reads the upstream's
 				// native Responses frames:
 				//   • the drainer's token extraction (usage / billing), and
-				//   • the placeholder restorer, which recognises
+				//   • the placeholder restorer, which recognizes
 				//     response.output_text.delta explicitly.
 				// Everything downstream of this line is Chat Completions.
 				// No-op pass-through when the bridge did not engage.

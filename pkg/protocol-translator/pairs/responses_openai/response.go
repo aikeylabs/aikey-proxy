@@ -87,7 +87,9 @@ func ConvertNonStreamResponse(ctx context.Context, body []byte) ([]byte, *transl
 	msg := choice.Get("message")
 	respID := responseID(in.Get("id").String())
 
-	var out []outputItem
+	toolCalls := msg.Get("tool_calls").Array()
+	// Never nil: an empty `output` must encode as [], not null.
+	out := make([]outputItem, 0, 1+len(toolCalls))
 	text := msg.Get("content").String()
 	if text != "" {
 		out = append(out, outputItem{
@@ -98,7 +100,7 @@ func ConvertNonStreamResponse(ctx context.Context, body []byte) ([]byte, *transl
 			Content: []contentPart{{Type: "output_text", Text: text, Annotations: []any{}}},
 		})
 	}
-	for i, tc := range msg.Get("tool_calls").Array() {
+	for i, tc := range toolCalls {
 		out = append(out, outputItem{
 			Type:      "function_call",
 			ID:        functionCallItemID(respID, i),
@@ -107,9 +109,6 @@ func ConvertNonStreamResponse(ctx context.Context, body []byte) ([]byte, *transl
 			Name:      tc.Get("function.name").String(),
 			Arguments: tc.Get("function.arguments").String(),
 		})
-	}
-	if out == nil {
-		out = []outputItem{}
 	}
 
 	status, incomplete := statusFor(choice.Get("finish_reason").String())

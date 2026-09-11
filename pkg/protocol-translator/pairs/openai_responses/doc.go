@@ -40,7 +40,7 @@
 //
 //  3. Unsupported request fields are REJECTED, not dropped. `stop`, `n>1` and
 //     the sampling penalties have no Responses equivalent; silently discarding
-//     them would change the model's behaviour in a way the caller cannot see.
+//     them would change the model's behavior in a way the caller cannot see.
 //     A loud 400 naming the parameter is the lesser harm (CLAUDE.md 失败要显眼).
 //
 // # Scope

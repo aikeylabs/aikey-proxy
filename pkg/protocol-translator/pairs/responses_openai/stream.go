@@ -20,7 +20,7 @@ import (
 // content part that must have been ANNOUNCED first, and where the final
 // `response.completed` carries the whole assembled output.
 //
-// So going this way means synthesising events the source never sent, and it
+// So going this way means synthesizing events the source never sent, and it
 // cannot be done frame-locally:
 //
 //   - the opening `response.created` needs the id and model, which only arrive
@@ -253,7 +253,7 @@ func (sc *streamScratch) finish(st *translator.StreamState, finishReason string)
 		return nil
 	}
 	sc.finished = true
-	var out [][]byte
+	out := make([][]byte, 0, 6)
 
 	if sc.openedText {
 		full := sc.text.String()
@@ -379,7 +379,7 @@ func mustJSON(v map[string]any) []byte {
 // emit one when it sends a chunk carrying finish_reason. An upstream that is
 // cut off, times out, or simply stops sends none, and the client is then
 // waiting on a connection that has already closed — and unlike Chat
-// Completions there is no bare sentinel it could fall back to recognising.
+// Completions there is no bare sentinel it could fall back to recognizing.
 //
 // The frame carries the output accumulated so far, so a client that ignored
 // every delta still reads a complete answer. Status is "completed" for the same

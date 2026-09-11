@@ -184,7 +184,7 @@ func (d *sseDeStreamer) collapse() {
 // Frames are accumulated rather than matched line-by-line because SSE permits a
 // payload to span several `data:` lines; a line-wise reader silently truncates
 // exactly the large responses this is most useful for.
-func readCompletedResponse(r io.Reader) ([]byte, string, error) {
+func readCompletedResponse(r io.Reader) (envelope []byte, deltaText string, err error) {
 	var found []byte
 	var deltas strings.Builder
 	var data bytes.Buffer

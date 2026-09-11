@@ -27,14 +27,14 @@
 // `instructions` because absent/empty is accepted upstream (spike S04/S05).
 //
 // `stream` because the fix belongs one layer out, not in this table. The
-// backend requires stream:true, but honouring that for a client that asked for
+// backend requires stream:true, but honoring that for a client that asked for
 // one whole body is only half a rewrite: the RESPONSE has to be collapsed back
 // too, and this function cannot do that — it only ever sees the request. So the
 // dialect bridge owns both halves (chat_completions_bridge_destream.go), which
 // keeps the pair of rewrites in one place where they cannot drift apart.
 //
 // oauthUpstreamRejectsShape below therefore still refuses a non-streaming
-// request, and that is not dead code — it is the SWITCHED-OFF behaviour. With
+// request, and that is not dead code — it is the SWITCHED-OFF behavior. With
 // the bridge enabled, both a bridged Chat Completions client and a native
 // /responses one arrive here already rewritten to stream:true and pass; with it
 // disabled nothing rewrites them and this refusal is what the caller gets,

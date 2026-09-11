@@ -138,7 +138,7 @@ func convertUserContent(content gjson.Result) ([]contentPart, *translator.Transl
 		case "image_url", "input_image":
 			// Chat Completions nests the URL under image_url.url; the newer
 			// part shape carries it flat. Accept both so a client that already
-			// speaks Responses-flavoured parts is not punished for it.
+			// speaks Responses-flavored parts is not punished for it.
 			url := p.Get("image_url.url").String()
 			if url == "" {
 				url = p.Get("image_url").String()
@@ -199,8 +199,9 @@ func convertTools(tools gjson.Result) ([]responsTool, *translator.TranslateError
 	if !tools.Exists() || !tools.IsArray() || len(tools.Array()) == 0 {
 		return nil, nil
 	}
-	var out []responsTool
-	for _, t := range tools.Array() {
+	arr := tools.Array()
+	out := make([]responsTool, 0, len(arr))
+	for _, t := range arr {
 		if typ := t.Get("type").String(); typ != "function" && typ != "" {
 			return nil, &translator.TranslateError{
 				Code:       translator.CodeUnsupportedParam,
@@ -214,7 +215,7 @@ func convertTools(tools gjson.Result) ([]responsTool, *translator.TranslateError
 		if name == "" {
 			// Already-flat declarations are accepted for the same reason the
 			// image part is: a client that speaks the target shape should not
-			// be penalised for it.
+			// be penalized for it.
 			name = t.Get("name").String()
 		}
 		if name == "" {

@@ -24,7 +24,7 @@ import (
 //
 // Every other test of the /chat/completions → /responses direction runs against
 // a MOCK standing in for chatgpt.com/backend-api/codex. The translation is
-// modelled on good evidence — the conversation-audit parser built from live
+// modeled on good evidence — the conversation-audit parser built from live
 // codex traffic, the resident mock provider's shapes, the measured rule table
 // in codex_shape_normalize.go — but no test has ever put the translated body in
 // front of the real backend. Until one does, "the bridge works" means "the
@@ -99,7 +99,7 @@ func TestLiveCodexAcceptsTheBridgedShape(t *testing.T) {
 	// operator spends a real request on it. The host is echoed and every verdict
 	// below names it, so a rehearsal can never read as a live result.
 	upstream := codexUpstreamBaseURL()
-	req, err := http.NewRequest(http.MethodPost, upstream+"/responses", bytes.NewReader(translated))
+	req, err := http.NewRequestWithContext(context.Background(), http.MethodPost, upstream+"/responses", bytes.NewReader(translated))
 	if err != nil {
 		t.Fatal(err)
 	}
