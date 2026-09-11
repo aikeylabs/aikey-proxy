@@ -8,6 +8,7 @@ import (
 	"io"
 	"log/slog"
 	"net/http"
+	"sort"
 	"strings"
 
 	"github.com/AiKeyLabs/aikey-proxy/internal/observability"
@@ -65,6 +66,10 @@ const (
 	deStreamCompletedEvent = "response.completed"
 	// deStreamDeltaEvent carries the text a streaming client actually renders.
 	deStreamDeltaEvent = "response.output_text.delta"
+	// deStreamItemDoneEvent carries each finished output item — message, reasoning,
+	// function_call — as the upstream completes it. The real Codex backend sends its
+	// function calls ONLY here: response.completed arrives with "output": [].
+	deStreamItemDoneEvent = "response.output_item.done"
 )
 
 // newBridgedStreamingBody is the ONE client-facing wrapper for a bridged
@@ -209,8 +214,8 @@ func (d *sseDeStreamer) Close() error { return d.upstream.Close() }
 
 // collapse drains the stream and fills out with the client-facing body.
 func (d *sseDeStreamer) collapse() {
-	completed, deltaText, readErr := readCompletedResponse(d.upstream)
-	completed = fillOutputFromDeltas(completed, deltaText)
+	stream, readErr := readCompletedResponse(d.upstream)
+	completed, outputSource := fillOutput(stream)
 
 	if completed == nil {
 		// The stream ended without its terminal event: upstream cut off, or a
@@ -245,23 +250,62 @@ func (d *sseDeStreamer) collapse() {
 	}
 	d.out.Write(body)
 	if d.logger != nil {
+		if outputSource == deStreamOutputNone {
+			// 🔴 Loud on purpose. The stream completed but carried neither a message
+			// nor a tool call, so the client is about to receive 200 with an empty
+			// answer — indistinguishable, from its side, from a model that chose to
+			// say nothing. Until 2026-09-11 exactly this happened silently to every
+			// non-streaming tool call on the Codex backend.
+			// Bugfix: workflow/CI/bugfix/2026-09-11-bridge-destream-drops-tool-calls.md
+			d.logger.Warn("dialect bridge: de-streamed answer carries no message or tool call",
+				"event.name", observability.EventProxyBridgeEngaged,
+				"bytes", len(body),
+				"output_source", outputSource,
+			)
+			return
+		}
 		d.logger.Info("dialect bridge: de-streamed upstream answer for a non-streaming client",
 			"event.name", observability.EventProxyBridgeEngaged,
 			"bytes", len(body),
+			"output_source", outputSource,
 		)
 	}
 }
 
+// collapsedStream is everything one upstream event stream contributes to a
+// single non-streaming answer. fillOutput decides which part is authoritative.
+type collapsedStream struct {
+	envelope  []byte            // `response` of the last response.completed event (nil when absent)
+	doneItems []json.RawMessage // `item` of every response.output_item.done, ordered by output_index
+	deltaText string            // concatenated response.output_text.delta text
+}
+
+// indexedItem keeps an output item with its position while the stream is read.
+type indexedItem struct {
+	index int64
+	raw   json.RawMessage
+}
+
 // readCompletedResponse scans an SSE stream and returns the `response` object
-// from the last completed event (or nil) together with the text assembled from
-// the delta frames.
+// from the last completed event (or nil), every finished output item, and the
+// text assembled from the delta frames.
+//
+// 🔴 Why output items are collected (2026-09-11): the real ChatGPT Codex backend
+// sends a function call ONLY as a response.output_item.done event; its
+// response.completed carries "output": []. Reading just the completed event and
+// the text deltas threw every tool call away, so a non-streaming client got
+// 200, empty content, no tool_calls and finish_reason "stop" — silently, while
+// a streaming client asking the same question got the call.
+// Bugfix: workflow/CI/bugfix/2026-09-11-bridge-destream-drops-tool-calls.md
+// Fences: TestDeStream_RealCodexToolCallSurvivesCollapse, TestDeStream_FillOutputPrecedence
 //
 // Frames are accumulated rather than matched line-by-line because SSE permits a
 // payload to span several `data:` lines; a line-wise reader silently truncates
 // exactly the large responses this is most useful for.
-func readCompletedResponse(r io.Reader) (envelope []byte, deltaText string, err error) {
+func readCompletedResponse(r io.Reader) (stream collapsedStream, err error) {
 	var found []byte
 	var deltas strings.Builder
+	var items []indexedItem
 	var data bytes.Buffer
 
 	flush := func() {
@@ -276,6 +320,13 @@ func readCompletedResponse(r io.Reader) (envelope []byte, deltaText string, err 
 			}
 		case deStreamDeltaEvent:
 			deltas.WriteString(gjson.GetBytes(payload, "delta").String())
+		case deStreamItemDoneEvent:
+			if item := gjson.GetBytes(payload, "item"); item.IsObject() {
+				items = append(items, indexedItem{
+					index: gjson.GetBytes(payload, "output_index").Int(),
+					raw:   json.RawMessage(item.Raw),
+				})
+			}
 		}
 		data.Reset()
 	}
@@ -295,50 +346,112 @@ func readCompletedResponse(r io.Reader) (envelope []byte, deltaText string, err 
 		}
 	}
 	flush() // a final frame with no terminating blank line is still a frame
-	return found, deltas.String(), sc.Err()
+	sort.SliceStable(items, func(i, j int) bool { return items[i].index < items[j].index })
+	stream = collapsedStream{envelope: found, deltaText: deltas.String(), doneItems: make([]json.RawMessage, 0, len(items))}
+	for _, it := range items {
+		stream.doneItems = append(stream.doneItems, it.raw)
+	}
+	return stream, sc.Err()
 }
 
-// fillOutputFromDeltas puts the streamed text into the envelope when the
-// envelope did not carry it.
+// Where a collapsed answer came from — logged per request as output_source.
+const (
+	deStreamOutputEnvelope       = "envelope"
+	deStreamOutputItems          = "output_items"
+	deStreamOutputItemsAndDeltas = "output_items+deltas"
+	deStreamOutputDeltas         = "deltas"
+	deStreamOutputNone           = "none"
+)
+
+// deStreamAnswerItemTypes are the output item types that ARE an answer. A
+// reasoning item on its own is not: a client handed only reasoning got nothing.
+var deStreamAnswerItemTypes = map[string]bool{
+	"message":          true,
+	"function_call":    true,
+	"custom_tool_call": true,
+}
+
+// fillOutput makes the collapsed envelope carry the answer, choosing in order:
 //
-// Why the deltas are the authority here, not a fallback bolted on: a STREAMING
-// client's answer is the concatenation of the delta frames — that is what the
-// text a user sees has always been. `response.completed` carrying a finished
-// `output` array is a convenience some upstreams offer and others do not, so
-// reading only the envelope makes the non-streaming client's answer depend on a
-// property of the upstream that the streaming client never depended on. Two
-// clients asking the same question of the same backend would then get different
-// answers, one of them empty.
+//  1. the envelope's own `output`, when it already holds a message or tool call.
+//     An upstream that sends a finished output array keeps ITS structure;
+//  2. the response.output_item.done items — the only place the Codex backend
+//     puts a function call, and a complete message when it sends one. A message
+//     rebuilt from the text deltas is appended when no message item arrived;
+//  3. the text deltas alone (an upstream that streams text but no items).
 //
-// Found by the E2E, not by a unit test: the resident codex fixture emits a
-// completed event with usage and no output, so the de-streamed reply came back
-// well-formed, correctly billed, and with an empty string where the model's
-// answer should have been.
+// Why the deltas stay authoritative for text (2026-09-10, found by the E2E): a
+// STREAMING client's answer is the concatenation of the delta frames, so reading
+// only the envelope made the non-streaming answer depend on an upstream property
+// the streaming client never depended on — one of them came back empty.
 //
-// No-op when the envelope already has text, so an upstream that sends a full
-// output array keeps ITS structure — tool calls, refusals and multi-part
-// content included, none of which a flat delta string can reconstruct.
-func fillOutputFromDeltas(completed []byte, deltaText string) []byte {
-	if completed == nil || deltaText == "" {
-		return completed
+// Why output items come before the deltas (2026-09-11, found on staging): a
+// tool call has no text delta at all. Deltas-only rebuilt a message and dropped
+// the call; items carry both the call and the message.
+// Bugfix: workflow/CI/bugfix/2026-09-11-bridge-destream-drops-tool-calls.md
+func fillOutput(s collapsedStream) (body []byte, source string) {
+	if s.envelope == nil {
+		return nil, deStreamOutputNone
 	}
-	if gjson.GetBytes(completed, `output.#(type=="message")#|0`).Exists() ||
-		gjson.GetBytes(completed, "output_text").Exists() {
-		return completed
+	if gjson.GetBytes(s.envelope, "output_text").Exists() || resultsCarryAnswer(gjson.GetBytes(s.envelope, "output").Array()) {
+		return s.envelope, deStreamOutputEnvelope
+	}
+	items := make([]json.RawMessage, 0, len(s.doneItems)+1)
+	items = append(items, s.doneItems...)
+	source = deStreamOutputItems
+	if !rawItemsContainType(s.doneItems, "message") && s.deltaText != "" {
+		text, err := json.Marshal(s.deltaText)
+		if err != nil {
+			return s.envelope, deStreamOutputNone
+		}
+		items = append(items, json.RawMessage(`{"type":"message","role":"assistant","content":[{"type":"output_text","text":`+string(text)+`}]}`))
+		source = deStreamOutputItemsAndDeltas
+		if len(s.doneItems) == 0 {
+			source = deStreamOutputDeltas
+		}
+	}
+	if !rawItemsCarryAnswer(items) {
+		return s.envelope, deStreamOutputNone
 	}
 	var envelope map[string]json.RawMessage
-	if err := json.Unmarshal(completed, &envelope); err != nil || envelope == nil {
-		return completed
+	if err := json.Unmarshal(s.envelope, &envelope); err != nil || envelope == nil {
+		return s.envelope, deStreamOutputNone
 	}
-	text, err := json.Marshal(deltaText)
+	output, err := json.Marshal(items)
 	if err != nil {
-		return completed
+		return s.envelope, deStreamOutputNone
 	}
-	envelope["output"] = json.RawMessage(`[{"type":"message","role":"assistant","content":[{"type":"output_text","text":` +
-		string(text) + `}]}]`)
+	envelope["output"] = output
 	merged, err := json.Marshal(envelope)
 	if err != nil {
-		return completed
+		return s.envelope, deStreamOutputNone
 	}
-	return merged
+	return merged, source
+}
+
+func resultsCarryAnswer(items []gjson.Result) bool {
+	for _, it := range items {
+		if deStreamAnswerItemTypes[it.Get("type").String()] {
+			return true
+		}
+	}
+	return false
+}
+
+func rawItemsCarryAnswer(items []json.RawMessage) bool {
+	for _, it := range items {
+		if deStreamAnswerItemTypes[gjson.GetBytes(it, "type").String()] {
+			return true
+		}
+	}
+	return false
+}
+
+func rawItemsContainType(items []json.RawMessage, typ string) bool {
+	for _, it := range items {
+		if gjson.GetBytes(it, "type").String() == typ {
+			return true
+		}
+	}
+	return false
 }

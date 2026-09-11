@@ -1,0 +1,33 @@
+event: response.created
+data: {"type":"response.created","response":{"id":"resp_fixture0001","object":"response","created_at":1789109727,"status":"in_progress","background":false,"completed_at":null,"error":null,"frequency_penalty":0.0,"incomplete_details":null,"instructions":"Use the tool.","max_output_tokens":null,"max_tool_calls":null,"model":"gpt-5.5","moderation":null,"output":[],"parallel_tool_calls":true,"presence_penalty":0.0,"previous_response_id":null,"prompt_cache_key":"00000000-0000-4000-8000-000000000000","prompt_cache_retention":"24h","reasoning":{"context":"current_turn","effort":"medium","mode":"standard","summary":null},"safety_identifier":"user-fixture","service_tier":"auto","store":false,"temperature":1.0,"text":{"format":{"type":"text"},"verbosity":"medium"},"tool_choice":"required","tool_usage":{"image_gen":{"input_tokens":0,"input_tokens_details":{"image_tokens":0,"text_tokens":0},"output_tokens":0,"output_tokens_details":{"image_tokens":0,"text_tokens":0},"total_tokens":0},"web_search":{"num_requests":0}},"tools":[{"type":"function","description":"Get the current weather for a city","name":"get_weather","output_schema":null,"parameters":{"type":"object","properties":{"city":{"type":"string"}},"required":["city"],"additionalProperties":false},"strict":true}],"top_logprobs":0,"top_p":0.98,"truncation":"disabled","usage":null,"user":null,"metadata":{}},"sequence_number":0}
+
+event: response.in_progress
+data: {"type":"response.in_progress","response":{"id":"resp_fixture0001","object":"response","created_at":1789109727,"status":"in_progress","background":false,"completed_at":null,"error":null,"frequency_penalty":0.0,"incomplete_details":null,"instructions":"Use the tool.","max_output_tokens":null,"max_tool_calls":null,"model":"gpt-5.5","moderation":null,"output":[],"parallel_tool_calls":true,"presence_penalty":0.0,"previous_response_id":null,"prompt_cache_key":"00000000-0000-4000-8000-000000000000","prompt_cache_retention":"24h","reasoning":{"context":"current_turn","effort":"medium","mode":"standard","summary":null},"safety_identifier":"user-fixture","service_tier":"auto","store":false,"temperature":1.0,"text":{"format":{"type":"text"},"verbosity":"medium"},"tool_choice":"required","tool_usage":{"image_gen":{"input_tokens":0,"input_tokens_details":{"image_tokens":0,"text_tokens":0},"output_tokens":0,"output_tokens_details":{"image_tokens":0,"text_tokens":0},"total_tokens":0},"web_search":{"num_requests":0}},"tools":[{"type":"function","description":"Get the current weather for a city","name":"get_weather","output_schema":null,"parameters":{"type":"object","properties":{"city":{"type":"string"}},"required":["city"],"additionalProperties":false},"strict":true}],"top_logprobs":0,"top_p":0.98,"truncation":"disabled","usage":null,"user":null,"metadata":{}},"sequence_number":1}
+
+event: response.output_item.added
+data: {"type":"response.output_item.added","item":{"id":"fc_fixture0001","type":"function_call","status":"in_progress","arguments":"","call_id":"call_fixture0001","name":"get_weather"},"output_index":0,"sequence_number":2}
+
+event: response.function_call_arguments.delta
+data: {"type":"response.function_call_arguments.delta","delta":"{\"","item_id":"fc_fixture0001","obfuscation":"vFdgXn9wdUqO4e","output_index":0,"sequence_number":3}
+
+event: response.function_call_arguments.delta
+data: {"type":"response.function_call_arguments.delta","delta":"city","item_id":"fc_fixture0001","obfuscation":"vu32TooPQJlr","output_index":0,"sequence_number":4}
+
+event: response.function_call_arguments.delta
+data: {"type":"response.function_call_arguments.delta","delta":"\":\"","item_id":"fc_fixture0001","obfuscation":"Lu6d6q7DBsy0v","output_index":0,"sequence_number":5}
+
+event: response.function_call_arguments.delta
+data: {"type":"response.function_call_arguments.delta","delta":"Paris","item_id":"fc_fixture0001","obfuscation":"flA2VSndB5j","output_index":0,"sequence_number":6}
+
+event: response.function_call_arguments.delta
+data: {"type":"response.function_call_arguments.delta","delta":"\"}","item_id":"fc_fixture0001","obfuscation":"MlfxZurd9A42du","output_index":0,"sequence_number":7}
+
+event: response.function_call_arguments.done
+data: {"type":"response.function_call_arguments.done","arguments":"{\"city\":\"Paris\"}","item_id":"fc_fixture0001","output_index":0,"sequence_number":8}
+
+event: response.output_item.done
+data: {"type":"response.output_item.done","item":{"id":"fc_fixture0001","type":"function_call","status":"completed","arguments":"{\"city\":\"Paris\"}","call_id":"call_fixture0001","name":"get_weather"},"output_index":0,"sequence_number":9}
+
+event: response.completed
+data: {"type":"response.completed","response":{"id":"resp_fixture0001","object":"response","created_at":1789109727,"status":"completed","background":false,"completed_at":1789109729,"error":null,"frequency_penalty":0.0,"incomplete_details":null,"instructions":"Use the tool.","max_output_tokens":null,"max_tool_calls":null,"model":"gpt-5.5","moderation":null,"output":[],"parallel_tool_calls":true,"presence_penalty":0.0,"previous_response_id":null,"prompt_cache_key":"00000000-0000-4000-8000-000000000000","prompt_cache_retention":"24h","reasoning":{"context":"current_turn","effort":"medium","mode":"standard","summary":null},"safety_identifier":"user-fixture","service_tier":"default","store":false,"temperature":1.0,"text":{"format":{"type":"text"},"verbosity":"medium"},"tool_choice":"required","tool_usage":{"image_gen":{"input_tokens":0,"input_tokens_details":{"image_tokens":0,"text_tokens":0},"output_tokens":0,"output_tokens_details":{"image_tokens":0,"text_tokens":0},"total_tokens":0},"web_search":{"num_requests":0}},"tools":[{"type":"function","description":"Get the current weather for a city","name":"get_weather","output_schema":null,"parameters":{"type":"object","properties":{"city":{"type":"string"}},"required":["city"],"additionalProperties":false},"strict":true}],"top_logprobs":0,"top_p":0.98,"truncation":"disabled","usage":{"attribution":{"items":{"msg_fixture0001":{"cache_write_tokens":0,"cached_tokens":0,"content":[{"cache_write_tokens":0,"cached_tokens":0,"input_tokens":11,"output_tokens":0}],"input_tokens":11,"output_tokens":0},"fc_fixture0001":{"cache_write_tokens":0,"cached_tokens":0,"input_tokens":2,"output_tokens":18}},"request_fields":{"tools":{"cache_write_tokens":0,"cached_tokens":0,"input_tokens":38,"output_tokens":0},"instructions":{"cache_write_tokens":0,"cached_tokens":0,"input_tokens":8,"output_tokens":0}}},"input_tokens":59,"input_tokens_details":{"cache_write_tokens":0,"cached_tokens":0},"output_tokens":18,"output_tokens_details":{"reasoning_tokens":0},"total_tokens":77},"user":null,"metadata":{}},"sequence_number":10}
+
