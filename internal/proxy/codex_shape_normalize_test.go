@@ -537,3 +537,28 @@ func TestCodexNonStream_Answers422OnEveryLane(t *testing.T) {
 		})
 	}
 }
+
+// Measured on master2 staging 2026-09-11 (not a spike cell): the Codex backend
+// answers "Unsupported parameter: top_p" to ANY top_p — a number or null — while
+// temperature and max_tokens were already stripped. Named literally here: the
+// table test above loops over codexUnsupportedParams, so it cannot notice the
+// name being removed from that list.
+// Bugfix: workflow/CI/bugfix/2026-09-11-codex-rejects-top-p.md
+func TestNormalizeCodexBody_StripsTopP(t *testing.T) {
+	for _, in := range []string{
+		`{"model":"gpt-5.5","input":[],"stream":true,"store":false,"top_p":0.9}`,
+		`{"model":"gpt-5.5","input":[],"stream":true,"store":false,"top_p":null}`,
+	} {
+		out, changes := normalizeCodexBody([]byte(in))
+		var fields map[string]json.RawMessage
+		if err := json.Unmarshal(out, &fields); err != nil {
+			t.Fatalf("output is not JSON: %v (%s)", err, out)
+		}
+		if _, present := fields["top_p"]; present {
+			t.Fatalf("top_p reached the Codex backend: %s", out)
+		}
+		if strings.Join(changes, ",") != "strip:top_p" {
+			t.Fatalf("changes = %v, want [strip:top_p] — the client must see what was rewritten", changes)
+		}
+	}
+}

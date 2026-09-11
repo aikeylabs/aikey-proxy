@@ -1,11 +1,13 @@
 package proxy
 
 import (
-	"os"
 	"bytes"
+	"encoding/json"
 	"io"
+	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"strings"
 	"testing"
 	"time"
@@ -611,4 +613,137 @@ func TestDeStream_RealCodexStreamServesAllThreeClientShapes(t *testing.T) {
 			t.Errorf("answer not rebuilt from deltas: %q", got)
 		}
 	})
+}
+
+// The real Codex backend's tool-call stream, captured through the bridge on master2
+// staging (2026-09-11, gpt-5.5, native /responses stream:true, ids sanitized). The
+// function call arrives ONLY as response.output_item.done; response.completed has
+// "output": []. Before the fix a non-streaming client got an empty message with
+// finish_reason "stop" and no tool_calls; the streaming client got the call.
+// Bugfix: workflow/CI/bugfix/2026-09-11-bridge-destream-drops-tool-calls.md
+func TestDeStream_RealCodexToolCallSurvivesCollapse(t *testing.T) {
+	raw, err := os.ReadFile("testdata/codex_real_tool_call_stream_2026-09-11.sse")
+	if err != nil {
+		t.Fatalf("fixture missing: %v", err)
+	}
+
+	t.Run("non-streaming Chat Completions client gets tool_calls", func(t *testing.T) {
+		r := armBridgeDeStreamed(bridgeRequest(t, "/v1/chat/completions", nonStreamChatBody),
+			translator.FormatOpenAI, translator.FormatOpenAIResponses)
+		resp := responseWithoutContentType()
+		defer func() { _ = resp.Body.Close() }()
+		out, err := io.ReadAll(newBridgedStreamingBody(r.Context(), resp, io.NopCloser(bytes.NewReader(raw)), quietLogger()))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got := gjson.GetBytes(out, "object").String(); got != "chat.completion" {
+			t.Fatalf("object = %q, want chat.completion:\n%.500s", got, out)
+		}
+		if got := gjson.GetBytes(out, "choices.0.finish_reason").String(); got != "tool_calls" {
+			t.Fatalf("finish_reason = %q, want tool_calls — the call was dropped:\n%.500s", got, out)
+		}
+		call := gjson.GetBytes(out, "choices.0.message.tool_calls.0")
+		if call.Get("function.name").String() != "get_weather" || call.Get("id").String() == "" {
+			t.Fatalf("tool call missing or unnamed:\n%.500s", out)
+		}
+		var args map[string]any
+		if err := json.Unmarshal([]byte(call.Get("function.arguments").String()), &args); err != nil || args["city"] != "Paris" {
+			t.Fatalf("tool call arguments = %q, want JSON with city Paris", call.Get("function.arguments").String())
+		}
+	})
+
+	t.Run("native non-streaming Responses client gets the function_call item", func(t *testing.T) {
+		r := armBridgeDeStreamed(bridgeRequest(t, "/v1/responses", nativeResponsesBody),
+			translator.FormatOpenAIResponses, translator.FormatOpenAIResponses)
+		resp := responseWithoutContentType()
+		defer func() { _ = resp.Body.Close() }()
+		out, err := io.ReadAll(newBridgedStreamingBody(r.Context(), resp, io.NopCloser(bytes.NewReader(raw)), quietLogger()))
+		if err != nil {
+			t.Fatal(err)
+		}
+		fc := gjson.GetBytes(out, `output.#(type=="function_call")`)
+		if gjson.GetBytes(out, "status").String() != "completed" || fc.Get("name").String() != "get_weather" {
+			t.Fatalf("native client did not get the function_call item:\n%.500s", out)
+		}
+	})
+
+	t.Run("streaming Chat Completions client still gets the call as chunks", func(t *testing.T) {
+		r := armBridge(httptest.NewRequest(http.MethodPost, "/v1/chat/completions", nil),
+			translator.FormatOpenAI, translator.FormatOpenAIResponses)
+		resp := responseWithoutContentType()
+		defer func() { _ = resp.Body.Close() }()
+		out, err := io.ReadAll(newBridgedStreamingBody(r.Context(), resp, io.NopCloser(bytes.NewReader(raw)), quietLogger()))
+		if err != nil {
+			t.Fatal(err)
+		}
+		text := string(out)
+		if !strings.Contains(text, "chat.completion.chunk") || !strings.Contains(text, "get_weather") || !strings.Contains(text, "[DONE]") {
+			t.Fatalf("streaming client lost the tool call:\n%.600s", text)
+		}
+	})
+}
+
+// The precedence fillOutput applies, one row per upstream shape.
+func TestDeStream_FillOutputPrecedence(t *testing.T) {
+	msg := `{"type":"message","role":"assistant","content":[{"type":"output_text","text":"from-item"}]}`
+	call := `{"type":"function_call","call_id":"call_1","name":"get_weather","arguments":"{}"}`
+	reasoning := `{"type":"reasoning","summary":[]}`
+	empty := `{"id":"r","status":"completed","output":[]}`
+	cases := []struct {
+		name       string
+		s          collapsedStream
+		wantSource string
+		wantTypes  string
+		wantText   string
+	}{
+		{"envelope with its own message wins", collapsedStream{envelope: []byte(`{"id":"r","output":[` + msg + `]}`), deltaText: "ignored"},
+			deStreamOutputEnvelope, "message", "from-item"},
+		{"empty envelope + function_call item", collapsedStream{envelope: []byte(empty), doneItems: []json.RawMessage{json.RawMessage(call)}},
+			deStreamOutputItems, "function_call", ""},
+		{"empty envelope + reasoning and message items", collapsedStream{envelope: []byte(empty), doneItems: []json.RawMessage{json.RawMessage(reasoning), json.RawMessage(msg)}, deltaText: "from-item"},
+			deStreamOutputItems, "reasoning,message", "from-item"},
+		{"empty envelope + reasoning item + text deltas", collapsedStream{envelope: []byte(empty), doneItems: []json.RawMessage{json.RawMessage(reasoning)}, deltaText: "from-deltas"},
+			deStreamOutputItemsAndDeltas, "reasoning,message", "from-deltas"},
+		{"empty envelope + text deltas only", collapsedStream{envelope: []byte(empty), deltaText: "from-deltas"},
+			deStreamOutputDeltas, "message", "from-deltas"},
+		{"empty envelope and nothing else", collapsedStream{envelope: []byte(empty)},
+			deStreamOutputNone, "", ""},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			out, source := fillOutput(c.s)
+			if source != c.wantSource {
+				t.Fatalf("source = %q, want %q", source, c.wantSource)
+			}
+			var types []string
+			for _, it := range gjson.GetBytes(out, "output").Array() {
+				types = append(types, it.Get("type").String())
+			}
+			if got := strings.Join(types, ","); got != c.wantTypes {
+				t.Fatalf("output item types = %q, want %q (%s)", got, c.wantTypes, out)
+			}
+			if c.wantText != "" && gjson.GetBytes(out, `output.#(type=="message").content.0.text`).String() != c.wantText {
+				t.Fatalf("message text wrong: %s", out)
+			}
+		})
+	}
+}
+
+// A completed stream with no message and no tool call must say so at WARN: the
+// client receives 200 with nothing in it.
+func TestDeStream_EmptyAnswerIsLoggedAtWarn(t *testing.T) {
+	var buf bytes.Buffer
+	logger := slog.New(slog.NewJSONHandler(&buf, &slog.HandlerOptions{Level: slog.LevelDebug}))
+	r := armBridgeDeStreamed(bridgeRequest(t, "/v1/chat/completions", nonStreamChatBody),
+		translator.FormatOpenAI, translator.FormatOpenAIResponses)
+	resp := responseWithoutContentType()
+	defer func() { _ = resp.Body.Close() }()
+	stream := "event: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\"id\":\"r\",\"status\":\"completed\",\"output\":[]}}\n\n"
+	if _, err := io.ReadAll(newBridgedStreamingBody(r.Context(), resp, io.NopCloser(strings.NewReader(stream)), logger)); err != nil {
+		t.Fatal(err)
+	}
+	logs := buf.String()
+	if !strings.Contains(logs, `"level":"WARN"`) || !strings.Contains(logs, `"output_source":"none"`) {
+		t.Fatalf("an empty de-streamed answer was not logged at WARN with output_source=none:\n%s", logs)
+	}
 }

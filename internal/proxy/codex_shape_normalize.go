@@ -21,6 +21,12 @@
 //	| max_output_tokens /       | Unsupported parameter: <name>  | strip and RECORD (a fallback to another  | S10, S11,      |
 //	| temperature / truncation /|                                | Codex-backed relay would not honor them | S16, S17       |
 //	| metadata present          |                                | either; refusing only drops the traffic) |                |
+//	| top_p (any value, null    | Unsupported parameter: top_p   | strip and RECORD (same reasoning)        | staging        |
+//	| included)                 |                                |                                          | 2026-09-11 (1) |
+//
+// (1) Not a spike cell: measured through the bridge on master2 staging after a
+// Chat Completions client sending top_p got a hard 400 while temperature and
+// max_tokens were already stripped. Bugfix: workflow/CI/bugfix/2026-09-11-codex-rejects-top-p.md
 //
 // Deliberately NOT rewritten here: `stream` and `instructions`.
 //
@@ -72,7 +78,7 @@ import (
 // rejects with "Unsupported parameter: <name>" (spike S10/S11/S16/S17). `user`
 // was never isolated on the real backend (S17 carried user + metadata and only
 // metadata was reported), so it is deliberately not on this list.
-var codexUnsupportedParams = []string{"max_output_tokens", "temperature", "truncation", "metadata"}
+var codexUnsupportedParams = []string{"max_output_tokens", "temperature", "truncation", "metadata", "top_p"}
 
 const (
 	codexNormalizedInput       = "input"
