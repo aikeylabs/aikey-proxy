@@ -298,7 +298,45 @@ func (p *Proxy) bridgeOrRejectDialect(
 	}
 	inbound := dialectForPath(r.URL.Path)
 	if inbound == "" {
-		// Not a chat surface (/v1/models and friends). Untouched.
+		// Not a chat dialect. Most such paths (/v1/models, /v1/images/*) are
+		// served by every upstream and must flow untouched.
+		//
+		// 🔴 But not all of them (2026-09-10). #45 deliberately kept refusing
+		// /completions and /embeddings on a ChatGPT OAuth credential: the codex
+		// backend serves neither, and forwarding them hands the client that
+		// backend's misleading error instead of the actionable
+		// OAUTH_RESPONSES_ONLY sentence. This function used to return here before
+		// anything consulted that gate, so both paths were forwarded again — and
+		// the gate's own tests stayed green, because they test the gate function,
+		// which never changed.
+		//
+		// The gate stays the single source of truth for WHICH paths are foreign;
+		// this only decides whether the destination is the one the gate's
+		// sentence describes. The upstream is resolved lazily, so /v1/models never
+		// pays for (or logs about) that lookup. A relay an operator declared is
+		// not the codex backend and may serve /embeddings, so #44's pass-through
+		// stands for it.
+		// Bugfix: workflow/CI/bugfix/20260910-bridge-dropped-the-gate-for-non-chat-surfaces.md
+		// Fences: TestBridgeGate_* in oauth_gate_non_chat_surfaces_test.go; regression R15 (v1.0.1-alpha.16)
+		if reason := oauthUpstreamRejectsPath(oauthCode, r.URL.Path); reason != "" {
+			base := p.oauthUpstreamBase(oauthCode, protocolType, existingBase, logger)
+			if p.bridgeRT().isCodexEndpoint(base) {
+				if logger != nil {
+					logger.Warn("oauth upstream does not serve this endpoint",
+						"event.name", observability.EventProxyRequestDialectUnsupported,
+						"error.code", observability.ErrCodeOAuthResponsesOnly,
+						"error.message", reason,
+						"url.path", r.URL.Path,
+					)
+				}
+				return r, &dialectRefusal{
+					Status:    oauthResponsesOnlyStatus,
+					ErrorType: "invalid_request_error",
+					Code:      observability.ErrCodeOAuthResponsesOnly,
+					Message:   reason,
+				}
+			}
+		}
 		return r, nil
 	}
 
