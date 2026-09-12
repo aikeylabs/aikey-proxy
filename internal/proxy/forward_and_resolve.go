@@ -1188,6 +1188,21 @@ func (p *Proxy) serveRoute(w http.ResponseWriter, r *http.Request, route *vkeys.
 				// and translation so tokens/usage and audit see the masked form;
 				// the restored originals exist only on the wire to the client.
 				// No-op nil check when this request built no restore mapping.
+				//
+				// bugfix: 需求包 roadmap20260320/技术实现/阶段9-商业化版本/博时基金合规能力融合/
+				// R-compliance-canned-answer-1 代答短路请求，原文不出上游 (proposal
+				// layer; upgrades to a `spec:` anchor when the rule is written back)
+				//   —— its 射程 note is where 「规则 2 唯一例外」 above got a globally
+				//   unique id: design §6 不变量 13 says 护栏只在「请求未发往上游」时
+				//   写响应体，占位符还原是既有且唯一的例外，and THIS is that
+				//   exception. Nothing else the compliance guardrail owns may write
+				//   a body from the response leg — in particular the canned answer
+				//   must never be synthesised here, because the whole point of it is
+				//   that the request was never issued.
+				// 围栏: compliance_guardrail_response_fence_test.go —
+				//   TestFence_GuardrailNeverRewritesAForwardedResponse; this call is
+				//   the sole entry in responseLegGuardrailExemptions, and a second
+				//   one is a user sign-off, not a code change.
 				if maskRestoreFromContext(r.Context()) != nil {
 					body = restoreMaskedResponseBody(r.Context(), body, logger)
 				}

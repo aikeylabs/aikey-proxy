@@ -616,6 +616,35 @@ func (p *Proxy) applyInboundFilter(
 			// Refuse the whole request — one content piece contained content the
 			// policy blocks (e.g. full private key, batch customer data). Restore
 			// the original body for any error-path logging; do NOT forward.
+			//
+			// 🔴 THIS IS THE GUARDRAIL SHORT-CIRCUIT. Two red lines govern the
+			// bytes written below, and the canned answer (代答) is specified to
+			// land at this exact point rather than beside it:
+			//
+			// R-compliance-canned-answer-1 代答短路请求，原文不出上游
+			//   —— 与 ActionBlock 使用同一短路点与同一 `return false` 语义。
+			//   Its 射程 note carries design §6 不变量 13: 护栏只在「请求未发往
+			//   上游」时写响应体；一旦转发过上游，响应体永不由护栏改写（占位符
+			//   还原是既有且唯一的例外，见 filter_restore.go）。
+			// R-compliance-canned-answer-3 代答文案原样输出，不得插值命中片段
+			//   —— design §6 不变量 12. Whatever text goes to the client here is
+			//   printed VERBATIM: no Sprintf, no template, no concatenation of
+			//   anything the detector found. Interpolation would turn the refusal
+			//   into a channel that echoes the customer's ID-card number back to
+			//   whoever sent it — the same red line as 「原文不出客户信任边界」,
+			//   reached from the other side.
+			//
+			// bugfix: 需求包 roadmap20260320/技术实现/阶段9-商业化版本/博时基金合规能力融合/
+			//   openspec/changes/add-compliance-grading-fusion/specs/compliance-canned-answer/spec.md
+			//   (both rules are still PROPOSAL-layer, so they are referenced by id
+			//   rather than written as `spec:` anchors — a `spec:` anchor tells
+			//   check-spec-writeback the rule has landed, and the canned answer has
+			//   not. Upgrade both in the change that lands it. Same convention as
+			//   aikey-control-master internal/compliance/grading_document.go.)
+			// 围栏: compliance_guardrail_response_fence_test.go —
+			//   TestFence_GuardrailShortCircuitBodyIsNeverInterpolated derives THIS
+			//   call site from the source and rejects any non-verbatim argument, so
+			//   the canned answer inherits the check without anyone updating a list.
 			p.errors.Add(1)
 			logger.Info("filter: request blocked",
 				"event.name", "proxy.filter.blocked",
