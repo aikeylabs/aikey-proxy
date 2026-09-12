@@ -30,6 +30,48 @@ listen:
 
 vault:
   path: "~/.aikey/data/vault.db"
+# Chat Completions bridge — OFF by default.
+#
+# A ChatGPT OAuth (codex) credential's upstream, chatgpt.com/backend-api/codex,
+# serves ONLY the OpenAI Responses API (/responses). Clients speaking the
+# ordinary Chat Completions dialect (the OpenAI SDKs, opencode, ai-sdk,
+# LangChain, Cursor, ...) are refused with OAUTH_RESPONSES_ONLY.
+#
+# enabled: true makes AiKey translate instead of refusing, in either direction,
+# turning a team ChatGPT subscription into a general OpenAI-compatible endpoint.
+# Off changes nothing about today's behaviour, and /v1/responses traffic is
+# unaffected in either state.
+#
+# 🔴 DO NOT turn it on by editing THIS file. This is the SYSTEM layer — it is
+# re-rendered on every install, so a change here is silently reverted on the
+# next upgrade. Set it in the USER layer, which is never re-rendered and wins
+# on merge (same place upstream_proxy lives):
+#
+#   # ~/.aikey/config/aikey-user.yaml
+#   proxy:
+#     chat_completions_bridge:
+#       enabled: true
+#
+# upstreams — where an OAuth credential may send its token, and what each
+# destination speaks. Empty (the default) means ONE destination is reachable:
+# the compiled-in chatgpt.com/backend-api/codex.
+#
+# 🔴 This list is a security boundary. An OAuth access token is not a key the
+# customer can cheaply rotate — it IS the ChatGPT subscription, and any host
+# that receives one holds the whole account. So there is no wildcard form,
+# entries are matched by exact hostname, and a non-https destination is refused
+# unless it is loopback. `dialect` is REQUIRED (responses | chat_completions):
+# guessing it would send a well-formed request in the wrong shape, so a missing
+# value fails startup instead.
+#
+#   upstreams:
+#     - host: "relay.corp.example"
+#       dialect: "chat_completions"
+chat_completions_bridge:
+  enabled: false
+  upstreams: []
+
+
 
 # Virtual keys are delivered via vault (managed_virtual_keys_cache or
 # personal_route_token columns). Add keys with `aikey add <alias>

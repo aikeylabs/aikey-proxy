@@ -8,12 +8,12 @@ package proxy
 // §上游地址单一解析 fixes two rules that this package used to satisfy on the
 // forwarding path only:
 //
-//	1. 「单一解析器」 — the upstream address comes from ONE resolver: the route
-//	   row for (provider, protocol), with the key's own address as an explicit
-//	   overlay on top.
-//	2. 「展示=执行」 — what we SHOW (and what we PROBE) must be byte-identical to
-//	   what we FORWARD to, "同一个解析函数". The spec goes further and says a
-//	   second, parallel fallback 「应导致围栏变红」.
+//  1. 「单一解析器」 — the upstream address comes from ONE resolver: the route
+//     row for (provider, protocol), with the key's own address as an explicit
+//     overlay on top.
+//  2. 「展示=执行」 — what we SHOW (and what we PROBE) must be byte-identical to
+//     what we FORWARD to, "同一个解析函数". The spec goes further and says a
+//     second, parallel fallback 「应导致围栏变红」.
 //
 // The connectivity probe never obeyed either. It could not: the resolution
 // lived inline in the Tier2Probe sentinel branch of pipelines.go, reachable

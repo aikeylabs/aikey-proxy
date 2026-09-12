@@ -195,6 +195,19 @@ const (
 	// original status; an operator reading this line knows a channel is
 	// advertising a model its accounts cannot serve.
 	EventProxyCodexUpstreamReclassified = "proxy.codex.upstream_reclassified"
+	// EventProxyBridgeEngaged marks a request whose Chat Completions body was
+	// translated to the Responses API for a credential whose upstream serves
+	// only that dialect. Emitted once per bridged request, at Info: it is the
+	// only signal that distinguishes "the operator turned the bridge on" from
+	// "the bridge is on but nothing reaches it".
+	EventProxyBridgeEngaged = "proxy.request.bridge_engaged"
+	// EventProxyBridgeTranslateFailed marks a bridged response the translator
+	// could not convert back to the inbound dialect. Error, not Warn: the
+	// client receives a 502 instead of an answer.
+	EventProxyBridgeTranslateFailed = "proxy.response.bridge_translate_failed"
+	// EventProxyBridgeContentTypeSniffed: an armed bridge received an upstream
+	// body with NO Content-Type and classified it from its first bytes.
+	EventProxyBridgeContentTypeSniffed = "proxy.response.bridge_content_type_sniffed"
 	// Fence I13 runtime guard (2026-07-21). EventProxyRequestIdentityScrubbed:
 	// an outbound header carried one of the control-plane member-identity shapes
 	// enumerated in proxy/member_identity_guard.go (that file is the only place
@@ -526,6 +539,12 @@ const (
 	// the fallback chain. Distinct from OAUTH_CODEX_SHAPE_UNSUPPORTED, which is
 	// about the request SHAPE and is decided before dialing.
 	ErrCodeOAuthModelUnsupported = "OAUTH_MODEL_UNSUPPORTED"
+	// ErrCodeOAuthUpstreamNotAllowed marks an OAuth credential whose configured
+	// upstream was discarded because it is not on the operator's allowlist, or
+	// is reachable only over plaintext. The request still runs, against the
+	// compiled-in default — the code exists so a configured value that does
+	// nothing is distinguishable from one that works.
+	ErrCodeOAuthUpstreamNotAllowed = "OAUTH_UPSTREAM_NOT_ALLOWED"
 	// ErrCodeAccountEgressProxy (§11.7, P7): the resolved oauth-group account pins
 	// a per-account egress proxy whose already-constructed dial path is currently
 	// unreachable. 503; the request is REFUSED rather than sent out the node's IP

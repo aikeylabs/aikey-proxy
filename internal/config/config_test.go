@@ -289,3 +289,156 @@ func TestLoad_EmptyUserYamlIsNoOp(t *testing.T) {
 		t.Fatalf("empty user file shouldn't override anything: got team=%q", got)
 	}
 }
+
+// TestChatCompletionsBridge_UserLayerOverridesSystem is the fence for a
+// delivery trap, not for the parser.
+//
+// aikey-proxy.yaml is the SYSTEM layer: aikey-config-tool re-renders it from
+// the template on every install. An operator who turns the bridge on by
+// editing that file would have it silently reverted on the next upgrade — the
+// feature would appear to "randomly stop working" with nothing in any log.
+// The supported place is aikey-user.yaml's `proxy:` section, which is never
+// re-rendered and wins on merge. This test proves that path actually reaches
+// Config, so the instruction in the template comment is true.
+func TestChatCompletionsBridge_UserLayerOverridesSystem(t *testing.T) {
+	dir := t.TempDir()
+	sysPath := filepath.Join(dir, "aikey-proxy.yaml")
+	if err := os.WriteFile(sysPath, []byte(
+		"listen:\n  host: \"127.0.0.1\"\n  port: 27200\n"+
+			"vault:\n  path: \"/tmp/v.db\"\n"+
+			"chat_completions_bridge:\n  enabled: false\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	// No user file yet: the system default must hold.
+	cfg, err := Load(sysPath)
+	if err != nil {
+		t.Fatalf("load without user file: %v", err)
+	}
+	if cfg.ChatCompletionsBridge.Enabled {
+		t.Fatal("bridge is on with no user override; off must be the shipped default")
+	}
+
+	if err := os.WriteFile(filepath.Join(dir, "aikey-user.yaml"), []byte(
+		"proxy:\n  chat_completions_bridge:\n    enabled: true\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err = Load(sysPath)
+	if err != nil {
+		t.Fatalf("load with user file: %v", err)
+	}
+	if !cfg.ChatCompletionsBridge.Enabled {
+		t.Fatal("the user layer did not reach Config — an operator turning the bridge on " +
+			"in aikey-user.yaml would see no effect, and the only writable alternative " +
+			"(the system file) is reverted on upgrade")
+	}
+}
+
+// TestChatCompletionsBridge_UpstreamValidation guards the config surface that
+// decides where an OAuth token may be sent.
+//
+// Every case here fails at STARTUP on purpose. The alternative — noticing at
+// the first request that needs it — means a deployment looks healthy until a
+// user hits the one credential that is misconfigured, and the symptom
+// (wrong-shaped request, or traffic quietly going to the default) points
+// nowhere near the config.
+func TestChatCompletionsBridge_UpstreamValidation(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		up      []BridgeUpstream
+		wantErr string
+	}{
+		{"valid", []BridgeUpstream{{Host: "relay.example", Dialect: BridgeDialectChatCompletions}}, ""},
+		{"valid responses", []BridgeUpstream{{Host: "r.example", Dialect: BridgeDialectResponses}}, ""},
+		{"missing host", []BridgeUpstream{{Dialect: BridgeDialectResponses}}, "host is required"},
+		{"missing dialect", []BridgeUpstream{{Host: "relay.example"}}, "dialect is required"},
+		{"unknown dialect", []BridgeUpstream{{Host: "relay.example", Dialect: "grpc"}}, "unknown dialect"},
+		{"scheme in host", []BridgeUpstream{{Host: "https://relay.example", Dialect: BridgeDialectResponses}}, "bare hostname"},
+		{"wildcard host", []BridgeUpstream{{Host: "*.example", Dialect: BridgeDialectResponses}}, "bare hostname"},
+		{"path in host", []BridgeUpstream{{Host: "relay.example/v1", Dialect: BridgeDialectResponses}}, "bare hostname"},
+		{"duplicate host", []BridgeUpstream{
+			{Host: "relay.example", Dialect: BridgeDialectResponses},
+			{Host: "RELAY.example", Dialect: BridgeDialectChatCompletions},
+		}, "listed twice"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			err := ChatCompletionsBridgeConfig{Enabled: true, Upstreams: tc.up}.Validate()
+			if tc.wantErr == "" {
+				if err != nil {
+					t.Fatalf("valid config rejected: %v", err)
+				}
+				return
+			}
+			if err == nil {
+				t.Fatalf("invalid config accepted (%s)", tc.name)
+			}
+			if !strings.Contains(err.Error(), tc.wantErr) {
+				t.Errorf("error = %q, want it to mention %q", err, tc.wantErr)
+			}
+		})
+	}
+}
+
+// TestChatCompletionsBridge_EmptyIsValid — the shipped default must not need a
+// config block at all.
+func TestChatCompletionsBridge_EmptyIsValid(t *testing.T) {
+	if err := (ChatCompletionsBridgeConfig{}).Validate(); err != nil {
+		t.Fatalf("the zero-value bridge config was rejected: %v", err)
+	}
+}
+
+// TestShippedDefaultConfigsActuallyLoad is a fence over the two files that
+// become a customer's configuration.
+//
+// `aikey-proxy.yaml.example` is copied verbatim into every release bundle as
+// `config/default/aikey-proxy.yaml` (release.sh), and `aikey-proxy.yaml` is the
+// dev fixture the same shape is maintained against. Until this test existed
+// NOTHING parsed either of them: the dev-fixture gate compares top-level key
+// NAMES as text, which cannot notice a YAML syntax error, a mis-indented block
+// or a value of the wrong type.
+//
+// The failure that gap allowed is the worst kind for a shipped default: the
+// file is fine in review, fine in the gate, and then every FRESH INSTALL fails
+// to start — on the customer's machine, at the moment they first try it, with
+// nothing in the repo having gone red.
+func TestShippedDefaultConfigsActuallyLoad(t *testing.T) {
+	for _, name := range []string{"aikey-proxy.yaml", "aikey-proxy.yaml.example"} {
+		t.Run(name, func(t *testing.T) {
+			src := filepath.Join("..", "..", name)
+			if _, err := os.Stat(src); err != nil {
+				t.Fatalf("%s is missing; release.sh ships it as the bundle default", name)
+			}
+			// Copy into a temp dir: Load resolves a sibling aikey-user.yaml, and
+			// reading the repo's own directory would make the result depend on
+			// whatever a developer happens to have lying next to it.
+			dir := t.TempDir()
+			data, err := os.ReadFile(src)
+			if err != nil {
+				t.Fatal(err)
+			}
+			dst := filepath.Join(dir, "aikey-proxy.yaml")
+			if err := os.WriteFile(dst, data, 0o600); err != nil {
+				t.Fatal(err)
+			}
+
+			cfg, err := Load(dst)
+			if err != nil {
+				t.Fatalf("the shipped default config does not load: %v\n"+
+					"every fresh install from a release bundle would fail to start", err)
+			}
+
+			// A shipped default must never arrive with translation already on:
+			// it would mean a customer who asked for nothing gets their prompts
+			// and answers rewritten.
+			if cfg.ChatCompletionsBridge.Enabled {
+				t.Error("the shipped default enables the dialect bridge; it must be opt-in")
+			}
+			// And it must never arrive pre-authorizing an OAuth destination.
+			if len(cfg.ChatCompletionsBridge.Upstreams) != 0 {
+				t.Errorf("the shipped default pre-authorizes %d OAuth upstream(s); the allowlist "+
+					"must start empty so only the compiled-in destination is reachable",
+					len(cfg.ChatCompletionsBridge.Upstreams))
+			}
+		})
+	}
+}

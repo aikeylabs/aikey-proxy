@@ -3,6 +3,7 @@ package proxy
 import (
 	"context"
 	"encoding/json"
+	"log/slog"
 	"net/http"
 	"net/url"
 	"os"
@@ -331,7 +332,8 @@ func codexUpstreamBaseURL() string {
 // carrying the model in context; the caller must use the returned request).
 // Other providers keep an already-resolved route/account base when present and
 // otherwise fall back to the provider table; they need no request mutation.
-func resolveOAuthUpstream(canonicalCode, protocolType, existingBase string, r *http.Request) (baseURL string, req *http.Request) {
+func (p *Proxy) resolveOAuthUpstream(canonicalCode, protocolType, existingBase string, r *http.Request, logger *slog.Logger) (baseURL string, req *http.Request) {
+	base := p.oauthUpstreamBase(canonicalCode, protocolType, existingBase, logger)
 	switch canonicalCode {
 	case "openai":
 		req = captureCodexModel(r)
@@ -346,7 +348,18 @@ func resolveOAuthUpstream(canonicalCode, protocolType, existingBase string, r *h
 		// makes the forwarded shape match the upstream too. Mirrors the
 		// version-segment re-normalization providerroutes.Stitch does for
 		// table-known API-key hosts.
-		if strings.HasPrefix(req.URL.Path, "/v1/") {
+		// The /v1 strip is a CODEX fact, not an openai one: that upstream
+		// serves /responses directly off its base. A configured relay is a
+		// different destination with its own convention, so the strip is scoped
+		// to the codex base and relays get the generic version-segment dedup
+		// instead (the same rule providerroutes applies to unknown hosts).
+		if p.bridgeRT().isCodexEndpoint(base) {
+			if strings.HasPrefix(req.URL.Path, "/v1/") {
+				req.URL.Path = strings.TrimPrefix(req.URL.Path, "/v1")
+				req.URL.RawPath = ""
+			}
+		} else if strings.HasSuffix(strings.TrimRight(base, "/"), "/v1") &&
+			strings.HasPrefix(req.URL.Path, "/v1/") {
 			req.URL.Path = strings.TrimPrefix(req.URL.Path, "/v1")
 			req.URL.RawPath = ""
 		}
@@ -356,17 +369,30 @@ func resolveOAuthUpstream(canonicalCode, protocolType, existingBase string, r *h
 		// lane cannot forget it. Runs after the path strip so its /responses
 		// check sees the upstream-shaped path.
 		// spec: R-tokenhub-pool-fallback-7.S1 非 Codex 形状的请求不得以 400 断掉兜底链
-		req = normalizeCodexRequest(req)
-		return codexUpstreamBaseURL(), markCodexUpstream(req)
-	default:
-		// A configured test-only override is the final upstream for hermetic
-		// Anthropic E2Es, even when the member runtime carries the provider's
-		// non-empty default URL. runtimeDeps began delivering that default in
-		// 2026-07-23; checking only in providerBaseURLForProtocol then silently
-		// bypassed the hook and sent test traffic to the real provider edge.
-		// Production is unchanged: this branch is inert unless the explicit env
-		// value also passes the loopback / RFC 6761 .test safety gate.
 		//
+		// 🔴 GATED on the destination actually being the Codex backend, which
+		// stopped being a given when an operator gained the ability to declare
+		// another upstream for an openai OAuth credential. The rewrites here
+		// (force store:false, strip temperature / max_output_tokens / metadata)
+		// exist because the CODEX backend 400s on those shapes; codex_shape_
+		// normalize.go's own rule is "never call it for traffic that is not
+		// Codex-bound — api.openai.com accepts all of these shapes". A declared
+		// relay is that same case: normalizing would silently discard the
+		// caller's sampling parameters on a request the relay would have
+		// accepted verbatim.
+		//
+		// markCodexUpstream rides the SAME gate. Its own contract is "called
+		// from resolveOAuthUpstream's two Codex exits", and it exists so a 400
+		// from that backend can be reclassified by codex-specific rules
+		// (codex_upstream_reclassify.go). A declared relay is not that backend:
+		// reclassifying ITS 400s by those rules would relabel an error the
+		// relay meant literally.
+		if p.bridgeRT().isCodexEndpoint(base) {
+			req = normalizeCodexRequest(req)
+			req = markCodexUpstream(req)
+		}
+		return base, req
+	default:
 		// Codex-dialect normalization keys on the PERSONA, not the canonical code:
 		// the Resident Mock Provider simulating the Codex upstream (provider mock +
 		// protocol openai_compatible → persona "openai") enforces the same
@@ -375,20 +401,126 @@ func resolveOAuthUpstream(canonicalCode, protocolType, existingBase string, r *h
 		// the first run answered "400 Input must be a list" exactly because only
 		// the canonical "openai" branch above normalized).
 		// spec: R-tokenhub-pool-fallback-7.S1 非 Codex 形状的请求不得以 400 断掉兜底链
+		//
+		// Left keyed on persona (not on the destination, as the branch above now
+		// is): the dialect bridge returns early for every canonicalCode except
+		// "openai", so a declared relay can never reach this branch.
 		if persona, ok := oauthInjectionProvider(canonicalCode, protocolType); ok && persona == "openai" {
 			r = markCodexUpstream(normalizeCodexRequest(r))
 		}
-		if testBase, ok := oauthTestBaseURL(canonicalCode, protocolType); ok {
-			return testBase, r
-		}
-		if strings.TrimSpace(existingBase) != "" {
-			return existingBase, r
-		}
-		if protocolType != "" {
-			return providerBaseURLForProtocol(canonicalCode, protocolType), r
-		}
-		return providerDefaultBaseURL(canonicalCode), r
+		return base, r
 	}
+}
+
+// oauthUpstreamBase answers ONLY "where does this OAuth credential's traffic
+// go", with no request mutation.
+//
+// It exists as its own function because two callers need that answer at
+// different moments: resolveOAuthUpstream, which then sets up the request, and
+// the dialect bridge, which must know the destination BEFORE the request is
+// shaped (the outbound dialect is a property of the destination). Deriving it
+// twice is how the two would come to disagree about where a request went.
+func (p *Proxy) oauthUpstreamBase(canonicalCode, protocolType, existingBase string, logger *slog.Logger) string {
+	if canonicalCode == "openai" {
+		return p.openAIOAuthBase(existingBase, logger)
+	}
+	// A configured test-only override is the final upstream for hermetic
+	// Anthropic E2Es, even when the member runtime carries the provider's
+	// non-empty default URL. runtimeDeps began delivering that default in
+	// 2026-07-23; checking only in providerBaseURLForProtocol then silently
+	// bypassed the hook and sent test traffic to the real provider edge.
+	// Production is unchanged: this branch is inert unless the explicit env
+	// value also passes the loopback / RFC 6761 .test safety gate.
+	if testBase, ok := oauthTestBaseURL(canonicalCode, protocolType); ok {
+		return testBase
+	}
+	if strings.TrimSpace(existingBase) != "" {
+		return existingBase
+	}
+	if protocolType != "" {
+		return providerBaseURLForProtocol(canonicalCode, protocolType)
+	}
+	return providerDefaultBaseURL(canonicalCode)
+}
+
+// openAIOAuthBase applies the OAuth destination allowlist.
+//
+// # Why openai is the one provider with an allowlist
+//
+// Every other provider's OAuth upstream equals its API-key upstream, so a
+// credential pointed somewhere unusual is the operator's own deployment
+// talking to its own gateway. The ChatGPT OAuth credential is different in kind:
+// the token is not a rotatable key issued for this purpose, it IS the
+// subscription, and any host that receives one holds the whole account. So the
+// destination stays compiled in unless an operator enumerated an alternative.
+//
+// # Why a non-listed base is IGNORED rather than refused
+//
+// Existing codex pools already carry a non-empty runtime base_url that this
+// lane has always discarded. Turning that into a refusal would break every one
+// of them on upgrade to fix a misconfiguration none of them have. It is
+// discarded as before — but never silently: a WARN says which value was
+// dropped, because a configured value that does nothing is otherwise
+// indistinguishable from one that works.
+func (p *Proxy) openAIOAuthBase(existingBase string, logger *slog.Logger) string {
+	def := codexUpstreamBaseURL()
+	candidate := strings.TrimSpace(existingBase)
+	if candidate == "" {
+		return def
+	}
+	host := hostOf(candidate)
+	if host == "" || host == hostOf(def) {
+		return def
+	}
+	if logger == nil {
+		logger = slog.Default()
+	}
+	if !p.bridgeRT().allowsHost(host) {
+		logger.Warn("ignored an OAuth upstream that is not on the allowlist",
+			"event.name", observability.EventProxyRequestUpstreamError,
+			"error.code", observability.ErrCodeOAuthUpstreamNotAllowed,
+			"upstream_host", host,
+			"detail", "add it to chat_completions_bridge.upstreams to permit it; "+
+				"until then this credential uses its compiled-in default",
+		)
+		return def
+	}
+	if !oauthUpstreamTransportAllowed(candidate) {
+		logger.Warn("ignored an allowlisted OAuth upstream reachable only over plaintext",
+			"event.name", observability.EventProxyRequestUpstreamError,
+			"error.code", observability.ErrCodeOAuthUpstreamNotAllowed,
+			"upstream_host", host,
+			"detail", "an OAuth access token is the subscription itself and must not cross a "+
+				"plaintext hop; use https, or a loopback address for local testing",
+		)
+		return def
+	}
+	return candidate
+}
+
+// oauthUpstreamTransportAllowed refuses to carry an OAuth token over a hop that
+// anyone on the path can read.
+//
+// https is the rule. The two exceptions are addresses that never leave the
+// machine or can never resolve publicly — loopback, and the RFC 6761 reserved
+// .test TLD the hermetic E2Es use — which is the same safety shape
+// testOnlyBaseURLAllowed already applies to the test hooks.
+func oauthUpstreamTransportAllowed(raw string) bool {
+	u, err := url.Parse(raw)
+	if err != nil {
+		return false
+	}
+	if u.Scheme == "https" {
+		return true
+	}
+	if u.Scheme != "http" {
+		return false
+	}
+	host := u.Hostname()
+	if host == "127.0.0.1" || host == "localhost" || host == "::1" {
+		return true
+	}
+	return strings.HasSuffix(host, ".test")
 }
 
 // oauthUpstreamRejectsPath reports whether an OAuth-credential request can NOT
@@ -431,15 +563,50 @@ func oauthUpstreamRejectsPath(canonicalCode, urlPath string) string {
 	if canonicalCode != "openai" {
 		return ""
 	}
-	// The Responses API is the only dialect chatgpt.com/backend-api/codex serves.
-	// Match on suffix so both /v1/responses (legacy lane) and /responses (group
-	// lane, already stripped) pass.
-	if strings.HasSuffix(strings.TrimSuffix(urlPath, "/"), "/responses") {
+	// 🔴 Refuse the CHAT DIALECT, not every path that is not /responses
+	// (2026-09-10). The original rule was "allow /responses, refuse the rest",
+	// written when Responses was the only endpoint anyone had reason to call.
+	// chatgpt.com/backend-api/codex is a whole product surface, and it serves
+	// more than that — measured from a codex client's own request log, talking
+	// DIRECTLY to the upstream with the same kind of OAuth credential:
+	//
+	//     GET  /backend-api/codex/models        → 200   (340 calls, 333 KB body)
+	//     POST /backend-api/codex/responses     → 200   (52 calls)
+	//     POST /backend-api/codex/images/edits  → 200   (image generation)
+	//
+	// So the sentence this used to return — "whose upstream only serves the
+	// Responses API" — was simply FALSE for those paths, and the refusal was
+	// ours, not the upstream's. The cost was not cosmetic: codex probes
+	// /models before it will use a provider, so an OAuth credential behind
+	// AiKey was refused at discovery and never issued the /responses call it
+	// was perfectly able to make (measured on a live cluster: 7 /models
+	// attempts, 0 /responses). Image generation was blocked the same way.
+	//
+	// The gate keeps doing the job it was built for on 2026-07-13: a client
+	// that speaks Chat Completions (opencode, ai-sdk, LangChain) still gets a
+	// sentence naming the real problem instead of the upstream's misleading
+	// "invalid x-api-key". That is a claim about THREE known surfaces, so it is
+	// now written as those three rather than as "everything else".
+	//
+	// 🚫 Deliberately a DENYLIST of known-foreign dialects, not an allowlist of
+	// what codex serves. An allowlist would silently block every endpoint that
+	// backend grows next — which is exactly the failure being fixed here, one
+	// release later.
+	// Bugfix: workflow/CI/bugfix/20260910-oauth-gate-refused-endpoints-the-upstream-serves.md
+	trimmed := strings.TrimSuffix(urlPath, "/")
+	chatDialect := false
+	for _, suffix := range []string{"/chat/completions", "/completions", "/embeddings"} {
+		if strings.HasSuffix(trimmed, suffix) {
+			chatDialect = true
+			break
+		}
+	}
+	if !chatDialect {
 		return ""
 	}
-	return "This key is backed by a ChatGPT OAuth account, whose upstream only serves the Responses API (/responses). " +
-		"The client called " + urlPath + " (Chat Completions). Use an API-key credential for this client, " +
-		"or use a Responses-API client such as codex."
+	return "This key is backed by a ChatGPT OAuth account, whose upstream serves the Responses API (/responses), " +
+		"not the Chat Completions family. The client called " + urlPath + " (Chat Completions). " +
+		"Use an API-key credential for this client, or use a Responses-API client such as codex."
 }
 
 // testOnlyBaseURLAllowed gates the AIKEY_PROXY_TEST_* base-url hooks. Allowed:

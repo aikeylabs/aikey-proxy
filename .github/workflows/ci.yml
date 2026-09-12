@@ -1,32 +1,32 @@
 # CI gate — runs unit/in-process tests on every push and PR.
 # Project rule: 持续交付 = CI/CD 失败即失败. A non-zero exit blocks the PR.
-# Scope: native `go test ./...` only (no docker/PG); heavier integration
-# (dbmigrate-test-postgres etc.) is intentionally left to nightly/opt-in so
-# this gate needs nothing beyond a GitHub-hosted runner.
+# Scope: native `go test ./...` + the release gate's `make lint` (no docker/PG);
+# heavier integration (dbmigrate-test-postgres etc.) is intentionally left to
+# nightly/opt-in so this gate needs nothing beyond a GitHub-hosted runner.
 #
 # 🔴 Why the sibling checkout below exists (added 2026-08-14)
 #
-# This module's go.mod `replace`s fourteen dependencies to `../<repo>` paths. A
-# lone `actions/checkout` gives the runner none of them, so EVERY run died in
+# This module's go.mod `replace`s its dependencies to `../<repo>` paths. A lone
+# `actions/checkout` gives the runner none of them, so EVERY run died in
 # `go vet` with
 #
 #     github.com/AiKeyLabs/pkg/egress@v0.0.0: replacement directory ../pkg/egress
-#     does not exist                                        (×14)
+#     does not exist
 #
 # before a single test executed. That is not a flaky gate — it is a gate that has
-# never once run. The hot-path call-graph fence (MOD-16 / PLANE-01) has lived in
-# internal/proxy since it landed and had never been exercised by CI; it was only
-# ever run by hand. A fence CI cannot reach is a fence nobody is holding.
+# never once run. A fence CI cannot reach is a fence nobody is holding.
 #
 # ⚠️ REQUIRED SECRET: AIKEY_CI_TOKEN — a PAT or GitHub App installation token that
-# can read aikey-auth-broker, aikey-config-tool and ai-degrade-detector, which are
-# PRIVATE. The default GITHUB_TOKEN cannot read another private repository.
+# can READ every sibling repository. The list is not written here: it is derived
+# from go.mod (scripts/ci/siblings.sh repos) plus aikey-cli for a golden fixture,
+# and every run prints it as a table in the job summary, marking which repositories
+# the token can and cannot read. The default GITHUB_TOKEN cannot read another
+# private repository.
 #
 #     gh secret set AIKEY_CI_TOKEN --repo aikeylabs/aikey-proxy
 #
-# The preflight FAILS rather than skipping when it is absent: a run that could not
-# see two thirds of what it compiles must not report green. Same contract as
-# aikey-license-core's exit-gate.yml and aikey-cli's parity job.
+# The preflight FAILS rather than skipping when the token is absent or cannot read
+# a sibling: a run that could not see what it compiles must not report green.
 name: CI
 
 on:
@@ -45,6 +45,14 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          # Full history, for two consumers: `make lint` diffs against a pinned
+          # baseline commit (--new-from-rev), and the release-line resolver below
+          # needs merge-bases with the remote release branches.
+          fetch-depth: 0
+
+      - name: CI helper scripts behave (sibling list, release-line resolver)
+        run: make test-ci-scripts
 
       - name: Preflight — the sibling-checkout token must be present
         env:
@@ -52,9 +60,72 @@ jobs:
         run: |
           if [ -z "${TOKEN}" ]; then
             echo "::error::AIKEY_CI_TOKEN is not configured. This module replaces" \
-                 "fourteen dependencies to private sibling repositories and the" \
-                 "default GITHUB_TOKEN cannot read them. Refusing to run a gate" \
-                 "that could not compile what it is meant to check."
+                 "dependencies to private sibling repositories and the default" \
+                 "GITHUB_TOKEN cannot read them. Refusing to run a gate that could" \
+                 "not compile what it is meant to check."
+            exit 1
+          fi
+
+      # 🔴 Which repositories, and which release line, are DERIVED — see
+      # scripts/ci/siblings.sh for why neither is written down here any more.
+      - name: Resolve the sibling repositories and this commit's release line
+        id: siblings
+        run: |
+          set -euo pipefail
+          repos="$(bash scripts/ci/siblings.sh repos go.mod | tr '\n' ' ')aikey-cli"
+          line="$(bash scripts/ci/siblings.sh release-line)"
+          echo "repos=${repos}" >> "$GITHUB_OUTPUT"
+          echo "release_line=${line}" >> "$GITHUB_OUTPUT"
+          echo "::notice::sibling repositories: ${repos} · release line of this commit: ${line}"
+
+      # 🔴 Probe EVERY repository before failing, and say which ones in the job
+      # summary. The previous form stopped at the first unreadable repository, so
+      # an admin fixing the token saw one name per run — and since 2026-08-26 every
+      # run on develop-v1.0.6 died on aikey-auth-broker without anyone reading the
+      # log. "Cannot see it" and "it is not there" are different problems: this
+      # step is the first one; the next step reports the second.
+      - name: Preflight — AIKEY_CI_TOKEN can read every sibling repository
+        env:
+          TOKEN: ${{ secrets.AIKEY_CI_TOKEN }}
+          REPOS: ${{ steps.siblings.outputs.repos }}
+        run: |
+          set -euo pipefail
+          dir="${RUNNER_TEMP}/siblings"; mkdir -p "$dir"
+          unreadable=""
+          {
+            echo "### Sibling repositories \`AIKEY_CI_TOKEN\` must be able to read"
+            echo ""
+            echo "| repository | why this job needs it | readable |"
+            echo "|---|---|---|"
+          } >> "$GITHUB_STEP_SUMMARY"
+          for repo in $REPOS; do
+            if [ "$repo" = aikey-cli ]; then
+              why="cross-language golden fixture (tests/fixtures/team_token_normalize.json)"
+            else
+              why="go.mod replace → $(bash scripts/ci/siblings.sh modules "$repo" go.mod | sed -E 's#^github.com/[^/]+/##' | paste -sd, - | sed 's/,/, /g')"
+            fi
+            url="https://x-access-token:${TOKEN}@github.com/aikeylabs/${repo}.git"
+            if heads="$(git ls-remote --heads "$url" 2>&1)"; then
+              printf '%s\n' "$heads" > "${dir}/${repo}.heads"
+              mark="yes"
+            else
+              unreadable="${unreadable} ${repo}"
+              mark="**NO**"
+              echo "::group::git ls-remote ${repo}"
+              # 🚫 Sanitise: git echoes the URL back, and the URL carries the token.
+              printf '%s\n' "$heads" | sed "s#${TOKEN}#***#g" | head -3
+              echo "::endgroup::"
+            fi
+            echo "| \`aikeylabs/${repo}\` | ${why} | ${mark} |" >> "$GITHUB_STEP_SUMMARY"
+          done
+          if [ -n "$unreadable" ]; then
+            {
+              echo ""
+              echo "**AIKEY_CI_TOKEN cannot read:${unreadable}.** These repositories exist; the token's scope does not cover them."
+              echo "An org admin must grant the token read access to **every** repository in the table above."
+              echo "Until then this job compiles, vets, lints and tests nothing."
+            } >> "$GITHUB_STEP_SUMMARY"
+            echo "::error title=AIKEY_CI_TOKEN cannot read${unreadable}::The token must be able to read ALL of: ${REPOS}. See the job summary for why each is needed. This is token scope, not a missing branch."
             exit 1
           fi
 
@@ -67,67 +138,51 @@ jobs:
           TOKEN: ${{ secrets.AIKEY_CI_TOKEN }}
           HEAD_REF: ${{ github.head_ref }}
           BASE_REF: ${{ github.base_ref }}
+          REPOS: ${{ steps.siblings.outputs.repos }}
+          RELEASE_LINE: ${{ steps.siblings.outputs.release_line }}
         run: |
           set -euo pipefail
           parent="$(dirname "$GITHUB_WORKSPACE")"
-
-          # 🔴 The order matters. A coordinated cross-repo change puts the SAME
-          # branch name in several repositories, so the PR's own head ref wins.
-          # Then the branch this PR targets — that is what makes a PR into
-          # develop-v1.0.5 pick up develop-v1.0.5 siblings without anything here
-          # naming a release line that later goes stale.
-          for repo in pkg aikey-auth-broker aikey-config-tool ai-degrade-detector aikey-cli; do
+          {
+            echo ""
+            echo "### Sibling branches this run compiled against (release line: \`${RELEASE_LINE}\`)"
+            echo ""
+            echo "| repository | branch |"
+            echo "|---|---|"
+          } >> "$GITHUB_STEP_SUMMARY"
+          for repo in $REPOS; do
             url="https://x-access-token:${TOKEN}@github.com/aikeylabs/${repo}.git"
-
-            # 🔴 Read the ref list ONCE, and keep git's stderr.
-            #
-            # This step's first form asked `git ls-remote --exit-code --heads` per
-            # candidate ref with `2>&1` sent to /dev/null, then reported "none of
-            # the candidate refs exist" if every probe failed. A token that cannot
-            # READ the repository fails exactly the same way — so the first real
-            # run blamed a missing branch on aikey-auth-broker while
-            # develop-v1.0.5 and main both existed, and the actual cause (the
-            # token's scope does not cover that private repo) was in the stderr
-            # that had been discarded. "Cannot see it" and "it is not there" are
-            # different problems with different fixes and must not print the same
-            # sentence.
-            if ! heads="$(git ls-remote --heads "$url" 2>&1)"; then
-              echo "::error::${repo}: cannot be read with AIKEY_CI_TOKEN. The repo" \
-                   "exists; the token's scope probably does not cover it. git said:"
-              # 🚫 Sanitise: git echoes the URL back, and the URL carries the token.
-              printf '%s\n' "$heads" | sed "s#${TOKEN}#***#g" | head -3
-              exit 1
-            fi
+            heads="$(cat "${RUNNER_TEMP}/siblings/${repo}.heads")"
 
             # 🔴 The order matters. A coordinated cross-repo change puts the SAME
-            # branch name in several repositories, so the PR's own head ref wins.
-            # Then the branch this PR targets — that is what makes a PR into
-            # develop-v1.0.5 pick up develop-v1.0.5 siblings without anything here
-            # naming a release line that later goes stale.
-            picked=""
-            for ref in "${HEAD_REF:-}" "${BASE_REF:-}" "${GITHUB_REF_NAME:-}" develop-v1.0.5 main; do
+            # branch name in several repositories, so the PR's own head ref wins,
+            # then the branch a PR targets, then the pushed branch itself. After
+            # those comes this commit's RELEASE LINE, resolved from merge-bases.
+            # Until 2026-09-11 that slot was a literal `develop-v1.0.5`: a push
+            # has no head/base ref, so every feature-branch push on develop-v1.0.6
+            # compiled against develop-v1.0.5 siblings.
+            picked=""; tried=""
+            for ref in "${HEAD_REF:-}" "${BASE_REF:-}" "${GITHUB_REF_NAME:-}" "${RELEASE_LINE:-}" main; do
               [ -n "$ref" ] || continue
+              tried="${tried} ${ref}"
               if printf '%s\n' "$heads" | awk '{print $2}' | grep -qxF "refs/heads/${ref}"; then
                 picked="$ref"; break
               fi
             done
             if [ -z "$picked" ]; then
-              echo "::error::${repo}: none of the refs tried exist" \
-                   "(${HEAD_REF:-} ${BASE_REF:-} ${GITHUB_REF_NAME:-} develop-v1.0.5 main)." \
+              echo "::error::${repo}: none of the refs tried exist (${tried# })." \
                    "Branches this repo actually has:"
               printf '%s\n' "$heads" | awk '{print "  " $2}' | head -10
               exit 1
             fi
             echo "::notice::${repo} @ ${picked}"
+            echo "| \`${repo}\` | \`${picked}\` |" >> "$GITHUB_STEP_SUMMARY"
             git clone --quiet --depth 1 --branch "$picked" "$url" "${parent}/${repo}"
           done
 
-      # 🔴 The anti-drift check, and the reason this job does not carry a
-      # hand-written list of module paths. The list above is REPOSITORIES; this
-      # asserts every `../` target go.mod actually names now resolves. Add a
-      # replace to a new repository and CI tells you exactly which path is
-      # missing, instead of reprinting fourteen module errors that bury the one
-      # that changed.
+      # 🔴 The anti-drift check. The list above is REPOSITORIES; this asserts every
+      # `../` target go.mod names resolves on the branch that was picked. Add a
+      # replace to a new directory and CI names exactly the path that is missing.
       - name: Every replace target resolves
         run: |
           set -euo pipefail
@@ -136,8 +191,7 @@ jobs:
           while IFS= read -r target; do
             [ -n "$target" ] || continue
             if [ ! -d "${parent}/${target#../}" ]; then
-              echo "::error::go.mod replaces ${target}, which is not checked out." \
-                   "Add its repository to the sibling checkout step above."
+              echo "::error::go.mod replaces ${target}, which is not present on the checked-out branch."
               missing=1
             fi
           done < <(grep -oE '=> \.\./[^[:space:]]+' go.mod | sed 's/^=> //' | sort -u)
@@ -147,9 +201,7 @@ jobs:
           # TestNormalizeTeamToken_GoldenCases reads the Rust CLI's
           # team_token_normalize.json so the two implementations of one spec are
           # compared against each other rather than each against its own idea of
-          # the answer. Without it that test fails "could not resolve monorepo
-          # root" — which is correct, and is also why go.mod alone is not the
-          # whole answer to "what does this suite need beside it".
+          # the answer.
           if [ ! -f "${parent}/aikey-cli/tests/fixtures/team_token_normalize.json" ]; then
             echo "::error::aikey-cli checked out without the team-token golden fixture."
             missing=1
@@ -163,5 +215,17 @@ jobs:
           cache: true
       - name: go vet
         run: go vet ./...
+
+      # 🔴 The release gate's lint, pre-merge. release.sh Step 2 runs "Proxy lint"
+      # (`make lint`, golangci --new-from-rev against a pinned baseline). CI never
+      # ran it, so the 47 findings PR #44 introduced were first seen by a release
+      # build days after merge (fixed in #46). Same target, same pinned
+      # golangci-lint version as the release host: GOLANGCI_LINT_VERSION in the
+      # Makefile.
+      - name: Install the pinned golangci-lint
+        run: make install-lint
+      - name: make lint (release gate)
+        run: make lint
+
       - name: go test
         run: go test ./... -count=1

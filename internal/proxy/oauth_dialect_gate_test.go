@@ -34,6 +34,23 @@ func TestOAuthUpstreamRejectsPath_CodexResponsesOnly(t *testing.T) {
 		{"openai oauth + group-lane /responses → allow", "openai", "/responses", false},
 		{"openai oauth + trailing slash → allow", "openai", "/v1/responses/", false},
 
+		// 🔴 The codex backend serves MORE than /responses, and refusing these
+		// was our bug, not the upstream's limit (2026-09-10). Each line below is
+		// a path a codex client was observed calling DIRECTLY against
+		// chatgpt.com/backend-api/codex and getting 200 — so a refusal here is
+		// AiKey inventing a failure the upstream would not have produced.
+		//
+		// /models is the expensive one: codex probes it before it will use a
+		// provider at all, so refusing it stopped the client at discovery and
+		// no /responses call was ever attempted (live cluster: 7 probes, 0
+		// /responses). /images/edits is how codex generates images; refusing it
+		// is why "图像服务返回 401" had no working answer.
+		{"openai oauth + models (codex probes this first) → allow", "openai", "/v1/models", false},
+		{"openai oauth + group-lane models → allow", "openai", "/models", false},
+		{"openai oauth + images/edits (codex image tool) → allow", "openai", "/v1/images/edits", false},
+		{"openai oauth + group-lane images/edits → allow", "openai", "/images/edits", false},
+		{"openai oauth + images/generations → allow", "openai", "/v1/images/generations", false},
+
 		// Every other provider's OAuth upstream == its API-key upstream: no gate.
 		{"anthropic oauth + messages → allow", "anthropic", "/v1/messages", false},
 		{"kimi oauth + chat/completions → allow", "kimi", "/v1/chat/completions", false},
