@@ -569,6 +569,16 @@ func Run() {
 	//
 	// See internal/proxy/license_capability.go.
 	announceLicenseCapabilities()
+	// The effective dialect-bridge switch and where it came from. Wired
+	// unconditionally: on a deployment with no control plane this reports
+	// source=local_config, which is the truthful answer and the one an operator
+	// needs when the console switch appears not to work.
+	adminHandler.DialectBridgeFn = func() admin.DialectBridgeStatus {
+		return admin.DialectBridgeStatus{
+			Enabled: sup.ChatCompletionsBridgeEnabled(),
+			Source:  sup.BridgeSwitchSource(),
+		}
+	}
 	adminHandler.SyncHealthFn = func() map[string]admin.SyncRailStatus {
 		snap := sup.ControlPlaneSyncSnapshot()
 		if len(snap) == 0 {

@@ -446,6 +446,14 @@ type Supervisor struct {
 	// local filter_stages is NULL (master mandate); the user's local toggle still
 	// governs when this is false. Polled by pollComplianceMasterPolicy.
 	masterCompliance atomic.Bool
+	// masterBridge is the control plane's answer for the Chat Completions ⇄
+	// Responses dialect bridge, polled by dialectBridgeRail.
+	//
+	// 🔴 nil is a THIRD state, not "false": it means no administrator has ever
+	// answered, and the worker then follows its local aikey-user.yaml. Collapsing
+	// nil into false would switch the bridge off under every deployment that had
+	// enabled it locally, on the day the console switch shipped.
+	masterBridge atomic.Pointer[bool]
 	// masterPasswordTierAdvanced mirrors masterPrivacyTier for the password
 	// lane (阶段8/合规密码档分级): true ⇒ the org forces the detector's
 	// CREDENTIAL_PASSWORD lane to advanced (full enforcement), baked into the
@@ -536,7 +544,7 @@ func New(cfg *config.Config, configPath, password, version string) (*Supervisor,
 	// licenseRails() is build-tag split: the licensing rails in a normal build,
 	// none in a -tags aikey_license_off build (see license_rail_off.go — the gate
 	// they feed is compiled out, so a running rail could only log 404s forever).
-	s.railset = newRailSet(append([]railSpec{s.groupRuntimeRail(), s.routingOverrideRail(), s.fallbackPolicyRail(), s.keyRevocationRail()}, s.licenseRails()...)...)
+	s.railset = newRailSet(append([]railSpec{s.groupRuntimeRail(), s.routingOverrideRail(), s.fallbackPolicyRail(), s.keyRevocationRail(), s.dialectBridgeRail()}, s.licenseRails()...)...)
 	gen, err := s.buildGeneration()
 	if err != nil {
 		_ = s.oauthPoolRuntime.Shutdown()
@@ -2062,11 +2070,15 @@ func (s *Supervisor) buildGeneration() (*generation, error) {
 	// The config → proxy shape conversion lives here because the proxy package
 	// deliberately does not import internal/config: the supervisor is the wiring
 	// layer for every other proxy setting too (SetConsoleURL, SetClusterNode).
-	bridgeUpstreams := make([]proxy.BridgeUpstreamRule, 0, len(s.cfg.ChatCompletionsBridge.Upstreams))
-	for _, u := range s.cfg.ChatCompletionsBridge.Upstreams {
-		bridgeUpstreams = append(bridgeUpstreams, proxy.BridgeUpstreamRule{Host: u.Host, Dialect: u.Dialect})
-	}
-	p.SetChatCompletionsBridge(s.cfg.ChatCompletionsBridge.Enabled, bridgeUpstreams)
+	//
+	// 🔴 The value comes from applyChatCompletionsBridge, NOT from s.cfg directly.
+	// A generation is rebuilt on every Reload — the vault's 5s change_seq tick, a
+	// compliance policy change and a quota policy change all trigger one — so
+	// reading the config file here would re-inject the LOCAL value over whatever
+	// the control plane had pushed, and the switch would flip back on its own with
+	// nothing in any log. dialect_bridge_rail.go holds the single reconciliation
+	// point both callers share. Fence: TestDialectBridge_AReloadDoesNotOverwriteTheControlPlanesAnswer.
+	s.applyChatCompletionsBridge(p)
 	// SyncRail §5.4: let the 401 wording distinguish "you need to sign in" from
 	// "the assignment rail is unreachable so this pick may be misdirected".
 	p.SetRoutingRailHealth(func() (string, int64) { return s.railHealthFor("routing_override") })

@@ -108,6 +108,12 @@ func (p *Proxy) SetChatCompletionsBridge(enabled bool, upstreams []BridgeUpstrea
 	p.bridge.Store(newBridgeRuntime(enabled, upstreams))
 }
 
+// ChatCompletionsBridgeEnabled reports whether the bridge is armed on this
+// proxy right now. Exported for the /status surface: an operator who flips the
+// switch in the console must be able to read back what this worker actually
+// ended up with, rather than inferring it from whether a request worked.
+func (p *Proxy) ChatCompletionsBridgeEnabled() bool { return p.bridgeRT().enabled }
+
 func (p *Proxy) bridgeRT() *bridgeRuntime {
 	if p == nil {
 		return emptyBridgeRuntime
