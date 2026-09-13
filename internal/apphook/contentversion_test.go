@@ -417,3 +417,79 @@ func TestContentVersionPoll_NeverDrivesChildLifecycle(t *testing.T) {
 		t.Errorf("the poll overwrote the real degrade reason: %q", reason)
 	}
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Task 3.2 — the policy the PROXY handed the child is part of its epoch
+// ─────────────────────────────────────────────────────────────────────────────
+
+// newWorkerWithPolicy builds an unstarted worker that was handed a spawn-time
+// policy document, the way the supervisor hands the detector its grading ladder.
+func newWorkerWithPolicy(t *testing.T, name, policyToken string) *ChildHook {
+	t.Helper()
+	return NewChildHook(&ChildHookConfig{
+		Name: name, BinaryPath: "/nonexistent", Timeout: time.Second,
+		ContentPolicyToken: policyToken,
+	})
+}
+
+// TestContentVersion_SpawnPolicyMovesTheEpoch: two children holding the SAME
+// packs but handed DIFFERENT ladders must not share a cache epoch — that is the
+// whole of R-compliance-grading-5's cache half. The report cannot express the
+// difference, so the composition has to.
+//
+// 能红 check: make ContentVersionWithPolicy return contentVersion unchanged.
+func TestContentVersion_SpawnPolicyMovesTheEpoch(t *testing.T) {
+	l4mask := newWorkerWithPolicy(t, "mask", "grading:1111111111111111")
+	l4warn := newWorkerWithPolicy(t, "warn", "grading:2222222222222222")
+	setContentVersion(l4mask, "packs-v1")
+	setContentVersion(l4warn, "packs-v1") // identical packs, on purpose
+
+	maskEpoch, okMask := CacheEpoch(l4mask)
+	warnEpoch, okWarn := CacheEpoch(l4warn)
+	if !okMask || !okWarn {
+		t.Fatalf("both children know their packs; got (%q,%v) (%q,%v)", maskEpoch, okMask, warnEpoch, okWarn)
+	}
+	if maskEpoch == warnEpoch {
+		t.Fatalf("the same packs under two different ladders share the epoch %q — a verdict "+
+			"minted while L4 masked stays replayable after the admin relaxed it to warn "+
+			"(R-compliance-grading-5.S1)", maskEpoch)
+	}
+	if !strings.Contains(maskEpoch, "packs-v1") {
+		t.Errorf("the policy must EXTEND the content version, not replace it (%q) — a pack "+
+			"swap still has to invalidate on its own", maskEpoch)
+	}
+	// Status() is the operator-facing projection of the same rule; if it drifted,
+	// /v1/diagnostics/pipeline would show an epoch the data plane is not using.
+	if st := l4mask.Status(); st.ContentVersion != maskEpoch {
+		t.Errorf("Status() and ContentVersion() disagree: %q vs %q", st.ContentVersion, maskEpoch)
+	}
+}
+
+// TestContentVersion_SpawnPolicyDoesNotRescueABlindChild pins the fail-safe
+// branch: knowing which ladder we handed a child says nothing about which packs
+// it is detecting with, so it must not turn "unknown" into a cacheable epoch.
+func TestContentVersion_SpawnPolicyDoesNotRescueABlindChild(t *testing.T) {
+	h := newWorkerWithPolicy(t, "blind", "grading:1111111111111111")
+	setHealthyButBlind(h)
+	if epoch, ok := CacheEpoch(h); ok {
+		t.Fatalf("a child that cannot state its packs must stay uncacheable even when its "+
+			"ladder is known; got (%q,%v)", epoch, ok)
+	}
+	if st := h.Status(); st.ContentVersion != "" {
+		t.Errorf("an unknown content set must publish no token, got %q", st.ContentVersion)
+	}
+}
+
+// TestContentVersion_NoPolicyLeavesTheTokenUntouched: every other AppHook (the
+// degrade detector, any future app) is handed no policy document, and its epoch
+// must be byte-identical to what it was before this mechanism existed.
+func TestContentVersion_NoPolicyLeavesTheTokenUntouched(t *testing.T) {
+	h := newUnstartedWorker(t, "nopolicy")
+	setContentVersion(h, "packs-v1")
+	if epoch, ok := CacheEpoch(h); !ok || epoch != "packs-v1" {
+		t.Fatalf("no spawn policy → unchanged epoch; got (%q,%v), want (\"packs-v1\",true)", epoch, ok)
+	}
+	if got := ContentVersionWithPolicy("", "grading:1111111111111111"); got != "" {
+		t.Errorf("an empty content version must stay empty, got %q", got)
+	}
+}

@@ -251,7 +251,30 @@ func (s *Supervisor) installFilterHook(p *proxy.Proxy, vaultReader *vault.Reader
 		passwordTierEnv += "advanced"
 	}
 
-	extraEnv := []string{recordAllowEnv, maxActionEnv, localIntakeEnv, privacyTierEnv, passwordTierEnv}
+	// bugfix: 需求包 roadmap20260320/技术实现/阶段9-商业化版本/博时基金合规能力融合/ (task 3.1)
+	// R-compliance-grading-5 still lives in the IN-FLIGHT delta
+	// openspec/changes/add-compliance-grading-fusion/specs/compliance-grading/spec.md,
+	// so it is referenced with a rule: tag rather than a steady-state anchor —
+	// check-code-anchors deliberately refuses an anchor to a proposal. They are
+	// upgraded when §7 writes the delta back to the steady-state layer.
+	//
+	// Org COMPLIANCE GRADING document (labels / ladder / escalation /
+	// fail-closed levels) → detector env. Third member of the same family as the
+	// two tiers above and under the same fence: READ THE ATOMIC, never this
+	// machine's environment or vault — the ladder is the organisation's decision
+	// and a member must not be able to soften it locally.
+	//
+	// "{}" (gradingEnvValue's answer when the org has no policy) means grading
+	// OFF, i.e. the detector decides by entity_actions exactly as it did before
+	// this feature. It is NOT what an unreadable policy produces — that keeps the
+	// last valid document, see applyComplianceMasterPolicy. Compact JSON, whose
+	// size ceiling the master enforces on save (7680 bytes, strictly below this
+	// side's runtime limit — DEC-compliance-grading-10; the runtime check itself
+	// is task 3.8). A change re-spawns the child via filterSigWithGrading.
+	// rule: R-compliance-grading-5
+	gradingEnv := "AIKEY_COMPLIANCE_GRADING=" + s.gradingEnvValue()
+
+	extraEnv := []string{recordAllowEnv, maxActionEnv, localIntakeEnv, privacyTierEnv, passwordTierEnv, gradingEnv}
 	// Resolve the pack-pull backend + tenant for the detector. Personal/Trial read
 	// the team URL from the CLI's config.json (no tenant scoping — one user, one
 	// view). A CLUSTER node has no CLI config.json; its control URL + org come from
@@ -290,6 +313,14 @@ func (s *Supervisor) installFilterHook(p *proxy.Proxy, vaultReader *vault.Reader
 		Timeout:      filterTimeout(),
 		ReadyTimeout: filterReadyTimeout(),
 		ExtraEnv:     extraEnv,
+		// Task 3.2: the ladder is invisible in the detector's own
+		// effective-content report (that report describes the packs it PULLED,
+		// not the policy we HANDED it), so the proxy has to put it into the
+		// verdict-cache epoch itself or a verdict minted under the old rung stays
+		// replayable after the admin relaxes it. Same bytes, same digest and same
+		// label as the filter signature above — see gradingComponent.
+		// rule: R-compliance-grading-5
+		ContentPolicyToken: s.gradingContentPolicyToken(),
 	}
 	// Pool of M independent detector processes (双进程+A: cross-process isolation
 	// on top of each process's internal worker pool). M from AIKEY_PROXY_FILTER_WORKERS

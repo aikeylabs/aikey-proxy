@@ -59,7 +59,20 @@ type ChildHookConfig struct {
 	// the proxy derives from vault — e.g. AIKEY_COMPLIANCE_RECORD_ALLOW from the
 	// app_records.filter_record_allow flag. The child re-reads these at spawn,
 	// so a flag change → vault change_seq → proxy reload → re-spawn picks it up.
-	ExtraEnv           []string
+	ExtraEnv []string
+	// ContentPolicyToken is an ALREADY-LABELLED, opaque token for a policy
+	// document this child is HANDED at spawn (today: the org compliance grading
+	// ladder, carried in ExtraEnv as AIKEY_COMPLIANCE_GRADING). "" = none.
+	//
+	// It is folded into ContentVersion() because such a document changes what the
+	// child decides while being INVISIBLE in the child's own effective-content
+	// report — the report describes what the child pulled, not what we gave it.
+	// Without this, a verdict memoized under the old document stays reachable
+	// after the swap. See ContentVersionWithPolicy in contentversion.go.
+	//
+	// The caller supplies the label ("grading:<sha256[:16]>") on purpose: this
+	// package must not learn what business the child is doing (不变量 #16).
+	ContentPolicyToken string
 	Timeout            time.Duration // per-Detect deadline (default 1ms)
 	ReadyTimeout       time.Duration // how long to wait for ready sentinel (default 5s)
 	RestartMaxAttempts int           // 0 = unlimited (default 3)
@@ -192,7 +205,7 @@ type ChildHook struct {
 	pollOnce     sync.Once
 	stopPollOnce sync.Once
 	cfg          ChildHookConfig
-	gen    atomic.Uint64 // spawn generation; the reader tied to an older gen won't clobber a newer spawn's state
+	gen          atomic.Uint64 // spawn generation; the reader tied to an older gen won't clobber a newer spawn's state
 	// lastRecoverAt (unix nano) gates the lazy self-heal: when degraded, the next
 	// request synchronously restarts the child, but a storm of requests must not
 	// hammer respawns — only one attempt per recoverCooldown (CAS-guarded).

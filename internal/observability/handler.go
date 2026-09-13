@@ -157,6 +157,15 @@ const (
 	// and a compliance batch was DROPPED. This is real audit loss, unlike every
 	// other event in this group — it is logged at ERROR for that reason.
 	EventComplianceDeadLetterOverflow = "proxy.compliance.dead_letter_overflow"
+	// EventComplianceGradingInvalid: GET /v1/compliance/policy carried a
+	// `grading` member this proxy could not use (unparseable, or not a JSON
+	// object). The org DOES have a grading policy — the response says so — but
+	// this node cannot read the new one, so it keeps the last valid one rather
+	// than falling back to "grading off" (DEC-compliance-grading-10: silently
+	// disabling an org's whole ladder on one bad response is the worst possible
+	// failure shape, because the console still looks correct). WARN, and the
+	// only externally visible sign that a fleet is running on a stale ladder.
+	EventComplianceGradingInvalid = "proxy.compliance.grading_invalid"
 )
 
 // Health events.
