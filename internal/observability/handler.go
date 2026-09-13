@@ -133,6 +133,15 @@ const (
 	// See supervisor/license_plane_rail.go and
 	// workflow/CI/bugfix/20260827-forwarding-gate-was-never-wired.md.
 	EventProxyLicensePlaneChanged    = "proxy.license.plane_changed"
+	// EventProxyDialectBridgePolicyChanged marks the transition when the control
+	// plane's answer for the Chat Completions ⇄ Responses switch changes —
+	// including to and from "unset", which is what decides whether this worker
+	// follows the control plane or its own config file.
+	EventProxyDialectBridgePolicyChanged = "proxy.dialect_bridge.policy_changed"
+	// EventProxyDialectBridgePolicyUnreadable marks a persisted policy this build
+	// could not parse. The worker falls back to local configuration rather than
+	// guessing, and says so.
+	EventProxyDialectBridgePolicyUnreadable = "proxy.dialect_bridge.policy_unreadable"
 	EventProxyLicensePlaneUnreadable = "proxy.license.plane_unreadable"
 	EventProxyLicensePlaneFileFailed = "proxy.license.plane_file_failed"
 	// EventProxyLicensePlaneCapabilities: logged once at start-up. It is also what

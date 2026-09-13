@@ -117,6 +117,9 @@ type Handler struct {
 	// SyncHealthFn supplies the SyncRail per-rail health map for /status. Nil or
 	// an empty map → the control_plane_sync field is omitted.
 	SyncHealthFn func() map[string]SyncRailStatus
+	// DialectBridgeFn supplies the effective Chat Completions ⇄ Responses switch
+	// and where it came from. Nil → the field is omitted.
+	DialectBridgeFn func() DialectBridgeStatus
 
 	// EffectivePacksFn returns the raw JSON report of compliance packs currently
 	// effective in the live filter child (built-in + pulled). Returns an error
@@ -337,6 +340,18 @@ type statusResponse struct {
 	// Release-checklist E2E and `aikey statusline` read this to assert the
 	// master-sync pipeline is alive (health-signal-surface rule).
 	ControlPlaneSync map[string]SyncRailStatus `json:"control_plane_sync,omitempty"`
+	// DialectBridge reports the effective Chat Completions ⇄ Responses switch and
+	// WHERE it came from.
+	//
+	// 🔴 The source is the load-bearing half, for the same reason it is on
+	// UpstreamFallback below. The rail's own state already appears under
+	// control_plane_sync["dialect_bridge"]; what that cannot say is whether the
+	// value in force came from the console or from this machine's own
+	// aikey-user.yaml. Without it, an operator who flips the switch and sees no
+	// change cannot tell "the answer has not arrived yet" from "this worker is
+	// still following its local file" — which is the same blindness the console
+	// switch exists to remove, reproduced one layer up.
+	DialectBridge *DialectBridgeStatus `json:"chat_completions_bridge,omitempty"`
 	// UpstreamFallback reports the five thresholds with each value's SOURCE
 	// (P0a task 1b.9). Omitted when the capability is not wired.
 	//
@@ -356,6 +371,18 @@ type statusResponse struct {
 	// that exited last month need completely different responses, and an operator
 	// cannot tell them apart from the verdict alone.
 	LicensePlane any `json:"license_plane,omitempty"`
+}
+
+// DialectBridgeStatus is the /status projection of the dialect-bridge switch.
+//
+// source is "control_plane" when an administrator has answered and this worker
+// is following that answer, and "local_config" when nobody has and the machine's
+// own aikey-user.yaml decides. Those are different operational situations that
+// produce the same `enabled` value, so reporting only the boolean would hide
+// exactly the fact an operator is looking for.
+type DialectBridgeStatus struct {
+	Enabled bool   `json:"enabled"`
+	Source  string `json:"source"`
 }
 
 // SyncRailStatus mirrors supervisor.RailSyncStatus for the /status wire (built
@@ -436,6 +463,11 @@ func (h *Handler) Status(w http.ResponseWriter, r *http.Request) {
 	if h.SyncHealthFn != nil {
 		syncHealth = h.SyncHealthFn()
 	}
+	var dialectBridge *DialectBridgeStatus
+	if h.DialectBridgeFn != nil {
+		st := h.DialectBridgeFn()
+		dialectBridge = &st
+	}
 	var upstreamFallback any
 	if h.UpstreamFallbackFn != nil {
 		upstreamFallback = h.UpstreamFallbackFn()
@@ -457,6 +489,7 @@ func (h *Handler) Status(w http.ResponseWriter, r *http.Request) {
 		TotalErrs:        totalErrs,
 		PoolRouting:      poolRouting,
 		ControlPlaneSync: syncHealth,
+		DialectBridge:    dialectBridge,
 		UpstreamFallback: upstreamFallback,
 		LicensePlane:     licensePlane,
 	})

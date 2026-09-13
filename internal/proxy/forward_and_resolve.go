@@ -1196,7 +1196,7 @@ func (p *Proxy) serveRoute(w http.ResponseWriter, r *http.Request, route *vkeys.
 				//   写响应体，占位符还原是既有且唯一的例外，and THIS is that
 				//   exception. Nothing else the compliance guardrail owns may write
 				//   a body from the response leg — in particular the canned answer
-				//   must never be synthesised here, because the whole point of it is
+				//   must never be synthesized here, because the whole point of it is
 				//   that the request was never issued.
 				// 围栏: compliance_guardrail_response_fence_test.go —
 				//   TestFence_GuardrailNeverRewritesAForwardedResponse; this call is

@@ -34,9 +34,9 @@ package proxy
 //	    The placeholder restore is the one documented, pre-existing exception.
 //
 // ---------------------------------------------------------------------------
-// 🔴 WHY THESE ARE SOURCE SCANS AND NOT BEHAVIOURAL CASES
+// 🔴 WHY THESE ARE SOURCE SCANS AND NOT BEHAVIORAL CASES
 //
-// Both invariants are NEGATIVE ("never do X"). A behavioural case for a negative
+// Both invariants are NEGATIVE ("never do X"). A behavioral case for a negative
 // can only ever prove "the one input I thought of did not trigger X" — it is
 // silent about the next code path, and these are precisely the invariants whose
 // violation looks like a normal, helpful feature at review time ("let's tell the
@@ -55,7 +55,7 @@ package proxy
 //
 // The canned answer is NOT implemented in this repository. `apphook.Action` has
 // four values (Allow / Mask / Block / Warn); there is no ActionAnswer, no
-// answer-text plumbing and no synthesised 200. `answer` is not yet in the
+// answer-text plumbing and no synthesized 200. `answer` is not yet in the
 // database action domain either (that is task 5.1, held by TODO-9).
 //
 // These fences are therefore written BEFORE the implementation, deliberately.
@@ -286,7 +286,7 @@ green that guards nothing.`)
 				used[src] = true
 			}
 
-			if prim := findInterpolation(arg, s.file); prim != "" {
+			if prim := findInterpolation(arg); prim != "" {
 				t.Errorf(`%s: argument %d of %s calls %s.
 
 design §6 invariant 12 / R-compliance-canned-answer-3: the text a guardrail
@@ -352,7 +352,7 @@ construction, add it to guardrailVerbatimSources WITH THE REASON.`,
 	}
 
 	// Keep the escape hatch honest. An exemption for an expression nobody passes
-	// any more would silently pre-authorise the name if it ever came back.
+	// any more would silently pre-authorize the name if it ever came back.
 	for expr := range guardrailVerbatimSources {
 		// "Used" covers the normal case; the wider scan covers the case where the
 		// argument was rejected for some OTHER reason, which must not also be
@@ -407,7 +407,7 @@ var responseLegGuardrailExemptions = map[string]string{
 // says nothing about the next one — and the next one is easy to write and looks
 // reasonable: ModifyResponse already has the verdict on the context, so
 // "forward, then swap the body for the canned answer if it was blocked" is a
-// three-line change that no behavioural test would notice, and it would send the
+// three-line change that no behavioral test would notice, and it would send the
 // prompt upstream first. The whole point of a canned answer is that the content
 // never left.
 //
@@ -487,7 +487,7 @@ it up" state; the guardrail either short-circuits before forwarding
 
 For the canned answer specifically this is the difference between the feature and
 its opposite: R-compliance-canned-answer-1 exists because the request is never
-issued. Synthesising the answer after forwarding produces the same bytes for the
+issued. Synthesizing the answer after forwarding produces the same bytes for the
 client and sends the customer's prompt upstream anyway.
 
 Fix: move the decision to applyInboundFilter, before the forward.
@@ -498,7 +498,7 @@ to the user, then add it to responseLegGuardrailExemptions with who signed off.`
 	}
 
 	// Staleness: an exemption for a name the response leg no longer calls would
-	// pre-authorise it for whoever reuses the name later.
+	// pre-authorize it for whoever reuses the name later.
 	for name := range responseLegGuardrailExemptions {
 		if !used[name] {
 			t.Errorf("responseLegGuardrailExemptions[%q] is stale: no response-leg body write "+
@@ -830,7 +830,7 @@ func isPkgType(e ast.Expr, pkg, name string) bool {
 
 // findInterpolation reports the first interpolation primitive called anywhere
 // inside expr, or "".
-func findInterpolation(expr ast.Expr, f *guardFile) string {
+func findInterpolation(expr ast.Expr) string {
 	found := ""
 	ast.Inspect(expr, func(n ast.Node) bool {
 		if found != "" {
@@ -887,7 +887,7 @@ func localIsVerbatimSafe(name string, s clientWriteSite) (bool, string, []string
 	seen := 0
 	record := func(rhs ast.Expr) {
 		seen++
-		if prim := findInterpolation(rhs, s.file); prim != "" {
+		if prim := findInterpolation(rhs); prim != "" {
 			problems = append(problems, fmt.Sprintf("assigned %s at %s, which calls %s",
 				exprString(rhs), s.file.fset.Position(rhs.Pos()), prim))
 			return
