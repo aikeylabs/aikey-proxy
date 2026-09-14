@@ -70,6 +70,24 @@ type Handler struct {
 	// CanaryResultFn returns the latest canary probe result (nil = canary disabled).
 	CanaryResultFn func() *events.CanaryResult
 
+	// CompliancePolicyHealthFn reports the org compliance-policy follower's raw
+	// state for GET /health: `consecutiveRejects` = polls in a row whose answer
+	// could not be used, `attempted` = false until the follower has run at all
+	// (Personal / no org), in which case the block is omitted rather than
+	// claiming a verdict about something that is not running.
+	//
+	// 🔴 Required by 「健康信号必须可被外部读取」, and not commentary. When the
+	// master's policy cannot be read this proxy KEEPS ENFORCING the last valid
+	// one — the safe direction, and the quiet one: the node serves normally and
+	// the console still shows the ladder the admin edited, so a fleet running on
+	// a stale ladder is invisible from everywhere except a WARN line. This is
+	// what makes it findable. Nil = not wired (older wiring / tests).
+	//
+	// Raw facts in, verdict derived here — the same split as ReporterMetricsFn /
+	// CanaryResultFn, so the wire vocabulary ("degraded", the reason code) lives
+	// in this package only.
+	CompliancePolicyHealthFn func() (consecutiveRejects int, attempted bool)
+
 	// DebugUpstreamHeadersStateFn / DebugUpstreamHeadersSetFn drive the
 	// /admin/debug/upstream-headers endpoints. State returns the resolved
 	// (enabled, source) tuple — source is "api" / "env" / "compile" /
@@ -117,6 +135,9 @@ type Handler struct {
 	// SyncHealthFn supplies the SyncRail per-rail health map for /status. Nil or
 	// an empty map → the control_plane_sync field is omitted.
 	SyncHealthFn func() map[string]SyncRailStatus
+	// DialectBridgeFn supplies the effective Chat Completions ⇄ Responses switch
+	// and where it came from. Nil → the field is omitted.
+	DialectBridgeFn func() DialectBridgeStatus
 
 	// EffectivePacksFn returns the raw JSON report of compliance packs currently
 	// effective in the live filter child (built-in + pulled). Returns an error
@@ -227,8 +248,14 @@ type healthResponse struct {
 	// healthy main-link forwarding (architecture: 主链路/旁路 isolation). Omitted
 	// when neither reporter nor canary is wired (offline Personal).
 	UsagePipeline *pipelineHealth `json:"usage_pipeline,omitempty"`
-	Status        string          `json:"status"`
-	Version       string          `json:"version"`
+	// CompliancePolicy is the org compliance-policy follower's verdict (task
+	// 3.8). Separate from UsagePipeline for the same 主链路/旁路 reason those two
+	// are separate from Status: they are independent lanes and one going
+	// degraded must not implicate the others. Omitted when this proxy has no
+	// follower (Personal / no org).
+	CompliancePolicy *pipelineHealth `json:"compliance_policy,omitempty"`
+	Status           string          `json:"status"`
+	Version          string          `json:"version"`
 }
 
 // pipelineHealth is a single readable verdict an external monitor / the release
@@ -236,6 +263,11 @@ type healthResponse struct {
 type pipelineHealth struct {
 	State   string   `json:"state"`             // "ok" | "degraded"
 	Reasons []string `json:"reasons,omitempty"` // populated when degraded
+	// ConsecutiveFailures is the current failure streak, when the lane has one.
+	// Same field name and meaning as CanaryResult / SyncRailStatus /
+	// SignalReportingHealth carry, so a monitor reads one vocabulary. Omitted at
+	// zero, which leaves the usage_pipeline block byte-identical to before.
+	ConsecutiveFailures int `json:"consecutive_failures,omitempty"`
 }
 
 const (
@@ -246,6 +278,23 @@ const (
 	// canaryDegradedThreshold: consecutive canary pipeline-failures before
 	// degraded. The canary runs every 5min, so 2 ≈ a sustained ~10min fault.
 	canaryDegradedThreshold = 2
+	// complianceGradingRejectedReason names the one way the compliance-policy
+	// lane degrades: the master's answer could not be used (unusable grading
+	// document, non-200, network error), so this node is enforcing a policy it
+	// could not refresh.
+	//
+	// 🔴 There is NO threshold on this one, unlike the two above. Those count a
+	// transport that blips for reasons nobody can act on; this one states that
+	// the ladder in force and the ladder on the console have diverged, which is
+	// true from the first rejected answer. The escalation from WARN to ERROR
+	// after a sustained run lives in the supervisor
+	// (gradingRejectEscalateAfter); it governs how loud the LOGS get, not
+	// whether this endpoint tells the truth.
+	//
+	// 🔴 A master that answers WITHOUT a grading policy is not this case. It is
+	// an older master, or an org that switched grading off — a supported
+	// deployment that reaches here as zero rejects and reads "ok".
+	complianceGradingRejectedReason = "grading_policy_rejected"
 )
 
 // usagePipelineHealth derives the bypass-pipeline verdict from the reporter
@@ -291,6 +340,24 @@ func usagePipelineHealth(rm *events.ReporterMetrics, cr *events.CanaryResult) *p
 	return &pipelineHealth{State: state, Reasons: reasons}
 }
 
+// compliancePolicyHealth derives the compliance-policy follower's verdict from
+// the raw counters CompliancePolicyHealthFn reports. Returns nil when the
+// follower has never polled, so the field is omitted rather than falsely
+// reporting "ok" for a lane that is not running.
+func compliancePolicyHealth(consecutiveRejects int, attempted bool) *pipelineHealth {
+	if !attempted {
+		return nil
+	}
+	if consecutiveRejects <= 0 {
+		return &pipelineHealth{State: "ok"}
+	}
+	return &pipelineHealth{
+		State:               "degraded",
+		Reasons:             []string{complianceGradingRejectedReason},
+		ConsecutiveFailures: consecutiveRejects,
+	}
+}
+
 // Health returns process liveness (Status) plus the bypass usage-pipeline
 // verdict (UsagePipeline). Always HTTP 200 with Status "ok" while serving — see
 // healthResponse / usagePipelineHealth for the liveness-vs-pipeline split.
@@ -309,11 +376,16 @@ func (h *Handler) Health(w http.ResponseWriter, r *http.Request) {
 	if h.CanaryResultFn != nil {
 		cr = h.CanaryResultFn()
 	}
+	var cp *pipelineHealth
+	if h.CompliancePolicyHealthFn != nil {
+		cp = compliancePolicyHealth(h.CompliancePolicyHealthFn())
+	}
 
 	writeJSON(w, http.StatusOK, healthResponse{
-		Status:        "ok", // liveness only — NOT flipped by bypass-pipeline degradation
-		Version:       Version,
-		UsagePipeline: usagePipelineHealth(rm, cr),
+		Status:           "ok", // liveness only — NOT flipped by bypass-pipeline degradation
+		Version:          Version,
+		UsagePipeline:    usagePipelineHealth(rm, cr),
+		CompliancePolicy: cp,
 	})
 }
 
@@ -337,6 +409,18 @@ type statusResponse struct {
 	// Release-checklist E2E and `aikey statusline` read this to assert the
 	// master-sync pipeline is alive (health-signal-surface rule).
 	ControlPlaneSync map[string]SyncRailStatus `json:"control_plane_sync,omitempty"`
+	// DialectBridge reports the effective Chat Completions ⇄ Responses switch and
+	// WHERE it came from.
+	//
+	// 🔴 The source is the load-bearing half, for the same reason it is on
+	// UpstreamFallback below. The rail's own state already appears under
+	// control_plane_sync["dialect_bridge"]; what that cannot say is whether the
+	// value in force came from the console or from this machine's own
+	// aikey-user.yaml. Without it, an operator who flips the switch and sees no
+	// change cannot tell "the answer has not arrived yet" from "this worker is
+	// still following its local file" — which is the same blindness the console
+	// switch exists to remove, reproduced one layer up.
+	DialectBridge *DialectBridgeStatus `json:"chat_completions_bridge,omitempty"`
 	// UpstreamFallback reports the five thresholds with each value's SOURCE
 	// (P0a task 1b.9). Omitted when the capability is not wired.
 	//
@@ -356,6 +440,18 @@ type statusResponse struct {
 	// that exited last month need completely different responses, and an operator
 	// cannot tell them apart from the verdict alone.
 	LicensePlane any `json:"license_plane,omitempty"`
+}
+
+// DialectBridgeStatus is the /status projection of the dialect-bridge switch.
+//
+// source is "control_plane" when an administrator has answered and this worker
+// is following that answer, and "local_config" when nobody has and the machine's
+// own aikey-user.yaml decides. Those are different operational situations that
+// produce the same `enabled` value, so reporting only the boolean would hide
+// exactly the fact an operator is looking for.
+type DialectBridgeStatus struct {
+	Enabled bool   `json:"enabled"`
+	Source  string `json:"source"`
 }
 
 // SyncRailStatus mirrors supervisor.RailSyncStatus for the /status wire (built
@@ -436,6 +532,11 @@ func (h *Handler) Status(w http.ResponseWriter, r *http.Request) {
 	if h.SyncHealthFn != nil {
 		syncHealth = h.SyncHealthFn()
 	}
+	var dialectBridge *DialectBridgeStatus
+	if h.DialectBridgeFn != nil {
+		st := h.DialectBridgeFn()
+		dialectBridge = &st
+	}
 	var upstreamFallback any
 	if h.UpstreamFallbackFn != nil {
 		upstreamFallback = h.UpstreamFallbackFn()
@@ -457,6 +558,7 @@ func (h *Handler) Status(w http.ResponseWriter, r *http.Request) {
 		TotalErrs:        totalErrs,
 		PoolRouting:      poolRouting,
 		ControlPlaneSync: syncHealth,
+		DialectBridge:    dialectBridge,
 		UpstreamFallback: upstreamFallback,
 		LicensePlane:     licensePlane,
 	})

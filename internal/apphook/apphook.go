@@ -41,6 +41,11 @@ const (
 	ActionMask  Action = 1 // payload mutated in-place by app (e.g. PII redacted), forward mutated version
 	ActionBlock Action = 2 // refuse the request, return error to user
 	ActionWarn  Action = 3 // pass through but record warning event
+	// ActionAnswer refuses the request like ActionBlock and serves an
+	// administrator-authored canned answer in its place (代答). Appended, never
+	// renumbered: the value travels the child pipe as a raw byte, so reordering
+	// the rungs would reinterpret every verdict already in flight.
+	ActionAnswer Action = 4
 )
 
 func (a Action) String() string {
@@ -53,10 +58,86 @@ func (a Action) String() string {
 		return "block"
 	case ActionWarn:
 		return "warn"
+	case ActionAnswer:
+		return "answer"
 	default:
 		return "unknown"
 	}
 }
+
+// Recognized reports whether a is an Action value THIS proxy build understands.
+//
+// The action byte comes off the child pipe unvalidated (ChildHook.Detect does a
+// straight Action(resp.action) conversion), so a child built against a newer
+// enum — or a tampered one — can hand back a value that is not in the set above.
+// This is the ONE definition of "in the set"; every consumer derives from it
+// rather than writing its own switch, so adding a rung cannot leave one reader
+// behind.
+func (a Action) Recognized() bool {
+	switch a {
+	case ActionAllow, ActionMask, ActionBlock, ActionWarn, ActionAnswer:
+		return true
+	}
+	return false
+}
+
+// NormalizeAction maps an unrecognized action onto ActionBlock, and leaves every
+// recognized one alone. FAIL-CLOSED, and that direction is the whole point.
+//
+// spec (PROPOSAL layer, 需求包 .../博时基金合规能力融合/openspec/changes/
+// add-compliance-grading-fusion/specs/compliance-canned-answer/spec.md):
+//
+//	R-compliance-canned-answer-6  proxy 收到无法识别的动作值时 SHALL 按 ActionBlock
+//	                              处理（fail-safe），SHALL NOT 按放行处理
+//
+// 🔴 DO NOT "restore" the old fail-open here. Two different failures were
+// conflated until 2026-09-13 and they point opposite ways:
+//
+//   - The child could not ANSWER (timeout, crash, not installed). §6 #11: never
+//     block the main path. Those paths return an explicit ActionAllow with
+//     Degraded=true (childhook.go) — they never reach this function, and this
+//     change did not touch them.
+//   - The child ANSWERED with a verdict we cannot read. The action value is a
+//     policy the master handed down. Not recognizing it means either this proxy
+//     is older than the policy, or the policy was tampered with. Forwarding on
+//     either is a version skew silently switching the compliance policy off.
+//
+// 围栏: internal/apphook TestUnknownAction_TreatedAsBlock (enum level) ·
+// internal/proxy TestApplyInboundFilter_UnknownAction_FailsClosedBlocked
+// (403 COMPLIANCE_BLOCKED, nothing forwarded).
+func NormalizeAction(a Action) Action {
+	if a.Recognized() {
+		return a
+	}
+	return ActionBlock
+}
+
+// SupportsCannedAnswer reports whether this proxy build can SERVE a canned
+// answer (代答) — not merely whether it knows the enum value.
+//
+// The detector reads this declaration to decide what to hand down: 代答 only
+// when true, plain ActionBlock when false (design.md §4b). Declaring a
+// capability this build cannot serve is the same defect as failing open on an
+// unknown action, reached from the other side — the policy says "answer", the
+// proxy cannot, and the difference shows up as behaviour nobody configured.
+//
+// 🔴 FALSE ON PURPOSE, and this is the task seam. Task 3.5 added the enum rung
+// and the fail-closed direction; the response synthesizer (writeCannedAnswer,
+// three protocol families × streaming/non-streaming) is task 3.6. Until it
+// exists this build can only refuse, which is exactly what
+// R-compliance-canned-answer-6.S1 prescribes for a proxy that has not declared
+// the capability — so the intermediate state is correct, just not the feature.
+//
+// TASK 3.6 FLIPS THIS TO TRUE in the same change that adds writeCannedAnswer and
+// the ActionAnswer dispatch branch. Two fences hold it honest:
+// internal/apphook TestSupportsCannedAnswer_FalseUntilWriterLands (invert it
+// there, do not delete it) and task 3.7's
+// TestCannedAnswer_UnconfiguredPathsByteIdentical, which asserts it is true.
+//
+// A function rather than a const so the dispatch guard reads as a capability
+// question at the call site, and so 3.6 can make it derive from configuration
+// if the canned answer ever becomes opt-in per deployment.
+func SupportsCannedAnswer() bool { return false }
 
 // Direction is the side of the LLM call (request inbound vs response outbound).
 // Apps may choose to inspect one or both.

@@ -22,6 +22,8 @@ package supervisor
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -491,6 +493,14 @@ type Supervisor struct {
 	// local filter_stages is NULL (master mandate); the user's local toggle still
 	// governs when this is false. Polled by pollComplianceMasterPolicy.
 	masterCompliance atomic.Bool
+	// masterBridge is the control plane's answer for the Chat Completions ⇄
+	// Responses dialect bridge, polled by dialectBridgeRail.
+	//
+	// 🔴 nil is a THIRD state, not "false": it means no administrator has ever
+	// answered, and the worker then follows its local aikey-user.yaml. Collapsing
+	// nil into false would switch the bridge off under every deployment that had
+	// enabled it locally, on the day the console switch shipped.
+	masterBridge atomic.Pointer[bool]
 	// masterPasswordTierAdvanced mirrors masterPrivacyTier for the password
 	// lane (阶段8/合规密码档分级): true ⇒ the org forces the detector's
 	// CREDENTIAL_PASSWORD lane to advanced (full enforcement), baked into the
@@ -514,6 +524,48 @@ type Supervisor struct {
 	// sends no content. Unlike masterCompliance a change needs a Reload — the
 	// value is baked into a child process's environment at spawn.
 	masterPrivacyTier atomic.Int64
+	// masterGrading is the org COMPLIANCE GRADING document (labels / ladder /
+	// escalation / fail-closed levels) polled from the same endpoint, held as
+	// the compact JSON bytes that go into the detector child's environment.
+	// nil ⇒ no policy ⇒ grading off ⇒ the decision layer behaves exactly as it
+	// did before the feature (R-compliance-grading-3).
+	//
+	// 🔴 nil here means ONLY "the org has no grading policy". It must never be
+	// reached by failing to read one: an unusable or unreachable policy leaves
+	// this field untouched, so the fleet keeps enforcing the last valid ladder
+	// instead of silently falling back to built-in defaults with a console that
+	// still shows the ladder (DEC-compliance-grading-10). Written solely by
+	// applyComplianceMasterPolicy. rule: R-compliance-grading-5
+	masterGrading atomic.Pointer[[]byte]
+	// masterPolicyRejects counts CONSECUTIVE polls of GET /v1/compliance/policy
+	// whose answer could not be used (unusable grading document, non-200,
+	// network error) — i.e. how long this node has been enforcing a compliance
+	// policy it could not refresh. Reset to 0 by the first usable answer.
+	//
+	// 🔴 WHY IT EXISTS (task 3.8). Keeping the last valid policy is the right
+	// failure direction, but it is also the QUIET one: the node keeps serving,
+	// the console keeps showing the ladder the admin edited, and nothing on the
+	// machine contradicts either. This counter is what turns that state into
+	// something an operator can read from outside the process
+	// (GET /health -> compliance_policy) instead of grepping WARN lines, which
+	// 「健康信号必须可被外部读取」 requires of every self-check.
+	//
+	// 🔴 A poll that comes back WITHOUT a grading member does NOT count. That is
+	// an older master, or an org with grading switched off — a supported
+	// deployment, and reporting it degraded would send operators after a fault
+	// that does not exist. Only "there was an answer and it was unusable" and
+	// "there was no answer" count. rule: R-compliance-grading-5
+	masterPolicyRejects atomic.Int64
+	// masterPolicyEscalated records that the sustained-staleness ERROR has
+	// already been emitted for the CURRENT reject streak, so the escalation fires
+	// once per crossing rather than every poll. Cleared on recovery, which
+	// re-arms it for the next outage (canary convention).
+	masterPolicyEscalated atomic.Bool
+	// masterPolicyAttempted is false until this process has actually run one
+	// compliance-policy poll. Personal installs with no team/org never do, and
+	// /health must OMIT the block there rather than assert a verdict about a
+	// follower that is not running — same posture as the sync rails' `attempted`.
+	masterPolicyAttempted atomic.Bool
 	// Enterprise quota (Phase 2 Stage 2 — design §0.5/§5.2). Snapshot + counter
 	// live on the supervisor (not per-generation) so the counter accumulates
 	// continuously across 5s syncs and /admin/reload; the snapshot is gen-swapped
@@ -581,7 +633,7 @@ func New(cfg *config.Config, configPath, password, version string) (*Supervisor,
 	// licenseRails() is build-tag split: the licensing rails in a normal build,
 	// none in a -tags aikey_license_off build (see license_rail_off.go — the gate
 	// they feed is compiled out, so a running rail could only log 404s forever).
-	s.railset = newRailSet(append([]railSpec{s.groupRuntimeRail(), s.routingOverrideRail(), s.fallbackPolicyRail(), s.keyRevocationRail(), s.scanNodesRail()}, s.licenseRails()...)...)
+	s.railset = newRailSet(append([]railSpec{s.groupRuntimeRail(), s.routingOverrideRail(), s.fallbackPolicyRail(), s.keyRevocationRail(), s.scanNodesRail(), s.dialectBridgeRail()}, s.licenseRails()...)...)
 	gen, err := s.buildGeneration()
 	if err != nil {
 		_ = s.oauthPoolRuntime.Shutdown()
@@ -1096,6 +1148,61 @@ func filterSigWithPasswordTier(base string, advanced bool) string {
 	return base + "|pwtier:" + strconv.FormatBool(advanced)
 }
 
+// bugfix: 需求包 roadmap20260320/技术实现/阶段9-商业化版本/博时基金合规能力融合/ (task 3.1)
+// R-compliance-grading-5 still lives in the IN-FLIGHT delta
+// openspec/changes/add-compliance-grading-fusion/specs/compliance-grading/spec.md,
+// so it is referenced with a rule: tag rather than a steady-state anchor —
+// check-code-anchors deliberately refuses an anchor to a proposal. They are
+// upgraded when §7 writes the delta back to the steady-state layer.
+//
+// filterSigWithGrading appends the org grading document to the filter signature,
+// for the third time and the same reason as the two tiers above: the document is
+// baked into the detector child's env at spawn, so an admin changing L4 from
+// mask to warn changes the console and nothing else until the child re-spawns.
+//
+// Hashed rather than embedded because the document is up to 8KB and the
+// signature is compared on every 5s sync tick; 16 hex chars (64 bits) makes an
+// accidental collision — two different ladders that fail to re-spawn — not worth
+// reasoning about. The bytes are already compact (normalizeGradingPolicy), so a
+// master that only re-indents its answer does not churn the fleet.
+//
+// 能红 check: ignore the gradingJSON argument and TestFilterSig_ChangesWithGrading
+// fails. rule: R-compliance-grading-5
+func filterSigWithGrading(base string, gradingJSON []byte) string {
+	return base + "|" + gradingComponent(gradingJSON)
+}
+
+// gradingComponent is the ONE reduction of the org grading document to a token,
+// spelled "grading:<sha256[:16]>" per design.md §4b.
+//
+// WHY ONE FUNCTION AND NOT TWO (task 3.2): the same document has to move THREE
+// things in lockstep — the filter signature (re-spawns the child), the child's
+// AIKEY_COMPLIANCE_GRADING env (what it decides with), and the proxy's verdict
+// cache epoch (what it may replay). Two of the three drifting apart is the worst
+// shape available here: the signature moves and the epoch does not (the fleet
+// re-spawns under a new ladder while the cache keeps replaying the old rungs),
+// or the epoch moves and the signature does not (every verdict re-scanned
+// forever against a child that never got the new ladder). Both are silent.
+//
+// All three therefore read the SAME bytes — gradingPolicyJSON(), canonicalised
+// once at the entry by normalizeGradingPolicy — through this one digest.
+// gradingEnvValue()'s only difference is the documented nil → "{}" mapping,
+// which is the wire spelling of "no policy", not a different document.
+// Fenced by TestGrading_SignatureEnvAndCacheEpochShareTheSameBytes.
+// rule: R-compliance-grading-5
+func gradingComponent(gradingJSON []byte) string {
+	sum := sha256.Sum256(gradingJSON)
+	return "grading:" + hex.EncodeToString(sum[:])[:16]
+}
+
+// gradingContentPolicyToken is what the detector child's ChildHookConfig carries
+// so apphook can fold the ladder into the verdict-cache epoch. Same digest, same
+// bytes, same label as the filter signature — see gradingComponent.
+// rule: R-compliance-grading-5
+func (s *Supervisor) gradingContentPolicyToken() string {
+	return gradingComponent(s.gradingPolicyJSON())
+}
+
 // syncManagedKeys checks the vault change_seq and, if it has advanced since
 // the active generation was built, merges current active managed keys into the
 // live registry.
@@ -1153,7 +1260,7 @@ func (s *Supervisor) syncManagedKeys() {
 	if baseSig, ok := computeFilterSig(gen.vault); ok {
 		// Fold in the org privacy tier: it is baked into the detector child's env
 		// at spawn, so only a re-spawn can change what a running detector sends.
-		newSig := filterSigWithPasswordTier(filterSigWithPrivacyTier(baseSig, s.masterPrivacyTier.Load()), s.masterPasswordTierAdvanced.Load())
+		newSig := filterSigWithGrading(filterSigWithPasswordTier(filterSigWithPrivacyTier(baseSig, s.masterPrivacyTier.Load()), s.masterPasswordTierAdvanced.Load()), s.gradingPolicyJSON())
 		if prev := s.lastFilterSig.Load(); prev == nil || *prev != newSig {
 			// R5: record the attempted signature BEFORE the reload so a
 			// persistently-failing Reload (e.g. transient build error) does NOT
@@ -2107,11 +2214,15 @@ func (s *Supervisor) buildGeneration() (*generation, error) {
 	// The config → proxy shape conversion lives here because the proxy package
 	// deliberately does not import internal/config: the supervisor is the wiring
 	// layer for every other proxy setting too (SetConsoleURL, SetClusterNode).
-	bridgeUpstreams := make([]proxy.BridgeUpstreamRule, 0, len(s.cfg.ChatCompletionsBridge.Upstreams))
-	for _, u := range s.cfg.ChatCompletionsBridge.Upstreams {
-		bridgeUpstreams = append(bridgeUpstreams, proxy.BridgeUpstreamRule{Host: u.Host, Dialect: u.Dialect})
-	}
-	p.SetChatCompletionsBridge(s.cfg.ChatCompletionsBridge.Enabled, bridgeUpstreams)
+	//
+	// 🔴 The value comes from applyChatCompletionsBridge, NOT from s.cfg directly.
+	// A generation is rebuilt on every Reload — the vault's 5s change_seq tick, a
+	// compliance policy change and a quota policy change all trigger one — so
+	// reading the config file here would re-inject the LOCAL value over whatever
+	// the control plane had pushed, and the switch would flip back on its own with
+	// nothing in any log. dialect_bridge_rail.go holds the single reconciliation
+	// point both callers share. Fence: TestDialectBridge_AReloadDoesNotOverwriteTheControlPlanesAnswer.
+	s.applyChatCompletionsBridge(p)
 	// SyncRail §5.4: let the 401 wording distinguish "you need to sign in" from
 	// "the assignment rail is unreachable so this pick may be misdirected".
 	p.SetRoutingRailHealth(func() (string, int64) { return s.railHealthFor("routing_override") })
@@ -2185,7 +2296,7 @@ func (s *Supervisor) buildGeneration() (*generation, error) {
 	// Record the filter-app signature this generation was built with so
 	// syncManagedKeys can detect a later enable/disable and trigger a reload.
 	if baseSig, ok := computeFilterSig(vaultReader); ok {
-		sig := filterSigWithPasswordTier(filterSigWithPrivacyTier(baseSig, s.masterPrivacyTier.Load()), s.masterPasswordTierAdvanced.Load())
+		sig := filterSigWithGrading(filterSigWithPasswordTier(filterSigWithPrivacyTier(baseSig, s.masterPrivacyTier.Load()), s.masterPasswordTierAdvanced.Load()), s.gradingPolicyJSON())
 		s.lastFilterSig.Store(&sig)
 	}
 

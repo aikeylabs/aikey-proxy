@@ -133,6 +133,15 @@ const (
 	// See supervisor/license_plane_rail.go and
 	// workflow/CI/bugfix/20260827-forwarding-gate-was-never-wired.md.
 	EventProxyLicensePlaneChanged    = "proxy.license.plane_changed"
+	// EventProxyDialectBridgePolicyChanged marks the transition when the control
+	// plane's answer for the Chat Completions ⇄ Responses switch changes —
+	// including to and from "unset", which is what decides whether this worker
+	// follows the control plane or its own config file.
+	EventProxyDialectBridgePolicyChanged = "proxy.dialect_bridge.policy_changed"
+	// EventProxyDialectBridgePolicyUnreadable marks a persisted policy this build
+	// could not parse. The worker falls back to local configuration rather than
+	// guessing, and says so.
+	EventProxyDialectBridgePolicyUnreadable = "proxy.dialect_bridge.policy_unreadable"
 	EventProxyLicensePlaneUnreadable = "proxy.license.plane_unreadable"
 	EventProxyLicensePlaneFileFailed = "proxy.license.plane_file_failed"
 	// EventProxyLicensePlaneCapabilities: logged once at start-up. It is also what
@@ -157,6 +166,31 @@ const (
 	// and a compliance batch was DROPPED. This is real audit loss, unlike every
 	// other event in this group — it is logged at ERROR for that reason.
 	EventComplianceDeadLetterOverflow = "proxy.compliance.dead_letter_overflow"
+	// EventComplianceGradingInvalid: GET /v1/compliance/policy carried a
+	// `grading` member this proxy could not use (unparseable, or not a JSON
+	// object). The org DOES have a grading policy — the response says so — but
+	// this node cannot read the new one, so it keeps the last valid one rather
+	// than falling back to "grading off" (DEC-compliance-grading-10: silently
+	// disabling an org's whole ladder on one bad response is the worst possible
+	// failure shape, because the console still looks correct). WARN, emitted on
+	// every poll that carries the same unusable document.
+	//
+	// It is no longer the ONLY sign: since task 3.8 the same condition also
+	// raises GET /health -> compliance_policy.state = "degraded" with reason
+	// grading_policy_rejected, because a log line is not an externally readable
+	// health signal (「健康信号必须可被外部读取」).
+	EventComplianceGradingInvalid = "proxy.compliance.grading_invalid"
+	// EventComplianceGradingStale: the org compliance policy has been
+	// unrefreshable for a SUSTAINED run of polls (unusable document, non-200 or
+	// network error, gradingRejectEscalateAfter times in a row). Logged at ERROR
+	// exactly once per crossing, and re-armed after any usable answer.
+	//
+	// Why a second event and a higher level: the per-poll WARN above cannot tell
+	// a one-minute blip from a fleet that has been enforcing a ladder its console
+	// stopped showing minutes ago, and 「自检类连续失败到一定次数要升级状态」
+	// forbids a self-check that stays at WARN forever. Escalation shape copied
+	// from the canary's unavailable streak (internal/events/canary.go).
+	EventComplianceGradingStale = "proxy.compliance.grading_stale_sustained"
 )
 
 // Health events.

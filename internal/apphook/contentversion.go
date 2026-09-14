@@ -196,7 +196,12 @@ func (h *ChildHook) contentVersionState() (token, reason string) {
 		return "", ContentVersionReasonChildDegraded
 	}
 	if v := h.contentVersion.Load(); v != nil && *v != "" {
-		return *v, ""
+		// Fold in the policy this child was SPAWNED with. Done here, in the one
+		// place the "do I know my content set?" rule lives, so ContentVersion()
+		// (what the verdict cache keys on) and Status() (what an operator reads on
+		// /v1/diagnostics/pipeline) cannot disagree about which epoch is live.
+		// rule: R-compliance-grading-5
+		return ContentVersionWithPolicy(*v, h.cfg.ContentPolicyToken), ""
 	}
 	if r := h.contentVersionReason.Load(); r != nil && *r != "" {
 		return "", *r
@@ -410,4 +415,49 @@ func (p *FilterPool) ContentVersion() (string, bool) {
 	}
 	sort.Strings(tokens)
 	return contentFingerprint([]byte(strings.Join(tokens, "|"))), true
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Spawn-time policy: content the PROXY hands the child, not content it pulls
+// ─────────────────────────────────────────────────────────────────────────────
+
+// ContentVersionWithPolicy composes the token a hook publishes out of the two
+// independent things that decide its verdicts:
+//
+//	contentVersion — the content the child pulls FOR ITSELF and restates in its
+//	                 effective-content report (packs, phrases, rule counts).
+//	policyToken    — an already-labelled, opaque token for a policy document the
+//	                 PROXY HANDED the child at spawn (ChildHookConfig.
+//	                 ContentPolicyToken). "" = this hook was handed none.
+//
+// bugfix: 需求包 roadmap20260320/技术实现/阶段9-商业化版本/博时基金合规能力融合/ (task 3.2)
+// R-compliance-grading-5 still lives in the IN-FLIGHT delta
+// openspec/changes/add-compliance-grading-fusion/specs/compliance-grading/spec.md,
+// so it is referenced with a rule: tag rather than a steady-state anchor —
+// check-code-anchors deliberately refuses an anchor to a proposal.
+//
+// WHY BOTH HALVES AND NOT JUST THE REPORT: the report is the child restating
+// what it pulled. It cannot restate what it was HANDED, because at the moment it
+// answers it has no way to know that the value in its environment is newer or
+// older than the one the proxy is now holding. So a policy swap is invisible in
+// the report by construction, and an epoch built from the report alone is
+// byte-identical across an admin relaxing L4 from mask to warn — the 2026-08-13
+// stale-mask bug reached through a second door.
+//
+// WHY THE CALLER LABELS THE TOKEN: keeping the label out of here is what keeps
+// 不变量 #16 (proxy MUST NOT know what business the app is doing) intact. This
+// layer concatenates two opaque strings; it never learns that one of them is a
+// compliance grading ladder. The supervisor, which owns that vocabulary, spells
+// the "grading:<sha256[:16]>" component (design.md §4b).
+//
+// 🔴 AN UNKNOWN CONTENT SET STAYS UNKNOWN. A policy token is not a content
+// version: a child that cannot say which packs it is using must not become
+// cacheable just because we know which ladder we handed it. The fail-safe branch
+// is the one with no visible symptom in a passing test, so it is pinned first.
+// rule: R-compliance-grading-5
+func ContentVersionWithPolicy(contentVersion, policyToken string) string {
+	if contentVersion == "" || policyToken == "" {
+		return contentVersion
+	}
+	return contentVersion + "|" + policyToken
 }

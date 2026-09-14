@@ -452,7 +452,11 @@ func (p *Proxy) applyInboundFilter(
 			// 污染 + 防写侧未来回归),也当作 miss、落到下方真扫按最新策略重判 —— block
 			// 是安全决策不复用陈旧拒绝。仅精确排除 ActionBlock,mask/warn/allow 命中路径
 			// 逐字不变(它们 action != ActionBlock,条件恒真)。
-			if v, ok := cache.Get(auditScopeKey, ckey); ok && v.action != apphook.ActionBlock {
+			// v.action.Recognized() 是 fail-closed 的读侧配套(2026-09-13,
+			// R-compliance-canned-answer-6):写侧已不再写入无法识别的判定(见下方
+			// Detect 后的归一),此处兜底进程内 pre-fix 污染 —— 回放一个本 build 读不懂
+			// 的判定没有任何意义,当 miss 落到真扫按最新策略重判。
+			if v, ok := cache.Get(auditScopeKey, ckey); ok && v.action.Recognized() && v.action != apphook.ActionBlock {
 				// Restorables replay from cache (offsets only): the hash-matched head
 				// is byte-identical, so the same spans slice the same originals.
 				// Event replays too (2026-08-08 审计缺口修复): a flagged piece resent
@@ -481,6 +485,44 @@ func (p *Proxy) applyInboundFilter(
 				// (方案 §5.4.5: PoC 期 child 忽略 user_role, 统一用 default).
 			})
 			detectNanos += time.Since(_t0).Nanoseconds()
+			// ── FAIL-CLOSED ON AN UNREADABLE VERDICT ────────────────────────────
+			// spec (PROPOSAL layer, 需求包 roadmap20260320/技术实现/阶段9-商业化版本/
+			// 博时基金合规能力融合/openspec/changes/add-compliance-grading-fusion/
+			// specs/compliance-canned-answer/spec.md):
+			//   R-compliance-canned-answer-6    未识别动作 SHALL 按 ActionBlock 处理
+			//   R-compliance-canned-answer-6.S1 403 COMPLIANCE_BLOCKED，上游 0 请求
+			//
+			// 🔴 2026-09-13 REVERSAL — read before "restoring" the old behaviour.
+			// This used to be handled by the switch's `default:` below as a LOUD
+			// FAIL-OPEN (2026-06-22 review). The "loud" half is kept verbatim; the
+			// "open" half is reversed, because two opposite failures were conflated:
+			//
+			//   child could not ANSWER (timeout/crash/not installed) → fail-OPEN,
+			//     §6 #11. Those paths return an explicit ActionAllow+Degraded from
+			//     ChildHook.Detect, are Recognized(), and are untouched here.
+			//   child ANSWERED with a verdict we cannot read → fail-CLOSED. The
+			//     action value is policy the master handed down; not recognizing it
+			//     means this proxy is older than the policy or the policy was
+			//     tampered with. Neither is a reason to forward the content.
+			//
+			// Placed HERE, before the cache write, on purpose: an unreadable verdict
+			// normalizes to Block and Block is never cached (see the guard below), so
+			// the cache cannot come to hold a value no reader can interpret.
+			//
+			// Reason is cleared: on a real Block it is empty by construction and the
+			// client gets the constant refusal (see guardrailVerbatimSources in
+			// compliance_guardrail_response_fence_test.go). On THIS path it is a
+			// string of unknown provenance from a verdict we just decided we cannot
+			// read — it must not be echoed to the caller.
+			// 围栏: TestApplyInboundFilter_UnknownAction_FailsClosedBlocked ·
+			//       internal/apphook TestUnknownAction_TreatedAsBlock
+			if resp != nil && !resp.Action.Recognized() {
+				logger.Warn("filter: unrecognized apphook action; refusing the request (fail-CLOSED)",
+					"event.name", "proxy.filter.unknown_action",
+					"action", int(resp.Action), "reason", resp.Reason, "degraded", resp.Degraded)
+				resp.Action = apphook.NormalizeAction(resp.Action)
+				resp.Reason = ""
+			}
 			// 只缓存"确定性"判定:degraded(超时/fail-open)与 nil 不缓存,否则会把
 			// "没扫成"误记成 allow、下轮命中缓存就放行(违反 INV-2)。
 			//
@@ -619,11 +661,55 @@ func (p *Proxy) applyInboundFilter(
 			teamEventIdx = len(teamEvents) - 1
 		}
 
+		// 代答 (canned answer) is KNOWN to this build but not yet SERVABLE: the
+		// six-shape response synthesizer (writeCannedAnswer) is task 3.6. Degrade to
+		// Block — precisely the behaviour R-compliance-canned-answer-6.S1 prescribes
+		// for a proxy that has not declared the capability (403 COMPLIANCE_BLOCKED,
+		// nothing forwarded), never a pass-through.
+		//
+		// Self-removing seam: when 3.6 flips apphook.SupportsCannedAnswer() to true,
+		// this guard stops firing and 3.6's own `case apphook.ActionAnswer:` (added
+		// beside ActionBlock, same short-circuit, same `return false`) takes over.
+		if action == apphook.ActionAnswer && !apphook.SupportsCannedAnswer() {
+			logger.Warn("filter: canned-answer verdict on a build that cannot synthesize one; refusing as a plain block",
+				"event.name", "proxy.filter.canned_answer_unsupported")
+			action = apphook.ActionBlock
+		}
+
 		switch action {
 		case apphook.ActionBlock:
 			// Refuse the whole request — one content piece contained content the
 			// policy blocks (e.g. full private key, batch customer data). Restore
 			// the original body for any error-path logging; do NOT forward.
+			//
+			// 🔴 THIS IS THE GUARDRAIL SHORT-CIRCUIT. Two red lines govern the
+			// bytes written below, and the canned answer (代答) is specified to
+			// land at this exact point rather than beside it:
+			//
+			// R-compliance-canned-answer-1 代答短路请求，原文不出上游
+			//   —— 与 ActionBlock 使用同一短路点与同一 `return false` 语义。
+			//   Its 射程 note carries design §6 不变量 13: 护栏只在「请求未发往
+			//   上游」时写响应体；一旦转发过上游，响应体永不由护栏改写（占位符
+			//   还原是既有且唯一的例外，见 filter_restore.go）。
+			// R-compliance-canned-answer-3 代答文案原样输出，不得插值命中片段
+			//   —— design §6 不变量 12. Whatever text goes to the client here is
+			//   printed VERBATIM: no Sprintf, no template, no concatenation of
+			//   anything the detector found. Interpolation would turn the refusal
+			//   into a channel that echoes the customer's ID-card number back to
+			//   whoever sent it — the same red line as 「原文不出客户信任边界」,
+			//   reached from the other side.
+			//
+			// bugfix: 需求包 roadmap20260320/技术实现/阶段9-商业化版本/博时基金合规能力融合/
+			//   openspec/changes/add-compliance-grading-fusion/specs/compliance-canned-answer/spec.md
+			//   (both rules are still PROPOSAL-layer, so they are referenced by id
+			//   rather than written as `spec:` anchors — a `spec:` anchor tells
+			//   check-spec-writeback the rule has landed, and the canned answer has
+			//   not. Upgrade both in the change that lands it. Same convention as
+			//   aikey-control-master internal/compliance/grading_document.go.)
+			// 围栏: compliance_guardrail_response_fence_test.go —
+			//   TestFence_GuardrailShortCircuitBodyIsNeverInterpolated derives THIS
+			//   call site from the source and rejects any non-verbatim argument, so
+			//   the canned answer inherits the check without anyone updating a list.
 			p.errors.Add(1)
 			logger.Info("filter: request blocked",
 				"event.name", "proxy.filter.blocked",
@@ -703,19 +789,25 @@ func (p *Proxy) applyInboundFilter(
 			}
 
 		default:
-			// Unknown / future Action value. childhook converts the child's raw
-			// wire byte straight to Action (childhook.go), so a misbehaving child
-			// or a protocol version skew can yield a value outside the known set.
-			// Fail-OPEN per §6 #11 (a detector anomaly must not block traffic),
-			// but surface it LOUDLY (失败要显眼) and count it as degraded so it is
-			// visible in metrics/alerts and never silently treated as a clean
-			// Allow verdict. Without this the request would slip through unscanned
-			// with zero signal (regression guarded by 2026-06-22 review).
-			logger.Warn("filter: unknown apphook action; forwarding as degraded fail-open",
+			// UNREACHABLE by construction: every verdict was passed through
+			// apphook.NormalizeAction above (unrecognized → Block), and
+			// ActionAnswer was degraded to Block just before this switch while
+			// SupportsCannedAnswer() is false. Kept, and kept fail-CLOSED, because
+			// the thing this branch has to survive is a FUTURE edit that removes or
+			// bypasses the normalization — the 2026-06-22 review was exactly that
+			// (an exhaustive-switch refactor dropped the catch-all). A refusal is
+			// the only outcome here that cannot silently forward content unscanned.
+			// Duplicates the refusal rather than reusing the ActionBlock branch:
+			// the two are reached for different reasons and neither may `fallthrough`
+			// into an earlier case in Go.
+			logger.Error("filter: verdict reached the dispatch switch un-normalized; refusing (fail-CLOSED)",
 				"event.name", "proxy.filter.unknown_action",
-				"action", int(resp.Action), "reason", resp.Reason)
-			degraded = true
-			selfDeg++
+				"action", int(action), "raw_action", int(resp.Action))
+			p.errors.Add(1)
+			r.Body = io.NopCloser(bytes.NewReader(bodyBytes))
+			writeJSONError(w, http.StatusForbidden, "invalid_request_error",
+				"COMPLIANCE_BLOCKED", "request blocked by compliance policy")
+			return false
 		}
 	}
 

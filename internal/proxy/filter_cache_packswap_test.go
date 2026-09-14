@@ -338,3 +338,123 @@ func TestFilterCache_PackSwapHitRateProfile(t *testing.T) {
 			swapped, wantSwapped, turns, turns/2-1)
 	}
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Task 3.2 — the ORG GRADING LADDER is the second content axis
+// (R-compliance-grading-5.S1)
+// ─────────────────────────────────────────────────────────────────────────────
+//
+// The pack swap above is content the detector pulls FOR ITSELF. The grading
+// ladder is the other half: a policy document the PROXY hands the child at
+// spawn (AIKEY_COMPLIANCE_GRADING, task 3.1). An admin moving L4 from mask to
+// warn changes what the very same detector, holding the very same packs,
+// decides about the very same text.
+//
+// That makes the packs fingerprint alone an INCOMPLETE epoch: it is
+// byte-identical across a ladder change, so every verdict memoized under the
+// old ladder stays reachable and the user keeps seeing text masked by a rung
+// the admin already relaxed — the 2026-08-13 stale-mask bug, reached through a
+// second door.
+//
+// gradedDetectorHook models exactly that: a FIXED packs token, a ladder that
+// can be relaxed at runtime, and a content version composed the way production
+// composes it (apphook.ContentVersionWithPolicy — the one place ChildHook
+// composes its own token, so de-fixing it turns this test red).
+
+type gradedDetectorHook struct {
+	packs      string // effective-content token; NEVER moves in this test
+	policy     string // labelled token for the ladder the child was handed
+	action     apphook.Action
+	trigger    string
+	calls      int
+	lastAction apphook.Action
+	mu         sync.Mutex
+}
+
+func (h *gradedDetectorHook) Name() string { return "graded-detector-fake" }
+
+func (h *gradedDetectorHook) Detect(_ context.Context, req *apphook.Request) *apphook.Response {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	h.calls++
+	if !strings.Contains(string(req.Payload), h.trigger) {
+		h.lastAction = apphook.ActionAllow
+		return &apphook.Response{Action: apphook.ActionAllow}
+	}
+	h.lastAction = h.action
+	if h.action == apphook.ActionMask {
+		return &apphook.Response{Action: apphook.ActionMask, MutatedPayload: []byte("[MASKED]")}
+	}
+	return &apphook.Response{Action: h.action}
+}
+
+func (h *gradedDetectorHook) Status() *apphook.Status {
+	return &apphook.Status{Healthy: true, Version: "ai-compliance-detector/1.4.2 proto/4"}
+}
+
+// ContentVersion goes through the production composer on purpose: a fake that
+// concatenated the two halves itself would assert the TEST's idea of the epoch,
+// not the code that ships.
+func (h *gradedDetectorHook) ContentVersion() (string, bool) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	return apphook.ContentVersionWithPolicy(h.packs, h.policy), h.packs != ""
+}
+
+// relaxLadder is one admin edit: L4 mask → warn. The packs token is deliberately
+// left untouched — that is the whole hazard.
+func (h *gradedDetectorHook) relaxLadder(policy string, action apphook.Action) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	h.policy, h.action = policy, action
+}
+
+func (h *gradedDetectorHook) snapshot() (calls int, last apphook.Action) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	return h.calls, h.lastAction
+}
+
+// TestFilterCache_GradingChangeInvalidatesMaskVerdict is R-compliance-grading-5.S1:
+// once the admin relaxes L4 to warn, the next turn carrying the very same text
+// must be RE-SCANNED and come back warn — not replay the cached mask.
+//
+// 能红 check: make apphook.ContentVersionWithPolicy ignore its policyToken (i.e.
+// let the epoch stop carrying the bytes the child was spawned with) and this
+// test fails with the stale mask still applied.
+func TestFilterCache_GradingChangeInvalidatesMaskVerdict(t *testing.T) {
+	const secret = "ZQXJV770412"
+	hook := &gradedDetectorHook{
+		packs:   "packs-v1",
+		policy:  "grading:1111111111111111",
+		action:  apphook.ActionMask,
+		trigger: secret,
+	}
+	p := &Proxy{filterHook: hook}
+	p.SetFilterCacheEnabled(true, 50)
+
+	if body := sendTurn(t, p, "my token is "+secret+" ok"); !strings.Contains(body, "[MASKED]") {
+		t.Fatalf("precondition: L4=mask must mask, got %q", body)
+	}
+
+	// The admin moves L4 from mask to warn. The detector keeps the SAME packs;
+	// only the ladder it was handed changed, so only the policy half of the
+	// epoch moves.
+	hook.relaxLadder("grading:2222222222222222", apphook.ActionWarn)
+
+	body := sendTurn(t, p, "my token is "+secret+" ok")
+	if strings.Contains(body, "[MASKED]") {
+		t.Fatalf("STALE MASK: L4 was relaxed to warn but the proxy replayed the verdict "+
+			"memoized under the old ladder; body=%q", body)
+	}
+	if !strings.Contains(body, secret) {
+		t.Fatalf("a warn verdict passes the content through untouched; body=%q", body)
+	}
+	calls, last := hook.snapshot()
+	if calls != 2 {
+		t.Errorf("the ladder change must force a real re-scan: Detect calls = %d, want 2", calls)
+	}
+	if last != apphook.ActionWarn {
+		t.Errorf("the re-scan must run under the NEW ladder: last action = %v, want warn", last)
+	}
+}

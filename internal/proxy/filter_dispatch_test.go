@@ -410,17 +410,34 @@ func TestItoaInt64(t *testing.T) {
 	}
 }
 
-// TestApplyInboundFilter_UnknownAction_FailsLoudDegraded — regression for the
-// 2026-06-22 third-party review: an exhaustive-switch refactor replaced the
-// switch's `default` with an explicit `case ActionAllow`, dropping the catch-all.
-// childhook converts the child's raw wire byte straight to Action, so a
-// misbehaving child / protocol skew can yield a value outside {Allow,Mask,Block,
-// Warn}. Such an unknown action MUST fail-OPEN (content proceeds, per §6 #11)
-// but LOUDLY: a WARN is logged and it counts as degraded — never a silent clean
-// Allow that slips through unscanned with zero signal.
-func TestApplyInboundFilter_UnknownAction_FailsLoudDegraded(t *testing.T) {
+// TestApplyInboundFilter_UnknownAction_FailsClosedBlocked pins the observable
+// half of R-compliance-canned-answer-6.S1: an action value this build cannot
+// read is REFUSED (403 COMPLIANCE_BLOCKED, nothing forwarded), never forwarded.
+//
+// spec (PROPOSAL layer): 需求包 roadmap20260320/技术实现/阶段9-商业化版本/
+// 博时基金合规能力融合/openspec/changes/add-compliance-grading-fusion/specs/
+// compliance-canned-answer/spec.md — R-compliance-canned-answer-6 / .S1.
+// Enum-level half: internal/apphook TestUnknownAction_TreatedAsBlock.
+//
+// 🔴 THIS REVERSES ITS OWN PREDECESSOR, deliberately. The test that stood here
+// until 2026-09-13 was TestApplyInboundFilter_UnknownAction_FailsLoudDegraded,
+// the 2026-06-22 third-party-review regression: an exhaustive-switch refactor
+// had dropped the catch-all, and the fix restored it as a LOUD FAIL-OPEN (warn +
+// count as degraded + forward). The "loud" half is kept verbatim. The "open"
+// half is reversed, because the two cases it conflated are opposites:
+//
+//	child could not answer (timeout / crash / unreachable)  → fail-OPEN, §6 #11.
+//	  Those paths return an explicit ActionAllow+Degraded from ChildHook.Detect
+//	  (internal/apphook/childhook.go), so they never reach this branch and are
+//	  byte-for-byte unaffected by the reversal.
+//	child answered with a verdict we cannot read              → fail-CLOSED.
+//	  The action value is policy handed down by the master. Not recognizing it
+//	  means this proxy is older than the policy, or the policy was tampered
+//	  with. Forwarding on either is "version skew silently switches the
+//	  compliance policy off" — R-compliance-canned-answer-6 names exactly this.
+func TestApplyInboundFilter_UnknownAction_FailsClosedBlocked(t *testing.T) {
 	const unknownAction = apphook.Action(99) // outside the defined action set
-	hook := &stubHook{resp: &apphook.Response{Action: unknownAction}}
+	hook := &stubHook{resp: &apphook.Response{Action: unknownAction, Reason: "detector said something we cannot read"}}
 	p := &Proxy{filterHook: hook}
 	r := newReq(`{"model":"m","messages":[{"role":"user","content":"hello world"}]}`)
 	w := httptest.NewRecorder()
@@ -430,17 +447,60 @@ func TestApplyInboundFilter_UnknownAction_FailsLoudDegraded(t *testing.T) {
 
 	proceed := p.applyInboundFilter(w, r, "m", "personal", "", "", "", "", "", logger)
 
-	// 1. fail-OPEN: the request proceeds and content is forwarded unchanged.
-	if !proceed {
-		t.Fatal("unknown action must fail-OPEN (proceed=true), got proceed=false")
+	// 1. fail-CLOSED. proceed=false IS the "upstream receives 0 requests" half of
+	// .S1 at this layer: the sole caller returns immediately on false, before any
+	// forwarding step (forward_and_resolve.go:510-512, read 2026-09-13).
+	if proceed {
+		t.Fatal("unrecognized action must fail-CLOSED (proceed=false); proceed=true forwards " +
+			"the content upstream unscanned, which R-compliance-canned-answer-6 forbids")
 	}
-	if got := readReqBody(t, r); !strings.Contains(got, "hello world") {
-		t.Errorf("content must pass through unchanged on unknown action, got %q", got)
+	if w.Code != http.StatusForbidden {
+		t.Errorf("status = %d, want 403", w.Code)
 	}
-	// 2. fail-LOUD: a WARN names the unknown action (not a silent clean Allow).
+	if body := w.Body.String(); !strings.Contains(body, "COMPLIANCE_BLOCKED") {
+		t.Errorf("body must carry COMPLIANCE_BLOCKED, got %q", body)
+	}
+	// 2. The client gets the constant refusal, NOT the detector's Reason. On a
+	// real Block the Reason is empty by construction (see guardrailVerbatimSources
+	// in compliance_guardrail_response_fence_test.go); on THIS path it is a string
+	// of unknown provenance from a verdict we already decided we cannot read, so
+	// it must not be echoed back to the caller.
+	if body := w.Body.String(); strings.Contains(body, "cannot read") {
+		t.Errorf("the unreadable verdict's Reason leaked into the client response: %q", body)
+	}
+	// 3. fail-LOUD: the operator can tell a version skew from a policy block.
 	if logs := logBuf.String(); !strings.Contains(logs, "proxy.filter.unknown_action") {
-		t.Errorf("expected a WARN (proxy.filter.unknown_action) for the unknown action, got logs:\n%s", logs)
+		t.Errorf("expected a WARN (proxy.filter.unknown_action) for the unrecognized action, got logs:\n%s", logs)
 	}
+}
+
+// TestActionCeiling_ClampsAnswerLikeBlock keeps the new ActionAnswer rung under
+// the block-type action ceiling (方案② 2026-08-10, 天花板只压不抬).
+//
+// WHY IT IS PART OF ADDING THE ENUM VALUE, not of implementing the canned answer:
+// clamp() enumerates the intrusive verdicts by name. A rung that is not named
+// there falls through its trailing `return a, false` and escapes the ceiling —
+// so a tool_result pinned to the audit rung, which may not even be masked, could
+// short-circuit the whole request with a canned answer. Answer is at least as
+// intrusive as Block (same short-circuit, same `return false`), so it clamps
+// with Block or the ceiling has a hole the day the value exists.
+func TestActionCeiling_ClampsAnswerLikeBlock(t *testing.T) {
+	for _, c := range []actionCeiling{ceilingAudit, ceilingOff} {
+		got, capped := c.clamp(apphook.ActionAnswer)
+		if got != apphook.ActionAllow || !capped {
+			t.Errorf("ceiling %s: clamp(answer) = (%v, capped=%v), want (allow, capped=true) — "+
+				"same as clamp(block) = %v", c, got, capped, mustClamp(c, apphook.ActionBlock))
+		}
+	}
+	// ceilingFull is the pass-through rung: it must NOT cap anything.
+	if got, capped := ceilingFull.clamp(apphook.ActionAnswer); got != apphook.ActionAnswer || capped {
+		t.Errorf("ceilingFull.clamp(answer) = (%v, %v), want (answer, false)", got, capped)
+	}
+}
+
+func mustClamp(c actionCeiling, a apphook.Action) apphook.Action {
+	out, _ := c.clamp(a)
+	return out
 }
 
 // TestInjectSeat pins the 2026-07-08 seat-attribution stamp: the compliance
