@@ -2,6 +2,8 @@ package asyncscan
 
 import (
 	"context"
+	"encoding/json"
+	"fmt"
 	"log/slog"
 	"sync"
 	"sync/atomic"
@@ -265,6 +267,24 @@ func (x *LocalExecutor) run(job PieceJob) {
 			res.Reason = deepscan.ReasonTransient
 			continue
 		}
+		// 🔴 The detector's answer IS the product of this lane. Until 2026-09-13
+		// this loop counted the chunk and dropped the response: every result left
+		// here with zero findings, so nothing this executor scanned was ever filed
+		// — personal content included. Offsets come back relative to the chunk the
+		// detector was given and are remapped to the piece here, exactly as the
+		// scan node's pool does (workers detector_pool.py), so Merge's head check
+		// compares like with like.
+		// bugfix: workflow/CI/bugfix/20260913-async-scan-lane-never-returned-findings.md
+		found, perr := chunkFindings(resp.Event, c.Start)
+		if perr != nil {
+			x.log.Warn("local async scan: detector event undecodable; this chunk's findings are lost and the piece is marked partial",
+				"event.name", observability.EventAsyncScanExecutorSaturated, "job_id", job.JobID, "error", perr)
+			res.Status = deepscan.StatusPartial
+			res.Reason = deepscan.ReasonTransient
+			continue
+		}
+		res.Findings = append(res.Findings, found...)
+		res.RuleVerdicts = append(res.RuleVerdicts, deepscan.RangeVerdict{Start: c.Start, End: c.End, Action: resp.Action.String()})
 		res.Engines.Rules.Chunks++
 	}
 	res.Engines.Rules.Status = res.Status
@@ -303,4 +323,37 @@ func (x *LocalExecutor) stopChild() {
 	if x.cfg.OnChildStopped != nil {
 		x.cfg.OnChildStopped()
 	}
+}
+
+// chunkFindings converts the detector's event for ONE chunk into findings at
+// absolute offsets into the piece. An empty event is "nothing found", not an
+// error; an event that does not decode is an error the caller must surface.
+func chunkFindings(event []byte, chunkStart int) ([]deepscan.Finding, error) {
+	if len(event) == 0 {
+		return nil, nil
+	}
+	var ev struct {
+		Findings []struct {
+			RuleID      string `json:"rule_id"`
+			Category    string `json:"category"`
+			EntityType  string `json:"entity_type"`
+			Severity    string `json:"severity"`
+			Confidence  int    `json:"confidence"`
+			StartOffset int    `json:"start_offset"`
+			EndOffset   int    `json:"end_offset"`
+			Detector    string `json:"detector"`
+		} `json:"findings"`
+	}
+	if err := json.Unmarshal(event, &ev); err != nil {
+		return nil, fmt.Errorf("decode detector event: %w", err)
+	}
+	out := make([]deepscan.Finding, 0, len(ev.Findings))
+	for _, f := range ev.Findings {
+		out = append(out, deepscan.Finding{
+			Engine: deepscan.EngineRules, RuleID: f.RuleID, Category: f.Category,
+			EntityType: f.EntityType, Severity: f.Severity, Confidence: f.Confidence,
+			Start: chunkStart + f.StartOffset, End: chunkStart + f.EndOffset, Detector: f.Detector,
+		})
+	}
+	return out, nil
 }

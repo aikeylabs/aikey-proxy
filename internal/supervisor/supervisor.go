@@ -100,7 +100,7 @@ type generation struct {
 	// remote forwarder + results pump). nil when the lane is not running, which
 	// is the normal state on Personal and on any deployment with deep scan off.
 	asyncLane *asyncScanLane
-	reporter   *events.Reporter     // usage reporter (nil when collector_url is not configured)
+	reporter  *events.Reporter // usage reporter (nil when collector_url is not configured)
 	// standaloneWAL is only populated when this generation created the
 	// local WAL writer AND no reporter consumed it — i.e. collector_url is
 	// empty. When a reporter is present it owns the WAL and its Close()

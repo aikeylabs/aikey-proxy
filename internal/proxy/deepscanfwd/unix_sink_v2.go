@@ -2,9 +2,7 @@ package deepscanfwd
 
 import (
 	"context"
-	"encoding/binary"
 	"fmt"
-	"io"
 	"net"
 	"sync"
 	"time"
@@ -85,24 +83,11 @@ func (s *unixSinkV2) Send(ctx context.Context, frame []byte) error {
 	return nil
 }
 
-// readResult reads exactly one framed result: [1B version][4B LE len][JSON].
+// readResult reads exactly one framed result. The framing lives in
+// deepscan.ReadResult, shared with the TLS sink so the two cannot drift.
 func (s *unixSinkV2) readResult() (deepscan.ResultFrame, error) {
 	_ = s.conn.SetReadDeadline(time.Now().Add(s.resultTimeout))
-	var head [5]byte
-	if _, err := io.ReadFull(s.conn, head[:]); err != nil {
-		return deepscan.ResultFrame{}, fmt.Errorf("deepscan v2 read header: %w", err)
-	}
-	n := binary.LittleEndian.Uint32(head[1:5])
-	// Length-prefix first, allocation never: refuse an oversized declared length
-	// instead of allocating it.
-	if n > deepscan.MaxFrameBytes {
-		return deepscan.ResultFrame{}, fmt.Errorf("deepscan v2 result declares %d bytes, over the %d cap", n, deepscan.MaxFrameBytes)
-	}
-	body := make([]byte, n)
-	if _, err := io.ReadFull(s.conn, body); err != nil {
-		return deepscan.ResultFrame{}, fmt.Errorf("deepscan v2 read body: %w", err)
-	}
-	return deepscan.DecodeResult(append(head[:], body...))
+	return deepscan.ReadResult(s.conn)
 }
 
 func (s *unixSinkV2) reset() {

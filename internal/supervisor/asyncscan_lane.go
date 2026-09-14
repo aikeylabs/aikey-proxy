@@ -480,24 +480,43 @@ func (s *Supervisor) asyncExecutorSpawn(vaultReader *vault.Reader) func() (appho
 		return nil
 	}
 	return func() (apphook.Hook, error) {
-		cfg := apphook.ChildHookConfig{
-			Name:       "ai-compliance-detector-async",
-			BinaryPath: binPath,
-			BinaryArgs: binArgs,
-			// A whole piece, not a request turn: seconds, not milliseconds.
-			Timeout:      time.Duration(envInt("AIKEY_PROXY_ASYNC_RULES_DETECT_TIMEOUT_MS", 2000)) * time.Millisecond,
-			ReadyTimeout: filterReadyTimeout(),
-			// 🔴 The SAME env scrubbing the request-path child gets, so this child
-			// cannot inherit AIKEY_DEEPSCAN_SOCKET and forward every prompt to the
-			// on-machine daemon a second time — the same content scanned twice and
-			// uploaded twice, by two senders whose event ids cannot collide.
-			ExtraEnv: s.filterChildEnv("", ""),
-		}
+		cfg := s.asyncExecutorChildConfig(binPath, binArgs)
 		h := apphook.NewChildHook(&cfg)
 		if err := h.Start(s.ctx); err != nil {
 			return nil, err
 		}
 		return h, nil
+	}
+}
+
+// asyncReturnEventsEnv makes the background detector hand every finding back to
+// the proxy and upload nothing itself (ai-compliance-detector returnEventsMode;
+// exact "1" only).
+const asyncReturnEventsEnv = "AIKEY_COMPLIANCE_RETURN_EVENTS=1"
+
+// asyncExecutorChildConfig is the background detector's process configuration.
+// Split out of asyncExecutorSpawn so its environment can be asserted without
+// starting a process.
+func (s *Supervisor) asyncExecutorChildConfig(binPath string, binArgs []string) apphook.ChildHookConfig {
+	return apphook.ChildHookConfig{
+		Name:       "ai-compliance-detector-async",
+		BinaryPath: binPath,
+		BinaryArgs: binArgs,
+		// A whole piece, not a request turn: seconds, not milliseconds.
+		Timeout:      time.Duration(envInt("AIKEY_PROXY_ASYNC_RULES_DETECT_TIMEOUT_MS", 2000)) * time.Millisecond,
+		ReadyTimeout: filterReadyTimeout(),
+		// 🔴 The SAME env scrubbing the request-path child gets, so this child
+		// cannot inherit AIKEY_DEEPSCAN_SOCKET and forward every prompt to the
+		// on-machine daemon a second time — the same content scanned twice and
+		// uploaded twice, by two senders whose event ids cannot collide.
+		//
+		// 🔴 PLUS return-events mode: this private pool must never upload on its
+		// own. The proxy is the only party that knows the seat, session and trace
+		// of a piece, so it is the only filer; a child that also uploaded would put
+		// a second, unattributed copy of every finding in a ledger. The detector's
+		// own doc names the proxy as the party that sets it; until 2026-09-13 only
+		// the scan node's pool (workers) did.
+		ExtraEnv: append(s.filterChildEnv("", ""), asyncReturnEventsEnv),
 	}
 }
 

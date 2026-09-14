@@ -135,3 +135,27 @@ func TestFileAsyncResult_TeamFindingsGoToMasterAndAreMirroredLocally(t *testing.
 		t.Fatalf("the local mirror is not labelled route_source=team, so the local page cannot tell it apart: %s", got[0])
 	}
 }
+
+// TestAsyncExecutorChild_ReturnsFindingsToTheProxy — the background detector
+// runs in return-events mode, so it never uploads on its own and the proxy stays
+// the single filer of what this lane finds.
+func TestAsyncExecutorChild_ReturnsFindingsToTheProxy(t *testing.T) {
+	s := &Supervisor{cfg: &config.Config{}}
+	cfg := s.asyncExecutorChildConfig("/bin/detector", nil)
+	found := false
+	for _, kv := range cfg.ExtraEnv {
+		if kv == "AIKEY_COMPLIANCE_RETURN_EVENTS=1" {
+			found = true
+		}
+		if strings.HasPrefix(kv, "AIKEY_DEEPSCAN_SOCKET=") && kv != "AIKEY_DEEPSCAN_SOCKET=" {
+			t.Fatalf("the background detector inherits a deep-scan socket (%q) — content would be scanned twice", kv)
+		}
+	}
+	if !found {
+		t.Fatalf("background detector env lacks AIKEY_COMPLIANCE_RETURN_EVENTS=1: %v", cfg.ExtraEnv)
+	}
+	// And the spawn path uses this config, not a hand-built copy of it.
+	if src := readSource(t, "asyncscan_lane.go"); !strings.Contains(src, "cfg := s.asyncExecutorChildConfig(binPath, binArgs)") {
+		t.Fatal("asyncExecutorSpawn does not build its child from asyncExecutorChildConfig")
+	}
+}

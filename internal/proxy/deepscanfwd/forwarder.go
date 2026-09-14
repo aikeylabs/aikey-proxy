@@ -2,6 +2,7 @@ package deepscanfwd
 
 import (
 	"context"
+	"errors"
 	"log/slog"
 	"sync"
 	"sync/atomic"
@@ -254,10 +255,23 @@ func (r *RemoteForwarder) deliver(q queued) {
 		err := sink.Send(ctx, mustEncode(q.frame))
 		cancel()
 		if err != nil {
+			// A node's refusal arrives in its result frame; the sink surfaces it as
+			// a RejectError so the existing rule applies — a terminal code stops
+			// here, any other lets the next node try. The sink has already reset
+			// its connection, so the cached sink stays.
+			var rej *deepscan.RejectError
+			if errors.As(err, &rej) {
+				r.noteFailure(n, rej.Code)
+				if terminalReject(rej.Code) {
+					return
+				}
+				continue
+			}
 			r.dropSink(n.ID)
 			r.noteFailure(n, err.Error())
 			continue
 		}
+		r.collectResult(n, sink)
 		r.forwarded.Add(1)
 		r.breaker.Report(n.ID, true)
 		r.consecFails.Store(0)
@@ -270,6 +284,32 @@ func (r *RemoteForwarder) deliver(q queued) {
 	// Every node refused or is open-circuit.
 	r.failed.Add(1)
 	r.escalateIfPersistent()
+}
+
+// collectResult moves the node's answer for the frame just delivered onto the
+// lane's results channel.
+//
+// 🔴 Results() existed and nothing ever wrote to it: every result a node
+// produced died inside the sink, and the lane's pump waited on an empty
+// channel forever — the async lane filed nothing in any edition.
+// bugfix: workflow/CI/bugfix/20260913-async-scan-lane-never-returned-findings.md
+func (r *RemoteForwarder) collectResult(n scannode.Node, sink deepscan.Sink) {
+	rs, ok := sink.(interface {
+		Results() <-chan deepscan.ResultFrame
+	})
+	if !ok {
+		return
+	}
+	select {
+	case res := <-rs.Results():
+		select {
+		case r.results <- res:
+		default:
+			r.log.Warn("deep-scan result dropped: the lane is not draining results",
+				"event.name", observability.EventDeepScanForwardFailed, "node", n.ID, "job_id", res.JobID)
+		}
+	default:
+	}
 }
 
 func (r *RemoteForwarder) rejectFor(n scannode.Node) string {

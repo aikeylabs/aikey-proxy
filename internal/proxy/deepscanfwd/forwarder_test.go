@@ -249,3 +249,79 @@ func waitFor(t *testing.T, d time.Duration, cond func() bool) {
 	}
 	t.Fatalf("condition not met within %v", d)
 }
+
+// answeringNode is a sink that, like a real node, answers each frame with a
+// result (or a refusal) on the same call.
+type answeringNode struct {
+	reject  string
+	mu      sync.Mutex
+	sent    int
+	results chan deepscan.ResultFrame
+}
+
+func newAnsweringNode(reject string) *answeringNode {
+	return &answeringNode{reject: reject, results: make(chan deepscan.ResultFrame, 8)}
+}
+
+func (a *answeringNode) Send(_ context.Context, frame []byte) error {
+	a.mu.Lock()
+	a.sent++
+	a.mu.Unlock()
+	if a.reject != "" {
+		return &deepscan.RejectError{Code: a.reject}
+	}
+	f, err := deepscan.DecodeFrameV2(frame)
+	if err != nil {
+		return err
+	}
+	a.results <- deepscan.ResultFrame{JobID: f.JobID, Status: deepscan.StatusComplete}
+	return nil
+}
+func (a *answeringNode) Close() error                         { return nil }
+func (a *answeringNode) Results() <-chan deepscan.ResultFrame { return a.results }
+func (a *answeringNode) count() int                           { a.mu.Lock(); defer a.mu.Unlock(); return a.sent }
+
+// TestDeepScanForward_NodeResultReachesTheLane — what a node answers comes out
+// of the forwarder's Results(), which is what the lane's pump files.
+// bugfix: workflow/CI/bugfix/20260913-async-scan-lane-never-returned-findings.md
+func TestDeepScanForward_NodeResultReachesTheLane(t *testing.T) {
+	n1 := newAnsweringNode("")
+	r := NewRemoteForwarder(Config{
+		Nodes: nodes("scan-1"), QueueMax: 16, QueueBytes: 1 << 20,
+		DialSink: func(scannode.Node) deepscan.Sink { return n1 },
+	})
+	r.Start()
+	defer r.Close(context.Background())
+
+	fr := testFrame(1)
+	r.Enqueue(fr)
+	select {
+	case res := <-r.Results():
+		if res.JobID != fr.JobID {
+			t.Fatalf("result for job %q, want %q", res.JobID, fr.JobID)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("the node answered but no result came out of the forwarder — it would never be filed")
+	}
+}
+
+// TestDeepScanForward_TenantMismatchFromTheNodeStopsAtOneNode — the same rule as
+// TenantMismatchDoesNotTryAnotherNode, but with the refusal arriving the way a
+// real node sends it: in its answer, not from a pre-send hook.
+func TestDeepScanForward_TenantMismatchFromTheNodeStopsAtOneNode(t *testing.T) {
+	n1, n2 := newAnsweringNode(deepscan.RejectTenantMismatch), newAnsweringNode(deepscan.RejectTenantMismatch)
+	byID := map[string]*answeringNode{"scan-1": n1, "scan-2": n2}
+	r := NewRemoteForwarder(Config{
+		Nodes: nodes("scan-1", "scan-2"), QueueMax: 16, QueueBytes: 1 << 20,
+		DialSink: func(n scannode.Node) deepscan.Sink { return byID[n.ID] },
+	})
+	r.Start()
+	defer r.Close(context.Background())
+
+	r.Enqueue(testFrame(1))
+	waitFor(t, 3*time.Second, func() bool { return r.Stats().Failed > 0 })
+	time.Sleep(100 * time.Millisecond)
+	if got := n1.count() + n2.count(); got != 1 {
+		t.Fatalf("a tenant_mismatch answer led to %d deliveries; it must stop at the first node", got)
+	}
+}

@@ -2,6 +2,7 @@ package asyncscan
 
 import (
 	"context"
+	"fmt"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -165,4 +166,58 @@ func waitUntil(t *testing.T, d time.Duration, cond func() bool) {
 		time.Sleep(5 * time.Millisecond)
 	}
 	t.Fatalf("condition not met within %v", d)
+}
+
+// phoneHook answers like the real detector: for a chunk containing the phone
+// number it returns an event whose offsets are relative to THAT chunk.
+type phoneHook struct{}
+
+func (phoneHook) Name() string            { return "phone" }
+func (phoneHook) Status() *apphook.Status { return &apphook.Status{Healthy: true} }
+func (phoneHook) Detect(_ context.Context, r *apphook.Request) *apphook.Response {
+	i := strings.Index(string(r.Payload), "13800138000")
+	if i < 0 {
+		return &apphook.Response{Action: apphook.ActionAllow}
+	}
+	ev := fmt.Sprintf(`{"event_id":"x","findings":[{"rule_id":"pii.cn-phone","category":"pii","entity_type":"CN_PHONE","severity":"high","confidence":90,"start_offset":%d,"end_offset":%d,"detector":"regex"}]}`, i, i+11)
+	return &apphook.Response{Action: apphook.ActionMask, Event: []byte(ev)}
+}
+
+// TestAsyncLocalExecutor_ReturnsTailFindingsAtAbsoluteOffsets — the executor
+// hands back what the detector found, at offsets into the whole piece.
+//
+// 🔴 It used to count chunks and drop every response, so every local result was
+// empty and nothing it scanned was ever filed.
+// bugfix: workflow/CI/bugfix/20260913-async-scan-lane-never-returned-findings.md
+func TestAsyncLocalExecutor_ReturnsTailFindingsAtAbsoluteOffsets(t *testing.T) {
+	x := NewLocalExecutor(LocalExecutorConfig{
+		QueueMax: 4, QueueBytes: 1 << 20, IdleStop: time.Minute, DetectTimeout: time.Second,
+	}, func() (apphook.Hook, error) { return phoneHook{}, nil })
+	defer x.Close(context.Background())
+
+	text := strings.Repeat("y", 40*1024) + " 客户手机号 13800138000 请核对"
+	want := strings.Index(text, "13800138000")
+	if !x.Submit(PieceJob{
+		JobID: "j-tail", TenantID: "org_a", ContentSHA256: "sha", Source: deepscan.SourceRequest,
+		Text: text, HeadBytes: 16 << 10, Engines: []string{deepscan.EngineRules},
+	}) {
+		t.Fatal("submit refused")
+	}
+	var res deepscan.ResultFrame
+	select {
+	case res = <-x.Results():
+	case <-time.After(5 * time.Second):
+		t.Fatal("no result within 5s")
+	}
+	if len(res.Findings) == 0 {
+		t.Fatalf("the executor returned no findings for a tail phone number — the detector's answer was dropped (result %+v)", res)
+	}
+	for _, f := range res.Findings {
+		if f.Start != want || f.End != want+11 {
+			t.Fatalf("finding at [%d,%d), want [%d,%d) — offsets are not absolute into the piece", f.Start, f.End, want, want+11)
+		}
+	}
+	if len(res.RuleVerdicts) == 0 {
+		t.Fatal("no rule verdicts recorded — would-have-blocked can never be judged")
+	}
 }
