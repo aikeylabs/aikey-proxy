@@ -426,7 +426,7 @@ func (p *FilterPool) ContentVersion() (string, bool) {
 //
 //	contentVersion — the content the child pulls FOR ITSELF and restates in its
 //	                 effective-content report (packs, phrases, rule counts).
-//	policyToken    — an already-labelled, opaque token for a policy document the
+//	policyToken    — an already-labeled, opaque token for a policy document the
 //	                 PROXY HANDED the child at spawn (ChildHookConfig.
 //	                 ContentPolicyToken). "" = this hook was handed none.
 //

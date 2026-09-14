@@ -60,7 +60,7 @@ type ChildHookConfig struct {
 	// app_records.filter_record_allow flag. The child re-reads these at spawn,
 	// so a flag change → vault change_seq → proxy reload → re-spawn picks it up.
 	ExtraEnv []string
-	// ContentPolicyToken is an ALREADY-LABELLED, opaque token for a policy
+	// ContentPolicyToken is an ALREADY-LABELED, opaque token for a policy
 	// document this child is HANDED at spawn (today: the org compliance grading
 	// ladder, carried in ExtraEnv as AIKEY_COMPLIANCE_GRADING). "" = none.
 	//

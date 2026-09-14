@@ -492,7 +492,7 @@ func (p *Proxy) applyInboundFilter(
 			//   R-compliance-canned-answer-6    未识别动作 SHALL 按 ActionBlock 处理
 			//   R-compliance-canned-answer-6.S1 403 COMPLIANCE_BLOCKED，上游 0 请求
 			//
-			// 🔴 2026-09-13 REVERSAL — read before "restoring" the old behaviour.
+			// 🔴 2026-09-13 REVERSAL — read before "restoring" the old behavior.
 			// This used to be handled by the switch's `default:` below as a LOUD
 			// FAIL-OPEN (2026-06-22 review). The "loud" half is kept verbatim; the
 			// "open" half is reversed, because two opposite failures were conflated:
@@ -663,7 +663,7 @@ func (p *Proxy) applyInboundFilter(
 
 		// 代答 (canned answer) is KNOWN to this build but not yet SERVABLE: the
 		// six-shape response synthesizer (writeCannedAnswer) is task 3.6. Degrade to
-		// Block — precisely the behaviour R-compliance-canned-answer-6.S1 prescribes
+		// Block — precisely the behavior R-compliance-canned-answer-6.S1 prescribes
 		// for a proxy that has not declared the capability (403 COMPLIANCE_BLOCKED,
 		// nothing forwarded), never a pass-through.
 		//
@@ -788,6 +788,15 @@ func (p *Proxy) applyInboundFilter(
 				selfDeg++
 			}
 
+		case apphook.ActionAnswer:
+			// Listed so the switch is exhaustive, and deliberately adds NO behavior:
+			// the guard above degrades Answer to Block while
+			// apphook.SupportsCannedAnswer() is false, so this case is unreachable
+			// today. Reached anyway, it takes the default branch's fail-closed
+			// refusal below — exactly where it went before this case was listed.
+			// Task 3.6 replaces it with the real canned-answer branch beside
+			// ActionBlock (R-compliance-canned-answer-1).
+			fallthrough //nolint:gocritic // emptyFallthrough: exhaustive requires this case; falling into default keeps today's refusal byte-for-byte (user-approved 2026-09-14)
 		default:
 			// UNREACHABLE by construction: every verdict was passed through
 			// apphook.NormalizeAction above (unrecognized → Block), and

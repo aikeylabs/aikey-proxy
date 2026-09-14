@@ -363,7 +363,7 @@ func TestFilterCache_PackSwapHitRateProfile(t *testing.T) {
 
 type gradedDetectorHook struct {
 	packs      string // effective-content token; NEVER moves in this test
-	policy     string // labelled token for the ladder the child was handed
+	policy     string // labeled token for the ladder the child was handed
 	action     apphook.Action
 	trigger    string
 	calls      int

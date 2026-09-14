@@ -119,7 +119,7 @@ func NormalizeAction(a Action) Action {
 // when true, plain ActionBlock when false (design.md §4b). Declaring a
 // capability this build cannot serve is the same defect as failing open on an
 // unknown action, reached from the other side — the policy says "answer", the
-// proxy cannot, and the difference shows up as behaviour nobody configured.
+// proxy cannot, and the difference shows up as behavior nobody configured.
 //
 // 🔴 FALSE ON PURPOSE, and this is the task seam. Task 3.5 added the enum rung
 // and the fail-closed direction; the response synthesizer (writeCannedAnswer,
