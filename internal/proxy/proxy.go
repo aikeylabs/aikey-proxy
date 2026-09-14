@@ -15,6 +15,7 @@ import (
 	"github.com/AiKeyLabs/aikey-proxy/internal/events"
 	"github.com/AiKeyLabs/aikey-proxy/internal/provider"
 	"github.com/AiKeyLabs/aikey-proxy/internal/proxy/apppipe"
+	"github.com/AiKeyLabs/aikey-proxy/internal/proxy/asyncscan"
 	"github.com/AiKeyLabs/aikey-proxy/internal/proxy/probepipe"
 	"github.com/AiKeyLabs/aikey-proxy/internal/quota"
 	"github.com/AiKeyLabs/aikey-proxy/internal/vault"
@@ -82,6 +83,16 @@ type OAuthCredential struct {
 // Proxy is the core reverse proxy that handles virtual key resolution
 // and request forwarding.
 type Proxy struct {
+	// asyncEnqueuer receives every committed content piece for the asynchronous
+	// scan lane. atomic.Pointer so a supervisor reload can swap it without a
+	// lock on the request path; nil (the default) makes the commit point a
+	// single nil check. Set by the supervisor once the lane is configured.
+	asyncEnqueuer atomic.Pointer[*asyncscan.Enqueuer]
+	// deepScanHealthFn projects the asynchronous lane's state into the health
+	// response. nil until a lane is installed, which is itself the signal that
+	// this deployment runs no asynchronous scanning.
+	deepScanHealthFn atomic.Pointer[func() *DeepScanHealth]
+
 	// transport is the outbound RoundTripper for AI provider forwarding, held in an
 	// atomic.Pointer so the egress upstream-proxy URL can be HOT-SWAPPED at runtime
 	// (Settings → Upstream proxy, 2026-06-30) without racing the per-request read in
@@ -1089,4 +1100,32 @@ type UpstreamFallbackHealth struct {
 	ChainsLoaded    int            `json:"chains_loaded"`
 	Switches        int64          `json:"switches_total"`
 	CoolingBindings map[string]int `json:"cooling_bindings,omitempty"`
+}
+
+// SetAsyncEnqueuer installs (or clears, with nil) the asynchronous scan lane's
+// commit-point hook. Safe to call while serving.
+func (p *Proxy) SetAsyncEnqueuer(e *asyncscan.Enqueuer) {
+	p.asyncEnqueuer.Store(&e)
+}
+
+// SetDeepScanHealthFunc installs the lane's health projection.
+//
+// 🔴 A FUNCTION, NOT A SNAPSHOT. The counters move continuously and the lane is
+// rebuilt on every reload; a stored struct would go stale in exactly the
+// situation an operator is reading it (during an incident, after a reload).
+//
+// This existed as a FIELD on FilterHookHealth with nothing writing it, so the
+// only externally readable signal for the whole asynchronous lane was
+// permanently absent from the health response — which the repo's own rule
+// ("健康信号必须可被外部读取") forbids, and which made "the lane is doing nothing"
+// and "the lane is not installed" the same observation from outside.
+func (p *Proxy) SetDeepScanHealthFunc(f func() *DeepScanHealth) {
+	p.deepScanHealthFn.Store(&f)
+}
+
+func (p *Proxy) deepScanHealth() *DeepScanHealth {
+	if f := p.deepScanHealthFn.Load(); f != nil && *f != nil {
+		return (*f)()
+	}
+	return nil
 }

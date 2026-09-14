@@ -162,13 +162,13 @@ func (s *Supervisor) syncComplianceMasterPolicy(ctx context.Context) {
 // WHY IT IS SPLIT OUT OF THE POLLER: three of the four values it takes are
 // baked into a child process's environment at spawn, and the rule for what to
 // do when the master's answer is unusable is DIFFERENT per value — a distinction
-// that only exists as behaviour, so it needs somewhere to be asserted. The
+// that only exists as behavior, so it needs somewhere to be asserted. The
 // poller itself needs a control-panel URL, a team VK and a live generation, so
 // nothing could be pinned through it; this method needs a zero Supervisor.
 //
 // fetchOK=false means "no answer", never "the answer was: nothing". Everything
 // this method would set stays as it was, which for the scalars is the long
-// standing behaviour ("don't flap on a transient miss") and for the grading
+// standing behavior ("don't flap on a transient miss") and for the grading
 // document is DEC-compliance-grading-10: one unusable response must not switch
 // an organisation's whole ladder off while its console still shows it on.
 // rule: R-compliance-grading-5

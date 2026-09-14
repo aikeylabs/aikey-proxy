@@ -33,7 +33,7 @@ type Finding struct {
 	// pieces[i].text (filter_dispatch.go caps the payload at pipeInputCap on a
 	// rune boundary and re-attaches the tail after masking). Piece #2's [10,21)
 	// is a completely different substring from piece #1's [10,21) — see
-	// injectWireLabels for the same warning on the labelling join.
+	// injectWireLabels for the same warning on the labeling join.
 	StartOffset int `json:"start_offset"`
 	EndOffset   int `json:"end_offset"`
 	// Level is the classification level (1..N) resolved from the tenant's
@@ -101,7 +101,7 @@ type Finding struct {
 // to dedupe on, so two skipped hits may or may not have been the same string.
 // Hits the rules exclude (unconfirmed, below the level floor) are not skips —
 // they are working as intended and must not raise a WARN at the caller.
-func countDistinctHits(pieces []contentPiece, findings [][]Finding, minLevel int) (count int, skipped int) {
+func countDistinctHits(pieces []contentPiece, findings [][]Finding, minLevel int) (count, skipped int) {
 	distinct := make(map[string]struct{})
 	for i := range findings {
 		// A findings row past the end of pieces has no text to slice against.

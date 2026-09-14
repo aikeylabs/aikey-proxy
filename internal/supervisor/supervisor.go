@@ -57,6 +57,7 @@ import (
 	"github.com/AiKeyLabs/aikey-proxy/internal/vkeys"
 	"github.com/AiKeyLabs/aikey-proxy/pkg/heartbeat"
 	"github.com/AiKeyLabs/pkg/providerroutes"
+	"github.com/AiKeyLabs/pkg/scannode"
 )
 
 func providerBaseURLForProtocol(providerCode, protocolType string) string {
@@ -97,7 +98,11 @@ const (
 // proxy handler, and event infrastructure.
 type generation struct {
 	filterHook apphook.FilterTarget // P4 compliance/DLP filter (single child or M-process pool; nil when no filter app is active)
-	reporter   *events.Reporter     // usage reporter (nil when collector_url is not configured)
+	// asyncLane is the asynchronous deep-scan lane (enqueuer + local executor +
+	// remote forwarder + results pump). nil when the lane is not running, which
+	// is the normal state on Personal and on any deployment with deep scan off.
+	asyncLane *asyncScanLane
+	reporter  *events.Reporter // usage reporter (nil when collector_url is not configured)
 	// standaloneWAL is only populated when this generation created the
 	// local WAL writer AND no reporter consumed it — i.e. collector_url is
 	// empty. When a reporter is present it owns the WAL and its Close()
@@ -207,6 +212,15 @@ func (g *generation) closeAll() {
 	if g.filterHook != nil {
 		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 		_ = g.filterHook.Shutdown(ctx)
+		cancel()
+	}
+	// Then the async scan lane, BEFORE the reporter: its results pump uploads
+	// through that reporter, so closing the reporter first would leave in-flight
+	// findings with nowhere to go and log an upload failure for every one of
+	// them on every reload.
+	if g.asyncLane != nil {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		g.asyncLane.Close(ctx)
 		cancel()
 	}
 	// Close canary probe first (it uses the reporter).
@@ -348,6 +362,44 @@ type Supervisor struct {
 	active        atomic.Pointer[generation]
 	cancel        context.CancelFunc
 	cfg           *config.Config
+	// scanNodes is the currently trusted scan-node set, published by the
+	// `scan_nodes` sync rail (Production) or the rendered cluster-node.env
+	// (Cluster). nil or empty means "no remote lane" — which is the permanent,
+	// correct answer on Personal and Trial, not an error state.
+	//
+	// atomic.Pointer because the rail replaces the whole set on each refresh while
+	// the data plane reads it per piece; a mutex here would put the control plane
+	// in the way of every scan.
+	scanNodes atomic.Pointer[scannode.NodeSet]
+	// scanToken is the current `sct1` org token the scan_nodes rail fetched.
+	// Held apart from scanNodes because it rotates on a different clock (600s vs
+	// the node list's "rarely"), and because a token is a secret while a node
+	// list is topology.
+	scanToken atomic.Pointer[string]
+	// teamAsyncScan is the org's instruction for TEAM content: nodes / local /
+	// off. Published by the same rail as scanNodes, but held separately because
+	// it answers a different question — scanNodes says WHERE a piece could go,
+	// this says WHETHER team content may go anywhere at all. nil ⇒ off: a proxy
+	// that has never reached a master must not decide on its own that the
+	// organization permits asynchronous scanning of its employees' content.
+	teamAsyncScan atomic.Pointer[string]
+	// filterMaxAction is the compliance filter's operational ceiling (vault
+	// app_records.filter_max_action: full | warn), recorded by installFilterHook so
+	// the asynchronous lane clamps its high-risk verdict with the SAME value the
+	// synchronous detector child was started with (R-scan-node-deepscan-20.S3).
+	// nil ⇒ full, installFilterHook's own fallback.
+	// bugfix: workflow/CI/bugfix/20260914-async-scan-verdict-ignores-content-and-deploy-ceilings.md
+	filterMaxAction atomic.Pointer[string]
+	// intakeFeatures is what the master advertised it can STORE (from GET
+	// /v1/compliance/policy). asyncscan.EncodeForMaster strips anything not named
+	// here, so a new proxy against an old master does not take an intake batch
+	// down over an optional observability field.
+	intakeFeatures atomic.Pointer[[]string]
+	// nowFn is an injectable clock for token-expiry decisions in tests.
+	nowFn func() time.Time
+	// scanNodesHTTP overrides the scan_nodes rail's HTTP client. nil ⇒ the
+	// package client. Tests set it to an httptest TLS server's client.
+	scanNodesHTTP *http.Client
 	// lastQuotaSig is the signature of the last quota policy this node pulled from
 	// the master (C′ 2026-06-17). pollQuotaPolicy uses it to write quota_rules_cache
 	// + Reload ONLY when the policy actually changed — so an admin's limit edit
@@ -588,7 +640,7 @@ func New(cfg *config.Config, configPath, password, version string) (*Supervisor,
 	// licenseRails() is build-tag split: the licensing rails in a normal build,
 	// none in a -tags aikey_license_off build (see license_rail_off.go — the gate
 	// they feed is compiled out, so a running rail could only log 404s forever).
-	s.railset = newRailSet(append([]railSpec{s.groupRuntimeRail(), s.routingOverrideRail(), s.fallbackPolicyRail(), s.keyRevocationRail(), s.dialectBridgeRail()}, s.licenseRails()...)...)
+	s.railset = newRailSet(append([]railSpec{s.groupRuntimeRail(), s.routingOverrideRail(), s.fallbackPolicyRail(), s.keyRevocationRail(), s.scanNodesRail(), s.dialectBridgeRail()}, s.licenseRails()...)...)
 	gen, err := s.buildGeneration()
 	if err != nil {
 		_ = s.oauthPoolRuntime.Shutdown()
@@ -2447,6 +2499,17 @@ func (s *Supervisor) buildGeneration() (*generation, error) {
 		ownedWAL = sharedWAL
 	}
 
+	// The ASYNCHRONOUS deep-scan lane. Installed here, after the reporter exists,
+	// because the lane's results pump uploads through it — and after the filter
+	// hook, because the lane is fed by that hook's commit point.
+	//
+	// 🔴 Called unconditionally, including when it will decide to install
+	// nothing: installAsyncScanLane clears p's enqueuer in that case. A reload
+	// that turns the lane off (deep scan set to off, compliance killed by the
+	// operator, the org's nodes withdrawn) must not leave the PREVIOUS
+	// generation's hook installed on a proxy that is about to serve.
+	asyncLane := s.installAsyncScanLane(p, reporter, s.asyncExecutorSpawn(vaultReader))
+
 	gen := &generation{
 		id:              id,
 		vaultPath:       s.cfg.Vault.Path,
@@ -2465,6 +2528,7 @@ func (s *Supervisor) buildGeneration() (*generation, error) {
 		contentWAL:      contentWAL,
 		signalReporting: signalCfg,
 		contentSeqAlloc: contentSeqAlloc,
+		asyncLane:       asyncLane,
 		drained:         make(chan struct{}),
 	}
 

@@ -30,12 +30,14 @@ import (
 	"io"
 	"log/slog"
 	"net/http"
+	"strings"
 	"sync/atomic"
 	"time"
 	"unicode/utf8"
 
 	"github.com/AiKeyLabs/aikey-proxy/internal/apphook"
 	"github.com/AiKeyLabs/aikey-proxy/internal/observability"
+	"github.com/AiKeyLabs/aikey-proxy/internal/proxy/asyncscan"
 )
 
 // pipeInputCap bounds how many bytes of a content piece the proxy sends over the
@@ -399,6 +401,11 @@ func (p *Proxy) applyInboundFilter(
 		}
 	}
 
+	// Per-piece head_bytes for the asynchronous lane: how much of each piece the
+	// fast layer actually inspected. Recorded here rather than recomputed at the
+	// commit point, because the cap is applied here and a second derivation is a
+	// second thing that can disagree with it.
+	asyncHeadBytes := make([]int, len(pieces))
 	for i := range pieces {
 		// Cap the per-piece payload sent over the pipe (the detector only scans
 		// the first pipeInputCap bytes anyway). The untouched tail is re-attached
@@ -435,6 +442,7 @@ func (p *Proxy) applyInboundFilter(
 		// 两者必须同源 —— 分家就是 2026-06-17~2026-09-08 那个 BUG 的全部根因。
 		// 见 auditUnitID 的不变量注释。
 		contentID := hashHead(head)
+		asyncHeadBytes[i] = len(head)
 		var resp *apphook.Response
 		var ckey string
 		if cache != nil {
@@ -484,7 +492,7 @@ func (p *Proxy) applyInboundFilter(
 			//   R-compliance-canned-answer-6    未识别动作 SHALL 按 ActionBlock 处理
 			//   R-compliance-canned-answer-6.S1 403 COMPLIANCE_BLOCKED，上游 0 请求
 			//
-			// 🔴 2026-09-13 REVERSAL — read before "restoring" the old behaviour.
+			// 🔴 2026-09-13 REVERSAL — read before "restoring" the old behavior.
 			// This used to be handled by the switch's `default:` below as a LOUD
 			// FAIL-OPEN (2026-06-22 review). The "loud" half is kept verbatim; the
 			// "open" half is reversed, because two opposite failures were conflated:
@@ -655,7 +663,7 @@ func (p *Proxy) applyInboundFilter(
 
 		// 代答 (canned answer) is KNOWN to this build but not yet SERVABLE: the
 		// six-shape response synthesizer (writeCannedAnswer) is task 3.6. Degrade to
-		// Block — precisely the behaviour R-compliance-canned-answer-6.S1 prescribes
+		// Block — precisely the behavior R-compliance-canned-answer-6.S1 prescribes
 		// for a proxy that has not declared the capability (403 COMPLIANCE_BLOCKED,
 		// nothing forwarded), never a pass-through.
 		//
@@ -780,6 +788,15 @@ func (p *Proxy) applyInboundFilter(
 				selfDeg++
 			}
 
+		case apphook.ActionAnswer:
+			// Listed so the switch is exhaustive, and deliberately adds NO behavior:
+			// the guard above degrades Answer to Block while
+			// apphook.SupportsCannedAnswer() is false, so this case is unreachable
+			// today. Reached anyway, it takes the default branch's fail-closed
+			// refusal below — exactly where it went before this case was listed.
+			// Task 3.6 replaces it with the real canned-answer branch beside
+			// ActionBlock (R-compliance-canned-answer-1).
+			fallthrough //nolint:gocritic // emptyFallthrough: exhaustive requires this case; falling into default keeps today's refusal byte-for-byte (user-approved 2026-09-14)
 		default:
 			// UNREACHABLE by construction: every verdict was passed through
 			// apphook.NormalizeAction above (unrecognized → Block), and
@@ -801,6 +818,51 @@ func (p *Proxy) applyInboundFilter(
 				"COMPLIANCE_BLOCKED", "request blocked by compliance policy")
 			return false
 		}
+	}
+
+	// ── Asynchronous scan commit point ───────────────────────────────────────
+	//
+	// 🔴 THIS LINE'S POSITION IS THE FEATURE. Everything above may still refuse
+	// the request: the ActionBlock arm returns false at the switch, so a blocked
+	// request never reaches here. That makes "a refused request's bytes are never
+	// handed to a scan node" structural rather than a flag somebody has to
+	// remember to check — and it matters, because those bytes were just decided
+	// to be too sensitive to forward upstream. Sending them to a node afterwards
+	// would push exactly that content off the machine and then file an audit row
+	// implying it was forwarded.
+	//
+	// Cache-hit pieces are submitted too: the fast layer skipped the detector for
+	// them, but "has the ASYNC lane seen this?" is a different question with a
+	// different key (whole-piece hash vs scanned-head hash), so the filtering
+	// belongs in the already-scanned record, not here.
+	//
+	// nil enqueuer (no async lane configured — the common Personal default before
+	// the lane is wired) costs one nil check.
+	// spec: R-scan-node-deepscan-4.S1 / -23.S1 · baseline-forensics §F1
+	if e := p.asyncEnqueuer.Load(); e != nil && *e != nil {
+		committed := make([]asyncscan.CommittedPiece, 0, len(pieces))
+		for i := range pieces {
+			committed = append(committed, asyncscan.CommittedPiece{
+				// strings.Clone: pieces[i].text is a substring of the request body,
+				// and a substring keeps the WHOLE body alive. Queuing it without a
+				// copy would pin every buffered request body until the scan drains.
+				Text:      strings.Clone(pieces[i].text),
+				HeadBytes: asyncHeadBytes[i],
+				Source:    "request",
+				Personal:  routeSource == "personal",
+				// The piece's own ceiling travels with it, so a tool_result tail is
+				// judged against audit, not against a plain-text block ceiling.
+				Ceiling: pieces[i].ceiling.asyncVerdictCeiling(),
+			})
+		}
+		(*e).OnCommit(committed, asyncscan.RequestIdentity{
+			TenantID:     orgID,
+			SeatID:       seatID,
+			VirtualKeyID: virtualKeyID,
+			SessionID:    sessionID,
+			TraceID:      traceID,
+			ScopeKey:     auditScopeKey,
+		})
 	}
 
 	if restoreState != nil && len(restoreState.keys) > 0 {
