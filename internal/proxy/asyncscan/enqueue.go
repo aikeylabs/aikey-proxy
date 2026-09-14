@@ -1,5 +1,7 @@
 package asyncscan
 
+import "github.com/AiKeyLabs/aikey-proxy/internal/apphook"
+
 // RequestIdentity is everything the proxy resolved about the request, and it
 // stays HERE — it is stamped onto the event after a result comes back, and never
 // travels to a scan node (design §3.3).
@@ -22,6 +24,17 @@ type CommittedPiece struct {
 	// Personal is true when the piece belongs to a personal route, which never
 	// leaves the machine (R-scan-node-deepscan-16.S1).
 	Personal bool
+	// Ceiling is the most this KIND of content may be acted on: plain text is
+	// block-capable (apphook.ActionBlock); tool_result / tool_use are capped at
+	// audit (apphook.ActionWarn). The lane clamps its "would have blocked" verdict
+	// with it (R-scan-node-deepscan-20.S2). Remembered by the proxy, never sent in
+	// a frame — a node has no business knowing what kind of block content came from.
+	//
+	// 🔴 The zero value (ActionAllow) is the WEAKEST rung on purpose, the same
+	// choice actionCeiling makes: a caller that forgets to set it under-reports
+	// high risk; the opposite default would file every agent file read as a leak.
+	// bugfix: workflow/CI/bugfix/20260914-async-scan-verdict-ignores-content-and-deploy-ceilings.md
+	Ceiling apphook.Action
 }
 
 // SubmitFunc hands one piece to the lane. It must not block.

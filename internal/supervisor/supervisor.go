@@ -383,6 +383,13 @@ type Supervisor struct {
 	// that has never reached a master must not decide on its own that the
 	// organization permits asynchronous scanning of its employees' content.
 	teamAsyncScan atomic.Pointer[string]
+	// filterMaxAction is the compliance filter's operational ceiling (vault
+	// app_records.filter_max_action: full | warn), recorded by installFilterHook so
+	// the asynchronous lane clamps its high-risk verdict with the SAME value the
+	// synchronous detector child was started with (R-scan-node-deepscan-20.S3).
+	// nil ⇒ full, installFilterHook's own fallback.
+	// bugfix: workflow/CI/bugfix/20260914-async-scan-verdict-ignores-content-and-deploy-ceilings.md
+	filterMaxAction atomic.Pointer[string]
 	// intakeFeatures is what the master advertised it can STORE (from GET
 	// /v1/compliance/policy). asyncscan.EncodeForMaster strips anything not named
 	// here, so a new proxy against an old master does not take an intake batch

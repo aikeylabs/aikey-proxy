@@ -120,3 +120,47 @@ func TestAsyncScan_BlockedRequestReachesNoCommitPoint(t *testing.T) {
 			"handing them to a scan node would push off the machine exactly the content the policy just stopped", called)
 	}
 }
+
+// TestAsyncScan_CommitPointCarriesEachPiecesCeiling — the lane learns what kind
+// of content each piece was, so its verdict can be clamped like the sync one.
+//
+// 🔴 WHY. CommittedPiece had no ceiling, so the lane could not tell a user's text
+// from a file an agent read and judged both against block: a tool_result tail
+// credential filed as async_rule_leak although tool content is capped at audit
+// (方案②, R-scan-node-deepscan-20.S2).
+// bugfix: workflow/CI/bugfix/20260914-async-scan-verdict-ignores-content-and-deploy-ceilings.md
+func TestAsyncScan_CommitPointCarriesEachPiecesCeiling(t *testing.T) {
+	var mu sync.Mutex
+	got := map[string]apphook.Action{}
+	enq := asyncscan.NewEnqueuer(func(p asyncscan.CommittedPiece, _ asyncscan.RequestIdentity) bool {
+		mu.Lock()
+		defer mu.Unlock()
+		got[p.Text] = p.Ceiling
+		return true
+	}, asyncscan.NewScannedLRU(16))
+
+	hook := &stubHook{resp: &apphook.Response{Action: apphook.ActionAllow, Reason: "r"}}
+	p := &Proxy{filterHook: hook}
+	p.SetAsyncEnqueuer(enq)
+	body := `{"messages":[` +
+		`{"role":"user","content":[{"type":"text","text":"summarize the file"}]},` +
+		`{"role":"user","content":[{"type":"tool_result","tool_use_id":"t1","content":[{"type":"text","text":"FILE BODY"}]}]}` +
+		`]}`
+	if proceed := p.applyInboundFilter(httptest.NewRecorder(), newReq(body), "m", "team", "org_a", "vk1", "seat1", "sess1", "trace1", discardLogger()); !proceed {
+		t.Fatal("must proceed")
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+	text, ok1 := got["summarize the file"]
+	tool, ok2 := got["FILE BODY"]
+	if !ok1 || !ok2 {
+		t.Fatalf("the commit point did not offer both pieces (got %v) — this fence would be vacuous", got)
+	}
+	if text != apphook.ActionBlock {
+		t.Errorf("plain text piece ceiling = %v, want block", text)
+	}
+	if tool != apphook.ActionWarn {
+		t.Errorf("tool_result piece ceiling = %v, want warn (audit) — the lane would judge a file an agent read as a leak", tool)
+	}
+}

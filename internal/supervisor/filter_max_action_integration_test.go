@@ -121,6 +121,15 @@ func TestFilterIntegration_MaxActionFullWarnFullFromVault(t *testing.T) {
 		// before its verdict is compared against the expected action. Setting the
 		// environment is not evidence that the child honored it.
 		sealed.AssertHeld(t, target)
+		// The asynchronous lane clamps its high-risk verdict with the SAME
+		// filter_max_action this install just read (R-scan-node-deepscan-20.S3).
+		// Asserted here, through the real install path, because a unit test that
+		// sets the field by hand cannot notice installFilterHook no longer recording it.
+		// bugfix: workflow/CI/bugfix/20260914-async-scan-verdict-ignores-content-and-deploy-ceilings.md
+		if got := s.asyncDeployCeiling(); got != want {
+			t.Fatalf("async deployment ceiling after install = %s; want %s — the lane would judge high risk against a "+
+				"filter_max_action the detector was not started with", got, want)
+		}
 		response := target.Detect(context.Background(), request)
 		shutdownCtx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 		defer cancel()

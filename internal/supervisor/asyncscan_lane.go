@@ -265,16 +265,24 @@ func (s *Supervisor) asyncSubmitFunc(lane *asyncScanLane) asyncscan.SubmitFunc {
 		}
 
 		job := deepscanfwd.PieceJob{
-			JobID:         id.TraceID + ":" + contentSHA[:16],
-			TenantID:      id.TenantID,
-			AuditUnitID:   id.ScopeKey,
+			JobID:    id.TraceID + ":" + contentSHA[:16],
+			TenantID: id.TenantID,
+			// 🔴 Scope + WHOLE-content hash, never the bare scope. Every async event id
+			// (ar_ / ad_) derives from this, and ingest dedups on event_id — with the
+			// bare scope, the first tail finding of a conversation was filed and every
+			// later one silently dropped (R-scan-node-deepscan-15).
+			// bugfix: workflow/CI/bugfix/20260914-async-scan-events-keyed-by-session-not-content.md
+			AuditUnitID:   asyncscan.PieceIdentityForContent(id.ScopeKey, contentSHA).AuditUnitID,
 			ContentSHA256: contentSHA,
 			Source:        p.Source,
 			Text:          p.Text,
 			HeadBytes:     p.HeadBytes,
 			Engines:       []string{"rules", "bge"},
 		}
-		lane.jobs.Store(job.JobID, jobRecord{job: job, id: id, personal: p.Personal})
+		lane.jobs.Store(job.JobID, jobRecord{
+			job: job, id: id, personal: p.Personal,
+			pieceCeiling: p.Ceiling, deployCeiling: s.asyncDeployCeiling(),
+		})
 
 		switch placement {
 		case asyncscan.PlacementRemote:
@@ -326,6 +334,12 @@ type jobRecord struct {
 	// here because it exists only at the commit point (CommittedPiece.Personal)
 	// and never travels in the frame — a node must not learn it either.
 	personal bool
+	// pieceCeiling / deployCeiling clamp the "would have blocked" verdict. Taken at
+	// SUBMIT time, from the policy the content was forwarded under, and — like
+	// `personal` — never put in a frame.
+	// bugfix: workflow/CI/bugfix/20260914-async-scan-verdict-ignores-content-and-deploy-ceilings.md
+	pieceCeiling  apphook.Action
+	deployCeiling apphook.Action
 }
 
 // pumpAsyncResults drains both executors and files what they found.
@@ -373,7 +387,10 @@ func (s *Supervisor) fileAsyncResult(lane *asyncScanLane, reporter *events.Repor
 			"event.name", observability.EventAsyncScanVersionSkew, "job_id", r.JobID)
 		return
 	}
-	merged := asyncscan.Merge(rec.job, r, apphook.ActionBlock, apphook.ActionBlock)
+	// 🔴 Both ceilings come from the job record. They were hard-coded to block, so a
+	// tool_result tail credential filed as async_rule_leak (R-scan-node-deepscan-20.S2)
+	// and filter_max_action=warn was ignored (.S3).
+	merged := asyncscan.Merge(rec.job, r, rec.pieceCeiling, rec.deployCeiling)
 	lane.lru.Finalize(rec.job.ContentSHA256)
 
 	evs := asyncscan.BuildEvents(merged, rec.id)
@@ -605,4 +622,16 @@ func (s *Supervisor) mintClusterScanToken() string {
 		return ""
 	}
 	return scantoken.Mint(ks.Current, org, time.Now())
+}
+
+// asyncDeployCeiling is the deployment-wide clamp on the asynchronous high-risk
+// verdict. filter_max_action=warn means nothing is blocked synchronously, so
+// nothing found afterwards "would have been" blocked (R-scan-node-deepscan-20.S3).
+// Anything else — including no hook installed yet — reads as full, the same
+// fallback installFilterHook uses.
+func (s *Supervisor) asyncDeployCeiling() apphook.Action {
+	if v := s.filterMaxAction.Load(); v != nil && *v == "warn" {
+		return apphook.ActionWarn
+	}
+	return apphook.ActionBlock
 }

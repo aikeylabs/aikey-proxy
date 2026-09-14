@@ -254,6 +254,26 @@ func (c actionCeiling) clamp(a apphook.Action) (effective apphook.Action, capped
 	return a, false
 }
 
+// asyncVerdictCeiling is this ceiling as the asynchronous lane's verdict clamp
+// (asyncscan.Merge pieceCeiling): full content is block-capable, audit content is
+// capped at warn, and anything else — off, or an unknown rung — is the weakest.
+// The same ladder the synchronous clamp above applies, expressed as the Action
+// the lane compares against. R-scan-node-deepscan-20.S1 / .S2.
+// bugfix: workflow/CI/bugfix/20260914-async-scan-verdict-ignores-content-and-deploy-ceilings.md
+func (c actionCeiling) asyncVerdictCeiling() apphook.Action {
+	switch c {
+	case ceilingFull:
+		return apphook.ActionBlock
+	case ceilingAudit:
+		return apphook.ActionWarn
+	case ceilingOff:
+		// Never extracted, so never committed; listed so a new rung cannot slip past.
+		return apphook.ActionAllow
+	default:
+		return apphook.ActionAllow
+	}
+}
+
 // String renders the ceiling for logs / audit records. Deliberately uses the
 // detector's own ladder vocabulary (off|audit|warn|mask) so an operator reading
 // `action_taken` on a capped event sees a value from the same dictionary.

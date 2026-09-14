@@ -841,6 +841,9 @@ func (p *Proxy) applyInboundFilter(
 				HeadBytes: asyncHeadBytes[i],
 				Source:    "request",
 				Personal:  routeSource == "personal",
+				// The piece's own ceiling travels with it, so a tool_result tail is
+				// judged against audit, not against a plain-text block ceiling.
+				Ceiling: pieces[i].ceiling.asyncVerdictCeiling(),
 			})
 		}
 		(*e).OnCommit(committed, asyncscan.RequestIdentity{

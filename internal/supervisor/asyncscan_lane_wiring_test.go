@@ -245,3 +245,48 @@ func TestAsyncSubmit_SameContentTwiceIsScannedOnce(t *testing.T) {
 		t.Fatalf("the same content was scanned %d times — the already-scanned record is keyed on the whole content", len(local.got))
 	}
 }
+
+// TestAsyncSubmit_DifferentContentInOneScopeIsTwoAuditUnits — two different
+// pieces in one conversation are two audit rows, not one.
+//
+// 🔴 WHY. The lane set PieceJob.AuditUnitID to the bare scope key, so every
+// asynchronous event id (ar_ / ad_) in a session was derived from the session
+// alone. Both ingests dedup on event_id (ON CONFLICT DO NOTHING), so after the
+// FIRST tail finding of a conversation every later one — any file, any content —
+// was dropped without a trace. Measured live on 2026-09-14: a second tail
+// credential in the same session filed 0 rows, and the ids of the rows that did
+// land matched sha256("async_rule\x00" + scope) exactly. The per-content identity
+// (asyncscan.PieceIdentityForContent) existed, was fenced, and nothing in
+// production called it — so this asserts the LANE's job, not the helper.
+// bugfix: workflow/CI/bugfix/20260914-async-scan-events-keyed-by-session-not-content.md
+func TestAsyncSubmit_DifferentContentInOneScopeIsTwoAuditUnits(t *testing.T) {
+	s := &Supervisor{cfg: &config.Config{}}
+	mode := string(asyncscan.TeamAsyncScanLocal)
+	s.teamAsyncScan.Store(&mode)
+	lane := newLaneForTest()
+	local := &fakeExec{}
+	lane.localSubmit = local.Submit
+
+	id := asyncscan.RequestIdentity{TenantID: "org_a", TraceID: "t-scope", ScopeKey: "s:sess-1"}
+	for _, text := range []string{"first file the agent read", "second file the agent read"} {
+		if !s.asyncSubmitFunc(lane)(asyncscan.CommittedPiece{Text: text, Source: "request"}, id) {
+			t.Fatalf("the lane refused %q", text)
+		}
+	}
+	if len(local.got) != 2 {
+		t.Fatalf("local executor got %d jobs, want 2", len(local.got))
+	}
+	a, b := local.got[0], local.got[1]
+	if a.AuditUnitID == b.AuditUnitID {
+		t.Fatalf("two different pieces in one scope share audit unit %q — ingest keeps the first event and silently "+
+			"drops every later finding of the conversation", a.AuditUnitID)
+	}
+	for _, j := range local.got {
+		if want := asyncscan.PieceIdentityForContent(id.ScopeKey, j.ContentSHA256).AuditUnitID; j.AuditUnitID != want {
+			t.Fatalf("job audit unit = %q, want %q (scope + whole-content hash, R-scan-node-deepscan-15)", j.AuditUnitID, want)
+		}
+	}
+	if asyncscan.RuleScanEventID(a.AuditUnitID) == asyncscan.RuleScanEventID(b.AuditUnitID) {
+		t.Fatal("the two pieces would file under the same ar_ event id")
+	}
+}

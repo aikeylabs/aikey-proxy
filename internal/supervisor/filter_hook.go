@@ -202,6 +202,8 @@ func (s *Supervisor) installFilterHook(p *proxy.Proxy, vaultReader *vault.Reader
 			maxAction = configured
 		}
 	}
+	// One value, two consumers: the child's env below, and the async lane's verdict.
+	s.filterMaxAction.Store(&maxAction)
 	maxActionEnv := "AIKEY_COMPLIANCE_FILTER_MAX_ACTION=" + maxAction
 
 	extraEnv := s.filterChildEnv(recordAllowEnv, maxActionEnv)
