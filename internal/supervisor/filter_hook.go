@@ -269,8 +269,11 @@ func (s *Supervisor) installFilterHook(p *proxy.Proxy, vaultReader *vault.Reader
 	// this feature. It is NOT what an unreadable policy produces — that keeps the
 	// last valid document, see applyComplianceMasterPolicy. Compact JSON, whose
 	// size ceiling the master enforces on save (7680 bytes, strictly below this
-	// side's runtime limit — DEC-compliance-grading-10; the runtime check itself
-	// is task 3.8). A change re-spawns the child via filterSigWithGrading.
+	// side's runtime limit gradingEnvLimitBytes = 8192 — DEC-compliance-grading-10;
+	// the runtime check is in normalizeGradingPolicy, which measures these exact
+	// bytes BEFORE they can replace a good policy, so an oversize document is
+	// rejected rather than shipped into a spawn that would fail on the machine).
+	// A change re-spawns the child via filterSigWithGrading.
 	// rule: R-compliance-grading-5
 	gradingEnv := "AIKEY_COMPLIANCE_GRADING=" + s.gradingEnvValue()
 

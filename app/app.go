@@ -485,6 +485,7 @@ func Run() {
 	adminHandler.CollectorMetricsFn = sup.CollectorMetrics
 	adminHandler.ReplayDeadLetterFn = sup.ReplayDeadLetter
 	adminHandler.CanaryResultFn = sup.CanaryResult
+	wireCompliancePolicyHealth(adminHandler, sup)
 	adminHandler.DebugUpstreamHeadersStateFn = proxy.UpstreamHeadersDebugState
 	adminHandler.DebugUpstreamHeadersSetFn = proxy.SetUpstreamHeadersDebugAPIOverride
 	adminHandler.AppHealthFn = sup.AppHealthSnapshot
@@ -1435,4 +1436,21 @@ func (a *brokerAdapter) ResolveCredential(ctx context.Context, accountID string)
 func (a *brokerAdapter) GetAccountStatus(ctx context.Context, accountID string) (string, error) {
 	status, err := a.inner.GetAccountStatus(ctx, accountID)
 	return string(status), err
+}
+
+// wireCompliancePolicyHealth connects the org compliance-policy follower's
+// verdict to GET /health (task 3.8, R-compliance-grading-14.S2).
+//
+// It is one assignment, but it has a NAME so it can be fenced. The chain
+// supervisor → admin handler → JSON is hand-copied at each hop, and a hop that
+// is simply never wired produces no error anywhere: /health would keep
+// answering, just permanently silent about a fleet enforcing a stale compliance
+// ladder — the exact "手工搬运的中转层会静默吞字段" failure. See
+// app/compliance_health_wiring_test.go.
+//
+// Wired unconditionally: the handler omits the block until the follower has
+// actually polled, which is the truthful answer on a Personal install with no
+// org to follow.
+func wireCompliancePolicyHealth(adminHandler *admin.Handler, sup *supervisor.Supervisor) {
+	adminHandler.CompliancePolicyHealthFn = sup.ComplianceMasterPolicyHealth
 }

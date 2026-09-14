@@ -492,6 +492,35 @@ type Supervisor struct {
 	// still shows the ladder (DEC-compliance-grading-10). Written solely by
 	// applyComplianceMasterPolicy. rule: R-compliance-grading-5
 	masterGrading atomic.Pointer[[]byte]
+	// masterPolicyRejects counts CONSECUTIVE polls of GET /v1/compliance/policy
+	// whose answer could not be used (unusable grading document, non-200,
+	// network error) — i.e. how long this node has been enforcing a compliance
+	// policy it could not refresh. Reset to 0 by the first usable answer.
+	//
+	// 🔴 WHY IT EXISTS (task 3.8). Keeping the last valid policy is the right
+	// failure direction, but it is also the QUIET one: the node keeps serving,
+	// the console keeps showing the ladder the admin edited, and nothing on the
+	// machine contradicts either. This counter is what turns that state into
+	// something an operator can read from outside the process
+	// (GET /health -> compliance_policy) instead of grepping WARN lines, which
+	// 「健康信号必须可被外部读取」 requires of every self-check.
+	//
+	// 🔴 A poll that comes back WITHOUT a grading member does NOT count. That is
+	// an older master, or an org with grading switched off — a supported
+	// deployment, and reporting it degraded would send operators after a fault
+	// that does not exist. Only "there was an answer and it was unusable" and
+	// "there was no answer" count. rule: R-compliance-grading-5
+	masterPolicyRejects atomic.Int64
+	// masterPolicyEscalated records that the sustained-staleness ERROR has
+	// already been emitted for the CURRENT reject streak, so the escalation fires
+	// once per crossing rather than every poll. Cleared on recovery, which
+	// re-arms it for the next outage (canary convention).
+	masterPolicyEscalated atomic.Bool
+	// masterPolicyAttempted is false until this process has actually run one
+	// compliance-policy poll. Personal installs with no team/org never do, and
+	// /health must OMIT the block there rather than assert a verdict about a
+	// follower that is not running — same posture as the sync rails' `attempted`.
+	masterPolicyAttempted atomic.Bool
 	// Enterprise quota (Phase 2 Stage 2 — design §0.5/§5.2). Snapshot + counter
 	// live on the supervisor (not per-generation) so the counter accumulates
 	// continuously across 5s syncs and /admin/reload; the snapshot is gen-swapped

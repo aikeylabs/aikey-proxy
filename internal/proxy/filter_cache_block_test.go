@@ -184,3 +184,64 @@ func TestFilterCache_WarnStillCached(t *testing.T) {
 		t.Errorf("回归:warn 应仍被缓存,第2次应命中:called %d, want 1(block 修复不得误伤 warn)", hook.called)
 	}
 }
+
+// ── 未识别动作与缓存(2026-09-13, task 3.5) ──────────────────────────────────
+//
+// spec (PROPOSAL layer, 需求包 roadmap20260320/技术实现/阶段9-商业化版本/
+// 博时基金合规能力融合/openspec/changes/add-compliance-grading-fusion/specs/
+// compliance-canned-answer/spec.md): R-compliance-canned-answer-6。
+//
+// 这两条守的是「无法识别的判定」在缓存两侧的行为,和上面 block 两条同型、同理由:
+// 判定不可回放。**为什么单独写而不是并进上面**:block 是"读得懂、但决定不复用",
+// 未识别是"根本读不懂"——后者若进了缓存,连"它是什么"都无从判断。
+//
+// ⚠️ 这两条也是 dispatch 归一调用点(applyInboundFilter 里 Detect 之后的
+// `!resp.Action.Recognized()`)唯一的围栏。TestApplyInboundFilter_UnknownAction_
+// FailsClosedBlocked 拦不住它被删:switch 的 `default:` 是第二层 fail-closed,
+// 删掉调用点那条仍绿(2026-09-13 能红 B 实测)。缓存侧只有前置归一能满足。
+
+// 写侧:未识别判定归一为 block,而 block 从不入缓存 → 缓存里查不到任何条目。
+func TestFilterCache_UnrecognizedVerdictLeavesNoCacheEntry(t *testing.T) {
+	hook := &stubHook{resp: &apphook.Response{Action: apphook.Action(99), Reason: "unreadable"}}
+	p := &Proxy{filterHook: hook}
+	p.SetFilterCacheEnabled(true, 5)
+
+	const content = "verdict-we-cannot-read"
+	p.applyInboundFilter(httptest.NewRecorder(),
+		newReq(`{"messages":[{"role":"user","content":"`+content+`"}]}`),
+		"m", "personal", "", "", "", "", "", discardLogger())
+
+	smc, ok := p.filterCache.(*sessionMaskCache)
+	if !ok {
+		t.Fatalf("filterCache 应是 *sessionMaskCache, got %T", p.filterCache)
+	}
+	epoch, _ := apphook.CacheEpoch(hook)
+	key := cacheKey(hook.Status().Version, epoch, hashHead(content))
+	if v, hit := smc.Get("global", key); hit {
+		t.Errorf("未识别判定不应写入缓存(应先归一为 block,而 block 不入缓存),但查到条目:action=%d", v.action)
+	}
+}
+
+// 读侧:缓存里残留一条本 build 读不懂的判定(进程内 pre-fix 污染 / 未来写侧回归)
+// 时必须当 miss、落到真扫重判,而不是回放一个没人能解释的判定。
+func TestFilterCache_ReadSideSkipsPollutedUnrecognized(t *testing.T) {
+	hook := &stubHook{resp: &apphook.Response{Action: apphook.ActionAllow}}
+	p := &Proxy{filterHook: hook}
+	p.SetFilterCacheEnabled(true, 5)
+
+	const content = "polluted-with-an-unreadable-verdict"
+	smc := p.filterCache.(*sessionMaskCache)
+	epoch, _ := apphook.CacheEpoch(hook)
+	key := cacheKey(hook.Status().Version, epoch, hashHead(content))
+	smc.Put("global", key, maskVerdict{action: apphook.Action(99), reason: "unreadable"})
+
+	w := httptest.NewRecorder()
+	proceed := p.applyInboundFilter(w, newReq(`{"messages":[{"role":"user","content":"`+content+`"}]}`),
+		"m", "personal", "", "", "", "", "", discardLogger())
+	if !proceed {
+		t.Fatalf("读侧守卫失败:残留的未识别判定被回放,请求被拒(status=%d,应重判为 Allow 放行)", w.Code)
+	}
+	if hook.called != 1 {
+		t.Errorf("读侧守卫失败:未识别判定命中缓存直接返回,detector 未被重判调用(called=%d, want 1)", hook.called)
+	}
+}

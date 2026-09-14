@@ -11,10 +11,14 @@ package supervisor
 // re-spawn.
 
 import (
+	"bytes"
+	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"strings"
 	"testing"
+
+	"github.com/AiKeyLabs/aikey-proxy/internal/observability"
 )
 
 // TestFetchComplianceMasterPolicy_PasswordTierFailureDirection: only the exact
@@ -142,6 +146,39 @@ func TestFetchComplianceMasterPolicy_GradingFailureDirection(t *testing.T) {
 	}
 }
 
+// gradingSeedPolicyBody is the one GOOD org policy every "keep the last valid
+// one" fence starts from: grading on, L5 = block. Shared so the fences below all
+// prove the same starting state rather than three lookalike literals.
+const gradingSeedPolicyBody = `{"enabled":true,"privacy_tier":1,` +
+	`"grading":{"labels":{"5":"L5"},"ladder":{"5":{"action":"block"}}}}`
+
+// seedGradingSupervisor returns a supervisor that has already taken one GOOD
+// policy — the only state in which "keep the last valid one" is a meaningful
+// claim — plus the exact AIKEY_COMPLIANCE_GRADING value that policy produces, so
+// a caller can assert the env did not move.
+func seedGradingSupervisor(t *testing.T) (*Supervisor, string) {
+	t.Helper()
+	s := &Supervisor{}
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte(gradingSeedPolicyBody))
+	}))
+	defer srv.Close()
+	enabled, tier, adv, grading, ok := fetchComplianceMasterPolicy(t.Context(), srv.URL, "org-1")
+	if !ok || grading == nil {
+		t.Fatalf("seed policy must be usable; ok=%v grading=%q", ok, grading)
+	}
+	s.applyComplianceMasterPolicy(enabled, tier, adv, grading, ok)
+	env := s.gradingEnvValue()
+	if env == gradingPolicyDisabled {
+		t.Fatalf("seed did not take: env is %q", env)
+	}
+	if rejects, attempted := s.ComplianceMasterPolicyHealth(); !attempted || rejects != 0 {
+		t.Fatalf("a supervisor that just took a good policy must read healthy; "+
+			"rejects=%d attempted=%v", rejects, attempted)
+	}
+	return s, env
+}
+
 // TestGradingDownlink_ThreeFailureStatesAreDistinct pins the DECISION layer: the
 // same three states, now measured where it matters — what the detector child
 // would actually be spawned with.
@@ -153,29 +190,7 @@ func TestFetchComplianceMasterPolicy_GradingFailureDirection(t *testing.T) {
 // 能红 check: make applyComplianceMasterPolicy store the fetched value
 // unconditionally (i.e. drop the fetchOK gate) and ② + ③ fail with "{}".
 func TestGradingDownlink_ThreeFailureStatesAreDistinct(t *testing.T) {
-	const validBody = `{"enabled":true,"privacy_tier":1,` +
-		`"grading":{"labels":{"5":"L5"},"ladder":{"5":{"action":"block"}}}}`
-
-	// seed returns a supervisor that has already taken one GOOD policy, which is
-	// the only state in which "keep the last valid one" is a meaningful claim.
-	seed := func(t *testing.T) (*Supervisor, string) {
-		t.Helper()
-		s := &Supervisor{}
-		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			_, _ = w.Write([]byte(validBody))
-		}))
-		defer srv.Close()
-		enabled, tier, adv, grading, ok := fetchComplianceMasterPolicy(t.Context(), srv.URL, "org-1")
-		if !ok || grading == nil {
-			t.Fatalf("seed policy must be usable; ok=%v grading=%q", ok, grading)
-		}
-		s.applyComplianceMasterPolicy(enabled, tier, adv, grading, ok)
-		env := s.gradingEnvValue()
-		if env == gradingPolicyDisabled {
-			t.Fatalf("seed did not take: env is %q", env)
-		}
-		return s, env
-	}
+	seed := seedGradingSupervisor
 
 	// ① Absent key = an old master = grading OFF. This one SHOULD become {}.
 	t.Run("absent key switches grading off", func(t *testing.T) {
@@ -377,4 +392,197 @@ func TestGrading_SignatureEnvAndCacheEpochShareTheSameBytes(t *testing.T) {
 			t.Fatal("turning grading on must move the cache epoch")
 		}
 	})
+}
+
+// ---------------------------------------------------------------------------
+// Task 3.8 — the runtime size limit, and making "we are enforcing a stale
+// ladder" READABLE FROM OUTSIDE the process.
+//
+// Why these fences exist: task 3.1 made an unusable policy keep the last valid
+// one, which is the safe direction — but it also makes the machine LOOK fine
+// while it enforces a ladder the console no longer shows. That is harder to
+// notice than an outright failure, and 「健康信号必须可被外部读取」 names exactly
+// this case: a self-check may not live in a log line only.
+// ---------------------------------------------------------------------------
+
+// gradingOversizePolicyBody is a policy response whose grading document is
+// deliberately past gradingEnvLimitBytes once compacted. Built from the limit
+// constant rather than a second literal so the fence tracks the limit if it
+// ever moves (and so nobody has to keep two numbers in step).
+func gradingOversizePolicyBody() string {
+	return `{"enabled":true,"privacy_tier":1,"grading":{"labels":{"5":"` +
+		strings.Repeat("L", gradingEnvLimitBytes) + `"}}}`
+}
+
+// TestGradingDownlink_KeepsLastValidOnOversize is the 3.A10 fence
+// (R-compliance-grading-14.S2).
+//
+// A grading document too large for the child's environment is the third way an
+// answer can be unusable, alongside 3.1's malformed JSON and non-200. It must
+// land in the SAME place: the last valid ladder stays in force, the env is never
+// rewritten to "{}", and the health surface says degraded with a reason code so
+// an operator can find the machine without reading its logs.
+//
+// 能红 checks (both verified for the report):
+//   - drop the gradingEnvLimitBytes check in normalizeGradingPolicy → the
+//     oversize document is accepted and the env moves;
+//   - keep the WARN but stop counting the rejection (or stop exposing the
+//     counter) → the health assertions below fail while the log still looks
+//     right, which is precisely the "logs only" failure this task is about.
+func TestGradingDownlink_KeepsLastValidOnOversize(t *testing.T) {
+	s, seeded := seedGradingSupervisor(t)
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte(gradingOversizePolicyBody()))
+	}))
+	defer srv.Close()
+
+	enabled, tier, adv, grading, ok := fetchComplianceMasterPolicy(t.Context(), srv.URL, "org-1")
+	if ok {
+		t.Fatal("an oversize grading document must be reported as UNUSABLE (ok=false); " +
+			"reporting it as an answer is what lets it overwrite a good policy")
+	}
+	if grading != nil {
+		t.Fatalf("the fetch layer must not hand back a rejected document, got %d bytes", len(grading))
+	}
+
+	changed := s.applyComplianceMasterPolicy(enabled, tier, adv, grading, ok)
+	if changed {
+		t.Fatal("a rejected policy must not report a change; re-spawning here would hand " +
+			"the child the same env for no reason")
+	}
+	if got := s.gradingEnvValue(); got != seeded {
+		t.Fatalf("AIKEY_COMPLIANCE_GRADING = %q, want the last valid %q — one oversize "+
+			"response must not disable an organisation's whole ladder "+
+			"(DEC-compliance-grading-10)", got, seeded)
+	}
+	if got := s.gradingEnvValue(); got == gradingPolicyDisabled {
+		t.Fatal(`the env was replaced with "{}" — that is the ONE thing this rule forbids`)
+	}
+
+	// The half this task adds: the state is readable without a log scrape.
+	rejects, attempted := s.ComplianceMasterPolicyHealth()
+	if !attempted {
+		t.Fatal("the follower has polled, so the health surface must report on it; " +
+			"an omitted block reads as 'no follower here'")
+	}
+	if rejects != 1 {
+		t.Fatalf("consecutive rejects = %d, want 1 — the streak is what /health turns into "+
+			"degraded and what the escalation counts", rejects)
+	}
+
+	// And it self-heals: one good answer clears it, so the signal cannot get
+	// stuck red after the admin fixes the policy.
+	{
+		good := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			_, _ = w.Write([]byte(gradingSeedPolicyBody))
+		}))
+		defer good.Close()
+		enabled, tier, adv, grading, ok := fetchComplianceMasterPolicy(t.Context(), good.URL, "org-1")
+		s.applyComplianceMasterPolicy(enabled, tier, adv, grading, ok)
+		if rejects, _ := s.ComplianceMasterPolicyHealth(); rejects != 0 {
+			t.Fatalf("consecutive rejects = %d after a usable answer, want 0 — a health "+
+				"signal that never recovers is a signal operators learn to ignore", rejects)
+		}
+	}
+}
+
+// TestGradingDownlink_OldMasterIsNotDegraded guards the distinction 3.1 built and
+// this task must not flatten: ① a master that answers WITHOUT a grading member
+// is a legitimate deployment (an older master, or an org that switched grading
+// off), not a fault. Reporting it degraded sends operators chasing a failure
+// that does not exist.
+//
+// 能红 check: make ① increment the reject streak (i.e. treat "no grading" the
+// same as "unusable grading") and this fails.
+func TestGradingDownlink_OldMasterIsNotDegraded(t *testing.T) {
+	s, _ := seedGradingSupervisor(t)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte(`{"enabled":true,"privacy_tier":1}`))
+	}))
+	defer srv.Close()
+
+	enabled, tier, adv, grading, ok := fetchComplianceMasterPolicy(t.Context(), srv.URL, "org-1")
+	s.applyComplianceMasterPolicy(enabled, tier, adv, grading, ok)
+
+	if got := s.gradingEnvValue(); got != gradingPolicyDisabled {
+		t.Fatalf("AIKEY_COMPLIANCE_GRADING = %q, want %q — ① really does switch grading off",
+			got, gradingPolicyDisabled)
+	}
+	rejects, attempted := s.ComplianceMasterPolicyHealth()
+	if !attempted {
+		t.Fatal("the follower polled; the health block must be present")
+	}
+	if rejects != 0 {
+		t.Fatalf("consecutive rejects = %d, want 0 — an old master is a supported "+
+			"deployment, and marking it degraded makes the signal useless", rejects)
+	}
+}
+
+// TestGradingDownlink_NeverPolledIsNotDegraded: a proxy with no team/org never
+// runs the follower at all (syncComplianceMasterPolicy early-returns), so the
+// health block must be OMITTED rather than claiming either verdict. Same posture
+// as the usage pipeline and the sync rails, which omit what they cannot speak to.
+func TestGradingDownlink_NeverPolledIsNotDegraded(t *testing.T) {
+	var s Supervisor
+	if rejects, attempted := s.ComplianceMasterPolicyHealth(); attempted || rejects != 0 {
+		t.Fatalf("a supervisor that never polled reported rejects=%d attempted=%v; want 0/false",
+			rejects, attempted)
+	}
+}
+
+// TestGradingDownlink_RejectStreakEscalatesPastWarn is the "不能一直停留在 WARN"
+// half of the health-signal rule. A single rejection is a WARN; a SUSTAINED one
+// means the fleet has been enforcing a stale ladder for minutes, which is a
+// different operational fact and must not read the same in the logs.
+//
+// Shape copied from the canary's unavailable-streak escalation
+// (internal/events/canary.go): count the streak, escalate exactly ONCE per
+// crossing, reset on recovery.
+//
+// 能红 check: delete the escalation branch (leaving only the per-cycle WARN) and
+// the ERROR assertion fails.
+func TestGradingDownlink_RejectStreakEscalatesPastWarn(t *testing.T) {
+	var buf bytes.Buffer
+	prev := slog.Default()
+	slog.SetDefault(slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelDebug})))
+	defer slog.SetDefault(prev)
+
+	s, _ := seedGradingSupervisor(t)
+	for i := 0; i < gradingRejectEscalateAfter+3; i++ {
+		s.applyComplianceMasterPolicy(false, privacyTierMetadataOnly, false, nil, false)
+	}
+	if rejects, _ := s.ComplianceMasterPolicyHealth(); rejects != gradingRejectEscalateAfter+3 {
+		t.Fatalf("consecutive rejects = %d, want %d", rejects, gradingRejectEscalateAfter+3)
+	}
+
+	logs := buf.String()
+	if n := strings.Count(logs, observability.EventComplianceGradingStale); n != 1 {
+		t.Fatalf("the sustained-staleness escalation was logged %d times, want exactly 1 "+
+			"(once per crossing — a per-cycle ERROR is noise, zero is the bug this fence "+
+			"exists for).\nlogs:\n%s", n, logs)
+	}
+	if !strings.Contains(logs, "level=ERROR") {
+		t.Fatalf("the escalation must rise ABOVE the per-cycle WARN, or a sustained "+
+			"outage looks exactly like a single blip.\nlogs:\n%s", logs)
+	}
+
+	// Recovery re-arms it: a second sustained outage must alarm again.
+	buf.Reset()
+	good := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte(gradingSeedPolicyBody))
+	}))
+	defer good.Close()
+	enabled, tier, adv, grading, ok := fetchComplianceMasterPolicy(t.Context(), good.URL, "org-1")
+	s.applyComplianceMasterPolicy(enabled, tier, adv, grading, ok)
+	if rejects, _ := s.ComplianceMasterPolicyHealth(); rejects != 0 {
+		t.Fatalf("consecutive rejects = %d after recovery, want 0", rejects)
+	}
+	for i := 0; i < gradingRejectEscalateAfter; i++ {
+		s.applyComplianceMasterPolicy(false, privacyTierMetadataOnly, false, nil, false)
+	}
+	if n := strings.Count(buf.String(), observability.EventComplianceGradingStale); n != 1 {
+		t.Fatalf("the escalation did not re-arm after recovery (logged %d times, want 1); "+
+			"a one-shot alarm goes silent for the rest of the process's life", n)
+	}
 }

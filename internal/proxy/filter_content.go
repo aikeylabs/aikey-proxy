@@ -234,11 +234,23 @@ func (c actionCeiling) clamp(a apphook.Action) (effective apphook.Action, capped
 		return a, false
 	}
 	switch a {
-	case apphook.ActionMask, apphook.ActionBlock:
+	// ActionAnswer caps with ActionBlock, not with the pass-through rungs: it
+	// short-circuits the request at the same point and with the same
+	// `return false` as a block (R-compliance-canned-answer-1), so under a
+	// capped rung it is exactly as intrusive. Naming it here is what keeps the
+	// ceiling 只压不抬 — a rung missing from this list falls through to the
+	// trailing `return a, false` below and escapes the ceiling entirely.
+	// 围栏: TestActionCeiling_ClampsAnswerLikeBlock.
+	case apphook.ActionMask, apphook.ActionBlock, apphook.ActionAnswer:
 		return apphook.ActionAllow, true
 	case apphook.ActionAllow, apphook.ActionWarn:
 		return a, false
 	}
+	// Unrecognized value: left unchanged ON PURPOSE. The ceiling's job is to
+	// LOWER a verdict, and it cannot rank a verdict it cannot read. The
+	// fail-closed conversion happens once, at the dispatch site
+	// (apphook.NormalizeAction in applyInboundFilter) — clamping to Allow here
+	// would fail OPEN and beat it to the punch.
 	return a, false
 }
 

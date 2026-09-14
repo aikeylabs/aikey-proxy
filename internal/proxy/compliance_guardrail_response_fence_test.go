@@ -50,13 +50,18 @@ package proxy
 // workflow/CI/IDE/claude/principles/documented-contract-needs-enforcement.md.
 //
 // ---------------------------------------------------------------------------
-// ⚠️ WHAT IS AND IS NOT IMPLEMENTED TODAY (2026-09-12, task 6.4) — READ THIS
-// BEFORE CONCLUDING ANYTHING FROM A GREEN RUN.
+// ⚠️ WHAT IS AND IS NOT IMPLEMENTED TODAY (updated 2026-09-13, task 3.5; first
+// written 2026-09-12, task 6.4) — READ THIS BEFORE CONCLUDING ANYTHING FROM A
+// GREEN RUN.
 //
-// The canned answer is NOT implemented in this repository. `apphook.Action` has
-// four values (Allow / Mask / Block / Warn); there is no ActionAnswer, no
-// answer-text plumbing and no synthesized 200. `answer` is not yet in the
-// database action domain either (that is task 5.1, held by TODO-9).
+// The canned answer is still NOT implemented in this repository. Task 3.5 added
+// the enum rung `apphook.ActionAnswer` (Allow / Mask / Block / Warn / Answer)
+// and made an unrecognized action fail CLOSED, but there is no answer-text
+// plumbing and no synthesized 200: `apphook.SupportsCannedAnswer()` returns
+// false and applyInboundFilter degrades an Answer verdict to a plain Block.
+// The synthesizer (writeCannedAnswer, three protocol families × streaming and
+// non-streaming) is task 3.6, and it is the change that makes site two below
+// real.
 //
 // These fences are therefore written BEFORE the implementation, deliberately.
 // They are NOT vacuous while they wait:

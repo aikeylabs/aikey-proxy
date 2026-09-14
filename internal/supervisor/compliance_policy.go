@@ -47,6 +47,35 @@ const (
 	// grading. It is NOT the fallback for "the answer was unusable" — see
 	// applyComplianceMasterPolicy.
 	gradingPolicyDisabled = "{}"
+
+	// gradingEnvLimitBytes is the RUNTIME hard limit on the compact grading
+	// document, measured on the exact bytes this proxy is about to bake into the
+	// detector child's AIKEY_COMPLIANCE_GRADING variable.
+	//
+	// Why a limit at all: the ladder travels to the child as an environment
+	// variable, and an oversize value does not fail politely — it fails at
+	// spawn, on the machine, with no way back to the master that sent it. So the
+	// document is measured HERE, at the single point of entry, and a document
+	// that will not fit is treated as unusable exactly like malformed JSON: keep
+	// the last valid ladder, never "{}".
+	//
+	// 🔴 The master's SAVE-side budget is 7680 bytes and must stay STRICTLY BELOW
+	// this number (DEC-compliance-grading-10). The direction is the safety
+	// property: anything the console accepted is guaranteed to fit here, so a
+	// policy can never be saveable-but-unshippable. Two numbers, one inequality —
+	// do NOT collapse them into one shared constant, and do not raise 7680 to
+	// 8192; the gap is the margin that keeps the inequality strict as the wire
+	// framing around the document changes.
+	gradingEnvLimitBytes = 8192
+
+	// gradingRejectEscalateAfter is how many CONSECUTIVE unusable policy answers
+	// raise the WARN to an ERROR (once per crossing). Copied from the canary's
+	// unavailableEscalateThreshold (internal/events/canary.go), which exists for
+	// the same reason and is the repo's convention for "a self-check must not sit
+	// at WARN forever": long enough to ride out a deploy-window blip, short
+	// enough that a real misconfiguration alarms. At the 60s poll interval this
+	// is ~6 minutes of enforcing a ladder the console no longer shows.
+	gradingRejectEscalateAfter = 6
 )
 
 var complianceHTTPClient = httpx.NewSwappableDirect(10 * time.Second)
@@ -144,9 +173,15 @@ func (s *Supervisor) syncComplianceMasterPolicy(ctx context.Context) {
 // an organisation's whole ladder off while its console still shows it on.
 // rule: R-compliance-grading-5
 func (s *Supervisor) applyComplianceMasterPolicy(enabled bool, tier int, passwordAdvanced bool, gradingJSON []byte, fetchOK bool) bool {
+	// One poll happened, so /health may speak about this follower from now on.
+	s.masterPolicyAttempted.Store(true)
 	if !fetchOK {
+		s.noteCompliancePolicyRejected()
 		return false // ②③: keep the last valid policy; nothing changed, nothing to re-spawn
 	}
+	// ① and the happy path are BOTH usable answers: the node is following the
+	// master, whether or not that master has a grading policy to give.
+	s.noteCompliancePolicyAccepted()
 	// Persist for the web toggle + CLI guard. locked == enabled for now (master
 	// ON ⇒ user can't disable; master OFF ⇒ user free). Kept as two fields so a
 	// future "force-off + locked" variant doesn't change the wire shape.
@@ -190,6 +225,60 @@ func (s *Supervisor) applyComplianceMasterPolicy(enabled bool, tier int, passwor
 		return true
 	}
 	return false
+}
+
+// noteCompliancePolicyRejected records one poll whose answer could not be used
+// and escalates a SUSTAINED run of them past the per-poll WARN.
+//
+// The health surface (GET /health -> compliance_policy) turns the very first
+// rejection into `degraded`, without a threshold, because unlike an upload or
+// canary blip a rejected policy is not a transport hiccup: from that moment the
+// ladder this node enforces and the ladder the console displays are two
+// different documents, and that is true whether it lasts one minute or an hour.
+// The threshold below governs how LOUD the logs get, not whether the endpoint
+// tells the truth. rule: R-compliance-grading-5
+func (s *Supervisor) noteCompliancePolicyRejected() {
+	streak := s.masterPolicyRejects.Add(1)
+	if streak < gradingRejectEscalateAfter || s.masterPolicyEscalated.Swap(true) {
+		return
+	}
+	slog.Error("compliance master policy has been unrefreshable for a sustained run of polls; "+
+		"this node is still enforcing the last valid policy, which may no longer match the console. "+
+		"Check the control plane's /v1/compliance/policy response for this org",
+		"event.name", observability.EventComplianceGradingStale,
+		"error.code", "COMPLIANCE_POLICY_STALE",
+		"consecutive_rejects", streak)
+}
+
+// noteCompliancePolicyAccepted clears the streak after a usable answer and
+// re-arms the escalation, so a second outage alarms as loudly as the first. A
+// recovery is logged only when there was something to recover FROM (state
+// transitions, not steady state).
+func (s *Supervisor) noteCompliancePolicyAccepted() {
+	previous := s.masterPolicyRejects.Swap(0)
+	s.masterPolicyEscalated.Store(false)
+	if previous > 0 {
+		slog.Info("compliance master policy refreshed again",
+			"event.name", "proxy.compliance.policy_recovered",
+			"previous_consecutive_rejects", previous)
+	}
+}
+
+// ComplianceMasterPolicyHealth is the externally readable state of the org
+// compliance-policy follower, for GET /health (task 3.8).
+//
+//	consecutiveRejects — polls in a row whose answer could not be used. 0 means
+//	  the node is following the master; anything above 0 means it is enforcing a
+//	  policy it could not refresh, i.e. `degraded`.
+//	attempted — false until the first poll. A Personal install with no team/org
+//	  never polls, and /health omits the block there rather than claiming a
+//	  verdict about a follower that is not running.
+//
+// Deliberately returns raw facts rather than a verdict: internal/admin derives
+// the state + reason code, the same split usagePipelineHealth already uses, so
+// the wire vocabulary lives in exactly one package. rule: R-compliance-grading-5
+func (s *Supervisor) ComplianceMasterPolicyHealth() (consecutiveRejects int, attempted bool) {
+	return int(s.masterPolicyRejects.Load()), s.masterPolicyAttempted.Load()
 }
 
 // swapMasterGrading stores the org grading document and reports whether it
@@ -322,6 +411,13 @@ func fetchComplianceMasterPolicy(ctx context.Context, masterURL, orgID string) (
 // travel all the way into the child and fail inside the detector's own parser,
 // far from anything that can say which master sent it. Rejecting it here is the
 // difference between one WARN naming the cause and a silent loss of the ladder.
+//
+// WHY THE SIZE CHECK IS HERE and not at spawn: these compact bytes ARE the value
+// gradingEnvValue hands to the child, so this is the only place that can measure
+// the real thing before it is stored. Measuring at spawn would be too late in
+// the way that matters — by then the oversize document has already replaced the
+// last valid one in masterGrading, and "keep the last valid ladder" would have
+// nothing left to keep. rule: R-compliance-grading-5
 func normalizeGradingPolicy(raw *json.RawMessage) ([]byte, bool) {
 	if raw == nil || len(*raw) == 0 {
 		return nil, true
@@ -335,6 +431,13 @@ func normalizeGradingPolicy(raw *json.RawMessage) ([]byte, bool) {
 	case string(b) == "null", string(b) == "{}":
 		return nil, true // an explicit "no policy" says the same as an absent one
 	case len(b) == 0 || b[0] != '{':
+		return nil, false
+	case len(b) > gradingEnvLimitBytes:
+		// Too large for the child's environment. Same verdict as malformed:
+		// unusable, so the caller keeps the last valid ladder. The console
+		// enforces 7680 on save, so reaching this branch means the document did
+		// not come through the console's save path — which is exactly why the
+		// runtime cannot assume the ceiling was already applied.
 		return nil, false
 	}
 	return b, true
