@@ -29,6 +29,11 @@ package apphook
 //	unset / 0 (partial checkout)   → still skip (a developer must be able to run
 //	                                 this repo's suite without the sibling repo),
 //	                                 but loudly, on /dev/tty + stderr.
+//	AIKEY_TEST_DETECTOR_BINARY=<p> → use THAT binary instead of the sibling repo's
+//	                                 bin/detector (same variable and meaning as
+//	                                 internal/proxy's live-test door). A named
+//	                                 path that is not a file FAILS in both modes:
+//	                                 a typo is a defect, not an environment fact.
 //
 // Missing repo and broken repo are deliberately NOT collapsed: "not cloned" is
 // an environment fact (release.sh gates its own detector fences on
@@ -62,9 +67,21 @@ const requireNoSkipsEnv = "AIKEY_REQUIRE_NO_TEST_SKIPS"
 // it lives in a _test.go file and reaches no shipped binary.
 const detectorRepoOverrideEnv = "AIKEY_TEST_DETECTOR_REPO"
 
+// detectorBinaryEnv names an explicitly built detector and takes precedence
+// over the sibling repo lookup. Reused, NOT invented: internal/proxy's
+// live-test door already reads this exact variable, and TestChildHook_ListPacks
+// has described this gate as honoring it since 2026-08-17 — while the gate never
+// read it. Without it, the only way to run this suite against a freshly built
+// detector was to overwrite the SHARED sibling bin/detector, which other
+// sessions on the same checkout may be executing.
+// Bugfix: workflow/CI/bugfix/20260914-apphook-detector-gate-ignores-binary-env.md
+// Fence: TestDetectorGateSkipPolicy/binary_env_wins_over_sibling_lookup
+const detectorBinaryEnv = "AIKEY_TEST_DETECTOR_BINARY"
+
 var (
-	errDetectorRepoMissing = errors.New("ai-compliance-detector repo is not checked out")
-	errDetectorNotBuilt    = errors.New("ai-compliance-detector/bin/detector was never built")
+	errDetectorRepoMissing      = errors.New("ai-compliance-detector repo is not checked out")
+	errDetectorNotBuilt         = errors.New("ai-compliance-detector/bin/detector was never built")
+	errDetectorEnvBinaryInvalid = errors.New("the explicitly named detector binary is not a usable file")
 )
 
 func strictNoSkips() bool {
@@ -89,22 +106,44 @@ func detectorRepoDir() string {
 // so a permission probe there would reject a perfectly good binary. Existence +
 // "not a directory" is what this layer can assert portably; an unusable binary
 // surfaces as a Start() error, which the skip guard below also catches.
-func locateDetectorBinary() (string, error) {
+//
+// The second return value names where the binary came from, so the door can
+// say which detector answered — a stale sibling build (2026-09-14) turned
+// TestChildHook_ListPacks red with nothing in the output pointing at the binary.
+func locateDetectorBinary() (string, string, error) {
+	// Explicit beats implicit: a caller who named a binary wants THAT binary,
+	// even when a (possibly stale) sibling build also exists.
+	if explicit := strings.TrimSpace(os.Getenv(detectorBinaryEnv)); explicit != "" {
+		if statErr := statDetectorFile(explicit); statErr != nil {
+			return "", "", fmt.Errorf("%w (%s=%s): %w", errDetectorEnvBinaryInvalid, detectorBinaryEnv, explicit, statErr)
+		}
+		return explicit, detectorBinaryEnv, nil
+	}
+
 	repo := detectorRepoDir()
 	// `.git` (dir or gitdir-file, so linked worktrees count) mirrors release.sh's
 	// own gate for "is this sibling repo part of the checkout at all".
 	if _, err := os.Stat(filepath.Join(repo, ".git")); err != nil {
-		return "", fmt.Errorf("%w (looked in %s)", errDetectorRepoMissing, repo)
+		return "", "", fmt.Errorf("%w (looked in %s)", errDetectorRepoMissing, repo)
 	}
 	binary := filepath.Join(repo, "bin", "detector")
-	info, err := os.Stat(binary)
+	if statErr := statDetectorFile(binary); statErr != nil {
+		return "", "", fmt.Errorf("%w (%s): %w", errDetectorNotBuilt, binary, statErr)
+	}
+	return binary, "sibling repo build", nil
+}
+
+// statDetectorFile is the one existence check both sources share (existence +
+// not a directory; see the exec-bit note on locateDetectorBinary).
+func statDetectorFile(path string) error {
+	info, err := os.Stat(path)
 	if err != nil {
-		return "", fmt.Errorf("%w (%s): %w", errDetectorNotBuilt, binary, err)
+		return err
 	}
 	if info.IsDir() {
-		return "", fmt.Errorf("%w (%s is a directory)", errDetectorNotBuilt, binary)
+		return fmt.Errorf("%s is a directory", path)
 	}
-	return binary, nil
+	return nil
 }
 
 // requireSealedDetector is the ONLY sanctioned way for a test in this package to
@@ -133,8 +172,11 @@ func locateDetectorBinary() (string, error) {
 func requireSealedDetector(t *testing.T) (string, detectortest.Sealed) {
 	t.Helper()
 
-	binary, err := locateDetectorBinary()
+	binary, source, err := locateDetectorBinary()
 	if err == nil {
+		// Visible under -v and on any failure, so a red assertion downstream can
+		// be traced to WHICH binary answered.
+		t.Logf("detector binary: %s (from %s)", binary, source)
 		// The binary exists, so from here on a skip can only come from the
 		// test's own Start() failure path — a defect, not an environment fact.
 		forbidSilentSkip(t)
@@ -142,6 +184,12 @@ func requireSealedDetector(t *testing.T) (string, detectortest.Sealed) {
 	}
 
 	reason, fix := classifyDetectorErr(err)
+	// A binary the caller NAMED that is not there is never an environment fact,
+	// so the local-dev skip does not apply: skipping would print "ok" for a run
+	// that tested nothing the caller asked for.
+	if errors.Is(err, errDetectorEnvBinaryInvalid) {
+		t.Fatalf("%s: %s\n  Fix: %s\n  Underlying error: %v", detectorBinaryEnv, reason, fix, err)
+	}
 	if strictNoSkips() {
 		t.Fatalf("%s=1 forbids skipping: %s\n"+
 			"  The internal/apphook suite is the ONLY coverage of the proxy↔detector IPC\n"+
@@ -169,12 +217,17 @@ func requireDetectorBinary(t *testing.T) string {
 
 func classifyDetectorErr(err error) (reason, fix string) {
 	switch {
+	case errors.Is(err, errDetectorEnvBinaryInvalid):
+		return "the detector binary named by " + detectorBinaryEnv + " does not exist or is a directory",
+			"point " + detectorBinaryEnv + " at a built detector (absolute path — `go test` runs in the package directory), " +
+				"or unset it to use the sibling repo's bin/detector"
 	case errors.Is(err, errDetectorRepoMissing):
 		return "the sibling ai-compliance-detector repo is not checked out",
-			"clone ai-compliance-detector next to aikey-proxy"
+			"clone ai-compliance-detector next to aikey-proxy, or set " + detectorBinaryEnv + " to a detector you built"
 	case errors.Is(err, errDetectorNotBuilt):
 		return "the sibling ai-compliance-detector repo is checked out but its binary was never built",
-			"run `make test` (it builds the sibling detector first) instead of a bare `go test`"
+			"run `make test` (it builds the sibling detector first) instead of a bare `go test`, " +
+				"or set " + detectorBinaryEnv + " to a detector you built"
 	default:
 		return "the detector binary could not be located", "see the error above"
 	}
@@ -269,7 +322,7 @@ func TestDetectorGateSkipPolicy(t *testing.T) {
 		t.Fatalf("locate test binary: %v", err)
 	}
 
-	run := func(t *testing.T, strict string) (string, int) {
+	run := func(t *testing.T, strict, binaryEnv string) (string, int) {
 		t.Helper()
 		cmd := exec.Command(self, "-test.run", "^TestDetectorGateProbe$", "-test.v")
 		cmd.Env = append(os.Environ(),
@@ -278,6 +331,9 @@ func TestDetectorGateSkipPolicy(t *testing.T) {
 			// touching the real sibling checkout.
 			detectorRepoOverrideEnv+"="+filepath.Join(t.TempDir(), "no-such-detector-repo"),
 			requireNoSkipsEnv+"="+strict,
+			// Always set, even to "": a developer's exported binary variable would
+			// otherwise bypass the repo-missing branch the first two legs observe.
+			detectorBinaryEnv+"="+binaryEnv,
 		)
 		out, err := cmd.CombinedOutput()
 		code := 0
@@ -291,7 +347,7 @@ func TestDetectorGateSkipPolicy(t *testing.T) {
 	}
 
 	t.Run("strict_fails_never_skips", func(t *testing.T) {
-		out, code := run(t, "1")
+		out, code := run(t, "1", "")
 		if code == 0 {
 			t.Fatalf("strict leg exited 0 — a missing sibling repo still reads as a pass:\n%s", out)
 		}
@@ -307,7 +363,7 @@ func TestDetectorGateSkipPolicy(t *testing.T) {
 	})
 
 	t.Run("local_skips_but_is_loud", func(t *testing.T) {
-		out, code := run(t, "")
+		out, code := run(t, "", "")
 		if code != 0 {
 			t.Fatalf("non-strict leg exited %d — local dev must stay runnable without the sibling repo:\n%s", code, out)
 		}
@@ -318,6 +374,44 @@ func TestDetectorGateSkipPolicy(t *testing.T) {
 			if !strings.Contains(out, want) {
 				t.Errorf("non-strict leg banner missing %q:\n%s", want, out)
 			}
+		}
+	})
+
+	// The sibling repo is deliberately missing and strict mode is on, so the ONLY
+	// way this leg can exit 0 is that the gate read detectorBinaryEnv. The probe
+	// never starts the child, so an empty placeholder file is enough.
+	// Bugfix: workflow/CI/bugfix/20260914-apphook-detector-gate-ignores-binary-env.md
+	t.Run("binary_env_wins_over_sibling_lookup", func(t *testing.T) {
+		placeholder := filepath.Join(t.TempDir(), "detector")
+		if err := os.WriteFile(placeholder, nil, 0o600); err != nil {
+			t.Fatalf("write placeholder binary: %v", err)
+		}
+		out, code := run(t, "1", placeholder)
+		if code != 0 {
+			t.Fatalf("exited %d with %s set — the gate ignored it and fell back to the (missing) sibling repo:\n%s",
+				code, detectorBinaryEnv, out)
+		}
+		if strings.Contains(out, "--- SKIP") {
+			t.Errorf("skipped although %s named a file:\n%s", detectorBinaryEnv, out)
+		}
+		if !strings.Contains(out, placeholder) {
+			t.Errorf("the gate did not name the binary it chose:\n%s", out)
+		}
+	})
+
+	t.Run("missing_binary_env_fails_even_locally", func(t *testing.T) {
+		out, code := run(t, "", filepath.Join(t.TempDir(), "no-such-detector"))
+		if code == 0 {
+			t.Fatalf("exited 0 — a %s naming nothing reads as a pass:\n%s", detectorBinaryEnv, out)
+		}
+		if !strings.Contains(out, "--- FAIL") {
+			t.Errorf("no --- FAIL:\n%s", out)
+		}
+		if strings.Contains(out, "--- SKIP") {
+			t.Errorf("SKIPPED — an explicitly named binary must never degrade to a skip:\n%s", out)
+		}
+		if !strings.Contains(out, detectorBinaryEnv) {
+			t.Errorf("failure does not name %s:\n%s", detectorBinaryEnv, out)
 		}
 	})
 }

@@ -11,7 +11,7 @@ package detectortest
 // primitive sources for that path, and a test cannot spawn the detector without
 // one of them:
 //
-//	AIKEY_TEST_DETECTOR_BINARY   the env-provided binary (proxy live tests)
+//	AIKEY_TEST_DETECTOR_BINARY   the env-provided binary (proxy live tests + apphook gate)
 //	"bin", "detector"            the sibling repo's build output
 //	locateDetectorBinary         the sibling repo resolver + skip policy (apphook)
 //
