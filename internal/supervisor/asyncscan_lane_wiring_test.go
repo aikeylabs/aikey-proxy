@@ -181,7 +181,7 @@ func TestAsyncSubmit_TeamPieceWithNodesGoesRemote(t *testing.T) {
 func TestAsyncSubmit_PersonalPieceNeverGoesRemote(t *testing.T) {
 	// 🔴 The org says "use nodes" and there ARE nodes. A personal piece must
 	// still be scanned on this machine: it is an individual's own content, with
-	// no organization behind it and no tenant a node could authorise it against.
+	// no organization behind it and no tenant a node could authorize it against.
 	s := &Supervisor{cfg: &config.Config{}}
 	mode := string(asyncscan.TeamAsyncScanNodes)
 	s.teamAsyncScan.Store(&mode)
