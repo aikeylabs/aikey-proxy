@@ -95,7 +95,7 @@ func TestUnixSinkV2_RoundTripsResultAndCarriesNoToken(t *testing.T) {
 			t.Errorf("the result's findings did not survive: %+v", r.Findings)
 		}
 	case <-time.After(time.Second):
-		t.Fatal("no result was published — the v1 fire-and-forget behaviour would look exactly like this, " +
+		t.Fatal("no result was published — the v1 fire-and-forget behavior would look exactly like this, " +
 			"and the async lane would produce no audit rows at all")
 	}
 }

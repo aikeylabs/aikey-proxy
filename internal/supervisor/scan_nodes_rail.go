@@ -160,7 +160,7 @@ func (s *Supervisor) syncScanNodes(ctx context.Context, _ *generation, masterURL
 		Nodes: nodes,
 		// The trust set is a CLOSED list built from this very response. A node
 		// that later presents a different certificate is refused by the client,
-		// and a node not named here can never be dialled at all.
+		// and a node not named here can never be dialed at all.
 		Trusted: func(fp string) bool { return trusted[strings.ToLower(fp)] },
 		Reason:  reason,
 	})

@@ -24,7 +24,7 @@ import (
 const (
 	EnvScanNodeAddrs        = "AIKEY_PROXY_SCAN_NODE_ADDRS"
 	EnvScanNodeFingerprints = "AIKEY_PROXY_SCAN_NODE_FINGERPRINTS"
-	EnvScanTokenKeyFile     = "AIKEY_SCAN_TOKEN_KEY_FILE"
+	EnvScanTokenKeyFile     = "AIKEY_SCAN_TOKEN_KEY_FILE" //nolint:gosec // G101: an environment variable NAME, not a credential
 )
 
 // LoadRenderedScanNodes builds the node set from the rendered environment.

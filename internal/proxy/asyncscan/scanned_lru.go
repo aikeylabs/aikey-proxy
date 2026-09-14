@@ -6,7 +6,7 @@ import (
 )
 
 // maxTransientAttempts is how often a piece may fail transiently before the lane
-// gives up and finalises it as partial.
+// gives up and finalizes it as partial.
 //
 // Why a limit at all: a transient failure (result timeout, node dropped the
 // connection) leaves the piece unscanned, so the correct response is to try
@@ -56,13 +56,15 @@ func (l *ScannedLRU) Claim(key string) bool {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	if el, ok := l.items[key]; ok {
-		e := el.Value.(*lruEntry)
-		l.order.MoveToFront(el)
-		if e.final || e.inFlight {
-			return false
+		if e, ok := entryOf(el); ok {
+			l.order.MoveToFront(el)
+			if e.final || e.inFlight {
+				return false
+			}
+			e.inFlight = true
+			return true
 		}
-		e.inFlight = true
-		return true
+		l.drop(el, key)
 	}
 	l.put(&lruEntry{key: key, inFlight: true})
 	return true
@@ -74,25 +76,32 @@ func (l *ScannedLRU) Finalize(key string) {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	if el, ok := l.items[key]; ok {
-		e := el.Value.(*lruEntry)
-		e.final, e.inFlight = true, false
-		l.order.MoveToFront(el)
-		return
+		if e, ok := entryOf(el); ok {
+			e.final, e.inFlight = true, false
+			l.order.MoveToFront(el)
+			return
+		}
+		l.drop(el, key)
 	}
 	l.put(&lruEntry{key: key, final: true})
 }
 
 // Transient records a transient failure and returns how many have now occurred.
-// At maxTransientAttempts the piece is finalised so it stops being re-enqueued.
+// At maxTransientAttempts the piece is finalized so it stops being re-enqueued.
 func (l *ScannedLRU) Transient(key string) int {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	el, ok := l.items[key]
+	var e *lruEntry
+	if ok {
+		if e, ok = entryOf(el); !ok {
+			l.drop(el, key)
+		}
+	}
 	if !ok {
 		l.put(&lruEntry{key: key, attempts: 1})
 		return 1
 	}
-	e := el.Value.(*lruEntry)
 	e.attempts++
 	e.inFlight = false
 	if e.attempts >= maxTransientAttempts {
@@ -102,13 +111,30 @@ func (l *ScannedLRU) Transient(key string) int {
 	return e.attempts
 }
 
-// Release clears the in-flight mark without finalising (the piece was never sent).
+// Release clears the in-flight mark without finalizing (the piece was never sent).
 func (l *ScannedLRU) Release(key string) {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	if el, ok := l.items[key]; ok {
-		el.Value.(*lruEntry).inFlight = false
+		if e, ok := entryOf(el); ok {
+			e.inFlight = false
+		}
 	}
+}
+
+// entryOf returns the entry an element holds. The list only ever holds
+// *lruEntry (see put); anything else means the structure is corrupt, and the
+// callers treat that as "not recorded" — one rescan — rather than panicking on
+// the request path that feeds this lane.
+func entryOf(el *list.Element) (*lruEntry, bool) {
+	e, ok := el.Value.(*lruEntry)
+	return e, ok
+}
+
+// drop removes an element whose value is unusable, so the key can be recorded afresh.
+func (l *ScannedLRU) drop(el *list.Element, key string) {
+	l.order.Remove(el)
+	delete(l.items, key)
 }
 
 func (l *ScannedLRU) put(e *lruEntry) {
@@ -120,6 +146,8 @@ func (l *ScannedLRU) put(e *lruEntry) {
 			return
 		}
 		l.order.Remove(oldest)
-		delete(l.items, oldest.Value.(*lruEntry).key)
+		if e, ok := entryOf(oldest); ok {
+			delete(l.items, e.key)
+		}
 	}
 }

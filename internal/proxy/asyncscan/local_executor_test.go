@@ -51,7 +51,7 @@ func (h *countingHook) Status() *apphook.Status { return &apphook.Status{Healthy
 // request pool completely untouched. This test proves both by counting calls on
 // two distinct hooks.
 func TestAsyncLocalExecutor_SaturationNeverTouchesRequestPool(t *testing.T) {
-	requestPool := &countingHook{name: "request-pool"}
+	requestPool := &countingHook{}
 	background := &countingHook{name: "background-pool", delay: 300 * time.Millisecond}
 
 	var spawned atomic.Int64

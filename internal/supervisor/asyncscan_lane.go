@@ -82,7 +82,7 @@ type asyncScanLane struct {
 // generation's hook installed.
 func (s *Supervisor) installAsyncScanLane(p *proxy.Proxy, reporter *events.Reporter, spawn func() (apphook.Hook, error)) *asyncScanLane {
 	// The operator kill-switch turns off compliance entirely, and the async lane
-	// is part of compliance. Checked first so "off" cannot be partially honoured.
+	// is part of compliance. Checked first so "off" cannot be partially honored.
 	if complianceDisabledByOperator() {
 		p.SetAsyncEnqueuer(nil)
 		return nil
@@ -181,7 +181,7 @@ func (s *Supervisor) installAsyncScanLane(p *proxy.Proxy, reporter *events.Repor
 	// installed" are the same observation from outside the process — and the
 	// first live run of the failover case spent its whole budget unable to tell
 	// them apart.
-	reason := string(nodesReason)
+	reason := nodesReason
 	p.SetDeepScanHealthFunc(func() *proxy.DeepScanHealth {
 		return lane.health(string(mode), reason)
 	})
@@ -247,7 +247,7 @@ func remoteNodeCount(l *asyncScanLane) int {
 func (s *Supervisor) asyncSubmitFunc(lane *asyncScanLane) asyncscan.SubmitFunc {
 	return func(p asyncscan.CommittedPiece, id asyncscan.RequestIdentity) bool {
 		// Placement is asyncscan.Place and nothing else: that is where "a personal
-		// piece never leaves this machine" and "an unrecognised team_async_scan
+		// piece never leaves this machine" and "an unrecognized team_async_scan
 		// value fails closed" live. Re-deciding here would duplicate two security
 		// rules in a second place, which is how one of them eventually drifts.
 		placement := asyncscan.Place(p, s.teamAsyncScanMode(), s.isClusterNode())
@@ -296,9 +296,16 @@ func (s *Supervisor) asyncSubmitFunc(lane *asyncScanLane) asyncscan.SubmitFunc {
 			}
 			frame, _ := deepscanfwd.BuildFrame(job, tok, envInt("AIKEY_PROXY_DEEPSCAN_MAX_PIECE_BYTES", 0))
 			return lane.remote.Enqueue(frame)
-		default:
+		case asyncscan.PlacementLocal:
 			return lane.submitLocal(job)
+		case asyncscan.PlacementSkip:
+			// Returned above; listed so a placement added later has to be routed
+			// on purpose instead of falling into whichever lane the default named.
+			return false
 		}
+		// A placement Place never returns: scan nothing. Fail closed, the same
+		// direction Place takes for an unrecognized team_async_scan value.
+		return false
 	}
 }
 
@@ -344,7 +351,7 @@ func (s *Supervisor) pumpAsyncResults(lane *asyncScanLane, reporter *events.Repo
 // the events.
 //
 // 🔴 The identity (seat, session, trace, tenant) is joined HERE, from the job
-// this proxy remembered — it never travelled to the node (design §3.3). That is
+// this proxy remembered — it never traveled to the node (design §3.3). That is
 // the whole reason the node uploads nothing: it does not know, and must not
 // know, whose request this was.
 func (s *Supervisor) fileAsyncResult(lane *asyncScanLane, reporter *events.Reporter, r deepscan.ResultFrame) {
@@ -357,7 +364,15 @@ func (s *Supervisor) fileAsyncResult(lane *asyncScanLane, reporter *events.Repor
 			"event.name", observability.EventAsyncScanVersionSkew, "job_id", r.JobID)
 		return
 	}
-	rec := v.(jobRecord)
+	rec, ok := v.(jobRecord)
+	if !ok {
+		// Only asyncSubmitFunc stores into lane.jobs, and only jobRecord values.
+		// Anything else is a programming error; filing under a guessed identity
+		// would be worse than dropping, so drop loudly.
+		slog.Warn("async scan: job record of an unexpected type; result not filed",
+			"event.name", observability.EventAsyncScanVersionSkew, "job_id", r.JobID)
+		return
+	}
 	merged := asyncscan.Merge(rec.job, r, apphook.ActionBlock, apphook.ActionBlock)
 	lane.lru.Finalize(rec.job.ContentSHA256)
 
@@ -435,7 +450,7 @@ func (l *asyncScanLane) Close(ctx context.Context) {
 
 // teamAsyncScanMode is what the control plane last said about team content.
 // Unset ⇒ off: a proxy that has never reached a master must not decide on its
-// own that the organisation permits asynchronous scanning of team content.
+// own that the organization permits asynchronous scanning of team content.
 func (s *Supervisor) teamAsyncScanMode() asyncscan.TeamAsyncScan {
 	if v := s.teamAsyncScan.Load(); v != nil {
 		return asyncscan.TeamAsyncScan(*v)

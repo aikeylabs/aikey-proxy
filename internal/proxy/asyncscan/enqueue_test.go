@@ -72,7 +72,7 @@ func TestAsyncScanLRU_ResentPieceScannedOnce(t *testing.T) {
 	l.Finalize(key)
 	for turn := 2; turn <= 3; turn++ {
 		if l.Claim(key) {
-			t.Errorf("turn %d re-claimed a finalised piece; the whole history would be re-scanned every turn", turn)
+			t.Errorf("turn %d re-claimed a finalized piece; the whole history would be re-scanned every turn", turn)
 		}
 	}
 
@@ -84,7 +84,7 @@ func TestAsyncScanLRU_ResentPieceScannedOnce(t *testing.T) {
 
 // TestAsyncScanLRU_TransientFailureRetriesThenFinalises: a piece whose scan
 // failed transiently must be retried when it reappears — but not forever. After
-// the third transient failure it is finalised as partial, so a permanently
+// the third transient failure it is finalized as partial, so a permanently
 // unreachable node cannot make every turn re-enqueue the same content.
 func TestAsyncScanLRU_TransientFailureRetriesThenFinalises(t *testing.T) {
 	l := NewScannedLRU(8)
@@ -98,7 +98,7 @@ func TestAsyncScanLRU_TransientFailureRetriesThenFinalises(t *testing.T) {
 		}
 	}
 	if l.Claim(key) {
-		t.Error("after the third transient failure the piece must be finalised, not retried forever")
+		t.Error("after the third transient failure the piece must be finalized, not retried forever")
 	}
 }
 
@@ -109,7 +109,7 @@ func TestAsyncScanLRU_TransientFailureRetriesThenFinalises(t *testing.T) {
 // cache — it only ever looked at the head. The async lane looks at the WHOLE
 // piece, so if it reused the head hash, a user could get one scan of a long
 // document and then append anything at all to it forever, and every later
-// version would be recognised as "already scanned".
+// version would be recognized as "already scanned".
 func TestAsyncScanIdentity_SameHeadDifferentTailTwoUnits(t *testing.T) {
 	head := strings.Repeat("a", 16*1024)
 	p1 := head + "the tail is clean"

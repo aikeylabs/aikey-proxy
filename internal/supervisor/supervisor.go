@@ -381,7 +381,7 @@ type Supervisor struct {
 	// it answers a different question — scanNodes says WHERE a piece could go,
 	// this says WHETHER team content may go anywhere at all. nil ⇒ off: a proxy
 	// that has never reached a master must not decide on its own that the
-	// organisation permits asynchronous scanning of its employees' content.
+	// organization permits asynchronous scanning of its employees' content.
 	teamAsyncScan atomic.Pointer[string]
 	// intakeFeatures is what the master advertised it can STORE (from GET
 	// /v1/compliance/policy). asyncscan.EncodeForMaster strips anything not named

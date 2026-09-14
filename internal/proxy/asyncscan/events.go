@@ -17,7 +17,7 @@ import (
 //
 // 🚫 There is deliberately NO snippet field of any kind. A remote result carries
 // no content (design §3.1), and adding somewhere to put content here is how it
-// would start travelling.
+// would start traveling.
 type Event struct {
 	EventID      string    `json:"event_id"`
 	CreatedAt    time.Time `json:"created_at"`

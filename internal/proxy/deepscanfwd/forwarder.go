@@ -30,7 +30,7 @@ type Config struct {
 	QueueMax   int
 	QueueBytes int64
 	// DialSink builds the transport for one node. Injected so tests drive real
-	// queue and failover behaviour without a TLS listener per case; production
+	// queue and failover behavior without a TLS listener per case; production
 	// passes scannode.NewTLSSink.
 	DialSink func(scannode.Node) deepscan.Sink
 	// RejectFor lets a test express "this node answers with reject code X".
@@ -165,7 +165,9 @@ func (r *RemoteForwarder) Enqueue(f deepscan.FrameV2) bool {
 
 func (r *RemoteForwarder) countDrop(size int64, reason string) {
 	r.dropped.Add(1)
-	r.droppedBytes.Add(uint64(size))
+	if size > 0 {
+		r.droppedBytes.Add(uint64(size)) //nolint:gosec // G115: a byte length, guarded non-negative above
+	}
 	// WARN, aggregated by the caller's rate limiter upstream: a drop is a real
 	// coverage hole, and the health section carries the running totals.
 	r.log.Warn("deep-scan task dropped before delivery; this content will not be re-scanned unless it is sent again",

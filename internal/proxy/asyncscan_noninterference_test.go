@@ -58,7 +58,7 @@ func TestAsyncScan_CommitPointNeverAltersTheForwardedRequest(t *testing.T) {
 			if proceed := p.applyInboundFilter(w, r, "m", "team", "org_a", "vk1", "seat1", "sess1", "trace1", discardLogger()); !proceed {
 				t.Fatal("must proceed")
 			}
-			// ⚠️ HONEST NOTE ON THIS ASSERTION'S STRENGTH. It is defence in depth, and
+			// ⚠️ HONEST NOTE ON THIS ASSERTION'S STRENGTH. It is defense in depth, and
 			// it CANNOT be made red by a mutation at the commit point: when nothing
 			// was masked, applyInboundFilter restores the original bodyBytes
 			// unconditionally on its way out (`if maskedCount == 0 { r.Body = ...

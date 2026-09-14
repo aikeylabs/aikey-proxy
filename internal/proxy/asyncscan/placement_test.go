@@ -12,7 +12,7 @@ import (
 // this package, and the only one with no exceptions.
 //
 // 🔴 A personal-routed piece is an individual's own content on their own machine,
-// scanned for their own self-view. It has no organisation behind it, no tenant to
+// scanned for their own self-view. It has no organization behind it, no tenant to
 // authorize a node against, and nobody who consented to it being sent anywhere.
 // So it is scanned HERE or not at all — regardless of how many nodes are
 // configured, regardless of what the org policy says, regardless of edition.

@@ -136,7 +136,11 @@ func wouldHaveBlocked(findings []deepscan.Finding, verdicts []deepscan.RangeVerd
 	}
 	for _, f := range findings {
 		for _, v := range verdicts {
-			if v.Action != "block" {
+			// 🔴 `answer` is a refusal too. It arrived with compliance grading on
+			// develop-v1.0.7, after this function was written: a tail hit whose rule
+			// serves a canned answer would otherwise never be reported as the leak
+			// it is, because only the literal "block" was checked.
+			if v.Action != apphook.ActionBlock.String() && v.Action != apphook.ActionAnswer.String() {
 				continue
 			}
 			// The finding must lie inside a range the receiver judged block.
@@ -154,7 +158,10 @@ func wouldHaveBlocked(findings []deepscan.Finding, verdicts []deepscan.RangeVerd
 // integers would rank warn above block.
 func severityRank(a apphook.Action) int {
 	switch a {
-	case apphook.ActionBlock:
+	case apphook.ActionBlock, apphook.ActionAnswer:
+		// A canned answer REFUSES the request exactly as a block does (apphook:
+		// "refuses the request like ActionBlock"); it only differs in what the
+		// client reads. For "would this have been stopped?" the two are one rung.
 		return 3
 	case apphook.ActionMask:
 		return 2
@@ -163,7 +170,7 @@ func severityRank(a apphook.Action) int {
 	case apphook.ActionAllow:
 		return 0
 	default:
-		// An unknown action ranks lowest, so an unrecognised ceiling can never be
+		// An unknown action ranks lowest, so an unrecognized ceiling can never be
 		// read as permission to call something a leak.
 		return 0
 	}

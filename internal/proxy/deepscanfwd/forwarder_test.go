@@ -153,7 +153,7 @@ func TestDeepScanForward_DegradesAfterThreeFailuresAndRecovers(t *testing.T) {
 	for i := 0; i < 3; i++ {
 		r.Enqueue(testFrame(i))
 	}
-	waitFor(t, 3*time.Second, func() bool { return r.Stats().Status == StatusDegraded })
+	waitFor(t, func() bool { return r.Stats().Status == StatusDegraded })
 
 	bad.mu.Lock()
 	bad.failAll = false
@@ -166,7 +166,7 @@ func TestDeepScanForward_DegradesAfterThreeFailuresAndRecovers(t *testing.T) {
 	// elapsed AND (b) new work shows up — which is exactly what a real proxy
 	// does on the user's next turn. A test that expected the forwarder to retry
 	// on its own would be asserting a retry loop the design forbids.
-	waitFor(t, 3*time.Second, func() bool {
+	waitFor(t, func() bool {
 		r.Enqueue(testFrame(100 + int(r.Stats().Enqueued)))
 		return r.Stats().Status == StatusOK
 	})
@@ -231,15 +231,16 @@ func TestDeepScanForward_TenantMismatchDoesNotTryAnotherNode(t *testing.T) {
 	defer r.Close(context.Background())
 
 	r.Enqueue(testFrame(1))
-	waitFor(t, 3*time.Second, func() bool { return r.Stats().Failed > 0 })
+	waitFor(t, func() bool { return r.Stats().Failed > 0 })
 
 	if got := n1.count() + n2.count(); got > 1 {
 		t.Errorf("a tenant_mismatch frame was delivered %d times; it must stop at the first node", got)
 	}
 }
 
-func waitFor(t *testing.T, d time.Duration, cond func() bool) {
+func waitFor(t *testing.T, cond func() bool) {
 	t.Helper()
+	const d = 3 * time.Second
 	deadline := time.Now().Add(d)
 	for time.Now().Before(deadline) {
 		if cond() {
@@ -319,7 +320,7 @@ func TestDeepScanForward_TenantMismatchFromTheNodeStopsAtOneNode(t *testing.T) {
 	defer r.Close(context.Background())
 
 	r.Enqueue(testFrame(1))
-	waitFor(t, 3*time.Second, func() bool { return r.Stats().Failed > 0 })
+	waitFor(t, func() bool { return r.Stats().Failed > 0 })
 	time.Sleep(100 * time.Millisecond)
 	if got := n1.count() + n2.count(); got != 1 {
 		t.Fatalf("a tenant_mismatch answer led to %d deliveries; it must stop at the first node", got)

@@ -29,14 +29,14 @@ const (
 //
 // 🔴 RULE ONE, NO EXCEPTIONS: a personal-routed piece is scanned locally or not
 // at all. It is an individual's own content, on their own machine, for their own
-// self-view — there is no organisation behind it, no tenant a node could
+// self-view — there is no organization behind it, no tenant a node could
 // authorize it against, and nobody who agreed to it being sent anywhere. Every
 // other input to this function is irrelevant once Personal is true, and the fence
 // TestAsyncScanPlacement_PersonalPieceNeverLeavesMachine checks that exhaustively
 // because the plausible regression is a later "...unless the org forces it"
 // branch that only fires in one combination. spec: R-scan-node-deepscan-16.S1
 //
-// 🔴 RULE TWO: an unrecognised policy value FAILS CLOSED. A newer master could
+// 🔴 RULE TWO: an unrecognized policy value FAILS CLOSED. A newer master could
 // send a mode this binary has never heard of; treating it as "remote" would ship
 // raw content somewhere on the strength of a string we cannot interpret, and that
 // is the one decision here that cannot be taken back. Skipping loses coverage,

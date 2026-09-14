@@ -1,4 +1,4 @@
-// Package probes holds one-off SPIKE probes that measure real runtime behaviour
+// Package probes holds one-off SPIKE probes that measure real runtime behavior
 // the design has to assume. They are not fences: they answer a question once,
 // the answer is written into the design package's baseline-forensics.md, and the
 // probe stays only so the measurement can be re-run on a new Go / OS version.

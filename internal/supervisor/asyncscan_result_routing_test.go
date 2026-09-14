@@ -132,7 +132,7 @@ func TestFileAsyncResult_TeamFindingsGoToMasterAndAreMirroredLocally(t *testing.
 		t.Fatalf("team findings were mirrored locally %d time(s), want 1", len(got))
 	}
 	if !strings.Contains(got[0], `"route_source":"team"`) {
-		t.Fatalf("the local mirror is not labelled route_source=team, so the local page cannot tell it apart: %s", got[0])
+		t.Fatalf("the local mirror is not labeled route_source=team, so the local page cannot tell it apart: %s", got[0])
 	}
 }
 

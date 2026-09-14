@@ -17,7 +17,9 @@ func ruleFinding(start, end int, entity string) deepscan.Finding {
 	}
 }
 
-func job(headBytes, total int) PieceJob {
+// job is a 64 KiB piece whose first 16 KiB the fast layer already inspected.
+func job() PieceJob {
+	const headBytes, total = 16 * 1024, 64 * 1024
 	return PieceJob{
 		JobID: "j1", TenantID: "org_a", AuditUnitID: "au_1", ContentSHA256: "sha",
 		Source: deepscan.SourceRequest, Text: strings.Repeat("a", total), HeadBytes: headBytes,
@@ -32,7 +34,7 @@ func job(headBytes, total int) PieceJob {
 // chunk-relative offset reached the audit row, a reviewer opening the finding
 // would be shown the wrong span of the prompt — confidently and silently.
 func TestAsyncRules_TailFindingAbsoluteOffset(t *testing.T) {
-	j := job(16*1024, 64*1024)
+	j := job()
 	m := Merge(j, deepscan.ResultFrame{
 		JobID: "j1", Status: deepscan.StatusComplete,
 		ScannedBytes: 64 * 1024, TotalBytes: 64 * 1024,
@@ -54,7 +56,7 @@ func TestAsyncRules_TailFindingAbsoluteOffset(t *testing.T) {
 // layer, once by the async lane — under two different event ids, so neither
 // database constraint can collapse them.
 func TestAsyncRules_HeadAlreadyScannedNotDuplicated(t *testing.T) {
-	j := job(16*1024, 64*1024)
+	j := job()
 	m := Merge(j, deepscan.ResultFrame{
 		JobID: "j1", Status: deepscan.StatusComplete,
 		Findings: []deepscan.Finding{
@@ -88,7 +90,7 @@ func TestAsyncRules_HeadAlreadyScannedNotDuplicated(t *testing.T) {
 // whose action is block. The synchronous layer never saw those bytes, so the
 // content WENT UPSTREAM. That is the high-risk case an admin must be shown.
 func TestAsyncRules_PlainTextBlockRuleIsLeak(t *testing.T) {
-	j := job(16*1024, 64*1024)
+	j := job()
 	m := Merge(j, deepscan.ResultFrame{
 		JobID: "j1", Status: deepscan.StatusComplete,
 		Findings:     []deepscan.Finding{ruleFinding(40_000, 40_060, "CREDENTIAL_DSN")},
@@ -116,7 +118,7 @@ func TestAsyncRules_PlainTextBlockRuleIsLeak(t *testing.T) {
 // admin's high-risk queue with cases where the product behaved exactly as
 // designed — and a queue full of non-incidents is a queue nobody reads.
 func TestAsyncRules_ToolResultCappedNotLeak(t *testing.T) {
-	j := job(16*1024, 64*1024)
+	j := job()
 	m := Merge(j, deepscan.ResultFrame{
 		JobID: "j1", Status: deepscan.StatusComplete,
 		Findings:     []deepscan.Finding{ruleFinding(40_000, 40_060, "CREDENTIAL_DSN")},
@@ -138,7 +140,7 @@ func TestAsyncRules_ToolResultCappedNotLeak(t *testing.T) {
 // to warn (filter_max_action). Then no content would ever have been blocked, so
 // nothing the async lane finds can be a leak.
 func TestAsyncRules_DeploymentCeilingWarnNotLeak(t *testing.T) {
-	j := job(16*1024, 64*1024)
+	j := job()
 	m := Merge(j, deepscan.ResultFrame{
 		JobID: "j1", Status: deepscan.StatusComplete,
 		Findings:     []deepscan.Finding{ruleFinding(40_000, 40_060, "CREDENTIAL_DSN")},
@@ -160,7 +162,7 @@ func TestAsyncRules_DeploymentCeilingWarnNotLeak(t *testing.T) {
 // accepting it silently would mean an admin cannot explain why one machine
 // reports findings another does not. So: use it, and make the skew visible.
 func TestAsyncScanResult_VersionSkewCounted(t *testing.T) {
-	j := job(16*1024, 64*1024)
+	j := job()
 	j.DetectorVersion, j.ContentVersion = "abc123", "cv-7"
 
 	same := Merge(j, deepscan.ResultFrame{
@@ -192,7 +194,7 @@ func TestAsyncScanResult_VersionSkewCounted(t *testing.T) {
 // TestAsyncScanEvents_CarryProxyStampedIdentityAndNoContent checks what actually
 // reaches master.
 func TestAsyncScanEvents_CarryProxyStampedIdentityAndNoContent(t *testing.T) {
-	j := job(16*1024, 64*1024)
+	j := job()
 	m := Merge(j, deepscan.ResultFrame{
 		JobID: "j1", Status: deepscan.StatusPartial, Reason: deepscan.ReasonPieceCap,
 		ScannedBytes: 60 * 1024, TotalBytes: 64 * 1024,
@@ -243,5 +245,19 @@ func TestAsyncScanEvents_CarryProxyStampedIdentityAndNoContent(t *testing.T) {
 	}
 	if cov["status"] != deepscan.StatusPartial {
 		t.Errorf("scan_coverage.status = %v, want partial", cov["status"])
+	}
+}
+
+// TestWouldHaveBlocked_CannedAnswerIsARefusal — a tail finding inside a range the
+// receiver judged `answer` (代答) is a leak exactly like one judged `block`: the
+// synchronous layer would have refused the request either way.
+func TestWouldHaveBlocked_CannedAnswerIsARefusal(t *testing.T) {
+	m := Merge(job(), deepscan.ResultFrame{
+		JobID: "j1", Status: deepscan.StatusComplete,
+		Findings:     []deepscan.Finding{ruleFinding(50_000, 50_060, "CN_ID_CARD")},
+		RuleVerdicts: []deepscan.RangeVerdict{{Start: 49_000, End: 51_000, Action: apphook.ActionAnswer.String()}},
+	}, apphook.ActionBlock, apphook.ActionBlock)
+	if !m.WouldHaveBlocked || m.Scenario != ScenarioAsyncRuleLeak {
+		t.Fatalf("a tail hit under a canned-answer rule was not reported as a leak (would_have_blocked=%v scenario=%q)", m.WouldHaveBlocked, m.Scenario)
 	}
 }

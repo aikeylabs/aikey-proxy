@@ -44,7 +44,7 @@ func Finalize(m MergedResult, attempts int) (bool, *Coverage) {
 	return true, &cov
 }
 
-// EncodeForMaster serialises events for upload, removing fields the target
+// EncodeForMaster serializes events for upload, removing fields the target
 // master has not advertised support for.
 //
 // 🔴 WHY STRIP RATHER THAN NOT-BUILD. The events are built once, and the same
@@ -65,7 +65,8 @@ func EncodeForMaster(events []Event, features []string) [][]byte {
 		}
 	}
 	out := make([][]byte, 0, len(events))
-	for _, ev := range events {
+	for i := range events {
+		ev := events[i] // a COPY on purpose — see the strip below
 		if !supportsCoverage {
 			// Strip by clearing the pointer on a COPY: ev is a value, so this does
 			// not mutate the caller's slice — a dead-letter replay against a newer
@@ -74,7 +75,7 @@ func EncodeForMaster(events []Event, features []string) [][]byte {
 		}
 		b, err := json.Marshal(ev)
 		if err != nil {
-			// A finding that cannot be marshalled is a programming error, not a
+			// A finding that cannot be marshaled is a programming error, not a
 			// runtime condition. Dropping the event silently would be the worst
 			// outcome, so skip this one and keep the rest of the batch.
 			continue

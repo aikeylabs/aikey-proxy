@@ -152,7 +152,9 @@ func (x *LocalExecutor) Submit(job PieceJob) bool {
 
 func (x *LocalExecutor) countDrop(size int64, reason string) {
 	x.dropped.Add(1)
-	x.droppedBytes.Add(uint64(size))
+	if size > 0 {
+		x.droppedBytes.Add(uint64(size)) //nolint:gosec // G115: a byte length, guarded non-negative above
+	}
 	x.log.Warn("local async scan dropped a piece; its tail will not be scanned unless the content is sent again",
 		"event.name", observability.EventAsyncScanExecutorSaturated,
 		"reason", reason, "bytes", size, "dropped_total", x.dropped.Load())

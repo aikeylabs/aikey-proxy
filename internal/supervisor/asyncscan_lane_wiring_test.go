@@ -16,7 +16,7 @@ import (
 // TestAsyncScanLane_IsActuallyConstructed pins the COMPOSITION ROOT of the
 // asynchronous deep-scan lane.
 //
-// 🔴 WHY A FENCE ON CONSTRUCTION, NOT ON BEHAVIOUR.
+// 🔴 WHY A FENCE ON CONSTRUCTION, NOT ON BEHAVIOR.
 // Every piece of this lane — asyncscan's enqueuer, local executor, placement,
 // merge, coverage and event builder, and deepscanfwd's forwarder, frame builder
 // and v2 sink — was written, unit-tested and green, while NOTHING OUTSIDE TESTS
@@ -137,7 +137,7 @@ func readSource(t *testing.T, name string) string {
 	return string(b)
 }
 
-// ── behaviour, not just presence ─────────────────────────────────────────────
+// ── behavior, not just presence ─────────────────────────────────────────────
 //
 // The source scans above prove the lane is CONSTRUCTED. These prove it ROUTES:
 // a committed piece has to reach an executor, and a personal piece has to reach
@@ -181,7 +181,7 @@ func TestAsyncSubmit_TeamPieceWithNodesGoesRemote(t *testing.T) {
 func TestAsyncSubmit_PersonalPieceNeverGoesRemote(t *testing.T) {
 	// 🔴 The org says "use nodes" and there ARE nodes. A personal piece must
 	// still be scanned on this machine: it is an individual's own content, with
-	// no organisation behind it and no tenant a node could authorise it against.
+	// no organization behind it and no tenant a node could authorise it against.
 	s := &Supervisor{cfg: &config.Config{}}
 	mode := string(asyncscan.TeamAsyncScanNodes)
 	s.teamAsyncScan.Store(&mode)

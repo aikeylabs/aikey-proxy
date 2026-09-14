@@ -5,7 +5,7 @@
 // The outbound half (frame assembly, delivery, failover) lives in
 // internal/proxy/deepscanfwd. The split follows the security boundary, not the
 // call graph: that package decides what leaves the machine, this one decides
-// what the organisation is told.
+// what the organization is told.
 //
 // spec: R-scan-node-deepscan-4.S1 / -15.S1 / -15.S2 / -23.S1 · design §3.3, §3.7, §4b.2
 package asyncscan
@@ -31,7 +31,7 @@ type PieceID struct {
 // at. The async lane looks at everything, so reusing the head hash would mean a
 // user could get one long document scanned and then append arbitrary content to
 // it forever: every later version shares the head, so every later version would
-// be recognised as "already scanned" and skipped.
+// be recognized as "already scanned" and skipped.
 //
 // Fence: TestAsyncScanIdentity_SameHeadDifferentTailTwoUnits.
 func PieceIdentity(scopeKey, text string) PieceID {

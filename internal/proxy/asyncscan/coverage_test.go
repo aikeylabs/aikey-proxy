@@ -38,7 +38,7 @@ func TestAsyncScanCoverage_PieceCapIsFinalPartial(t *testing.T) {
 
 // TestAsyncScanCoverage_TransientPartialNotFinal: a transient failure (node
 // timed out, connection dropped) leaves the piece UNSCANNED, so it must stay
-// claimable — until the attempt cap, after which it finalises as partial so a
+// claimable — until the attempt cap, after which it finalizes as partial so a
 // permanently-down node cannot make every turn re-enqueue the same content.
 func TestAsyncScanCoverage_TransientPartialNotFinal(t *testing.T) {
 	m := MergedResult{
@@ -49,12 +49,12 @@ func TestAsyncScanCoverage_TransientPartialNotFinal(t *testing.T) {
 	for attempt := 1; attempt < maxTransientAttempts; attempt++ {
 		final, _ := Finalize(transient(m), attempt)
 		if final {
-			t.Fatalf("attempt %d: a transient failure must NOT finalise — the content was never scanned", attempt)
+			t.Fatalf("attempt %d: a transient failure must NOT finalize — the content was never scanned", attempt)
 		}
 	}
 	final, cov := Finalize(transient(m), maxTransientAttempts)
 	if !final {
-		t.Fatalf("after %d transient failures the piece must finalise, or a down node re-enqueues it every turn", maxTransientAttempts)
+		t.Fatalf("after %d transient failures the piece must finalize, or a down node re-enqueues it every turn", maxTransientAttempts)
 	}
 	if cov == nil || cov.Status != deepscan.StatusPartial {
 		t.Errorf("the give-up result must be recorded as partial, not complete: %+v", cov)
