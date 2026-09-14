@@ -714,4 +714,10 @@ const (
 	EventAsyncScanCoverageUnsupported = "proxy.async_scan.coverage_unsupported"
 	EventAsyncScanVersionSkew         = "proxy.async_scan.version_skew"
 	EventAsyncScanExecutorSaturated   = "proxy.async_scan.executor_saturated"
+	// EventAsyncScanPersonalFileFailed: a PERSONAL piece's async findings could
+	// not reach the local ledger (dead-lettered for retry; never sent elsewhere).
+	EventAsyncScanPersonalFileFailed = "proxy.async_scan.personal_file_failed"
+	// EventAsyncScanLocalMirrorFailed: the best-effort local copy of a TEAM async
+	// result failed. The master upload is unaffected and is the record of truth.
+	EventAsyncScanLocalMirrorFailed = "proxy.async_scan.local_mirror_failed"
 )

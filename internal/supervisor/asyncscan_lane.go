@@ -50,14 +50,14 @@ import (
 // asyncScanLane is one generation's lane. Everything in it is torn down on
 // reload-drain, in the order the comments below explain.
 type asyncScanLane struct {
-	enqueuer  *asyncscan.Enqueuer
-	local     *asyncscan.LocalExecutor
-	remote    *deepscanfwd.RemoteForwarder
-	lru       *asyncscan.ScannedLRU
-	jobs      sync.Map // job id -> deepscanfwd.PieceJob, for Merge when the result returns
-	stop      chan struct{}
-	done      sync.WaitGroup
-	log       *slog.Logger
+	enqueuer *asyncscan.Enqueuer
+	local    *asyncscan.LocalExecutor
+	remote   *deepscanfwd.RemoteForwarder
+	lru      *asyncscan.ScannedLRU
+	jobs     sync.Map // job id -> deepscanfwd.PieceJob, for Merge when the result returns
+	stop     chan struct{}
+	done     sync.WaitGroup
+	log      *slog.Logger
 	// localSubmit is the door to the local executor. An indirection rather than
 	// a direct lane.local.Submit call so a test can drive the ROUTING decision
 	// without spawning a real detector child — the same seam LocalExecutor and
@@ -274,7 +274,7 @@ func (s *Supervisor) asyncSubmitFunc(lane *asyncScanLane) asyncscan.SubmitFunc {
 			HeadBytes:     p.HeadBytes,
 			Engines:       []string{"rules", "bge"},
 		}
-		lane.jobs.Store(job.JobID, jobRecord{job: job, id: id})
+		lane.jobs.Store(job.JobID, jobRecord{job: job, id: id, personal: p.Personal})
 
 		switch placement {
 		case asyncscan.PlacementRemote:
@@ -315,6 +315,10 @@ func (l *asyncScanLane) submitLocal(job deepscanfwd.PieceJob) bool {
 type jobRecord struct {
 	job deepscanfwd.PieceJob
 	id  asyncscan.RequestIdentity
+	// personal decides which ledger the result is filed in. It is remembered
+	// here because it exists only at the commit point (CommittedPiece.Personal)
+	// and never travels in the frame — a node must not learn it either.
+	personal bool
 }
 
 // pumpAsyncResults drains both executors and files what they found.
@@ -361,6 +365,28 @@ func (s *Supervisor) fileAsyncResult(lane *asyncScanLane, reporter *events.Repor
 	if len(evs) == 0 || reporter == nil {
 		return
 	}
+	// The local self-view store has no scan_coverage column, so local copies use
+	// the conservative encoding (no advertised features ⇒ coverage stripped).
+	localPayloads := asyncscan.EncodeForMaster(evs, nil)
+
+	// 🔴 A PERSONAL piece is filed in the employee's OWN ledger and nowhere else
+	// (design §4b.6; checklist A-8.1: master 0 rows, local ledger 1 row). Until
+	// 2026-09-13 every result was filed as "team": findings on content sent with a
+	// personal key — tenant, seat, key id, session, trace, categories — reached
+	// the organisation's master, and the local ledger got nothing. The synchronous
+	// fast layer never did this; the async lane lost the flag at the commit point.
+	// Same transport and dead letter as every other compliance upload.
+	// bugfix: workflow/CI/bugfix/20260913-async-scan-filed-personal-findings-as-team.md
+	if rec.personal {
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer cancel()
+		if err := reporter.UploadAsyncComplianceBatch(ctx, "personal", localPayloads); err != nil {
+			slog.Warn("async scan: personal findings did not reach the local ledger (dead-lettered for retry)",
+				"event.name", observability.EventAsyncScanPersonalFileFailed, "error", err)
+		}
+		return
+	}
+
 	// EncodeForMaster strips fields the master has not advertised in
 	// intake_features — a new proxy against an old master must not take the
 	// batch down over an optional observability field.
@@ -375,6 +401,18 @@ func (s *Supervisor) fileAsyncResult(lane *asyncScanLane, reporter *events.Repor
 		// so a permanently failing lane is visible rather than merely quiet.
 		slog.Warn("async scan: event upload failed (dead-lettered for retry)",
 			"event.name", observability.EventDeepScanForwardFailed, "error", err)
+	}
+	// LOCAL MIRROR of team results — the same decision the synchronous fast layer
+	// already implements (user 2026-09-03: team and personal detections are both
+	// recorded on this machine's page), extended to this lane by user decision
+	// 2026-09-13. Best-effort and after the master upload: never dead-lettered,
+	// and its failure never touches the record of truth. No-op on a host without
+	// a local store. See Reporter.MirrorComplianceEventsLocally.
+	mctx, mcancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer mcancel()
+	if err := reporter.MirrorComplianceEventsLocally(mctx, "team", localPayloads); err != nil {
+		slog.Warn("async scan: local mirror of team findings failed (master upload unaffected)",
+			"event.name", observability.EventAsyncScanLocalMirrorFailed, "error", err)
 	}
 }
 
