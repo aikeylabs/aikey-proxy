@@ -30,12 +30,14 @@ import (
 	"io"
 	"log/slog"
 	"net/http"
+	"strings"
 	"sync/atomic"
 	"time"
 	"unicode/utf8"
 
 	"github.com/AiKeyLabs/aikey-proxy/internal/apphook"
 	"github.com/AiKeyLabs/aikey-proxy/internal/observability"
+	"github.com/AiKeyLabs/aikey-proxy/internal/proxy/asyncscan"
 )
 
 // pipeInputCap bounds how many bytes of a content piece the proxy sends over the
@@ -399,6 +401,11 @@ func (p *Proxy) applyInboundFilter(
 		}
 	}
 
+	// Per-piece head_bytes for the asynchronous lane: how much of each piece the
+	// fast layer actually inspected. Recorded here rather than recomputed at the
+	// commit point, because the cap is applied here and a second derivation is a
+	// second thing that can disagree with it.
+	asyncHeadBytes := make([]int, len(pieces))
 	for i := range pieces {
 		// Cap the per-piece payload sent over the pipe (the detector only scans
 		// the first pipeInputCap bytes anyway). The untouched tail is re-attached
@@ -435,6 +442,7 @@ func (p *Proxy) applyInboundFilter(
 		// 两者必须同源 —— 分家就是 2026-06-17~2026-09-08 那个 BUG 的全部根因。
 		// 见 auditUnitID 的不变量注释。
 		contentID := hashHead(head)
+		asyncHeadBytes[i] = len(head)
 		var resp *apphook.Response
 		var ckey string
 		if cache != nil {
@@ -709,6 +717,48 @@ func (p *Proxy) applyInboundFilter(
 			degraded = true
 			selfDeg++
 		}
+	}
+
+	// ── Asynchronous scan commit point ───────────────────────────────────────
+	//
+	// 🔴 THIS LINE'S POSITION IS THE FEATURE. Everything above may still refuse
+	// the request: the ActionBlock arm returns false at the switch, so a blocked
+	// request never reaches here. That makes "a refused request's bytes are never
+	// handed to a scan node" structural rather than a flag somebody has to
+	// remember to check — and it matters, because those bytes were just decided
+	// to be too sensitive to forward upstream. Sending them to a node afterwards
+	// would push exactly that content off the machine and then file an audit row
+	// implying it was forwarded.
+	//
+	// Cache-hit pieces are submitted too: the fast layer skipped the detector for
+	// them, but "has the ASYNC lane seen this?" is a different question with a
+	// different key (whole-piece hash vs scanned-head hash), so the filtering
+	// belongs in the already-scanned record, not here.
+	//
+	// nil enqueuer (no async lane configured — the common Personal default before
+	// the lane is wired) costs one nil check.
+	// spec: R-scan-node-deepscan-4.S1 / -23.S1 · baseline-forensics §F1
+	if e := p.asyncEnqueuer.Load(); e != nil && *e != nil {
+		committed := make([]asyncscan.CommittedPiece, 0, len(pieces))
+		for i := range pieces {
+			committed = append(committed, asyncscan.CommittedPiece{
+				// strings.Clone: pieces[i].text is a substring of the request body,
+				// and a substring keeps the WHOLE body alive. Queuing it without a
+				// copy would pin every buffered request body until the scan drains.
+				Text:      strings.Clone(pieces[i].text),
+				HeadBytes: asyncHeadBytes[i],
+				Source:    "request",
+				Personal:  routeSource == "personal",
+			})
+		}
+		(*e).OnCommit(committed, asyncscan.RequestIdentity{
+			TenantID:     orgID,
+			SeatID:       seatID,
+			VirtualKeyID: virtualKeyID,
+			SessionID:    sessionID,
+			TraceID:      traceID,
+			ScopeKey:     auditScopeKey,
+		})
 	}
 
 	if restoreState != nil && len(restoreState.keys) > 0 {

@@ -217,6 +217,15 @@ type FilterHookHealth struct {
 	WorkersTotal   int                  `json:"workers_total"`
 	Workers        []FilterWorkerHealth `json:"workers"`
 	VerdictCache   VerdictCacheHealth   `json:"verdict_cache"`
+	// DeepScan is the asynchronous scan lane's health. Additive block here rather
+	// than a new route (慎重新建 API/接口协议) — same reasoning as VerdictCache
+	// above, and read in the same breath: "is the detector answering, and is the
+	// content it could not reach being scanned afterwards?".
+	//
+	// Omitted entirely when no lane is configured: "absent" and "off" are
+	// different answers to an operator's question, and rendering an empty block
+	// would conflate them. See deepscan_health.go.
+	DeepScan *DeepScanHealth `json:"deepscan,omitempty"`
 }
 
 // contentVersionCausePrecedence orders the reasons a unit can be blind, most
@@ -257,6 +266,7 @@ func (p *Proxy) filterHookHealth() FilterHookHealth {
 	// comes back as a pool of one, so this loop has no "is it a pool?" branch.
 	statuses := apphook.WorkerStatuses(hook)
 	h := FilterHookHealth{
+		DeepScan:     p.deepScanHealth(),
 		Name:         hook.Name(),
 		WorkersTotal: len(statuses),
 		Workers:      make([]FilterWorkerHealth, 0, len(statuses)),

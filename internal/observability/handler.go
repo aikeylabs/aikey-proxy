@@ -695,3 +695,23 @@ func SetupLogger(logDir, serviceName, serviceVersion string, level slog.Level) (
 	slog.SetDefault(slog.New(NewMultiHandler(text, json)))
 	return asyncW, nil
 }
+
+// Asynchronous deep-scan / rule back-scan (design §4b.11). These are the proxy's
+// side of a lane that produces NO user-visible effect when it works, so its only
+// operator surface is these events plus the health section. Every one of them
+// describes lost or degraded COVERAGE — none of them may carry content.
+const (
+	EventDeepScanEnqueueDropped    = "proxy.deepscan.enqueue_dropped"
+	EventDeepScanForwardFailed     = "proxy.deepscan.forward_failed"
+	EventDeepScanStatusChanged     = "proxy.deepscan.status_changed"
+	EventDeepScanPublicNodeRefused = "proxy.deepscan.public_node_refused"
+
+	EventScanNodeInsecureNodeRejected = "proxy.scan_node.insecure_node_rejected"
+	EventScanNodeUntrustedFingerprint = "proxy.scan_node.untrusted_fingerprint"
+	EventScanNodeInsecureControlPlane = "proxy.scan_node.insecure_control_plane"
+
+	EventAsyncScanHighRisk            = "proxy.async_scan.high_risk"
+	EventAsyncScanCoverageUnsupported = "proxy.async_scan.coverage_unsupported"
+	EventAsyncScanVersionSkew         = "proxy.async_scan.version_skew"
+	EventAsyncScanExecutorSaturated   = "proxy.async_scan.executor_saturated"
+)

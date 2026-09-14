@@ -204,84 +204,7 @@ func (s *Supervisor) installFilterHook(p *proxy.Proxy, vaultReader *vault.Reader
 	}
 	maxActionEnv := "AIKEY_COMPLIANCE_FILTER_MAX_ACTION=" + maxAction
 
-	// Explicitly enable the detector's Personal/Trial local-intake path. Why an
-	// explicit flag instead of letting the detector self-decide: the detector
-	// self-discovers the local-server URL from the CLI yaml, which exists on any
-	// dev machine — so a test/bench that spawns the detector binary directly
-	// (e.g. TestChildHookFullStackLatency, N=1000 fixture iterations) would
-	// otherwise upload its fixtures into the live audit DB. Only the real
-	// supervisor sets this, so tests stay isolated. Harmless on Production: the
-	// detector checks AIKEY_CONTROL_MASTER_URL first and takes the master path
-	// before ever reaching the local-intake gate.
-	const localIntakeEnv = "AIKEY_COMPLIANCE_LOCAL_INTAKE=1"
-
-	// Pass the team control-panel URL so the detector's pack puller pulls
-	// compliance packs from that backend (public /v1/packs/changed, no token).
-	// Injected as AIKEY_PACK_MASTER_URL — NOT AIKEY_CONTROL_MASTER_URL — so it
-	// drives ONLY pack pulling, never the detector's event-intake routing (which
-	// must stay LOCAL self-view on Personal; setting the control-master URL there
-	// would switch intake to the master path and, with no app token, disable it).
-	// The URL's single source is config.json controlPanelUrl (set by
-	// `aikey login --control-url`); the proxy is the conduit, the detector keeps
-	// NO copy. Empty (no team configured) → puller stays offline.
-	// Org compliance PRIVACY TIER → detector env. This is the ONLY channel by
-	// which the detector learns whether it may attach the raw matched text to the
-	// compliance events it hands back for upload (tier 3), and the value comes
-	// from the ORG's own control-master via pollComplianceMasterPolicy.
-	//
-	// 🔴 READ THE ATOMIC, NEVER THE ENVIRONMENT OR THE VAULT. There is
-	// deliberately no local override: the person whose prompts these are must not
-	// be able to authorize sending them, and an admin must not have to trust that
-	// every machine in the fleet was configured correctly. If this ever grows an
-	// `os.Getenv` fallback "for testing", that is the fence gone.
-	//
-	// The zero value is 0, which the detector's own parser clamps to tier 1, so a
-	// node that has never reached its policy sends nothing. A tier change forces
-	// a re-spawn through the filter signature (filterSigWithPrivacyTier) — a
-	// running child keeps the env it was born with.
-	privacyTierEnv := "AIKEY_COMPLIANCE_PRIVACY_TIER=" +
-		strconv.FormatInt(s.masterPrivacyTier.Load(), 10)
-
-	// Same fence as the privacy tier: READ THE ATOMIC, no local override — the
-	// org's force must not be defeatable by a member machine's environment. ""
-	// (no force) leaves the detector on its own level (override file, else the
-	// factory simple default). spec: R-credential-password-tier-4
-	passwordTierEnv := "AIKEY_COMPLIANCE_PASSWORD_TIER="
-	if s.masterPasswordTierAdvanced.Load() {
-		passwordTierEnv += "advanced"
-	}
-
-	extraEnv := []string{recordAllowEnv, maxActionEnv, localIntakeEnv, privacyTierEnv, passwordTierEnv}
-	// Resolve the pack-pull backend + tenant for the detector. Personal/Trial read
-	// the team URL from the CLI's config.json (no tenant scoping — one user, one
-	// view). A CLUSTER node has no CLI config.json; its control URL + org come from
-	// the shared cluster-node.env (the same AIKEY_HUB_* the daemon uses — proxy and
-	// daemon both EnvironmentFile= it). Single-tenant per node (gap2 decision), so
-	// AIKEY_TENANT_ID is a single value scoping the pull to THIS org's packs.
-	// Reusing the existing detector pack-puller (GET /v1/packs/changed, which already
-	// ships phrases + does atomic ruleset swap) means org-custom phrases reach the
-	// node with no new endpoint/protocol — only these two env vars.
-	masterURL := readControlPanelURL()
-	tenantID := ""
-	if s.cfg != nil && s.cfg.Cluster.Enabled {
-		if u := os.Getenv("AIKEY_HUB_CONTROL_URL"); u != "" {
-			masterURL = strings.TrimRight(u, "/")
-		}
-		tenantID = os.Getenv("AIKEY_HUB_ORG_ID")
-	}
-	if masterURL != "" {
-		// Bound to a backend → pull packs from it, and poll every 60s so a newly
-		// published pack appears within ~1 minute (the detector's default is 1h,
-		// too slow for "add pack → see it"). Incremental cursor-based pulls are
-		// cheap. Offline (no backend) → neither var is set, puller stays off.
-		extraEnv = append(extraEnv,
-			"AIKEY_PACK_MASTER_URL="+masterURL,
-			"AIKEY_PACK_POLL_INTERVAL=60s",
-		)
-		if tenantID != "" {
-			extraEnv = append(extraEnv, "AIKEY_TENANT_ID="+tenantID)
-		}
-	}
+	extraEnv := s.filterChildEnv(recordAllowEnv, maxActionEnv)
 
 	cfg := apphook.ChildHookConfig{
 		Name:         "ai-compliance-detector",
@@ -684,4 +607,96 @@ func readControlPanelURL() string {
 		return ""
 	}
 	return strings.TrimRight(cfg.ControlPanelURL, "/")
+}
+
+// filterChildEnv assembles the environment the compliance detector child is
+// spawned with.
+//
+// Extracted from installFilterHook so the child's environment can be asserted
+// WITHOUT spawning a detector: the double-send fence
+// (TestDeepScanMode_ChildSocketAlwaysStripped) has to check the real list this
+// code path produces, and a test that rebuilt the list itself would pass while
+// production drifted. Everything here is unchanged from when it was inline,
+// except the trailing deepScanChildSocketEnv.
+func (s *Supervisor) filterChildEnv(recordAllowEnv, maxActionEnv string) []string {
+	// Explicitly enable the detector's Personal/Trial local-intake path. Why an
+	// explicit flag instead of letting the detector self-decide: the detector
+	// self-discovers the local-server URL from the CLI yaml, which exists on any
+	// dev machine — so a test/bench that spawns the detector binary directly
+	// (e.g. TestChildHookFullStackLatency, N=1000 fixture iterations) would
+	// otherwise upload its fixtures into the live audit DB. Only the real
+	// supervisor sets this, so tests stay isolated. Harmless on Production: the
+	// detector checks AIKEY_CONTROL_MASTER_URL first and takes the master path
+	// before ever reaching the local-intake gate.
+	const localIntakeEnv = "AIKEY_COMPLIANCE_LOCAL_INTAKE=1"
+
+	// Pass the team control-panel URL so the detector's pack puller pulls
+	// compliance packs from that backend (public /v1/packs/changed, no token).
+	// Injected as AIKEY_PACK_MASTER_URL — NOT AIKEY_CONTROL_MASTER_URL — so it
+	// drives ONLY pack pulling, never the detector's event-intake routing (which
+	// must stay LOCAL self-view on Personal; setting the control-master URL there
+	// would switch intake to the master path and, with no app token, disable it).
+	// The URL's single source is config.json controlPanelUrl (set by
+	// `aikey login --control-url`); the proxy is the conduit, the detector keeps
+	// NO copy. Empty (no team configured) → puller stays offline.
+	// Org compliance PRIVACY TIER → detector env. This is the ONLY channel by
+	// which the detector learns whether it may attach the raw matched text to the
+	// compliance events it hands back for upload (tier 3), and the value comes
+	// from the ORG's own control-master via pollComplianceMasterPolicy.
+	//
+	// 🔴 READ THE ATOMIC, NEVER THE ENVIRONMENT OR THE VAULT. There is
+	// deliberately no local override: the person whose prompts these are must not
+	// be able to authorize sending them, and an admin must not have to trust that
+	// every machine in the fleet was configured correctly. If this ever grows an
+	// `os.Getenv` fallback "for testing", that is the fence gone.
+	//
+	// The zero value is 0, which the detector's own parser clamps to tier 1, so a
+	// node that has never reached its policy sends nothing. A tier change forces
+	// a re-spawn through the filter signature (filterSigWithPrivacyTier) — a
+	// running child keeps the env it was born with.
+	privacyTierEnv := "AIKEY_COMPLIANCE_PRIVACY_TIER=" +
+		strconv.FormatInt(s.masterPrivacyTier.Load(), 10)
+
+	// Same fence as the privacy tier: READ THE ATOMIC, no local override — the
+	// org's force must not be defeatable by a member machine's environment. ""
+	// (no force) leaves the detector on its own level (override file, else the
+	// factory simple default). spec: R-credential-password-tier-4
+	passwordTierEnv := "AIKEY_COMPLIANCE_PASSWORD_TIER="
+	if s.masterPasswordTierAdvanced.Load() {
+		passwordTierEnv += "advanced"
+	}
+
+	extraEnv := []string{recordAllowEnv, maxActionEnv, localIntakeEnv, privacyTierEnv, passwordTierEnv, deepScanChildSocketEnv}
+	// Resolve the pack-pull backend + tenant for the detector. Personal/Trial read
+	// the team URL from the CLI's config.json (no tenant scoping — one user, one
+	// view). A CLUSTER node has no CLI config.json; its control URL + org come from
+	// the shared cluster-node.env (the same AIKEY_HUB_* the daemon uses — proxy and
+	// daemon both EnvironmentFile= it). Single-tenant per node (gap2 decision), so
+	// AIKEY_TENANT_ID is a single value scoping the pull to THIS org's packs.
+	// Reusing the existing detector pack-puller (GET /v1/packs/changed, which already
+	// ships phrases + does atomic ruleset swap) means org-custom phrases reach the
+	// node with no new endpoint/protocol — only these two env vars.
+	masterURL := readControlPanelURL()
+	tenantID := ""
+	if s.cfg != nil && s.cfg.Cluster.Enabled {
+		if u := os.Getenv("AIKEY_HUB_CONTROL_URL"); u != "" {
+			masterURL = strings.TrimRight(u, "/")
+		}
+		tenantID = os.Getenv("AIKEY_HUB_ORG_ID")
+	}
+	if masterURL != "" {
+		// Bound to a backend → pull packs from it, and poll every 60s so a newly
+		// published pack appears within ~1 minute (the detector's default is 1h,
+		// too slow for "add pack → see it"). Incremental cursor-based pulls are
+		// cheap. Offline (no backend) → neither var is set, puller stays off.
+		extraEnv = append(extraEnv,
+			"AIKEY_PACK_MASTER_URL="+masterURL,
+			"AIKEY_PACK_POLL_INTERVAL=60s",
+		)
+		if tenantID != "" {
+			extraEnv = append(extraEnv, "AIKEY_TENANT_ID="+tenantID)
+		}
+	}
+
+	return extraEnv
 }

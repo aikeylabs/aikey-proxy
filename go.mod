@@ -48,6 +48,14 @@ replace github.com/AiKeyLabs/pkg/providerroutes => ../pkg/providerroutes
 
 replace github.com/AiKeyLabs/pkg/seatassign => ../pkg/seatassign
 
+replace github.com/AiKeyLabs/pkg/deepscan => ../pkg/deepscan
+
+replace github.com/AiKeyLabs/pkg/scannode => ../pkg/scannode
+
+replace github.com/AiKeyLabs/pkg/scantoken => ../pkg/scantoken
+
+replace github.com/AiKeyLabs/pkg/scanchunk => ../pkg/scanchunk
+
 replace github.com/AiKeyLabs/pkg/usagehash => ../pkg/usagehash
 
 replace github.com/AiKeyLabs/aikey-auth-broker => ../aikey-auth-broker
@@ -61,9 +69,13 @@ replace github.com/AiKeyLabs/aikey-config-tool => ../aikey-config-tool
 replace github.com/aikeylabs/ai-degrade-detector/proxy-plugin/rhythm => ../ai-degrade-detector/proxy-plugin/rhythm
 
 require (
+	github.com/AiKeyLabs/pkg/deepscan v0.0.0
 	github.com/AiKeyLabs/pkg/egress v0.0.0
 	github.com/AiKeyLabs/pkg/pipewire v0.0.0
 	github.com/AiKeyLabs/pkg/routingwire v0.0.0
+	github.com/AiKeyLabs/pkg/scanchunk v0.0.0
+	github.com/AiKeyLabs/pkg/scannode v0.0.0
+	github.com/AiKeyLabs/pkg/scantoken v0.0.0
 	github.com/andybalholm/brotli v1.2.0 // indirect
 	github.com/dustin/go-humanize v1.0.1 // indirect
 	github.com/google/go-querystring v1.1.0 // indirect
