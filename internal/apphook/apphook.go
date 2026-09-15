@@ -128,16 +128,30 @@ func NormalizeAction(a Action) Action {
 // R-compliance-canned-answer-6.S1 prescribes for a proxy that has not declared
 // the capability — so the intermediate state is correct, just not the feature.
 //
-// TASK 3.6 FLIPS THIS TO TRUE in the same change that adds writeCannedAnswer and
-// the ActionAnswer dispatch branch. Two fences hold it honest:
-// internal/apphook TestSupportsCannedAnswer_FalseUntilWriterLands (invert it
-// there, do not delete it) and task 3.7's
-// TestCannedAnswer_UnconfiguredPathsByteIdentical, which asserts it is true.
+// ✅ FLIPPED TO TRUE BY TASK 3.6 (2026-09-13), together with
+// internal/proxy/canned_answer.go (writeCannedAnswer — three protocol families ×
+// streaming/non-streaming) and the `case ActionAnswer` dispatch branch. The
+// sentence above now reads in the past tense: this build CAN synthesize.
+//
+// 🔴 WHAT THIS DOES AND DOES NOT CLAIM. It claims one thing: given an Answer
+// verdict AND a text, this binary can produce a protocol-legal reply without
+// contacting a provider. It does NOT claim the end-to-end feature works — the
+// detector cannot yet READ this bit (TODO-68: the handshake is child → proxy
+// only, and the ruling is to carry the declaration on the existing spawn env),
+// and no carrier hands the resolved text BACK (see Response.AnswerText). Both
+// are cross-boundary contracts owned outside task 3.6's file list. Until they
+// land, a real Answer verdict still ends as a loud block — which is the same
+// safe outcome as before, reached one step later.
+//
+// The fence that used to pin this false is inverted, not deleted:
+// TestSupportsCannedAnswer_TrueOnceWriterLanded (task 3.5 handed the inversion
+// over explicitly; the controller signed off on 2026-09-13). Task 3.7's
+// TestCannedAnswer_UnconfiguredPathsByteIdentical also asserts it is true.
 //
 // A function rather than a const so the dispatch guard reads as a capability
-// question at the call site, and so 3.6 can make it derive from configuration
-// if the canned answer ever becomes opt-in per deployment.
-func SupportsCannedAnswer() bool { return false }
+// question at the call site, and so it can derive from configuration if the
+// canned answer ever becomes opt-in per deployment.
+func SupportsCannedAnswer() bool { return true }
 
 // Direction is the side of the LLM call (request inbound vs response outbound).
 // Apps may choose to inspect one or both.
@@ -193,6 +207,39 @@ type Response struct {
 	LatencyObserved time.Duration // measured by proxy, set by Hook.Detect not by child
 	Action          Action
 	Degraded        bool // true if child unreachable / timed out — proxy already fell back to Allow
+
+	// AnswerText is the administrator-authored canned answer (代答) the proxy
+	// serves INSTEAD of forwarding, populated iff Action == ActionAnswer. It is
+	// emitted VERBATIM — see internal/proxy/canned_answer.go, red line 1
+	// (R-compliance-canned-answer-3).
+	//
+	// ✅ CARRIER LANDED (task 3.12, 2026-09-14). The three-tier fallback that
+	// produces this text lives in the DETECTOR (actionpolicy.ResolveAnswerText,
+	// task 2.11) and it reaches here through the `findings` SLOT of the v4 pipe,
+	// which is free on an Answer verdict because there is no masked payload —
+	// the slot's per-op meanings are tabulated on childResponse in childhook.go.
+	// Zero new wire fields, zero version bump. 围栏:
+	// TestCannedAnswerTextReachesProxy (apphook) ·
+	// TestCannedAnswerTextNeverLeavesInUploadedEvent (proxy).
+	//
+	// 🔴 STILL UNREACHABLE IN PRODUCTION, and NOT because of this side. The
+	// detector degrades every `answer` to `block` inside answerOrBlock until it
+	// can learn whether this proxy declares SupportsCannedAnswer(), and that
+	// capability bit has no carrier yet (TODO-68, ruled: reuse the existing
+	// spawn env). Both halves of the text carrier are complete and fenced; the
+	// remaining hop is the capability bit, not the text.
+	//
+	// The rule-level tier of the fallback is separately empty in production
+	// (TODO-76: types.Finding.AnswerText has no producer), so the tiers that can
+	// actually appear here today are `level` and `org`.
+	AnswerText string
+	// AnswerSource names WHICH tier supplied AnswerText — `rule` / `level` /
+	// `org`, spelled identically to actionpolicy.AnswerSource and to the
+	// `events[].answer_source` wire field (design §4b). `none` never appears
+	// here: it means no tier had a text, and that request's action_taken is
+	// `block`, not an answer. Carried in the same pipe slot as AnswerText (task
+	// 3.12); the same reachability caveat applies.
+	AnswerSource string
 }
 
 // RestorableMask is one restorable placeholder token in a Mask verdict.

@@ -191,6 +191,18 @@ const (
 	// forbids a self-check that stays at WARN forever. Escalation shape copied
 	// from the canary's unavailable streak (internal/events/canary.go).
 	EventComplianceGradingStale = "proxy.compliance.grading_stale_sustained"
+	// EventComplianceEscalationRuleRefused: one `escalation[]` entry of the org
+	// grading document will NOT be enforced by this proxy — a threshold that
+	// cannot mean anything (min_count < 1) or an action it cannot enact at
+	// request level (see proxy.escalationEnactableAction). WARN, and one line per
+	// refused rule: the administrator configured a control and the console will
+	// keep showing it, so a silent drop leaves them believing it works.
+	EventComplianceEscalationRuleRefused = "proxy.compliance.escalation_rule_refused"
+	// EventComplianceEscalationRulesActive: how many cumulative rules this
+	// generation enforces. Emitted only when there is at least one, so an
+	// ordinary deployment stays quiet; it is the line that says "this node is
+	// running a request-level control" at the moment the generation is built.
+	EventComplianceEscalationRulesActive = "proxy.compliance.escalation_rules_active"
 )
 
 // Health events.
@@ -387,8 +399,30 @@ const (
 	// Suspended = WARN (a real, unattributable latency regression is now in
 	// effect). Resumed = INFO (recovery is not a fault, but the operator needs
 	// the bracket to know the window closed).
-	EventProxyFilterVerdictCacheSuspended = "proxy.filter.verdict_cache_suspended"
-	EventProxyFilterVerdictCacheResumed   = "proxy.filter.verdict_cache_resumed"
+	// EventProxyFilterEscalationUnresolved: the request-level escalation counter
+	// found hits that passed every rule filter (confirmed, at or above the level
+	// floor, in a counted family) but could NOT be sliced out of the piece text
+	// they were reported in. The detector's offsets and the proxy's copy of the
+	// text disagree — a cross-process desync. Those hits are not counted, which
+	// can only make escalation less likely (the fail-open direction), so the
+	// request is never failed over it; this WARN is what keeps that fail-open
+	// from being silent. Carries counts only (R-compliance-grading-16).
+	EventProxyFilterEscalationUnresolved = "proxy.filter.escalation_unresolved_hits"
+	// EventProxyFilterEscalated: a request was escalated by the org's cumulative
+	// rule — refused because of an ACCUMULATION across content pieces rather than
+	// because of any single piece. INFO, because it is a policy working as
+	// configured; it carries the rule text and the counts (all administrator
+	// config, never anything matched), which is the only way an operator can tell
+	// this refusal apart from an ordinary per-piece block in a log.
+	EventProxyFilterEscalated = "proxy.filter.escalated"
+	// EventProxyFilterEscalationEventDropped: the escalation was ENFORCED but its
+	// request-verdict audit row could not be produced (no trace id to derive the
+	// event id from, or the event failed to build). The user was refused and the
+	// administrator has no record of why — an audit gap, so it is WARN rather
+	// than a debug line (R-compliance-grading-18).
+	EventProxyFilterEscalationEventDropped = "proxy.filter.escalation_event_dropped"
+	EventProxyFilterVerdictCacheSuspended  = "proxy.filter.verdict_cache_suspended"
+	EventProxyFilterVerdictCacheResumed    = "proxy.filter.verdict_cache_resumed"
 	// Oauth-group routing (N8). EventProxyGroupRouteResolved: a group VK request
 	// picked + injected a candidate account. EventProxyGroupRouteDegraded: no
 	// usable candidate (no material / all expired-exhausted / key unavailable) →

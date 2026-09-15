@@ -363,6 +363,47 @@ func (s *Supervisor) installFilterHook(p *proxy.Proxy, vaultReader *vault.Reader
 	p.SetFilterCacheEnabled(cacheOn, cacheWindow)
 	// 扫描角色策略(方案 §3.4):默认 user+assistant。assistant 必须在内 —— 响应侧
 	// 占位符还原把原文交回客户端,下一轮它以 assistant 身份重发(见 filter_content.go)。
+	// MAX_ACTION → the PROXY's request-level escalation ceiling (task 3.13). The
+	// SAME variable that became AIKEY_COMPLIANCE_FILTER_MAX_ACTION in the detector
+	// env above — never a second read of the vault or the environment. The detector
+	// caps each piece; only the proxy can cap the cumulative verdict; two sources
+	// would let an operator's MAX_ACTION=warn stop per-piece refusals while the
+	// cumulative rule still refused the whole request. Handed over next to the
+	// grading document for the same reason that one is.
+	// Fence: TestEscalation_MaxActionReachesProxyFromSupervisor.
+	// rule: R-compliance-grading-15
+	if err := p.SetComplianceMaxAction(maxAction); err != nil {
+		slog.Warn("supervisor: filter max action refused by the proxy; request-level escalation keeps full enforcement",
+			"event.name", observability.EventProxyFilterMaxActionReadFailed, "slug", slug, "error", err)
+	}
+	// Org grading document → the PROXY's own reader (task 3.11). The same bytes
+	// that went into the detector's AIKEY_COMPLIANCE_GRADING above, because the
+	// two readers must never be looking at different policies — the detector
+	// takes the ladder (per-piece action), the proxy takes `escalation[]` (the
+	// cumulative rule, which is request-level and therefore cannot be evaluated
+	// by a child that only ever sees one content piece: DEC-compliance-grading-11
+	// 决定 1). Handed over HERE, one line below the env that carries the same
+	// document, so the two cannot drift apart unnoticed.
+	// rule: R-compliance-grading-15
+	escRules, refusedRules, gradingErr := p.SetComplianceGrading(s.gradingPolicyJSON())
+	if gradingErr != nil {
+		// The document is not JSON at all. The last valid policy stays installed
+		// (applyComplianceMasterPolicy never replaces a good document with an
+		// unreadable one, R-compliance-grading-14), so this is loud but not fatal.
+		slog.Warn("supervisor: org compliance grading document unreadable; escalation rules unchanged",
+			"event.name", observability.EventComplianceGradingInvalid, "error", gradingErr)
+	}
+	for _, refused := range refusedRules {
+		// 失败要显眼: an administrator configured a cumulative rule this proxy will
+		// NOT carry out. Silently dropping it leaves them looking at a control on
+		// the console that does nothing.
+		slog.Warn("supervisor: escalation rule refused; it will NOT be enforced",
+			"event.name", observability.EventComplianceEscalationRuleRefused, "rule", refused)
+	}
+	if escRules > 0 {
+		slog.Info("supervisor: request-level compliance escalation active",
+			"event.name", observability.EventComplianceEscalationRulesActive, "rules", escRules)
+	}
 	scanRoles, rejectedRoles := p.SetFilterScanRoles(filterScanRoles())
 	if len(rejectedRoles) > 0 {
 		// 失败要显眼:不认识的角色名被丢弃,必须让运维看见,而不是静默按默认跑。

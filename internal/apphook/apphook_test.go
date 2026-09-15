@@ -80,23 +80,39 @@ func TestActionAnswer_EnumAndString(t *testing.T) {
 	}
 }
 
-// TestSupportsCannedAnswer_FalseUntilWriterLands pins the honesty of the
-// capability declaration: this build KNOWS the answer action (it is in the enum,
-// above) but cannot yet SYNTHESIZE the response — writeCannedAnswer is task 3.6.
+// TestSupportsCannedAnswer_TrueOnceWriterLanded pins the honesty of the
+// capability declaration: this build both KNOWS the answer action (it is in the
+// enum, above) and can SYNTHESIZE the response.
 //
 // The declaration is what the detector reads to decide whether to hand down
 // `answer` at all ("探测器仅在为真时下发代答；为假时下发 ActionBlock",
 // design.md §4b). Declaring a capability we cannot serve is the exact failure
-// R-compliance-canned-answer-6 exists to prevent, from the other side.
+// R-compliance-canned-answer-6 exists to prevent, from the other side — and so
+// is the mirror image, refusing to declare one we CAN serve, which leaves an
+// administrator's configured canned answer coming out as a hard block forever.
 //
-// 🔴 TASK 3.6 FLIPS THIS to true in the same change that adds writeCannedAnswer
-// and the ActionAnswer dispatch branch. Task 3.7's
-// TestCannedAnswer_UnconfiguredPathsByteIdentical asserts it is true by then, so
-// forgetting the flip is a red test, not a silent lie.
-func TestSupportsCannedAnswer_FalseUntilWriterLands(t *testing.T) {
-	if SupportsCannedAnswer() {
-		t.Fatal("SupportsCannedAnswer() = true, but this build has no writeCannedAnswer " +
-			"(task 3.6). If 3.6 has landed, flip this assertion in the SAME change — " +
-			"do not delete it, invert it.")
+// 🔴 THIS TEST IS AN INVERSION, NOT A NEW TEST. Until 2026-09-13 it stood here
+// as TestSupportsCannedAnswer_FalseUntilWriterLands and asserted the opposite.
+// Task 3.5 added the enum rung and left the writer for 3.6, so `false` was the
+// truthful value then; task 3.6 landed internal/proxy/canned_answer.go
+// (writeCannedAnswer — three protocol families × streaming/non-streaming) and
+// the `case ActionAnswer` dispatch branch, so `true` is the truthful value now.
+// 3.5 handed the inversion over explicitly and the controller signed it off in
+// the 3.6 dispatch. The test is kept rather than deleted because what it really
+// guards is "the declaration matches the build", in whichever direction that
+// currently points.
+//
+// ⚠️ WHAT IT DOES NOT ASSERT: that the end-to-end feature works. The detector
+// still has no way to READ this bit (TODO-68) and nothing carries the resolved
+// text back to the proxy (Response.AnswerText's NO PRODUCER YET note). Both are
+// cross-boundary contracts outside 3.6's scope. A green here means this binary
+// can serve a canned answer, not that one has ever been served.
+func TestSupportsCannedAnswer_TrueOnceWriterLanded(t *testing.T) {
+	if !SupportsCannedAnswer() {
+		t.Fatal("SupportsCannedAnswer() = false, but this build DOES have writeCannedAnswer " +
+			"(internal/proxy/canned_answer.go, task 3.6). A build that can serve a canned " +
+			"answer and says it cannot leaves every configured 代答 coming out as a hard " +
+			"block. If the writer was removed, invert this assertion in the SAME change — " +
+			"do not delete it.")
 	}
 }

@@ -122,6 +122,52 @@ func capRuneBoundary(s string, limit int) int {
 // conversation record to join to either, so an empty key is the honest answer
 // rather than a freshly minted id that would join to nothing.
 // (2026-08-09 F1a cross-audit key, decision A.)
+// cacheableVerdict is THE single answer to "may this verdict be replayed from
+// the cache instead of re-asking the detector?" — used by BOTH the read guard
+// and the write guard, so the two cannot drift apart.
+//
+// WHY IT IS A FUNCTION AND NOT TWO INLINE CONDITIONS. Until 2026-09-13 it was
+// two hand-synchronised `!= apphook.ActionBlock` comparisons with a comment on
+// each pointing at the other. That survives one excluded value; the canned
+// answer makes it two, and a concept with no name in the code gets re-derived by
+// hand every time — which is how one side ends up excluding a verdict the other
+// side still replays. (principle: documented-contract-needs-enforcement,
+// 「概念在代码里没有名字就会被反复手工重推 ⇒ 先给唯一出口」.)
+//
+// EXCLUDED, and both for the same two reasons:
+//
+//   - ActionBlock (用户拍板 2026-08-08, 安全边界修复). ① A refusal must be
+//     re-decided against the LATEST policy/pack every time, or an administrator
+//     who relaxes a rule keeps serving stale 403s. ② It does not forward
+//     upstream, so the detector call the cache would save is worth nothing —
+//     the ROI is negative on its own.
+//     bugfix: workflow/CI/bugfix/2026-08-08-compliance-cache-block-verdict-cached.md
+//
+//   - ActionAnswer (task 3.6, 2026-09-13). Both reasons carry over verbatim, and
+//     design.md states the premise that makes it non-negotiable: 「代答与阻断
+//     同强度」 — the canned answer is the friendly PRESENTATION of a block, not a
+//     weaker outcome. clamp() already treats it as block-strength under the
+//     action ceiling (TestActionCeiling_ClampsAnswerLikeBlock); the cache is the
+//     other place that has to agree, or 「同强度」 is false in exactly one spot.
+//     ③ A third reason is specific to 代答: the SENTENCE is administrator
+//     content that can be edited in the console. A cached answer would keep
+//     speaking the old sentence after the administrator replaced it — a
+//     compliance statement going out in the operator's name that the operator
+//     has already retracted.
+//     🔴 And one concrete bug it prevents today: maskVerdict carries no
+//     answer text (it holds maskedHead / reason / restorables / event). A
+//     replayed Answer verdict would arrive with an empty text and degrade to a
+//     403 — so an identical prompt would get a friendly 200 the first time and a
+//     hard block the second, within the TTL, with nothing changed. Caching the
+//     text instead was the alternative and is rejected by reasons ①–③ above.
+//     围栏: TestCannedAnswer_VerdictIsNeverCached
+//
+// mask / warn / allow are unchanged: they forward upstream, so replaying their
+// verdict saves a real detector call.
+func cacheableVerdict(a apphook.Action) bool {
+	return a != apphook.ActionBlock && a != apphook.ActionAnswer
+}
+
 func (p *Proxy) applyInboundFilter(
 	w http.ResponseWriter,
 	r *http.Request,
@@ -352,6 +398,42 @@ func (p *Proxy) applyInboundFilter(
 		// stashed on the request context for the response leg. Memory-only,
 		// request-scoped, never logged/persisted (B3 拍板 2026-08-06).
 		restoreState *maskRestore
+		// ── Request-level escalation, step 4 of DEC-compliance-grading-11 ────
+		//
+		// escFindings[i] / escUnitIDs[i] belong to pieces[i]. They are allocated
+		// to len(pieces) and written BY INDEX rather than appended, because
+		// several branches below `continue` out of the loop and an append-based
+		// collection would silently shift every later piece's findings onto the
+		// wrong text — the offsets are PER-PIECE, so a shifted row does not error,
+		// it slices a different substring (see Finding.StartOffset).
+		//
+		// Memory-only and thrown away at the end of the request: the counter's
+		// whole design is that dedup happens in the proxy's memory and nothing
+		// content-derived is added to any wire or row (R-compliance-grading-16).
+		escFindings = make([][]Finding, len(pieces))
+		escUnitIDs  = make([]string, len(pieces))
+		// ── Deferred refusal (DEC-compliance-grading-11 决定 5) ───────────────
+		//
+		// `block` / `answer` used to write their response and `return false` the
+		// moment a piece produced one. They now RECORD the refusal and let the
+		// loop finish, because the cumulative rule cannot count hits in pieces
+		// that were never scanned. The response bytes are written after the loop
+		// and are byte-identical: FIRST refusal wins, so what the client receives
+		// is the same verdict, the same status and the same body the early return
+		// would have produced (R-compliance-grading-15.S2,
+		// TestEscalation_EmptyRulesKeepsOutcome).
+		//
+		// 🔴 refusalMsg is assigned ONLY from resp.Reason or from a string
+		// literal, and that is load bearing: the red-line fence
+		// TestFence_GuardrailShortCircuitBodyIsNeverInterpolated proves the body
+		// handed to the client is verbatim by following a local's assignments, and
+		// resp.Reason is the expression its exemption table names. Assigning it
+		// through any other expression re-opens an approved red-line exemption
+		// under a new name.
+		refusalAction   = apphook.ActionAllow // ActionAllow = nothing refused yet
+		refusalMsg      string
+		refusalAnswer   *cannedAnswerPlan
+		refusalDegraded bool
 	)
 	// Record every filterable request, including block/degraded early returns.
 	// A request with at least one cache hit is the steady-state incremental lane;
@@ -448,7 +530,7 @@ func (p *Proxy) applyInboundFilter(
 			// R-compliance-canned-answer-6):写侧已不再写入无法识别的判定(见下方
 			// Detect 后的归一),此处兜底进程内 pre-fix 污染 —— 回放一个本 build 读不懂
 			// 的判定没有任何意义,当 miss 落到真扫按最新策略重判。
-			if v, ok := cache.Get(auditScopeKey, ckey); ok && v.action.Recognized() && v.action != apphook.ActionBlock {
+			if v, ok := cache.Get(auditScopeKey, ckey); ok && v.action.Recognized() && cacheableVerdict(v.action) {
 				// Restorables replay from cache (offsets only): the hash-matched head
 				// is byte-identical, so the same spans slice the same originals.
 				// Event replays too (2026-08-08 审计缺口修复): a flagged piece resent
@@ -530,8 +612,10 @@ func (p *Proxy) applyInboundFilter(
 			// mask/warn/allow 缓存行为保持不变(它们转发上游,复用判定收益实在)。
 			// 隐患溯源:CN_ADDRESS 本身无 block 档,但其他 entity 的 HighRiskBlock
 			// (policy.go HighRiskBlock)已在用这条链 → 当前生产就有此隐患。
-			// 配套读侧守卫见上方 Get 分支(v.action != ActionBlock)。
-			if cache != nil && resp != nil && !resp.Degraded && resp.Action != apphook.ActionBlock {
+			// 配套读侧守卫见上方 Get 分支 —— 两侧现在都过同一个 cacheableVerdict(),
+			// 见该函数的注释:第三个取值(代答)加进来时,「写侧排除 / 读侧守卫」这对
+			// 手工同步的条件就该收成一个出口了。
+			if cache != nil && resp != nil && !resp.Degraded && cacheableVerdict(resp.Action) {
 				// maskedHead is cached in the detector's NUMBERLESS token form —
 				// per-request numbering happens AFTER cache replay so numbers stay
 				// request-scoped (同请求内按出现顺序编号) instead of leaking a stale
@@ -554,6 +638,14 @@ func (p *Proxy) applyInboundFilter(
 			nilResp++
 			continue
 		}
+
+		// Feed the request-level counter. Decoded from the event the detector
+		// built for THIS piece — including on a cache hit, whose replayed event
+		// is the same document (R-compliance-grading-18.S3 requires exactly that:
+		// a history piece served from cache still participates in this turn's
+		// count). Nil on a personal route, where the child uploads its own event
+		// and hands the proxy none — see decodeEventFindings.
+		escFindings[i] = decodeEventFindings(resp.Event)
 
 		// ── ACTION CEILING (方案② 2026-08-10) ────────────────────────────────
 		// The piece's ceiling comes from the SAME table row that made its block
@@ -645,7 +737,15 @@ func (p *Proxy) applyInboundFilter(
 			// 新审计行,而两条入库路径的 ON CONFLICT (event_id) 只能吸收重放、吸收不了重扫。
 			// spec: R-compliance-filter-scope-2(审计单元 = 一个会话内的一段违规内容)
 			// bugfix: workflow/CI/bugfix/2026-09-08-compliance-audit-unit-id-parasitic-on-cache.md
-			ev = injectEventID(ev, auditUnitID(auditScopeKey, contentID))
+			unitID := auditUnitID(auditScopeKey, contentID)
+			// Remember it for the request verdict: R-compliance-grading-18 says
+			// the verdict row SHALL list the content rows that were counted, and
+			// SHALL relate to them through that list rather than through
+			// trace_id — a history piece served from cache keeps the trace it was
+			// first stored with, so a trace join would silently miss exactly the
+			// rows the cumulative rule needed.
+			escUnitIDs[i] = unitID
+			ev = injectEventID(ev, unitID)
 			if capped {
 				ev = injectActionTaken(ev, pieces[i].ceiling.String())
 			}
@@ -653,19 +753,44 @@ func (p *Proxy) applyInboundFilter(
 			teamEventIdx = len(teamEvents) - 1
 		}
 
-		// 代答 (canned answer) is KNOWN to this build but not yet SERVABLE: the
-		// six-shape response synthesizer (writeCannedAnswer) is task 3.6. Degrade to
-		// Block — precisely the behaviour R-compliance-canned-answer-6.S1 prescribes
-		// for a proxy that has not declared the capability (403 COMPLIANCE_BLOCKED,
-		// nothing forwarded), never a pass-through.
+		// 代答 (canned answer): decide ONCE, here, whether this verdict can
+		// actually be served — and degrade to Block if it cannot.
 		//
-		// Self-removing seam: when 3.6 flips apphook.SupportsCannedAnswer() to true,
-		// this guard stops firing and 3.6's own `case apphook.ActionAnswer:` (added
-		// beside ActionBlock, same short-circuit, same `return false`) takes over.
-		if action == apphook.ActionAnswer && !apphook.SupportsCannedAnswer() {
-			logger.Warn("filter: canned-answer verdict on a build that cannot synthesize one; refusing as a plain block",
-				"event.name", "proxy.filter.canned_answer_unsupported")
-			action = apphook.ActionBlock
+		// 🔴 WHY THE DECISION IS HERE AND NOT IN THE SWITCH BRANCH. By the time
+		// the branch runs, the response writer is the only thing left; a
+		// discovery at that point ("no text after all") has nowhere to go but a
+		// half-written body. Resolving first means the `case ActionAnswer` below
+		// is reached ONLY when a complete answer is guaranteed, and every other
+		// outcome takes the ordinary, well-tested block path with no second
+		// refusal implementation to keep in sync.
+		//
+		// 🔴 AND WHY THE GUARD MUST LIVE IN THIS REPOSITORY AT ALL. master
+		// stopped rejecting an out-of-domain answer_source on 2026-09-12 (task
+		// 1.20: 200 + NULL column + WARN, no longer 400), so nothing downstream
+		// reports it if the proxy answers with nothing. R-compliance-canned-
+		// answer-2.S2 「三级皆空 → 退回阻断而非放行」 is held here or nowhere.
+		// Fence: TestCannedAnswer_EmptyTextFallsBackToBlock.
+		var cannedAnswer *cannedAnswerPlan
+		if action == apphook.ActionAnswer {
+			cannedAnswer = planCannedAnswer(resp, r, bodyBytes, logger)
+			if cannedAnswer == nil {
+				action = apphook.ActionBlock
+			}
+		}
+		if teamEventIdx >= 0 && action == apphook.ActionAnswer && cannedAnswer.source != "" {
+			// answer_source travels with the audit event so an administrator can
+			// tell whether the sentence the user saw came from the rule they just
+			// edited or from the org-wide default they forgot about (design §4b,
+			// R-compliance-canned-answer-7). `none` never reaches here — that case
+			// degraded to Block above and is recorded as one, below.
+			teamEvents[teamEventIdx] = injectAnswerSource(teamEvents[teamEventIdx], cannedAnswer.source)
+		}
+		if teamEventIdx >= 0 && resp.Action == apphook.ActionAnswer && action == apphook.ActionBlock {
+			// The detector said "answer"; the proxy blocked. Correct the record to
+			// what ACTUALLY happened, exactly as the ceiling-capped case does a few
+			// lines up — leaving the detector's word in would tell the compliance
+			// dashboard the user got a friendly refusal when they got a 403.
+			teamEvents[teamEventIdx] = injectActionTaken(teamEvents[teamEventIdx], apphook.ActionBlock.String())
 		}
 
 		switch action {
@@ -702,18 +827,61 @@ func (p *Proxy) applyInboundFilter(
 			//   TestFence_GuardrailShortCircuitBodyIsNeverInterpolated derives THIS
 			//   call site from the source and rejects any non-verbatim argument, so
 			//   the canned answer inherits the check without anyone updating a list.
-			p.errors.Add(1)
-			logger.Info("filter: request blocked",
-				"event.name", "proxy.filter.blocked",
-				"reason", resp.Reason, "degraded", resp.Degraded)
-			r.Body = io.NopCloser(bytes.NewReader(bodyBytes))
-			msg := resp.Reason
-			if msg == "" {
-				msg = "request blocked by compliance policy"
+			//
+			// 🔴 2026-09-14 (task 3.11, DEC-compliance-grading-11 决定 5): the
+			// SHORT-CIRCUIT IS UNCHANGED — nothing is forwarded, the request never
+			// becomes an upstream request — but the RESPONSE WRITE moved to just
+			// after this loop, so the cumulative rule can see the pieces that come
+			// after this one. First refusal wins, so the bytes the client receives
+			// are the same ones this branch used to write.
+			if refusalAction == apphook.ActionAllow {
+				refusalAction = apphook.ActionBlock
+				// Assigned from resp.Reason ONLY — see the refusalMsg declaration
+				// for why the fence depends on that. The empty-reason fallback
+				// stays at the WRITE site, so the "filter: request blocked" log
+				// keeps reporting the detector's raw reason (empty when it gave
+				// none) exactly as it did before the write moved.
+				refusalMsg = resp.Reason
+				refusalDegraded = resp.Degraded
 			}
-			writeJSONError(w, http.StatusForbidden, "invalid_request_error",
-				"COMPLIANCE_BLOCKED", msg)
-			return false
+
+		case apphook.ActionAnswer:
+			// 代答 — the SAME short-circuit as ActionBlock and the same
+			// `return false`; only the bytes differ. Deliberately a sibling case
+			// rather than a variant inside the block branch, because Go cannot
+			// fall through backwards and because the two write different status
+			// codes: this is the one place in the guardrail that answers 200.
+			//
+			// spec (PROPOSAL layer, 需求包 roadmap20260320/技术实现/阶段9-商业化版本/
+			// 博时基金合规能力融合/openspec/changes/add-compliance-grading-fusion/
+			// specs/compliance-canned-answer/spec.md):
+			//   R-compliance-canned-answer-1  代答短路请求，原文不出上游 —— nothing
+			//     was forwarded before this point and nothing is after it; the
+			//     request never becomes an upstream request at all.
+			//   R-compliance-canned-answer-3  代答文案原样输出，不得插值命中片段 ——
+			//     cannedAnswer.text goes to writeCannedAnswer untouched. No
+			//     Sprintf, no template, no concatenation with anything the
+			//     detector found. See canned_answer.go's red line 1 for what
+			//     interpolation here would actually mean.
+			//
+			// 🔴 NOT counted in p.errors, unlike the block above, and that is a
+			// judgement worth writing down: a canned answer is a SUCCESSFUL
+			// refusal — HTTP 200, the client's SDK parses it, the user reads a
+			// sentence. Counting it as a proxy error would make an organisation
+			// that configured 代答 look unhealthy in proportion to how well the
+			// feature is working. The compliance event (already appended above)
+			// is where a refusal is counted.
+			//
+			// 🔴 2026-09-14 (task 3.11): like the block above, the WRITE moved to
+			// just after the loop; the short-circuit itself is untouched. THE PLAN
+			// IS CARRIED OVER WHOLE — the sentence the client reads is the one
+			// THIS piece resolved, not a later piece's, because first refusal
+			// wins.
+			if refusalAction == apphook.ActionAllow {
+				refusalAction = apphook.ActionAnswer
+				refusalAnswer = cannedAnswer
+				refusalDegraded = resp.Degraded
+			}
 
 		case apphook.ActionMask:
 			if pieces[i].setText == nil {
@@ -792,15 +960,193 @@ func (p *Proxy) applyInboundFilter(
 			// Duplicates the refusal rather than reusing the ActionBlock branch:
 			// the two are reached for different reasons and neither may `fallthrough`
 			// into an earlier case in Go.
+			//
+			// The ERROR stays HERE, at the point of detection, because it names
+			// THIS piece's unreadable action; only the response write moved after
+			// the loop with the other two refusals (task 3.11). The message it
+			// refuses with is the constant, exactly as before.
 			logger.Error("filter: verdict reached the dispatch switch un-normalized; refusing (fail-CLOSED)",
 				"event.name", "proxy.filter.unknown_action",
 				"action", int(action), "raw_action", int(resp.Action))
-			p.errors.Add(1)
-			r.Body = io.NopCloser(bytes.NewReader(bodyBytes))
-			writeJSONError(w, http.StatusForbidden, "invalid_request_error",
-				"COMPLIANCE_BLOCKED", "request blocked by compliance policy")
+			if refusalAction == apphook.ActionAllow {
+				refusalAction = apphook.ActionBlock
+				refusalMsg = "request blocked by compliance policy"
+			}
+		}
+	}
+
+	// ─────────────────────────────────────────────────────────────────────────
+	// REQUEST-LEVEL VERDICT — step 4 of DEC-compliance-grading-11.
+	//
+	// The detector decides per CONTENT PIECE and is stateless per frame, so a
+	// request whose three messages carry one customer record each looks like
+	// three separate single-hit prompts to it. The cumulative rule («≥L4 命中
+	// ≥3 条 → 拦截») is a statement about the REQUEST, and this — after the loop,
+	// holding every piece's findings — is the only place in the system where the
+	// request as a whole exists (DEC-compliance-grading-11 决定 1).
+	//
+	// 🔴 IT RUNS ON EVERY FILTERABLE REQUEST, including ones with no rules
+	// configured and ones already refused above. Making it conditional on
+	// len(rules) > 0 would be free and is exactly what R-compliance-grading-15.S2
+	// rules out — 「不接受『没配就走不到』作为等价性论据」: an unconfigured org must
+	// exercise the same path, so the counters below can prove it ran and
+	// concluded nothing.
+	//
+	// spec: R-compliance-grading-15 — proposal-layer, hence `rule:` and not a
+	// `spec:` anchor (see the canned-answer branches above for the convention).
+	// rule: R-compliance-grading-15
+	esc := evaluateEscalation(pieces, escFindings, p.escalationRules, p.requestEscalationCeiling())
+	p.escalationMetrics.evaluated.Add(1)
+	p.escalationMetrics.lastCounted.Store(int64(esc.Counted))
+	if esc.Skipped > 0 {
+		// 🔴 THE WARN TASK 3.9 HANDED OVER. countDistinctHits is a pure function
+		// with no request context, so it returns the number instead of logging it
+		// and the logging obligation moves HERE, where request_id / trace_id /
+		// span_id are on the logger (handle_dispatch stamps them via slog.With —
+		// which is why this must be `logger` and never the package default).
+		//
+		// WHAT IT MEANS: these hits passed the confirmed + level + family filters
+		// and STILL could not be resolved to a value, i.e. the detector's offsets
+		// and the proxy's text disagree — a cross-process desync. It is not a
+		// by-design exclusion: those never reach this number, precisely so this
+		// WARN does not fire on every agent turn and stop being read.
+		//
+		// The request is NOT failed over it (§6 #11): an unresolvable hit is
+		// simply not counted, which can only make escalation LESS likely — the
+		// fail-open direction the sync detection budget prescribes. This line is
+		// what keeps that fail-open from being silent.
+		p.escalationMetrics.unresolvedHits.Add(int64(esc.Skipped))
+		logger.Warn("filter: escalation counter could not resolve some confirmed hits to a value; "+
+			"they were NOT counted (detector offsets and proxy text disagree)",
+			"event.name", observability.EventProxyFilterEscalationUnresolved,
+			"unresolved_hits", esc.Skipped, "pieces", len(pieces), "counted", esc.Counted)
+	}
+	if esc.Rule != nil {
+		p.escalationMetrics.triggered.Add(1)
+		// 失败要显眼, inverted: this is the one line that says a request was
+		// refused by an accumulation rather than by any single piece. Rule text
+		// and counts only — every part of it comes from the administrator's
+		// document, never from what was matched.
+		logger.Info("filter: request escalated by the cumulative compliance rule",
+			"event.name", observability.EventProxyFilterEscalated,
+			"rule", esc.Rule.String(), "counted", esc.Counted, "pieces", len(pieces),
+			"action", esc.Action.String(), "capped", esc.Capped,
+			"already_refused", refusalAction != apphook.ActionAllow)
+
+		// Record the conclusion as its OWN audit row (R-compliance-grading-18).
+		// Team route only: a personal-route event is uploaded by the detector
+		// itself and the proxy has no channel of its own there — the same reason
+		// escFindings is empty on that route, so a personal request cannot reach
+		// this branch in the first place.
+		if routeClass == apphook.RouteClassTeam {
+			units := make([]string, 0, len(esc.Units))
+			for _, idx := range esc.Units {
+				if id := escUnitIDs[idx]; id != "" {
+					units = append(units, id)
+				}
+			}
+			ev, err := buildRequestVerdictEvent(requestVerdict{
+				TraceID:      traceID,
+				TenantID:     orgID,
+				VirtualKeyID: virtualKeyID,
+				SeatID:       seatID,
+				SessionID:    sessionID,
+				Action:       esc.Action.String(),
+				Rule:         esc.Rule.String(),
+				Counted:      esc.Counted,
+				UnitIDs:      units,
+				Now:          time.Now(),
+			})
+			switch {
+			case err != nil:
+				// Fail-loud, never fail the request: the refusal below still
+				// happens, the audit row is what is missing.
+				logger.Warn("filter: request verdict event could not be built; the escalation was "+
+					"enforced but not recorded",
+					"event.name", observability.EventProxyFilterEscalationEventDropped,
+					"error", err.Error(), "rule", esc.Rule.String())
+			case len(ev) == 0:
+				// No trace id → no derivable event id. buildRequestVerdictEvent
+				// documents why minting one anyway would be worse than emitting
+				// nothing (every trace-less request in the fleet would collapse
+				// onto one shared row).
+				logger.Warn("filter: request escalated but no trace id to derive a verdict event id "+
+					"from; the escalation is enforced but has no audit row",
+					"event.name", observability.EventProxyFilterEscalationEventDropped,
+					"rule", esc.Rule.String())
+			default:
+				teamEvents = append(teamEvents, ev)
+			}
+		}
+
+		// Enact it. Only ever a STRENGTHENING: a refusal already recorded by a
+		// piece stands as-is (R-compliance-grading-15: 「SHALL NOT 弱于逐片段动作的
+		// 最强项」), and the ceiling has already had its say inside
+		// evaluateEscalation.
+		if refusalAction == apphook.ActionAllow && esc.Action == apphook.ActionBlock {
+			refusalAction = apphook.ActionBlock
+			// A literal, not a rule rendering: the client is told a policy
+			// refused them, never which rule or how many hits it took. Handing
+			// the caller the count would turn the refusal into an oracle they can
+			// probe. The administrator sees all of it on the audit row.
+			refusalMsg = "request blocked by compliance policy"
+		}
+	}
+
+	// ── The deferred refusal, written here instead of inside the loop ────────
+	//
+	// Placed BEFORE the restore stash and the two post-loop signals below so a
+	// refused request leaves this function exactly where it used to: no
+	// placeholder state is handed to a response leg that will never run, and
+	// neither the scan-coverage counter nor the degraded WARN fires for bytes
+	// that never reached an upstream. That skip is deliberate and pre-existing —
+	// see the comment on the truncation block.
+	if refusalAction != apphook.ActionAllow {
+		r.Body = io.NopCloser(bytes.NewReader(bodyBytes))
+		if refusalAction == apphook.ActionAnswer {
+			// Re-bound under the name the write site has always used. The red-line
+			// fence TestFence_GuardrailShortCircuitBodyIsNeverInterpolated keys its
+			// four approved exemptions on these exact expressions
+			// (`cannedAnswer.proto` / `.streaming` / `.text` + `model`), and each
+			// entry states WHY that value cannot carry detector output. Renaming
+			// them here would force four red-line exemptions to be re-approved
+			// under new names for a value that has not changed — a worse outcome
+			// than one alias line.
+			cannedAnswer := refusalAnswer
+			if err := writeCannedAnswer(w, cannedAnswer.proto, cannedAnswer.streaming, model, cannedAnswer.text); err != nil {
+				// planCannedAnswer already proved the shape is synthesizable, so
+				// reaching here means the CLIENT went away mid-write (or the
+				// writer was handed something it refuses). Either way the request
+				// is still short-circuited — never forwarded — which is the half
+				// that protects the content. Loud, because a synthesizer that
+				// cannot synthesize what it just approved is a defect, not noise.
+				logger.Error("filter: canned answer could not be written; request still refused, nothing forwarded",
+					"event.name", "proxy.filter.canned_answer_write_failed",
+					"protocol", cannedAnswer.proto.String(), "streaming", cannedAnswer.streaming,
+					"error", err.Error())
+				return false
+			}
+			logger.Info("filter: request answered from policy (代答); nothing forwarded upstream",
+				"event.name", "proxy.filter.answered",
+				"protocol", cannedAnswer.proto.String(), "streaming", cannedAnswer.streaming,
+				"answer_source", cannedAnswer.source, "answer_text_len", len(cannedAnswer.text),
+				"degraded", refusalDegraded)
 			return false
 		}
+		p.errors.Add(1)
+		// Logged BEFORE the fallback below, so `reason` is still the detector's
+		// own word (empty when it gave none) and not the constant the client is
+		// about to be shown — byte-identical to what this line printed when it
+		// lived inside the loop.
+		logger.Info("filter: request blocked",
+			"event.name", "proxy.filter.blocked",
+			"reason", refusalMsg, "degraded", refusalDegraded)
+		if refusalMsg == "" {
+			refusalMsg = "request blocked by compliance policy"
+		}
+		writeJSONError(w, http.StatusForbidden, "invalid_request_error",
+			"COMPLIANCE_BLOCKED", refusalMsg)
+		return false
 	}
 
 	if restoreState != nil && len(restoreState.keys) > 0 {
@@ -1146,6 +1492,51 @@ func injectActionTaken(eventJSON []byte, action string) []byte {
 		return eventJSON
 	}
 	m["action_taken"] = q
+	out, err := json.Marshal(m)
+	if err != nil {
+		return eventJSON
+	}
+	return out
+}
+
+// injectAnswerSource stamps `answer_source` onto the team event JSON: WHICH tier
+// of the three-level fallback supplied the sentence the user actually saw
+// (`rule` / `level` / `org`, spelled identically to the detector's
+// actionpolicy.AnswerSource and to design §4b's wire field).
+//
+// WHY IT MATTERS TO A HUMAN: an administrator looking at a 代答 row needs to
+// know whether that sentence came from the rule they just edited or from the
+// org-wide default they set up a year ago and forgot. Without it the audit page
+// can say "the user was answered" but not "answered with whose text", which is
+// the only actionable half.
+//
+// 🔴 `none` IS NEVER STAMPED. It is not a fourth tier — it means no tier had a
+// text, and such a request is not a canned answer at all: applyInboundFilter
+// degrades it to ActionBlock and the row's action_taken is `block`
+// (R-compliance-canned-answer-2.S2). Callers must not pass it, and the guard
+// below is defence in depth rather than policy.
+//
+// ⚠️ master stopped rejecting an out-of-domain value on 2026-09-12 (task 1.20:
+// 200 + NULL column + WARN, no longer 400), so a wrong value here is silently
+// dropped at the far end. The domain is held on this side or nowhere.
+//
+// Fail-safe like the rest of the inject* family: any parse/marshal problem
+// returns the event unchanged — an annotation must never cost the audit record.
+func injectAnswerSource(eventJSON []byte, source string) []byte {
+	switch source {
+	case "rule", "level", "org":
+	default:
+		return eventJSON
+	}
+	var m map[string]json.RawMessage
+	if err := json.Unmarshal(eventJSON, &m); err != nil {
+		return eventJSON
+	}
+	q, err := json.Marshal(source)
+	if err != nil {
+		return eventJSON
+	}
+	m["answer_source"] = q
 	out, err := json.Marshal(m)
 	if err != nil {
 		return eventJSON

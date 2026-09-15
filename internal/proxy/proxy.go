@@ -2,6 +2,7 @@ package proxy
 
 import (
 	"context"
+	"fmt"
 	"log/slog"
 	"net/http"
 	"net/url"
@@ -333,6 +334,44 @@ type Proxy struct {
 	//
 	// 🔴 Generation-scoped, NOT process-scoped: see generationID below.
 	scanCoverage scanCoverage
+	// escalationRules are the org grading document's `escalation[]` entries this
+	// generation enforces, already filtered to the ones this proxy can enact
+	// (SetComplianceGrading → parseEscalationRules). Empty — the default, and the
+	// state of every org that never configured grading — means the request-level
+	// verdict concludes "no escalation" on every request.
+	//
+	// 🔴 Written ONCE at generation build and read-only afterwards, exactly like
+	// filterScanRoles: a policy change re-spawns the detector child through the
+	// filter signature (filterSigWithGrading) and therefore rebuilds the
+	// generation, so there is no in-place mutation to race with in-flight
+	// requests.
+	escalationRules []EscalationRule
+	// complianceMaxAction is the filter app's operational enforcement ceiling —
+	// the SAME value the supervisor hands the detector child as
+	// AIKEY_COMPLIANCE_FILTER_MAX_ACTION ("full" | "warn"; "" = full, exactly as
+	// the detector's actionpolicy.ParseMaxAction reads an unset variable). The
+	// proxy reads it for ONE purpose: the request-level escalation ceiling
+	// (requestEscalationCeiling, escalation.go).
+	//
+	// 🔴 A STRING, NOT AN actionCeiling, BECAUSE OF THE ZERO VALUE. actionCeiling's
+	// zero value is ceilingAudit on purpose (see its header in filter_content.go).
+	// Storing the rung here would make every Proxy built without this setter —
+	// every generation with no filter app, and most fences — clamp an escalated
+	// block to ALLOW. "" meaning full is the detector's own reading of "unset", so
+	// the two readers agree on the default as well as on the value.
+	//
+	// Written once at generation build, like escalationRules: a MAX_ACTION change
+	// is part of the filter reload signature (filterAppSignaturePart), so it
+	// rebuilds the generation rather than mutating a live one.
+	complianceMaxAction string
+	// escalationMetrics counts what the request-level verdict did this
+	// generation. It is the only in-process evidence that the verdict path RAN —
+	// which R-compliance-grading-15.S2 requires to be assertable, because「结果
+	// 没变」on its own is equally satisfied by the whole evaluation being deleted.
+	// Counts only — never a value, a rule body or any content.
+	//
+	// 🔴 Generation-scoped, NOT process-scoped: see generationID below.
+	escalationMetrics escalationMetrics
 	// generationID is the supervisor generation that built this Proxy
 	// (supervisor.buildGeneration → s.genID.Add(1)). It is published on
 	// /v1/diagnostics/pipeline as `generation_id`.
@@ -848,6 +887,69 @@ func (p *Proxy) SetFilterScanRoles(roles []string) (applied, rejected []string) 
 // FilterScanRoles returns the effective scan-role policy (sorted), for status
 // reporting and diagnostics.
 func (p *Proxy) FilterScanRoles() []string { return p.filterScanRoles.list() }
+
+// SetComplianceGrading installs the org compliance grading document for this
+// generation. Called once at generation build by the supervisor with the SAME
+// bytes it bakes into the detector child's AIKEY_COMPLIANCE_GRADING env, so the
+// two readers can never be looking at different policies.
+//
+// The proxy reads exactly ONE member of that document: `escalation[]`, the
+// cumulative rule, which is request-level and therefore cannot be evaluated
+// inside the detector (it only ever sees one content piece — DEC-compliance-
+// grading-11 决定 1). Everything else in the document — labels, the ladder, the
+// canned-answer fallback, fail_closed_levels, route_policy — is the detector's
+// or the console's, and is deliberately not modelled here: a partial reader that
+// wrote anything back would delete what it has not learned yet.
+//
+// Returns how many rules were installed, plus one line per rule that was
+// REFUSED, so the caller can WARN. 🔴 A refused rule is a control the
+// administrator configured and this proxy will not carry out; it must never be
+// dropped silently (失败要显眼). err is non-nil only for a document that is not
+// JSON at all — the supervisor keeps the last valid policy in that case
+// (R-compliance-grading-14), so escalation keeps running on the previous rules
+// rather than being switched off by one bad response.
+//
+// rule: R-compliance-grading-15 (累计升级在片段循环后做请求级判定)
+func (p *Proxy) SetComplianceGrading(gradingJSON []byte) (applied int, refused []string, err error) {
+	rules, refused, err := parseEscalationRules(gradingJSON)
+	if err != nil {
+		return 0, refused, err
+	}
+	p.escalationRules = rules
+	return len(rules), refused, nil
+}
+
+// SetComplianceMaxAction installs the filter app's MAX_ACTION ("full" | "warn";
+// "" = full) for this generation. Called once at generation build by the
+// supervisor with the SAME variable it bakes into the detector child's
+// AIKEY_COMPLIANCE_FILTER_MAX_ACTION env: per-piece verdicts are capped inside the
+// child, the cumulative escalation verdict is capped here
+// (requestEscalationCeiling), and feeding both from one value is what keeps the
+// two caps from disagreeing.
+//
+// A value outside the domain is REFUSED with an error and the previous value is
+// kept (full, on a freshly built generation). Unreachable through the supervisor
+// today — its value comes from vault.GetFilterMaxAction, which already rejects
+// anything but full/warn, and the detector child refuses to start on the same bad
+// value — but refusing is what stops a future caller from turning a typo into a
+// rung nobody chose.
+//
+// rule: R-compliance-grading-15 (升级后的动作 SHALL 受请求级天花板 MAX_ACTION 钳制)
+func (p *Proxy) SetComplianceMaxAction(maxAction string) error {
+	if _, ok := requestCeilingForMaxAction(maxAction); !ok {
+		return fmt.Errorf("compliance filter max action %q is not recognized; allowed: full, warn", maxAction)
+	}
+	p.complianceMaxAction = maxAction
+	return nil
+}
+
+// ComplianceEscalationRules reports the request-level escalation rules this
+// generation enforces. Exists for status reporting and for the fences, which
+// assert the WIRING by behavior rather than by reading supervisor.go's text
+// (same posture as IsClusterNode).
+func (p *Proxy) ComplianceEscalationRules() []EscalationRule {
+	return append([]EscalationRule(nil), p.escalationRules...)
+}
 
 // SetFilterCache installs (or clears, with nil) the per-piece content-hash cache
 // used by the inbound filter. nil = cache OFF (dispatcher does no hashing →

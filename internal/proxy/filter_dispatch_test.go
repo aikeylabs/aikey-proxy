@@ -1,19 +1,25 @@
 package proxy
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"encoding/json"
+	"fmt"
 	"io"
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/AiKeyLabs/aikey-proxy/internal/apphook"
 	"github.com/AiKeyLabs/aikey-proxy/internal/events"
+	"github.com/AiKeyLabs/pkg/pipewire"
 )
 
 // stubHook is a configurable apphook.Hook for testing applyInboundFilter's
@@ -549,5 +555,210 @@ func TestInjectSession(t *testing.T) {
 	// empty session (codex / no session header) → unchanged
 	if got := string(injectSession([]byte(`{"event_id":"x"}`), "")); got != `{"event_id":"x"}` {
 		t.Fatalf("empty session mutated: %s", got)
+	}
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// R-compliance-grading-10.S2 — detector timeout stays fail-open WITH grading on
+// ─────────────────────────────────────────────────────────────────────────────
+
+// timeoutChildGradingOutEnv tells the helper child where to record the grading
+// document it was spawned with. Its presence is also what turns the helper test
+// into a child process instead of a skipped test.
+const timeoutChildGradingOutEnv = "AIKEY_TEST_TIMEOUT_CHILD_GRADING_OUT"
+
+// complianceGradingEnvName MIRRORS the variable the supervisor bakes into the
+// detector child (internal/supervisor/filter_hook.go `gradingEnv :=
+// "AIKEY_COMPLIANCE_GRADING=" + ...`). It cannot be imported: supervisor imports
+// this package. If the supervisor renames it, this fence keeps passing against
+// a name no real detector reads — the supervisor-side wiring fence
+// (compliance_escalation_wiring_fence_test.go) is what guards that half.
+const complianceGradingEnvName = "AIKEY_COMPLIANCE_GRADING"
+
+// fenceDetectTimeout is the "探测器 100ms 未返回" of 2.A5 / R-compliance-grading-10.S2.
+// It is set on the REAL ChildHook, so the deadline that fires is production code
+// (apphook.ChildHook.Detect → context.WithTimeout), not something this test does.
+const fenceDetectTimeout = 100 * time.Millisecond
+
+// TestHelperDetectorTimeoutChild is not a test: it is the detector child for
+// TestApplyInboundFilter_DetectorTimeoutStaysFailOpenWithGrading, re-executed
+// from this same binary (the os/exec TestHelperProcess pattern, see
+// internal/apphook/canned_answer_carrier_test.go).
+//
+// It signals ready, records the grading env it was handed, and then reads every
+// request frame and NEVER answers — a hung detector. STDOUT IS THE PIPE, so it
+// never returns into the framework (which would print a summary onto it).
+func TestHelperDetectorTimeoutChild(t *testing.T) {
+	out := os.Getenv(timeoutChildGradingOutEnv)
+	if out == "" {
+		t.Skip("helper process; not a test")
+	}
+	if err := os.WriteFile(out, []byte(os.Getenv(complianceGradingEnvName)), 0o600); err != nil {
+		os.Exit(2)
+	}
+	fmt.Fprintln(os.Stderr, "ready detector-timeout-child")
+	in := bufio.NewReader(os.Stdin)
+	for {
+		if _, _, err := pipewire.ReadFrame(in); err != nil {
+			os.Exit(0) // stdin closed: the parent shut us down
+		}
+		// Deliberately no response: every Detect must run into its deadline.
+	}
+}
+
+// detectCallCounter wraps the real ChildHook so the fence can prove the verdict
+// came from exactly one Detect call that actually waited out the deadline.
+type detectCallCounter struct {
+	inner apphook.Hook
+	calls atomic.Int64
+}
+
+func (c *detectCallCounter) Name() string { return c.inner.Name() }
+func (c *detectCallCounter) Detect(ctx context.Context, req *apphook.Request) *apphook.Response {
+	c.calls.Add(1)
+	return c.inner.Detect(ctx, req)
+}
+func (c *detectCallCounter) Status() *apphook.Status { return c.inner.Status() }
+
+// TestApplyInboundFilter_DetectorTimeoutStaysFailOpenWithGrading pins
+// R-compliance-grading-10.S2: `fail_closed_levels` only applies once detection
+// has COMPLETED; when the detector cannot answer, the level is undecidable and
+// the request SHALL stay fail-open + WARN.
+//
+// GIVEN 分级文档含 fail_closed_levels=[5] 且含一条 L5 block 的 escalation 规则;
+// 同一份字节既装进 proxy (SetComplianceGrading) 又作为 AIKEY_COMPLIANCE_GRADING
+// 交给探测器子进程 (与 supervisor/filter_hook.go 的装配方式一致)。
+// WHEN 探测器 100ms 内未返回 (真实 ChildHook 超时, 不是 stub 直接给 Degraded)。
+// THEN 原文透传 (proceed=true, 请求体不变)、WARN 恰好 1 条 (proxy.filter.degraded)、
+// 5xx 0 次; 请求级升级判定照常执行且结论为「无升级」。
+//
+// spec (PROPOSAL layer): 需求包 roadmap20260320/技术实现/阶段9-商业化版本/
+// 博时基金合规能力融合/openspec/changes/add-compliance-grading-fusion/specs/
+// compliance-grading/spec.md — R-compliance-grading-10 / .S2; 验收细则 tasks.md 2.A5.
+// rule: R-compliance-grading-10.S2
+//
+// WHY THIS IS NOT TestApplyInboundFilter_DegradedFailsOpen RENAMED: that test
+// hands the proxy a ready-made Degraded=true from a stub, with no grading
+// installed and no log assertion. This one (1) installs grading on both sides
+// and PROVES it is installed (the anti-vacuous assertions below go red if the
+// install step is removed), (2) lets the production ChildHook deadline fire
+// against a child that really hangs, and (3) counts the WARN.
+//
+// 🔴 Future (阶段 B, tasks.md 11.x): once `fail_closed_on_detector_unavailable`
+// exists, this fence is the SWITCH-OFF half and must stay green unchanged —
+// do not rename it (tasks.md runs it by exact name).
+func TestApplyInboundFilter_DetectorTimeoutStaysFailOpenWithGrading(t *testing.T) {
+	gradingDoc := []byte(`{"escalation":[{"min_level":5,"min_count":1,"action":"block"}],"fail_closed_levels":[5]}`)
+
+	// --- GIVEN: grading installed in the proxy through the production setter ---
+	p := &Proxy{}
+	applied, refused, err := p.SetComplianceGrading(gradingDoc)
+	if err != nil || len(refused) > 0 || applied != 1 {
+		t.Fatalf("SetComplianceGrading: applied=%d refused=%v err=%v", applied, refused, err)
+	}
+
+	// --- GIVEN: the same bytes handed to a detector child that never answers ---
+	gradingSeen := filepath.Join(t.TempDir(), "grading-seen.json")
+	child := apphook.NewChildHook(&apphook.ChildHookConfig{
+		Name:       "detector-timeout-child",
+		BinaryPath: os.Args[0],
+		BinaryArgs: []string{"-test.run", "^TestHelperDetectorTimeoutChild$"},
+		ExtraEnv: []string{
+			timeoutChildGradingOutEnv + "=" + gradingSeen,
+			complianceGradingEnvName + "=" + string(gradingDoc),
+		},
+		Timeout:      fenceDetectTimeout,
+		ReadyTimeout: 15 * time.Second,
+	})
+	startCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	if err := child.Start(startCtx); err != nil {
+		t.Fatalf("start detector-timeout child: %v", err)
+	}
+	t.Cleanup(func() {
+		ctx, c := context.WithTimeout(context.Background(), 5*time.Second)
+		defer c()
+		_ = child.Shutdown(ctx)
+	})
+	hook := &detectCallCounter{inner: child}
+	p.SetFilterHook(hook)
+
+	// --- Anti-vacuous: the grading GIVEN is really in force on both sides ------
+	// Proxy side: the only member of the document the proxy models is
+	// escalation[] (proxy.go SetComplianceGrading). fail_closed_levels lives in
+	// the detector and is deliberately not held here — so the detector-side
+	// assertion below is what proves fail_closed_levels was configured at all.
+	if rules := p.ComplianceEscalationRules(); len(rules) != 1 || rules[0].MinLevel != 5 || rules[0].Action != "block" {
+		t.Fatalf("anti-vacuous: proxy holds escalation rules %v, want exactly [level>=5,count>=1,action=block] — "+
+			"without grading installed this fence proves nothing about R-compliance-grading-10", rules)
+	}
+	seenRaw, err := os.ReadFile(gradingSeen)
+	if err != nil {
+		t.Fatalf("anti-vacuous: detector child did not record its grading env: %v", err)
+	}
+	var seen struct {
+		FailClosedLevels []int `json:"fail_closed_levels"`
+	}
+	if err := json.Unmarshal(seenRaw, &seen); err != nil || len(seen.FailClosedLevels) != 1 || seen.FailClosedLevels[0] != 5 {
+		t.Fatalf("anti-vacuous: detector child received %s=%q (fail_closed_levels=%v, err=%v), want fail_closed_levels=[5] — "+
+			"the scenario's GIVEN is not in force", complianceGradingEnvName, seenRaw, seen.FailClosedLevels, err)
+	}
+
+	// --- WHEN: one request whose only piece hits the hung detector -------------
+	const body = `{"model":"m","messages":[{"role":"user","content":"please summarise the attached quarterly fund report"}]}`
+	r := newReq(body)
+	w := httptest.NewRecorder()
+	var logBuf bytes.Buffer
+	logger := slog.New(slog.NewTextHandler(&logBuf, &slog.HandlerOptions{Level: slog.LevelWarn}))
+
+	t0 := time.Now()
+	proceed := p.applyInboundFilter(w, r, "m", "personal", "", "", "", "", "", logger)
+	elapsed := time.Since(t0)
+
+	// It really was a timeout: one Detect, and it waited out the deadline.
+	if got := hook.calls.Load(); got != 1 {
+		t.Fatalf("Detect calls = %d, want 1", got)
+	}
+	if elapsed < fenceDetectTimeout {
+		t.Fatalf("applyInboundFilter returned in %s, before the %s detect deadline — this was not a real timeout "+
+			"(e.g. the hook was already degraded), so the fence would not be testing the timeout path", elapsed, fenceDetectTimeout)
+	}
+	if elapsed > 5*time.Second {
+		t.Errorf("applyInboundFilter took %s; a timed-out detector must not hold the request (§6 #11)", elapsed)
+	}
+
+	// --- THEN: fail-open, verbatim, no 5xx --------------------------------------
+	if !proceed {
+		t.Fatalf("proceed=false: a detector timeout was turned into a refusal (status %d, body %q). "+
+			"R-compliance-grading-10 — fail_closed_levels only applies after detection COMPLETED; "+
+			"a timeout SHALL stay fail-open", w.Code, w.Body.String())
+	}
+	if w.Code >= 500 {
+		t.Errorf("status = %d, want no 5xx on detector timeout", w.Code)
+	}
+	if w.Code != http.StatusOK || w.Body.Len() != 0 {
+		t.Errorf("filter wrote a response on the fail-open path: status=%d body=%q", w.Code, w.Body.String())
+	}
+	if got := readReqBody(t, r); got != body {
+		t.Errorf("request body changed on the fail-open path:\n got: %s\nwant: %s", got, body)
+	}
+
+	// --- THEN: exactly one WARN, and it is the degraded one ---------------------
+	logs := logBuf.String()
+	if n := strings.Count(logs, "level=ERROR"); n != 0 {
+		t.Errorf("ERROR lines = %d on a fail-open timeout, want 0:\n%s", n, logs)
+	}
+	if n := strings.Count(logs, "level=WARN"); n != 1 {
+		t.Errorf("WARN lines = %d, want exactly 1:\n%s", n, logs)
+	}
+	if !strings.Contains(logs, "event.name=proxy.filter.degraded") || !strings.Contains(logs, "self_deg=1") {
+		t.Errorf("the single WARN must be proxy.filter.degraded with self_deg=1, got:\n%s", logs)
+	}
+
+	// --- THEN: the grading-aware request verdict ran and concluded nothing -----
+	snap := p.escalationSnapshot()
+	if snap.evaluated != 1 || snap.triggered != 0 {
+		t.Errorf("escalation evaluated=%d triggered=%d, want 1/0 — with rules installed the request-level "+
+			"verdict must run and must not escalate a request whose detection never completed", snap.evaluated, snap.triggered)
 	}
 }

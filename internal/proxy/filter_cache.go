@@ -58,6 +58,20 @@ type maskVerdict struct {
 	// detector uploads to its own local self-view and hands the proxy nothing) and for
 	// clean pieces (the detector drops allow+0-findings events at source).
 	//
+	// 🔴 THE EVIDENCE GATE'S VERDICT RIDES INSIDE THESE BYTES. Each finding in the
+	// event JSON carries `confirmed` — the gate's allow-list/validator/entropy/
+	// context ruling, which is what cumulative escalation counts
+	// (R-compliance-grading-16, see escalation.go Finding.Confirmed). It survives
+	// a cache hit only because the event is replayed VERBATIM and every stamping
+	// step works on map[string]json.RawMessage, so no field this proxy has never
+	// heard of is dropped. Do NOT "normalize" this into a typed struct on the way
+	// in or out, and do NOT keep a second decoded copy here: a hand-copied relay
+	// drops fields silently, and a dropped `confirmed` reads downstream as "not
+	// confirmed" with no error anywhere. If a future consumer needs findings on a
+	// cache hit, decode them FROM THESE BYTES at the point of use.
+	// Fence: filter_cache_confirmed_test.go TestConfirmedSurvivesWireAndCache.
+	// 需求包: roadmap20260320/技术实现/阶段9-商业化版本/博时基金合规能力融合 (task 2.13)
+	//
 	// Replaying the SAME bytes is what makes this safe to re-upload: the event_id
 	// inside them is the detector's, minted once, and BOTH ingest paths are keyed on
 	// it idempotently (control-master storage.IngestBatch: ON CONFLICT (event_id) DO

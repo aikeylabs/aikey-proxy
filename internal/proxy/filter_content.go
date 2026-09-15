@@ -194,9 +194,29 @@ const (
 	// exists to fight. Ordering is expressed by rank() instead of the raw
 	// integer, precisely so the two concerns stay independent.
 	ceilingOff
+	// ceilingWarn — mask / block / answer → WARN: the content is forwarded
+	// byte-unchanged and the record says `warn`. This is the operator's
+	// AIKEY_COMPLIANCE_FILTER_MAX_ACTION=warn rung, spelled to match the detector's
+	// actionpolicy.capRuntimeAction (MaxActionWarn: mask/block → warn) word for
+	// word, so the per-piece verdicts capped inside the child and the
+	// request-level escalation capped in this process say the same thing.
+	//
+	// 🔴 WHY A RUNG OF ITS OWN AND NOT ceilingAudit. Both let the request through,
+	// so a check on "was it refused?" cannot tell them apart — but audit turns a
+	// block into ALLOW, which silently changes "warn the operator" into "nothing
+	// happened": the opposite reading of warn from the detector's. (Task 3.13,
+	// fence: TestEscalation_MaxActionWarnCapsEscalatedBlock.)
+	//
+	// Today it is reachable ONLY as the request-level escalation ceiling
+	// (requestCeilingForMaxAction, escalation.go); no blockScanPolicy row carries
+	// it. Appended after ceilingOff so the zero value stays ceilingAudit; its
+	// place in the ordering comes from rank(), like ceilingOff's.
+	ceilingWarn
 )
 
-// rank orders the rungs by how much they PERMIT: off(0) < audit(1) < full(2).
+// rank orders the rungs by how much they PERMIT: off(0) < audit(1) < warn(2) <
+// full(3). warn sits above audit because a capped verdict still surfaces as a
+// warning there instead of vanishing into allow.
 //
 // Deliberately not the iota order — see the ceilingOff comment. An unrecognized
 // value ranks as audit, so a corrupted/未来 rung degrades toward "record it",
@@ -207,8 +227,10 @@ func (c actionCeiling) rank() uint8 {
 		return 0
 	case ceilingAudit:
 		return 1
-	case ceilingFull:
+	case ceilingWarn:
 		return 2
+	case ceilingFull:
+		return 3
 	default: // any unknown value degrades to the audit rung
 		return 1
 	}
@@ -242,7 +264,7 @@ func (c actionCeiling) clamp(a apphook.Action) (effective apphook.Action, capped
 	// trailing `return a, false` below and escapes the ceiling entirely.
 	// 围栏: TestActionCeiling_ClampsAnswerLikeBlock.
 	case apphook.ActionMask, apphook.ActionBlock, apphook.ActionAnswer:
-		return apphook.ActionAllow, true
+		return c.cappedVerdict(), true
 	case apphook.ActionAllow, apphook.ActionWarn:
 		return a, false
 	}
@@ -252,6 +274,18 @@ func (c actionCeiling) clamp(a apphook.Action) (effective apphook.Action, capped
 	// (apphook.NormalizeAction in applyInboundFilter) — clamping to Allow here
 	// would fail OPEN and beat it to the punch.
 	return a, false
+}
+
+// cappedVerdict is the verdict an intrusive action (mask / block / answer) is
+// lowered TO under this ceiling — the one table that says what each capping rung
+// means, so clamp() carries no per-rung branching of its own. Only warn lowers
+// to a warning; audit, off and any unknown value (which rank() already treats as
+// audit) lower to allow.
+func (c actionCeiling) cappedVerdict() apphook.Action {
+	if c == ceilingWarn {
+		return apphook.ActionWarn
+	}
+	return apphook.ActionAllow
 }
 
 // String renders the ceiling for logs / audit records. Deliberately uses the
@@ -265,6 +299,8 @@ func (c actionCeiling) String() string {
 		return "off"
 	case ceilingAudit:
 		return "audit"
+	case ceilingWarn:
+		return "warn"
 	default:
 		return "audit"
 	}

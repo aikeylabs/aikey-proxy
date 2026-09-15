@@ -107,7 +107,12 @@ import (
 var guardrailFiles = map[string]string{
 	"filter_dispatch.go": "applyInboundFilter — the verdict switch and the short-circuit " +
 		"(case apphook.ActionBlock → writeJSONError → return false). The canned answer lands here.",
-	"filter_content.go":     "content extraction and per-piece ceilings — produces the pieces a verdict applies to",
+	"filter_content.go": "content extraction and per-piece ceilings — produces the pieces a verdict applies to",
+	"escalation.go": "the REQUEST-level verdict (task 3.11): turns every piece's findings into one " +
+		"cumulative conclusion and resolves the org rule's action, so it decides a verdict the " +
+		"short-circuit in filter_dispatch.go then acts on. It writes no response itself — listed " +
+		"because fence 0 is about SCOPE, and a file that produces a refusal must be inside the " +
+		"scope of the two fences below even when today it holds no write site.",
 	"filter_cache.go":       "verdict cache — replays a previous verdict, so it can reach the same short-circuit",
 	"filter_performance.go": "the 15ms budget and fail-open bookkeeping around the detect call",
 	"filter_restore.go": "the placeholder restore — the ONE documented response-leg exception to invariant 13 " +
@@ -198,6 +203,70 @@ var guardrailVerbatimSources = map[string]string{
 	// fence.
 	"resp.Reason": "the detector's human-readable reason, which apphook never populates on a " +
 		"Block verdict (see the note above), so the client always gets the constant fallback",
+
+	// ---------------------------------------------------------------------
+	// Site two: the canned answer (代答), landed by task 3.6 on 2026-09-13 —
+	// the site this fence's header predicted ("the canned answer will be site
+	// two, in scope automatically"). Four arguments, four reasons.
+	//
+	// 🔴 THESE FOUR ENTRIES WIDEN A RED-LINE FENCE. They were added as a
+	// deliberate, reviewable act, which is the only sanctioned way to widen it
+	// (the fence's own error text says so: "add it to guardrailVerbatimSources
+	// WITH THE REASON"). None of them exempts an interpolation primitive —
+	// that check runs before this table and cannot be whitelisted — and none
+	// of them is content the detector matched.
+	// ---------------------------------------------------------------------
+
+	// Selects WHICH of the six shapes to synthesize. Derived from the request
+	// PATH only (protocolKindFromPath: /messages | /chat/completions |
+	// /responses), never from the body and never from a verdict. It is a
+	// uint8 enum: it chooses a struct to marshal, it is never printed into one.
+	"cannedAnswer.proto": "a ProtocolKind enum derived solely from the request path " +
+		"(canned_answer.go protocolKindFromPath); it selects a response shape and is never " +
+		"written into the body",
+
+	// Selects streaming vs non-streaming. A bool read from the client's own
+	// `"stream": true` flag through the existing isStreamingRequest, i.e. the
+	// same single source of truth the forwarding path uses. Also never printed.
+	"cannedAnswer.streaming": "a bool read from the client's own \"stream\" flag via the " +
+		"existing isStreamingRequest; it selects a response shape and is never written into the body",
+
+	// Echoed into the reply's `model` field, exactly as every real provider
+	// echoes it. It is applyInboundFilter's `model` parameter — the route's
+	// resolved model name.
+	//
+	// ⚠️ Why this is not "content that was just scanned", stated precisely
+	// rather than assumed: the pieces the detector sees are extracted from
+	// message CONTENT (filter_content.go), and the top-level `model` field is
+	// never one of them. So no finding can reach the client through it, and
+	// omitting it would produce a reply that clients treat as malformed.
+	"model": "the route's resolved model name, echoed into the reply's model field the way " +
+		"every provider echoes it; it is never one of the content pieces the detector scans " +
+		"(filter_content.go extracts pieces from message content, not from the model field)",
+
+	// THE canned answer text. This is the value invariant 12 was written
+	// about, and passing it here is precisely what the fence's own error
+	// message prescribes ("Fix: hand over the stored text").
+	//
+	// It is administrator-authored by construction: every one of the three
+	// tiers behind it is a column an administrator filled in and reviewed —
+	// compliance_rules.answer_text, compliance_grading.ladder[level].answer_text,
+	// compliance_grading.answer_fallback — resolved through the single outlet
+	// actionpolicy.ResolveAnswerText (design §4b.3). No model writes it; no
+	// detector match contributes to it.
+	//
+	// ⚠️ SAME BOUNDARY AS resp.Reason, and it must be said out loud: that
+	// guarantee lives in the DETECTOR's wire, in another repository. A source
+	// scan of aikey-proxy cannot see a future detector version that starts
+	// stuffing matched text into the answer field. If AnswerText ever becomes
+	// free-form detector output, this entry is wrong and the fix is to stop
+	// passing it to the client, not to relax the fence.
+	// The behavioural half is canned_answer_test.go
+	// TestCannedAnswer_TextIsNeverInterpolated, which asserts the bytes on the
+	// wire are byte-identical to the stored text and carry no finding fragment.
+	"cannedAnswer.text": "the administrator-authored canned answer, resolved through the single " +
+		"outlet actionpolicy.ResolveAnswerText from three administrator-filled columns and " +
+		"emitted verbatim — the value this invariant exists to carry (see the boundary note above)",
 }
 
 // interpolationPrimitives are the calls that turn "print this text" into "print

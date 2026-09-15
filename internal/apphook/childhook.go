@@ -107,11 +107,58 @@ func (c *ChildHookConfig) applyDefaults() {
 
 // childResponse is a decoded response frame, delivered to the waiting caller by
 // the reader goroutine via the pending map.
+//
+// # The `findings` slot means a DIFFERENT thing per op — this list is the only
+// # definition of which
+//
+// The wire (pipewire.Response.Findings) carries one length-prefixed blob whose
+// meaning is decided by the op that was sent and the action that came back. Every
+// meaning must be listed here, because a reader who guesses is a reader who ships
+// a bug: the slot has already been mistaken for the event's `findings` array
+// once (see internal/proxy/escalation.go, corrected 2026-09-14).
+//
+//	op=Detect,  action=Mask    → the MASKED PAYLOAD to forward upstream (bytes,
+//	                             not JSON). Lands on Response.MutatedPayload.
+//	op=Detect,  action=Answer  → the canned answer (代答) as
+//	                             {"answer_text","answer_source"} JSON. Lands on
+//	                             Response.AnswerText / Response.AnswerSource.
+//	                             Administrator-authored CONTENT: consumed inside
+//	                             this process, never uploaded, never logged
+//	                             (only its length) — task 3.12.
+//	op=ListPacks               → the effective-packs JSON report. Deliberately
+//	                             carries the ladder's ACTION only, never a canned
+//	                             answer text (that endpoint is broadly readable;
+//	                             see the detector's cmd/detector/list_packs.go).
+//	anything else              → empty.
+//
+// 🔴 NOT the same thing as the `findings` ARRAY inside `event` below. That one is
+// part of the audit document and IS uploaded to master; this one is not. 同名异物
+// — the confusion is the reason task 3.12 exists.
 type childResponse struct {
-	findings []byte // ActionMask → masked payload; ListPacks → JSON report; else per-op
+	findings []byte // per-op payload; see the table above
 	maskmeta []byte // v4: restorable-mask JSON (offsets only); empty unless the mask is restorable
 	event    []byte // team-routed compliance event for the proxy to forward; empty otherwise
 	action   byte
+}
+
+// wireCannedAnswer is the ActionAnswer meaning of the `findings` slot: the text
+// an administrator wrote, plus which fallback tier supplied it.
+//
+// 🔴 WHY THIS IS A HAND-WRITTEN MIRROR AND WHAT KEEPS IT HONEST. Every other
+// JSON contract on this pipe is an alias of a pkg/pipewire type, because a
+// hand-retyped mirror drifts in a way the protocol version byte cannot catch
+// (see wireMaskMeta below for the incident). pkg/pipewire is a SIBLING
+// REPOSITORY, and extending its wire contract was ruled out of scope for task
+// 3.12 (TODO-68 weighed the same question for the capability bit and chose not
+// to). So the shared type is replaced by a paired byte-for-byte fixture: this
+// side pins the exact bytes in TestCannedAnswerTextReachesProxy, and
+// ai-compliance-detector pins the same literal from the producing side in
+// cmd/detector/canned_answer_carrier_test.go. Rename a tag on either side and
+// that side's own suite goes red. Promoting this into pkg/pipewire is the
+// standing recommendation — see the report for task 3.12.
+type wireCannedAnswer struct {
+	Text   string `json:"answer_text"`
+	Source string `json:"answer_source"`
 }
 
 // wireMaskMeta is the detector's v4 restorable-mask JSON contract.
@@ -708,6 +755,29 @@ func (h *ChildHook) Detect(ctx context.Context, req *Request) *Response {
 					})
 				}
 			}
+		}
+	}
+	if res.Action == ActionAnswer && len(resp.findings) > 0 {
+		// 代答 (canned answer, task 3.12): the administrator's text, carried in
+		// the per-op `findings` slot (empty in an Answer verdict otherwise — there
+		// is no mask). Structured exactly like the ActionMask branch above so the
+		// two per-op meanings of one slot read as siblings, not as a special case.
+		//
+		// FAIL-CLOSED ON A PARSE ERROR, and that direction matters: leaving the
+		// text empty makes planCannedAnswer degrade the verdict to a plain block
+		// (R-compliance-canned-answer-2.S2) rather than serve a 200 with nothing
+		// in it. Loud but CONTENT-FREE — the text is administrator content and
+		// logs travel further than the trust boundary the compliance channel
+		// guards, so only its length is ever printed (same rule as
+		// internal/proxy/canned_answer.go and the detector's levelOf()).
+		var ca wireCannedAnswer
+		if err := json.Unmarshal(resp.findings, &ca); err != nil {
+			slog.Warn("apphook: canned answer payload unparseable; the verdict will degrade to a block",
+				"event.name", "proxy.apphook.canned_answer_invalid",
+				"name", h.cfg.Name, "error", err, "payload_bytes", len(resp.findings))
+		} else {
+			res.AnswerText = ca.Text
+			res.AnswerSource = ca.Source
 		}
 	}
 	if len(resp.event) > 0 {
