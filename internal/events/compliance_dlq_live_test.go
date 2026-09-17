@@ -46,7 +46,7 @@ const (
 	// outlet nobody looks at: master 落库 was fenced twice before, the mirror
 	// never once.
 	liveMirrorURLEnv = "AIKEY_LIVE_COMPLIANCE_MIRROR_URL"
-	// liveTenantEnv is the org id the master will recognise. It MUST be a real
+	// liveTenantEnv is the org id the master will recognize. It MUST be a real
 	// organizations row: applyGradingLevelPolicy strips every level whose tenant
 	// has no grading document, so an unknown tenant makes `level IS NULL` for a
 	// reason that has nothing to do with this proxy.

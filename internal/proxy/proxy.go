@@ -230,6 +230,13 @@ type Proxy struct {
 	// Proxy, so the first request after a reload re-announces the state. That is
 	// correct — the new generation has not said it yet.
 	filterCacheSuspended atomic.Bool
+	// personalProjectionMissing latches whether the LAST personal-route request
+	// that had escalation rules installed saw a flagged piece come back without a
+	// count projection (TODO-87) — a detector older than this proxy. Same latch
+	// posture and generation scope as filterCacheSuspended above: the condition
+	// persists until the detector is upgraded, so it is logged on the transition,
+	// not per request. See notePersonalProjectionState.
+	personalProjectionMissing atomic.Bool
 	// filterPerformance is a bounded, content-free rolling latency window for
 	// the externally readable compliance health surface. It lives with the
 	// generation so a reload cannot mix samples from different detector builds.
@@ -898,7 +905,7 @@ func (p *Proxy) FilterScanRoles() []string { return p.filterScanRoles.list() }
 // inside the detector (it only ever sees one content piece — DEC-compliance-
 // grading-11 决定 1). Everything else in the document — labels, the ladder, the
 // canned-answer fallback, fail_closed_levels, route_policy — is the detector's
-// or the console's, and is deliberately not modelled here: a partial reader that
+// or the console's, and is deliberately not modeled here: a partial reader that
 // wrote anything back would delete what it has not learned yet.
 //
 // Returns how many rules were installed, plus one line per rule that was

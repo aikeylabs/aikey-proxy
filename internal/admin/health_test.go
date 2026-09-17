@@ -119,7 +119,7 @@ func hasReason(ss []string, want string) bool {
 // verdict (R-compliance-grading-14.S2).
 //
 // Why on the ENDPOINT and not in a log: keeping the last valid grading ladder
-// when the master's answer is unusable is the safe behaviour, but it makes a
+// when the master's answer is unusable is the safe behavior, but it makes a
 // machine enforcing a stale ladder indistinguishable from a healthy one. 「健康
 // 信号必须可被外部读取」 forbids leaving that in a WARN line only.
 // ---------------------------------------------------------------------------

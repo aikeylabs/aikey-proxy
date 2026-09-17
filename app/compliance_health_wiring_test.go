@@ -45,7 +45,7 @@ func TestCompliancePolicyHealthIsWiredToAdmin(t *testing.T) {
 //
 // Asserting on the source is deliberate. The alternative is standing up the
 // whole application to observe one assignment, and the thing at risk here is not
-// the assignment's behaviour — it is whether anyone still makes it. Same posture
+// the assignment's behavior — it is whether anyone still makes it. Same posture
 // as internal/proxy/hotpath_callgraph_fence_test.go.
 //
 // 能红 check: delete the wireCompliancePolicyHealth(...) line from app.go.

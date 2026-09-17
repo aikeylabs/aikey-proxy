@@ -300,7 +300,7 @@ func TestCannedAnswer_StreamSequenceClosesCleanly(t *testing.T) {
 // R-compliance-canned-answer-3.S1 — the text is NEVER interpolated. 🔴 RED LINE.
 // -----------------------------------------------------------------------------
 
-// TestCannedAnswer_TextIsNeverInterpolated is the behavioural half of design §6
+// TestCannedAnswer_TextIsNeverInterpolated is the behavioral half of design §6
 // invariant 12 (the source-scan half is
 // TestFence_GuardrailShortCircuitBodyIsNeverInterpolated).
 //
@@ -447,7 +447,7 @@ func TestCannedAnswer_EmptyTextFallsBackToBlock(t *testing.T) {
 //
 // Asserted on the SHARED predicate rather than by driving two requests, because
 // the predicate is what both the read guard and the write guard consult; a
-// behavioural test would prove one of the two sites and say nothing about the
+// behavioral test would prove one of the two sites and say nothing about the
 // other. Anti-vacuity: the mask/warn/allow rungs are asserted cacheable in the
 // same loop, so a predicate that simply returned false everywhere fails here.
 func TestCannedAnswer_VerdictIsNeverCached(t *testing.T) {
@@ -478,7 +478,7 @@ func TestCannedAnswer_VerdictIsNeverCached(t *testing.T) {
 // the administrator's choosing. It cannot happen here because the payload is
 // json.Marshal'd (newlines become the two characters \ and n, so a frame is
 // always exactly one line), and asserting it is how that property stays true if
-// someone later "optimises" the framing. Note this is NOT a text-interpolation
+// someone later "optimizes" the framing. Note this is NOT a text-interpolation
 // bug — nothing substitutes anything — it is a FRAMING bug, which is why it
 // needs its own assertion rather than relying on the interpolation fence.
 //
@@ -587,8 +587,9 @@ func (f sseFrameT) jsonInt(t *testing.T, path string) int64 {
 // failure mode that makes an SDK hang rather than error, so it fails here.
 func parseSSE(t *testing.T, body string) []sseFrameT {
 	t.Helper()
-	var out []sseFrameT
-	for _, block := range strings.Split(strings.TrimRight(body, "\n"), "\n\n") {
+	blocks := strings.Split(strings.TrimRight(body, "\n"), "\n\n")
+	out := make([]sseFrameT, 0, len(blocks))
+	for _, block := range blocks {
 		if strings.TrimSpace(block) == "" {
 			continue
 		}
@@ -627,7 +628,6 @@ func parseSSE(t *testing.T, body string) []sseFrameT {
 // miniature that the whole feature is about.
 func decodeAllJSONFrames(t *testing.T, body string, streaming bool) []any {
 	t.Helper()
-	var out []any
 	if !streaming {
 		var m any
 		if err := json.Unmarshal([]byte(body), &m); err != nil {
@@ -635,7 +635,9 @@ func decodeAllJSONFrames(t *testing.T, body string, streaming bool) []any {
 		}
 		return []any{m}
 	}
-	for _, f := range parseSSE(t, body) {
+	frames := parseSSE(t, body)
+	out := make([]any, 0, len(frames))
+	for _, f := range frames {
 		if f.data == "[DONE]" {
 			continue
 		}
@@ -720,7 +722,7 @@ type baselinePathOutcome struct {
 //	    -run '^TestZZBaselineCapture$' -count=1 -v
 //
 // WHY IT HAD TO BE MEASURED, and this is the whole point of task 3.7: the
-// tempting argument is "an organisation that configured no canned answer never
+// tempting argument is "an organization that configured no canned answer never
 // reaches the new code, so nothing can have changed". That argument assumes we
 // already know every entry point, and 3.6 did not only add a branch — it also
 // rewrote the verdict-cache guard that block / mask / warn / allow ALL pass
@@ -800,7 +802,7 @@ func baselineHookFor(path string) *stubHook {
 }
 
 // TestCannedAnswer_UnconfiguredPathsByteIdentical is the regression half of the
-// canned answer: it proves that adding 代答 changed NOTHING for an organisation
+// canned answer: it proves that adding 代答 changed NOTHING for an organization
 // that has not configured one.
 //
 // 🔴 IT ASSERTS TWO THINGS AND NEEDS BOTH. Byte-equality alone is worthless on
@@ -832,7 +834,7 @@ func TestCannedAnswer_UnconfiguredPathsByteIdentical(t *testing.T) {
 			"requires the equivalence to hold with 代答 live in the binary")
 	}
 	t.Run("precondition: the ActionAnswer branch is compiled in and reachable", func(t *testing.T) {
-		// Behavioural, not reflective: a `case apphook.ActionAnswer:` that had
+		// Behavioral, not reflective: a `case apphook.ActionAnswer:` that had
 		// been dropped or made unreachable cannot produce a 200 carrying the
 		// administrator's sentence. This is the strongest in-process evidence
 		// that the branch exists in THIS binary — the same binary the four
@@ -892,7 +894,7 @@ func TestCannedAnswer_UnconfiguredPathsByteIdentical(t *testing.T) {
 				if got != want {
 					t.Errorf("round %d of the %s path is NOT byte-identical to the pre-代答 baseline (7da287b).\n"+
 						" got: %#v\nwant: %#v\n"+
-						"代答 was specified to be additive: an organisation that configured none must see the "+
+						"代答 was specified to be additive: an organization that configured none must see the "+
 						"exact same bytes it saw before (R-compliance-canned-answer-8.S1). A difference here is "+
 						"a change shipped to every customer who never asked for the feature.", round+1, path, got, want)
 				}

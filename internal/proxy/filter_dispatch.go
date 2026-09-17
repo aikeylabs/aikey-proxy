@@ -21,6 +21,14 @@
 // does NOT fail the user's request. (The "declared-but-no-dispatcher" case is
 // handled separately by filterStub501Active at dispatch entry, which IS
 // fail-loud — that's a config error, not a runtime degrade.)
+//
+// EXCEPTION to #11 — a child that ANSWERED with a verdict this proxy cannot read
+// fails CLOSED (refused, never forwarded): an unrecognized action value
+// (2026-09-13, R-compliance-canned-answer-6) and a verdict frame larger than the
+// pipe's single-frame limit (TODO-120, user decision 2026-09-15, all editions).
+// Neither is "the filter could not run"; forwarding on them turns a policy the
+// detector applied into content that left unscanned. Timeouts and a dead child
+// stay fail-open — see the FAIL-CLOSED block in applyInboundFilter.
 package proxy
 
 import (
@@ -36,6 +44,7 @@ import (
 
 	"github.com/AiKeyLabs/aikey-proxy/internal/apphook"
 	"github.com/AiKeyLabs/aikey-proxy/internal/observability"
+	"github.com/AiKeyLabs/pkg/pipewire"
 )
 
 // pipeInputCap bounds how many bytes of a content piece the proxy sends over the
@@ -74,6 +83,19 @@ type scanCoverage struct {
 	// skippedBytes: total bytes that were forwarded upstream without ever being
 	// handed to the detector. This is the number that quantifies the blind spot.
 	skippedBytes atomic.Int64
+	// incompleteScanVerdicts: how many pieces were REFUSED because the detector
+	// reported that its scan did not look at everything (TODO-121). Same surface
+	// and same reasoning as the counter below — it is content whose verdict was
+	// produced without a complete inspection, and a rising number means either a
+	// deployment under sustained load or someone probing the hit budget.
+	incompleteScanVerdicts atomic.Int64
+	// unreadableOversizeVerdicts: how many pieces were REFUSED because the
+	// detector's verdict frame exceeded the pipe's single-frame limit (TODO-120).
+	// Unlike the two counters above this is not content that went out unscanned —
+	// the request was refused — but it is still content whose verdict nobody read,
+	// and a rising number means legitimate large inputs are being 403'd until the
+	// detector budgets its frames (TODO-120-A). Same surface, same reasoning.
+	unreadableOversizeVerdicts atomic.Int64
 }
 
 // capRuneBoundary returns the largest byte offset ≤ cap on a UTF-8 rune boundary.
@@ -127,7 +149,7 @@ func capRuneBoundary(s string, limit int) int {
 // and the write guard, so the two cannot drift apart.
 //
 // WHY IT IS A FUNCTION AND NOT TWO INLINE CONDITIONS. Until 2026-09-13 it was
-// two hand-synchronised `!= apphook.ActionBlock` comparisons with a comment on
+// two hand-synchronized `!= apphook.ActionBlock` comparisons with a comment on
 // each pointing at the other. That survives one excluded value; the canned
 // answer makes it two, and a concept with no name in the code gets re-derived by
 // hand every time — which is how one side ends up excluding a verdict the other
@@ -310,6 +332,40 @@ func (p *Proxy) applyInboundFilter(
 			}
 		})
 	}()
+	// Personal-route request-verdict rows (TODO-87, user decision 2026-09-15 V1),
+	// written on exit to this machine's LOCAL self-view store ONLY.
+	//
+	// 🔴 A SEPARATE BATCH FROM teamEvents, ON PURPOSE. teamEvents is the master
+	// upload; putting a personal-route row there would either be dropped by the
+	// route guard above or — the day that guard is loosened — reach master,
+	// breaking the 2026-05-10 personal/team isolation the user kept in place.
+	// This batch never holds a content row: on the personal route the detector
+	// uploads those itself, and the proxy only records the request-level
+	// conclusion it alone can reach. Best-effort: never dead-lettered, and a
+	// failure never touches the refusal (see Reporter.UploadComplianceEventsLocally).
+	// Fence: TestEscalation_PersonalRouteNoDoubleUpload.
+	var localVerdictEvents [][]byte
+	defer func() {
+		if len(localVerdictEvents) == 0 {
+			return
+		}
+		if p.reporter == nil {
+			logger.Warn("filter: personal-route request verdict dropped — no reporter configured",
+				"event.name", observability.EventProxyFilterEscalationEventDropped, "count", len(localVerdictEvents))
+			return
+		}
+		evs := localVerdictEvents
+		observability.GoSafe("proxy.filter.request_verdict_local", observability.Isolated, func() {
+			ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+			defer cancel()
+			if err := p.reporter.UploadComplianceEventsLocally(ctx, evs); err != nil {
+				logger.Warn("filter: personal-route request verdict could not be written to the local self-view "+
+					"(the refusal itself is unaffected)",
+					"event.name", observability.EventProxyFilterRequestVerdictLocalFailed,
+					"error", err, "count", len(evs))
+			}
+		})
+	}()
 
 	// Read + re-buffer the body. We must restore r.Body regardless of verdict
 	// so the ReverseProxy downstream can read it.
@@ -412,16 +468,26 @@ func (p *Proxy) applyInboundFilter(
 		// content-derived is added to any wire or row (R-compliance-grading-16).
 		escFindings = make([][]Finding, len(pieces))
 		escUnitIDs  = make([]string, len(pieces))
+		// Personal-route projection accounting for this request (TODO-87): pieces
+		// that came back with a count projection, and FLAGGED pieces that came back
+		// without one (a detector older than this proxy). Counts only; reported
+		// once after the loop by notePersonalProjectionState.
+		personalProjected   int
+		personalUnprojected int
 		// ── Deferred refusal (DEC-compliance-grading-11 决定 5) ───────────────
 		//
 		// `block` / `answer` used to write their response and `return false` the
 		// moment a piece produced one. They now RECORD the refusal and let the
 		// loop finish, because the cumulative rule cannot count hits in pieces
 		// that were never scanned. The response bytes are written after the loop
-		// and are byte-identical: FIRST refusal wins, so what the client receives
+		// and stay byte-identical: FIRST refusal wins, so what the client receives
 		// is the same verdict, the same status and the same body the early return
-		// would have produced (R-compliance-grading-15.S2,
-		// TestEscalation_EmptyRulesKeepsOutcome).
+		// would have produced. The recorded events are NOT identical, by decision:
+		// a refused multi-piece request records a content row for every piece
+		// scanned after the refusal point (ratified 2026-09-15,
+		// R-compliance-grading-15.S2, TODO-99). Fences:
+		// TestEscalation_EmptyRulesKeepsOutcome (response) and
+		// TestEscalation_ZeroRulesRefusedMultiPieceRecordsEveryScannedPiece (rows).
 		//
 		// 🔴 refusalMsg is assigned ONLY from resp.Reason or from a string
 		// literal, and that is load bearing: the red-line fence
@@ -566,7 +632,7 @@ func (p *Proxy) applyInboundFilter(
 			//   R-compliance-canned-answer-6    未识别动作 SHALL 按 ActionBlock 处理
 			//   R-compliance-canned-answer-6.S1 403 COMPLIANCE_BLOCKED，上游 0 请求
 			//
-			// 🔴 2026-09-13 REVERSAL — read before "restoring" the old behaviour.
+			// 🔴 2026-09-13 REVERSAL — read before "restoring" the old behavior.
 			// This used to be handled by the switch's `default:` below as a LOUD
 			// FAIL-OPEN (2026-06-22 review). The "loud" half is kept verbatim; the
 			// "open" half is reversed, because two opposite failures were conflated:
@@ -590,7 +656,55 @@ func (p *Proxy) applyInboundFilter(
 			// read — it must not be echoed to the caller.
 			// 围栏: TestApplyInboundFilter_UnknownAction_FailsClosedBlocked ·
 			//       internal/apphook TestUnknownAction_TreatedAsBlock
-			if resp != nil && !resp.Action.Recognized() {
+			//
+			// SECOND SHAPE, same branch (TODO-120, P0, user decision 2026-09-15 P2:
+			// every edition): the child answered but its verdict FRAME exceeded the
+			// pipe's single-frame limit, so the frame was skipped unread
+			// (resp.VerdictUnreadable, set by ChildHook). Until then it was reported
+			// as Degraded and fell through to the fail-open `case ActionAllow` below —
+			// repeating a sensitive value a few hundred times forwarded it unscanned.
+			// It is refused here with the constant message (Reason cleared: the
+			// rule above about not echoing an unreadable verdict applies verbatim),
+			// and Block is never cached (cacheableVerdict), so no replay either.
+			// Known cost: no team audit event for this piece — the frame that held
+			// it was never read. The request is refused, so no content left.
+			// 围栏: TestApplyInboundFilter_LiveDetector_OversizeVerdictNeverForwardedUnscanned ·
+			//       TestApplyInboundFilter_OversizeVerdictFailsClosedAndIsCounted ·
+			//       internal/apphook TestChildHook_OversizeFrameFailsClosedAndStreamStaysInSync
+			switch {
+			case resp == nil:
+			case resp.VerdictUnreadable:
+				p.scanCoverage.unreadableOversizeVerdicts.Add(1)
+				logger.Warn("filter: detector verdict frame exceeded the pipe frame limit and was not read; "+
+					"refusing the request (fail-CLOSED)",
+					"event.name", observability.EventProxyFilterVerdictUnreadableOversize,
+					"hook", hook.Name(), "frame_bytes", resp.UnreadableFrameBytes,
+					"max_bytes", pipewire.MaxPayloadBytes)
+				resp.Action = apphook.ActionBlock
+				resp.Reason = ""
+			case resp.ScanIncomplete:
+				// THIRD SHAPE of the same family (TODO-121, P0, user decision
+				// 2026-09-15: every edition). The child answered, and its answer says
+				// it did not finish looking — a lane hit its hit budget or overran
+				// its deadline. Forwarding on that is how a prompt engineered to
+				// explode the hit count reached the upstream uninspected, so it is
+				// refused with the same constant message and the same Reason-clearing
+				// rule as the two branches around it. Block is never cached, so there
+				// is no replay either.
+				//
+				// A TIMEOUT of the whole Detect stays fail-OPEN next door (Degraded →
+				// case ActionAllow): that is "the child could not answer", §6 #11, and
+				// reversing it is NOT part of this change.
+				// 围栏: TestApplyInboundFilter_IncompleteVerdictFailsClosed ·
+				//       TestApplyInboundFilter_DegradedFailsOpen (unchanged control)
+				p.scanCoverage.incompleteScanVerdicts.Add(1)
+				logger.Warn("filter: detector reported an INCOMPLETE scan for this content; "+
+					"refusing the request (fail-CLOSED)",
+					"event.name", observability.EventProxyFilterScanIncomplete,
+					"hook", hook.Name())
+				resp.Action = apphook.ActionBlock
+				resp.Reason = ""
+			case !resp.Action.Recognized():
 				logger.Warn("filter: unrecognized apphook action; refusing the request (fail-CLOSED)",
 					"event.name", "proxy.filter.unknown_action",
 					"action", int(resp.Action), "reason", resp.Reason, "degraded", resp.Degraded)
@@ -615,7 +729,14 @@ func (p *Proxy) applyInboundFilter(
 			// 配套读侧守卫见上方 Get 分支 —— 两侧现在都过同一个 cacheableVerdict(),
 			// 见该函数的注释:第三个取值(代答)加进来时,「写侧排除 / 读侧守卫」这对
 			// 手工同步的条件就该收成一个出口了。
-			if cache != nil && resp != nil && !resp.Degraded && cacheableVerdict(resp.Action) {
+			// !resp.ScanIncomplete is redundant TODAY — the branch above rewrites an
+			// incomplete verdict to Block and cacheableVerdict already excludes
+			// Block — and it is written anyway, because the thing this guard has to
+			// survive is a future edit that moves or softens that rewrite. A verdict
+			// produced from a scan that did not finish must never be replayed for an
+			// hour, and that rule should be legible HERE, at the write, rather than
+			// depending on a chain of reasoning through another branch (TODO-121).
+			if cache != nil && resp != nil && !resp.Degraded && !resp.ScanIncomplete && cacheableVerdict(resp.Action) {
 				// maskedHead is cached in the detector's NUMBERLESS token form —
 				// per-request numbering happens AFTER cache replay so numbers stay
 				// request-scoped (同请求内按出现顺序编号) instead of leaking a stale
@@ -639,13 +760,30 @@ func (p *Proxy) applyInboundFilter(
 			continue
 		}
 
-		// Feed the request-level counter. Decoded from the event the detector
-		// built for THIS piece — including on a cache hit, whose replayed event
-		// is the same document (R-compliance-grading-18.S3 requires exactly that:
-		// a history piece served from cache still participates in this turn's
-		// count). Nil on a personal route, where the child uploads its own event
-		// and hands the proxy none — see decodeEventFindings.
+		// Feed the request-level counter. Decoded from what the detector handed
+		// back for THIS piece — including on a cache hit, whose replayed bytes are
+		// the same document (R-compliance-grading-18.S3 requires exactly that: a
+		// history piece served from cache still participates in this turn's
+		// count). On a team route that is the full event; on a personal route it
+		// is the content-free count projection (TODO-87, 2026-09-15: the org's
+		// cumulative rule follows the PERSON). ONE reader for both routes, so the
+		// two cannot count differently — see decodeEventFindings.
+		// spec: R-compliance-grading-15
 		escFindings[i] = decodeEventFindings(resp.Event)
+		if routeClass != apphook.RouteClassTeam {
+			// The proxy uploads nothing on this route, so the only id that names
+			// this piece's content row is the one the detector uploaded it under.
+			// The team branch below mints its own content-derived id instead,
+			// because there the proxy IS the uploader.
+			escUnitIDs[i] = decodeEventID(resp.Event)
+			switch {
+			case len(resp.Event) > 0:
+				personalProjected++
+			case resp.Action != apphook.ActionAllow:
+				// Flagged but uncountable: the detector predates TODO-87.
+				personalUnprojected++
+			}
+		}
 
 		// ── ACTION CEILING (方案② 2026-08-10) ────────────────────────────────
 		// The piece's ceiling comes from the SAME table row that made its block
@@ -867,7 +1005,7 @@ func (p *Proxy) applyInboundFilter(
 			// 🔴 NOT counted in p.errors, unlike the block above, and that is a
 			// judgement worth writing down: a canned answer is a SUCCESSFUL
 			// refusal — HTTP 200, the client's SDK parses it, the user reads a
-			// sentence. Counting it as a proxy error would make an organisation
+			// sentence. Counting it as a proxy error would make an organization
 			// that configured 代答 look unhealthy in proportion to how well the
 			// feature is working. The compliance event (already appended above)
 			// is where a refusal is counted.
@@ -995,6 +1133,12 @@ func (p *Proxy) applyInboundFilter(
 	// spec: R-compliance-grading-15 — proposal-layer, hence `rule:` and not a
 	// `spec:` anchor (see the canned-answer branches above for the convention).
 	// rule: R-compliance-grading-15
+	if routeClass != apphook.RouteClassTeam {
+		// TODO-87 BUT NOT: a detector that returns no projection only WARNs, it
+		// never refuses. Here, after the loop and ahead of every exit below, so a
+		// refused request reports it too and one request logs it at most once.
+		p.notePersonalProjectionState(logger, personalProjected, personalUnprojected)
+	}
 	esc := evaluateEscalation(pieces, escFindings, p.escalationRules, p.requestEscalationCeiling())
 	p.escalationMetrics.evaluated.Add(1)
 	p.escalationMetrics.lastCounted.Store(int64(esc.Counted))
@@ -1033,50 +1177,58 @@ func (p *Proxy) applyInboundFilter(
 			"action", esc.Action.String(), "capped", esc.Capped,
 			"already_refused", refusalAction != apphook.ActionAllow)
 
-		// Record the conclusion as its OWN audit row (R-compliance-grading-18).
-		// Team route only: a personal-route event is uploaded by the detector
-		// itself and the proxy has no channel of its own there — the same reason
-		// escFindings is empty on that route, so a personal request cannot reach
-		// this branch in the first place.
-		if routeClass == apphook.RouteClassTeam {
-			units := make([]string, 0, len(esc.Units))
-			for _, idx := range esc.Units {
-				if id := escUnitIDs[idx]; id != "" {
-					units = append(units, id)
-				}
+		// Record the conclusion as its OWN audit row (R-compliance-grading-18),
+		// on BOTH routes since TODO-87 (2026-09-15 — this block used to be team
+		// only, on the premise that a personal request could not reach it; the
+		// count projection removed that premise). unit_ids name the content rows
+		// that were counted: the proxy's own content-derived ids on a team route,
+		// the detector's projection event ids on a personal route (escUnitIDs is
+		// filled per route in the loop above).
+		// spec: R-compliance-grading-18
+		units := make([]string, 0, len(esc.Units))
+		for _, idx := range esc.Units {
+			if id := escUnitIDs[idx]; id != "" {
+				units = append(units, id)
 			}
-			ev, err := buildRequestVerdictEvent(requestVerdict{
-				TraceID:      traceID,
-				TenantID:     orgID,
-				VirtualKeyID: virtualKeyID,
-				SeatID:       seatID,
-				SessionID:    sessionID,
-				Action:       esc.Action.String(),
-				Rule:         esc.Rule.String(),
-				Counted:      esc.Counted,
-				UnitIDs:      units,
-				Now:          time.Now(),
-			})
-			switch {
-			case err != nil:
-				// Fail-loud, never fail the request: the refusal below still
-				// happens, the audit row is what is missing.
-				logger.Warn("filter: request verdict event could not be built; the escalation was "+
-					"enforced but not recorded",
-					"event.name", observability.EventProxyFilterEscalationEventDropped,
-					"error", err.Error(), "rule", esc.Rule.String())
-			case len(ev) == 0:
-				// No trace id → no derivable event id. buildRequestVerdictEvent
-				// documents why minting one anyway would be worse than emitting
-				// nothing (every trace-less request in the fleet would collapse
-				// onto one shared row).
-				logger.Warn("filter: request escalated but no trace id to derive a verdict event id "+
-					"from; the escalation is enforced but has no audit row",
-					"event.name", observability.EventProxyFilterEscalationEventDropped,
-					"rule", esc.Rule.String())
-			default:
-				teamEvents = append(teamEvents, ev)
-			}
+		}
+		ev, evErr := buildRequestVerdictEvent(requestVerdict{
+			TraceID:      traceID,
+			TenantID:     orgID,
+			VirtualKeyID: virtualKeyID,
+			SeatID:       seatID,
+			SessionID:    sessionID,
+			Action:       esc.Action.String(),
+			Rule:         esc.Rule.String(),
+			Counted:      esc.Counted,
+			UnitIDs:      units,
+			Now:          time.Now(),
+		})
+		switch {
+		case evErr != nil:
+			// Fail-loud, never fail the request: the refusal below still
+			// happens, the audit row is what is missing.
+			logger.Warn("filter: request verdict event could not be built; the escalation was "+
+				"enforced but not recorded",
+				"event.name", observability.EventProxyFilterEscalationEventDropped,
+				"error", evErr.Error(), "rule", esc.Rule.String())
+		case len(ev) == 0:
+			// No trace id → no derivable event id. buildRequestVerdictEvent
+			// documents why minting one anyway would be worse than emitting
+			// nothing (every trace-less request in the fleet would collapse
+			// onto one shared row).
+			logger.Warn("filter: request escalated but no trace id to derive a verdict event id "+
+				"from; the escalation is enforced but has no audit row",
+				"event.name", observability.EventProxyFilterEscalationEventDropped,
+				"rule", esc.Rule.String())
+		case routeClass == apphook.RouteClassTeam:
+			teamEvents = append(teamEvents, ev)
+		default:
+			// Personal route: LOCAL self-view only (user decision V1). Never
+			// teamEvents — master holds none of this route's content rows, so
+			// every unit id would dangle there, and the personal/team isolation
+			// of 2026-05-10 stays in force. Fence:
+			// TestEscalation_PersonalRouteNoDoubleUpload.
+			localVerdictEvents = append(localVerdictEvents, ev)
 		}
 
 		// Enact it. Only ever a STRENGTHENING: a refusal already recorded by a
@@ -1113,7 +1265,7 @@ func (p *Proxy) applyInboundFilter(
 			// under new names for a value that has not changed — a worse outcome
 			// than one alias line.
 			cannedAnswer := refusalAnswer
-			if err := writeCannedAnswer(w, cannedAnswer.proto, cannedAnswer.streaming, model, cannedAnswer.text); err != nil {
+			if writeErr := writeCannedAnswer(w, cannedAnswer.proto, cannedAnswer.streaming, model, cannedAnswer.text); writeErr != nil {
 				// planCannedAnswer already proved the shape is synthesizable, so
 				// reaching here means the CLIENT went away mid-write (or the
 				// writer was handed something it refuses). Either way the request
@@ -1123,7 +1275,7 @@ func (p *Proxy) applyInboundFilter(
 				logger.Error("filter: canned answer could not be written; request still refused, nothing forwarded",
 					"event.name", "proxy.filter.canned_answer_write_failed",
 					"protocol", cannedAnswer.proto.String(), "streaming", cannedAnswer.streaming,
-					"error", err.Error())
+					"error", writeErr.Error())
 				return false
 			}
 			logger.Info("filter: request answered from policy (代答); nothing forwarded upstream",
@@ -1514,7 +1666,7 @@ func injectActionTaken(eventJSON []byte, action string) []byte {
 // text, and such a request is not a canned answer at all: applyInboundFilter
 // degrades it to ActionBlock and the row's action_taken is `block`
 // (R-compliance-canned-answer-2.S2). Callers must not pass it, and the guard
-// below is defence in depth rather than policy.
+// below is defense in depth rather than policy.
 //
 // ⚠️ master stopped rejecting an out-of-domain value on 2026-09-12 (task 1.20:
 // 200 + NULL column + WARN, no longer 400), so a wrong value here is silently

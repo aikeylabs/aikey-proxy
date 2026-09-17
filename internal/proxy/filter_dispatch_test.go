@@ -705,7 +705,7 @@ func TestApplyInboundFilter_DetectorTimeoutStaysFailOpenWithGrading(t *testing.T
 	}
 
 	// --- WHEN: one request whose only piece hits the hung detector -------------
-	const body = `{"model":"m","messages":[{"role":"user","content":"please summarise the attached quarterly fund report"}]}`
+	const body = `{"model":"m","messages":[{"role":"user","content":"please summarize the attached quarterly fund report"}]}`
 	r := newReq(body)
 	w := httptest.NewRecorder()
 	var logBuf bytes.Buffer

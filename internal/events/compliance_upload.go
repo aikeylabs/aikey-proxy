@@ -104,8 +104,9 @@ func (r *Reporter) UploadComplianceEvents(ctx context.Context, routeSource strin
 // isolation is reversed for compliance events only; usage routing is untouched.
 //
 // Contract, deliberately weaker than UploadComplianceEvents:
-//   - no "personal" route on this host (Cluster node / server-side proxy — no
-//     local self-view store) → nil, nothing sent, nothing logged: not a gap;
+//   - no EXPLICIT non-empty "personal" route on this host (see
+//     hasLocalSelfViewRoute — a Cluster node carries only `team` + collector_url)
+//     → nil, nothing sent, nothing logged: not a gap;
 //   - failure → returned to the caller for a WARN, NEVER dead-lettered: the
 //     master copy is the record of truth and is conserved by the primary
 //     upload; replaying a mirror would double the dead-letter store for a
@@ -114,7 +115,7 @@ func (r *Reporter) UploadComplianceEvents(ctx context.Context, routeSource strin
 //     event_id is unchanged, so the local store's ON CONFLICT DO NOTHING keeps
 //     a retry idempotent.
 func (r *Reporter) MirrorComplianceEventsLocally(ctx context.Context, routeSource string, eventJSONs [][]byte) error {
-	if r.urlForRouteSource("personal") == "" || len(eventJSONs) == 0 {
+	if !r.hasLocalSelfViewRoute() || len(eventJSONs) == 0 {
 		return nil
 	}
 	stamped := make([][]byte, 0, len(eventJSONs))
@@ -134,10 +135,58 @@ func (r *Reporter) MirrorComplianceEventsLocally(ctx context.Context, routeSourc
 		}
 		stamped = append(stamped, b)
 	}
-	if upErr := r.postComplianceEvents(ctx, "personal", stamped); upErr != nil {
+	return r.UploadComplianceEventsLocally(ctx, stamped)
+}
+
+// UploadComplianceEventsLocally delivers compliance events to this host's LOCAL
+// self-view store (the "personal" collector route) exactly as given — no
+// route_source stamp, because these rows belong to the local lane itself rather
+// than mirroring a team upload.
+//
+// WHY IT EXISTS (TODO-87, user decision 2026-09-15 V1): on a PERSONAL route the
+// proxy now records a request-verdict row when the org's cumulative rule refuses
+// a member's request. That row goes to the local store ONLY — master receives
+// nothing from the personal route, so the 2026-05-10 personal/team isolation is
+// unchanged — and UploadComplianceEvents is the wrong tool for it: that method
+// dead-letters every failure for replay to master's route.
+//
+// Contract, identical to MirrorComplianceEventsLocally's (which delegates here):
+//   - no EXPLICIT non-empty "personal" route on this host (hasLocalSelfViewRoute;
+//     a Cluster node / server-side proxy) → nil, nothing sent: there is no local
+//     store to record into;
+//   - failure → returned for the caller's WARN, NEVER dead-lettered: the local
+//     store is not an authority the replay machinery addresses, and the refusal
+//     it describes has already been enforced;
+//   - event ids are deterministic (request-verdict ids derive from the trace), so
+//     the local store's ON CONFLICT DO NOTHING keeps a retry idempotent.
+func (r *Reporter) UploadComplianceEventsLocally(ctx context.Context, eventJSONs [][]byte) error {
+	if !r.hasLocalSelfViewRoute() || len(eventJSONs) == 0 {
+		return nil
+	}
+	// Explicit nil return, not `return r.postComplianceEvents(...)`: that returns
+	// a typed *uploadError, and a nil one wrapped in `error` is non-nil.
+	if upErr := r.postComplianceEvents(ctx, "personal", eventJSONs); upErr != nil {
 		return upErr
 	}
 	return nil
+}
+
+// hasLocalSelfViewRoute reports whether this host has a LOCAL self-view store to
+// deliver the local compliance lane to: the route table carries an EXPLICIT,
+// non-empty "personal" key.
+//
+// 🔴 Deliberately NOT urlForRouteSource("personal") != "". That resolver falls
+// back to CollectorURL when the key is absent — right for USAGE (a legacy
+// single-sink config still uploads), wrong here: a Cluster node's config has only
+// `team` plus collector_url, both pointing at the control-master gateway, so the
+// fallback turned "no local store" into "master", and every team compliance
+// batch was followed by a route_source-stamped copy POSTed to master. Every
+// install path that has a local store writes the key explicitly (template
+// common/aikey-proxy.yaml.tmpl, bundled aikey-proxy.yaml). The other
+// urlForRouteSource callers keep the fallback on purpose.
+// bugfix: roadmap20260320/技术实现/阶段9-商业化版本/博时基金合规能力融合/task-execution/TODO.md (TODO-119)
+func (r *Reporter) hasLocalSelfViewRoute() bool {
+	return r.cfg.CollectorRoutes["personal"] != ""
 }
 
 func (r *Reporter) postComplianceEvents(ctx context.Context, routeSource string, eventJSONs [][]byte) *uploadError {

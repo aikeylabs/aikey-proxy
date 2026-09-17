@@ -186,6 +186,75 @@ func TestMirrorComplianceEventsLocally_StampsRouteSource_NoDeadLetter(t *testing
 	}
 }
 
+// TestUploadComplianceEventsLocally_UnstampedNoopWithoutRouteNoDeadLetter fences
+// the local-only lane the personal-route request verdict uses (TODO-87 V1):
+//  1. delivered to the "personal" route byte-for-byte — NOT stamped route_source,
+//     because on the local store that key marks a mirror of a TEAM upload;
+//  2. nothing is ever sent to the team route;
+//  3. no local route (Cluster node / server) → silent no-op;
+//  4. failure → reported, NOT dead-lettered (the dead letter replays to master's
+//     route, and this lane must never reach master).
+func TestUploadComplianceEventsLocally_UnstampedNoopWithoutRouteNoDeadLetter(t *testing.T) {
+	var gotBody []byte
+	local := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotBody, _ = io.ReadAll(r.Body)
+		_ = json.NewEncoder(w).Encode(map[string][]string{"accepted_ids": {"rv_1"}})
+	}))
+	defer local.Close()
+	var teamHits atomic.Int64
+	team := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		teamHits.Add(1)
+		_ = json.NewEncoder(w).Encode(map[string][]string{"accepted_ids": {}})
+	}))
+	defer team.Close()
+
+	dir := t.TempDir()
+	r, err := NewReporter(&ReporterConfig{
+		CollectorRoutes:           map[string]string{"team": team.URL, "personal": local.URL},
+		CollectorRouteCredentials: map[string]Credential{"team": &StaticTokenCredential{Token: "member-jwt-x"}},
+		WALDir:                    dir,
+		DBPath:                    filepath.Join(dir, "events.db"),
+	})
+	if err != nil {
+		t.Fatalf("NewReporter: %v", err)
+	}
+	t.Cleanup(func() { r.Close() })
+	ctx := context.Background()
+	ev := `{"event_id":"rv_1","scenario":"request_verdict","action_taken":"block"}`
+
+	if err := r.UploadComplianceEventsLocally(ctx, [][]byte{[]byte(ev)}); err != nil {
+		t.Fatalf("local upload: %v", err)
+	}
+	if want := `{"events":[` + ev + `]}`; string(gotBody) != want {
+		t.Fatalf("local route body = %s, want %s (unstamped, byte-for-byte)", gotBody, want)
+	}
+	if n := teamHits.Load(); n != 0 {
+		t.Fatalf("the team route received %d request(s) from the local-only lane", n)
+	}
+
+	r2 := newComplianceReporter(t, t.TempDir(), "http://127.0.0.1:1")
+	if err := r2.UploadComplianceEventsLocally(ctx, [][]byte{[]byte(ev)}); err != nil {
+		t.Fatalf("a host without a local store must be a silent no-op, got: %v", err)
+	}
+
+	dir3 := t.TempDir()
+	r3, err := NewReporter(&ReporterConfig{
+		CollectorRoutes: map[string]string{"team": "http://127.0.0.1:1", "personal": "http://127.0.0.1:1"},
+		WALDir:          dir3,
+		DBPath:          filepath.Join(dir3, "events.db"),
+	})
+	if err != nil {
+		t.Fatalf("NewReporter: %v", err)
+	}
+	t.Cleanup(func() { r3.Close() })
+	if err := r3.UploadComplianceEventsLocally(ctx, [][]byte{[]byte(ev)}); err == nil {
+		t.Fatal("an unreachable local store must be reported to the caller, not swallowed")
+	}
+	if got := readDeadLetterEntries(t, dir3); len(got) != 0 {
+		t.Fatalf("a failed local-only upload must not be dead-lettered; got %d entries", len(got))
+	}
+}
+
 // A 400 from an older master must CONSERVE the batch, not drop it. 400 is
 // "terminal" only in the sense of "do not hot-retry" — the same bytes succeed
 // after the master upgrades, so discarding them is wrong.

@@ -1046,7 +1046,7 @@ func TestEscalation_RulesAreReadFromTheGradingDocument(t *testing.T) {
 	}
 }
 
-// TestEscalation_EnactableActionSetIsSingular is a TRIPWIRE, not a behaviour
+// TestEscalation_EnactableActionSetIsSingular is a TRIPWIRE, not a behavior
 // test: evaluateEscalation picks the FIRST rule that fires, which is only
 // correct while every enactable action concludes the same thing.
 //
@@ -1354,7 +1354,7 @@ func TestEscalation_UnresolvedHitsRaiseAWarn(t *testing.T) {
 //
 // WHY IT MATTERS: an operator sets AIKEY_COMPLIANCE_FILTER_MAX_ACTION=warn during
 // a rollout observation window — "block nothing yet, show me what would
-// happen". The detector honours it per piece (mask/block → warn inside
+// happen". The detector honors it per piece (mask/block → warn inside
 // actionpolicy.capRuntimeAction). Before this task the CUMULATIVE rule ignored
 // it and refused the whole request anyway: the safety valve failed exactly when
 // an operator is most likely to be using it (a new escalation rule and a lowered
@@ -1363,7 +1363,7 @@ func TestEscalation_UnresolvedHitsRaiseAWarn(t *testing.T) {
 //
 // Sub-cases, each the other's control:
 //
-//	unset → refused, verdict row `block`   (3.11 behaviour, byte-for-byte)
+//	unset → refused, verdict row `block`   (3.11 behavior, byte-for-byte)
 //	full  → refused, verdict row `block`   (same)
 //	warn  → FORWARDED, verdict row `warn`  (the fix)
 //

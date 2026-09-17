@@ -45,6 +45,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/AiKeyLabs/aikey-proxy/internal/observability"
 	"github.com/AiKeyLabs/pkg/aikeycompat"
 	"github.com/AiKeyLabs/pkg/pipewire"
 )
@@ -60,7 +61,7 @@ type ChildHookConfig struct {
 	// app_records.filter_record_allow flag. The child re-reads these at spawn,
 	// so a flag change → vault change_seq → proxy reload → re-spawn picks it up.
 	ExtraEnv []string
-	// ContentPolicyToken is an ALREADY-LABELLED, opaque token for a policy
+	// ContentPolicyToken is an ALREADY-LABELED, opaque token for a policy
 	// document this child is HANDED at spawn (today: the org compliance grading
 	// ladder, carried in ExtraEnv as AIKEY_COMPLIANCE_GRADING). "" = none.
 	//
@@ -139,27 +140,25 @@ type childResponse struct {
 	maskmeta []byte // v4: restorable-mask JSON (offsets only); empty unless the mask is restorable
 	event    []byte // team-routed compliance event for the proxy to forward; empty otherwise
 	action   byte
+	// oversize: the child's frame for this request exceeded
+	// pipewire.MaxPayloadBytes and was skipped unread (TODO-120). findings,
+	// maskmeta and event are empty; action is the byte the child wrote,
+	// informational only — the verdict itself could not be read.
+	oversize   bool
+	frameBytes uint32
 }
 
 // wireCannedAnswer is the ActionAnswer meaning of the `findings` slot: the text
 // an administrator wrote, plus which fallback tier supplied it.
 //
-// 🔴 WHY THIS IS A HAND-WRITTEN MIRROR AND WHAT KEEPS IT HONEST. Every other
-// JSON contract on this pipe is an alias of a pkg/pipewire type, because a
-// hand-retyped mirror drifts in a way the protocol version byte cannot catch
-// (see wireMaskMeta below for the incident). pkg/pipewire is a SIBLING
-// REPOSITORY, and extending its wire contract was ruled out of scope for task
-// 3.12 (TODO-68 weighed the same question for the capability bit and chose not
-// to). So the shared type is replaced by a paired byte-for-byte fixture: this
-// side pins the exact bytes in TestCannedAnswerTextReachesProxy, and
-// ai-compliance-detector pins the same literal from the producing side in
-// cmd/detector/canned_answer_carrier_test.go. Rename a tag on either side and
-// that side's own suite goes red. Promoting this into pkg/pipewire is the
-// standing recommendation — see the report for task 3.12.
-type wireCannedAnswer struct {
-	Text   string `json:"answer_text"`
-	Source string `json:"answer_source"`
-}
+// It is an alias of the shared pkg/pipewire type, like every other JSON contract
+// on this pipe, because a hand-retyped mirror drifts in a way the protocol
+// version byte cannot catch (see wireMaskMeta below for the incident). Task 3.12
+// shipped it as a hand-written mirror held honest by a byte literal pinned in
+// both repositories; TODO-85 (2026-09-15) promoted it into pkg/pipewire, whose
+// TestCannedAnswerWireBytes is now the ONE byte pin.
+// TestCannedAnswerContractIsPipewireAlias goes red if a local struct comes back.
+type wireCannedAnswer = pipewire.CannedAnswer
 
 // wireMaskMeta is the detector's v4 restorable-mask JSON contract.
 //
@@ -415,10 +414,30 @@ func (h *ChildHook) spawnLocked(ctx context.Context) error {
 // degraded so the next call lazily self-heals. In-flight callers are NOT failed
 // here — they time out via their own ctx (fail-open), which avoids racing a
 // concurrent restart's fresh requests.
+//
+// 🔴 EXCEPT an oversize frame (TODO-120, P0, 2026-09-15). A verdict frame longer
+// than pipewire.MaxPayloadBytes is a child that ANSWERED, not a pipe that broke:
+// readFrame skips it and keeps the stream aligned, and this loop hands that one
+// request an `oversize` response (Detect turns it into a fail-CLOSED refusal) and
+// keeps reading. It used to fall into the branch below: markDegraded + return,
+// which failed this request and every other in-flight request OPEN and made later
+// requests fail open instantly until a respawn — so repeating a sensitive value a
+// few hundred times forwarded it upstream unscanned.
+// 围栏: TestChildHook_OversizeFrameFailsClosedAndStreamStaysInSync ·
+// internal/proxy TestApplyInboundFilter_LiveDetector_OversizeVerdictNeverForwardedUnscanned.
 func (h *ChildHook) readLoop(r *bufio.Reader, gen uint64) {
 	for {
 		payload, err := h.readFrame(r)
 		if err != nil {
+			var oversize *pipewire.OversizeFrameError
+			if errors.As(err, &oversize) {
+				h.deliver(oversize.ReqID, &childResponse{
+					action:     oversize.Action,
+					oversize:   true,
+					frameBytes: oversize.Length,
+				})
+				continue
+			}
 			if h.gen.Load() == gen {
 				h.markDegraded("read_failed: " + err.Error())
 			}
@@ -428,15 +447,22 @@ func (h *ChildHook) readLoop(r *bufio.Reader, gen uint64) {
 		if !ok {
 			continue // malformed; drop (a real desync surfaces as a read error next)
 		}
-		h.pendingMu.Lock()
-		ch, ok := h.pending[reqID]
-		if ok {
-			delete(h.pending, reqID)
-		}
-		h.pendingMu.Unlock()
-		if ok {
-			ch <- resp // buffered (cap 1); never blocks even if the caller timed out
-		}
+		h.deliver(reqID, resp)
+	}
+}
+
+// deliver hands resp to the caller waiting on reqID, if it is still waiting. A
+// caller that already timed out removed its own entry, and the response is
+// dropped.
+func (h *ChildHook) deliver(reqID uint32, resp *childResponse) {
+	h.pendingMu.Lock()
+	ch, ok := h.pending[reqID]
+	if ok {
+		delete(h.pending, reqID)
+	}
+	h.pendingMu.Unlock()
+	if ok {
+		ch <- resp // buffered (cap 1); never blocks even if the caller timed out
 	}
 }
 
@@ -729,6 +755,21 @@ func (h *ChildHook) Detect(ctx context.Context, req *Request) *Response {
 		return &Response{Action: ActionAllow, Degraded: true, Reason: reason}
 	}
 
+	if resp.oversize {
+		// The child ANSWERED; its frame was too large to read (TODO-120). This is
+		// a verdict we cannot read, not a child we cannot reach, so it is neither
+		// Allow nor Degraded: Block + VerdictUnreadable, and the dispatcher refuses
+		// the request in every edition (R-compliance-canned-answer-6's family).
+		// The child stays healthy — it did its job, and the stream is in sync.
+		h.markDetectAnswered()
+		return &Response{
+			Action:               ActionBlock,
+			VerdictUnreadable:    true,
+			UnreadableFrameBytes: int(resp.frameBytes),
+			LatencyObserved:      time.Since(start),
+		}
+	}
+
 	res := &Response{
 		Action:          Action(resp.action),
 		LatencyObserved: time.Since(start),
@@ -784,7 +825,14 @@ func (h *ChildHook) Detect(ctx context.Context, req *Request) *Response {
 		res.Event = resp.event
 	}
 
-	// Update status (cheap atomic swap).
+	h.markDetectAnswered()
+	return res
+}
+
+// markDetectAnswered records that the child answered a Detect (cheap atomic
+// swap). Shared by the normal verdict path and the oversize-frame path: both are
+// a child that did its job, so both keep it healthy.
+func (h *ChildHook) markDetectAnswered() {
 	old := h.status.Load()
 	h.status.Store(&Status{
 		Healthy:       true,
@@ -794,8 +842,6 @@ func (h *ChildHook) Detect(ctx context.Context, req *Request) *Response {
 		RestartCount:  old.RestartCount,
 		LastDetectAt:  time.Now(),
 	})
-
-	return res
 }
 
 // ErrPacksUnavailable means the child could not report its effective packs
@@ -839,6 +885,16 @@ func (h *ChildHook) listPacks(ctx context.Context, markOnErr bool) ([]byte, erro
 			h.markDegraded("listpacks_failed: " + err.Error())
 		}
 		return nil, err
+	}
+	// An oversize report (TODO-120) was skipped unread: the child answered, so it
+	// is NOT marked degraded — taking a child that serves Detect out of rotation
+	// over an unreadable packs report would trade a missing admin view for
+	// uninspected traffic. Unavailable, exactly like an empty report.
+	if resp.oversize {
+		slog.Warn("apphook: effective-packs report exceeded the pipe frame limit and was not read",
+			"event.name", observability.EventAppHookListPacksOversize,
+			"name", h.cfg.Name, "frame_bytes", resp.frameBytes, "max_bytes", pipewire.MaxPayloadBytes)
+		return nil, ErrPacksUnavailable
 	}
 	// A child that doesn't implement op=4 returns an empty report → unavailable.
 	if len(resp.findings) == 0 {
@@ -1002,9 +1058,19 @@ func (s *pipeSession) writeFrame(ctx context.Context, payload []byte) error {
 // readFrame reads [version][len][payload] from r (the reader goroutine's stdout)
 // and enforces the version byte — a child speaking a different protocol must
 // fail loud rather than have its bytes mis-parsed at the wrong offsets.
+//
+// It reads with pipewire.ReadResponseFrame, which reports a frame over
+// MaxPayloadBytes as *pipewire.OversizeFrameError AFTER consuming it, so the
+// stream stays aligned (TODO-120). That error is only honored when its version
+// is the one we expect — a foreign-version frame is a protocol mismatch, and the
+// bytes we skipped were never ours to interpret.
 func (h *ChildHook) readFrame(r *bufio.Reader) ([]byte, error) {
-	version, payload, err := pipewire.ReadFrame(r)
+	version, payload, err := pipewire.ReadResponseFrame(r)
 	if err != nil {
+		var oversize *pipewire.OversizeFrameError
+		if errors.As(err, &oversize) && oversize.Version != h.cfg.ProtocolVersion {
+			return nil, fmt.Errorf("protocol version mismatch: child=%d expected=%d", oversize.Version, h.cfg.ProtocolVersion)
+		}
 		return nil, err
 	}
 	if version != h.cfg.ProtocolVersion {

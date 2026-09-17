@@ -32,7 +32,11 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"go/ast"
+	"go/parser"
+	"go/token"
 	"os"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
@@ -58,17 +62,93 @@ const carrierChildEvent = `{"event_id":"e-carrier-1","action_taken":"answer","fi
 const cannedAnswerGolden = "抱歉，这条内容命中了公司合规策略，无法发送给模型。\n" +
 	"如需帮助请联系合规部门。占位语法示例：{{IDCARD_1}} 原样保留。"
 
-// cannedAnswerGoldenWire is the EXACT byte string the detector writes into the
-// Findings slot for an ActionAnswer verdict.
+// cannedAnswerWire renders the Findings-slot payload the detector writes for an
+// ActionAnswer verdict, using the shared pipewire type both sides compile
+// against.
 //
-// 🔴 IT IS A LITERAL ON PURPOSE, AND IT IS PAIRED. ai-compliance-detector's
-// cmd/detector/canned_answer_carrier_test.go pins the same bytes from the
-// producing side. The two repositories cannot share a Go type (the shared wire
-// package pkg/pipewire is a sibling repo and adding to it was ruled out of scope
-// — see the report for task 3.12), so a byte-for-byte literal on each side is
-// what stands in for the shared type: rename a JSON tag on either side and that
-// side's own suite goes red.
-const cannedAnswerGoldenWire = `{"answer_text":"抱歉，这条内容命中了公司合规策略，无法发送给模型。\n如需帮助请联系合规部门。占位语法示例：{{IDCARD_1}} 原样保留。","answer_source":"level"}`
+// It is deliberately NOT a byte literal (TODO-85). The literal used to be pinned
+// here and in ai-compliance-detector as a stand-in for a shared type; the type
+// now exists, its bytes are pinned once in pkg/pipewire
+// TestCannedAnswerWireBytes, and TestCannedAnswerContractIsPipewireAlias below
+// keeps this package decoding with that type.
+func cannedAnswerWire(t *testing.T, text, source string) string {
+	t.Helper()
+	wire, err := json.Marshal(pipewire.CannedAnswer{Text: text, Source: source})
+	if err != nil {
+		t.Fatalf("marshal canned answer: %v", err)
+	}
+	return string(wire)
+}
+
+// TestCannedAnswerContractIsPipewireAlias — the 代答 action byte and payload type
+// are pkg/pipewire's; this package references them and must not re-spell them.
+//
+// Why a structural check for the constant: a local `ActionAnswer Action = 4` has
+// the right value, so any value comparison stays green with the copy back in
+// place. The re-spelling itself is what must go red.
+func TestCannedAnswerContractIsPipewireAlias(t *testing.T) {
+	if reflect.TypeOf(wireCannedAnswer{}) != reflect.TypeOf(pipewire.CannedAnswer{}) {
+		t.Errorf("wireCannedAnswer is %v, not an alias of pipewire.CannedAnswer — a local "+
+			"struct copy is exactly the hand-copied mirror whose JSON tags drift unseen",
+			reflect.TypeOf(wireCannedAnswer{}))
+	}
+
+	entries, err := os.ReadDir(".")
+	if err != nil {
+		t.Fatalf("read package dir: %v", err)
+	}
+	fset := token.NewFileSet()
+	var decls []string
+	for _, entry := range entries {
+		file := entry.Name()
+		if !strings.HasSuffix(file, ".go") || strings.HasSuffix(file, "_test.go") {
+			continue
+		}
+		parsed, err := parser.ParseFile(fset, file, nil, 0)
+		if err != nil {
+			t.Fatalf("parse %s: %v", file, err)
+		}
+		for _, decl := range parsed.Decls {
+			gen, ok := decl.(*ast.GenDecl)
+			if !ok || gen.Tok != token.CONST {
+				continue
+			}
+			for _, spec := range gen.Specs {
+				vs := spec.(*ast.ValueSpec)
+				for i, ident := range vs.Names {
+					if ident.Name != "ActionAnswer" {
+						continue
+					}
+					pos := fset.Position(ident.Pos()).String()
+					decls = append(decls, pos)
+					if i >= len(vs.Values) || !selectsPipewireActionAnswer(vs.Values[i]) {
+						t.Errorf("ActionAnswer at %s does not reference pipewire.ActionAnswer — the "+
+							"value must be referenced, never re-spelled as a literal", pos)
+					}
+				}
+			}
+		}
+	}
+	if len(decls) != 1 {
+		t.Errorf("ActionAnswer declared %d times (%v), want exactly 1 referencing pipewire.ActionAnswer",
+			len(decls), decls)
+	}
+}
+
+func selectsPipewireActionAnswer(expr ast.Expr) bool {
+	found := false
+	ast.Inspect(expr, func(n ast.Node) bool {
+		sel, ok := n.(*ast.SelectorExpr)
+		if !ok {
+			return true
+		}
+		if pkg, ok := sel.X.(*ast.Ident); ok && pkg.Name == "pipewire" && sel.Sel.Name == "ActionAnswer" {
+			found = true
+		}
+		return !found
+	})
+	return found
+}
 
 // TestHelperCannedAnswerChild is not a test: it is the child process for
 // TestCannedAnswerTextReachesProxy, re-executed from this same binary (the
@@ -109,11 +189,8 @@ func TestHelperCannedAnswerChild(t *testing.T) {
 			body = nil
 		}
 		res := &pipewire.Response{
-			ReqID: req.ReqID,
-			// 4 = ActionAnswer. Spelled as a literal because pkg/pipewire does
-			// not name it (see cannedAnswerGoldenWire); apphook.ActionAnswer is
-			// the authority and is asserted against it below.
-			Action:   4,
+			ReqID:    req.ReqID,
+			Action:   pipewire.ActionAnswer,
 			Findings: body,
 			Event:    []byte(carrierChildEvent),
 		}
@@ -130,17 +207,18 @@ func TestHelperCannedAnswerChild(t *testing.T) {
 // GIVEN 探测器判定为代答且已解析出文案 WHEN 经 pipe 送达 proxy
 // THEN proxy 拿得到 answer_text 与 answer_source (验收 3.A14 前半)
 func TestCannedAnswerTextReachesProxy(t *testing.T) {
-	if uint8(ActionAnswer) != 4 {
-		t.Fatalf("ActionAnswer = %d, want 4 — the child writes the raw byte 4 and "+
-			"the enum value travels the pipe unvalidated; renumbering it reinterprets "+
-			"every verdict in flight", uint8(ActionAnswer))
+	if uint8(ActionAnswer) != pipewire.ActionAnswer {
+		t.Fatalf("ActionAnswer = %d, want pipewire.ActionAnswer (%d) — the child writes the raw "+
+			"pipewire byte and the enum value travels the pipe unvalidated",
+			uint8(ActionAnswer), pipewire.ActionAnswer)
 	}
+	goldenWire := cannedAnswerWire(t, cannedAnswerGolden, "level")
 
 	h := NewChildHook(&ChildHookConfig{
 		Name:         "canned-answer-carrier",
 		BinaryPath:   os.Args[0],
 		BinaryArgs:   []string{"-test.run", "^TestHelperCannedAnswerChild$"},
-		ExtraEnv:     []string{carrierChildEnv + "=" + cannedAnswerGoldenWire},
+		ExtraEnv:     []string{carrierChildEnv + "=" + goldenWire},
 		Timeout:      5 * time.Second,
 		ReadyTimeout: 15 * time.Second,
 	})
@@ -153,7 +231,7 @@ func TestCannedAnswerTextReachesProxy(t *testing.T) {
 
 	// --- the case the feature exists for -------------------------------------
 	t.Run("text_and_source_arrive", func(t *testing.T) {
-		res := h.Detect(ctx, &Request{Payload: []byte(cannedAnswerGoldenWire)})
+		res := h.Detect(ctx, &Request{Payload: []byte(goldenWire)})
 		if res.Degraded {
 			t.Fatalf("child degraded: %s", res.Reason)
 		}
@@ -191,8 +269,8 @@ func TestCannedAnswerTextReachesProxy(t *testing.T) {
 		{"empty_findings_slot", "unset", "", ""},
 		{"malformed_json", `{"answer_text":`, "", ""},
 		{"not_an_object", `["answer_text"]`, "", ""},
-		{"source_none_carries_no_text", `{"answer_text":"","answer_source":"none"}`, "", "none"},
-		{"non_ascii_and_emoji", `{"answer_text":"合规策略拒绝了这条请求 🚫 — “引号” и кириллица","answer_source":"org"}`,
+		{"source_none_carries_no_text", cannedAnswerWire(t, "", "none"), "", "none"},
+		{"non_ascii_and_emoji", cannedAnswerWire(t, "合规策略拒绝了这条请求 🚫 — “引号” и кириллица", "org"),
 			"合规策略拒绝了这条请求 🚫 — “引号” и кириллица", "org"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -216,14 +294,11 @@ func TestCannedAnswerTextReachesProxy(t *testing.T) {
 	// protocol's own payload cap, and the text must arrive byte-identical up to it.
 	t.Run("oversized_text_survives", func(t *testing.T) {
 		long := strings.Repeat("合规提示。Compliance notice. ", 900) // ~30 KB of UTF-8
-		wire, err := json.Marshal(map[string]string{"answer_text": long, "answer_source": "org"})
-		if err != nil {
-			t.Fatalf("marshal: %v", err)
-		}
+		wire := cannedAnswerWire(t, long, "org")
 		if len(wire) >= pipewire.MaxPayloadBytes {
 			t.Fatalf("fixture %d bytes exceeds the protocol cap; shrink it", len(wire))
 		}
-		res := h.Detect(ctx, &Request{Payload: wire})
+		res := h.Detect(ctx, &Request{Payload: []byte(wire)})
 		if res.AnswerText != long {
 			t.Errorf("oversized text truncated: got %d bytes, want %d", len(res.AnswerText), len(long))
 		}

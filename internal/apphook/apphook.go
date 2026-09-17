@@ -31,6 +31,8 @@ package apphook
 import (
 	"context"
 	"time"
+
+	"github.com/AiKeyLabs/pkg/pipewire"
 )
 
 // Action is the verdict from a child app. Generic — not compliance-specific.
@@ -45,7 +47,12 @@ const (
 	// administrator-authored canned answer in its place (代答). Appended, never
 	// renumbered: the value travels the child pipe as a raw byte, so reordering
 	// the rungs would reinterpret every verdict already in flight.
-	ActionAnswer Action = 4
+	//
+	// The value is pipewire's, referenced rather than re-spelled (TODO-85): the
+	// detector writes pipewire.ActionAnswer, and a second spelling here is the
+	// hand-copied shape pkg/pipewire exists to remove. Fence:
+	// TestCannedAnswerContractIsPipewireAlias.
+	ActionAnswer Action = Action(pipewire.ActionAnswer)
 )
 
 func (a Action) String() string {
@@ -119,7 +126,7 @@ func NormalizeAction(a Action) Action {
 // when true, plain ActionBlock when false (design.md §4b). Declaring a
 // capability this build cannot serve is the same defect as failing open on an
 // unknown action, reached from the other side — the policy says "answer", the
-// proxy cannot, and the difference shows up as behaviour nobody configured.
+// proxy cannot, and the difference shows up as behavior nobody configured.
 //
 // 🔴 FALSE ON PURPOSE, and this is the task seam. Task 3.5 added the enum rung
 // and the fail-closed direction; the response synthesizer (writeCannedAnswer,
@@ -192,10 +199,16 @@ type Request struct {
 type Response struct {
 	Reason         string // human-readable (for error messages, logs)
 	MutatedPayload []byte // present iff Action == ActionMask
-	// Event is the compliance event JSON the child hands back for the proxy to
-	// forward to master, populated ONLY for team-routed requests (RouteClass=1).
-	// Empty for personal-routed (child uploaded locally) and non-Detect ops.
-	// (v2 protocol, update doc 20260603 §2.2/§3.2.)
+	// Event is a per-route-class slot (see pipewire.Response.Event for the
+	// authoritative table):
+	//   - team-routed (RouteClass=1): the full compliance event JSON the proxy
+	//     forwards to master (v2 protocol, update doc 20260603 §2.2/§3.2);
+	//   - personal-routed (RouteClass=0): a content-free pipewire.CountProjection
+	//     for the request-level escalation counter ONLY — the child already
+	//     uploaded the full event locally, and the proxy must never upload these
+	//     bytes (TODO-87, 2026-09-15). Empty when the org has no grading document
+	//     or the child predates TODO-87;
+	//   - non-Detect ops: empty.
 	Event []byte
 	// Restorables (v4 protocol, 2026-08-08) describes placeholder tokens the app
 	// substituted into MutatedPayload that the proxy MAY renumber into
@@ -207,6 +220,51 @@ type Response struct {
 	LatencyObserved time.Duration // measured by proxy, set by Hook.Detect not by child
 	Action          Action
 	Degraded        bool // true if child unreachable / timed out — proxy already fell back to Allow
+
+	// VerdictUnreadable marks a verdict the child DID produce but this proxy could
+	// not read — today: a response frame longer than pipewire.MaxPayloadBytes,
+	// skipped unread (TODO-120, P0, 2026-09-15). ChildHook sets it together with
+	// Action=ActionBlock and Degraded=false. In-memory only: it never travels the
+	// pipe, so no ProtocolVersion bump.
+	//
+	// 🔴 It is the OPPOSITE of Degraded, and that difference is the point:
+	//   Degraded          — the child could not ANSWER → fail OPEN (§6 #11);
+	//   VerdictUnreadable — the child answered and we cannot READ it → fail
+	//                       CLOSED, the same family as an unrecognized action
+	//                       (R-compliance-canned-answer-6). The dispatcher refuses
+	//                       the request on it in every edition (user decision P2).
+	// Before TODO-120 this shape was reported as Degraded, and repeating a
+	// sensitive value a few hundred times forwarded it upstream unscanned.
+	VerdictUnreadable bool
+	// UnreadableFrameBytes is the declared length of the frame behind
+	// VerdictUnreadable, for the operator's WARN line only; 0 otherwise.
+	UnreadableFrameBytes int
+
+	// ScanIncomplete marks a verdict the child produced from a scan that did NOT
+	// look at everything (TODO-121). It is the THIRD member of the family the two
+	// fields above belong to, and the three point in two different directions:
+	//
+	//	Degraded          — the child could not ANSWER          → fail OPEN (§6 #11)
+	//	VerdictUnreadable — it answered, we cannot READ it      → fail CLOSED
+	//	ScanIncomplete    — it answered, and it knows it did not finish → fail CLOSED
+	//
+	// Leaving the third one on the fail-open side would mean accepting that the
+	// detector may report "allow" for content it never finished inspecting, which
+	// is the P0 TODO-121 exists to close.
+	//
+	// In-memory only: it never travels the pipe, so no ProtocolVersion bump.
+	//
+	// 🔴 NO PRODUCER ON THE CHILD PIPE IN THIS ITERATION, and that is a decision,
+	// not an oversight. The detector enforces this rule AT SOURCE — an incomplete
+	// scan with no findings is refused inside the detector and arrives here as an
+	// ordinary ActionBlock — because carrying the bit across the pipe needs either
+	// a new wire field or a new meaning for an existing slot, and the user ruled
+	// 「第一期不加 wire 字段」 (design P6, 2026-09-15). What this field and the
+	// dispatcher branch behind it buy today is that the proxy-side leg is built
+	// and FENCED, so the day a carrier lands the handling is already correct
+	// rather than being re-derived. The gap it leaves is written up in the task
+	// report's 疑虑 section, not left to be discovered.
+	ScanIncomplete bool
 
 	// AnswerText is the administrator-authored canned answer (代答) the proxy
 	// serves INSTEAD of forwarding, populated iff Action == ActionAnswer. It is
@@ -268,6 +326,10 @@ type RestorableMask struct {
 //   - Detect MUST return within the configured timeout (default 1ms).
 //   - On any error / timeout / unreachable child, return Response{Action: Allow, Degraded: true}.
 //   - NEVER block the main LLM request path. degraded ≠ fail.
+//   - EXCEPTION (TODO-120, 2026-09-15): a verdict the child produced but the
+//     proxy cannot read (a frame over pipewire.MaxPayloadBytes) is NOT an error
+//     of the child's reachability — return Response{Action: Block,
+//     VerdictUnreadable: true, Degraded: false}. See Response.VerdictUnreadable.
 type Hook interface {
 	// Name is the app identifier (e.g. "ai-compliance-detector",
 	// "degrade-detector"). Used for status reporting and logs only.

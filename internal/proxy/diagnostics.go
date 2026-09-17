@@ -506,9 +506,21 @@ type MaskRestoreHealth struct {
 	// PipelineDiagnostics.GenerationID.
 	TruncatedPieces int64 `json:"scan_truncated_pieces"`
 	SkippedBytes    int64 `json:"scan_skipped_bytes"`
-	Issued          int64 `json:"placeholders_issued"`
-	Restored        int64 `json:"placeholders_restored"`
-	FidelityPct     int   `json:"fidelity_pct"`
+	// UnreadableOversizeVerdicts counts pieces REFUSED because the detector's
+	// verdict frame exceeded the pipe's single-frame limit (TODO-120,
+	// proxy.filter.verdict_unreadable_oversize). Scan scope for the same reason
+	// as the two above — it answers "whose verdict did nobody get to read?" — and
+	// likewise does NOT feed Status. Generation-scoped.
+	UnreadableOversizeVerdicts int64 `json:"scan_unreadable_oversize_verdicts"`
+	// IncompleteScanVerdicts counts pieces REFUSED because the detector reported
+	// an incomplete scan (TODO-121, proxy.filter.scan_incomplete). Scan scope for
+	// the same reason as the three above — it answers "whose content was judged
+	// without being fully inspected?" — and likewise does NOT feed Status.
+	// Generation-scoped.
+	IncompleteScanVerdicts int64 `json:"scan_incomplete_verdicts"`
+	Issued                 int64 `json:"placeholders_issued"`
+	Restored               int64 `json:"placeholders_restored"`
+	FidelityPct            int   `json:"fidelity_pct"`
 }
 
 // maskRestoreHealth is the ONE function every surface consults for placeholder
@@ -529,6 +541,9 @@ func (p *Proxy) maskRestoreHealth() MaskRestoreHealth {
 		// deployments least likely to be watching for it.
 		TruncatedPieces: p.scanCoverage.truncatedPieces.Load(),
 		SkippedBytes:    p.scanCoverage.skippedBytes.Load(),
+		// Same "before the early returns" reasoning as the two above.
+		UnreadableOversizeVerdicts: p.scanCoverage.unreadableOversizeVerdicts.Load(),
+		IncompleteScanVerdicts:     p.scanCoverage.incompleteScanVerdicts.Load(),
 	}
 	if issued <= 0 {
 		h.Status = MaskRestoreInactive

@@ -107,6 +107,8 @@ func (p ProtocolKind) String() string {
 		return "anthropic_messages"
 	case ProtocolOpenAIResponses:
 		return "openai_responses"
+	case ProtocolUnknown:
+		// Listed so the switch is exhaustive; it reads the same as an out-of-range kind.
 	}
 	return "unknown"
 }
@@ -160,11 +162,11 @@ var errNoCannedAnswer = errors.New("canned answer not synthesizable")
 // holding a truncated 200 with no way for the caller to fall back to a refusal —
 // the one outcome worse than either a block or an answer.
 //
-// The empty-text check here is defence in depth, not the policy: the policy
+// The empty-text check here is defense in depth, not the policy: the policy
 // lives at the call site (a resolved source of `none` degrades to ActionBlock
 // before we get here, R-compliance-canned-answer-2.S2). Duplicated because an
 // all-blank body reaches the user as 「模型什么也没说」 — indistinguishable from a
-// broken proxy, and it teaches exactly the retry behaviour 代答 exists to stop.
+// broken proxy, and it teaches exactly the retry behavior 代答 exists to stop.
 func writeCannedAnswer(w http.ResponseWriter, proto ProtocolKind, streaming bool, model, text string) error {
 	if strings.TrimSpace(text) == "" {
 		return errNoCannedAnswer
@@ -281,7 +283,7 @@ func planCannedAnswer(resp *apphook.Response, r *http.Request, bodyBytes []byte,
 	// 2. Text. Whitespace-only counts as empty, matching ResolveAnswerText's own
 	// hasText(): an all-blank "answer" reaches the user as a reply with nothing
 	// in it, which reads as 「模型什么也没说」 — not as a refusal, and it teaches
-	// exactly the retry behaviour 代答 exists to stop.
+	// exactly the retry behavior 代答 exists to stop.
 	text := resp.AnswerText
 	if strings.TrimSpace(text) == "" {
 		return degrade("no_answer_text")
@@ -367,6 +369,9 @@ func cannedAnswerBody(proto ProtocolKind, now time.Time, model, text string) ([]
 			}},
 			Usage: &responsesUsage{},
 		})
+	case ProtocolUnknown:
+		// Listed so the switch is exhaustive; an unknown shape is refused below, and
+		// writeCannedAnswer already rejects it before reaching here.
 	}
 	return nil, errNoCannedAnswer
 }
@@ -388,6 +393,8 @@ func cannedAnswerStreamFrames(proto ProtocolKind, now time.Time, model, text str
 		return anthropicStreamFrames(model, text)
 	case ProtocolOpenAIResponses:
 		return openAIResponsesStreamFrames(now, model, text)
+	case ProtocolUnknown:
+		// Listed so the switch is exhaustive; an unknown shape is refused below.
 	}
 	return nil, errNoCannedAnswer
 }
@@ -410,7 +417,7 @@ func openAIChatStreamFrames(now time.Time, model, text string) ([][]byte, error)
 		}
 	}
 	filtered := finishReasonContentFilter
-	var frames [][]byte
+	frames := make([][]byte, 0, 3) // role, content, finish
 	for _, payload := range []any{
 		chunk(openAIChatDelta{Role: "assistant"}, nil),
 		chunk(openAIChatDelta{Content: text}, nil),
@@ -469,7 +476,7 @@ func anthropicStreamFrames(model, text string) ([][]byte, error) {
 		}},
 		{"message_stop", anthropicStreamMessageStop{Type: "message_stop"}},
 	}
-	var frames [][]byte
+	frames := make([][]byte, 0, len(events))
 	for _, e := range events {
 		f, err := sseFrame(e.name, e.payload)
 		if err != nil {
@@ -558,7 +565,7 @@ func openAIResponsesStreamFrames(now time.Time, model, text string) ([][]byte, e
 				[]responsesOutputItem{doneItem}),
 		}},
 	}
-	var frames [][]byte
+	frames := make([][]byte, 0, len(events))
 	for _, e := range events {
 		f, err := sseFrame(e.name, e.payload)
 		if err != nil {
@@ -571,7 +578,7 @@ func openAIResponsesStreamFrames(now time.Time, model, text string) ([][]byte, e
 
 // sseFrame renders one `event:`/`data:` frame.
 //
-// 🔴 The payload is MARSHALLED, never formatted. json.Marshal escaping is
+// 🔴 The payload is MARSHALED, never formatted. json.Marshal escaping is
 // encoding, not interpolation: the client's decoder yields the original bytes,
 // which is exactly what invariant 12 requires. Note there is no Sprintf anywhere
 // in this file — the frame envelope is assembled from constants and the

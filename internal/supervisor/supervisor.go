@@ -1123,6 +1123,12 @@ func filterSigWithPasswordTier(base string, advanced bool) string {
 //
 // 能红 check: ignore the gradingJSON argument and TestFilterSig_ChangesWithGrading
 // fails. rule: R-compliance-grading-5
+//
+// spec: R-compliance-grading-5 分级策略变更必须让判定缓存与在跑子进程收敛
+// (task 7.5, 2026-09-14: the ID above has since been promoted to the
+// steady-state layer, so it is now anchored per check-code-anchors format —
+// the "rule:" note above stays as-is, this line does not replace it) —
+// roadmap20260320/技术实现/阶段9-商业化版本/博时基金合规能力融合/openspec/specs/compliance-grading/spec.md
 func filterSigWithGrading(base string, gradingJSON []byte) string {
 	return base + "|" + gradingComponent(gradingJSON)
 }

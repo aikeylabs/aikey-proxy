@@ -25,7 +25,7 @@ package proxy
 // reader who believes the (now corrected) comment in escalation.go — 「the
 // dispatcher forwards findings to master」 — would conclude that the text is
 // already leaving the machine and design the next feature accordingly. This
-// fence pins the truth as behaviour rather than as prose.
+// fence pins the truth as behavior rather than as prose.
 //
 // The SOURCE label (`answer_source`) does go up, deliberately: an administrator
 // reading the audit page must be able to tell which tier the sentence came from

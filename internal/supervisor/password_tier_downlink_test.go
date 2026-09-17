@@ -80,12 +80,12 @@ func TestFilterSig_ChangesWithPasswordTier(t *testing.T) {
 // both "always {}" and "keep the valid policy"):
 //
 //	① the `grading` key is ABSENT        → an old master → {} → grading OFF.
-//	                                       This is CORRECT behaviour, not a failure.
+//	                                       This is CORRECT behavior, not a failure.
 //	② the key is there but UNUSABLE      → keep the last valid policy + WARN.
 //	③ non-200 / network error            → keep the last valid policy.
 //
 // 🔴 Writing {} for ② or ③ would let one bad response — one network blip —
-// silently switch off compliance grading for an entire organisation, with a
+// silently switch off compliance grading for an entire organization, with a
 // normal-looking console on the other end. That is the whole reason ok exists as
 // a separate return: without it the fetch layer's nil would mean both "the org
 // turned grading off" and "I could not reach the org", which are opposites.

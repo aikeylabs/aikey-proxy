@@ -277,7 +277,24 @@ func (s *Supervisor) installFilterHook(p *proxy.Proxy, vaultReader *vault.Reader
 	// rule: R-compliance-grading-5
 	gradingEnv := "AIKEY_COMPLIANCE_GRADING=" + s.gradingEnvValue()
 
-	extraEnv := []string{recordAllowEnv, maxActionEnv, localIntakeEnv, privacyTierEnv, passwordTierEnv, gradingEnv}
+	// PARENT→CHILD capability declaration (TODO-114, 用户拍板 2026-09-15 方案 A).
+	// What THIS proxy binary can process from the child, derived ONLY from
+	// compiled Supports* predicates — see apphook/capabilities.go for why it may
+	// never come from vault, config or the environment.
+	//
+	// 🔴 RESIDENT AND UNCONDITIONAL, never inside a branch and never omitted. Two
+	// separate reasons, and losing either one is a silent defect:
+	//  1. The child must always learn the answer. An OLD proxy declares nothing,
+	//     and the detector reads that as "do not hand me a count projection" —
+	//     which is what stops a refusal that leaves no audit row behind.
+	//  2. ExtraEnv is appended AFTER os.Environ() and Go's exec keeps the LAST
+	//     occurrence, so this line is what overrides a residue value inherited
+	//     from ~/.aikey/proxy.env, cluster-node.env or a developer shell. Omit it
+	//     for an empty set and the residue would be believed.
+	// Fence: supervisor/filter_hook_capabilities_fence_test.go.
+	// rule: R-compliance-grading-24 个人路由计数投影（回传前提：proxy 已声明能处理）
+	extraEnv := []string{recordAllowEnv, maxActionEnv, localIntakeEnv, privacyTierEnv, passwordTierEnv, gradingEnv,
+		apphook.ProxyCapabilitiesEnv()}
 	// Resolve the pack-pull backend + tenant for the detector. Personal/Trial read
 	// the team URL from the CLI's config.json (no tenant scoping — one user, one
 	// view). A CLUSTER node has no CLI config.json; its control URL + org come from

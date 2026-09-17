@@ -132,7 +132,7 @@ const (
 	// change makes the verdict observable; refusing on it is a separate change.
 	// See supervisor/license_plane_rail.go and
 	// workflow/CI/bugfix/20260827-forwarding-gate-was-never-wired.md.
-	EventProxyLicensePlaneChanged    = "proxy.license.plane_changed"
+	EventProxyLicensePlaneChanged = "proxy.license.plane_changed"
 	// EventProxyDialectBridgePolicyChanged marks the transition when the control
 	// plane's answer for the Chat Completions ⇄ Responses switch changes —
 	// including to and from "unset", which is what decides whether this worker
@@ -142,8 +142,8 @@ const (
 	// could not parse. The worker falls back to local configuration rather than
 	// guessing, and says so.
 	EventProxyDialectBridgePolicyUnreadable = "proxy.dialect_bridge.policy_unreadable"
-	EventProxyLicensePlaneUnreadable = "proxy.license.plane_unreadable"
-	EventProxyLicensePlaneFileFailed = "proxy.license.plane_file_failed"
+	EventProxyLicensePlaneUnreadable        = "proxy.license.plane_unreadable"
+	EventProxyLicensePlaneFileFailed        = "proxy.license.plane_file_failed"
 	// EventProxyLicensePlaneCapabilities: logged once at start-up. It is also what
 	// anchors internal/proxy.LicenseConsumerMarker into the shipped binary — a
 	// const nothing references can be dropped by the linker, and the release gate
@@ -180,6 +180,14 @@ const (
 	// grading_policy_rejected, because a log line is not an externally readable
 	// health signal (「健康信号必须可被外部读取」).
 	EventComplianceGradingInvalid = "proxy.compliance.grading_invalid"
+	// EventCompliancePolicyUndecodable: GET /v1/compliance/policy answered 200
+	// but the body itself is not decodable JSON, so not even `enabled` could be
+	// read. Same outcome as the grading event above (keep the last valid policy,
+	// /health degraded) and the same one-WARN-per-rejected-poll contract; a
+	// separate name because the thing to inspect is whatever answered that URL,
+	// not the org's policy. Before 2026-09-15 this branch logged nothing at all.
+	// spec: R-compliance-grading-14.S2
+	EventCompliancePolicyUndecodable = "proxy.compliance.policy_undecodable"
 	// EventComplianceGradingStale: the org compliance policy has been
 	// unrefreshable for a SUSTAINED run of polls (unusable document, non-200 or
 	// network error, gradingRejectEscalateAfter times in a row). Logged at ERROR
@@ -356,6 +364,39 @@ const (
 	// (mask_restore.scan_truncated_pieces / scan_skipped_bytes), because a signal
 	// that only exists in a log file is not externally readable (health-signal-surface).
 	EventProxyFilterInputTruncated = "proxy.filter.input_truncated"
+	// EventProxyFilterVerdictUnreadableOversize: the detector ANSWERED a piece, but
+	// its verdict frame was longer than the pipe's single-frame limit
+	// (pipewire.MaxPayloadBytes), so the proxy skipped the frame without reading
+	// it and REFUSED the request (403 COMPLIANCE_BLOCKED) — fail-CLOSED, in every
+	// edition (TODO-120, user decision 2026-09-15; same family as an unrecognized
+	// action, R-compliance-canned-answer-6).
+	//
+	// WHY it exists: until TODO-120 this shape marked the child degraded and failed
+	// the request — and every other in-flight request — OPEN, so repeating a
+	// sensitive value a few hundred times forwarded it unscanned. The WARN names
+	// the frame size so an operator can tell "detector reply too large" from a
+	// policy block. Fields: hook, frame_bytes, max_bytes — never any content (the
+	// frame body is never read). Aggregate: /v1/diagnostics/pipeline
+	// mask_restore.scan_unreadable_oversize_verdicts.
+	EventProxyFilterVerdictUnreadableOversize = "proxy.filter.verdict_unreadable_oversize"
+	// EventProxyFilterScanIncomplete: the detector ANSWERED for a piece but
+	// reported that its scan did not look at everything (a lane hit its hit budget
+	// or overran its deadline), so the proxy REFUSED the request rather than
+	// forwarding content that was never fully inspected — fail-CLOSED, in every
+	// edition (TODO-121, user decision 2026-09-15; the third member of the family
+	// R-compliance-canned-answer-6 governs, after an unrecognized action and an
+	// unreadable oversize frame).
+	//
+	// WHY it is fail-closed while a TIMEOUT stays fail-open: a timeout means the
+	// child could not answer at all (§6 #11 — never block the main path on a
+	// filter that cannot run). This is the opposite case — the child answered, and
+	// its answer says "I did not finish", so treating it as a clean pass is how a
+	// hit explosion got forwarded unscanned in the first place.
+	//
+	// Fields: hook, findings (how many the partial scan did produce) — never any
+	// content. Aggregate: /v1/diagnostics/pipeline
+	// mask_restore.scan_incomplete_verdicts.
+	EventProxyFilterScanIncomplete = "proxy.filter.scan_incomplete"
 	// App-hook effective-content tracking (2026-08-13, bugfix
 	// 20260813-pack-swap-does-not-invalidate-proxy-cache). A child app can
 	// hot-swap the content it detects against without restarting, so the proxy
@@ -376,6 +417,11 @@ const (
 	// the same child-side condition.
 	EventAppHookContentVersionChanged = "proxy.apphook.content_version_changed"
 	EventAppHookContentVersionUnknown = "proxy.apphook.content_version_unknown"
+	// EventAppHookListPacksOversize: the child's op=ListPacks report exceeded the
+	// pipe's single-frame limit and was skipped unread (TODO-120). The child is
+	// NOT marked degraded — it still serves Detect — and the report reads as
+	// unavailable. Fields: name, frame_bytes, max_bytes; no content.
+	EventAppHookListPacksOversize = "proxy.apphook.listpacks_oversize"
 	// Verdict-cache suspension, observed FROM THE DATA PLANE (2026-08-13, review
 	// finding B6). The pair above is raised by the background poll inside the
 	// hook; these two are the dispatcher's own 二层兜底 (日志规范), raised at the
@@ -421,8 +467,27 @@ const (
 	// administrator has no record of why — an audit gap, so it is WARN rather
 	// than a debug line (R-compliance-grading-18).
 	EventProxyFilterEscalationEventDropped = "proxy.filter.escalation_event_dropped"
-	EventProxyFilterVerdictCacheSuspended  = "proxy.filter.verdict_cache_suspended"
-	EventProxyFilterVerdictCacheResumed    = "proxy.filter.verdict_cache_resumed"
+	// EventProxyFilterPersonalProjectionMissing: escalation rules are installed,
+	// a PERSONAL-routed piece came back flagged (mask / warn / block / answer),
+	// and the detector handed back no count projection in Response.Event — so
+	// that piece cannot count toward the org's cumulative rule (TODO-87). The
+	// usual cause is a detector older than the proxy. The request is NOT failed
+	// (fail-open, §6 #11); this line is what keeps the under-enforcement from
+	// being silent. WARN on the TRANSITION only, latched on the Proxy
+	// generation: an un-upgraded detector stays that way, and one line per
+	// request would bury the signal.
+	// EventProxyFilterPersonalProjectionRestored: INFO bracket — a flagged
+	// personal-route piece carried a projection again after the WARN above.
+	EventProxyFilterPersonalProjectionMissing  = "proxy.filter.personal_count_projection_missing"
+	EventProxyFilterPersonalProjectionRestored = "proxy.filter.personal_count_projection_restored"
+	// EventProxyFilterRequestVerdictLocalFailed: the request-verdict row of a
+	// PERSONAL-routed escalation could not be written to this machine's local
+	// self-view store. That row goes to the local store ONLY (TODO-87, 2026-09-15
+	// user decision V1: master receives nothing from the personal route), and it
+	// is best-effort: never dead-lettered, and the refusal itself is unaffected.
+	EventProxyFilterRequestVerdictLocalFailed = "proxy.filter.request_verdict_local_upload_failed"
+	EventProxyFilterVerdictCacheSuspended     = "proxy.filter.verdict_cache_suspended"
+	EventProxyFilterVerdictCacheResumed       = "proxy.filter.verdict_cache_resumed"
 	// Oauth-group routing (N8). EventProxyGroupRouteResolved: a group VK request
 	// picked + injected a candidate account. EventProxyGroupRouteDegraded: no
 	// usable candidate (no material / all expired-exhausted / key unavailable) →
@@ -539,6 +604,17 @@ const (
 	ErrCodeProviderError                  = "PROVIDER_ERROR"
 	ErrCodeUsageExtractionFailed          = "USAGE_EXTRACTION_FAILED"
 	ErrCodeClusterVaultAssignmentsCorrupt = "CLUSTER_VAULT_ASSIGNMENTS_CORRUPT"
+	// Reason codes for ONE rejected org compliance-policy download (the per-poll
+	// WARN of R-compliance-grading-14.S2; the node keeps enforcing the last valid
+	// policy either way). Two codes because the remedy differs:
+	//   ErrCodeCompliancePolicyUndecodable — the whole /v1/compliance/policy body
+	//     is not decodable JSON (a proxy / gateway page in front of the master, a
+	//     truncated body): look at what answers that URL, not at the policy.
+	//   ErrCodeComplianceGradingUnusable — the body decoded, but its `grading`
+	//     member is unparseable, not an object, or over the size bound: look at
+	//     the org's grading policy on the console.
+	ErrCodeCompliancePolicyUndecodable = "COMPLIANCE_POLICY_UNDECODABLE"
+	ErrCodeComplianceGradingUnusable   = "COMPLIANCE_GRADING_UNUSABLE"
 	// ErrCodeLicenseForwardingDenied: this deployment's license does not currently
 	// permit AI forwarding (expired, never activated past its grace deadline,
 	// revoked, or bound to a different machine). Carried on a 402, NOT a 403:

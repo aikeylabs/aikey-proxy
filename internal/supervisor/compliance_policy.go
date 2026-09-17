@@ -162,13 +162,13 @@ func (s *Supervisor) syncComplianceMasterPolicy(ctx context.Context) {
 // WHY IT IS SPLIT OUT OF THE POLLER: three of the four values it takes are
 // baked into a child process's environment at spawn, and the rule for what to
 // do when the master's answer is unusable is DIFFERENT per value — a distinction
-// that only exists as behaviour, so it needs somewhere to be asserted. The
+// that only exists as behavior, so it needs somewhere to be asserted. The
 // poller itself needs a control-panel URL, a team VK and a live generation, so
 // nothing could be pinned through it; this method needs a zero Supervisor.
 //
 // fetchOK=false means "no answer", never "the answer was: nothing". Everything
 // this method would set stays as it was, which for the scalars is the long
-// standing behaviour ("don't flap on a transient miss") and for the grading
+// standing behavior ("don't flap on a transient miss") and for the grading
 // document is DEC-compliance-grading-10: one unusable response must not switch
 // an organisation's whole ladder off while its console still shows it on.
 // rule: R-compliance-grading-5
@@ -377,6 +377,17 @@ func fetchComplianceMasterPolicy(ctx context.Context, masterURL, orgID string) (
 		Grading *json.RawMessage `json:"grading"`
 	}
 	if err := json.NewDecoder(resp.Body).Decode(&body); err != nil {
+		// spec: R-compliance-grading-14.S2 一次非法下发恰好一条 WARN（带原因码）
+		// Used to return silently: /health still went degraded, but the logs held
+		// no trace of the first rejection. One WARN per rejected document, emitted
+		// HERE in the failing branch rather than in noteCompliancePolicyRejected,
+		// because that counter also sees network errors and non-200 answers, which
+		// the 2026-09-15 decision (TODO-103) deliberately left out of this clause.
+		// No decoder error text: it can quote bytes of the body.
+		slog.Warn("compliance master policy response is not decodable JSON; "+
+			"keeping the last valid policy",
+			"event.name", observability.EventCompliancePolicyUndecodable,
+			"error.code", observability.ErrCodeCompliancePolicyUndecodable)
 		return false, privacyTierMetadataOnly, false, nil, false
 	}
 	grading, gradingUsable := normalizeGradingPolicy(body.Grading)
@@ -384,9 +395,11 @@ func fetchComplianceMasterPolicy(ctx context.Context, masterURL, orgID string) (
 		// Loud, because the only other symptom is a fleet quietly enforcing an
 		// older ladder than the console displays (失败要显眼). No content: the
 		// document is org policy, but it is still not ours to log.
+		// spec: R-compliance-grading-14.S2 — carries the reason code too.
 		slog.Warn("compliance master policy carries an unusable grading document; "+
 			"keeping the last valid one",
 			"event.name", observability.EventComplianceGradingInvalid,
+			"error.code", observability.ErrCodeComplianceGradingUnusable,
 			"bytes", len(*body.Grading))
 		return false, privacyTierMetadataOnly, false, nil, false
 	}

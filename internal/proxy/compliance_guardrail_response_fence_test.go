@@ -261,7 +261,7 @@ var guardrailVerbatimSources = map[string]string{
 	// stuffing matched text into the answer field. If AnswerText ever becomes
 	// free-form detector output, this entry is wrong and the fix is to stop
 	// passing it to the client, not to relax the fence.
-	// The behavioural half is canned_answer_test.go
+	// The behavioral half is canned_answer_test.go
 	// TestCannedAnswer_TextIsNeverInterpolated, which asserts the bytes on the
 	// wire are byte-identical to the stored text and carry no finding fragment.
 	"cannedAnswer.text": "the administrator-authored canned answer, resolved through the single " +

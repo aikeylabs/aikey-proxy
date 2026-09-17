@@ -9,11 +9,11 @@ import (
 // Fence for the supervisor half of task 3.11: the org escalation rules must
 // actually be HANDED to the proxy.
 //
-// 🔴 WHY A SOURCE FENCE AND NOT A BEHAVIOURAL ONE. The call lives on
+// 🔴 WHY A SOURCE FENCE AND NOT A BEHAVIORAL ONE. The call lives on
 // installFilterHook's spawn-SUCCESS path, and the only test in this package that
 // reaches that path is filter_max_action_integration_test.go (build tag
 // `integration`: a real CLI-migrated vault plus the real detector binary). A
-// unit-level behavioural fence would need that same harness. The alternative
+// unit-level behavioral fence would need that same harness. The alternative
 // that looks cheaper — a test that calls p.SetComplianceGrading itself — is the
 // false-green shape task 3.8 caught in its own first draft: it stays green with
 // the production call site deleted. So this asserts on the call site, reusing
@@ -43,7 +43,7 @@ func TestEscalationRulesAreHandedToTheProxy(t *testing.T) {
 
 	// Same bytes as the detector env, or the two readers can enforce different
 	// policies. gradingEnvValue (the env) and SetComplianceGrading must both read
-	// gradingPolicyJSON — one document, two readers, each modelling its own member.
+	// gradingPolicyJSON — one document, two readers, each modeling its own member.
 	var arg ast.Expr
 	ast.Inspect(install, func(n ast.Node) bool {
 		call, ok := n.(*ast.CallExpr)
@@ -83,7 +83,7 @@ func TestEscalationRulesAreHandedToTheProxy(t *testing.T) {
 // said to only warn on). So this asserts that both uses are the SAME declared
 // variable, and that nothing reassigns it after the env line is built.
 //
-// Source fence rather than behavioural, for the reason the fence above spells
+// Source fence rather than behavioral, for the reason the fence above spells
 // out: the call sits on installFilterHook's spawn-SUCCESS path, which only the
 // `integration`-tagged harness reaches.
 //

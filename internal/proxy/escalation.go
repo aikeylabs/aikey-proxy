@@ -13,10 +13,12 @@ import (
 	"bytes"
 	"encoding/json"
 	"fmt"
+	"log/slog"
 	"strings"
 	"sync/atomic"
 
 	"github.com/AiKeyLabs/aikey-proxy/internal/apphook"
+	"github.com/AiKeyLabs/aikey-proxy/internal/observability"
 )
 
 // Finding is the proxy-side decoded view of one detector finding, holding only
@@ -41,7 +43,7 @@ import (
 // Corrected 2026-09-14 (task 3.12) because a wrong comment is the next
 // implementer's input: task 3.6 was about to build the 代答 text carrier on top
 // of this sentence, which would have meant weighing the privacy of a payload it
-// believed already travelled to master. 「重名不同义的字段必须写全限定」— hence the
+// believed already traveled to master. 「重名不同义的字段必须写全限定」— hence the
 // full qualification above rather than a bare "findings".
 //
 // Field names and JSON tags are taken verbatim from the compliance intake wire
@@ -62,7 +64,7 @@ type Finding struct {
 	// pieces[i].text (filter_dispatch.go caps the payload at pipeInputCap on a
 	// rune boundary and re-attaches the tail after masking). Piece #2's [10,21)
 	// is a completely different substring from piece #1's [10,21) — see
-	// injectWireLabels for the same warning on the labelling join.
+	// injectWireLabels for the same warning on the labeling join.
 	StartOffset int `json:"start_offset"`
 	EndOffset   int `json:"end_offset"`
 	// Level is the classification level (1..N) resolved from the tenant's
@@ -149,7 +151,7 @@ type Finding struct {
 // by-design exclusion into it and the caller WARNs on every agent turn that
 // reads a config file, at which point nobody reads the WARN any more and the
 // real cross-process desync it exists to surface goes back to being invisible.
-func countDistinctHits(pieces []contentPiece, findings [][]Finding, minLevel int) (count int, skipped int) {
+func countDistinctHits(pieces []contentPiece, findings [][]Finding, minLevel int) (count, skipped int) {
 	t := tallyDistinctHits(pieces, findings, minLevel)
 	return t.count, t.skipped
 }
@@ -163,7 +165,7 @@ func countDistinctHits(pieces []contentPiece, findings [][]Finding, minLevel int
 // minLevel && countsTowardEscalation && sliceable` a second time, and the day
 // the two spellings disagree the verdict row would name pieces that were not
 // counted (or omit ones that were) with nothing going red. countDistinctHits
-// keeps its exact signature and behaviour on top of this core, so the fences
+// keeps its exact signature and behavior on top of this core, so the fences
 // task 3.9 wrote still exercise the code that ships.
 type hitTally struct {
 	// count is the number of DISTINCT values, the input to a rule's min_count.
@@ -302,7 +304,7 @@ func hitValue(text string, f Finding) (string, bool) {
 // (`escalation []{min_level int, min_count int, action string}`), which is the
 // same document master stores and the console edits. Unknown members of the
 // document are the customer's own and pass through untouched — this type is a
-// READER and is never marshalled back (the same posture as the detector's
+// READER and is never marshaled back (the same posture as the detector's
 // actionpolicy.Grading and master's compliance.GradingDocument; a partial writer
 // deletes what it has not learned yet).
 //
@@ -348,7 +350,7 @@ func (r EscalationRule) String() string {
 //   - answer (代答) needs an administrator-authored SENTENCE, and every tier of
 //     the three-tier fallback that produces one is resolved per FINDING inside
 //     the detector (actionpolicy.ResolveAnswerText). A request-level conclusion
-//     belongs to no finding, so there is no text to serve; synthesising a 200
+//     belongs to no finding, so there is no text to serve; synthesizing a 200
 //     with an empty body is exactly the failure R-compliance-canned-answer-2.S2
 //     rules out. It is REJECTED rather than degraded to a silent block because
 //     the administrator asked for a friendly refusal and must be told they are
@@ -463,7 +465,7 @@ type escalationOutcome struct {
 	// When no rule fired it is the LARGEST count any pass produced, i.e. how
 	// close the request came. That distinction is what lets a reader tell "every
 	// hit was excluded" (0) apart from "two hits, threshold three" (2) — the
-	// second is a working control, the first is often a mis-labelled ruleset.
+	// second is a working control, the first is often a mis-labeled ruleset.
 	// With no rules configured at all there is no pass and it is 0.
 	Counted int
 	// Skipped is the largest number of unresolvable hits any counting pass saw.
@@ -575,13 +577,16 @@ func evaluateEscalation(pieces []contentPiece, findings [][]Finding, rules []Esc
 // and it still travels to master intact; failing the user's request over it
 // would turn a reporting defect into an outage (§6 #11).
 //
-// EMPTY ON PERSONAL ROUTES, BY CONSTRUCTION — read this before concluding the
-// counter is broken there. apphook.Response.Event is populated ONLY for
-// team-routed requests; on a personal route the detector uploads its own event
-// to the local intake and hands the proxy nothing. So a personal-route request
-// counts zero hits and never escalates. That is a KNOWN LIMIT of this iteration,
-// not a silent one: closing it needs the findings to cross the pipe on the
-// personal route too, which is a wire-contract change in another repository.
+// PERSONAL ROUTES (TODO-87, 2026-09-15 — this paragraph used to say personal
+// routes decode to nothing and never escalate; that limit is closed). On a
+// personal route apphook.Response.Event is a pipewire.CountProjection: the
+// detector has already uploaded the full event to the local self-view and hands
+// the proxy only `event_id` + `findings[]{start_offset, end_offset, level,
+// category, confirmed}`. Those keys are a subset of a team event's, so THIS one
+// reader serves both routes and the two cannot count differently. Event is still
+// empty on a personal route when the org has no grading document (nothing to
+// count) or the detector predates TODO-87 (the dispatcher WARNs on that).
+// spec: R-compliance-grading-15 (累计升级在片段循环后做请求级判定 — now on both routes)
 func decodeEventFindings(eventJSON []byte) []Finding {
 	if len(eventJSON) == 0 {
 		return nil
@@ -601,9 +606,72 @@ func decodeEventFindings(eventJSON []byte) []Finding {
 	return findings
 }
 
+// decodeEventID reads `event_id` out of a personal-route count projection
+// (pipewire.CountProjection) — the id of the content row the DETECTOR uploaded
+// to the local self-view for this piece.
+//
+// It is the personal route's counterpart of auditUnitID: on a team route the
+// proxy mints the row id itself (content-derived) because it uploads the row; on
+// a personal route it uploads nothing, so the only id that names an existing row
+// is the one the detector already used. The request-verdict row lists these ids
+// in escalation.unit_ids (R-compliance-grading-18: 「关联走该列表」), so using any
+// other value would leave every entry pointing at nothing.
+//
+// Fail-safe like decodeEventFindings: unreadable ⇒ "". An empty id is skipped
+// when the verdict row's list is built, never invented.
+func decodeEventID(eventJSON []byte) string {
+	if len(eventJSON) == 0 {
+		return ""
+	}
+	var head struct {
+		EventID string `json:"event_id"`
+	}
+	if err := json.Unmarshal(eventJSON, &head); err != nil {
+		return ""
+	}
+	return head.EventID
+}
+
+// notePersonalProjectionState surfaces, on the transition only, that a
+// personal-route request could not be fully counted because the detector handed
+// back no count projection for some flagged pieces (TODO-87 BUT NOT: 探测器过旧
+// 不回传投影时只告警不拦截).
+//
+// withProjection / withoutProjection count THIS request's pieces: a piece with a
+// projection, and a flagged (non-allow) piece without one. With no escalation
+// rules installed there is nothing to under-enforce and it stays silent — the
+// Personal edition and orgs without rules must see no new log line.
+//
+// WHY THE LATCH: an un-upgraded detector stays un-upgraded, so a per-request
+// line would emit at request rate until someone upgrades — the same reasoning as
+// noteVerdictCacheState. Called from the dispatcher with the REQUEST logger so
+// the WARN carries request_id / trace_id / span_id (日志规范).
+func (p *Proxy) notePersonalProjectionState(logger *slog.Logger, withProjection, withoutProjection int) {
+	if len(p.escalationRules) == 0 {
+		return
+	}
+	if withoutProjection > 0 {
+		if p.personalProjectionMissing.CompareAndSwap(false, true) {
+			logger.Warn("filter: personal-route pieces were flagged but the detector returned no count projection; "+
+				"they do NOT count toward the organization's cumulative escalation rule (upgrade the detector)",
+				"event.name", observability.EventProxyFilterPersonalProjectionMissing,
+				"pieces_without_projection", withoutProjection,
+				"pieces_with_projection", withProjection,
+				"rules", len(p.escalationRules))
+		}
+		return
+	}
+	if withProjection > 0 && p.personalProjectionMissing.CompareAndSwap(true, false) {
+		logger.Info("filter: personal-route count projections are arriving again; cumulative escalation counts "+
+			"personal-key traffic",
+			"event.name", observability.EventProxyFilterPersonalProjectionRestored,
+			"pieces_with_projection", withProjection)
+	}
+}
+
 // parseEscalationRules reads `escalation[]` out of the org grading document the
 // master handed down (the same bytes the supervisor bakes into the detector's
-// AIKEY_COMPLIANCE_GRADING env — one document, two readers, each modelling only
+// AIKEY_COMPLIANCE_GRADING env — one document, two readers, each modeling only
 // its own member).
 //
 // It returns the rules this proxy can enact and, separately, a human-readable

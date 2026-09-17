@@ -391,6 +391,12 @@ func toolResultPiece(t *testing.T, payload string) []contentPiece {
 
 // categorizedHit is hitAt plus the family label. It reuses hitAt so the offset
 // arithmetic stays in exactly one place.
+// level stays a parameter although every call passes escalationMinLevel today:
+// countDistinctHits filters on minLevel, so a case proving that below-threshold
+// hits are not counted needs a different level, and a constant here would have
+// to be undone to write it.
+//
+//nolint:unparam // deliberate: see above
 func categorizedHit(t *testing.T, text, value, category string, level int) Finding {
 	t.Helper()
 	f := hitAt(t, text, value, level, true)
