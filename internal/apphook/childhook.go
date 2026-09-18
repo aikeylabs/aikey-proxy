@@ -614,9 +614,32 @@ func (h *ChildHook) lazyRecover() {
 // Name implements Hook.
 func (h *ChildHook) Name() string { return h.cfg.Name }
 
+// callClass says what a failed roundtrip is allowed to conclude about the child.
+// ONE enum instead of per-call-site booleans: which failures move the worker's
+// health is a single policy, and it must read the same at every raise site.
+type callClass uint8
+
+const (
+	// callHealthSignal — Detect and the background content-version poll. Their
+	// failures are the health signal: a write timeout retires the pipe and marks
+	// the child degraded (bugfix 20260813-childhook-write-before-deadline-wedges-
+	// main-path), a write error marks it degraded. A REPLY timeout marks nothing
+	// on either — that was already so before TODO-144.
+	callHealthSignal callClass = iota
+	// callAdminQuery — operator-initiated GET /admin/compliance/packs. Its
+	// failure is returned to the caller and concludes NOTHING about the child:
+	// no markDegraded, no pipe retirement (TODO-144; see ListPacks for the Why).
+	callAdminQuery
+)
+
+// concludesHealth reports whether a failure of this call may change the child's
+// health state (markDegraded / retire the pipe session).
+func (c callClass) concludesHealth() bool { return c == callHealthSignal }
+
 // roundtrip sends one request and waits for its response (or the ctx deadline).
 // Concurrency-safe: many roundtrips can be in flight at once, demuxed by req-id.
-func (h *ChildHook) roundtrip(ctx context.Context, op, routeClass byte, body []byte) (*childResponse, error) {
+// class decides whether a failure here may touch the child's health state.
+func (h *ChildHook) roundtrip(ctx context.Context, class callClass, op, routeClass byte, body []byte) (*childResponse, error) {
 	// Lazy self-heal: if degraded, kick a bounded respawn off in the BACKGROUND
 	// and fail open immediately. The restart must NOT run on the hot path —
 	// lazyRecover uses context.Background()+lazyRestartBound (2s), ignoring this
@@ -632,7 +655,9 @@ func (h *ChildHook) roundtrip(ctx context.Context, op, routeClass byte, body []b
 
 	s := h.session.Load()
 	if s == nil {
-		h.markDegraded("write_failed: stdin closed")
+		if class.concludesHealth() {
+			h.markDegraded("write_failed: stdin closed")
+		}
 		return nil, errStdinClosed
 	}
 
@@ -648,7 +673,7 @@ func (h *ChildHook) roundtrip(ctx context.Context, op, routeClass byte, body []b
 		ReqID:      reqID,
 		Prompt:     string(body),
 	})
-	if err := h.writeFrame(ctx, s, payload); err != nil {
+	if err := h.writeFrame(ctx, class, s, payload); err != nil {
 		h.removePending(reqID)
 		return nil, err
 	}
@@ -670,7 +695,8 @@ func (h *ChildHook) roundtrip(ctx context.Context, op, routeClass byte, body []b
 // raise site (logging-conventions: reasons are enumerated).
 //
 // Not exhaustive — the dynamic causes stay prefixed free-form strings
-// (`not_installed: <stat error>`, `write_failed: …`, `listpacks_failed: …`)
+// (`not_installed: <stat error>`, `write_failed: …`; `listpacks_failed: …` is
+// no longer raised since TODO-144 — an admin query does not judge health)
 // because the operator needs the underlying OS error verbatim. Readers must
 // therefore match these constants exactly and treat anything else as
 // "degraded, cause as reported", never as "unknown state".
@@ -720,11 +746,25 @@ var (
 //
 // s is passed in (rather than re-read from h.session) so a concurrent restart
 // that already installed a FRESH session cannot be torn down by a stale timeout.
-func (h *ChildHook) writeFrame(ctx context.Context, s *pipeSession, payload []byte) error {
+//
+// An admin query (callAdminQuery) never retires the session, and that does NOT
+// weaken frame integrity (TODO-144). pipeSession.writeFrame returns
+// errWriteTimeout in exactly three shapes: the session was already broken
+// (nothing to do); the caller gave up while QUEUED for the permit (it wrote no
+// byte, the stream is untouched); or it gave up while its own write goroutine
+// was in flight — and that goroutine keeps the permit until the WHOLE frame is
+// out, so no other writer can interleave. If the child really is wedged, that
+// stuck permit makes the next Detect (or the 5s content-version poll) time out
+// on the permit wait, and THAT caller retires the pipe through the branch below.
+// The wedge still self-heals; only the verdict moves to the data plane.
+func (h *ChildHook) writeFrame(ctx context.Context, class callClass, s *pipeSession, payload []byte) error {
 	err := s.writeFrame(ctx, payload)
 	switch {
 	case err == nil:
 		return nil
+	case !class.concludesHealth():
+		// Admin query: the error goes to the caller; the child's state is not ours
+		// to judge (TODO-144).
 	case errors.Is(err, errWriteTimeout):
 		// Order is load-bearing: broken BEFORE close. The stuck writer releases the
 		// permit only after close() unblocks its syscall, so any caller still queued
@@ -746,7 +786,7 @@ func (h *ChildHook) Detect(ctx context.Context, req *Request) *Response {
 	defer cancel()
 
 	start := time.Now()
-	resp, err := h.roundtrip(ctx, pipewire.OpDetect, req.RouteClass, req.Payload)
+	resp, err := h.roundtrip(ctx, callHealthSignal, pipewire.OpDetect, req.RouteClass, req.Payload)
 	if err != nil {
 		reason := "child degraded"
 		if !errors.Is(err, errDegraded) {
@@ -849,40 +889,81 @@ func (h *ChildHook) markDetectAnswered() {
 // "packs unavailable" response — never an error that affects the data plane.
 var ErrPacksUnavailable = errors.New("apphook: effective packs unavailable")
 
+// adminQueryTimeout bounds one operator-initiated ListPacks (TODO-144).
+//
+// WHY NOT cfg.Timeout (the 150ms Detect deadline) any more: on a K=1 child the
+// op=ListPacks frame waits for the child's single worker slot, i.e. for every
+// Detect already in flight — and the child keeps working on a Detect after the
+// proxy has given up on it at 150ms. So the admin query's latency is queueing
+// time, not child health, and 150ms made "an admin opened a page while one
+// Detect was slow" indistinguishable from "the child is broken"
+// (task-execution/runs/todo-132-verify.md §1, amplifier A).
+//
+// WHY 2s — bounded on both sides:
+//   - lower bound: long enough to wait out a queue of in-flight Detects. One
+//     Detect costs the child about its lane deadline (detectorLaneDeadlineSmall,
+//     100ms, mirrored in supervisor/filter_hook.go) plus overhead; 2s is more
+//     than 10 whole Detect budgets (150ms each) of queue ahead of the query.
+//   - upper bound: shorter than the tightest known client of this endpoint,
+//     `aikey doctor` (aikey-cli src/commands_proxy.rs fetch_compliance_packs,
+//     3s agent timeout), with ~1s left for HTTP and scheduling — so the proxy's
+//     own answer ({available:false}) reaches the client instead of the client
+//     timing out first and reporting "cannot reach proxy".
+//   - it stays below contentVersionPollTimeout (5s): the background poll is the
+//     patient reader; the admin view is interactive.
+//
+// Not env-tunable on purpose: a knob would be a second, silent way to change
+// how long an operator page can hang.
+const adminQueryTimeout = 2 * time.Second
+
 // ListPacks queries the child for its currently-effective compliance packs
 // (op=4: built-in baseline + pulled packs). Returns the raw JSON report payload.
 // Shares the multiplexed pipe (its own req-id), so it never blocks a Detect.
+//
+// 🔴 A FAILED ADMIN QUERY IS NOT A HEALTH SIGNAL (TODO-144, user decision
+// 2026-09-17; this reverses the earlier "someone asked a direct question and got
+// no answer, which is a health signal" intent). Marking the child degraded here
+// took it out of the FilterPool's serving set and respawned it, so an operator
+// opening the compliance page — or a release script polling `.available` — could
+// switch content inspection off on a worker that was merely busy
+// (task-execution/runs/todo-132-verify.md §1, §4 amplifier A). The child's health
+// is now judged ONLY by the calls that carry user traffic or run on the child's
+// own schedule: Detect (write timeout → retire + degrade; bugfix 20260813) and
+// the background content-version poll (5s budget, every 15s). A failure here is
+// returned to the caller — the admin handler renders it as {available:false},
+// never as available — and logged at WARN so it is not silent.
 func (h *ChildHook) ListPacks(ctx context.Context) ([]byte, error) {
-	ctx, cancel := context.WithTimeout(ctx, h.cfg.Timeout)
+	ctx, cancel := context.WithTimeout(ctx, adminQueryTimeout)
 	defer cancel()
-	return h.listPacks(ctx, true)
+	start := time.Now()
+	report, err := h.listPacks(ctx, callAdminQuery)
+	if err != nil && !errors.Is(err, ErrPacksUnavailable) {
+		// The loud replacement for the markDegraded WARN this path used to raise:
+		// the operator still sees WHY the page said unavailable, without the side
+		// effect. ErrPacksUnavailable is excluded because each of its causes is
+		// already logged where it is decided (degraded child, oversize report) or
+		// is a normal state (a child too old to answer op=4).
+		slog.Warn("apphook: effective-packs query failed; the worker's health is left unchanged",
+			"event.name", observability.EventAppHookListPacksFailed,
+			"name", h.cfg.Name, "error", err, "elapsed_ms", time.Since(start).Milliseconds(),
+			"budget_ms", adminQueryTimeout.Milliseconds())
+	}
+	return report, err
 }
 
-// listPacks is the shared core. markOnErr distinguishes the two callers:
-//
-//   - ListPacks (operator-initiated, GET /admin/compliance/packs) passes true —
-//     someone asked a direct question and got no answer, which is a health signal
-//     about this child and belongs in DegradedReason.
-//   - the content-version poll (contentversion.go) passes false. It runs every
-//     15s on its own schedule, and a transient failure there must not re-label a
-//     child that is happily serving Detect as degraded, which would take it out
-//     of the FilterPool's healthy set and trigger a respawn on the data plane.
-//     Its own failure signal is EventAppHookContentVersionUnknown plus the
-//     caller's cache going fail-safe — both louder than a reused status string.
+// listPacks is the shared core of the operator query (ListPacks,
+// callAdminQuery) and the content-version poll (contentversion.go,
+// callHealthSignal). Neither marks the child degraded on a REPLY timeout; only
+// the poll's WRITE failures move health, inside writeFrame. The poll's own
+// failure signal is EventAppHookContentVersionUnknown plus the caller's cache
+// going fail-safe.
 //
 // ctx must already carry the caller's deadline.
-func (h *ChildHook) listPacks(ctx context.Context, markOnErr bool) ([]byte, error) {
-	resp, err := h.roundtrip(ctx, pipewire.OpListPacks, pipewire.RouteClassPersonal, nil)
+func (h *ChildHook) listPacks(ctx context.Context, class callClass) ([]byte, error) {
+	resp, err := h.roundtrip(ctx, class, pipewire.OpListPacks, pipewire.RouteClassPersonal, nil)
 	if err != nil {
 		if errors.Is(err, errDegraded) {
 			return nil, ErrPacksUnavailable
-		}
-		if markOnErr && !errors.Is(err, errWriteTimeout) {
-			// A write timeout already recorded its own precise reason
-			// (DegradeReasonWriteTimeout) inside writeFrame; re-marking here would
-			// bury the actual cause under a generic "listpacks_failed" label and cost
-			// the operator the one clue that says "the child stopped reading".
-			h.markDegraded("listpacks_failed: " + err.Error())
 		}
 		return nil, err
 	}

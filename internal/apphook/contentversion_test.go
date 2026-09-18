@@ -301,8 +301,8 @@ func drainingChild(t *testing.T, name string) *ChildHook {
 	return h
 }
 
-// TestContentVersionPoll_ReplyTimeoutStaysQuiet is the whole point of splitting
-// listPacks on markOnErr.
+// TestContentVersionPoll_ReplyTimeoutStaysQuiet is the whole point of letting
+// listPacks' caller class (callClass) decide what a failure may conclude.
 //
 // WHY IT MATTERS ON THE DATA PLANE: DegradedReason feeds Status().Healthy,
 // FilterPool drops unhealthy workers from its serving set, and markDegraded is
@@ -322,7 +322,7 @@ func TestContentVersionPoll_ReplyTimeoutStaysQuiet(t *testing.T) {
 
 	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
 	defer cancel()
-	_, err := h.listPacks(ctx, false) // markOnErr=false → the background poll
+	_, err := h.listPacks(ctx, callHealthSignal) // the background poll
 	if err == nil || errors.Is(err, errWriteTimeout) {
 		t.Fatalf("expected a reply timeout, got %v", err)
 	}
@@ -333,15 +333,19 @@ func TestContentVersionPoll_ReplyTimeoutStaysQuiet(t *testing.T) {
 		t.Error("the background poll must not take a healthy child out of the pool's serving set")
 	}
 
-	// The operator-initiated path is deliberately the opposite: someone asked a
-	// direct question, got no answer, and that IS a health signal about this child.
+	// ⚠️ REVERSED 2026-09-17 (TODO-144, user decision): this half used to assert
+	// the opposite — that an operator-initiated ListPacks failure IS recorded as
+	// `listpacks_failed`. That turned an admin opening the compliance page into a
+	// way to take a busy worker out of rotation (task-execution/runs/
+	// todo-132-verify.md §4 amplifier A). The operator path is now as quiet as the
+	// poll; the fuller fences live in childhook_admin_query_test.go.
 	ctx2, cancel2 := context.WithTimeout(context.Background(), 50*time.Millisecond)
 	defer cancel2()
-	if _, err := h.listPacks(ctx2, true); err == nil {
+	if _, err := h.ListPacks(ctx2); err == nil {
 		t.Fatal("expected the operator query to fail")
 	}
-	if reason := h.Status().DegradedReason; !strings.Contains(reason, "listpacks_failed") {
-		t.Errorf("an operator-initiated ListPacks failure must be recorded, got %q", reason)
+	if reason := h.Status().DegradedReason; reason != "" {
+		t.Errorf("an operator-initiated ListPacks failure must not relabel the child, got %q", reason)
 	}
 }
 
@@ -358,7 +362,7 @@ func TestRefreshContentVersion_TimeoutClearsTokenWithoutDegrading(t *testing.T) 
 	// it out. publishContentVersion is the real publish rule, not a restatement.
 	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
 	defer cancel()
-	report, err := h.listPacks(ctx, false)
+	report, err := h.listPacks(ctx, callHealthSignal)
 	if err == nil {
 		t.Fatal("expected the poll to time out")
 	}

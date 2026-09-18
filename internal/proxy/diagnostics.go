@@ -160,7 +160,8 @@ type FilterWorkerHealth struct {
 	Index int `json:"index"`
 	// DegradedReason is the child's own enumerated cause, populated iff
 	// !Healthy: not_started | not_installed: … | write_timeout | write_failed: … |
-	// read_failed: … | ready_timeout | listpacks_failed: … | restarting | crash.
+	// read_failed: … | ready_timeout | restarting | crash. (`listpacks_failed: …`
+	// is no longer raised: TODO-144 made the admin packs query health-neutral.)
 	// This is the field whose absence made `ak doctor` unable to tell a wedged
 	// child from one that never started (review findings B5/B36).
 	DegradedReason string `json:"degraded_reason,omitempty"`

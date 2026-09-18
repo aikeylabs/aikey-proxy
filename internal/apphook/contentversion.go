@@ -271,7 +271,7 @@ func (h *ChildHook) refreshContentVersion() {
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), contentVersionPollTimeout)
 	defer cancel()
-	h.publishContentVersion(h.listPacks(ctx, false))
+	h.publishContentVersion(h.listPacks(ctx, callHealthSignal))
 }
 
 // publishContentVersion turns one poll result into the published token. Split out

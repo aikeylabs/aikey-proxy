@@ -422,6 +422,14 @@ const (
 	// NOT marked degraded — it still serves Detect — and the report reads as
 	// unavailable. Fields: name, frame_bytes, max_bytes; no content.
 	EventAppHookListPacksOversize = "proxy.apphook.listpacks_oversize"
+	// EventAppHookListPacksFailed: WARN, per failed operator query
+	// (GET /admin/compliance/packs → ChildHook.ListPacks) — timed out or could
+	// not be written/read. Since TODO-144 such a failure deliberately does NOT
+	// mark the child degraded, so this line is where it stays visible. Not raised
+	// for the normal "unavailable" states (degraded child, child too old to
+	// answer op=ListPacks, oversize report — the last has its own event above).
+	// Fields: name, error, elapsed_ms, budget_ms; no content.
+	EventAppHookListPacksFailed = "proxy.apphook.listpacks_failed"
 	// Verdict-cache suspension, observed FROM THE DATA PLANE (2026-08-13, review
 	// finding B6). The pair above is raised by the background poll inside the
 	// hook; these two are the dispatcher's own 二层兜底 (日志规范), raised at the
