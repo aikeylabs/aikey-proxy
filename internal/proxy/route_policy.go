@@ -115,14 +115,20 @@ func (r RoutePolicyRule) allows(target ProviderRef) bool {
 //     and R-compliance-canned-answer-6 applies to any policy value this build
 //     cannot read.
 //
-// ok=false tells the install-time reader to WARN; the action returned is what
-// gets enforced either way.
-func routePolicyEnactableOtherwise(otherwise string) (action apphook.Action, ok bool) {
+// ok=false tells the install-time reader to WARN. The enforced action is
+// ALWAYS apphook.ActionBlock regardless of ok — this function only reports
+// whether the spelling was recognized, it never varies the outcome (see the
+// callers, which both hard-code apphook.ActionBlock rather than reading it
+// from here — that constancy is exactly what "only `block` exists" means, so
+// there is no second action for this function to return; go vet/unparam
+// flagged the removed `action` result as always-`block` on 2026-09-19, see
+// aikeylabs/workflow/CI/bugfix/2026-09-19-release-lint-fix.md).
+func routePolicyEnactableOtherwise(otherwise string) (ok bool) {
 	switch otherwise {
 	case "", "block":
-		return apphook.ActionBlock, true
+		return true
 	default:
-		return apphook.ActionBlock, false
+		return false
 	}
 }
 
@@ -161,7 +167,7 @@ func parseRoutePolicy(gradingJSON []byte) (rules RoutePolicy, notes []string, er
 					" is malformed and matches NO provider; the rule is enforced with it matching nothing)")
 			}
 		}
-		if _, ok := routePolicyEnactableOtherwise(r.Otherwise); !ok {
+		if !routePolicyEnactableOtherwise(r.Otherwise) {
 			notes = append(notes, r.String()+" (otherwise="+r.Otherwise+
 				" is not recognized; ENFORCED AS block — fail-closed, see routePolicyEnactableOtherwise)")
 		}
@@ -194,13 +200,16 @@ func parseRoutePolicy(gradingJSON []byte) (rules RoutePolicy, notes []string, er
 // `[]FindingLite`. The proxy's finding view already exists as Finding
 // (escalation.go) with exactly the fields this needs (level, confirmed); a
 // second near-identical type would be two answers to one question.
-func applyGradingRoutePolicy(findings []Finding, target ProviderRef, p RoutePolicy) (apphook.Action, string) {
+func applyGradingRoutePolicy(findings []Finding, target ProviderRef, p RoutePolicy) (action apphook.Action, reason string) {
 	rule, violated := p.firstViolated(findings, target)
 	if !violated {
 		return apphook.ActionAllow, ""
 	}
-	action, _ := routePolicyEnactableOtherwise(rule.Otherwise)
-	return action, rule.String()
+	// Only `block` exists (routePolicyEnactableOtherwise), so the action here
+	// is always apphook.ActionBlock — an unrecognized `otherwise` spelling is
+	// still enforced as block (fail-closed, see routePolicyEnactableOtherwise);
+	// parseRoutePolicy is what reports the note that gets a WARN at install time.
+	return apphook.ActionBlock, rule.String()
 }
 
 // firstViolated is the ONE predicate behind the decision: the first rule, in

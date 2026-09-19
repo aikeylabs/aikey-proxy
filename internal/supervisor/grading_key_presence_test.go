@@ -20,7 +20,7 @@ package supervisor
 //         task-execution/TODO.md TODO-61
 //
 // 能红: make normalizeGradingPolicy map `{}` to nil again (the pre-TODO-61
-// behaviour) and the "{}" arm fails; make gradingEnvValue spell "no member" as
+// behavior) and the "{}" arm fails; make gradingEnvValue spell "no member" as
 // "{}" again and the absent arm fails.
 
 import (
@@ -44,7 +44,7 @@ func TestGradingDownlink_KeyPresenceSurvivesToTheChild(t *testing.T) {
 		{name: "absent", body: `{"enabled":true,"privacy_tier":1}`, wantEnv: "", wantJSON: ""},
 		// New master, grading not configured: the member is present and empty.
 		{name: "empty object", body: `{"enabled":true,"privacy_tier":1,"grading":{}}`, wantEnv: "{}", wantJSON: "{}"},
-		// New master, ladder configured: unchanged behaviour.
+		// New master, ladder configured: unchanged behavior.
 		{name: "non-empty", body: `{"enabled":true,"privacy_tier":1,"grading":` + ladderDoc + `}`,
 			wantEnv: ladderDoc, wantJSON: ladderDoc},
 	}
