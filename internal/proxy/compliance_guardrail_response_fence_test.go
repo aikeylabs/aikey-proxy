@@ -113,6 +113,12 @@ var guardrailFiles = map[string]string{
 		"short-circuit in filter_dispatch.go then acts on. It writes no response itself — listed " +
 		"because fence 0 is about SCOPE, and a file that produces a refusal must be inside the " +
 		"scope of the two fences below even when today it holds no write site.",
+	"route_policy.go": "the grading route policy (task 11.2, R-compliance-grading-8): decides a REQUEST-level " +
+		"refusal from the findings' levels and the target provider, which the short-circuit in " +
+		"filter_dispatch.go then writes. It writes no response itself.",
+	"request_verdict.go": "the request-verdict audit row (TODO-171, DEC-compliance-grading-27): folds the " +
+		"escalation and route-policy conclusions into the row's action_taken (strongerVerdictAction). " +
+		"It writes no response and decides no refusal — the audit row only.",
 	"filter_cache.go":       "verdict cache — replays a previous verdict, so it can reach the same short-circuit",
 	"filter_performance.go": "the 15ms budget and fail-open bookkeeping around the detect call",
 	"filter_restore.go": "the placeholder restore — the ONE documented response-leg exception to invariant 13 " +

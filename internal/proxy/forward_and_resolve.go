@@ -507,6 +507,12 @@ func (p *Proxy) serveRoute(w http.ResponseWriter, r *http.Request, route *vkeys.
 	// the conversation-audit observer is handed (route.ObserverContext), so a
 	// compliance event and its conversation turn cannot disagree about the key.
 	// See traceIDForAudit for why this is same-source by construction.
+	// The grading route policy inside the filter checks where the content is
+	// actually going: route.ProviderCode AFTER the truthfulProviderCode
+	// normalization at the top of this function. Handed over on the request
+	// context (withRouteTarget) — the route itself is never changed by that check.
+	// spec: R-compliance-grading-8
+	withRouteTarget(r, ProviderRef{Code: route.ProviderCode})
 	if !p.applyInboundFilter(w, r, extractModel(r), route.RouteSource, route.OrgID, route.VirtualKeyID, route.SeatID, resolveSessionID(r, route.ProtocolType, route.ProviderCode), traceIDForAudit(route), logger) {
 		return
 	}

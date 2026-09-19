@@ -111,7 +111,11 @@ func TestFetchComplianceMasterPolicy_GradingFailureDirection(t *testing.T) {
 		// ① absent / explicitly empty ⇒ usable answer meaning "grading off".
 		{name: "grading key absent (old master)", body: `{"enabled":true,"privacy_tier":1}`, status: 200, wantOK: true, wantNil: true},
 		{name: "grading key null", body: `{"enabled":true,"grading":null}`, status: 200, wantOK: true, wantNil: true},
-		{name: "grading empty object", body: `{"enabled":true,"grading":{}}`, status: 200, wantOK: true, wantNil: true},
+		// TODO-61 (2026-09-18): `{}` is reported as the two bytes, NOT nil. It is
+		// still "grading off" for enforcement, but the member's presence says the
+		// master speaks 分级 and the detector needs that bit; folding it into nil
+		// made it indistinguishable from an old master. Was wantNil: true.
+		{name: "grading empty object", body: `{"enabled":true,"grading":{}}`, status: 200, wantOK: true, wantNil: false},
 		// ② present but unusable ⇒ NOT an answer; the caller must keep what it has.
 		{name: "grading present but malformed JSON", body: `{"enabled":true,"grading":{"ladder":}}`, status: 200, wantOK: false, wantNil: true},
 		{name: "grading present but not an object", body: `{"enabled":true,"grading":"nope"}`, status: 200, wantOK: false, wantNil: true},
@@ -201,10 +205,12 @@ func TestGradingDownlink_ThreeFailureStatesAreDistinct(t *testing.T) {
 		defer srv.Close()
 		enabled, tier, adv, grading, ok := fetchComplianceMasterPolicy(t.Context(), srv.URL, "org-1")
 		changed := s.applyComplianceMasterPolicy(enabled, tier, adv, grading, ok)
-		if got := s.gradingEnvValue(); got != gradingPolicyDisabled {
+		// TODO-61: absent is spelled gradingPolicyAbsent ("") on the child env,
+		// kept apart from an explicit `{}` (gradingPolicyDisabled). Was "{}".
+		if got := s.gradingEnvValue(); got != gradingPolicyAbsent {
 			t.Fatalf("AIKEY_COMPLIANCE_GRADING = %q, want %q — a master that does not speak "+
 				"grading means grading is off, not that the last policy sticks forever "+
-				"(was %q)", got, gradingPolicyDisabled, seeded)
+				"(was %q)", got, gradingPolicyAbsent, seeded)
 		}
 		if !changed {
 			t.Fatal("switching grading off must be reported as a change, or the running " +
@@ -373,12 +379,14 @@ func TestGrading_SignatureEnvAndCacheEpochShareTheSameBytes(t *testing.T) {
 
 	t.Run("no policy is one deliberate asymmetry, not three", func(t *testing.T) {
 		s := &Supervisor{} // never took a policy
-		// "{}" is the WIRE SPELLING of "no policy" for the child, whose parser
-		// needs an object; nil is the same statement on this side. Pinned so the
-		// asymmetry stays the documented one and cannot quietly become a second
-		// source of bytes.
-		if got := s.gradingEnvValue(); got != gradingPolicyDisabled {
-			t.Fatalf("no policy must reach the child as %q, got %q", gradingPolicyDisabled, got)
+		// "" (gradingPolicyAbsent) is the WIRE SPELLING of "no document" for the
+		// child — the detector's parsers read empty input as "no document"; nil is
+		// the same statement on this side. Pinned so the asymmetry stays the
+		// documented one and cannot quietly become a second source of bytes.
+		// TODO-61 (2026-09-18): was "{}", which is now reserved for a master that
+		// answered with an explicit empty document.
+		if got := s.gradingEnvValue(); got != gradingPolicyAbsent {
+			t.Fatalf("no policy must reach the child as %q, got %q", gradingPolicyAbsent, got)
 		}
 		if s.gradingPolicyJSON() != nil {
 			t.Fatalf("no policy must stay nil on this side, got %q", s.gradingPolicyJSON())
@@ -505,9 +513,10 @@ func TestGradingDownlink_OldMasterIsNotDegraded(t *testing.T) {
 	enabled, tier, adv, grading, ok := fetchComplianceMasterPolicy(t.Context(), srv.URL, "org-1")
 	s.applyComplianceMasterPolicy(enabled, tier, adv, grading, ok)
 
-	if got := s.gradingEnvValue(); got != gradingPolicyDisabled {
+	// TODO-61: an absent member reaches the child as gradingPolicyAbsent (""), not "{}".
+	if got := s.gradingEnvValue(); got != gradingPolicyAbsent {
 		t.Fatalf("AIKEY_COMPLIANCE_GRADING = %q, want %q — ① really does switch grading off",
-			got, gradingPolicyDisabled)
+			got, gradingPolicyAbsent)
 	}
 	rejects, attempted := s.ComplianceMasterPolicyHealth()
 	if !attempted {

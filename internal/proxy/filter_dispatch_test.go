@@ -19,6 +19,8 @@ import (
 
 	"github.com/AiKeyLabs/aikey-proxy/internal/apphook"
 	"github.com/AiKeyLabs/aikey-proxy/internal/events"
+	"github.com/AiKeyLabs/aikey-proxy/internal/observability"
+	"github.com/AiKeyLabs/aikey-proxy/internal/vkeys"
 	"github.com/AiKeyLabs/pkg/pipewire"
 )
 
@@ -761,4 +763,230 @@ func TestApplyInboundFilter_DetectorTimeoutStaysFailOpenWithGrading(t *testing.T
 		t.Errorf("escalation evaluated=%d triggered=%d, want 1/0 — with rules installed the request-level "+
 			"verdict must run and must not escalate a request whose detection never completed", snap.evaluated, snap.triggered)
 	}
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// R-compliance-grading-8.S1 — route_policy: an L4 hit may only go to an allowed
+// provider (T/AMAC §11.2 b: high-sensitivity data is inferred in an isolated
+// environment only).
+// ─────────────────────────────────────────────────────────────────────────────
+
+// TestRoutePolicy_L4ToExternalProviderDenied is the fence for
+// R-compliance-grading-8.S1 (task 11.2).
+//
+// GIVEN route_policy=[{min_level:4, allowed_providers:["intranet-*"], otherwise:"block"}]
+// WHEN  a request carrying a CONFIRMED L4 hit targets `anthropic`
+// THEN  403 COMPLIANCE_ROUTE_POLICY_DENIED and the upstream receives NOTHING;
+//
+//	the same request targeting `intranet-qwen` is forwarded, and the upstream
+//	receives ZERO X-Aikey-* headers (red line: stripAikeyRequestHeaders, no
+//	exception for intranet providers);
+//	an empty route_policy leaves the forwarded bytes identical.
+//
+// It drives serveRoute — the single funnel every real route passes through — so
+// the header assertion reads what the upstream actually RECEIVED, not what a
+// helper returned. The L3 / unconfirmed / MAX_ACTION=warn cases are the controls
+// that make the refusal mean something: without them a policy that blocked every
+// flagged request would pass the first case.
+//
+// The audit-row half of the scenario (「事件 action_taken='block' 且 metadata 记
+// route_policy」) is fenced separately since TODO-171 (DEC-compliance-grading-27
+// declared the field on master first): TestRoutePolicy_DeniedRequestEmitsVerdictRow
+// and its siblings in route_policy_verdict_test.go. What THIS test asserts is the
+// in-process evidence: the INFO line carrying min_level + target_provider, and
+// the per-generation counter.
+func TestRoutePolicy_L4ToExternalProviderDenied(t *testing.T) {
+	const (
+		idCard   = "110101199003074578"
+		prompt   = "customer id " + idCard + " please summarize the file"
+		l4Policy = `{"route_policy":[{"min_level":4,"allowed_providers":["intranet-*"],"otherwise":"block"}]}`
+	)
+	type outcome struct {
+		status          int
+		body            string
+		upstreamHits    int
+		upstreamHeaders http.Header
+		upstreamBody    string
+		logs            string
+		proxy           *Proxy
+	}
+	run := func(t *testing.T, grading, providerCode string, hit gradedHit, maxAction string) outcome {
+		t.Helper()
+		var (
+			hits    atomic.Int32
+			gotHdr  http.Header
+			gotBody string
+		)
+		upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			hits.Add(1)
+			gotHdr = r.Header.Clone()
+			b, _ := io.ReadAll(r.Body)
+			gotBody = string(b)
+			w.Header().Set("Content-Type", "application/json")
+			if strings.HasSuffix(r.URL.Path, "/messages") {
+				_, _ = w.Write([]byte(`{"id":"msg_rp","type":"message","content":[{"type":"text","text":"ok"}],` +
+					`"usage":{"input_tokens":1,"output_tokens":1}}`))
+				return
+			}
+			_, _ = w.Write([]byte(`{"id":"chatcmpl_rp","choices":[{"message":{"content":"ok"}}],` +
+				`"usage":{"prompt_tokens":1,"completion_tokens":1}}`))
+		}))
+		defer upstream.Close()
+
+		p := setupTestProxy(t, upstream.URL)
+		if grading != "" {
+			if _, _, err := p.SetComplianceGrading([]byte(grading)); err != nil {
+				t.Fatalf("SetComplianceGrading(%s): %v", grading, err)
+			}
+		}
+		if maxAction != "" {
+			if err := p.SetComplianceMaxAction(maxAction); err != nil {
+				t.Fatalf("SetComplianceMaxAction(%q): %v", maxAction, err)
+			}
+		}
+		p.SetFilterHook(&contentScriptedHook{answer: func(payload string) *apphook.Response {
+			if !strings.Contains(payload, idCard) {
+				return &apphook.Response{Action: apphook.ActionAllow}
+			}
+			// warn = the ladder's own per-piece action lets it through; only the
+			// route policy can stop this request.
+			return &apphook.Response{Action: apphook.ActionWarn,
+				Event: eventJSON(t, "ev-route-policy", "warn", payload, []gradedHit{hit})}
+		}})
+
+		protocol, path, body := "openai_compatible", "/v1/chat/completions",
+			`{"model":"qwen-72b","messages":[{"role":"user","content":"`+prompt+`"}]}`
+		if providerCode == "anthropic" {
+			protocol, path, body = "anthropic", "/v1/messages",
+				`{"model":"claude-3-5-sonnet-20241022","max_tokens":64,"messages":[{"role":"user","content":"`+prompt+`"}]}`
+		}
+		prov, err := p.providers.Get(protocol)
+		if err != nil {
+			t.Fatalf("provider %s: %v", protocol, err)
+		}
+		route := &vkeys.ResolvedRoute{
+			VirtualKeyID: "vk-route-policy", Provider: providerCode, ProviderCode: providerCode,
+			ProtocolType: protocol, PlaintextKey: "sk-fake", BaseURL: upstream.URL,
+			RouteSource: "team", OrgID: "org-route-policy",
+		}
+		req := httptest.NewRequest(http.MethodPost, path, strings.NewReader(body))
+		req.Header.Set("Content-Type", "application/json")
+		// Two inbound X-Aikey-* headers the client sent, in both spellings. The
+		// proxy also stamps its own (extractModel writes x-aikey-model), so the
+		// outbound assertion covers client-sent AND proxy-added headers.
+		req.Header.Set("X-Aikey-Trace-Id", "client-trace")
+		req.Header["x-aikey-client"] = []string{"lowercase-variant"}
+		var logBuf bytes.Buffer
+		logger := slog.New(slog.NewJSONHandler(&logBuf, &slog.HandlerOptions{Level: slog.LevelDebug}))
+		w := httptest.NewRecorder()
+
+		p.serveRoute(w, req, route, prov, "sk-fake", "", time.Now(), logger)
+
+		return outcome{status: w.Code, body: w.Body.String(), upstreamHits: int(hits.Load()),
+			upstreamHeaders: gotHdr, upstreamBody: gotBody, logs: logBuf.String(), proxy: p}
+	}
+	l4 := gradedHit{value: idCard, category: "pii", level: 4, confirmed: true}
+
+	t.Run("L4 to anthropic is refused before any upstream request", func(t *testing.T) {
+		o := run(t, l4Policy, "anthropic", l4, "")
+		if got := len(o.proxy.ComplianceRoutePolicy()); got != 1 {
+			t.Fatalf("installed route_policy rules = %d, want 1 — the grading document's route_policy "+
+				"member did not reach the proxy", got)
+		}
+		if o.status != http.StatusForbidden {
+			t.Fatalf("status = %d, want 403; body=%s", o.status, o.body)
+		}
+		if !strings.Contains(o.body, observability.ErrCodeComplianceRoutePolicyDenied) {
+			t.Errorf("body must carry %s, got %s", observability.ErrCodeComplianceRoutePolicyDenied, o.body)
+		}
+		if o.upstreamHits != 0 {
+			t.Errorf("upstream received %d request(s); a route-policy refusal must forward NOTHING", o.upstreamHits)
+		}
+		if strings.Contains(o.body, idCard) {
+			t.Errorf("refusal body echoes the matched value: %s", o.body)
+		}
+		for _, needle := range []string{
+			`"event.name":"` + observability.EventProxyFilterRoutePolicyDenied + `"`,
+			`"min_level":4`, `"target_provider":"anthropic"`,
+		} {
+			if !strings.Contains(o.logs, needle) {
+				t.Errorf("route-policy refusal log must carry %s; logs:\n%s", needle, o.logs)
+			}
+		}
+		if snap := o.proxy.routePolicySnapshot(); snap.evaluated != 1 || snap.denied != 1 {
+			t.Errorf("route policy evaluated=%d denied=%d, want 1/1", snap.evaluated, snap.denied)
+		}
+	})
+
+	t.Run("L4 to intranet-qwen is forwarded with zero X-Aikey headers", func(t *testing.T) {
+		o := run(t, l4Policy, "intranet-qwen", l4, "")
+		if o.status != http.StatusOK {
+			t.Fatalf("status = %d, want 200; body=%s", o.status, o.body)
+		}
+		if o.upstreamHits != 1 {
+			t.Fatalf("upstream hits = %d, want 1", o.upstreamHits)
+		}
+		// Anti-vacuity: a header map that captured nothing would pass the loop.
+		if o.upstreamHeaders.Get("Content-Type") == "" {
+			t.Fatalf("upstream captured no headers — the X-Aikey-* assertion below would be vacuous")
+		}
+		var leaked []string
+		for k := range o.upstreamHeaders {
+			if len(k) >= 8 && strings.EqualFold(k[:8], "X-Aikey-") {
+				leaked = append(leaked, k)
+			}
+		}
+		if len(leaked) != 0 {
+			t.Errorf("RED LINE: the intranet upstream received X-Aikey-* headers %v — no exception for "+
+				"intranet providers (stripAikeyRequestHeaders)", leaked)
+		}
+		if snap := o.proxy.routePolicySnapshot(); snap.evaluated != 1 || snap.denied != 0 {
+			t.Errorf("route policy evaluated=%d denied=%d, want 1/0", snap.evaluated, snap.denied)
+		}
+	})
+
+	t.Run("empty route_policy leaves the forwarded request byte-identical", func(t *testing.T) {
+		baseline := run(t, "", "anthropic", l4, "")
+		if baseline.status != http.StatusOK || baseline.upstreamHits != 1 {
+			t.Fatalf("baseline: status=%d hits=%d, want 200/1", baseline.status, baseline.upstreamHits)
+		}
+		for _, doc := range []string{`{}`, `{"route_policy":[]}`, `{"escalation":[]}`} {
+			o := run(t, doc, "anthropic", l4, "")
+			if o.status != http.StatusOK || o.upstreamHits != 1 {
+				t.Errorf("grading %s: status=%d hits=%d, want 200/1", doc, o.status, o.upstreamHits)
+				continue
+			}
+			if o.upstreamBody != baseline.upstreamBody {
+				t.Errorf("grading %s changed the forwarded body:\n got %s\nwant %s", doc, o.upstreamBody, baseline.upstreamBody)
+			}
+			if strings.Contains(o.logs, observability.EventProxyFilterRoutePolicyDenied) {
+				t.Errorf("grading %s: a route-policy refusal was logged with no route_policy configured", doc)
+			}
+		}
+	})
+
+	// Controls — each one is a way the refusal above could be passing for the
+	// wrong reason.
+	t.Run("L3 hit to anthropic is forwarded (level floor is read)", func(t *testing.T) {
+		o := run(t, l4Policy, "anthropic", gradedHit{value: idCard, category: "pii", level: 3, confirmed: true}, "")
+		if o.status != http.StatusOK || o.upstreamHits != 1 {
+			t.Errorf("status=%d hits=%d, want 200/1 — an L3 hit is below min_level 4", o.status, o.upstreamHits)
+		}
+	})
+	t.Run("unconfirmed L4 hit to anthropic is forwarded (weak hits never strengthen)", func(t *testing.T) {
+		o := run(t, l4Policy, "anthropic", gradedHit{value: idCard, category: "pii", level: 4, confirmed: false}, "")
+		if o.status != http.StatusOK || o.upstreamHits != 1 {
+			t.Errorf("status=%d hits=%d, want 200/1 — an unconfirmed hit must not raise the action "+
+				"(R-compliance-grading-16)", o.status, o.upstreamHits)
+		}
+	})
+	t.Run("MAX_ACTION=warn caps the refusal", func(t *testing.T) {
+		o := run(t, l4Policy, "anthropic", l4, "warn")
+		if o.status != http.StatusOK || o.upstreamHits != 1 {
+			t.Errorf("status=%d hits=%d, want 200/1 — the operator's MAX_ACTION ceiling only presses down", o.status, o.upstreamHits)
+		}
+		if snap := o.proxy.routePolicySnapshot(); snap.capped != 1 {
+			t.Errorf("route policy capped=%d, want 1 — a capped refusal must be counted, not silent", snap.capped)
+		}
+	})
 }

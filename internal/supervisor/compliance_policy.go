@@ -38,14 +38,30 @@ const (
 	complianceMasterPolicyKey = "compliance.master_policy"
 	compliancePollInterval    = 60 * time.Second
 
-	// gradingPolicyDisabled is what AIKEY_COMPLIANCE_GRADING carries when this
-	// org has no grading policy: an empty object, i.e. grading OFF, and the
-	// detector's decision layer behaves byte-for-byte as it did before the
-	// feature existed (R-compliance-grading-3).
+	// gradingPolicyAbsent is what AIKEY_COMPLIANCE_GRADING carries when the
+	// master's answer had NO `grading` member (an old master), or when this node
+	// has never followed a master (Personal): no document at all — the same
+	// thing a pre-grading proxy handed the child. The detector reads it as "the
+	// master does not speak 分级" and puts no level / leaf_path / max_level on
+	// the intake wire.
 	//
-	// 🔴 It is ONLY ever reached from a master that answered and did not mention
-	// grading. It is NOT the fallback for "the answer was unusable" — see
+	// gradingPolicyDisabled is what it carries when a NEW master answered with an
+	// explicit `{}`: the org configured no ladder. Grading enforcement is OFF
+	// exactly as with the absent case (neither declares a rung, so the decision
+	// layer behaves byte-for-byte as before the feature — R-compliance-grading-3
+	// is about the ACTION), but the master understands 分级 keys, so the
+	// classification tree's level is still reported (R-compliance-grading-1).
+	//
+	// 🔴 WHY TWO SPELLINGS (TODO-61). They used to be one (`{}` for both), which
+	// made "old master" and "tree built, ladder not configured" indistinguishable
+	// to the detector: that org saw 未分级 on every audit row although its tree had
+	// graded them. No field was added for this (拍板 15): the member's presence is
+	// already on the wire, and collapsing it was losing information.
+	// 需求包: roadmap20260320/技术实现/阶段9-商业化版本/博时基金合规能力融合/ task-execution/TODO.md TODO-61
+	//
+	// 🔴 Neither is EVER the fallback for "the answer was unusable" — see
 	// applyComplianceMasterPolicy.
+	gradingPolicyAbsent   = ""
 	gradingPolicyDisabled = "{}"
 
 	// gradingEnvLimitBytes is the RUNTIME hard limit on the compact grading
@@ -286,9 +302,10 @@ func (s *Supervisor) ComplianceMasterPolicyHealth() (consecutiveRejects int, att
 // swap-then-compare on a pointer: the bytes are what matter, and the poller
 // re-decodes an identical document every 60s.
 //
-// A nil / empty document is stored as "no policy" (⇒ gradingPolicyDisabled in
-// the child env), which is the ① old-master case only — the unusable-answer
-// cases never reach here (see applyComplianceMasterPolicy).
+// A nil / empty document is stored as "no member" (⇒ gradingPolicyAbsent in
+// the child env), which is the ① old-master case only; an explicit `{}` is
+// stored as those two bytes (TODO-61). The unusable-answer cases never reach
+// here (see applyComplianceMasterPolicy).
 func (s *Supervisor) swapMasterGrading(gradingJSON []byte) bool {
 	if bytes.Equal(s.gradingPolicyJSON(), gradingJSON) {
 		return false
@@ -302,8 +319,9 @@ func (s *Supervisor) swapMasterGrading(gradingJSON []byte) bool {
 	return true
 }
 
-// gradingPolicyJSON is the compact grading document currently in force, or nil
-// when the org has none. Read by the spawn path (env) and the filter signature.
+// gradingPolicyJSON is the compact grading document currently in force: nil
+// when the master sent no `grading` member, the two bytes `{}` when it sent an
+// empty one (TODO-61). Read by the spawn path (env) and the filter signature.
 func (s *Supervisor) gradingPolicyJSON() []byte {
 	if p := s.masterGrading.Load(); p != nil {
 		return *p
@@ -312,14 +330,15 @@ func (s *Supervisor) gradingPolicyJSON() []byte {
 }
 
 // gradingEnvValue is the exact AIKEY_COMPLIANCE_GRADING value handed to the
-// detector child — the single place that decides what "no policy" looks like on
+// detector child — the single place that decides what "no member" looks like on
 // the wire into the child, so the spawn path cannot spell it differently from
-// the fences.
+// the fences. An explicit `{}` is passed through verbatim; only the absent
+// member maps to gradingPolicyAbsent (TODO-61, see the constants).
 func (s *Supervisor) gradingEnvValue() string {
 	if g := s.gradingPolicyJSON(); len(g) > 0 {
 		return string(g)
 	}
-	return gradingPolicyDisabled
+	return gradingPolicyAbsent
 }
 
 // fetchComplianceMasterPolicy GETs the PUBLIC tenant policy endpoint (no JWT,
@@ -329,9 +348,10 @@ func (s *Supervisor) gradingEnvValue() string {
 // 🔴 THIS LAYER ONLY REPORTS; IT NEVER DECIDES. That matters for gradingJSON,
 // which comes back nil in two OPPOSITE situations, told apart by ok:
 //
-//	nil, ok=true  — the master answered and does not have a grading policy
-//	                (an old master, or an org that switched grading off) ⇒ the
-//	                caller turns grading OFF.
+//	nil, ok=true  — the master answered WITHOUT a grading member (an old
+//	                master) ⇒ the caller turns grading OFF. An org that switched
+//	                grading off answers `{}`, which comes back as those bytes
+//	                (ok=true), not nil — TODO-61, see gradingPolicyAbsent.
 //	nil, ok=false — the master's answer could not be used (unusable document,
 //	                non-200, network error) ⇒ the caller KEEPS the last valid
 //	                policy. Never {}: one bad response must not disable an
@@ -373,7 +393,9 @@ func fetchComplianceMasterPolicy(ctx context.Context, masterURL, orgID string) (
 		// about grading, which is a different statement from one that answers
 		// with something we cannot read. Absent ⇒ nil ⇒ grading off; unusable ⇒
 		// ok=false ⇒ keep what we have. (`grading: null` also lands on nil,
-		// which says the same thing as absent.)
+		// which says the same thing as absent.) And `{}` is a THIRD statement —
+		// "I speak grading, nothing is configured" — kept apart from absent all
+		// the way into the child (TODO-61).
 		Grading *json.RawMessage `json:"grading"`
 	}
 	if err := json.NewDecoder(resp.Body).Decode(&body); err != nil {
@@ -409,9 +431,19 @@ func fetchComplianceMasterPolicy(ctx context.Context, masterURL, orgID string) (
 // normalizeGradingPolicy turns the raw `grading` member into the exact bytes the
 // detector child will be handed, or reports that it is unusable.
 //
-//	(nil, true)   — no grading policy (absent / null / {}) ⇒ grading OFF.
+//	(nil, true)   — no grading member (absent / null) ⇒ an old master ⇒ grading OFF.
+//	("{}", true)  — explicit empty document ⇒ a new master, nothing configured ⇒
+//	                grading enforcement OFF, but the key's presence is KEPT.
 //	(bytes, true) — usable, already compact.
 //	(nil, false)  — present but unusable ⇒ the caller keeps the last valid one.
+//
+// WHY `{}` IS NOT FOLDED INTO nil (TODO-61): it used to be ("an explicit no
+// policy says the same as an absent one"), and it does say the same thing to
+// the ENFORCEMENT layer. It does not say the same thing about the master: only a
+// master that knows grading sends the member, and the detector needs exactly
+// that bit to decide whether level / leaf_path / max_level may go on the intake
+// wire. Folding it away made an org with a classification tree but no ladder
+// report every finding as 未分级.
 //
 // WHY COMPACT HERE and not at spawn: the filter signature is taken over these
 // bytes, and the signature is what re-spawns every detector in the fleet. A
@@ -441,8 +473,12 @@ func normalizeGradingPolicy(raw *json.RawMessage) ([]byte, bool) {
 	}
 	b := compact.Bytes()
 	switch {
-	case string(b) == "null", string(b) == "{}":
-		return nil, true // an explicit "no policy" says the same as an absent one
+	case string(b) == "null":
+		return nil, true // `null` says the same as an absent member
+	case string(b) == gradingPolicyDisabled:
+		// Kept, not folded into nil: the member's PRESENCE is the capability
+		// probe the detector reads (TODO-61). Same verdict for enforcement.
+		return b, true
 	case len(b) == 0 || b[0] != '{':
 		return nil, false
 	case len(b) > gradingEnvLimitBytes:

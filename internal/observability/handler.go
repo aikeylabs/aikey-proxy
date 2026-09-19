@@ -469,6 +469,28 @@ const (
 	// config, never anything matched), which is the only way an operator can tell
 	// this refusal apart from an ordinary per-piece block in a log.
 	EventProxyFilterEscalated = "proxy.filter.escalated"
+	// EventProxyFilterRoutePolicyDenied: a request was refused because it carries
+	// a confirmed hit at or above an org route_policy rule's min_level while its
+	// target provider is outside that rule's allowed_providers (T/AMAC §11.2 b:
+	// high-sensitivity data may only be inferred in an isolated environment).
+	// INFO, because it is a policy working as configured. Carries the rule
+	// rendering (min_level / allowed_providers / otherwise — administrator config)
+	// and target_provider (the route's own provider code); never anything matched.
+	// EventProxyFilterRoutePolicyCapped: the same conclusion, pressed down by the
+	// operator's MAX_ACTION=warn ceiling — the request WAS forwarded. INFO, and
+	// kept distinct so an operator can see that the ceiling, not the policy,
+	// let an L-high hit reach an external provider.
+	// spec: R-compliance-grading-8
+	EventProxyFilterRoutePolicyDenied = "proxy.filter.route_policy_denied"
+	EventProxyFilterRoutePolicyCapped = "proxy.filter.route_policy_capped"
+	// EventComplianceRoutePolicyRuleRefused: WARN at generation build — an org
+	// route_policy rule this proxy cannot read as written (negative min_level,
+	// malformed allowed_providers glob, unknown `otherwise`). See
+	// Proxy.SetComplianceGrading for what happens to each shape.
+	EventComplianceRoutePolicyRuleRefused = "proxy.compliance.route_policy_rule_refused"
+	// EventComplianceRoutePolicyActive: INFO at generation build — how many
+	// route_policy rules this generation enforces (absent when none).
+	EventComplianceRoutePolicyActive = "proxy.compliance.route_policy_active"
 	// EventProxyFilterEscalationEventDropped: the escalation was ENFORCED but its
 	// request-verdict audit row could not be produced (no trace id to derive the
 	// event id from, or the event failed to build). The user was refused and the
@@ -633,6 +655,22 @@ const (
 	// the data path read by an SDK.
 	// bugfix: workflow/CI/bugfix/20260827-forwarding-gate-was-never-wired.md
 	ErrCodeLicenseForwardingDenied = "LICENSE_FORWARDING_DENIED"
+	// ErrCodeComplianceRoutePolicyDenied (business error, compliance module):
+	// 403 — the request carries content whose sensitivity level the org's
+	// route_policy does not allow to be sent to the TARGET provider of this route
+	// (e.g. an L4 hit headed for an external model when only `intranet-*` is
+	// allowed for L4+).
+	//   Cause: a configured rule, not a failure — the org administrator decided
+	//     where high-sensitivity content may be inferred (T/AMAC §11.2 b).
+	//   Next step for the user: send this content through a model your
+	//     organization approves for sensitive data (typically an intranet model),
+	//     or remove the sensitive content from the request. The route is NEVER
+	//     silently switched for them (R-compliance-grading-8).
+	//   Kept distinct from COMPLIANCE_BLOCKED because the remedy differs: that
+	//     code means "this content may not be sent anywhere", this one means
+	//     "this content may not be sent HERE".
+	// spec: R-compliance-grading-8
+	ErrCodeComplianceRoutePolicyDenied = "COMPLIANCE_ROUTE_POLICY_DENIED"
 	// Enterprise quota (Phase 2, design §5.5). Stage 3 wires the token code;
 	// USD + degraded-block are reserved for later stages ($ enforcement / §8).
 	ErrCodeQuotaExceededToken = "QUOTA_EXCEEDED_TOKEN"

@@ -94,6 +94,11 @@ const (
 	// change may affect the next request, but must not make one in-flight request
 	// report success/failure against a different path than it actually used.
 	ctxKeyProviderPathDecision
+	// ctxKeyRouteTarget carries the ProviderRef the request is about to be sent
+	// to, stashed by serveRoute (withRouteTarget) right before the inbound
+	// filter, read by the grading route policy (R-compliance-grading-8). Absent →
+	// ProviderRef{}, which matches no allow-list: the restrictive answer.
+	ctxKeyRouteTarget
 )
 
 // traceFromContext retrieves the request's TraceContext. Returns the zero value

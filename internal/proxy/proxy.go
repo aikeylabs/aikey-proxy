@@ -353,6 +353,18 @@ type Proxy struct {
 	// generation, so there is no in-place mutation to race with in-flight
 	// requests.
 	escalationRules []EscalationRule
+	// routePolicy is the org grading document's `route_policy[]` this generation
+	// enforces (SetComplianceGrading → parseRoutePolicy). Empty — the default and
+	// the state of every org that never configured it — means the route decision
+	// is not consulted and the request is forwarded exactly as before
+	// (R-compliance-grading-3.S1). Written ONCE at generation build, read-only
+	// afterwards, for the same reason as escalationRules.
+	// spec: R-compliance-grading-8
+	routePolicy RoutePolicy
+	// routePolicyMetrics counts what the route decision did this generation
+	// (evaluated / denied / capped). Counts only. Generation-scoped like
+	// escalationMetrics.
+	routePolicyMetrics routePolicyMetrics
 	// complianceMaxAction is the filter app's operational enforcement ceiling —
 	// the SAME value the supervisor hands the detector child as
 	// AIKEY_COMPLIANCE_FILTER_MAX_ACTION ("full" | "warn"; "" = full, exactly as
@@ -900,13 +912,24 @@ func (p *Proxy) FilterScanRoles() []string { return p.filterScanRoles.list() }
 // bytes it bakes into the detector child's AIKEY_COMPLIANCE_GRADING env, so the
 // two readers can never be looking at different policies.
 //
-// The proxy reads exactly ONE member of that document: `escalation[]`, the
-// cumulative rule, which is request-level and therefore cannot be evaluated
-// inside the detector (it only ever sees one content piece — DEC-compliance-
-// grading-11 决定 1). Everything else in the document — labels, the ladder, the
-// canned-answer fallback, fail_closed_levels, route_policy — is the detector's
-// or the console's, and is deliberately not modeled here: a partial reader that
-// wrote anything back would delete what it has not learned yet.
+// The proxy reads exactly TWO members of that document, both request-level and
+// therefore impossible to evaluate inside the detector (it only ever sees one
+// content piece — DEC-compliance-grading-11 决定 1):
+//   - `escalation[]`, the cumulative rule;
+//   - `route_policy[]` (task 11.2, R-compliance-grading-8), which needs the
+//     request's TARGET PROVIDER — a fact the detector never receives.
+//
+// Everything else in the document — labels, the ladder, the canned-answer
+// fallback, fail_closed_levels — is the detector's or the console's, and is
+// deliberately not modeled here: a partial reader that wrote anything back would
+// delete what it has not learned yet.
+//
+// The two members are decoded INDEPENDENTLY: an unreadable escalation member
+// must not disarm the routing rule. route_policy's own notes (a rule enforced in
+// a way the administrator may not expect) are WARNed HERE rather than returned,
+// because the return values are the escalation contract the supervisor already
+// labels as such ("escalation rule refused") — mixing route_policy lines into
+// them would mislabel them.
 //
 // Returns how many rules were installed, plus one line per rule that was
 // REFUSED, so the caller can WARN. 🔴 A refused rule is a control the
@@ -918,6 +941,7 @@ func (p *Proxy) FilterScanRoles() []string { return p.filterScanRoles.list() }
 //
 // rule: R-compliance-grading-15 (累计升级在片段循环后做请求级判定)
 func (p *Proxy) SetComplianceGrading(gradingJSON []byte) (applied int, refused []string, err error) {
+	p.installRoutePolicy(gradingJSON)
 	rules, refused, err := parseEscalationRules(gradingJSON)
 	if err != nil {
 		return 0, refused, err

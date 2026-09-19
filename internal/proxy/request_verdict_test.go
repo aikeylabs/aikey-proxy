@@ -164,6 +164,10 @@ func TestBuildRequestVerdictEvent_NoTraceProducesNoEvent(t *testing.T) {
 // 也就不经过 detector 那一侧的任何脱敏。所以"它带了什么"这件事只有这里能守。
 func TestBuildRequestVerdictEvent_CarriesNoContent(t *testing.T) {
 	v := sampleVerdict()
+	// TODO-171: exercise the two DEC-compliance-grading-27 fields too, so the
+	// whitelist below covers every key this builder can emit.
+	v.CountedIsLowerBound = true
+	v.RoutePolicy = &routePolicyVerdict{MinLevel: 4, TargetProvider: "anthropic", UnitIDs: []string{"au_p1"}}
 	raw, err := buildRequestVerdictEvent(v)
 	if err != nil {
 		t.Fatalf("buildRequestVerdictEvent: %v", err)
@@ -178,7 +182,7 @@ func TestBuildRequestVerdictEvent_CarriesNoContent(t *testing.T) {
 		"event_id": true, "created_at": true, "tenant_id": true, "scenario": true,
 		"action_taken": true, "prompt_length": true, "virtual_key_id": true,
 		"seat_id": true, "session_id": true, "trace_id": true,
-		"escalation": true, "findings": true,
+		"escalation": true, "route_policy": true, "findings": true,
 	}
 	for k := range keys {
 		if !allowed[k] {
@@ -192,8 +196,19 @@ func TestBuildRequestVerdictEvent_CarriesNoContent(t *testing.T) {
 		t.Fatalf("unmarshal escalation: %v", err)
 	}
 	for k := range esc {
-		if k != "rule" && k != "counted" && k != "unit_ids" {
-			t.Fatalf("escalation 多带了子键 %q —— DEC-compliance-grading-14 的字段集是固定的", k)
+		if k != "rule" && k != "counted" && k != "unit_ids" && k != "counted_is_lower_bound" {
+			t.Fatalf("escalation 多带了子键 %q —— 字段集由 DEC-compliance-grading-14/27 固定", k)
+		}
+	}
+	// route_policy 的子键同样是白名单(DEC-compliance-grading-27):等级数字、
+	// provider 码、已存在审计行主键 —— 没有片段、哈希、指纹、摘要。
+	var rp map[string]json.RawMessage
+	if err := json.Unmarshal(keys["route_policy"], &rp); err != nil {
+		t.Fatalf("unmarshal route_policy: %v", err)
+	}
+	for k := range rp {
+		if k != "min_level" && k != "target_provider" && k != "unit_ids" {
+			t.Fatalf("route_policy 多带了子键 %q —— DEC-compliance-grading-27 的字段集是固定的", k)
 		}
 	}
 	// prompt_hash / redacted_snippet / context_snippet 这类可能携带内容的键

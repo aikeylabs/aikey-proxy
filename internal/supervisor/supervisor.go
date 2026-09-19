@@ -482,10 +482,12 @@ type Supervisor struct {
 	// masterGrading is the org COMPLIANCE GRADING document (labels / ladder /
 	// escalation / fail-closed levels) polled from the same endpoint, held as
 	// the compact JSON bytes that go into the detector child's environment.
-	// nil ⇒ no policy ⇒ grading off ⇒ the decision layer behaves exactly as it
-	// did before the feature (R-compliance-grading-3).
+	// nil ⇒ the master sent no `grading` member ⇒ grading off ⇒ the decision
+	// layer behaves exactly as it did before the feature (R-compliance-grading-3).
+	// An explicit `{}` is stored as those bytes, not nil: same enforcement, but
+	// the member's presence is what lets the detector report levels (TODO-61).
 	//
-	// 🔴 nil here means ONLY "the org has no grading policy". It must never be
+	// 🔴 nil here means ONLY "the master sent no grading member". It must never be
 	// reached by failing to read one: an unusable or unreachable policy leaves
 	// this field untouched, so the fleet keeps enforcing the last valid ladder
 	// instead of silently falling back to built-in defaults with a console that
@@ -1147,8 +1149,11 @@ func filterSigWithGrading(base string, gradingJSON []byte) string {
 //
 // All three therefore read the SAME bytes — gradingPolicyJSON(), canonicalised
 // once at the entry by normalizeGradingPolicy — through this one digest.
-// gradingEnvValue()'s only difference is the documented nil → "{}" mapping,
-// which is the wire spelling of "no policy", not a different document.
+// gradingEnvValue()'s only difference is the documented nil → "" mapping
+// (gradingPolicyAbsent), which is the wire spelling of "no document", not a
+// different document. An explicit `{}` hashes differently from nil on purpose:
+// an old master upgraded to one that answers `{}` must re-spawn the child, whose
+// env changed (TODO-61).
 // Fenced by TestGrading_SignatureEnvAndCacheEpochShareTheSameBytes.
 // rule: R-compliance-grading-5
 func gradingComponent(gradingJSON []byte) string {

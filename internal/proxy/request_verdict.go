@@ -5,7 +5,11 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"log/slog"
 	"time"
+
+	"github.com/AiKeyLabs/aikey-proxy/internal/apphook"
+	"github.com/AiKeyLabs/aikey-proxy/internal/observability"
 )
 
 // scenarioRequestVerdict marks a compliance event as a REQUEST-level verdict
@@ -41,7 +45,38 @@ type escalationWire struct {
 	Rule    string   `json:"rule"`
 	Counted int      `json:"counted"`
 	UnitIDs []string `json:"unit_ids"`
+	// CountedIsLowerBound — DEC-compliance-grading-27 (TODO-171, user decision
+	// 2026-09-18; declared on master first). true ⇔ a piece was cut at
+	// pipeInputCap, so Counted is only a lower bound. Same word as the
+	// proxy.filter.escalated log field. omitempty: only `true` ever travels —
+	// absent must never be read as 「计数完整」.
+	// spec: R-compliance-grading-17.S2
+	CountedIsLowerBound bool `json:"counted_is_lower_bound,omitempty"`
 }
+
+// routePolicyWire is the typed `route_policy` verdict payload — BESIDE
+// escalation on the same verdict row (DEC-compliance-grading-27). Mirror of
+// master intakeRoutePolicyWire / storage.RoutePolicy; same wire-change rules as
+// escalationWire above (declared on master first, which is why this proxy may
+// send it).
+//
+// 🔴 NOT the grading document's route_policy[] (RoutePolicyRule list): this is
+// the ONE rule the request violated plus the request's target.
+//
+// DC5: MinLevel is the administrator's number, TargetProvider the route's own
+// provider code, UnitIDs primary keys of existing audit rows. Nothing derived
+// from the prompt.
+// spec: R-compliance-grading-8.S1
+type routePolicyWire struct {
+	MinLevel       int      `json:"min_level"`
+	TargetProvider string   `json:"target_provider,omitempty"`
+	UnitIDs        []string `json:"unit_ids"`
+}
+
+// maxRoutePolicyVerdictUnitIDs mirrors master's bound (intake_level.go
+// maxRoutePolicyUnitIDs): master STRIPS a route_policy with more ids than
+// this, so the sender truncates first rather than lose the whole verdict.
+const maxRoutePolicyVerdictUnitIDs = 256
 
 // requestVerdict is everything the escalation conclusion needs in order to be
 // recorded. All of it is already resolved on the filter's request path; nothing
@@ -65,10 +100,27 @@ type requestVerdict struct {
 	// do with any content row's, which keep whatever the ladder gave them.
 	Action string
 	// Rule / Counted / UnitIDs are the escalation evidence; see escalationWire.
+	// Rule == "" means the cumulative rule did NOT fire on this request, and the
+	// payload then carries no `escalation` key at all (a verdict that only
+	// violated a route policy must not read as 「触发了空规则、数了 0 条」).
 	Rule    string
 	Counted int
 	UnitIDs []string
-	Now     time.Time
+	// CountedIsLowerBound: see escalationWire. Only meaningful with Rule != "".
+	CountedIsLowerBound bool
+	// RoutePolicy is the route-policy conclusion; nil ⇔ no route_policy rule
+	// was violated. DEC-compliance-grading-27 (TODO-171).
+	RoutePolicy *routePolicyVerdict
+	Now         time.Time
+}
+
+// routePolicyVerdict is the route-policy conclusion for one request: the
+// violated rule's floor, the request's target provider code ("" ⇔ unknown),
+// and the ids of the content rows whose confirmed hit reached the floor.
+type routePolicyVerdict struct {
+	MinLevel       int
+	TargetProvider string
+	UnitIDs        []string
 }
 
 // requestVerdictEventID derives the verdict row's event id from the turn's trace
@@ -145,18 +197,19 @@ func buildRequestVerdictEvent(v requestVerdict) ([]byte, error) {
 	// no findings of its own" instead of "findings unknown" — the hits live on
 	// the content rows named in escalation.unit_ids.
 	payload := struct {
-		EventID      string         `json:"event_id"`
-		CreatedAt    time.Time      `json:"created_at"`
-		TenantID     string         `json:"tenant_id"`
-		Scenario     string         `json:"scenario"`
-		PromptLength int            `json:"prompt_length"`
-		ActionTaken  string         `json:"action_taken"`
-		VirtualKeyID string         `json:"virtual_key_id,omitempty"`
-		SeatID       string         `json:"seat_id,omitempty"`
-		SessionID    string         `json:"session_id,omitempty"`
-		TraceID      string         `json:"trace_id"`
-		Escalation   escalationWire `json:"escalation"`
-		Findings     []struct{}     `json:"findings"`
+		EventID      string           `json:"event_id"`
+		CreatedAt    time.Time        `json:"created_at"`
+		TenantID     string           `json:"tenant_id"`
+		Scenario     string           `json:"scenario"`
+		PromptLength int              `json:"prompt_length"`
+		ActionTaken  string           `json:"action_taken"`
+		VirtualKeyID string           `json:"virtual_key_id,omitempty"`
+		SeatID       string           `json:"seat_id,omitempty"`
+		SessionID    string           `json:"session_id,omitempty"`
+		TraceID      string           `json:"trace_id"`
+		Escalation   *escalationWire  `json:"escalation,omitempty"`
+		RoutePolicy  *routePolicyWire `json:"route_policy,omitempty"`
+		Findings     []struct{}       `json:"findings"`
 	}{
 		EventID:      eventID,
 		CreatedAt:    v.Now.UTC(),
@@ -167,16 +220,81 @@ func buildRequestVerdictEvent(v requestVerdict) ([]byte, error) {
 		SeatID:       v.SeatID,
 		SessionID:    v.SessionID,
 		TraceID:      v.TraceID,
-		Escalation: escalationWire{
-			Rule:    v.Rule,
-			Counted: v.Counted,
-			UnitIDs: v.UnitIDs,
-		},
-		Findings: []struct{}{},
+		Findings:     []struct{}{},
+	}
+	// Each conclusion travels only when it was reached (DEC-compliance-grading-27):
+	// one trace ⇒ one verdict row, carrying escalation, route_policy, or both.
+	if v.Rule != "" {
+		payload.Escalation = &escalationWire{
+			Rule:                v.Rule,
+			Counted:             v.Counted,
+			UnitIDs:             v.UnitIDs,
+			CountedIsLowerBound: v.CountedIsLowerBound,
+		}
+	}
+	if v.RoutePolicy != nil {
+		ids := v.RoutePolicy.UnitIDs
+		if ids == nil {
+			ids = []string{}
+		}
+		if len(ids) > maxRoutePolicyVerdictUnitIDs {
+			ids = ids[:maxRoutePolicyVerdictUnitIDs]
+		}
+		payload.RoutePolicy = &routePolicyWire{
+			MinLevel:       v.RoutePolicy.MinLevel,
+			TargetProvider: v.RoutePolicy.TargetProvider,
+			UnitIDs:        ids,
+		}
 	}
 	raw, err := json.Marshal(payload)
 	if err != nil {
 		return nil, fmt.Errorf("build request verdict event: %w", err)
 	}
 	return raw, nil
+}
+
+// strongerVerdictAction folds the route-policy conclusion into the verdict
+// row's action_taken. Each conclusion is ALREADY post-ceiling (MAX_ACTION), so
+// this only decides what one row says when both fired: `block` wins if either
+// concluded block; otherwise the conclusion already on the row stands (the
+// escalation's own action, exactly as the row said before TODO-171), and a
+// row with none yet takes the new one.
+//
+// Deliberately NOT a general action-strength order — none exists in this
+// package, and inventing one for a single call site would be a second answer
+// to a question the ladder already owns.
+func strongerVerdictAction(current, next apphook.Action) apphook.Action {
+	switch {
+	case current == apphook.ActionBlock || next == apphook.ActionBlock:
+		return apphook.ActionBlock
+	case current == apphook.ActionAllow:
+		return next
+	default:
+		return current
+	}
+}
+
+// buildVerdictRowOrWarn builds the request-verdict row and turns both
+// no-row outcomes into a loud WARN (fail-loud, never fail the request: the
+// refusal still happens, the audit row is what is missing).
+func (p *Proxy) buildVerdictRowOrWarn(logger *slog.Logger, v requestVerdict) []byte {
+	ev, err := buildRequestVerdictEvent(v)
+	switch {
+	case err != nil:
+		logger.Warn("filter: request verdict event could not be built; the request-level verdict was "+
+			"enforced but not recorded",
+			"event.name", observability.EventProxyFilterEscalationEventDropped,
+			"error", err.Error(), "rule", v.Rule, "route_policy", v.RoutePolicy != nil)
+		return nil
+	case len(ev) == 0:
+		// No trace id → no derivable event id. buildRequestVerdictEvent documents
+		// why minting one anyway would be worse than emitting nothing (every
+		// trace-less request in the fleet would collapse onto one shared row).
+		logger.Warn("filter: request-level verdict reached but no trace id to derive a verdict event id "+
+			"from; it is enforced but has no audit row",
+			"event.name", observability.EventProxyFilterEscalationEventDropped,
+			"rule", v.Rule, "route_policy", v.RoutePolicy != nil)
+		return nil
+	}
+	return ev
 }

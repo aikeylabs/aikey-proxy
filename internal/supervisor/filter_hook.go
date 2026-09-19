@@ -264,10 +264,13 @@ func (s *Supervisor) installFilterHook(p *proxy.Proxy, vaultReader *vault.Reader
 	// machine's environment or vault — the ladder is the organisation's decision
 	// and a member must not be able to soften it locally.
 	//
-	// "{}" (gradingEnvValue's answer when the org has no policy) means grading
-	// OFF, i.e. the detector decides by entity_actions exactly as it did before
-	// this feature. It is NOT what an unreadable policy produces — that keeps the
-	// last valid document, see applyComplianceMasterPolicy. Compact JSON, whose
+	// "" (the master sent no `grading` member — an old master, or no master) and
+	// "{}" (a new master, nothing configured) both mean grading OFF, i.e. the
+	// detector decides by entity_actions exactly as it did before this feature.
+	// They are two spellings on purpose: only "{}" lets the detector report the
+	// classification tree's level (TODO-61, see gradingPolicyAbsent). Neither is
+	// what an unreadable policy produces — that keeps the last valid document,
+	// see applyComplianceMasterPolicy. Compact JSON, whose
 	// size ceiling the master enforces on save (7680 bytes, strictly below this
 	// side's runtime limit gradingEnvLimitBytes = 8192 — DEC-compliance-grading-10;
 	// the runtime check is in normalizeGradingPolicy, which measures these exact

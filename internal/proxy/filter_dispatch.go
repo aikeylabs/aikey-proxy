@@ -500,6 +500,11 @@ func (p *Proxy) applyInboundFilter(
 		refusalMsg      string
 		refusalAnswer   *cannedAnswerPlan
 		refusalDegraded bool
+		// refusalByRoutePolicy: the refusal was decided by the grading route
+		// policy (R-compliance-grading-8), which answers with its OWN code —
+		// COMPLIANCE_ROUTE_POLICY_DENIED means "not HERE", COMPLIANCE_BLOCKED means
+		// "not anywhere", and the user's remedy differs.
+		refusalByRoutePolicy bool
 	)
 	// Record every filterable request, including block/degraded early returns.
 	// A request with at least one cache hit is the steady-state incremental lane;
@@ -1142,6 +1147,16 @@ func (p *Proxy) applyInboundFilter(
 	esc := evaluateEscalation(pieces, escFindings, p.escalationRules, p.requestEscalationCeiling())
 	p.escalationMetrics.evaluated.Add(1)
 	p.escalationMetrics.lastCounted.Store(int64(esc.Counted))
+	// TODO-72: a piece cut at pipeInputCap had its tail forwarded unscanned, so
+	// esc.Counted is only a LOWER BOUND and this verdict may have let through a
+	// request that should have escalated. Declared, not closed, in this release
+	// (DEC-compliance-grading-26; chunked scanning is the next one) — the
+	// counter and the log field below are what keep it from being silent.
+	// spec: R-compliance-grading-17.S2
+	countIsLowerBound := truncPieces > 0
+	if countIsLowerBound {
+		p.escalationMetrics.evaluatedOnTruncated.Add(1)
+	}
 	if esc.Skipped > 0 {
 		// 🔴 THE WARN TASK 3.9 HANDED OVER. countDistinctHits is a pure function
 		// with no request context, so it returns the number instead of logging it
@@ -1165,6 +1180,14 @@ func (p *Proxy) applyInboundFilter(
 			"event.name", observability.EventProxyFilterEscalationUnresolved,
 			"unresolved_hits", esc.Skipped, "pieces", len(pieces), "counted", esc.Counted)
 	}
+	// The request-level verdict row, filled by whichever request-level
+	// conclusions are reached below (cumulative escalation, route policy, or
+	// both) and emitted ONCE after both (TODO-171, DEC-compliance-grading-27).
+	verdict := requestVerdict{
+		TraceID: traceID, TenantID: orgID, VirtualKeyID: virtualKeyID,
+		SeatID: seatID, SessionID: sessionID,
+	}
+	verdictAction := apphook.ActionAllow
 	if esc.Rule != nil {
 		p.escalationMetrics.triggered.Add(1)
 		// 失败要显眼, inverted: this is the one line that says a request was
@@ -1175,15 +1198,23 @@ func (p *Proxy) applyInboundFilter(
 			"event.name", observability.EventProxyFilterEscalated,
 			"rule", esc.Rule.String(), "counted", esc.Counted, "pieces", len(pieces),
 			"action", esc.Action.String(), "capped", esc.Capped,
-			"already_refused", refusalAction != apphook.ActionAllow)
+			"already_refused", refusalAction != apphook.ActionAllow,
+			// Same key as proxy.filter.input_truncated so the two lines join.
+			"pieces_truncated", truncPieces,
+			"counted_is_lower_bound", countIsLowerBound)
 
 		// Record the conclusion as its OWN audit row (R-compliance-grading-18),
-		// on BOTH routes since TODO-87 (2026-09-15 — this block used to be team
-		// only, on the premise that a personal request could not reach it; the
-		// count projection removed that premise). unit_ids name the content rows
-		// that were counted: the proxy's own content-derived ids on a team route,
-		// the detector's projection event ids on a personal route (escUnitIDs is
+		// on BOTH routes since TODO-87. unit_ids name the content rows that were
+		// counted: the proxy's own content-derived ids on a team route, the
+		// detector's projection event ids on a personal route (escUnitIDs is
 		// filled per route in the loop above).
+		//
+		// 🔴 The row itself is NOT built here any more (TODO-171,
+		// DEC-compliance-grading-27): a route-policy violation below is the
+		// OTHER request-level conclusion, and the verdict id derives from the
+		// trace — one request, one row. Built once, after both decisions, by
+		// emitRequestVerdict; a second row here would be absorbed by master's
+		// ON CONFLICT (event_id) DO NOTHING and half the audit would vanish.
 		// spec: R-compliance-grading-18
 		units := make([]string, 0, len(esc.Units))
 		for _, idx := range esc.Units {
@@ -1191,45 +1222,11 @@ func (p *Proxy) applyInboundFilter(
 				units = append(units, id)
 			}
 		}
-		ev, evErr := buildRequestVerdictEvent(requestVerdict{
-			TraceID:      traceID,
-			TenantID:     orgID,
-			VirtualKeyID: virtualKeyID,
-			SeatID:       seatID,
-			SessionID:    sessionID,
-			Action:       esc.Action.String(),
-			Rule:         esc.Rule.String(),
-			Counted:      esc.Counted,
-			UnitIDs:      units,
-			Now:          time.Now(),
-		})
-		switch {
-		case evErr != nil:
-			// Fail-loud, never fail the request: the refusal below still
-			// happens, the audit row is what is missing.
-			logger.Warn("filter: request verdict event could not be built; the escalation was "+
-				"enforced but not recorded",
-				"event.name", observability.EventProxyFilterEscalationEventDropped,
-				"error", evErr.Error(), "rule", esc.Rule.String())
-		case len(ev) == 0:
-			// No trace id → no derivable event id. buildRequestVerdictEvent
-			// documents why minting one anyway would be worse than emitting
-			// nothing (every trace-less request in the fleet would collapse
-			// onto one shared row).
-			logger.Warn("filter: request escalated but no trace id to derive a verdict event id "+
-				"from; the escalation is enforced but has no audit row",
-				"event.name", observability.EventProxyFilterEscalationEventDropped,
-				"rule", esc.Rule.String())
-		case routeClass == apphook.RouteClassTeam:
-			teamEvents = append(teamEvents, ev)
-		default:
-			// Personal route: LOCAL self-view only (user decision V1). Never
-			// teamEvents — master holds none of this route's content rows, so
-			// every unit id would dangle there, and the personal/team isolation
-			// of 2026-05-10 stays in force. Fence:
-			// TestEscalation_PersonalRouteNoDoubleUpload.
-			localVerdictEvents = append(localVerdictEvents, ev)
-		}
+		verdict.Rule = esc.Rule.String()
+		verdict.Counted = esc.Counted
+		verdict.UnitIDs = units
+		verdict.CountedIsLowerBound = countIsLowerBound
+		verdictAction = esc.Action
 
 		// Enact it. Only ever a STRENGTHENING: a refusal already recorded by a
 		// piece stands as-is (R-compliance-grading-15: 「SHALL NOT 弱于逐片段动作的
@@ -1242,6 +1239,90 @@ func (p *Proxy) applyInboundFilter(
 			// the caller the count would turn the refusal into an oracle they can
 			// probe. The administrator sees all of it on the audit row.
 			refusalMsg = "request blocked by compliance policy"
+		}
+	}
+
+	// ── Grading-driven route policy (task 11.2) ─────────────────────────────
+	//
+	// spec: R-compliance-grading-8 (判定发生在检测之后、provider 选择之前；不静默改路由；不外泄等级)
+	//
+	// After the loop because the levels only exist once every piece has been
+	// scanned (cache hits included — escFindings is filled on both paths), and
+	// before the deferred refusal so a refusal here takes the ONE guardrail
+	// short-circuit below: nothing is forwarded, nothing is re-routed.
+	//
+	// Reads ONLY each finding's level + confirmed (applyGradingRoutePolicy); no
+	// rule is re-run. An empty policy skips the whole block, which is what keeps
+	// an org that never configured route_policy byte-identical to before.
+	//
+	// The operator's MAX_ACTION ceiling applies exactly as it does to the
+	// cumulative rule (「天花板只压不抬」): with MAX_ACTION=warn the request is
+	// forwarded and the capped conclusion is logged and counted, never silent.
+	if len(p.routePolicy) > 0 {
+		p.routePolicyMetrics.evaluated.Add(1)
+		target := routeTargetFromContext(r.Context())
+		var all []Finding
+		for _, fs := range escFindings {
+			all = append(all, fs...)
+		}
+		if action, reason := applyGradingRoutePolicy(all, target, p.routePolicy); action != apphook.ActionAllow {
+			rule, _ := p.routePolicy.firstViolated(all, target)
+			enforced, capped := p.requestEscalationCeiling().clamp(action)
+			// The route-policy conclusion goes on the request-verdict row in
+			// BOTH outcomes — refused, and capped by MAX_ACTION=warn (user
+			// decision 2026-09-18: a capped request is L-high content that
+			// really went outside the allow-list, the fact an audit most needs).
+			// Config + the route's provider code + existing row ids only (DC5).
+			// spec: R-compliance-grading-8.S1
+			rpUnits := []string{}
+			for _, idx := range rule.triggeringPieces(escFindings) {
+				if id := escUnitIDs[idx]; id != "" {
+					rpUnits = append(rpUnits, id)
+				}
+			}
+			verdict.RoutePolicy = &routePolicyVerdict{
+				MinLevel: rule.verdictMinLevel(), TargetProvider: target.Code, UnitIDs: rpUnits,
+			}
+			verdictAction = strongerVerdictAction(verdictAction, enforced)
+			switch {
+			case capped:
+				p.routePolicyMetrics.capped.Add(1)
+				logger.Info("filter: grading route policy would refuse this request, but the MAX_ACTION ceiling "+
+					"let it through; content forwarded to a provider outside the allow-list",
+					"event.name", observability.EventProxyFilterRoutePolicyCapped,
+					"route_policy", reason, "min_level", rule.MinLevel, "target_provider", target.Code,
+					"enforced", enforced.String())
+			case enforced == apphook.ActionBlock:
+				p.routePolicyMetrics.denied.Add(1)
+				// Config + the route's own provider code only — never the matched
+				// value, never which piece.
+				logger.Info("filter: request refused by the grading route policy; nothing forwarded",
+					"event.name", observability.EventProxyFilterRoutePolicyDenied,
+					"route_policy", reason, "min_level", rule.MinLevel, "target_provider", target.Code,
+					"already_refused", refusalAction != apphook.ActionAllow)
+				if refusalAction == apphook.ActionAllow {
+					refusalAction = apphook.ActionBlock
+					refusalByRoutePolicy = true
+				}
+			}
+		}
+	}
+
+	// ── The request-verdict row, emitted once (TODO-171) ───────────────────
+	if verdict.Rule != "" || verdict.RoutePolicy != nil {
+		verdict.Action = verdictAction.String()
+		verdict.Now = time.Now()
+		switch ev := p.buildVerdictRowOrWarn(logger, verdict); {
+		case ev == nil:
+		case routeClass == apphook.RouteClassTeam:
+			teamEvents = append(teamEvents, ev)
+		default:
+			// Personal route: LOCAL self-view only (user decision V1). Never
+			// teamEvents — master holds none of this route's content rows, so
+			// every unit id would dangle there, and the personal/team isolation
+			// of 2026-05-10 stays in force. Fence:
+			// TestEscalation_PersonalRouteNoDoubleUpload.
+			localVerdictEvents = append(localVerdictEvents, ev)
 		}
 	}
 
@@ -1286,6 +1367,19 @@ func (p *Proxy) applyInboundFilter(
 			return false
 		}
 		p.errors.Add(1)
+		if refusalByRoutePolicy {
+			// A constant, like every other refusal body: the client learns the
+			// policy said "not to this provider" and what to do about it — never
+			// the level, the rule or the matched value (an oracle for probing the
+			// classification). The administrator has all of it in the log above.
+			writeJSONError(w, http.StatusForbidden, "invalid_request_error",
+				observability.ErrCodeComplianceRoutePolicyDenied,
+				"Your organization's compliance policy does not allow content of this sensitivity "+
+					"level to be sent to this model provider. Send it through a model provider your "+
+					"organization approves for sensitive data (for example an intranet model), or "+
+					"remove the sensitive content and try again.")
+			return false
+		}
 		// Logged BEFORE the fallback below, so `reason` is still the detector's
 		// own word (empty when it gave none) and not the constant the client is
 		// about to be shown — byte-identical to what this line printed when it

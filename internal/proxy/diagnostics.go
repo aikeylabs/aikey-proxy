@@ -98,6 +98,9 @@ type PipelineDiagnostics struct {
 	// point-in-time projection of live child state, not a cumulative count. It is
 	// therefore safe to read on its own without comparing GenerationID.
 	FilterHook FilterHookHealth `json:"filter_hook"`
+	// Escalation is the request-level cumulative-rule counters (TODO-72) —
+	// see EscalationHealth. Generation-scoped.
+	Escalation EscalationHealth `json:"escalation"`
 }
 
 // FilterHookStatus is the filter dispatcher's 4-state verdict. `partial` exists
@@ -580,6 +583,92 @@ func (p *Proxy) maskRestoreHealth() MaskRestoreHealth {
 	return h
 }
 
+// EscalationHealthStatus is the request-level cumulative-escalation verdict
+// (TODO-72). Stable strings; `inactive` / `ok` / `degraded` mean what they mean
+// on every other block of this endpoint.
+type EscalationHealthStatus string
+
+const (
+	// EscalationHealthInactive: no cumulative rule is installed on this
+	// generation. The verdict still RUNS on every filterable request (the
+	// counters prove it — R-compliance-grading-15.S2) but can never fire.
+	EscalationHealthInactive EscalationHealthStatus = "inactive"
+	// EscalationHealthOK: rules installed, every verdict so far was reached on
+	// fully scanned input and every counted hit resolved.
+	EscalationHealthOK EscalationHealthStatus = "ok"
+	// EscalationHealthLowerBound: at least one verdict this generation was
+	// reached on a request with a piece cut at pipeInputCap, so its count was a
+	// lower bound. The DECLARED blind spot of DEC-compliance-grading-26 — not a
+	// fault of this proxy, and deliberately not `degraded`: calling a documented
+	// limitation "degraded" would train operators to ignore the word.
+	EscalationHealthLowerBound EscalationHealthStatus = "lower_bound"
+	// EscalationHealthDegraded: confirmed hits could not be resolved to a value
+	// (detector offsets and proxy text disagree — a cross-process desync). A real
+	// fault, so it wins over lower_bound.
+	EscalationHealthDegraded EscalationHealthStatus = "degraded"
+)
+
+// EscalationHealth exposes escalationMetrics read-only (TODO-72). Before this
+// block the counters were readable only through a test helper, so "how many
+// requests did the cumulative rule refuse, and how many of its verdicts were
+// reached on input the detector never fully saw?" had no external answer
+// (health-signal-surface).
+//
+// Additive block on the existing endpoint, same reasoning as FilterHook
+// (慎重新建 API/接口协议): one more question an operator asks about the same
+// request pipeline, no new route, no new auth posture.
+//
+// 🔴 Generation-scoped like every counter above — compare GenerationID.
+// Counts only: never a value, a rule body or anything content-derived.
+//
+// spec: R-compliance-grading-17.S2 (已知限制：>16KB 片段尾部不计入累计)
+type EscalationHealth struct {
+	Status EscalationHealthStatus `json:"status"`
+	Reason string                 `json:"reason"`
+	// Rules: cumulative rules installed on this generation.
+	Rules int `json:"rules"`
+	// Evaluated / Triggered: request-level verdicts run / verdicts where a rule
+	// fired (before the MAX_ACTION ceiling — a capped escalation still counts).
+	Evaluated int64 `json:"evaluated"`
+	Triggered int64 `json:"triggered"`
+	// LastCounted: distinct-hit count of the most recent verdict (a gauge).
+	LastCounted int64 `json:"last_counted"`
+	// UnresolvedHits: confirmed hits that could not be sliced to a value.
+	UnresolvedHits int64 `json:"unresolved_hits"`
+	// EvaluatedOnTruncatedInput: verdicts reached on a request in which at
+	// least one piece was cut at pipeInputCap — each of these counted a lower
+	// bound. Read with mask_restore.scan_truncated_pieces.
+	EvaluatedOnTruncatedInput int64 `json:"evaluated_on_truncated_input"`
+}
+
+// escalationHealth is the one function that renders the block. Pure read.
+func (p *Proxy) escalationHealth() EscalationHealth {
+	m := &p.escalationMetrics
+	h := EscalationHealth{
+		Rules:                     len(p.escalationRules),
+		Evaluated:                 m.evaluated.Load(),
+		Triggered:                 m.triggered.Load(),
+		LastCounted:               m.lastCounted.Load(),
+		UnresolvedHits:            m.unresolvedHits.Load(),
+		EvaluatedOnTruncatedInput: m.evaluatedOnTruncated.Load(),
+	}
+	switch {
+	case h.Rules == 0:
+		h.Status = EscalationHealthInactive
+		h.Reason = "No cumulative escalation rule is configured for this organization; requests are checked but never refused for accumulated hits."
+	case h.UnresolvedHits > 0:
+		h.Status = EscalationHealthDegraded
+		h.Reason = fmt.Sprintf("%d confirmed hit(s) could not be matched back to the request text and were not counted — the detector and the proxy disagree about offsets. Requests may be let through that should have been refused; check that the detector and proxy versions match.", h.UnresolvedHits)
+	case h.EvaluatedOnTruncatedInput > 0:
+		h.Status = EscalationHealthLowerBound
+		h.Reason = fmt.Sprintf("%d of %d escalation check(s) ran on requests with content longer than %d bytes. Only the first %d bytes of such content is scanned, so those counts are a lower bound: a request can be let through when some of its hits sit past that point. This is a known limit of this release.", h.EvaluatedOnTruncatedInput, h.Evaluated, pipeInputCap, pipeInputCap)
+	default:
+		h.Status = EscalationHealthOK
+		h.Reason = "Cumulative escalation rules are active and every check so far ran on fully scanned content."
+	}
+	return h
+}
+
 // RegistryProvenance proves WHICH embedded registry is live (P7.14: the digest
 // changes only when the binary does — editing a mapping line is a re-release).
 type RegistryProvenance struct {
@@ -665,6 +754,7 @@ func (p *Proxy) handleDiagnosticsPipeline(w http.ResponseWriter, r *http.Request
 		ModelMapping: p.mappingHealth(),
 		MaskRestore:  p.maskRestoreHealth(),
 		FilterHook:   p.filterHookHealth(),
+		Escalation:   p.escalationHealth(),
 	}
 
 	w.Header().Set("Content-Type", "application/json")

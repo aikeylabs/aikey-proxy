@@ -742,6 +742,14 @@ type escalationMetrics struct {
 	// (see countDistinctHits' `skipped`). A rising number means the detector's
 	// offsets and the proxy's text disagree — a cross-process desync.
 	unresolvedHits atomic.Int64
+	// evaluatedOnTruncated: verdicts reached on a request in which at least one
+	// content piece was cut at pipeInputCap (TODO-72). On those requests the
+	// detector never saw the tail, so `lastCounted` is a LOWER BOUND and a
+	// request that should have escalated may have been let through. This is a
+	// declared blind spot (DEC-compliance-grading-26), not a fault — the number
+	// exists so an operator can see how often a verdict was reached on
+	// incomplete input instead of inferring it from silence.
+	evaluatedOnTruncated atomic.Int64
 }
 
 // escalationSnapshot is a consistent-enough read of the counters for fences and
