@@ -273,6 +273,44 @@ var guardrailVerbatimSources = map[string]string{
 	"cannedAnswer.text": "the administrator-authored canned answer, resolved through the single " +
 		"outlet actionpolicy.ResolveAnswerText from three administrator-filled columns and " +
 		"emitted verbatim — the value this invariant exists to carry (see the boundary note above)",
+
+	// ---------------------------------------------------------------------
+	// Site two, argument five, as of TODO-178 (2026-09-20).
+	//
+	// 🔴 THIS ENTRY WIDENS THE RED LINE THE MOST OF ANY ENTRY IN THIS TABLE,
+	// and it is the ONE case invariant 12 was written to forbid: the expansion
+	// really is derived from what the detector matched. It is here because the
+	// USER REVERSED THAT SENTENCE on 2026-09-20 after being shown what it costs
+	// — R-compliance-canned-answer-10 supersedes the 「一律不插值」 clause of
+	// R-compliance-canned-answer-3 and nothing else in it. An agent must not add
+	// a sibling entry on its own authority; the bar is the same user sign-off.
+	//
+	// What keeps the widening bounded, each part fenced separately:
+	//   - ONE token. `{{机密内容}}` exactly; every other `{{…}}` still reaches
+	//     the client byte for byte (TestCannedAnswerVariable_OtherPlaceholdersStayVerbatim),
+	//     and the token is spelled in exactly one place
+	//     (TestFence_ConfidentialVariableHasOneSpelling).
+	//   - NEVER THE RAW VALUE. Every fragment comes out of maskHitFragment,
+	//     which can only ever reveal ASCII digits and only when the value carries
+	//     ≥ cannedAnswerMinDigitsToReveal of them; the field has exactly one
+	//     producer (TestFence_CannedAnswerFragmentHasOneProducer).
+	//   - BOUNDED. cannedAnswerMaxHits entries, cannedAnswerFragmentMaxRunes each
+	//     (TestCannedAnswerVariable_TruncatesAtCap).
+	//   - NO NEW DATA ANYWHERE. Computed from the piece text this process already
+	//     holds plus offsets already on the wire, thrown away after the write —
+	//     the audit upload is byte-identical either way
+	//     (TestCannedAnswerVariable_AuditRowUnchanged).
+	//   - NO SUBSTITUTION PRIMITIVE. The renderer walks the text with
+	//     strings.Index and copies; the interpolationPrimitives ban above is
+	//     untouched and still cannot be whitelisted.
+	//
+	// ⚠️ The administrator's own text is still verbatim OUTSIDE the token — the
+	// half of invariant 12 that protects the sentence itself did not move.
+	"renderCannedAnswerText(cannedAnswer.text, collectCannedAnswerHits(pieces, escFindings, escEvents), logger)": "" +
+		"the administrator's text with the ONE whitelisted variable expanded to 「命中类别 + 打码片段」 " +
+		"(R-compliance-canned-answer-10, user decision 2026-09-20, supersedes the no-interpolation " +
+		"clause of -3). Bounded by the five fences named in the note above; the fragments can only " +
+		"ever be masked output of maskHitFragment",
 }
 
 // interpolationPrimitives are the calls that turn "print this text" into "print

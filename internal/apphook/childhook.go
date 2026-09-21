@@ -352,19 +352,33 @@ func (h *ChildHook) spawnLocked(ctx context.Context) error {
 				sentReady = true
 				continue // KEEP draining — do NOT return (see below)
 			}
+			// Drain + surface child stderr for the WHOLE life of this generation.
+			//
+			// WHY DRAINING (2026-06-13 form-② filter-degrade RCA): the old code
+			// `return`ed here, so after startup the child's stderr was NEVER read.
+			// Two harms: (1) a 64KB pipe buffer eventually FILLS and the child BLOCKS
+			// on its next stderr write → it can't service Detect → every call times
+			// out → silent fail-open; (2) the child's own warnings/errors (the degrade
+			// reason) were discarded — a diagnosis blind spot.
+			//
+			// WHY THE `sentReady` CONDITION IS GONE (2026-09-20): logging only AFTER
+			// the sentinel still discarded the startup half — and startup is exactly
+			// when a child reports what it could not initialize, because it has not
+			// finished booting yet. Every Cluster worker wrote
+			//   "warn: pack cache dir init failed (...permission denied); puller disabled"
+			// into that window and it was thrown away, leaving `packs=off` in the
+			// ready banner as the only clue that graded compliance was dead fleet-wide.
+			// A child's line is cheap; a discarded one costs a live investigation.
+			// Volume is bounded: a handful of lines per spawn, not per request.
+			// See workflow/CI/bugfix/2026-09-20-cluster-node-home-subtree-owned-by-root-disables-pack-pull.md
+			// Fence: TestChildHook_SurfacesStderrWrittenBeforeReady.
+			phase := "startup"
 			if sentReady {
-				// Drain + surface child stderr for the life of this generation. WHY
-				// (2026-06-13 form-② filter-degrade RCA): the old code `return`ed
-				// here, so after startup the child's stderr was NEVER read. Two harms:
-				// (1) a 64KB pipe buffer eventually FILLS and the child BLOCKS on its
-				// next stderr write → it can't service Detect → every call times out →
-				// silent fail-open; (2) the child's own warnings/errors (the degrade
-				// reason) were discarded — a diagnosis blind spot. Draining fixes the
-				// deadlock; logging makes the child's voice visible link-side.
-				slog.Warn("apphook: child stderr",
-					"event.name", "proxy.apphook.child_stderr",
-					"name", h.cfg.Name, "line", line)
+				phase = "running"
 			}
+			slog.Warn("apphook: child stderr",
+				"event.name", observability.EventAppHookChildStderr,
+				"name", h.cfg.Name, "phase", phase, "line", line)
 		}
 	}()
 

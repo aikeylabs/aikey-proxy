@@ -309,6 +309,14 @@ const (
 	// without splitting the join, so it names a code defect, not a content event.
 	EventProxyFilterActionCapped        = "proxy.filter.action_capped"
 	EventProxyFilterMaskUnwritablePiece = "proxy.filter.mask_unwritable_piece"
+	// EventProxyFilterCannedAnswerVariableEmpty: a canned answer used the one
+	// whitelisted variable (`{{机密内容}}`, R-compliance-canned-answer-10) but the
+	// request produced no readable confirmed hit, so the expansion fell back to the
+	// generic term. The user still gets a sentence that reads; the operator needs
+	// this line because otherwise "the variable quietly stopped naming anything"
+	// (offsets desynced, findings absent) looks exactly like a normal answer.
+	// Counts only — never a category, never a fragment.
+	EventProxyFilterCannedAnswerVariableEmpty = "proxy.filter.canned_answer_variable_empty"
 	// EventProxyFilterMaxActionReadFailed means the operational enforcement
 	// ceiling could not be read from the Vault. The supervisor preserves the
 	// safer full ceiling and emits this stable event for external alerting.
@@ -417,6 +425,19 @@ const (
 	// the same child-side condition.
 	EventAppHookContentVersionChanged = "proxy.apphook.content_version_changed"
 	EventAppHookContentVersionUnknown = "proxy.apphook.content_version_unknown"
+	// EventAppHookChildStderr: WARN, one per non-sentinel line the hook child
+	// writes to stderr, for the WHOLE life of the child — startup included.
+	// Fields: name, phase ("startup" before the ready sentinel, "running" after),
+	// line. The child decides what it says; the proxy only guarantees it is heard.
+	//
+	// The `phase` split exists because the startup half used to be read and
+	// DISCARDED: the drain goroutine started logging only after the ready
+	// sentinel. A child that fails to initialize a subsystem reports it before it
+	// reports ready, so the half that mattered most was the half thrown away —
+	// on the Cluster edition that turned a permission fault into the unexplained
+	// word `packs=off` and hid it for six weeks. See
+	// workflow/CI/bugfix/2026-09-20-cluster-node-home-subtree-owned-by-root-disables-pack-pull.md
+	EventAppHookChildStderr = "proxy.apphook.child_stderr"
 	// EventAppHookListPacksOversize: the child's op=ListPacks report exceeded the
 	// pipe's single-frame limit and was skipped unread (TODO-120). The child is
 	// NOT marked degraded — it still serves Detect — and the report reads as

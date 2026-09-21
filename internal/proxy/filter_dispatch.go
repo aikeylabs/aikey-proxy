@@ -468,6 +468,14 @@ func (p *Proxy) applyInboundFilter(
 		// content-derived is added to any wire or row (R-compliance-grading-16).
 		escFindings = make([][]Finding, len(pieces))
 		escUnitIDs  = make([]string, len(pieces))
+		// escEvents[i] is the RAW event document piece i came back with, kept
+		// only so the canned answer's whitelisted variable can read the tenant's
+		// own leaf NAME for each hit (TODO-178, R-compliance-canned-answer-10).
+		// A reference, not a copy, and read on the answer path only — the
+		// counter's own reader (proxy.Finding) is deliberately NOT widened,
+		// because it is shared with the content-free personal-route projection
+		// (see decodeEventLeafNames for the whole reason).
+		escEvents = make([][]byte, len(pieces))
 		// Personal-route projection accounting for this request (TODO-87): pieces
 		// that came back with a count projection, and FLAGGED pieces that came back
 		// without one (a detector older than this proxy). Counts only; reported
@@ -775,6 +783,7 @@ func (p *Proxy) applyInboundFilter(
 		// two cannot count differently — see decodeEventFindings.
 		// spec: R-compliance-grading-15
 		escFindings[i] = decodeEventFindings(resp.Event)
+		escEvents[i] = resp.Event
 		if routeClass != apphook.RouteClassTeam {
 			// The proxy uploads nothing on this route, so the only id that names
 			// this piece's content row is the one the detector uploaded it under.
@@ -1346,7 +1355,25 @@ func (p *Proxy) applyInboundFilter(
 			// under new names for a value that has not changed — a worse outcome
 			// than one alias line.
 			cannedAnswer := refusalAnswer
-			if writeErr := writeCannedAnswer(w, cannedAnswer.proto, cannedAnswer.streaming, model, cannedAnswer.text); writeErr != nil {
+			// 🔴 THE ONE WHITELISTED VARIABLE (TODO-178, user decision 2026-09-20,
+			// R-compliance-canned-answer-10 — which SUPERSEDES the 「一律不插值」
+			// sentence of R-compliance-canned-answer-3 and nothing else in it).
+			//
+			// Rendered HERE, at the single write site, and not inside the six-shape
+			// synthesizer: writeCannedAnswer is the outlet for the six SHAPES, and
+			// putting the substitution behind it would move it out of the scan range
+			// of the red-line fence below — a fence that stopped looking is worse
+			// than no fence. Here it stays an argument the fence must judge, which
+			// is why guardrailVerbatimSources carries this exact expression with its
+			// reason.
+			//
+			// The hits are computed from what this process already holds — the piece
+			// text plus the detector's offsets, sliced by the same hitValue the
+			// escalation counter uses — so nothing is added to any wire, event or
+			// row. See canned_answer_variable.go for the masking rule and for the
+			// three residual exposures the user accepted.
+			answerText := renderCannedAnswerText(cannedAnswer.text, collectCannedAnswerHits(pieces, escFindings, escEvents), logger)
+			if writeErr := writeCannedAnswer(w, cannedAnswer.proto, cannedAnswer.streaming, model, answerText); writeErr != nil {
 				// planCannedAnswer already proved the shape is synthesizable, so
 				// reaching here means the CLIENT went away mid-write (or the
 				// writer was handed something it refuses). Either way the request
@@ -1363,6 +1390,9 @@ func (p *Proxy) applyInboundFilter(
 				"event.name", "proxy.filter.answered",
 				"protocol", cannedAnswer.proto.String(), "streaming", cannedAnswer.streaming,
 				"answer_source", cannedAnswer.source, "answer_text_len", len(cannedAnswer.text),
+				// Lengths only — never the text, never a category, never a fragment
+				// (the same rule planCannedAnswer's WARN states).
+				"answer_rendered_len", len(answerText),
 				"degraded", refusalDegraded)
 			return false
 		}
