@@ -157,11 +157,55 @@ func (s *Supervisor) syncComplianceMasterPolicy(ctx context.Context) {
 		return // no team / no org → no mandate; local toggle governs (Personal)
 	}
 	enabled, tier, passwordAdvanced, gradingJSON, ok := fetchComplianceMasterPolicy(ctx, masterURL, orgID)
-	if s.applyComplianceMasterPolicy(enabled, tier, passwordAdvanced, gradingJSON, ok) {
-		if err := s.Reload(ctx); err != nil {
-			slog.Warn("compliance policy reload failed",
-				"event.name", "proxy.compliance.policy_reload_failed", "error", err)
+	change := s.applyComplianceMasterPolicy(enabled, tier, passwordAdvanced, gradingJSON, ok)
+	s.actOnCompliancePolicyChange(ctx, change, s.Reload)
+}
+
+// compliancePolicyChange is what one poll changed and therefore what must
+// happen to the running detector (TODO-188 方案 C split the old single bool).
+//
+//	respawn — a value that can ONLY reach the detector through its spawn env
+//	          changed (enabled / privacy_tier / password_tier): full reload,
+//	          exactly as before C. A grading change riding along is carried by
+//	          that same reload.
+//	grading — ONLY the grading document changed: hot-swap it into the running
+//	          detector (hotSwapGrading) instead of re-spawning the pool.
+//	          previousGrading is the document in force before this poll, so a
+//	          refusal can restore it.
+type compliancePolicyChange struct {
+	respawn         bool
+	grading         bool
+	previousGrading []byte
+}
+
+// any reports whether the poll changed anything the detector must learn.
+func (c compliancePolicyChange) any() bool { return c.respawn || c.grading }
+
+// actOnCompliancePolicyChange is the testable core of the poll's decision: the
+// reload is a parameter (same posture as healFilterStubWithReload) so a fence
+// can assert WHETHER the pool was rebuilt without standing up a generation build.
+// rule: R-compliance-grading-5
+// spec: R-compliance-grading-5.1
+func (s *Supervisor) actOnCompliancePolicyChange(ctx context.Context, change compliancePolicyChange, reload func(context.Context) error) {
+	switch {
+	case change.respawn:
+		s.gradingHotSwapRefusals.Store(0) // the re-spawned pool is born with the new document (cold path)
+	case change.grading:
+		if s.hotSwapGrading(ctx, change.previousGrading) != gradingSwapNeedsReload {
+			return
 		}
+		// Fall through to the pre-C behavior: an old detector, or no usable
+		// answer. masterGrading already holds the new document, so the reload
+		// spawns with it — byte-for-byte what happened before C.
+	default:
+		// Nothing changed. If the master reverted to the document this node is
+		// enforcing, the console and the node agree again.
+		s.gradingHotSwapRefusals.Store(0)
+		return
+	}
+	if err := reload(ctx); err != nil {
+		slog.Warn("compliance policy reload failed",
+			"event.name", "proxy.compliance.policy_reload_failed", "error", err)
 	}
 }
 
@@ -188,12 +232,12 @@ func (s *Supervisor) syncComplianceMasterPolicy(ctx context.Context) {
 // document is DEC-compliance-grading-10: one unusable response must not switch
 // an organisation's whole ladder off while its console still shows it on.
 // rule: R-compliance-grading-5
-func (s *Supervisor) applyComplianceMasterPolicy(enabled bool, tier int, passwordAdvanced bool, gradingJSON []byte, fetchOK bool) bool {
+func (s *Supervisor) applyComplianceMasterPolicy(enabled bool, tier int, passwordAdvanced bool, gradingJSON []byte, fetchOK bool) compliancePolicyChange {
 	// One poll happened, so /health may speak about this follower from now on.
 	s.masterPolicyAttempted.Store(true)
 	if !fetchOK {
 		s.noteCompliancePolicyRejected()
-		return false // ②③: keep the last valid policy; nothing changed, nothing to re-spawn
+		return compliancePolicyChange{} // ②③: keep the last valid policy; nothing changed, nothing to re-spawn
 	}
 	// ① and the happy path are BOTH usable answers: the node is following the
 	// master, whether or not that master has a grading policy to give.
@@ -229,18 +273,24 @@ func (s *Supervisor) applyComplianceMasterPolicy(enabled bool, tier int, passwor
 	// keep the enforcement they were born with. spec: R-credential-password-tier-4.S1
 	passwordChanged := s.masterPasswordTierAdvanced.Swap(passwordAdvanced) != passwordAdvanced
 	enabledChanged := s.masterCompliance.Swap(enabled) != enabled
-	// Same reasoning once more for the grading document: the ladder reaches the
-	// detector as AIKEY_COMPLIANCE_GRADING at spawn, so an admin changing L4 from
-	// mask to warn changes nothing on a machine whose child is already running
-	// until something forces a re-spawn. rule: R-compliance-grading-5
+	// The grading document is stored here too, but it no longer forces a
+	// re-spawn on its own (TODO-188 方案 C): when it is the ONLY change, the
+	// caller hot-swaps it into the running detector, and restores
+	// previousGrading if the detector refuses it (用户拍板 C.7-3). It still
+	// rides a re-spawn caused by the values above. rule: R-compliance-grading-5
+	previousGrading := s.gradingPolicyJSON()
 	gradingChanged := s.swapMasterGrading(gradingJSON)
 	if enabledChanged || tierChanged || passwordChanged || gradingChanged {
 		slog.Info("compliance master policy changed",
 			"event.name", "proxy.compliance.policy_changed",
 			"enabled", enabled, "privacy_tier", tier, "grading_changed", gradingChanged)
-		return true
 	}
-	return false
+	respawn := enabledChanged || tierChanged || passwordChanged
+	return compliancePolicyChange{
+		respawn:         respawn,
+		grading:         gradingChanged && !respawn,
+		previousGrading: previousGrading,
+	}
 }
 
 // noteCompliancePolicyRejected records one poll whose answer could not be used

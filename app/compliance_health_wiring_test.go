@@ -73,3 +73,18 @@ func TestCompliancePolicyHealthWiringIsReachedFromApp(t *testing.T) {
 			"them, so GET /health omits compliance_policy on every shipped proxy", wiring)
 	}
 }
+
+// TestGradingHotSwapRefusalsAreWiredToAdmin — the second fact on the same lane
+// (TODO-188 方案 C) travels the same hand-copied hop, so it gets the same fence.
+// 能红: drop the GradingHotSwapRefusalsFn assignment from wireCompliancePolicyHealth.
+func TestGradingHotSwapRefusalsAreWiredToAdmin(t *testing.T) {
+	h := &admin.Handler{}
+	wireCompliancePolicyHealth(h, &supervisor.Supervisor{})
+	if h.GradingHotSwapRefusalsFn == nil {
+		t.Fatal("admin.Handler.GradingHotSwapRefusalsFn is nil after wiring — a grading change the " +
+			"detector refused would never reach GET /health")
+	}
+	if n := h.GradingHotSwapRefusalsFn(); n != 0 {
+		t.Fatalf("a fresh supervisor reports %d refusals, want 0", n)
+	}
+}

@@ -206,6 +206,11 @@ func (p *Proxy) applyInboundFilter(
 	if hook == nil {
 		return true // no filter installed — pass through
 	}
+	// ONE org grading installation per request (TODO-188 方案 C): the supervisor
+	// may hot-swap it while this request runs, and the cumulative rule and the
+	// route decision below must judge this request by the same document.
+	// spec: R-compliance-grading-5.1
+	reqGrading := p.complianceGrading()
 	if r.Body == nil {
 		return true
 	}
@@ -1151,9 +1156,9 @@ func (p *Proxy) applyInboundFilter(
 		// TODO-87 BUT NOT: a detector that returns no projection only WARNs, it
 		// never refuses. Here, after the loop and ahead of every exit below, so a
 		// refused request reports it too and one request logs it at most once.
-		p.notePersonalProjectionState(logger, personalProjected, personalUnprojected)
+		p.notePersonalProjectionState(logger, len(reqGrading.escalation), personalProjected, personalUnprojected)
 	}
-	esc := evaluateEscalation(pieces, escFindings, p.escalationRules, p.requestEscalationCeiling())
+	esc := evaluateEscalation(pieces, escFindings, reqGrading.escalation, p.requestEscalationCeiling())
 	p.escalationMetrics.evaluated.Add(1)
 	p.escalationMetrics.lastCounted.Store(int64(esc.Counted))
 	// TODO-72: a piece cut at pipeInputCap had its tail forwarded unscanned, so
@@ -1267,15 +1272,15 @@ func (p *Proxy) applyInboundFilter(
 	// The operator's MAX_ACTION ceiling applies exactly as it does to the
 	// cumulative rule (「天花板只压不抬」): with MAX_ACTION=warn the request is
 	// forwarded and the capped conclusion is logged and counted, never silent.
-	if len(p.routePolicy) > 0 {
+	if len(reqGrading.routePolicy) > 0 {
 		p.routePolicyMetrics.evaluated.Add(1)
 		target := routeTargetFromContext(r.Context())
 		var all []Finding
 		for _, fs := range escFindings {
 			all = append(all, fs...)
 		}
-		if action, reason := applyGradingRoutePolicy(all, target, p.routePolicy); action != apphook.ActionAllow {
-			rule, _ := p.routePolicy.firstViolated(all, target)
+		if action, reason := applyGradingRoutePolicy(all, target, reqGrading.routePolicy); action != apphook.ActionAllow {
+			rule, _ := reqGrading.routePolicy.firstViolated(all, target)
 			enforced, capped := p.requestEscalationCeiling().clamp(action)
 			// The route-policy conclusion goes on the request-verdict row in
 			// BOTH outcomes — refused, and capped by MAX_ACTION=warn (user

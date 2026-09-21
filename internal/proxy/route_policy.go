@@ -282,37 +282,36 @@ func (p *Proxy) routePolicySnapshot() struct{ evaluated, denied, capped int } {
 // ComplianceRoutePolicy reports the route_policy rules this generation enforces
 // (status reporting and fences; asserts the wiring by behavior).
 func (p *Proxy) ComplianceRoutePolicy() RoutePolicy {
-	return append(RoutePolicy(nil), p.routePolicy...)
+	return append(RoutePolicy(nil), p.complianceGrading().routePolicy...)
 }
 
-// installRoutePolicy parses and installs `route_policy[]` for this generation,
-// WARNing every note (失败要显眼: a rule enforced differently from how it reads
-// must be visible to the operator) and INFO-ing the active rule count.
-//
-// On an undecodable member the previous state of THIS generation is kept (empty
-// on a fresh one): the supervisor only ever hands over the last VALID document
-// (R-compliance-grading-14), so reaching the error path means the member itself
-// is the wrong shape, which is WARNed. No request-scoped ids exist at generation
-// build, hence the package logger — the same posture as the supervisor's own
-// install-time lines.
+// parseRoutePolicyLogged parses `route_policy[]`, WARNing every note (失败要显眼:
+// a rule enforced differently from how it reads must be visible to the
+// operator) and INFO-ing the active rule count. ok=false on an undecodable
+// member: the caller (SetComplianceGrading) then keeps the route policy already
+// in force (empty on a fresh generation). The supervisor only ever hands over
+// the last VALID document (R-compliance-grading-14), so reaching the error path
+// means the member itself is the wrong shape, which is WARNed. No request-scoped
+// ids exist at install time, hence the package logger — the same posture as the
+// supervisor's own install-time lines.
 //
 // spec: R-compliance-grading-8
-func (p *Proxy) installRoutePolicy(gradingJSON []byte) {
+func (p *Proxy) parseRoutePolicyLogged(gradingJSON []byte) (RoutePolicy, bool) {
 	rules, notes, err := parseRoutePolicy(gradingJSON)
 	if err != nil {
-		slog.Warn("proxy: org route_policy member unreadable; route policy NOT enforced on this generation",
+		slog.Warn("proxy: org route_policy member unreadable; the route policy in force is kept",
 			"event.name", observability.EventComplianceRoutePolicyRuleRefused, "error", err.Error())
-		return
+		return nil, false
 	}
 	for _, n := range notes {
 		slog.Warn("proxy: route_policy rule will be enforced differently from how it reads",
 			"event.name", observability.EventComplianceRoutePolicyRuleRefused, "rule", n)
 	}
-	p.routePolicy = rules
 	if len(rules) > 0 {
 		slog.Info("proxy: grading-driven route policy active",
 			"event.name", observability.EventComplianceRoutePolicyActive, "rules", len(rules))
 	}
+	return rules, true
 }
 
 // withRouteTarget stashes the target provider on r's context (in place, the same

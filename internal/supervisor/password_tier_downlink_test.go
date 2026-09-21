@@ -212,7 +212,7 @@ func TestGradingDownlink_ThreeFailureStatesAreDistinct(t *testing.T) {
 				"grading means grading is off, not that the last policy sticks forever "+
 				"(was %q)", got, gradingPolicyAbsent, seeded)
 		}
-		if !changed {
+		if !changed.any() {
 			t.Fatal("switching grading off must be reported as a change, or the running " +
 				"detector keeps enforcing the ladder it was born with")
 		}
@@ -236,7 +236,7 @@ func TestGradingDownlink_ThreeFailureStatesAreDistinct(t *testing.T) {
 					"unusable response must not disable grading for the whole org "+
 					"(DEC-compliance-grading-10)", got, seeded)
 			}
-			if changed {
+			if changed.any() {
 				t.Fatal("a rejected policy must not report a change; re-spawning here would " +
 					"hand the child the same env for no reason")
 			}
@@ -294,6 +294,34 @@ func TestFilterSig_ChangesWithGrading(t *testing.T) {
 		t.Fatalf("grading must EXTEND the signature, not replace it (%q) — the slug set, "+
 			"record_allow and both tiers still have to trigger reloads", l4block)
 	}
+
+	// TODO-188 方案 C: the grading term now FOLLOWS THE DOCUMENT IN FORCE, not the
+	// last one the master sent. A document the running detector refused must
+	// leave the signature where it was — otherwise the next vault tick sees a
+	// "changed" grading term, reloads, and the new pool cold-parses the refused
+	// document into "grading off" (用户拍板 C.7-3). A document the detector
+	// confirmed moves it (and is recorded, so that tick does not reload either).
+	// 能红: sign masterGrading before the refusal restores it, or sign the fetched
+	// bytes instead of the stored ones → the refused row fails.
+	// spec: R-compliance-grading-5.1
+	t.Run("follows the document in force", func(t *testing.T) {
+		for _, c := range []struct {
+			mode      string
+			wantMoved bool
+		}{{"refuse", false}, {"ok", true}} {
+			r := newHotSwapRig(t, c.mode)
+			vaultBase, _ := computeFilterSig(r.gen.vault)
+			before := r.s.filterSigFrom(vaultBase)
+			r.edit(t, hotDocB)
+			after := r.s.filterSigFrom(vaultBase)
+			if moved := after != before; moved != c.wantMoved {
+				t.Errorf("detector %s: signature moved=%v, want %v", c.mode, moved, c.wantMoved)
+			}
+			if got := *r.s.lastFilterSig.Load(); got != after {
+				t.Errorf("detector %s: recorded signature %q != current %q — the next vault tick reloads", c.mode, got, after)
+			}
+		}
+	})
 }
 
 // ---------------------------------------------------------------------------
@@ -377,6 +405,32 @@ func TestGrading_SignatureEnvAndCacheEpochShareTheSameBytes(t *testing.T) {
 		}
 	})
 
+	// TODO-188 方案 C adds a FOURTH carrier: the bytes pushed into the running
+	// detector over the pipe (OpSetGrading). After a swap, the token the detector
+	// confirmed (every worker's cache-epoch policy half), the proxy's own epoch
+	// token, the signature's grading component and the digest of the env value a
+	// crash-restart would be born with must all be one document.
+	// 能红: push anything but gradingPolicyJSON() (e.g. the raw fetched body) →
+	// the worker row fails.
+	// spec: R-compliance-grading-5.1
+	t.Run("the hot-swap payload is the same document", func(t *testing.T) {
+		r := newHotSwapRig(t, "ok", "ok")
+		r.edit(t, hotDocB)
+		epoch := r.s.gradingContentPolicyToken()
+		vaultBase, _ := computeFilterSig(r.gen.vault)
+		if !strings.HasSuffix(r.s.filterSigFrom(vaultBase), "|"+epoch) {
+			t.Fatalf("signature does not carry the epoch token %q", epoch)
+		}
+		if got := gradingComponent([]byte(r.s.gradingEnvValue())); got != epoch {
+			t.Fatalf("respawn env digests to %q, epoch says %q", got, epoch)
+		}
+		for i, tok := range workerPolicyTokens(r.pool) {
+			if tok != epoch {
+				t.Fatalf("worker %d confirmed %q over the pipe, the proxy's epoch says %q", i, tok, epoch)
+			}
+		}
+	})
+
 	t.Run("no policy is one deliberate asymmetry, not three", func(t *testing.T) {
 		s := &Supervisor{} // never took a policy
 		// "" (gradingPolicyAbsent) is the WIRE SPELLING of "no document" for the
@@ -455,7 +509,7 @@ func TestGradingDownlink_KeepsLastValidOnOversize(t *testing.T) {
 	}
 
 	changed := s.applyComplianceMasterPolicy(enabled, tier, adv, grading, ok)
-	if changed {
+	if changed.any() {
 		t.Fatal("a rejected policy must not report a change; re-spawning here would hand " +
 			"the child the same env for no reason")
 	}

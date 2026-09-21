@@ -201,7 +201,7 @@ func (h *ChildHook) contentVersionState() (token, reason string) {
 		// (what the verdict cache keys on) and Status() (what an operator reads on
 		// /v1/diagnostics/pipeline) cannot disagree about which epoch is live.
 		// rule: R-compliance-grading-5
-		return ContentVersionWithPolicy(*v, h.cfg.ContentPolicyToken), ""
+		return ContentVersionWithPolicy(*v, h.currentPolicyToken()), ""
 	}
 	if r := h.contentVersionReason.Load(); r != nil && *r != "" {
 		return "", *r

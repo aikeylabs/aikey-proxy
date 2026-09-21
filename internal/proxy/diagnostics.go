@@ -645,7 +645,7 @@ type EscalationHealth struct {
 func (p *Proxy) escalationHealth() EscalationHealth {
 	m := &p.escalationMetrics
 	h := EscalationHealth{
-		Rules:                     len(p.escalationRules),
+		Rules:                     len(p.complianceGrading().escalation),
 		Evaluated:                 m.evaluated.Load(),
 		Triggered:                 m.triggered.Load(),
 		LastCounted:               m.lastCounted.Load(),

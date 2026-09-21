@@ -199,6 +199,25 @@ const (
 	// forbids a self-check that stays at WARN forever. Escalation shape copied
 	// from the canary's unavailable streak (internal/events/canary.go).
 	EventComplianceGradingStale = "proxy.compliance.grading_stale_sustained"
+	// EventComplianceGradingHotSwapped: an org grading change was pushed into the
+	// RUNNING detector pool (pipewire.OpSetGrading) and every worker confirmed it;
+	// the proxy's own escalation / route_policy moved to the same bytes. No
+	// reload, no extra detector process (TODO-188 方案 C). INFO, once per change.
+	EventComplianceGradingHotSwapped = "proxy.compliance.grading_hot_swapped"
+	// EventComplianceGradingHotSwapRefused: the running detector could not parse
+	// a new grading document and KEPT the previous one (用户拍板 2026-09-21,
+	// C.7-3). The whole node stays on the previous document — the workers that
+	// had applied it are rolled back, the proxy's rules are not touched, and no
+	// reload runs (a reload would cold-parse the refused document and switch
+	// grading OFF). ERROR on every refused change, plus GET /health ->
+	// compliance_policy degraded with reason grading_policy_refused_by_detector.
+	// Also raised when rolling one worker back fails (the pool is then mixed).
+	EventComplianceGradingHotSwapRefused = "proxy.compliance.grading_hot_swap_refused"
+	// EventComplianceGradingHotSwapFallback: at least one detector worker did
+	// not answer the push usably (a detector older than OpSetGrading, a degraded
+	// worker, a timeout) and none refused, so the proxy fell back to the pre-C
+	// full reload. INFO: this is the supported mixed-version path, not a fault.
+	EventComplianceGradingHotSwapFallback = "proxy.compliance.grading_hot_swap_fallback"
 	// EventComplianceEscalationRuleRefused: one `escalation[]` entry of the org
 	// grading document will NOT be enforced by this proxy — a threshold that
 	// cannot mean anything (min_count < 1) or an action it cannot enact at
@@ -666,6 +685,11 @@ const (
 	//     the org's grading policy on the console.
 	ErrCodeCompliancePolicyUndecodable = "COMPLIANCE_POLICY_UNDECODABLE"
 	ErrCodeComplianceGradingUnusable   = "COMPLIANCE_GRADING_UNUSABLE"
+	// ErrCodeComplianceGradingRefusedByDetector: the proxy could use the grading
+	// document but the RUNNING detector could not parse it (TODO-188 方案 C), so
+	// the node keeps enforcing the previous one. Remedy: upgrade the detector to
+	// the master's version, or fix the document the console saved.
+	ErrCodeComplianceGradingRefusedByDetector = "COMPLIANCE_GRADING_REFUSED_BY_DETECTOR"
 	// ErrCodeLicenseForwardingDenied: this deployment's license does not currently
 	// permit AI forwarding (expired, never activated past its grace deadline,
 	// revoked, or bound to a different machine). Carried on a 402, NOT a 403:

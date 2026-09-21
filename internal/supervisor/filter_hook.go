@@ -278,7 +278,11 @@ func (s *Supervisor) installFilterHook(p *proxy.Proxy, vaultReader *vault.Reader
 	// rejected rather than shipped into a spawn that would fail on the machine).
 	// A change re-spawns the child via filterSigWithGrading.
 	// rule: R-compliance-grading-5
-	gradingEnv := "AIKEY_COMPLIANCE_GRADING=" + s.gradingEnvValue()
+	// Since TODO-188 方案 C this env is the COLD path only (spawn and
+	// crash-restart); a later change reaches the running child over the pipe
+	// (hotSwapGrading), which rewrites this same key in the worker's respawn env
+	// once the child confirmed it. spec: R-compliance-grading-5.1
+	gradingEnv := gradingEnvKey + "=" + s.gradingEnvValue()
 
 	// PARENT→CHILD capability declaration (TODO-114, 用户拍板 2026-09-15 方案 A).
 	// What THIS proxy binary can process from the child, derived ONLY from
@@ -405,25 +409,10 @@ func (s *Supervisor) installFilterHook(p *proxy.Proxy, vaultReader *vault.Reader
 	// 决定 1). Handed over HERE, one line below the env that carries the same
 	// document, so the two cannot drift apart unnoticed.
 	// rule: R-compliance-grading-15
-	escRules, refusedRules, gradingErr := p.SetComplianceGrading(s.gradingPolicyJSON())
-	if gradingErr != nil {
-		// The document is not JSON at all. The last valid policy stays installed
-		// (applyComplianceMasterPolicy never replaces a good document with an
-		// unreadable one, R-compliance-grading-14), so this is loud but not fatal.
-		slog.Warn("supervisor: org compliance grading document unreadable; escalation rules unchanged",
-			"event.name", observability.EventComplianceGradingInvalid, "error", gradingErr)
-	}
-	for _, refused := range refusedRules {
-		// 失败要显眼: an administrator configured a cumulative rule this proxy will
-		// NOT carry out. Silently dropping it leaves them looking at a control on
-		// the console that does nothing.
-		slog.Warn("supervisor: escalation rule refused; it will NOT be enforced",
-			"event.name", observability.EventComplianceEscalationRuleRefused, "rule", refused)
-	}
-	if escRules > 0 {
-		slog.Info("supervisor: request-level compliance escalation active",
-			"event.name", observability.EventComplianceEscalationRulesActive, "rules", escRules)
-	}
+	// Same bytes as the env above; the log lines are shared with the hot swap
+	// (grading_hot_swap.go), which installs a confirmed document on a LIVE
+	// generation through the same setter.
+	logProxyGradingInstall(p.SetComplianceGrading(s.gradingPolicyJSON()))
 	scanRoles, rejectedRoles := p.SetFilterScanRoles(filterScanRoles())
 	if len(rejectedRoles) > 0 {
 		// 失败要显眼:不认识的角色名被丢弃,必须让运维看见,而不是静默按默认跑。

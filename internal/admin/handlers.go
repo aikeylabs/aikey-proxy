@@ -88,6 +88,14 @@ type Handler struct {
 	// in this package only.
 	CompliancePolicyHealthFn func() (consecutiveRejects int, attempted bool)
 
+	// GradingHotSwapRefusalsFn reports how many grading changes in a row the
+	// RUNNING detector refused to parse (TODO-188 方案 C). The node then keeps
+	// enforcing the previous document (用户拍板 C.7-3) while the console shows
+	// the new one — the same "quiet divergence" CompliancePolicyHealthFn exists
+	// for, with a different remedy (upgrade the detector, not fix the master), so
+	// it gets its own reason code in the same block. Nil = not wired.
+	GradingHotSwapRefusalsFn func() int
+
 	// DebugUpstreamHeadersStateFn / DebugUpstreamHeadersSetFn drive the
 	// /admin/debug/upstream-headers endpoints. State returns the resolved
 	// (enabled, source) tuple — source is "api" / "env" / "compile" /
@@ -295,6 +303,12 @@ const (
 	// an older master, or an org that switched grading off — a supported
 	// deployment that reaches here as zero rejects and reads "ok".
 	complianceGradingRejectedReason = "grading_policy_rejected"
+	// complianceGradingRefusedByDetectorReason: the master's document was usable
+	// but the running detector could not parse it, so a hot swap was refused and
+	// the node keeps the previous document (TODO-188 方案 C). No threshold, for
+	// the same reason as the one above: from the first refusal the ladder in
+	// force and the ladder on the console differ.
+	complianceGradingRefusedByDetectorReason = "grading_policy_refused_by_detector"
 )
 
 // usagePipelineHealth derives the bypass-pipeline verdict from the reporter
@@ -344,17 +358,28 @@ func usagePipelineHealth(rm *events.ReporterMetrics, cr *events.CanaryResult) *p
 // the raw counters CompliancePolicyHealthFn reports. Returns nil when the
 // follower has never polled, so the field is omitted rather than falsely
 // reporting "ok" for a lane that is not running.
-func compliancePolicyHealth(consecutiveRejects int, attempted bool) *pipelineHealth {
+//
+// detectorRefusals (TODO-188 方案 C) adds the second way the lane degrades; the
+// streak reported is the longer of the two, since both mean "enforcing a
+// document the console no longer shows" and a monitor reads one number.
+func compliancePolicyHealth(consecutiveRejects int, attempted bool, detectorRefusals int) *pipelineHealth {
 	if !attempted {
 		return nil
 	}
-	if consecutiveRejects <= 0 {
+	var reasons []string
+	if consecutiveRejects > 0 {
+		reasons = append(reasons, complianceGradingRejectedReason)
+	}
+	if detectorRefusals > 0 {
+		reasons = append(reasons, complianceGradingRefusedByDetectorReason)
+	}
+	if len(reasons) == 0 {
 		return &pipelineHealth{State: "ok"}
 	}
 	return &pipelineHealth{
 		State:               "degraded",
-		Reasons:             []string{complianceGradingRejectedReason},
-		ConsecutiveFailures: consecutiveRejects,
+		Reasons:             reasons,
+		ConsecutiveFailures: max(consecutiveRejects, detectorRefusals),
 	}
 }
 
@@ -378,7 +403,12 @@ func (h *Handler) Health(w http.ResponseWriter, r *http.Request) {
 	}
 	var cp *pipelineHealth
 	if h.CompliancePolicyHealthFn != nil {
-		cp = compliancePolicyHealth(h.CompliancePolicyHealthFn())
+		rejects, attempted := h.CompliancePolicyHealthFn()
+		refusals := 0
+		if h.GradingHotSwapRefusalsFn != nil {
+			refusals = h.GradingHotSwapRefusalsFn()
+		}
+		cp = compliancePolicyHealth(rejects, attempted, refusals)
 	}
 
 	writeJSON(w, http.StatusOK, healthResponse{

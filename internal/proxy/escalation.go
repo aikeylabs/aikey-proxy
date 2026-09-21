@@ -646,8 +646,8 @@ func decodeEventID(eventJSON []byte) string {
 // line would emit at request rate until someone upgrades — the same reasoning as
 // noteVerdictCacheState. Called from the dispatcher with the REQUEST logger so
 // the WARN carries request_id / trace_id / span_id (日志规范).
-func (p *Proxy) notePersonalProjectionState(logger *slog.Logger, withProjection, withoutProjection int) {
-	if len(p.escalationRules) == 0 {
+func (p *Proxy) notePersonalProjectionState(logger *slog.Logger, rules, withProjection, withoutProjection int) {
+	if rules == 0 {
 		return
 	}
 	if withoutProjection > 0 {
@@ -657,7 +657,7 @@ func (p *Proxy) notePersonalProjectionState(logger *slog.Logger, withProjection,
 				"event.name", observability.EventProxyFilterPersonalProjectionMissing,
 				"pieces_without_projection", withoutProjection,
 				"pieces_with_projection", withProjection,
-				"rules", len(p.escalationRules))
+				"rules", rules)
 		}
 		return
 	}

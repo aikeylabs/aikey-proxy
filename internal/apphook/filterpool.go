@@ -56,6 +56,14 @@ func NewFilterPool(name string, workers []*ChildHook) *FilterPool {
 // Name implements Hook.
 func (p *FilterPool) Name() string { return p.name }
 
+// Workers returns the pool's workers in dispatch order (a copy of the slice;
+// the workers themselves are shared). Used by the supervisor to address one
+// worker — e.g. rolling back a grading swap on exactly the workers that applied
+// it (TODO-188 方案 C). Same order as WorkerStatuses and SetGrading's results.
+func (p *FilterPool) Workers() []*ChildHook {
+	return append([]*ChildHook(nil), p.workers...)
+}
+
 // pick returns the worker that serves the next call, skipping workers that are
 // currently unfit to inspect anything — and nudging each one it skips to
 // self-heal.

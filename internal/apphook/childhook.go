@@ -73,6 +73,10 @@ type ChildHookConfig struct {
 	//
 	// The caller supplies the label ("grading:<sha256[:16]>") on purpose: this
 	// package must not learn what business the child is doing (不变量 #16).
+	//
+	// It is the SPAWN-time token. Since TODO-188 方案 C a running child can take
+	// a new document over the pipe (SetGrading); the hook then holds the live
+	// token in ChildHook.policyToken, seeded from this field.
 	ContentPolicyToken string
 	Timeout            time.Duration // per-Detect deadline (default 1ms)
 	ReadyTimeout       time.Duration // how long to wait for ready sentinel (default 5s)
@@ -244,6 +248,12 @@ type ChildHook struct {
 	// used to collapse into the same nil pointer, so the endpoint could report
 	// "cache off" but never "and here is the one command that fixes it".
 	contentVersionReason atomic.Pointer[string]
+	// policyToken is the token of the policy document this child is enforcing
+	// NOW: cfg.ContentPolicyToken at spawn, replaced by SetGrading only after the
+	// child confirmed the new document (TODO-188 方案 C). Folded into
+	// ContentVersion by contentVersionState. Atomic because the verdict-cache
+	// epoch is read on the request path while a swap lands.
+	policyToken atomic.Pointer[string]
 	// pollStop / pollOnce / stopPollOnce own the content-version poll's lifetime.
 	// It is started once on the first successful spawn and stopped once on
 	// Shutdown; both entry points are idempotent because their callers are.
@@ -272,6 +282,8 @@ func NewChildHook(in *ChildHookConfig) *ChildHook {
 	cfg := *in // copy so applyDefaults never mutates the caller's value
 	cfg.applyDefaults()
 	h := &ChildHook{cfg: cfg, pending: make(map[uint32]chan *childResponse), pollStop: make(chan struct{})}
+	spawnToken := cfg.ContentPolicyToken
+	h.policyToken.Store(&spawnToken)
 	h.degraded.Store(true) // start degraded; flip after successful Start
 	h.status.Store(&Status{
 		Healthy:        false,

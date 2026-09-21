@@ -341,26 +341,25 @@ type Proxy struct {
 	//
 	// 🔴 Generation-scoped, NOT process-scoped: see generationID below.
 	scanCoverage scanCoverage
-	// escalationRules are the org grading document's `escalation[]` entries this
-	// generation enforces, already filtered to the ones this proxy can enact
-	// (SetComplianceGrading → parseEscalationRules). Empty — the default, and the
-	// state of every org that never configured grading — means the request-level
-	// verdict concludes "no escalation" on every request.
+	// grading is the org grading document's two request-level members this
+	// proxy enforces — `escalation[]` (the cumulative rule) and `route_policy[]`
+	// — as ONE immutable value behind an atomic pointer. nil / empty members are
+	// the default, and the state of every org that never configured grading: the
+	// request-level verdict concludes "no escalation" and the route decision is
+	// not consulted (R-compliance-grading-3.S1).
 	//
-	// 🔴 Written ONCE at generation build and read-only afterwards, exactly like
-	// filterScanRoles: a policy change re-spawns the detector child through the
-	// filter signature (filterSigWithGrading) and therefore rebuilds the
-	// generation, so there is no in-place mutation to race with in-flight
-	// requests.
-	escalationRules []EscalationRule
-	// routePolicy is the org grading document's `route_policy[]` this generation
-	// enforces (SetComplianceGrading → parseRoutePolicy). Empty — the default and
-	// the state of every org that never configured it — means the route decision
-	// is not consulted and the request is forwarded exactly as before
-	// (R-compliance-grading-3.S1). Written ONCE at generation build, read-only
-	// afterwards, for the same reason as escalationRules.
+	// 🔴 WHY ATOMIC, AND WHY ONE VALUE (TODO-188 方案 C). These used to be two
+	// plain fields written once at generation build — a ladder edit re-spawned
+	// the detector and rebuilt the generation, so nothing mutated a live one.
+	// Since C the supervisor hot-swaps the document into the running detector
+	// AND into this proxy (SetComplianceGrading on the live generation), while
+	// requests are in flight. applyInboundFilter therefore loads this pointer ONCE
+	// per request (complianceGrading) and reads both members from that one value,
+	// so no request can count under the new escalation rules and route under the
+	// old policy. Written only by SetComplianceGrading.
 	// spec: R-compliance-grading-8
-	routePolicy RoutePolicy
+	// spec: R-compliance-grading-5.1
+	grading atomic.Pointer[complianceGradingRuntime]
 	// routePolicyMetrics counts what the route decision did this generation
 	// (evaluated / denied / capped). Counts only. Generation-scoped like
 	// escalationMetrics.
@@ -379,7 +378,7 @@ type Proxy struct {
 	// block to ALLOW. "" meaning full is the detector's own reading of "unset", so
 	// the two readers agree on the default as well as on the value.
 	//
-	// Written once at generation build, like escalationRules: a MAX_ACTION change
+	// Written once at generation build (unlike the grading document, which TODO-188 hot-swaps): a MAX_ACTION change
 	// is part of the filter reload signature (filterAppSignaturePart), so it
 	// rebuilds the generation rather than mutating a live one.
 	complianceMaxAction string
@@ -940,14 +939,49 @@ func (p *Proxy) FilterScanRoles() []string { return p.filterScanRoles.list() }
 // rather than being switched off by one bad response.
 //
 // rule: R-compliance-grading-15 (累计升级在片段循环后做请求级判定)
+//
+// TODO-188 方案 C: also called on a LIVE generation when the supervisor
+// hot-swaps the document (after every detector worker confirmed it). The two
+// members are therefore installed as ONE new value in a single atomic store,
+// built from the value in force: a member that does not decode keeps its
+// previous rules (unchanged semantics), and a request in flight keeps the value
+// it pinned.
 func (p *Proxy) SetComplianceGrading(gradingJSON []byte) (applied int, refused []string, err error) {
-	p.installRoutePolicy(gradingJSON)
+	next := *p.complianceGrading() // shallow copy; the slices are immutable once installed
+	if route, ok := p.parseRoutePolicyLogged(gradingJSON); ok {
+		next.routePolicy = route
+	}
 	rules, refused, err := parseEscalationRules(gradingJSON)
+	if err == nil {
+		next.escalation = rules
+	}
+	p.grading.Store(&next)
 	if err != nil {
 		return 0, refused, err
 	}
-	p.escalationRules = rules
 	return len(rules), refused, nil
+}
+
+// complianceGradingRuntime is one immutable installation of the org grading
+// document's request-level members. Never mutated after it is stored.
+type complianceGradingRuntime struct {
+	// escalation: the `escalation[]` entries this proxy can enact, already
+	// filtered by parseEscalationRules.
+	escalation []EscalationRule
+	// routePolicy: `route_policy[]` (parseRoutePolicy).
+	routePolicy RoutePolicy
+}
+
+// noComplianceGrading is what a Proxy that never received a document reads.
+var noComplianceGrading = &complianceGradingRuntime{}
+
+// complianceGrading returns the installation in force (never nil). The request
+// path calls it ONCE per request and passes the value down.
+func (p *Proxy) complianceGrading() *complianceGradingRuntime {
+	if g := p.grading.Load(); g != nil {
+		return g
+	}
+	return noComplianceGrading
 }
 
 // SetComplianceMaxAction installs the filter app's MAX_ACTION ("full" | "warn";
@@ -979,7 +1013,7 @@ func (p *Proxy) SetComplianceMaxAction(maxAction string) error {
 // assert the WIRING by behavior rather than by reading supervisor.go's text
 // (same posture as IsClusterNode).
 func (p *Proxy) ComplianceEscalationRules() []EscalationRule {
-	return append([]EscalationRule(nil), p.escalationRules...)
+	return append([]EscalationRule(nil), p.complianceGrading().escalation...)
 }
 
 // SetFilterCache installs (or clears, with nil) the per-piece content-hash cache

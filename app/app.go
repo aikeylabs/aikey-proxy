@@ -1453,4 +1453,7 @@ func (a *brokerAdapter) GetAccountStatus(ctx context.Context, accountID string) 
 // org to follow.
 func wireCompliancePolicyHealth(adminHandler *admin.Handler, sup *supervisor.Supervisor) {
 	adminHandler.CompliancePolicyHealthFn = sup.ComplianceMasterPolicyHealth
+	// TODO-188 方案 C: a grading change the running detector refused is the
+	// same lane's second way to diverge from the console.
+	adminHandler.GradingHotSwapRefusalsFn = sup.GradingHotSwapRefusals
 }

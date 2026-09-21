@@ -22,8 +22,6 @@ package supervisor
 
 import (
 	"context"
-	"crypto/sha256"
-	"encoding/hex"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -56,6 +54,7 @@ import (
 	"github.com/AiKeyLabs/aikey-proxy/internal/vault"
 	"github.com/AiKeyLabs/aikey-proxy/internal/vkeys"
 	"github.com/AiKeyLabs/aikey-proxy/pkg/heartbeat"
+	"github.com/AiKeyLabs/pkg/pipewire"
 	"github.com/AiKeyLabs/pkg/providerroutes"
 )
 
@@ -491,9 +490,21 @@ type Supervisor struct {
 	// reached by failing to read one: an unusable or unreachable policy leaves
 	// this field untouched, so the fleet keeps enforcing the last valid ladder
 	// instead of silently falling back to built-in defaults with a console that
-	// still shows the ladder (DEC-compliance-grading-10). Written solely by
-	// applyComplianceMasterPolicy. rule: R-compliance-grading-5
+	// still shows the ladder (DEC-compliance-grading-10). Written by
+	// applyComplianceMasterPolicy, and — since TODO-188 方案 C — restored by
+	// hotSwapGrading when the running detector refuses the new document, so it
+	// always names the document this node is actually enforcing (the next
+	// reload, crash-restart or signature check must not pick up a document the
+	// detector refused). rule: R-compliance-grading-5
 	masterGrading atomic.Pointer[[]byte]
+	// gradingHotSwapRefusals counts CONSECUTIVE grading changes the running
+	// detector refused to parse (TODO-188 方案 C, 用户拍板 C.7-3: keep the
+	// previous document). >0 means the console shows a ladder this node is NOT
+	// enforcing; GET /health -> compliance_policy turns it into `degraded` with
+	// reason grading_policy_refused_by_detector. Reset by a successful swap, by a
+	// reload that re-spawned the pool, or by the master reverting to the document
+	// in force. spec: R-compliance-grading-5.1
+	gradingHotSwapRefusals atomic.Int64
 	// masterPolicyRejects counts CONSECUTIVE polls of GET /v1/compliance/policy
 	// whose answer could not be used (unusable grading document, non-200,
 	// network error) — i.e. how long this node has been enforcing a compliance
@@ -1135,6 +1146,21 @@ func filterSigWithGrading(base string, gradingJSON []byte) string {
 	return base + "|" + gradingComponent(gradingJSON)
 }
 
+// filterSigFrom folds every supervisor-held, env-baked policy value into the
+// vault's filter-app signature — the ONE spelling of the full signature, shared
+// by buildGeneration (records what a generation was built with), syncManagedKeys
+// (decides whether to reload) and hotSwapGrading (records a document swapped in
+// without a reload). Three hand-copies of this expression were one forgotten
+// term away from a reload storm or a missed re-spawn.
+//
+// The grading term is masterGrading, which since TODO-188 方案 C names the
+// document the running detector CONFIRMED (a refused document is restored away
+// before any signature is taken) — "the signature follows the token in force".
+func (s *Supervisor) filterSigFrom(baseSig string) string {
+	return filterSigWithGrading(filterSigWithPasswordTier(filterSigWithPrivacyTier(baseSig,
+		s.masterPrivacyTier.Load()), s.masterPasswordTierAdvanced.Load()), s.gradingPolicyJSON())
+}
+
 // gradingComponent is the ONE reduction of the org grading document to a token,
 // spelled "grading:<sha256[:16]>" per design.md §4b.
 //
@@ -1156,9 +1182,12 @@ func filterSigWithGrading(base string, gradingJSON []byte) string {
 // env changed (TODO-61).
 // Fenced by TestGrading_SignatureEnvAndCacheEpochShareTheSameBytes.
 // rule: R-compliance-grading-5
+//
+// Since TODO-188 方案 C the digest itself lives in pkg/pipewire (GradingToken):
+// the detector echoes it in the OpSetGrading ack and this side compares, so a
+// second hand-written copy here could only ever disagree.
 func gradingComponent(gradingJSON []byte) string {
-	sum := sha256.Sum256(gradingJSON)
-	return "grading:" + hex.EncodeToString(sum[:])[:16]
+	return pipewire.GradingToken(gradingJSON)
 }
 
 // gradingContentPolicyToken is what the detector child's ChildHookConfig carries
@@ -1226,7 +1255,7 @@ func (s *Supervisor) syncManagedKeys() {
 	if baseSig, ok := computeFilterSig(gen.vault); ok {
 		// Fold in the org privacy tier: it is baked into the detector child's env
 		// at spawn, so only a re-spawn can change what a running detector sends.
-		newSig := filterSigWithGrading(filterSigWithPasswordTier(filterSigWithPrivacyTier(baseSig, s.masterPrivacyTier.Load()), s.masterPasswordTierAdvanced.Load()), s.gradingPolicyJSON())
+		newSig := s.filterSigFrom(baseSig)
 		if prev := s.lastFilterSig.Load(); prev == nil || *prev != newSig {
 			// R5: record the attempted signature BEFORE the reload so a
 			// persistently-failing Reload (e.g. transient build error) does NOT
@@ -2262,7 +2291,7 @@ func (s *Supervisor) buildGeneration() (*generation, error) {
 	// Record the filter-app signature this generation was built with so
 	// syncManagedKeys can detect a later enable/disable and trigger a reload.
 	if baseSig, ok := computeFilterSig(vaultReader); ok {
-		sig := filterSigWithGrading(filterSigWithPasswordTier(filterSigWithPrivacyTier(baseSig, s.masterPrivacyTier.Load()), s.masterPasswordTierAdvanced.Load()), s.gradingPolicyJSON())
+		sig := s.filterSigFrom(baseSig)
 		s.lastFilterSig.Store(&sig)
 	}
 

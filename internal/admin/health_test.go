@@ -209,3 +209,38 @@ func TestHealth_CompliancePolicyRawJSON(t *testing.T) {
 		}
 	}
 }
+
+// TestHealth_CompliancePolicyRefusedByDetector_ReportsDegraded — TODO-188 方案 C,
+// 用户拍板 C.7-3. When the running detector refuses a grading change, the node
+// keeps the previous document while the console shows the new one. That must be
+// readable from outside, under its OWN reason code (the remedy is "upgrade the
+// detector", not "fix the master's answer"), without a threshold, and it must
+// clear when the refusal streak does. The raw wire string is pinned because it
+// is what a monitor greps.
+//
+// 能红: drop the detectorRefusals branch → the degraded row fails.
+// spec: R-compliance-grading-5.1
+func TestHealth_CompliancePolicyRefusedByDetector_ReportsDegraded(t *testing.T) {
+	h := newHandlerForTest(&config.Config{})
+	h.CompliancePolicyHealthFn = func() (int, bool) { return 0, true } // the master's answer was fine
+	refusals := 1
+	h.GradingHotSwapRefusalsFn = func() int { return refusals }
+
+	req := httptest.NewRequest(http.MethodGet, "/health", nil)
+	rr := httptest.NewRecorder()
+	h.Health(rr, req)
+	for _, want := range []string{`"state":"degraded"`, `"grading_policy_refused_by_detector"`, `"consecutive_failures":1`} {
+		if !strings.Contains(rr.Body.String(), want) {
+			t.Fatalf("GET /health is missing %s after a detector refusal.\nbody: %s", want, rr.Body.String())
+		}
+	}
+	if strings.Contains(rr.Body.String(), `"grading_policy_rejected"`) {
+		t.Fatalf("a detector refusal must not borrow the master-rejection reason.\nbody: %s", rr.Body.String())
+	}
+
+	refusals = 0
+	_, resp := getHealth(t, h)
+	if resp.CompliancePolicy == nil || resp.CompliancePolicy.State != "ok" {
+		t.Fatalf("the verdict must clear with the streak, got %+v", resp.CompliancePolicy)
+	}
+}
