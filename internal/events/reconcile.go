@@ -498,21 +498,23 @@ func (r *Reporter) maybeAutoReconcile() {
 
 // walSeqSet returns the set of source_seqs present in the WAL for one source.
 func (r *Reporter) walSeqSet(source string) map[int64]bool {
-	set := make(map[int64]bool)
 	if r.wal == nil {
-		return set
+		return make(map[int64]bool)
 	}
-	entries, err := ReadAllWAL(r.wal.Dir())
-	if err != nil {
-		return set
+	if r.tail == nil {
+		r.tail = newUsageWALTailer(r.wal.Dir())
 	}
-	for i := range entries {
-		e := &entries[i]
-		if e.SourceID == source && e.SourceSeq > 0 {
-			set[e.SourceSeq] = true
-		}
+	// Served from the tailer's index, refreshed from disk FIRST: seqs are
+	// allocated before the append, so a lower seq can land after a higher one
+	// was drained — an index fed only by drain passes would call it WAL-absent
+	// and confirm-lost it (a false entry in the known-loss ledger). Refresh reads
+	// only bytes past the index high-water, never the directory
+	// (bugfix 2026-09-23-reporter-wal-full-reread-cpu).
+	if err := r.tail.refreshIndex(r.wal.CurrentFileName()); err != nil {
+		slog.Warn("reporter: wal index refresh for reconcile failed",
+			"event.name", "usage.reporter.wal_read_failed", "error", err)
 	}
-	return set
+	return r.tail.seqSet(source)
 }
 
 // resendWALSeqs reads the WAL entries for the given seqs and re-uploads them via
@@ -532,9 +534,20 @@ func (r *Reporter) resendWALSeqs(source string, seqs []int64) []int64 {
 	for _, s := range seqs {
 		want[s] = true
 	}
-	entries, err := ReadAllWAL(r.wal.Dir())
-	if err != nil {
-		return nil
+	if r.tail == nil {
+		r.tail = newUsageWALTailer(r.wal.Dir())
+	}
+	// Only the files that hold a wanted seq are read (index lookup), not the
+	// whole directory — typically one file out of hundreds. Payloads must come
+	// from disk: the index keeps keys, not events.
+	var entries []WALEntry
+	for _, p := range r.tail.filesHolding(source, want) {
+		got, err := ReadWALFile(p)
+		if err != nil {
+			slog.Warn("reporter: wal file read for re-send failed",
+				"event.name", "usage.reporter.wal_read_failed", "file", p, "error", err)
+		}
+		entries = append(entries, got...)
 	}
 	groups := make(map[string][]ReportableEvent)
 	for i := range entries {

@@ -152,7 +152,11 @@ type Reporter struct {
 	complianceLastFailureReason string
 	complianceLastFailureCode   int
 	wal                         *WALWriter
-	done                        chan struct{}
+	// tail reads the WAL incrementally (bytes past each file's commit cursor)
+	// and serves prune / reconcile from an in-memory index. Per Reporter, never
+	// on the shared writer — see wal_tail.go for the why and the invariants.
+	tail *walTailer[WALEntry]
+	done chan struct{}
 	// delivery-integrity cursors (memory only; see type doc). Guarded by mu.
 	sentSeq map[string]int64 // source_id → highest seq handed to upload
 	// switchRetryAt / switchBackoff gate stream-switch retries PER LANE. The
@@ -300,6 +304,9 @@ func NewReporter(in *ReporterConfig) (*Reporter, error) {
 		lastPeriodicSweepAt:       time.Now(),
 	}
 
+	if wal != nil {
+		r.tail = newUsageWALTailer(wal.Dir())
+	}
 	// Start upload loop if any destination is configured (legacy single
 	// CollectorURL OR per-route CollectorRoutes with at least one
 	// non-empty entry). With both unset, events still get WAL'd but
@@ -594,8 +601,11 @@ func (r *Reporter) uploadLoop() {
 
 // drainOnce reads the WAL, selects entries not yet handed to an upload
 // (source_seq > sentSeq[source], plus a one-shot pass over legacy v1 entries),
-// uploads them grouped by RouteSource, then prunes confirmed WAL files. One WAL
-// read per pass keeps it simple; the BatchSize cap bounds a single HTTP body.
+// uploads them grouped by RouteSource, then prunes confirmed WAL files. The
+// BatchSize cap bounds a single HTTP body. Reads are INCREMENTAL (wal_tail.go):
+// the original "one full WAL read per pass keeps it simple" cost O(directory
+// bytes) per pass and consumed 85% of a production node's CPU once the hourly
+// file reached 21 MB (bugfix 2026-09-23-reporter-wal-full-reread-cpu).
 func (r *Reporter) drainOnce(ctx context.Context, force bool) {
 	if r.wal == nil {
 		return
@@ -613,17 +623,56 @@ func (r *Reporter) drainOnce(ctx context.Context, force bool) {
 		}
 	}
 
-	entries, err := ReadAllWAL(r.wal.Dir())
+	// Incremental read (bugfix 2026-09-23-reporter-wal-full-reread-cpu): only
+	// bytes past each file's commit cursor are parsed. Cursors move at the END
+	// of the pass, past everything handed over (uploaded, dead-lettered,
+	// filtered by sentSeq/seenV1, no-route) and up to the first RETRYABLE entry,
+	// which is re-read next pass — the advance-on-send contract is unchanged
+	// (advance_on_send_contract_test.go). Restart / hot reload = empty cursors =
+	// full replay, exactly as before.
+	if r.tail == nil {
+		r.tail = newUsageWALTailer(r.wal.Dir())
+	}
+	items, ends, err := r.tail.readNew(r.wal.CurrentFileName())
 	if err != nil {
 		slog.Warn("reporter: wal read for upload failed",
 			"event.name", "usage.reporter.wal_read_failed", "error", err)
 		// Partial entries may still be returned; fall through to upload them.
 	}
-
 	anyRetryable := false
-	pending := make([]ReportableEvent, 0, len(entries))
-	for i := range entries {
-		e := &entries[i]
+	pending := make([]ReportableEvent, 0, len(items))
+	pendingPos := make([]walPos, 0, len(items))
+	holdAt := make(map[string]walPos) // file → earliest position NOT handed over this pass
+	noteHold := func(pos walPos) {
+		if h, ok := holdAt[pos.file]; !ok || pos.start < h.start {
+			holdAt[pos.file] = pos
+		}
+	}
+	flush := func() {
+		if len(pending) == 0 {
+			return
+		}
+		if ctx.Err() != nil {
+			// Budget exhausted (shutdown final flush): stop attempting —
+			// everything unsent stays in the WAL and resumes after restart.
+			anyRetryable = true
+			for _, pos := range pendingPos {
+				noteHold(pos)
+			}
+		} else {
+			retry, held := r.uploadPending(ctx, pending)
+			if retry {
+				anyRetryable = true
+			}
+			for _, i := range held {
+				noteHold(pendingPos[i])
+			}
+		}
+		pending = pending[:0]
+		pendingPos = pendingPos[:0]
+	}
+	for i := range items {
+		e := &items[i].entry
 		ev := e.EventJSON
 		if e.SchemaVersion >= WALSchemaV2 && e.SourceSeq > 0 {
 			// v2 path: skip anything already handed to an upload attempt.
@@ -655,25 +704,26 @@ func (r *Reporter) drainOnce(ctx context.Context, force bool) {
 			}
 		}
 		pending = append(pending, ev)
+		pendingPos = append(pendingPos, items[i].pos)
 		if len(pending) >= r.cfg.BatchSize {
+			flush()
 			if ctx.Err() != nil {
-				// Budget exhausted (shutdown final flush): stop attempting —
-				// everything unsent stays in the WAL and resumes after restart.
-				anyRetryable = true
+				// Nothing after this point is attempted either: hold it all.
+				for j := i + 1; j < len(items); j++ {
+					noteHold(items[j].pos)
+				}
 				break
 			}
-			if r.uploadPending(ctx, pending) {
-				anyRetryable = true
-			}
-			pending = pending[:0]
 		}
 	}
-	if len(pending) > 0 && ctx.Err() == nil {
-		if r.uploadPending(ctx, pending) {
-			anyRetryable = true
+	flush()
+	for file, end := range ends {
+		if h, ok := holdAt[file]; ok {
+			r.tail.commit(file, h.start, h.line-1)
+		} else {
+			r.tail.commit(file, end.end, end.line)
 		}
 	}
-
 	r.pruneConfirmedWAL()
 
 	// Arm or clear the non-blocking backoff gate for the next pass (B', 缺口2):
@@ -697,7 +747,9 @@ func (r *Reporter) drainOnce(ctx context.Context, force bool) {
 	}
 }
 
-// uploadPending groups events by RouteSource and uploads each group. A group
+// uploadPending groups events by RouteSource and uploads each group. It also
+// returns the batch indices it did NOT hand over (retryable failure or budget
+// gone) so drainOnce can hold the WAL cursor at the earliest of them. A group
 // that is locally DONE (uploaded ok OR terminally dead-lettered) advances
 // sentSeq / seenV1 so the next pass won't re-read it. A group that fails
 // RETRYABLY is left un-marked — it stays in the WAL and the next gated drain
@@ -731,9 +783,9 @@ func (r *Reporter) warnNoRouteOnce(batch []ReportableEvent) {
 	}
 }
 
-func (r *Reporter) uploadPending(ctx context.Context, batch []ReportableEvent) (anyRetryable bool) {
+func (r *Reporter) uploadPending(ctx context.Context, batch []ReportableEvent) (anyRetryable bool, held []int) {
 	if len(batch) == 0 {
-		return false
+		return false, nil
 	}
 	// Grouped by (route source, LANE), not route source alone (2026-08-21).
 	// The destination comes from the route source; the allocated_seq scalar in
@@ -743,6 +795,7 @@ func (r *Reporter) uploadPending(ctx context.Context, batch []ReportableEvent) (
 	// ledgered 768 real events as lost, just at batch granularity.
 	type groupKey struct{ routeSource, lane string }
 	groups := make(map[groupKey][]ReportableEvent, 1)
+	groupIdx := make(map[groupKey][]int, 1) // batch indices per group, for the caller's hold bookkeeping
 	skipped := 0
 	for i := range batch {
 		ev := &batch[i]
@@ -752,6 +805,7 @@ func (r *Reporter) uploadPending(ctx context.Context, batch []ReportableEvent) (
 		}
 		k := groupKey{routeSource: ev.RouteSource, lane: LaneOfEvent(ev)}
 		groups[k] = append(groups[k], *ev)
+		groupIdx[k] = append(groupIdx[k], i)
 	}
 	if skipped > 0 {
 		// No destination for this route_source (e.g. team route on a pure
@@ -764,10 +818,19 @@ func (r *Reporter) uploadPending(ctx context.Context, batch []ReportableEvent) (
 		// 5-second drain loop (bugfix 2026-08-20).
 		r.warnNoRouteOnce(batch)
 	}
-	for key, group := range groups {
+	keys := make([]groupKey, 0, len(groups))
+	for k := range groups {
+		keys = append(keys, k)
+	}
+	for gi, key := range keys {
+		group := groups[key]
 		routeSource := key.routeSource
 		if ctx.Err() != nil {
-			return true // budget gone mid-pass: remaining groups stay in the WAL
+			// budget gone mid-pass: this and every remaining group stay in the WAL
+			for _, k := range keys[gi:] {
+				held = append(held, groupIdx[k]...)
+			}
+			return true, held
 		}
 		url := r.urlForRouteSource(routeSource)
 		cred := r.credentialForRouteSource(routeSource)
@@ -775,9 +838,10 @@ func (r *Reporter) uploadPending(ctx context.Context, batch []ReportableEvent) (
 			r.markProcessed(group)
 		} else {
 			anyRetryable = true
+			held = append(held, groupIdx[key]...)
 		}
 	}
-	return anyRetryable
+	return anyRetryable, held
 }
 
 // markProcessed advances the in-memory cursors after a group has been handed to
@@ -813,57 +877,39 @@ func (r *Reporter) pruneConfirmedWAL() {
 	if err != nil {
 		return
 	}
+	if r.tail == nil {
+		r.tail = newUsageWALTailer(r.wal.Dir())
+	}
 	current := r.wal.CurrentFileName()
-
 	r.mu.RLock()
 	confirmed := make(map[string]int64, len(r.confirmedSeq))
 	for k, v := range r.confirmedSeq {
 		confirmed[k] = v
 	}
+	seen := make(map[string]bool, len(r.seenV1))
+	for k, v := range r.seenV1 {
+		seen[k] = v
+	}
 	r.mu.RUnlock()
-
+	// The per-file decision is served from the tailer's index instead of a
+	// ReadWALFile per rotated file per pass — that second full re-parse was part
+	// of the CPU profile (bugfix 2026-09-23-reporter-wal-full-reread-cpu). The
+	// predicate is unchanged (see walTailer.prunable).
 	for _, path := range files {
 		if filepath.Base(path) == current {
 			continue // never delete the file we're appending to
 		}
-		entries, err := ReadWALFile(path)
-		if err != nil || len(entries) == 0 {
+		if !r.tail.prunable(path, confirmed, seen) {
 			continue
 		}
-		prunable := true
-		sawV2 := false
-		for i := range entries {
-			e := &entries[i]
-			if e.SchemaVersion >= WALSchemaV2 && e.SourceSeq > 0 {
-				sawV2 = true
-				if e.SourceSeq > confirmed[e.SourceID] {
-					prunable = false
-					break
-				}
-			} else if e.EventJSON.EventID == "" || !r.seenV1Locked(e.EventJSON.EventID) {
-				// A v1 (or seq-less) entry: only prunable once uploaded (seenV1).
-				prunable = false
-				break
-			}
-		}
-		if prunable && sawV2 {
-			if err := os.Remove(path); err != nil {
-				slog.Warn("reporter: prune wal file failed",
-					"event.name", "usage.reporter.wal_prune_failed", "file", path, "error", err)
-			} else {
-				slog.Debug("reporter: pruned confirmed wal file", "file", path)
-			}
+		if err := os.Remove(path); err != nil {
+			slog.Warn("reporter: prune wal file failed",
+				"event.name", "usage.reporter.wal_prune_failed", "file", path, "error", err)
+		} else {
+			slog.Debug("reporter: pruned confirmed wal file", "file", path)
+			r.tail.forget(path)
 		}
 	}
-}
-
-// seenV1Locked reports whether a v1 event_id has been uploaded. Takes the read
-// lock itself so pruneConfirmedWAL can call it inside its file loop without
-// holding mu across file IO.
-func (r *Reporter) seenV1Locked(eventID string) bool {
-	r.mu.RLock()
-	defer r.mu.RUnlock()
-	return r.seenV1[eventID]
 }
 
 // uploadGroupResult tells uploadPending / resendWALSeqs whether a group is

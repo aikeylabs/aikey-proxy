@@ -35,6 +35,7 @@ import (
 	"strconv"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"github.com/AiKeyLabs/aikey-proxy/internal/events"
 	"github.com/AiKeyLabs/aikey-proxy/internal/observability"
@@ -243,9 +244,33 @@ func (p *Proxy) recordEvent(req *http.Request, resp *http.Response, startTime ti
 	p.reportUsage(route, bearerToken, ev.Model, startTime, resp.StatusCode, provider.TokenBreakdown{}, ev.ErrorType, errMsg, "", sessionID, "interrupted", upstreamReqID, req.URL.Path, ev.RequestID, ev.TraceID)
 }
 
-// errorBodyCap bounds the captured upstream error body (ODS error_message + WAL
-// stay small). Provider error envelopes are tiny JSON; 2KB is ample.
-const errorBodyCap = 2048
+// errorBodyCap bounds the captured upstream error body in CHARACTERS, so the
+// value fits the collector's `usage_event_ods.error_message VARCHAR(1024)`
+// (aikey-data/collector-service/migrations/001_usage_event_ods.sql) with room
+// for the "…" marker: 1023 kept + 1 marker = 1024. The old cap was 2048 BYTES:
+// PostgreSQL counts characters, rejected the row with SQLSTATE 22001, and the
+// collector's transient classification then made this proxy re-send the same
+// batch every 30 s for two weeks (worker-1, 2026-09-09 → 09-23). Bytes also cut
+// multibyte text mid-rune. Provider error envelopes are tiny JSON; 1 KB is ample.
+// bugfix: workflow/CI/bugfix/2026-09-23-collector-data-error-classified-transient.md
+const errorBodyCap = 1023
+
+// capErrorText trims s to errorBodyCap characters (not bytes — never splits a
+// UTF-8 sequence) and appends "…" when it did. Single exit for every error_message
+// producer in this file (upstream error body, transport refusal).
+func capErrorText(s string) string {
+	if utf8.RuneCountInString(s) <= errorBodyCap {
+		return s
+	}
+	n := 0
+	for i := range s {
+		if n == errorBodyCap {
+			return s[:i] + "…"
+		}
+		n++
+	}
+	return s
+}
 
 // captureUpstreamErrorBody reads the upstream error body, re-buffers it so the
 // client still receives the original payload, and returns the provider error
@@ -273,10 +298,7 @@ func captureUpstreamErrorBody(resp *http.Response) (errType, errMsg string) {
 	// keeps the RAW body for lossless storage — the page does the human-readable
 	// cleaning at render time.
 	pType, _ := parseUpstreamErrorEnvelope(body)
-	msg := strings.TrimSpace(string(body))
-	if len(msg) > errorBodyCap {
-		msg = msg[:errorBodyCap] + "…"
-	}
+	msg := capErrorText(strings.TrimSpace(string(body)))
 	return strings.TrimSpace(pType), msg
 }
 
@@ -725,10 +747,7 @@ func (p *Proxy) reportUpstreamRefusal(r *http.Request, route *vkeys.ResolvedRout
 	}
 	// Bounded with the same cap the answered-error path uses on the upstream
 	// body, so one pathological transport error cannot inflate an ODS row.
-	msg := cause.Error()
-	if len(msg) > errorBodyCap {
-		msg = msg[:errorBodyCap] + "…"
-	}
+	msg := capErrorText(cause.Error())
 	// resp is nil on purpose: there is no upstream response. buildBaseEvent is
 	// documented nil-resp-safe for exactly this caller, and it is what carries
 	// the trace/request ids and the client-requested model.

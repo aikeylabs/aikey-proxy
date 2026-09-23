@@ -5,6 +5,7 @@ import (
 	"net/http"
 	"strings"
 	"testing"
+	"unicode/utf8"
 )
 
 func respWithBody(body string) *http.Response {
@@ -54,5 +55,37 @@ func TestCaptureUpstreamErrorBody(t *testing.T) {
 	}
 	if gt, gm := captureUpstreamErrorBody(&http.Response{}); gt != "" || gm != "" {
 		t.Errorf("nil body must return empty, got (%q,%q)", gt, gm)
+	}
+}
+
+// TestCaptureUpstreamErrorBody_CapIsCharactersNotBytes is the fence for bugfix
+// 2026-09-23-collector-data-error-classified-transient: the collector stores
+// error_message in VARCHAR(1024) and PostgreSQL counts CHARACTERS. The old cap
+// was 2048 BYTES, produced a 2049-character value, PostgreSQL answered SQLSTATE
+// 22001 and the proxy re-sent that batch every 30 s for two weeks. The cap is
+// now errorBodyCap characters + "…" (= 1024 in total) and never splits a rune.
+func TestCaptureUpstreamErrorBody_CapIsCharactersNotBytes(t *testing.T) {
+	cjk := strings.Repeat("错", 3000)                     // 9000 bytes, 3000 characters
+	_, gm := captureUpstreamErrorBody(respWithBody(cjk)) //nolint:bodyclose // respWithBody is a NopCloser; captureUpstreamErrorBody reads and closes it
+	if n := utf8.RuneCountInString(gm); n != errorBodyCap+1 {
+		t.Fatalf("multibyte body: want %d chars (cap + marker), got %d chars / %d bytes", errorBodyCap+1, n, len(gm))
+	}
+	if !utf8.ValidString(gm) || !strings.HasSuffix(gm, "…") {
+		t.Fatalf("multibyte body: cap must keep UTF-8 valid and end with the marker")
+	}
+	if errorBodyCap+1 > 1024 {
+		t.Fatalf("errorBodyCap+marker = %d exceeds the collector's error_message VARCHAR(1024)", errorBodyCap+1)
+	}
+	ascii := strings.Repeat("x", 5000)
+	_, gm = captureUpstreamErrorBody(respWithBody(ascii)) //nolint:bodyclose // see above
+	if n := utf8.RuneCountInString(gm); n != errorBodyCap+1 {
+		t.Fatalf("ascii body: want %d chars, got %d", errorBodyCap+1, n)
+	}
+	if capErrorText("short") != "short" {
+		t.Fatalf("values under the cap must pass through unchanged")
+	}
+	exact := strings.Repeat("y", errorBodyCap)
+	if capErrorText(exact) != exact {
+		t.Fatalf("a value exactly at the cap must pass through unchanged")
 	}
 }

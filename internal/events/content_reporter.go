@@ -8,6 +8,8 @@ import (
 	"io"
 	"log/slog"
 	"net/http"
+	"os"
+	"path/filepath"
 	"sync"
 	"time"
 
@@ -69,11 +71,14 @@ type ContentReporter struct {
 	nextUploadAttempt time.Time
 	lastOKUploadAt    time.Time
 	wal               *ContentWAL
-	sentSeq           map[string]int64
-	confirmedSeq      map[string]int64
-	signal            chan struct{}
-	done              chan struct{}
-	cfg               ContentReporterConfig
+	// tail reads the content WAL incrementally and serves prune from its index
+	// (bugfix 2026-09-23-reporter-wal-full-reread-cpu; see wal_tail.go).
+	tail         *walTailer[ContentWALEntry]
+	sentSeq      map[string]int64
+	confirmedSeq map[string]int64
+	signal       chan struct{}
+	done         chan struct{}
+	cfg          ContentReporterConfig
 	// client is the swappable control-plane→collector client. An injected
 	// cfg.HTTPClient is wrapped fixed (not globally rebuilt); the default is
 	// registered so a host network change rebuilds it (self-heal registry).
@@ -101,7 +106,7 @@ func NewContentReporter(in *ContentReporterConfig, wal *ContentWAL) *ContentRepo
 	} else {
 		client = httpx.NewSwappableDirect(30 * time.Second)
 	}
-	return &ContentReporter{
+	cr := &ContentReporter{
 		cfg:          cfg,
 		client:       client,
 		wal:          wal,
@@ -110,6 +115,10 @@ func NewContentReporter(in *ContentReporterConfig, wal *ContentWAL) *ContentRepo
 		signal:       make(chan struct{}, 1),
 		done:         make(chan struct{}),
 	}
+	if wal != nil {
+		cr.tail = newContentWALTailer(wal.Dir())
+	}
+	return cr
 }
 
 // Start launches the upload loop on an isolated goroutine (a content-reporter
@@ -189,32 +198,46 @@ func (r *ContentReporter) drainOnce(ctx context.Context, force bool) {
 		}
 	}
 
-	entries, err := ReadAllContentWAL(r.wal.Dir())
+	// Incremental read (bugfix 2026-09-23-reporter-wal-full-reread-cpu): only
+	// bytes past each file's commit cursor are parsed; a full re-read of the
+	// content WAL per pass was 38% of a production node's CPU (prompts are
+	// large). Cursors commit at the end of the pass up to the first batch that
+	// was NOT handed over (retryable failure / budget gone); terminal drops and
+	// successes are passable. Restart = empty cursors = full replay, as before.
+	if r.tail == nil {
+		r.tail = newContentWALTailer(r.wal.Dir())
+	}
+	items, ends, err := r.tail.readNew(r.wal.CurrentFileName())
 	if err != nil {
 		slog.Warn("content reporter: wal read failed",
 			"event.name", "conversation.reporter.wal_read_failed", "error", err)
 	}
-
 	anyRetryable := false
-	pending := make([]ContentWALEntry, 0, len(entries))
+	pending := make([]ContentWALEntry, 0, len(items))
+	pendingPos := make([]walPos, 0, len(items))
+	holdAt := make(map[string]walPos)
+	noteHold := func(pos walPos) {
+		if h, ok := holdAt[pos.file]; !ok || pos.start < h.start {
+			holdAt[pos.file] = pos
+		}
+	}
 	flush := func() {
 		if len(pending) == 0 {
 			return
 		}
-		if ctx.Err() != nil {
-			// Budget exhausted (shutdown final flush): stop attempting — the
-			// remainder stays in the WAL and resumes after restart.
+		// Budget exhausted (shutdown final flush) → no attempt; retryable
+		// failure → attempted but not handed over. Both hold the cursor.
+		if ctx.Err() != nil || r.uploadBatch(ctx, pending) {
 			anyRetryable = true
-			pending = pending[:0]
-			return
-		}
-		if r.uploadBatch(ctx, pending) {
-			anyRetryable = true
+			for _, pos := range pendingPos {
+				noteHold(pos)
+			}
 		}
 		pending = pending[:0]
+		pendingPos = pendingPos[:0]
 	}
-	for i := range entries {
-		e := entries[i]
+	for i := range items {
+		e := items[i].entry
 		if e.SourceID == "" || e.SourceSeq == 0 {
 			continue // content entries always carry source identity
 		}
@@ -225,16 +248,20 @@ func (r *ContentReporter) drainOnce(ctx context.Context, force bool) {
 			continue
 		}
 		pending = append(pending, e)
+		pendingPos = append(pendingPos, items[i].pos)
 		if len(pending) >= r.cfg.BatchSize {
 			flush()
 		}
 	}
 	flush()
-
-	if _, perr := PruneConfirmedContentWAL(r.wal.Dir(), r.confirmedMapCopy(), r.wal.CurrentFileName()); perr != nil {
-		slog.Warn("content reporter: prune failed",
-			"event.name", "conversation.reporter.prune_failed", "error", perr)
+	for file, end := range ends {
+		if h, ok := holdAt[file]; ok {
+			r.tail.commit(file, h.start, h.line-1)
+		} else {
+			r.tail.commit(file, end.end, end.line)
+		}
 	}
+	r.pruneConfirmedContent()
 
 	r.mu.Lock()
 	if anyRetryable {
@@ -243,6 +270,30 @@ func (r *ContentReporter) drainOnce(ctx context.Context, force bool) {
 		r.nextUploadAttempt = time.Time{}
 	}
 	r.mu.Unlock()
+}
+
+// pruneConfirmedContent is PruneConfirmedContentWAL's decision served from the
+// tailer's index instead of re-reading every rotated file per pass (the
+// exported function is unchanged for its own callers and tests). Same rule:
+// never the current file; every entry keyed and ≤ confirmed[source]; an
+// unknown source or an entry without identity keeps the file.
+func (r *ContentReporter) pruneConfirmedContent() {
+	files, err := ListContentWALFiles(r.wal.Dir())
+	if err != nil {
+		slog.Warn("content reporter: prune failed",
+			"event.name", "conversation.reporter.prune_failed", "error", err)
+		return
+	}
+	current := r.wal.CurrentFileName()
+	confirmed := r.confirmedMapCopy()
+	for _, p := range files {
+		if filepath.Base(p) == current || !r.tail.prunable(p, confirmed, nil) {
+			continue
+		}
+		if err := os.Remove(p); err == nil {
+			r.tail.forget(p)
+		}
+	}
 }
 
 func (r *ContentReporter) confirmedMapCopy() map[string]int64 {
