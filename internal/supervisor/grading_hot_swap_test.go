@@ -26,6 +26,7 @@ import (
 	"github.com/AiKeyLabs/aikey-proxy/internal/apphook"
 	"github.com/AiKeyLabs/aikey-proxy/internal/observability"
 	"github.com/AiKeyLabs/aikey-proxy/internal/proxy"
+	"github.com/AiKeyLabs/aikey-proxy/internal/vault"
 	"github.com/AiKeyLabs/pkg/pipewire"
 )
 
@@ -93,9 +94,40 @@ type hotSwapRig struct {
 
 func newHotSwapRig(t *testing.T, modes ...string) *hotSwapRig {
 	t.Helper()
+	_, reader := newHotSwapRigVault(t)
 	s := &Supervisor{}
 	s.applyComplianceMasterPolicy(true, privacyTierMetadataOnly, false, []byte(hotDocA), true)
+	return startHotSwapRig(t, s, reader, modes...)
+}
 
+// newHotSwapRigVault is the rig's REAL vault: config table (so the persisted
+// compliance.master_policy can round-trip through it) plus one filter app, so
+// the recorded filter signature can be compared with what syncManagedKeys
+// would compute. Split out so the startup-baseline fence
+// (compliance_baseline_seed_test.go) can persist a policy BEFORE the
+// supervisor under test is seeded and its pool spawned.
+func newHotSwapRigVault(t *testing.T) (string, *vault.Reader) {
+	t.Helper()
+	dbPath, reader := newOpenableVault(t, nil)
+	db, err := sql.Open("sqlite", dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	if _, err := db.Exec(`CREATE TABLE app_records (slug TEXT, filter_stages TEXT, filter_record_allow INTEGER, filter_max_action TEXT)`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(`INSERT INTO app_records VALUES ('ai-compliance-detector','["pre_forward"]',0,'full')`); err != nil {
+		t.Fatal(err)
+	}
+	return dbPath, reader
+}
+
+// startHotSwapRig spawns the helper detectors with whatever policy s holds —
+// exactly what installFilterHook bakes into a spawn — and makes them the
+// active generation.
+func startHotSwapRig(t *testing.T, s *Supervisor, reader *vault.Reader, modes ...string) *hotSwapRig {
+	t.Helper()
 	workers := make([]*apphook.ChildHook, len(modes))
 	for i, mode := range modes {
 		workers[i] = apphook.NewChildHook(&apphook.ChildHookConfig{
@@ -131,21 +163,6 @@ func newHotSwapRig(t *testing.T, modes ...string) *hotSwapRig {
 
 	p := &proxy.Proxy{}
 	logProxyGradingInstall(p.SetComplianceGrading(s.gradingPolicyJSON()))
-
-	// A real vault with one filter app, so the recorded filter signature can be
-	// compared with what syncManagedKeys would compute.
-	dbPath, reader := newOpenableVault(t, nil)
-	db, err := sql.Open("sqlite", dbPath)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer db.Close()
-	if _, err := db.Exec(`CREATE TABLE app_records (slug TEXT, filter_stages TEXT, filter_record_allow INTEGER, filter_max_action TEXT)`); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := db.Exec(`INSERT INTO app_records VALUES ('ai-compliance-detector','["pre_forward"]',0,'full')`); err != nil {
-		t.Fatal(err)
-	}
 
 	gen := &generation{proxy: p, filterHook: pool, vault: reader}
 	s.active.Store(gen)

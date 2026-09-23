@@ -602,6 +602,13 @@ func New(cfg *config.Config, configPath, password, version string) (*Supervisor,
 	// none in a -tags aikey_license_off build (see license_rail_off.go — the gate
 	// they feed is compiled out, so a running rail could only log 404s forever).
 	s.railset = newRailSet(append([]railSpec{s.groupRuntimeRail(), s.routingOverrideRail(), s.fallbackPolicyRail(), s.keyRevocationRail(), s.dialectBridgeRail()}, s.licenseRails()...)...)
+	// Restore the org compliance policy's comparison baseline BEFORE the initial
+	// generation spawns the detector from it, so the first policy poll after a
+	// restart is a no-op when the master did not change anything (it used to
+	// re-spawn the whole pool every boot). Must stay above buildGeneration —
+	// fenced by TestComplianceBaseline_SeededBeforeInitialGeneration.
+	// bugfix: workflow/CI/bugfix/2026-09-21-cluster-worker-livelock-on-grading-reload-and-ingress-keeps-routing.md
+	s.seedComplianceMasterBaseline()
 	gen, err := s.buildGeneration()
 	if err != nil {
 		_ = s.oauthPoolRuntime.Shutdown()
@@ -679,15 +686,9 @@ func New(cfg *config.Config, configPath, password, version string) (*Supervisor,
 	// so clients discover it via /cluster/resolve. Inert for non-cluster proxies —
 	// Personal/Trial never set Cluster.Enabled, so this is a no-op there. Isolated
 	// (not Fatal): a registrar panic must NOT kill the data path; the proxy keeps
-	// serving locally even if the hub is unreachable.
+	// serving locally even if the hub is unreachable. One registrar per configured
+	// hub (see startClusterRegistrars below); the sources wired here are shared.
 	if s.cfg.Cluster.Enabled {
-		reg := cluster.NewRegistrar(
-			s.cfg.Cluster.HubURL,
-			s.cfg.Cluster.NodeID,
-			s.cfg.Cluster.NodeAddr,
-			s.cfg.Cluster.Weight,
-			s.cfg.Cluster.ServiceToken,
-		).WithInternalAddr(s.cfg.Cluster.InternalAddr)
 		// Health piggyback (P0-B): forward the co-located cluster-daemon's
 		// status file + proxy-own metrics + usage-pipeline canary verdict on
 		// every heartbeat so node health is externally readable. Pure
@@ -772,15 +773,64 @@ func New(cfg *config.Config, configPath, password, version string) (*Supervisor,
 			// the P3 "projection stale" yellow light (方案 20260819 D4): a
 			// worker whose daemon/apply chain stalls stops advancing this
 			// number while control's keeps moving.
+			// identity_key_missing_*: pool accounts this node is serving on a
+			// NODE-LOCAL rewrite key because the control plane's per-account key
+			// did not reach it (spec: R-codex-identity-rewrite-4). Same two
+			// field names as /status pool_routing — one signal, two readers.
+			// Active > 0 is CRIT; not omitempty, so "zero" and "this build
+			// cannot report it" stay distinguishable.
+			identityKey := proxy.IdentityKeyFallbackSnapshot()
 			return struct {
 				Enabled                  bool            `json:"enabled"`
 				AssignmentRoutingVersion int64           `json:"assignment_routing_version,omitempty"`
 				CooledAccounts           []cooledAccount `json:"cooled_accounts,omitempty"`
-			}{Enabled: true, AssignmentRoutingVersion: s.routingOverrides.Version(), CooledAccounts: accounts}
+				IdentityKeyMissingActive int64           `json:"identity_key_missing_active"`
+				IdentityKeyMissingTotal  int64           `json:"identity_key_missing_total"`
+			}{Enabled: true, AssignmentRoutingVersion: s.routingOverrides.Version(), CooledAccounts: accounts,
+				IdentityKeyMissingActive: identityKey.MissingActive, IdentityKeyMissingTotal: identityKey.MissingTotal}
 		}
-		reg.SetHealthSource(cluster.NodeHealthSource(s.cfg.Vault.Path, s.version, time.Now(), canaryFn, metricsFn, poolRoutingFn))
-		observability.GoSafe("supervisor.cluster_registrar", observability.Isolated, func() { reg.Run(s.ctx) })
-		slog.Info("cluster mode enabled", "node_id", s.cfg.Cluster.NodeID, "hub", s.cfg.Cluster.HubURL)
+		// Device-routing self-check counters ride the same register/heartbeat
+		// payload (4.8 left this injection point). The control plane's
+		// `device_routing_token.nodes_unsupported` CRIT is computed from
+		// route_kind_missing_active, so without this line the hub would keep
+		// reading 0 while every request for those tokens fails — a silent
+		// version-skew outage.
+		//
+		// spec: R-device-routing-token-dispatch-20 类别缺失计数随心跳上报，active 归零即自动消失
+		// roadmap20260320/技术实现/阶段9-商业化版本/codex-pool-anti-linkage/openspec/specs/device-routing-token-dispatch/spec.md
+		deviceRoutingStatsFn := func() cluster.DeviceRoutingTokenStats {
+			snap := proxy.DeviceRoutingTokenSnapshot()
+			return cluster.DeviceRoutingTokenStats{
+				RouteKindMissingActive: snap.RouteKindMissingActive,
+				RouteKindMissingTotal:  snap.RouteKindMissingTotal,
+			}
+		}
+		// Why: multi-hub fan-out registration so every hub's node table is identical
+		// (update: roadmap20260320/技术实现/update/20260922-集群入口高可用-hub多实例与两台入口机.md, DEC-cluster-ingress-ha-2).
+		// One Registrar per hub, each in its own goroutine, all fed from the SAME
+		// underlying sources above (canary, runtime metrics, pool routing,
+		// device-routing counters, internal address). The health COLLECTOR is
+		// built per hub on purpose: NodeHealthSource keeps per-instance log
+		// de-dup state and is not written for concurrent callers, so one closure
+		// shared across registrar goroutines would race. startedAt is taken once
+		// so every hub sees the same process start. With only hub_url configured
+		// the list has one element and this is exactly the pre-2026-09-22 single
+		// registrar (same goroutine name, same log line).
+		startedAt := time.Now()
+		hubs := s.cfg.Cluster.AllHubURLs()
+		startClusterRegistrars(s.ctx, hubs, func(hubURL string) *cluster.Registrar {
+			reg := cluster.NewRegistrar(
+				hubURL,
+				s.cfg.Cluster.NodeID,
+				s.cfg.Cluster.NodeAddr,
+				s.cfg.Cluster.Weight,
+				s.cfg.Cluster.ServiceToken,
+			).WithInternalAddr(s.cfg.Cluster.InternalAddr)
+			reg.SetHealthSource(cluster.NodeHealthSource(s.cfg.Vault.Path, s.version, startedAt, canaryFn, metricsFn, poolRoutingFn))
+			reg.SetDeviceRoutingTokenStatsSource(deviceRoutingStatsFn)
+			return reg
+		})
+		slog.Info("cluster mode enabled", "node_id", s.cfg.Cluster.NodeID, "hub", strings.Join(hubs, ","))
 	}
 
 	// Budget-mode quota staleness heartbeat (D-U7/P9). ONLY started when
@@ -790,6 +840,23 @@ func New(cfg *config.Config, configPath, password, version string) (*Supervisor,
 	s.startQuotaHeartbeat()
 
 	return s, nil
+}
+
+// startClusterRegistrars launches one hub Registrar per URL, each in its own
+// Isolated goroutine. Independence is the point: the loops share no state, so a
+// hub that refuses connections or hangs delays nothing but its own loop, and a
+// registrar panic can kill neither the data path nor the other registrars.
+// build is called once per hub, in order, and must return a fully wired
+// Registrar. The goroutine name is unchanged from the single-hub era so a
+// one-hub deployment is byte-identical to before.
+// Why: multi-hub fan-out registration so every hub's node table is identical
+// (update: roadmap20260320/技术实现/update/20260922-集群入口高可用-hub多实例与两台入口机.md, DEC-cluster-ingress-ha-2).
+// Fenced by TestStartClusterRegistrars_EveryHubIsServedEvenWhenOneHangs.
+func startClusterRegistrars(ctx context.Context, hubURLs []string, build func(hubURL string) *cluster.Registrar) {
+	for _, hubURL := range hubURLs {
+		reg := build(hubURL)
+		observability.GoSafe("supervisor.cluster_registrar", observability.Isolated, func() { reg.Run(ctx) })
+	}
 }
 
 // StartPolicyPollers launches the master-policy pollers whose first sync can
@@ -1330,6 +1397,10 @@ func (s *Supervisor) rebuildRouteRegistry(gen *generation) int {
 
 	// 2. Team managed keys
 	managedKeys, err := gen.vault.GetActiveManagedKeys()
+	// managedRead records whether the authoritative managed-key view was actually
+	// obtained. It gates the device-routing reconcile below: a vault read failure
+	// must never be allowed to look like "every token is fine now".
+	managedRead := err == nil
 	if err != nil {
 		slog.Warn("managed key sync: GetActiveManagedKeys failed", "error", err)
 	} else {
@@ -1387,6 +1458,19 @@ func (s *Supervisor) rebuildRouteRegistry(gen *generation) int {
 
 	// Atomic replace — deleted/revoked tokens disappear immediately.
 	gen.registry.ReplaceAll(allRoutes)
+	// Necessary path #2 for clearing device_routing_token.route_kind_missing_active
+	// (the other is the next request that gets through the strict branch): a
+	// reload is where a repaired or deleted token becomes visible, and an
+	// idempotent reconcile over the new authoritative set needs no event and no
+	// timer. A CRIT that can only be cleared by a request would stay lit forever
+	// on a token nobody calls any more.
+	//
+	// spec: R-device-routing-token-dispatch-20.S2 —— 下一次路由重载发现它的路由已带
+	// 类别、或它已不存在 → 同样清除，无需重启 proxy
+	// roadmap20260320/技术实现/阶段9-商业化版本/codex-pool-anti-linkage/openspec/specs/device-routing-token-dispatch/spec.md
+	if managedRead {
+		proxy.ReconcileDeviceRoutingRouteKind(allRoutes)
+	}
 	return len(allRoutes)
 }
 
@@ -2121,8 +2205,20 @@ func (s *Supervisor) buildGeneration() (*generation, error) {
 	// historical-prefix dirty data in the cache).
 	if managedKeys, mkErr := vaultReader.GetActiveManagedKeys(); mkErr != nil {
 		slog.Warn("could not load managed virtual keys", "error", mkErr)
-	} else if len(managedKeys) > 0 {
-		registry.Merge(buildManagedRoutes(managedKeys, s.revokedVKs()))
+	} else {
+		managedRoutes := buildManagedRoutes(managedKeys, s.revokedVKs())
+		if len(managedKeys) > 0 {
+			registry.Merge(managedRoutes)
+		}
+		// Same reconcile as the periodic reload path (rebuildRouteRegistry): a
+		// generation rebuild (/admin/reload) is also a route reload, and the
+		// device-routing counters live process-wide so they survive it. Only
+		// managed keys can be device-routing tokens, so this map is the complete
+		// authoritative view. Skipped above when the read FAILED — an unreadable
+		// vault must not clear a CRIT.
+		//
+		// spec: R-device-routing-token-dispatch-20.S2
+		proxy.ReconcileDeviceRoutingRouteKind(managedRoutes)
 	}
 
 	// Load personal-key + OAuth bearers (v1.0.4+) into the registry.

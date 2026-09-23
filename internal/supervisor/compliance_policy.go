@@ -19,7 +19,6 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
-	"fmt"
 	"log/slog"
 	"net/http"
 	"net/url"
@@ -32,9 +31,11 @@ import (
 )
 
 const (
-	// complianceMasterPolicyKey holds the JSON {enabled,locked} the UI + CLI read
-	// to reflect / enforce the org mandate. Plaintext config (like change_seq) —
-	// no vault unlock needed; integrity comes from the authenticated master pull.
+	// complianceMasterPolicyKey holds the persistedComplianceMasterPolicy JSON the
+	// UI + CLI read to reflect / enforce the org mandate, and that the supervisor
+	// reads back at boot as its comparison baseline (seedComplianceMasterBaseline).
+	// Plaintext config (like change_seq) — no vault unlock needed; integrity comes
+	// from the authenticated master pull, which overrules it on every poll.
 	complianceMasterPolicyKey = "compliance.master_policy"
 	compliancePollInterval    = 60 * time.Second
 
@@ -246,20 +247,21 @@ func (s *Supervisor) applyComplianceMasterPolicy(enabled bool, tier int, passwor
 	// ON ⇒ user can't disable; master OFF ⇒ user free). Kept as two fields so a
 	// future "force-off + locked" variant doesn't change the wire shape.
 	//
-	// privacy_tier rides along so the local console can SHOW what the org decided.
-	// 🔴 Writing it here does NOT make it settable locally: nothing reads this key
-	// back to decide anything — the detector env comes from the atomic below, and
-	// the master re-checks its own column at ingest. This value is for display.
-	// password_tier rides along for DISPLAY as well (same 🔴 note as privacy_tier:
-	// nothing reads this key back to decide anything — the detector env comes
-	// from the atomic below).
-	passwordTier := ""
-	if passwordAdvanced {
-		passwordTier = "advanced"
-	}
-	policy := fmt.Sprintf(`{"enabled":%t,"locked":%t,"privacy_tier":%d,"password_tier":%q}`, enabled, enabled, tier, passwordTier)
+	// privacy_tier and password_tier ride along so the local console can SHOW
+	// what the org decided, and so the NEXT boot can restore its comparison
+	// baseline from them (seedComplianceMasterBaseline, 2026-09-21).
+	// 🔴 Writing them here does NOT make them settable locally. The one reader
+	// that decides anything is that boot-time seed, and what it restores is only
+	// the value the first poll is COMPARED against: the master's answer is still
+	// the verdict on every poll, so a key edited locally differs from it, counts
+	// as "changed", and is overwritten (atomics + this key) by the master's
+	// values through a respawn. The master also re-checks its own column at
+	// ingest. Fenced by TestComplianceBaseline_LocalTamperIsOverruledByTheNextPoll.
+	// bugfix: workflow/CI/bugfix/2026-09-21-cluster-worker-livelock-on-grading-reload-and-ingress-keeps-routing.md
 	if s.cfg != nil {
-		_ = vault.WriteConfigString(s.cfg.Vault.Path, complianceMasterPolicyKey, policy)
+		if policy, err := json.Marshal(newPersistedComplianceMasterPolicy(enabled, tier, passwordAdvanced)); err == nil {
+			_ = vault.WriteConfigString(s.cfg.Vault.Path, complianceMasterPolicyKey, string(policy))
+		}
 	}
 	// The privacy tier is baked into the detector child's ENV at spawn, so a
 	// change only takes effect on a re-spawn. Store it BEFORE the reload decision
@@ -291,6 +293,92 @@ func (s *Supervisor) applyComplianceMasterPolicy(enabled bool, tier int, passwor
 		grading:         gradingChanged && !respawn,
 		previousGrading: previousGrading,
 	}
+}
+
+// persistedComplianceMasterPolicy is the ONE shape of complianceMasterPolicyKey:
+// written by applyComplianceMasterPolicy, read back by
+// seedComplianceMasterBaseline (and by the local UI / CLI guard, which parse
+// the same JSON). One struct so the writer and the reader cannot drift apart.
+// The field order is the byte order the key has always had.
+//
+// No grading member, on purpose (用户拍板 2026-09-21: do not grow this key):
+// after a restart the first poll that carries the org ladder is a grading-only
+// change, which TODO-188 方案 C hot-swaps into the running detector without a
+// new generation.
+type persistedComplianceMasterPolicy struct {
+	Enabled      bool   `json:"enabled"`
+	Locked       bool   `json:"locked"`
+	PrivacyTier  int    `json:"privacy_tier"`
+	PasswordTier string `json:"password_tier"`
+}
+
+func newPersistedComplianceMasterPolicy(enabled bool, tier int, passwordAdvanced bool) persistedComplianceMasterPolicy {
+	p := persistedComplianceMasterPolicy{Enabled: enabled, Locked: enabled, PrivacyTier: tier}
+	if passwordAdvanced {
+		p.PasswordTier = "advanced"
+	}
+	return p
+}
+
+// seedComplianceMasterBaseline restores the comparison baseline of
+// applyComplianceMasterPolicy — masterCompliance, masterPrivacyTier,
+// masterPasswordTierAdvanced — from the policy this node persisted the last
+// time it followed its master. New() calls it BEFORE the initial
+// buildGeneration, so the first detector pool is spawned with these values
+// (installFilterHook reads exactly these atomics) and the first poll compares
+// the master's answer against what is actually running.
+//
+// WHY (the 10.0.0.90 livelock, 2026-09-21): the atomics started at zero on every
+// boot while the key sat unread in the vault, so the first poll always saw
+// "changed" (tier 0 → the cluster's 3) and re-spawned the pool — new pool first,
+// old pool drained after — and the 5 s vault tick, whose filter signature folds
+// in the same atomics, queued a second full reload behind it. Four ~235 MB
+// detectors on a 1.6 GB worker crossed MemoryHigh and the node stopped
+// answering. Same pattern as seedQuotaSig and loaded_vault_change_seq: no new
+// state, the already-persisted payload is simply read back.
+//
+// 增强非依赖: an absent key (Personal, first boot) or an unreadable one leaves
+// the zero baseline — the pre-fix behavior, one respawn on the first poll —
+// and never blocks the boot. Grading is not seeded: the key carries none (see
+// persistedComplianceMasterPolicy).
+// bugfix: workflow/CI/bugfix/2026-09-21-cluster-worker-livelock-on-grading-reload-and-ingress-keeps-routing.md
+// bugfix: workflow/CI/bugfix/20260725-proxy-startup-reload-storm-5s-health-fail.md (腿 3 改点 A)
+func (s *Supervisor) seedComplianceMasterBaseline() {
+	if s.cfg == nil {
+		return
+	}
+	raw, err := vault.ReadConfigString(s.cfg.Vault.Path, complianceMasterPolicyKey)
+	if err != nil {
+		slog.Warn("compliance master policy baseline could not be read; the first policy poll will re-spawn the detector once",
+			"event.name", observability.EventComplianceMasterBaselineUnreadable,
+			"error.code", observability.ErrCodeComplianceMasterBaselineUnreadable,
+			"error", err)
+		return
+	}
+	if raw == "" {
+		slog.Info("no persisted compliance master policy; starting from the zero baseline",
+			"event.name", observability.EventComplianceMasterBaselineAbsent)
+		return
+	}
+	var p persistedComplianceMasterPolicy
+	if err := json.Unmarshal([]byte(raw), &p); err != nil {
+		// No decoder error text and no bytes: either could quote the key.
+		slog.Warn("persisted compliance master policy is not decodable; the first policy poll will re-spawn the detector once",
+			"event.name", observability.EventComplianceMasterBaselineUnreadable,
+			"error.code", observability.ErrCodeComplianceMasterBaselineUnreadable,
+			"bytes", len(raw))
+		return
+	}
+	// Same normalisation as the wire (fetchComplianceMasterPolicy): anything that
+	// is not an understood rung lands on metadata-only; only "advanced" forces.
+	tier := clampPrivacyTier(p.PrivacyTier)
+	advanced := p.PasswordTier == "advanced"
+	s.masterCompliance.Store(p.Enabled)
+	s.masterPrivacyTier.Store(int64(tier))
+	s.masterPasswordTierAdvanced.Store(advanced)
+	slog.Info("compliance master policy baseline restored from the last persisted policy",
+		"event.name", observability.EventComplianceMasterBaselineSeeded,
+		"enabled", p.Enabled, "privacy_tier", tier, "password_tier_advanced", advanced)
 }
 
 // noteCompliancePolicyRejected records one poll whose answer could not be used

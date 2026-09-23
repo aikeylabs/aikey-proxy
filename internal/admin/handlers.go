@@ -500,6 +500,47 @@ type PoolRoutingHealth struct {
 	CooledAccounts  []CooledAccount        `json:"cooled_accounts,omitempty"`
 	PathHealth      []ProviderPathHealth   `json:"path_health,omitempty"`
 	SignalReporting *SignalReportingHealth `json:"signal_reporting,omitempty"`
+	// IdentityKeyMissingActive / Total report pool accounts currently served on
+	// a NODE-LOCAL identity-rewrite key because the control plane's per-account
+	// key never reached this worker (spec: R-codex-identity-rewrite-4).
+	//
+	// 🔴 Active > 0 is CRIT, not WARN, and it is deliberately NOT omitempty: a
+	// degradation signal that disappears from the payload when it is zero is
+	// indistinguishable from a build that cannot report it at all, and a
+	// checklist asserting "zero" would then pass on an absent field. Active
+	// self-heals (no restart needed); Total is lifetime, for diagnosis only.
+	//
+	// It rides pool_routing rather than a cluster-only object because the same
+	// degradation exists on Personal/Production member proxies, and this object
+	// is already forwarded to the hub inside the cluster heartbeat.
+	IdentityKeyMissingActive int64 `json:"identity_key_missing_active"`
+	IdentityKeyMissingTotal  int64 `json:"identity_key_missing_total"`
+	// DeviceRoutingToken reports the worker's device-routing self-check counters
+	// (spec: R-device-routing-token-dispatch-7 / -20). It rides pool_routing
+	// beside signal_reporting for the same reason identity_key_missing_* does:
+	// this is pool-account routing health, and that object is already forwarded
+	// to the hub inside the cluster heartbeat.
+	//
+	// 🔴 Value, not pointer, and NOT omitempty — the counters are "present as
+	// soon as the probe is wired" (design §4b.5, 2026-09-22): zero must be
+	// reported as zero, so an absent object means "this build cannot report it"
+	// and a release check asserting zero cannot pass on a missing field.
+	DeviceRoutingToken DeviceRoutingTokenHealth `json:"device_routing_token"`
+}
+
+// DeviceRoutingTokenHealth mirrors proxy.DeviceRoutingTokenHealth for the
+// /status wire (admin does not import proxy). Field names are the health-signal
+// contract's dotted names verbatim.
+//
+//	decision_missing_24h      WARN — requests arrived with no account decision
+//	                          in the last 24h (old ingress). Sliding window.
+//	route_kind_missing_active CRIT when > 0 — tokens that still do not line up
+//	                          (rolled-back cluster daemon). Self-healing.
+//	route_kind_missing_total  never alerting — lifetime, diagnosis only.
+type DeviceRoutingTokenHealth struct {
+	DecisionMissing24h     int64 `json:"decision_missing_24h"`
+	RouteKindMissingActive int64 `json:"route_kind_missing_active"`
+	RouteKindMissingTotal  int64 `json:"route_kind_missing_total"`
 }
 
 type SignalReportingHealth struct {

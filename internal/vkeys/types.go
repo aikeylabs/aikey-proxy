@@ -104,6 +104,37 @@ type ResolvedRoute struct {
 	// Used by downstream consumers (WAL event, CLI status line, watch) to
 	// derive user-facing labels without fragile prefix parsing on VirtualKeyID.
 	RouteSource string
+	// RouteKind classifies WHICH KIND of route this is, independently of
+	// RouteSource above. "device_routing_token" marks a device-routing token —
+	// the third kind of AiKey token, whose account the control plane decides
+	// per employee DEVICE and hands the worker in an internal header. Empty
+	// means an ordinary route.
+	//
+	// 🔴 A SEPARATE field, not a new RouteSource value. RouteSource is the
+	// usage/WAL attribution key ("team" for every managed key, including these),
+	// so overloading it would silently re-label every device-routing token's
+	// usage rows and break the reporter's keying (design §4b hard values:
+	// route_kind is new, route_source stays "team").
+	//
+	// Carried from the node vault via ManagedKey.RouteKind (see
+	// supervisor.managedKeyToRoute). Empty means "kind unknown" — the worker
+	// refuses the strict branch on it rather than serving the token down the
+	// seat path (R-device-routing-token-dispatch-20.S2).
+	RouteKind string `json:"route_kind,omitempty"`
+	// IdentityKey is the RESOLVED ACCOUNT's Codex identity-rewrite key: 32 raw
+	// bytes, stamped onto the PER-REQUEST route copy by the group serve path
+	// once an account has been picked (spec: R-codex-identity-rewrite-4).
+	//
+	// It is never nil on a pool route: the resolver either decrypts the key the
+	// control plane delivered for that account, or derives one from THIS node's
+	// vault key plus the account id and raises a CRIT counter. The rewrite
+	// therefore always has a seed, and the client's original identifiers never
+	// have to be passed through for lack of one.
+	//
+	// 🔴 Raw key material. Never log it, never put it in an error, never let it
+	// reach a response header or an upstream request. It exists on the route
+	// only for the duration of one forwarded request.
+	IdentityKey []byte `json:"-"`
 	// ── App pipeline fields (RouteSource == "app" only) ────────────────────
 	//
 	// Phase 4 routes are loaded into the registry at startup like personal /

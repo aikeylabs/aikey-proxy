@@ -171,10 +171,12 @@ type Proxy struct {
 	// Supervisor's process lifetime. A generation must never close the shared
 	// reporter while a draining sibling can still publish into it.
 	ownsSignalReporter bool
-	// schedRouted tracks each (group|seat)'s last routed account so the unified
+	// schedRouted tracks each settle lane's last observation so the unified
 	// scheduling log receives one row per ROUTE CHANGE, never one per request
-	// (拍板 2026-08-17 #3 — see noteSchedRouteSettled).
-	schedRouted sync.Map // map[string]string: "<group>|<seat>" → account_id
+	// (拍板 2026-08-17 #3 — see noteSchedRouteSettled, which owns the key shape).
+	// Two shapes: "<group>|<seat>" for seat routes, "<group>|<seat>|<account>"
+	// for device-routing tokens (one token, many devices, one account each).
+	schedRouted sync.Map // map[string]schedRouteState
 	// routingOverrides is the allocation engine's seat→account routing-override
 	// cache (I-side §6.5). Shared across generations, polled by the supervisor; the
 	// group-route hot path reads it to redirect a seat off an unhealthy default.

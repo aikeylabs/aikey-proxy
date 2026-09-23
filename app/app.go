@@ -497,6 +497,22 @@ func Run() {
 			return nil
 		}
 		h := &admin.PoolRoutingHealth{Enabled: true}
+		// spec: R-codex-identity-rewrite-4 密钥缺失 → 健康端点报 CRIT（active > 0）。
+		// Read from the resolver that actually took the fallback, so the signal
+		// cannot claim health the request path did not have.
+		identityKey := proxy.IdentityKeyFallbackSnapshot()
+		h.IdentityKeyMissingActive = identityKey.MissingActive
+		h.IdentityKeyMissingTotal = identityKey.MissingTotal
+		// spec: R-device-routing-token-dispatch-7.S3 决定缺失 24 小时滑动窗口
+		// spec: R-device-routing-token-dispatch-20.S2 类别缺失 active > 0 → CRIT
+		// Read from the branch that actually refused the requests, so the signal
+		// cannot claim health the request path did not have.
+		drt := proxy.DeviceRoutingTokenSnapshot()
+		h.DeviceRoutingToken = admin.DeviceRoutingTokenHealth{
+			DecisionMissing24h:     drt.DecisionMissing24h,
+			RouteKindMissingActive: drt.RouteKindMissingActive,
+			RouteKindMissingTotal:  drt.RouteKindMissingTotal,
+		}
 		if signal := sup.SignalReportingHealthSnapshot(); signal != nil {
 			h.SignalReporting = &admin.SignalReportingHealth{
 				Status: signal.Status, ConsecutiveFailures: signal.ConsecutiveFailures,

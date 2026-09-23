@@ -3,6 +3,7 @@ package config
 import (
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 )
@@ -440,5 +441,124 @@ func TestShippedDefaultConfigsActuallyLoad(t *testing.T) {
 					len(cfg.ChatCompletionsBridge.Upstreams))
 			}
 		})
+	}
+}
+
+// ── 2026-09-22 cluster.hub_urls: multi-hub fan-out registration ─────────────
+//
+// update: roadmap20260320/技术实现/update/20260922-集群入口高可用-hub多实例与两台入口机.md
+// (DEC-cluster-ingress-ha-2): a node registers with EVERY configured hub so all
+// hub node tables are identical. hub_urls is the list spelling; hub_url stays
+// valid as the one-element legacy spelling. AllHubURLs() is the single place
+// that precedence and normalization live — the supervisor reads only it.
+
+func TestClusterConfig_AllHubURLs(t *testing.T) {
+	cases := []struct {
+		name string
+		c    ClusterConfig
+		want []string
+	}{
+		{"hub_url only (legacy) → one-element list, trailing slash stripped",
+			ClusterConfig{HubURL: "http://hub:27400/"}, []string{"http://hub:27400"}},
+		{"hub_urls takes precedence over hub_url",
+			ClusterConfig{HubURL: "http://old:27400", HubURLs: []string{"http://a:27400", "http://b:27400"}},
+			[]string{"http://a:27400", "http://b:27400"}},
+		{"entries are trimmed, slash-stripped, de-duplicated, blanks dropped, order kept",
+			ClusterConfig{HubURLs: []string{" http://a:27400/ ", "http://b:27400", "http://a:27400", "", "   "}},
+			[]string{"http://a:27400", "http://b:27400"}},
+		{"empty hub_urls list falls back to hub_url",
+			ClusterConfig{HubURL: "http://hub:27400", HubURLs: []string{}}, []string{"http://hub:27400"}},
+		{"neither → empty", ClusterConfig{}, nil},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := tc.c.AllHubURLs(); !slices.Equal(got, tc.want) {
+				t.Fatalf("AllHubURLs() = %q, want %q", got, tc.want)
+			}
+		})
+	}
+}
+
+func TestValidate_ClusterRequiresAtLeastOneHubFromEitherKey(t *testing.T) {
+	base := func() *Config {
+		c := &Config{}
+		c.Listen.Host = "127.0.0.1"
+		c.Listen.Port = 27200
+		c.Cluster.Enabled = true
+		c.Cluster.NodeID = "node-1"
+		c.Cluster.NodeAddr = "node:27200"
+		return c
+	}
+
+	err := base().validate()
+	if err == nil {
+		t.Fatal("cluster.enabled with neither hub_url nor hub_urls must be rejected")
+	}
+	for _, key := range []string{"cluster.hub_urls", "cluster.hub_url"} {
+		if !strings.Contains(err.Error(), key) {
+			t.Fatalf("the validation error must name %s so the operator sees both spellings; got: %v", key, err)
+		}
+	}
+
+	blank := base()
+	blank.Cluster.HubURLs = []string{"", "  "}
+	if err := blank.validate(); err == nil {
+		t.Fatal("hub_urls holding only blank entries is no hub at all and must be rejected")
+	}
+
+	legacy := base()
+	legacy.Cluster.HubURL = "http://hub:27400"
+	if err := legacy.validate(); err != nil {
+		t.Fatalf("hub_url alone must stay valid: %v", err)
+	}
+
+	list := base()
+	list.Cluster.HubURLs = []string{"http://a:27400", "http://b:27400"}
+	if err := list.validate(); err != nil {
+		t.Fatalf("hub_urls alone must be valid: %v", err)
+	}
+}
+
+func TestLoad_ClusterHubURLsListParsesFromYAML(t *testing.T) {
+	sysPath := writeTestPair(t, systemProxyYaml+`
+cluster:
+  enabled: true
+  node_id: "worker-1"
+  node_addr: "10.0.0.11:27200"
+  hub_urls:
+    - "http://10.0.0.11:27400"
+    - "http://10.0.0.12:27400/"
+    - "http://10.0.0.10:27400"
+`, "")
+	cfg, err := Load(sysPath)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if len(cfg.Cluster.HubURLs) != 3 {
+		t.Fatalf("cluster.hub_urls must unmarshal as a list, got %q", cfg.Cluster.HubURLs)
+	}
+	want := []string{"http://10.0.0.11:27400", "http://10.0.0.12:27400", "http://10.0.0.10:27400"}
+	if got := cfg.Cluster.AllHubURLs(); !slices.Equal(got, want) {
+		t.Fatalf("hub_urls from yaml → AllHubURLs() = %q, want %q", got, want)
+	}
+
+	// Backward compatibility: a config that only knows hub_url yields exactly that
+	// one hub — the pre-2026-09-22 shape is a one-element fan-out, nothing more.
+	legacyPath := writeTestPair(t, systemProxyYaml+`
+cluster:
+  enabled: true
+  node_id: "worker-1"
+  node_addr: "10.0.0.11:27200"
+  hub_url: "http://10.0.0.10:27400"
+`, "")
+	legacy, err := Load(legacyPath)
+	if err != nil {
+		t.Fatalf("Load legacy: %v", err)
+	}
+	if got := legacy.Cluster.AllHubURLs(); !slices.Equal(got, []string{"http://10.0.0.10:27400"}) {
+		t.Fatalf("legacy hub_url → AllHubURLs() = %q, want the single hub", got)
+	}
+	if legacy.Cluster.HubURLs != nil {
+		t.Fatalf("a legacy config must not synthesize hub_urls, got %q", legacy.Cluster.HubURLs)
 	}
 }

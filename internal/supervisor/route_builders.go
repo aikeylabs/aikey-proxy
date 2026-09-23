@@ -75,6 +75,25 @@ func managedKeyToRoute(mk *vault.ManagedKey) *vkeys.ResolvedRoute {
 		GroupAccounts: mk.GroupAccounts,
 		GroupRuntime:  mk.GroupRuntime,
 		RoutingConfig: mk.RoutingConfig,
+		// spec: R-device-routing-token-dispatch-20 device-routing token: on the
+		// internal header the worker MUST first check its local route's kind and
+		// refuse (503, reason=route_kind_missing) when it is missing — never fall
+		// back to the seat path and choose an account itself. See .S2 in
+		// roadmap20260320/技术实现/阶段9-商业化版本/codex-pool-anti-linkage/openspec/specs/device-routing-token-dispatch/spec.md
+		//
+		// 🔴 This is the LAST hop of a six-hop hand-copied relay (design §4b.7:
+		// control-plane bundle → daemon wire struct → daemon cache entry → node
+		// vault column → HERE → the worker's strict branch). Everything above in
+		// this literal is copied by hand the same way, and this file exists
+		// because RouteSource drifted exactly like this twice in 2026-04. Drop
+		// this one line and the value is silently "" on every route: the worker
+		// can no longer tell a device-routing token from a seat token, so it
+		// picks an account by itself instead of serving the one bound to that
+		// device — the failure R-device-routing-token-dispatch-20 exists to
+		// prevent. 🚫 Do NOT derive it from OauthGroupID being set: every
+		// pool-backed agent VK has that too. Pinned by
+		// TestRouteBuilders_CopiesRouteKind.
+		RouteKind: mk.RouteKind,
 	}
 }
 

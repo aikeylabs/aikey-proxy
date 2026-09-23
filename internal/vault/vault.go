@@ -366,6 +366,29 @@ type ManagedKey struct {
 	// persisted assignment (local ranked pick). CLI never touches this column
 	// (fenced in its structural sync).
 	MyAssignmentOverride string
+
+	// RouteKind classifies WHICH KIND of route this row is:
+	// "device_routing_token" marks a device-routing token — the third kind of
+	// AiKey token, whose account the control plane decides per employee DEVICE
+	// and hands this worker in an internal header. Empty means an ordinary
+	// token.
+	//
+	// 🔴 Empty ALSO means "an older cluster daemon wrote this row", and the two
+	// are deliberately the same value here, because the worker must not guess:
+	// seeing the internal header on a route with no kind it answers 503
+	// (reason=route_kind_missing) instead of falling back to the seat path and
+	// picking an account of its own — the state this classifier exists to make
+	// detectable (R-device-routing-token-dispatch-20.S2).
+	// ⚠️ "the vault HAS the column" is NOT evidence that the daemon is new
+	// enough: a rolled-back daemon leaves the column in place and writes empty
+	// values into it, which is why the check is per-request on this VALUE and
+	// never on the schema (design §4b.8).
+	//
+	// Storage: managed_virtual_keys_cache.route_kind (TEXT NOT NULL DEFAULT '',
+	// added by the CLI's vault migration). Probed with hasColumn so a vault
+	// that has not run that migration reads empty rather than failing — see
+	// queryManagedKeys.
+	RouteKind string
 }
 
 // GetActiveManagedKeys reads all team keys from managed_virtual_keys_cache that
@@ -444,6 +467,20 @@ func (r *Reader) queryManagedKeys(withGroup, withChain bool) ([]ManagedKey, erro
 	if withBinding {
 		bindingCols = ", binding_id"
 	}
+	// 🔴 route_kind is probed INDEPENDENTLY too, for the identical reason as
+	// binding_id above: folding it into chainCols would make a vault that has
+	// the chain but not this column fail the chain query and fall through to the
+	// GROUP tier, collapsing every configured chain to a single hop — failover
+	// switched off during a rolling upgrade, to gain one classifier. A separate
+	// probe cannot do that: worst case the column is absent and RouteKind stays
+	// empty, which the worker already treats as "kind unknown → refuse the
+	// strict branch" (R-device-routing-token-dispatch-20.S2).
+	// Pinned by TestVault_RouteKindColumnOptional.
+	routeKindCols := ""
+	withRouteKind := hasColumn(r.db, "managed_virtual_keys_cache", "route_kind")
+	if withRouteKind {
+		routeKindCols = ", route_kind"
+	}
 	groupCols := ""
 	// Direct-bind keys require provider_key_ciphertext; group VKs have NONE
 	// (material rides group_runtime), so when reading group columns we also admit
@@ -458,7 +495,7 @@ func (r *Reader) queryManagedKeys(withGroup, withChain bool) ([]ManagedKey, erro
 		       provider_code, protocol_type, base_url,
 		       provider_key_nonce, provider_key_ciphertext, provider_base_urls,
 		       org_id, seat_id, credential_id, credential_revision,
-		       virtual_key_revision, owner_account_id` + groupCols + chainCols + bindingCols + `
+		       virtual_key_revision, owner_account_id` + groupCols + chainCols + bindingCols + routeKindCols + `
 		FROM managed_virtual_keys_cache
 		WHERE key_status = 'active'
 		  AND ` + targetFilter + `
@@ -482,6 +519,7 @@ func (r *Reader) queryManagedKeys(withGroup, withChain bool) ([]ManagedKey, erro
 		var priority *int64                                                                        // chain cols (nullable / absent)
 		var fallbackRole, routeGroupID, routeGroupName *string
 		var bindingID *string // present only once the CLI has patched the column
+		var routeKind *string // present only once the CLI has patched the column
 
 		dest := []any{&vkID, &localAlias, &provCode, &protType, &baseURL, &nonce, &ciphertext, &providerBaseURLsJSON,
 			&orgID, &seatID, &credID, &credRev, &vkRev, &ownerAccountID}
@@ -493,6 +531,9 @@ func (r *Reader) queryManagedKeys(withGroup, withChain bool) ([]ManagedKey, erro
 		}
 		if withBinding {
 			dest = append(dest, &bindingID)
+		}
+		if withRouteKind {
+			dest = append(dest, &routeKind)
 		}
 		if err := rows.Scan(dest...); err != nil {
 			slog.Warn("managed key: scan error, skipping", "error", err)
@@ -569,6 +610,9 @@ func (r *Reader) queryManagedKeys(withGroup, withChain bool) ([]ManagedKey, erro
 			GroupRuntime:         derefStr(groupRuntime),
 			RoutingConfig:        derefStr(routingConfig),
 			MyAssignmentOverride: derefStr(myAssignmentOverride),
+			// Absent column, or NULL, both read as "" — "kind unknown", which the
+			// worker refuses rather than guessing (see ManagedKey.RouteKind).
+			RouteKind: derefStr(routeKind),
 		})
 	}
 	if err := rows.Err(); err != nil {

@@ -25,6 +25,30 @@ import (
 //	workflow/CI/research/oauth-codex-test/main.go (Codex)
 //	workflow/CI/research/oauth-kimi-test/main.go (Kimi)
 func oauthInject(req *http.Request, cred *OAuthCredential, providerCode string) {
+	oauthInjectForLane(req, cred, providerCode, oauthLaneClient)
+}
+
+// oauthInjectLane tells the injector which serving lane it is on. It exists for
+// exactly ONE header — ChatGPT-Account-Id — whose disposition differs between
+// the lanes; everything else in this file is lane-independent.
+type oauthInjectLane int
+
+const (
+	// oauthLaneClient is every lane that forwards the client's own identity:
+	// personal bindings, member VKs, and account-pool requests whose Codex
+	// identity rewrite is OFF. setIfAbsent semantics throughout — unchanged
+	// since bugfix 2026-04-16.
+	oauthLaneClient oauthInjectLane = iota
+	// oauthLaneRewrittenCodexPool is a Codex ACCOUNT-POOL request whose identity
+	// rewrite already ran for the chosen account. That request no longer carries
+	// the client's identity at all, so the account header must be ours too.
+	oauthLaneRewrittenCodexPool
+)
+
+// oauthInjectForLane is oauthInject plus the lane. Keeping the lane out of
+// oauthInject's signature keeps all its existing callers — and every lane they
+// serve — byte-identical.
+func oauthInjectForLane(req *http.Request, cred *OAuthCredential, providerCode string, lane oauthInjectLane) {
 	// Remove any existing API Key header (proxy may have set it from vault)
 	req.Header.Del("x-api-key")
 	req.Header.Del("X-Api-Key")
@@ -34,6 +58,9 @@ func oauthInject(req *http.Request, cred *OAuthCredential, providerCode string) 
 		injectClaudeOAuth(req, cred)
 	case "openai":
 		injectCodexOAuth(req, cred)
+		if lane == oauthLaneRewrittenCodexPool {
+			overwriteCodexAccountID(req, cred)
+		}
 	// 2026-05-08 Kimi 双平台拆分: 'kimi' 是 deprecated alias,'kimi_code' 与
 	// 'moonshot' 都用 Kimi OAuth 协议 (kimi-cli upstream client_id);三者共用
 	// 同一注入路径。
@@ -42,6 +69,36 @@ func oauthInject(req *http.Request, cred *OAuthCredential, providerCode string) 
 	default:
 		// Generic: just set Bearer token
 		req.Header.Set("Authorization", "Bearer "+cred.AccessToken)
+	}
+}
+
+// overwriteCodexAccountID pins ChatGPT-Account-Id to the SERVING pool account.
+//
+// spec: R-codex-identity-rewrite-1 客户端原始标识不出 worker —— ChatGPT-Account-Id
+// MUST 覆盖为当前账号的上游账号 id（不再「缺省才注入」）
+// roadmap20260320/技术实现/阶段9-商业化版本/codex-pool-anti-linkage/openspec/specs/codex-identity-rewrite/spec.md
+//
+// Why this reverses the convention rather than following it: setIfAbsent exists
+// to preserve values a real CLI knows better than we do (bugfix
+// workflow/CI/bugfix/2026-04-16-oauth-inject-missing-beta-and-header-overwrite.md).
+// On the pool lane that premise is false — the CLI's value belongs to whichever
+// ChatGPT account the user logged into locally, which is NOT the pool account
+// whose token this request carries. Forwarding it hands the upstream another
+// account's id next to our bearer token: a mismatch, and a linkage signal
+// between two pool accounts on the very lane built to cut that linkage.
+// The reversal is deliberately LOCAL — every other lane keeps setIfAbsent.
+//
+// Runs AFTER injectCodexOAuth on purpose: last writer wins, so this does not
+// depend on what the shared injector's own header disposition happens to be.
+//
+// An account whose ExternalID is still empty is left exactly as today
+// (injectCodexOAuth's legacy AccountID fallback): our internal account id is
+// not an upstream account id — sending it was the 2026-07-04 bug — so there is
+// nothing to overwrite WITH. That is a short material-convergence window, not a
+// steady state.
+func overwriteCodexAccountID(req *http.Request, cred *OAuthCredential) {
+	if id := cred.ExternalID; id != "" {
+		req.Header.Set("ChatGPT-Account-Id", id)
 	}
 }
 

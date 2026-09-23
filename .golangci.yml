@@ -74,6 +74,12 @@ linters-settings:
       - hugeParam
   misspell:
     locale: US
+    # `enviroment` is not a typo here: it is the real, misspelled directory
+    # name in the workflow repo (workflow/CI/enviroment/tokenhub-gcp/…), and
+    # comments that cite those paths must match them verbatim or the link
+    # breaks. Renaming the directory is a separate, cross-repo change.
+    ignore-words:
+      - enviroment
 
 issues:
   exclude-rules:

@@ -137,19 +137,63 @@ func fetchQuotaPolicy(ctx context.Context, masterURL, orgID string, seats []stri
 }
 
 // quotaSubjectsSig computes the change-signal over a subjects slice, order-
-// stabilized (sort by SubjectID + JSON re-marshal) so it is independent of
-// whitespace/key-order quirks. Shared by the poller (fetchQuotaPolicy) and the
-// startup baseline seed (Supervisor.seedQuotaSig) so the two can NEVER drift — a
-// seed computed here must equal the poller's sig for identical subjects, else the
-// first post-boot poll would false-fire a reload. Sorts in place (matches the
-// poller's prior behavior, which returned the sorted slice for WriteSubjects).
+// stabilized (sort by SubjectID) and CANONICAL in the rules / baselines JSON
+// (object keys sorted, numbers normalised), so it depends on what the policy
+// says, not on how a writer spelled it. Shared by the poller (fetchQuotaPolicy)
+// and the startup baseline seed (Supervisor.seedQuotaSig) so the two can NEVER
+// drift — a seed computed here must equal the poller's sig for identical
+// subjects, else the first post-boot poll would false-fire a reload. Sorts in
+// place (matches the poller's prior behavior, which returned the sorted slice
+// for WriteSubjects); the subjects' raw bytes are NOT rewritten — the
+// canonical form is only what gets signed.
+//
+// WHY CANONICAL, not raw bytes (2026-09-22): quota_rules_cache has a second
+// writer. On a Cluster node the daemon's `_internal cluster_apply` full-
+// replaces it on daemon start (aikey-cli commands_internal/vault_op.rs) — and a
+// deploy restarts the daemon together with the proxy, seconds before the proxy
+// seeds. It serializes through serde_json::Value WITHOUT preserve_order, i.e.
+// with sorted keys, while the control plane sends struct order. The raw-byte
+// signature therefore never matched after a daemon start, and every staging
+// boot ran one phantom quota reload — which, with "new generation first, old
+// drained after", is two extra detectors on a 1.6 GB worker. Canonicalising
+// here is the reader-side fix; the CLI's writer is left as it is.
+// Numbers go through float64: exact for every integer below 2^53, far above any
+// limit or usage this signs; the only effect beyond that would be a missed
+// change between two limits that differ past the 16th significant digit.
+// bugfix: workflow/CI/bugfix/2026-09-21-cluster-worker-livelock-on-grading-reload-and-ingress-keeps-routing.md
+// Fenced by TestSeedQuotaSig_MatchesPollerSigWhenCLIWroteTheCache.
 func quotaSubjectsSig(subjects []quota.PolicySubject) (string, error) {
 	sort.Slice(subjects, func(i, j int) bool { return subjects[i].SubjectID < subjects[j].SubjectID })
-	sigBytes, err := json.Marshal(subjects)
+	signed := make([]quota.PolicySubject, len(subjects))
+	for i := range subjects {
+		signed[i] = subjects[i]
+		signed[i].Rules = canonicalJSON(subjects[i].Rules)
+		signed[i].Baselines = canonicalJSON(subjects[i].Baselines)
+	}
+	sigBytes, err := json.Marshal(signed)
 	if err != nil {
 		return "", err
 	}
 	return string(sigBytes), nil
+}
+
+// canonicalJSON re-encodes raw through a generic decode, so object keys come
+// out sorted (encoding/json sorts map keys) and number spellings collapse
+// ("20" / "20.0"). Empty input stays empty (keeps `omitempty` semantics), and
+// bytes that do not decode are signed as-is — no worse than before.
+func canonicalJSON(raw json.RawMessage) json.RawMessage {
+	if len(raw) == 0 {
+		return raw
+	}
+	var v any
+	if err := json.Unmarshal(raw, &v); err != nil {
+		return raw
+	}
+	out, err := json.Marshal(v)
+	if err != nil {
+		return raw
+	}
+	return out
 }
 
 // distinctSeatIDsFromKeys collects the unique, non-empty seat ids from the active

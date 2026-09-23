@@ -114,6 +114,18 @@ const (
 	EventProxyGroupRuntimeReloadFailed       = "proxy.group_runtime.reload_failed"
 	EventProxyClusterVaultAssignmentsCorrupt = "proxy.routing_override.cluster_vault_corrupt"
 	EventProxyClusterVaultAssignmentsChanged = "proxy.routing_override.cluster_vault_changed"
+	// EventProxyGroupRuntimeIdentityKeyRelayFailed: the member rail could not
+	// carry one account's per-account Codex identity-rewrite key into the node
+	// vault (undecodable base64, or the vault encrypt failed). The account keeps
+	// serving on its token and the worker falls back to a node-local key while
+	// reporting CRIT, so this WARN is the only thing that tells "control sent
+	// junk" apart from "control is older than this daemon". The key itself is
+	// never logged. See supervisor/group_runtime_policy.go attachIdentityKey.
+	// It sits apart from the three EventProxyGroupRuntime* lines above only
+	// because its name is longer: inside that block gofmt would re-indent all of
+	// them, and those lines belong to other in-flight work.
+	// spec: R-codex-identity-rewrite-4 种子 = 账号专属密钥 + 原值
+	EventProxyGroupRuntimeIdentityKeyRelayFailed = "proxy.group_runtime.identity_key_relay_failed"
 	// EventProxySyncHealthFileFailed: the statusline sync-health bypass file
 	// (~/.aikey/run/sync-health.json) could not be written/removed — the claude
 	// status bar may show a stale (or miss a fresh) sync warning.
@@ -188,6 +200,20 @@ const (
 	// not the org's policy. Before 2026-09-15 this branch logged nothing at all.
 	// spec: R-compliance-grading-14.S2
 	EventCompliancePolicyUndecodable = "proxy.compliance.policy_undecodable"
+	// EventComplianceMasterBaseline*: the supervisor re-reads the org policy it
+	// persisted last run (vault config compliance.master_policy) at boot, BEFORE
+	// the initial generation spawns, so the first poll compares against what is
+	// actually running instead of zero values (bugfix 2026-09-21 cluster worker
+	// livelock, 延续: startup phantom change). Seeded = the baseline was restored
+	// (INFO, carries the three restored values). Absent = no persisted policy —
+	// normal on Personal and on a node's first boot (INFO, not WARN: a WARN on
+	// every Personal boot would teach operators to ignore it). Unreadable = the
+	// key could not be read or decoded: the node boots with the zero baseline,
+	// i.e. exactly the pre-fix behavior (one respawn on the first poll) — WARN,
+	// because it means the next boot pays that respawn again.
+	EventComplianceMasterBaselineSeeded     = "proxy.compliance.master_baseline_seeded"
+	EventComplianceMasterBaselineAbsent     = "proxy.compliance.master_baseline_absent"
+	EventComplianceMasterBaselineUnreadable = "proxy.compliance.master_baseline_unreadable"
 	// EventComplianceGradingStale: the org compliance policy has been
 	// unrefreshable for a SUSTAINED run of polls (unusable document, non-200 or
 	// network error, gradingRejectEscalateAfter times in a row). Logged at ERROR
@@ -572,6 +598,15 @@ const (
 	// not be parsed. The data path falls back to the product default, but a WARN
 	// keeps control-plane drift visible and traceable.
 	EventProxyGroupRoutingConfigInvalid = "proxy.group.routing_config_invalid"
+	// EventProxyCodexIdentityCarrierDropped: the per-account Codex identity
+	// rewrite could not rewrite one or more identifier carriers (an unparsable
+	// x-codex-turn-metadata blob, a non-UUID id), so it REMOVED them instead of
+	// forwarding the client's own values. The request is still served — the
+	// rewrite is a side feature and must not fail the main path — so this WARN
+	// is the only trace that the upstream saw one carrier fewer. Carrier NAMES
+	// only; an identifier value must never be logged.
+	// spec: R-codex-identity-rewrite-7 改写失败不阻塞，红线不破
+	EventProxyCodexIdentityCarrierDropped = "proxy.codex_identity.carrier_dropped"
 	// EventProxyGroupAccountSwitched (N9 #8): the seat's rank-0 (primary) account
 	// was unusable (cooled / exhausted / expired / no material) so the request
 	// fell back to a different candidate — an auditable account switch.
@@ -630,6 +665,29 @@ const (
 	// hint silently disappearing (or nagging stale) is a debugging trap.
 	EventProxyGroupLoginStateWriteFailed = "proxy.group.login_state_write_failed"
 	EventProxyGroupLoginStateClearFailed = "proxy.group.login_state_clear_failed"
+	// Device-routing-token strict branch (worker side). Each of these is a
+	// refusal that spends ZERO upstream quota, so the log line is the only trace
+	// the request leaves besides the client's status code.
+	//
+	//   DecisionMissing (WARN): the internal account header was absent on a
+	//     device-routing route — an old ingress during a rolling upgrade. Counted
+	//     into /status device_routing_token.decision_missing_24h.
+	//   RouteKindMissing (ERROR): the header was present but the local route is
+	//     not a device-routing route (rolled-back cluster daemon). ERROR, not
+	//     WARN: /status reports it as a CRIT-grade signal, and the alternative
+	//     behavior — ignoring the header and picking an account locally — is the
+	//     exact linkage this feature removes.
+	//   AccountUnavailable (WARN): the bound account itself cannot serve; the
+	//     log carries the classified reason so "quota" and "not synced" stay
+	//     distinguishable in the journal, not just in the response body.
+	//   OverrideMismatch (ERROR): the picker returned an account OTHER than the
+	//     one the control plane named. Unreachable by design — it means the pick
+	//     and the classification disagree, i.e. a program defect — so it fails
+	//     the request loudly instead of serving the wrong account quietly.
+	EventProxyDeviceRoutingDecisionMissing  = "proxy.device_routing.decision_missing"
+	EventProxyDeviceRoutingRouteKindMissing = "proxy.device_routing.route_kind_missing"
+	EventProxyDeviceRoutingAccountUnavail   = "proxy.device_routing.account_unavailable"
+	EventProxyDeviceRoutingOverrideMismatch = "proxy.device_routing.override_mismatch"
 )
 
 // Usage extraction events.
@@ -685,6 +743,12 @@ const (
 	//     the org's grading policy on the console.
 	ErrCodeCompliancePolicyUndecodable = "COMPLIANCE_POLICY_UNDECODABLE"
 	ErrCodeComplianceGradingUnusable   = "COMPLIANCE_GRADING_UNUSABLE"
+	// ErrCodeComplianceMasterBaselineUnreadable: the persisted org policy
+	// (compliance.master_policy) could not be read back at boot, so the first
+	// poll re-spawns the detector once. Remedy: none needed for correctness —
+	// the first successful poll rewrites the key; if it keeps recurring, check
+	// the vault file's permissions / integrity.
+	ErrCodeComplianceMasterBaselineUnreadable = "COMPLIANCE_MASTER_BASELINE_UNREADABLE"
 	// ErrCodeComplianceGradingRefusedByDetector: the proxy could use the grading
 	// document but the RUNNING detector could not parse it (TODO-188 方案 C), so
 	// the node keeps enforcing the previous one. Remedy: upgrade the detector to
@@ -733,7 +797,40 @@ const (
 	// ErrCodeGroupPoolFull (§5.5): 429 when the seat is blocked — every pool account
 	// is at the per-account user cap, or no usable account remains. Neutral wording
 	// (does not guess the cause); the user waits or contacts the admin.
-	ErrCodeGroupPoolFull               = "GROUP_POOL_FULL"
+	ErrCodeGroupPoolFull = "GROUP_POOL_FULL"
+	// Device-routing-token strict branch (worker side). A device-routing token
+	// carries ONE account decision made by the control plane, so the worker
+	// either serves that account or says why it cannot — it never picks another
+	// one. Four distinct facts, four codes, because the operator's next action
+	// differs for each and GROUP_* would conflate them with seat routing:
+	//
+	//   ACCOUNT_EXHAUSTED (429 + Retry-After): the bound account's window is
+	//     closed (cooldown / rate limit / 5h-7d window). Recovers by itself, and
+	//     an external relay may fail over to a third-party channel on it. This is
+	//     the ONLY code that means quota.
+	//   ACCOUNT_NOT_READY (503 + Retry-After: 2, reason=material_not_ready |
+	//     credential_unusable): the account cannot serve for a reason that is NOT
+	//     quota — its material has not synced to this worker, or its credential
+	//     is dead and the control plane must rebind. Reporting these as
+	//     ACCOUNT_EXHAUSTED would send the operator to look at quota.
+	//   NO_DECISION (503 + Retry-After: 1): the request arrived WITHOUT the
+	//     internal account header (old ingress, rolling upgrade). Fail closed —
+	//     picking locally would put the device on a second account.
+	//   NODE_UNSUPPORTED (503 + Retry-After, reason=route_kind_missing): the
+	//     header is here but this worker's local route does not say it is a
+	//     device-routing route (a rolled-back cluster daemon stopped writing
+	//     route_kind). Same code the CONTROL PLANE returns when a node never
+	//     advertised the capability — one fact ("this node cannot carry this
+	//     traffic"), one code, two detectors.
+	//
+	// spec: R-device-routing-token-dispatch-7 绑定账号不可用时按原因回码，不换号
+	// spec: R-device-routing-token-dispatch-20 节点不支持 / 类别缺失 → 拒绝，不按席位路径服务
+	// roadmap20260320/技术实现/阶段9-商业化版本/codex-pool-anti-linkage/openspec/specs/device-routing-token-dispatch/spec.md
+	ErrCodeDeviceRoutingTokenAccountExhausted = "DEVICE_ROUTING_TOKEN_ACCOUNT_EXHAUSTED"
+	ErrCodeDeviceRoutingTokenAccountNotReady  = "DEVICE_ROUTING_TOKEN_ACCOUNT_NOT_READY"
+	ErrCodeDeviceRoutingTokenNoDecision       = "DEVICE_ROUTING_TOKEN_NO_DECISION"
+	ErrCodeDeviceRoutingTokenNodeUnsupported  = "DEVICE_ROUTING_TOKEN_NODE_UNSUPPORTED"
+
 	ErrCodeGroupRequestBodyTooLarge    = "GROUP_REQUEST_BODY_TOO_LARGE"
 	ErrCodeGroupRequestBodyReadFailed  = "GROUP_REQUEST_BODY_READ_FAILED"
 	ErrCodeGroupReplayCapacityExceeded = "GROUP_REPLAY_CAPACITY_EXCEEDED"

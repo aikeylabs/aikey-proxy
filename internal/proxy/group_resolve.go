@@ -22,9 +22,15 @@
 package proxy
 
 import (
+	"crypto/hmac"
+	"crypto/sha256"
 	"encoding/base64"
 	"encoding/json"
+	"io"
 	"strings"
+	"sync"
+
+	"golang.org/x/crypto/hkdf"
 
 	"github.com/AiKeyLabs/aikey-proxy/internal/vault"
 	"github.com/AiKeyLabs/aikey-proxy/internal/vkeys"
@@ -66,6 +72,16 @@ const (
 	pickSourceOverrideConfirmsHRW = "override_confirms_hrw" // engine pick coincides with local rank-0
 	pickSourceLocalHRW            = "local_hrw"             // no usable override — local floor served rank-0
 	pickSourceLocalFallback       = "local_fallback"        // ranked walk advanced past override and rank-0
+	// pickSourceDeviceLedger: the control plane's DEVICE LEDGER named the account
+	// (device-routing token, 4.5's strict branch). It is not produced by
+	// classifyPickSource above — that function only knows where the account sits
+	// in this seat's local rank, which for a pinned account is an accident of
+	// hashing and says nothing about who decided. Written once, at its source:
+	// resolveGroupCredential (this file, :247) — Ruling-24, 2026-09-22.
+	// noteSchedRouteSettled (sched_event_report.go) only READS it afterward; see
+	// that function's own comment for why rewriting it there was removed.
+	// spec: R-device-routing-token-dispatch-19.S5
+	pickSourceDeviceLedger = "device_ledger"
 )
 
 // classifyPickSource labels the served account's decision provenance from the
@@ -128,6 +144,11 @@ type groupResolution struct {
 	// (§11.7, P7). "" → node-level egress applies. Non-secret; carried so the
 	// caller can pin this account's outbound to its own exit IP.
 	EgressProxyURL string
+	// IdentityKey is the chosen account's Codex identity-rewrite key (32 raw
+	// bytes) — either the one the control plane delivered or this node's
+	// fallback derivation. Never empty on a resolved route, never logged.
+	// spec: R-codex-identity-rewrite-4
+	IdentityKey []byte
 }
 
 // resolveGroupCredential ranks the route's group candidates for route.SeatID and
@@ -144,36 +165,9 @@ type groupResolution struct {
 // yet), its OAuth token is expired, its quota window is exhausted, or its secret
 // fails to decrypt (corrupt). If every candidate is skipped → GROUP_ALL_UNUSABLE.
 func resolveGroupCredential(route *vkeys.ResolvedRoute, derivedKey []byte, nowUnix int64, skip map[string]bool, overrideAccountID string) (*groupResolution, error) {
-	var refs []vkeys.GroupAccountRef
-	if route.GroupAccounts != "" {
-		_ = json.Unmarshal([]byte(route.GroupAccounts), &refs)
-	}
-
-	// Distinguish "not pulled yet" from "pulled → nothing for this seat" (2026-06-30):
-	//   ""       → the channel-③ poll hasn't landed → NO_MATERIAL (retry DOES help).
-	//   bad JSON → treat as not-ready → NO_MATERIAL (retry).
-	//   "{}"     → the proxy DID pull and this seat's group delivered NO accounts:
-	//              the member was unbound/removed (access gate wiped it to "{}"), or
-	//              the group has no enabled accounts → NO_CANDIDATES: retrying will
-	//              NOT help, the member must contact an admin. The candidate snapshot
-	//              (group_accounts) may still be STALE with entries — the material rail
-	//              (proxy 60s) is fresher than on-demand key sync, so trust "{}" over
-	//              stale candidates here. WHY: a removed member was shown "credentials
-	//              still syncing, retry shortly" forever — the message told them to
-	//              retry when only an admin re-adding the seat can fix it.
-	if route.GroupRuntime == "" {
-		return nil, &groupResolveError{Code: groupErrNoMaterial, Reason: "group_runtime not pulled yet"}
-	}
-	var material map[string]vkeys.GroupRuntimeAccount
-	if err := json.Unmarshal([]byte(route.GroupRuntime), &material); err != nil {
-		return nil, &groupResolveError{Code: groupErrNoMaterial, Reason: "group_runtime unparseable — treat as not-ready"}
-	}
-	if len(material) == 0 {
-		return nil, &groupResolveError{Code: groupErrNoCandidates, Reason: "group_runtime delivered no accounts for this seat (unbound/removed member or empty group)"}
-	}
-	refs = vkeys.MergeLiveGroupAccountRefs(refs, material)
-	if len(refs) == 0 {
-		return nil, &groupResolveError{Code: groupErrNoCandidates, Reason: "group_runtime contained no valid candidate accounts"}
+	refs, material, err := groupCandidates(route)
+	if err != nil {
+		return nil, err
 	}
 
 	// Rank exactly as master does: Account{AccountID, Priority}, Weight unset.
@@ -239,6 +233,25 @@ func resolveGroupCredential(route *vkeys.ResolvedRoute, derivedKey []byte, nowUn
 			res := buildGroupResolution(acc, refByID[acc], mat, secret)
 			res.Primary = primary
 			res.PickSource = classifyPickSource(acc, primary, overrideAccountID)
+			// THE one place pick_source is written (Ruling-24, 2026-09-22). For a
+			// device-routing token the override is not an engine decision at all —
+			// it is the control plane's device ledger, arriving through the same
+			// parameter. classifyPickSource above can only see WHERE the account
+			// sits in this seat's hash order, which for a pinned account is an
+			// accident and names the wrong decider. Overriding here (rather than
+			// at each consumer) is what keeps the slog line, the off-rank-0 audit
+			// and the scheduling event showing the same value for one request.
+			// Reaching this point with this route kind implies the strict branch
+			// admitted the request (the other device-routing modes refuse before
+			// resolve), so no second discriminator is needed.
+			// spec: R-device-routing-token-dispatch-19.S5
+			if route.RouteKind == routeKindDeviceRoutingToken {
+				res.PickSource = pickSourceDeviceLedger
+			}
+			// spec: R-codex-identity-rewrite-4 每个被选中的账号都必须带上一把改写
+			// 密钥（下发的，或本机降级派生的）——resolve 成功后才派，因为它是「这次
+			// 请求实际用哪个账号」的属性，不是候选集的属性。
+			res.IdentityKey = resolveIdentityKey(derivedKey, acc, mat)
 			return res, nil
 		default: // PickNone
 			// R36 (2026-07-04, codex pools): expiry is member-fixable, but only the
@@ -260,6 +273,152 @@ func resolveGroupCredential(route *vkeys.ResolvedRoute, derivedKey []byte, nowUn
 // vkeys.MaterialUsable — the shared pure pick used by BOTH this hot path and the
 // supervisor's display stamp. 2026-07-01 single-source-of-truth unification.)
 
+// groupCandidates parses a group route into the candidate set + material view
+// the pick ranks over. Extracted from resolveGroupCredential (zero behavior
+// change) so the device-routing strict gate classifies the pinned account
+// against the SAME merged view the picker will see: if the gate used the raw
+// candidate snapshot instead, "is it even a candidate" could answer differently
+// in the two places and the strict branch would either refuse a servable account
+// or hand PickRoutedAccount an override it then walks past.
+//
+// Distinguish "not pulled yet" from "pulled → nothing for this seat" (2026-06-30):
+//
+//	""       → the channel-③ poll hasn't landed → NO_MATERIAL (retry DOES help).
+//	bad JSON → treat as not-ready → NO_MATERIAL (retry).
+//	"{}"     → the proxy DID pull and this seat's group delivered NO accounts:
+//	           the member was unbound/removed (access gate wiped it to "{}"), or
+//	           the group has no enabled accounts → NO_CANDIDATES: retrying will
+//	           NOT help, the member must contact an admin. The candidate snapshot
+//	           (group_accounts) may still be STALE with entries — the material rail
+//	           (proxy 60s) is fresher than on-demand key sync, so trust "{}" over
+//	           stale candidates here. WHY: a removed member was shown "credentials
+//	           still syncing, retry shortly" forever — the message told them to
+//	           retry when only an admin re-adding the seat can fix it.
+func groupCandidates(route *vkeys.ResolvedRoute) ([]vkeys.GroupAccountRef, map[string]vkeys.GroupRuntimeAccount, error) {
+	var refs []vkeys.GroupAccountRef
+	if route.GroupAccounts != "" {
+		_ = json.Unmarshal([]byte(route.GroupAccounts), &refs)
+	}
+	if route.GroupRuntime == "" {
+		return nil, nil, &groupResolveError{Code: groupErrNoMaterial, Reason: "group_runtime not pulled yet"}
+	}
+	var material map[string]vkeys.GroupRuntimeAccount
+	if err := json.Unmarshal([]byte(route.GroupRuntime), &material); err != nil {
+		return nil, nil, &groupResolveError{Code: groupErrNoMaterial, Reason: "group_runtime unparseable — treat as not-ready"}
+	}
+	if len(material) == 0 {
+		return nil, nil, &groupResolveError{Code: groupErrNoCandidates, Reason: "group_runtime delivered no accounts for this seat (unbound/removed member or empty group)"}
+	}
+	refs = vkeys.MergeLiveGroupAccountRefs(refs, material)
+	if len(refs) == 0 {
+		return nil, nil, &groupResolveError{Code: groupErrNoCandidates, Reason: "group_runtime contained no valid candidate accounts"}
+	}
+	return refs, material, nil
+}
+
+// ── device-routing token: the strict branch's decisions (pure) ──────────────
+
+// deviceRoutingMode is what the (route kind, internal header) pair means for one
+// request. Four cases, and three of them are refusals — the pair can disagree in
+// both directions during a rolling upgrade, and BOTH directions have to fail
+// loudly: the header-writing chain has already lost a hop once (the ingress
+// cache-hit path, 4.4), and a request that silently takes the seat path is
+// indistinguishable from a healthy one.
+type deviceRoutingMode int
+
+const (
+	// deviceRoutingModeOff — an ordinary seat pool route with no internal
+	// header: byte-identical to the behavior before this branch existed.
+	deviceRoutingModeOff deviceRoutingMode = iota
+	// deviceRoutingModeStrict — a device-routing route WITH a decision: serve
+	// exactly that account or refuse.
+	deviceRoutingModeStrict
+	// deviceRoutingModeNoDecision — a device-routing route WITHOUT a decision
+	// (old ingress). 503 NO_DECISION; never pick locally.
+	deviceRoutingModeNoDecision
+	// deviceRoutingModeKindMissing — a decision arrived for a route this worker
+	// does not know to be a device-routing route (rolled-back cluster daemon, or
+	// an inbound forgery on the unauthenticated cluster port).
+	// 503 NODE_UNSUPPORTED; never ignore the header and serve normally.
+	deviceRoutingModeKindMissing
+)
+
+// deviceRoutingClassifyRequest is the whole (kind, header) truth table in one
+// place, so the serving path has no nested conditionals to get subtly wrong.
+//
+// spec: R-device-routing-token-dispatch-7.S3 类别是设备路由 ∧ 头缺失 → NO_DECISION
+// spec: R-device-routing-token-dispatch-20.S2 头存在 ∧ 类别不是设备路由 → NODE_UNSUPPORTED
+// roadmap20260320/技术实现/阶段9-商业化版本/codex-pool-anti-linkage/openspec/specs/device-routing-token-dispatch/spec.md
+func deviceRoutingClassifyRequest(routeKind, pinnedAccount string) deviceRoutingMode {
+	isDeviceRoute := routeKind == routeKindDeviceRoutingToken
+	switch {
+	case isDeviceRoute && pinnedAccount != "":
+		return deviceRoutingModeStrict
+	case isDeviceRoute:
+		return deviceRoutingModeNoDecision
+	case pinnedAccount != "":
+		return deviceRoutingModeKindMissing
+	default:
+		return deviceRoutingModeOff
+	}
+}
+
+// deviceRoutingPinnedState classifies the pinned account's own state for this
+// request. Pure apart from parsing the route it is handed.
+//
+// `cooling` and `authRevoked` MUST arrive as the two SEPARATE skip sets: the
+// serving path merges them for the picker, and a merged boolean set can no
+// longer tell "the window is closed" (429, recovers by itself) from "the token
+// was rejected" (503, the control plane must rebind).
+//
+// spec: R-device-routing-token-dispatch-7.S4
+func deviceRoutingPinnedState(
+	route *vkeys.ResolvedRoute, pinnedAccount string,
+	cooling, authRevoked map[string]bool, nowUnix int64,
+) vkeys.OverrideState {
+	refs, material, err := groupCandidates(route)
+	if err != nil {
+		// No parseable material at all — from the pinned account's point of view
+		// that is exactly "my material has not arrived", which is what the
+		// not-ready 503 says. The seat path's NO_MATERIAL / NO_CANDIDATES split
+		// is about whether an ADMIN must act for a member; a device-routing token
+		// has no member to send anywhere.
+		return vkeys.OverrideMaterialNotReady
+	}
+	return vkeys.ClassifyOverride(refs, material, pinnedAccount, cooling, authRevoked, nowUnix)
+}
+
+// groupWindowResetAt returns the earliest authoritative window reset among the
+// account's exhausted windows, for the 429's retry horizon. (false) when the
+// material names no reset — master snapshots may carry a legacy exhausted value
+// with no deadline, and inventing one would promise a recovery time nothing
+// backs.
+func groupWindowResetAt(groupRuntime, accountID string) (int64, bool) {
+	if groupRuntime == "" || accountID == "" {
+		return 0, false
+	}
+	var material map[string]vkeys.GroupRuntimeAccount
+	if err := json.Unmarshal([]byte(groupRuntime), &material); err != nil {
+		return 0, false
+	}
+	mat, ok := material[accountID]
+	if !ok {
+		return 0, false
+	}
+	earliest := int64(0)
+	consider := func(status string, resetAt *int64) {
+		if !vkeys.WindowExhausted(status) || resetAt == nil || *resetAt <= 0 {
+			return
+		}
+		if earliest == 0 || *resetAt < earliest {
+			earliest = *resetAt
+		}
+	}
+	consider(mat.WindowStatus, mat.WindowResetAt)
+	consider(mat.Window7dStatus, mat.Window7dResetAt)
+	return earliest, earliest > 0
+}
+
 // decryptGroupSecret base64-decodes the nonce + ciphertext and AES-GCM decrypts
 // the secret with the vault key.
 func decryptGroupSecret(derivedKey []byte, mat vkeys.GroupRuntimeAccount) (string, error) {
@@ -276,6 +435,125 @@ func decryptGroupSecret(derivedKey []byte, mat vkeys.GroupRuntimeAccount) (strin
 		return "", err
 	}
 	return string(pt), nil
+}
+
+// ── per-account Codex identity-rewrite key (spec: R-codex-identity-rewrite-4) ──
+
+// identityKeyNodeInfoPrefix is the fallback derivation's domain separator. It is
+// deliberately DIFFERENT from the control plane's label
+// ("aikey/codex-identity/v1/"): the two derivations use different key material
+// (MASTER_KEY vs this node's vault key) and different ids (credential_id vs
+// account_id), so distinct labels keep the two families from ever colliding.
+const identityKeyNodeInfoPrefix = "aikey/codex-identity/v1/node/"
+
+// identityKeyFallback tracks accounts currently served on a locally derived key.
+//
+// `active` is a SET of account ids, not a counter: it self-heals — an account
+// drops out the moment its material arrives with a key again, so the CRIT
+// clears with no proxy restart. `total` is the lifetime count and is for
+// diagnosis only, never for alerting. Same split and the same semantics as
+// cluster.DeviceRoutingTokenStats' route_kind_missing_active / _total.
+var identityKeyFallback = struct {
+	mu     sync.Mutex
+	active map[string]struct{}
+	total  int64
+}{active: map[string]struct{}{}}
+
+// IdentityKeyHealth is the externally readable identity-key degradation signal,
+// reported under /status pool_routing (and forwarded to the hub inside the
+// cluster heartbeat's pool_routing section — one surface, all four editions).
+//
+// MissingActive > 0 means CRIT, not WARN: every request for those accounts is
+// being rewritten under a key that only THIS node can produce, so the same
+// account presents a different identity on every other node — the linkage the
+// rewrite exists to remove is partially back, and no request has failed to say
+// so. Field names are the health-signal contract's dotted names verbatim.
+type IdentityKeyHealth struct {
+	MissingActive int64 `json:"identity_key_missing_active"`
+	MissingTotal  int64 `json:"identity_key_missing_total"`
+}
+
+// IdentityKeyFallbackSnapshot reads the counters for the health surface.
+func IdentityKeyFallbackSnapshot() IdentityKeyHealth {
+	identityKeyFallback.mu.Lock()
+	defer identityKeyFallback.mu.Unlock()
+	return IdentityKeyHealth{
+		MissingActive: int64(len(identityKeyFallback.active)),
+		MissingTotal:  identityKeyFallback.total,
+	}
+}
+
+func markIdentityKeyMissing(accountID string) {
+	identityKeyFallback.mu.Lock()
+	defer identityKeyFallback.mu.Unlock()
+	identityKeyFallback.total++
+	identityKeyFallback.active[accountID] = struct{}{}
+}
+
+func clearIdentityKeyMissing(accountID string) {
+	identityKeyFallback.mu.Lock()
+	defer identityKeyFallback.mu.Unlock()
+	delete(identityKeyFallback.active, accountID)
+}
+
+// resolveIdentityKey returns the 32-byte rewrite key for one account.
+//
+// spec: R-codex-identity-rewrite-4 密钥缺失时用「本机密钥 + 账号编号」派生降级，
+// 健康信号升 CRIT，MUST NOT 原样透传
+// roadmap20260320/技术实现/阶段9-商业化版本/codex-pool-anti-linkage/openspec/specs/codex-identity-rewrite/spec.md
+//
+// It NEVER returns empty. The rewrite must always have a seed: with no key the
+// only remaining behaviors would be to pass the client's real identifiers
+// upstream (the linkage this feature removes) or to fail the request (an outage
+// caused by a side feature). Degrading to a node-local key keeps the request
+// serving AND keeps the identifiers off the wire; the cost — this node's values
+// differ from every other node's for that account — is what the CRIT reports.
+//
+// Undecryptable material is treated exactly like absent material: the account's
+// token is still good, so a corrupt key must not take the route down.
+func resolveIdentityKey(derivedKey []byte, accountID string, mat vkeys.GroupRuntimeAccount) []byte {
+	if key, ok := decryptIdentityKey(derivedKey, mat); ok {
+		clearIdentityKeyMissing(accountID)
+		return key
+	}
+	markIdentityKeyMissing(accountID)
+	return deriveNodeIdentityKey(derivedKey, accountID)
+}
+
+func decryptIdentityKey(derivedKey []byte, mat vkeys.GroupRuntimeAccount) ([]byte, bool) {
+	if mat.IdentityKeyNonce == "" || mat.IdentityKeyCiphertext == "" {
+		return nil, false
+	}
+	nonce, err := base64.StdEncoding.DecodeString(mat.IdentityKeyNonce)
+	if err != nil {
+		return nil, false
+	}
+	ct, err := base64.StdEncoding.DecodeString(mat.IdentityKeyCiphertext)
+	if err != nil {
+		return nil, false
+	}
+	pt, err := vault.Decrypt(derivedKey, nonce, ct)
+	if err != nil || len(pt) == 0 {
+		return nil, false
+	}
+	return pt, true
+}
+
+// deriveNodeIdentityKey is the fallback: HKDF-SHA256 over THIS node's vault key
+// with the account id in the info label. Per-account (so two accounts on one
+// node never share a value) and per-node (so it is not reproducible elsewhere,
+// which is exactly why it is only a fallback). Same construction as the control
+// plane's, different keying material — no second crypto scheme to review.
+func deriveNodeIdentityKey(derivedKey []byte, accountID string) []byte {
+	out := make([]byte, 32)
+	if _, err := io.ReadFull(hkdf.New(sha256.New, derivedKey, nil, []byte(identityKeyNodeInfoPrefix+accountID)), out); err != nil {
+		// Unreachable with a healthy hash; a short read would be a weak key, so
+		// fall back to the HMAC of the same label rather than returning zeros.
+		mac := hmac.New(sha256.New, derivedKey)
+		mac.Write([]byte(identityKeyNodeInfoPrefix + accountID))
+		return mac.Sum(nil)
+	}
+	return out
 }
 
 // buildGroupResolution assembles the injectable credential for the chosen account.

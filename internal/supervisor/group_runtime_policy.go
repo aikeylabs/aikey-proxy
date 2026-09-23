@@ -246,6 +246,13 @@ type grAccount struct {
 	// (personal/team-member) proxy pins the account's outbound to its own exit IP,
 	// same as a cluster worker gets via the org rail. "" → node-level egress chain.
 	EgressProxyURL string `json:"egress_proxy_url"`
+	// IdentityKey is this ACCOUNT's Codex identity-rewrite key as master sends
+	// it: base64(std) of 32 bytes derived from MASTER_KEY + credential_id
+	// (spec: R-codex-identity-rewrite-4). Plaintext over TLS, like AccessToken
+	// above — buildGroupRuntimeMap re-encrypts it with the vault key before it
+	// touches disk. Empty from an older master ⇒ the resolver's node-local
+	// fallback runs and reports CRIT.
+	IdentityKey string `json:"identity_key"`
 	// Key and Revision are API-key-only. BaseURL is shared routing metadata:
 	// resident Mock OAuth needs its deployment URL while official OAuth may
 	// leave it empty and use the profile default.
@@ -446,13 +453,19 @@ func buildGroupRuntimeMap(derivedKey []byte, accounts []grAccount) map[string]vk
 		// needs_login marker carries NO secret — store it as-is so the resolver can
 		// return LOGIN_REQUIRED for it (P1), distinct from an absent account.
 		if a.NeedsLogin {
-			out[a.AccountID] = vkeys.GroupRuntimeAccount{
+			pending := vkeys.GroupRuntimeAccount{
 				CredentialType: a.CredentialType, CredentialID: a.CredentialID, NeedsLogin: true,
 				Identity: a.Identity, ProviderCode: a.ProviderCode, ProtocolType: a.ProtocolType,
 				BaseURL: a.BaseURL, Priority: a.Priority, ExternalID: a.ExternalID,
 				EgressProxyURL: a.EgressProxyURL,
 				Util5h:         a.Util5h, Util7d: a.Util7d, UtilObservedAt: a.UtilObservedAt,
 			}
+			// The identity key is ACCOUNT-level, so it is pinned even before this
+			// member logs in — same reasoning as EgressProxyURL above (bugfix
+			// 2026-07-17: an account attribute gated behind the login check
+			// silently delivered "").
+			attachIdentityKey(derivedKey, &pending, a.IdentityKey)
+			out[a.AccountID] = pending
 			continue
 		}
 		secret := a.AccessToken
@@ -490,9 +503,52 @@ func buildGroupRuntimeMap(derivedKey []byte, accounts []grAccount) map[string]vk
 			gra.ExternalID = a.ExternalID
 			gra.EgressProxyURL = a.EgressProxyURL // per-account egress (§11.7, P7) — member rail
 		}
+		attachIdentityKey(derivedKey, &gra, a.IdentityKey)
 		out[a.AccountID] = gra
 	}
 	return out
+}
+
+// attachIdentityKey is the member rail's hop for the per-account Codex
+// identity-rewrite key: decode what master delivered and re-encrypt it with the
+// vault key into the SAME at-rest shape the token uses.
+//
+// spec: R-codex-identity-rewrite-4 控制面按账号派生专属密钥、随账号材料加密下发
+// roadmap20260320/技术实现/阶段9-商业化版本/codex-pool-anti-linkage/openspec/specs/codex-identity-rewrite/spec.md
+//
+// Why a named helper rather than two inline copies: this relay has two writers
+// (here and the cluster daemon) and two call sites in THIS function alone
+// (needs_login and the normal path). The concept gets one exit so a fence can
+// assert "the material carries it" instead of "these particular lines exist"
+// — the hand-copied-relay family has dropped a field four times.
+//
+// A malformed delivery is DOWNGRADED, never fatal: the account still has a
+// usable token, and the resolver's node-local fallback keeps serving while the
+// health surface reports CRIT. Silence is not an option though — an empty field
+// here is indistinguishable from an old master, so it gets a WARN (logging
+// conventions: no silent fallback). The key itself is never logged.
+func attachIdentityKey(derivedKey []byte, mat *vkeys.GroupRuntimeAccount, deliveredB64 string) {
+	if mat == nil || deliveredB64 == "" {
+		return // old master / non-Codex pool: field absent, degradation path runs
+	}
+	raw, err := base64.StdEncoding.DecodeString(deliveredB64)
+	if err != nil || len(raw) == 0 {
+		slog.Warn("delivered per-account identity key is not usable base64; storing none (worker will fall back to a node-local key and report CRIT)",
+			"event.name", observability.EventProxyGroupRuntimeIdentityKeyRelayFailed,
+			"credential_id", mat.CredentialID,
+			"delivered_bytes", len(deliveredB64))
+		return
+	}
+	nonce, ct, err := vault.Encrypt(derivedKey, raw)
+	if err != nil {
+		slog.Warn("could not encrypt the per-account identity key for the node vault; storing none (worker will fall back to a node-local key and report CRIT)",
+			"event.name", observability.EventProxyGroupRuntimeIdentityKeyRelayFailed,
+			"credential_id", mat.CredentialID,
+			"error", err.Error())
+		return
+	}
+	mat.IdentityKeyNonce = base64.StdEncoding.EncodeToString(nonce)
+	mat.IdentityKeyCiphertext = base64.StdEncoding.EncodeToString(ct)
 }
 
 // marshalGroupRuntime renders the material map, stamping IsCurrentRouted=true on the

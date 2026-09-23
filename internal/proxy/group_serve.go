@@ -142,6 +142,18 @@ func (p *Proxy) handleOauthGroupRoute(
 	reqModel := extractModelLazy(replay.Bytes())
 
 	override := p.routingOverrides.lookup(route.SeatID, route.OauthGroupID)
+	// pinnedAccount is the control plane's account decision for a device-routing
+	// token, carried in the internal header by the cluster ingress. Read once per
+	// request; the ingress deletes this header for every other namespace, so its
+	// presence on an ordinary seat route is itself a fault (see the strict branch
+	// below).
+	pinnedAccount := r.Header.Get(headerRouteAccount)
+	strict := false
+	// maxSwitches caps how many ALTERNATE accounts this request may try. The seat
+	// path keeps its budget; a device-routing token gets ZERO — the whole point of
+	// the token is that this device stays on ONE account, so "retry elsewhere" is
+	// not a resilience feature here, it is the failure mode.
+	maxSwitches := groupFailoverMaxSwitches
 	for {
 		// baseSkip is durable routing state (whole-account/model-tier cooldown plus
 		// exact-token hard-revoke tombstones). A hard-revoked token is compared with
@@ -152,6 +164,49 @@ func (p *Proxy) handleOauthGroupRoute(
 		// one reached only because of a transient request-local 5xx is not.
 		timedSkip := p.poolCooldown.skipSetFor(reqModel)
 		authSkip := p.poolCooldown.authFailureSkipSet(route.OauthGroupID, route.SeatID, route.GroupRuntime, p.groupKey.DerivedKey())
+		nowUnix := time.Now().Unix()
+
+		// ── device-routing token: the STRICT branch ────────────────────────────
+		//
+		// Here, and not before the body read, because the account-state
+		// classification needs the two skip sets above — and it needs them
+		// SEPARATELY (cooling vs hard-revoked), which is why it runs before the
+		// merge two lines down: the merged set is a bare bool map that can no
+		// longer tell a closed window from a rejected token, and those two are a
+		// 429 and a 503.
+		//
+		// spec: R-device-routing-token-dispatch-7 用头指定的账号服务，或按原因拒绝；
+		// 绝不换号、绝不在节点内自选
+		// spec: R-device-routing-token-dispatch-20.S2 类别缺失 → 拒绝，不按席位路径服务
+		// roadmap20260320/技术实现/阶段9-商业化版本/codex-pool-anti-linkage/openspec/specs/device-routing-token-dispatch/spec.md
+		switch deviceRoutingClassifyRequest(route.RouteKind, pinnedAccount) {
+		case deviceRoutingModeNoDecision:
+			p.refuseDeviceRoutingNoDecision(w, logger, route)
+			return
+		case deviceRoutingModeKindMissing:
+			p.refuseDeviceRoutingRouteKindMissing(w, logger, route)
+			return
+		case deviceRoutingModeStrict:
+			// Necessary path #1 for clearing route_kind_missing_active. Reaching
+			// this case is itself the proof that the route now carries the kind, so
+			// the clear belongs BEFORE the account check: a token whose route was
+			// repaired while its account happens to be cooling must not keep a
+			// route_kind CRIT lit — that would point the operator at a daemon
+			// version when the real fact is a quota window.
+			clearDeviceRoutingRouteKindMissing(route.VirtualKeyID)
+			if state := deviceRoutingPinnedState(route, pinnedAccount, timedSkip, authSkip, nowUnix); state != vkeys.OverrideUsable {
+				p.refuseDeviceRoutingAccount(w, logger, route, pinnedAccount, state)
+				return
+			}
+			// The decision is the ONLY candidate: hand it to the UNCHANGED shared
+			// picker as the override and assert below that it came back.
+			override = pinnedAccount
+			strict = true
+			maxSwitches = 0
+		case deviceRoutingModeOff:
+			// Ordinary seat pool routing — unchanged.
+		}
+
 		baseSkip := mergeAccountSkipSets(timedSkip, authSkip)
 		skip := baseSkip
 		if len(failed) > 0 {
@@ -164,7 +219,6 @@ func (p *Proxy) handleOauthGroupRoute(
 			}
 			skip = merged
 		}
-		nowUnix := time.Now().Unix()
 		res, err := resolveGroupCredential(route, p.groupKey.DerivedKey(), nowUnix, skip, override)
 		if err != nil {
 			ge, isGE := err.(*groupResolveError)
@@ -258,8 +312,18 @@ func (p *Proxy) handleOauthGroupRoute(
 			p.degradeGroup(w, logger, route, code, groupDegradeMessage(code))
 			return
 		}
+		// Per-request self-check (spec: R-device-routing-token-dispatch-11.S1): the
+		// pick MUST be the account the control plane named. The classifier said it
+		// was usable and PickRoutedAccount honors a usable override, so a
+		// mismatch is a defect in this worker — not a routing decision — and the
+		// only two options are "serve a different account silently" (breaking the
+		// one guarantee this token type makes) or "fail loudly". Fail loudly.
+		if strict && res.AccountID != pinnedAccount {
+			p.refuseDeviceRoutingOverrideMismatch(w, logger, route, pinnedAccount, res.AccountID)
+			return
+		}
 		result := p.serveGroupAttempt(w, baseReq, replay, route, res, inboundBearer, startTime, logger, traceID,
-			upstreamAttempts, failed, failedPaths, &lastCaptured)
+			upstreamAttempts, maxSwitches, failed, failedPaths, &lastCaptured)
 		if result.attempted {
 			upstreamAttempts++
 		}
@@ -272,6 +336,23 @@ func (p *Proxy) handleOauthGroupRoute(
 			lastAuthFailedAccount = ""
 		}
 		if result.done {
+			return
+		}
+		if strict {
+			// A device-routing token never advances to another account, so the loop
+			// must not turn round. With maxSwitches = 0 an attempt that reached the
+			// upstream already produced the final answer (result.done), so the only
+			// way here is a PRE-DIAL refusal by the provider-path breaker: answer
+			// with that, rather than resolving again — which, with the pinned
+			// account now in `failed`, would walk to a sibling.
+			//
+			// spec: R-device-routing-token-dispatch-7.S1（不重试其他账号）
+			if result.blockedPath != nil {
+				p.respondProviderPathUnavailable(w, logger, route, *result.blockedPath)
+			} else {
+				p.degradeGroup(w, logger, route, observability.ErrCodeGroupUpstreamUnavailable,
+					groupDegradeMessage(observability.ErrCodeGroupUpstreamUnavailable))
+			}
 			return
 		}
 	}
@@ -288,11 +369,17 @@ type groupAttemptResult struct {
 // upstream, completed the client response, or was blocked by path health. A
 // captured upstream failure adds the account/path to the request-local skip set
 // so the caller can resolve the next useful candidate.
+//
+// maxSwitches is the caller's budget for ALTERNATE accounts on this request
+// (groupFailoverMaxSwitches on the seat path, 0 for a device-routing token).
+// Passing it in rather than reading the constant here is what makes "this
+// request may not switch accounts" a property of the request instead of a
+// second copy of the final-answer logic at the call site.
 func (p *Proxy) serveGroupAttempt(
 	w http.ResponseWriter, baseReq *http.Request, replay *groupReplayBody,
 	route *vkeys.ResolvedRoute, res *groupResolution, inboundBearer string,
 	startTime time.Time, logger *slog.Logger, traceID string,
-	attempt int, failed map[string]bool, failedPaths map[string]bool, lastCaptured **groupFailoverWriter,
+	attempt, maxSwitches int, failed map[string]bool, failedPaths map[string]bool, lastCaptured **groupFailoverWriter,
 ) groupAttemptResult {
 	// fresh clone per attempt: pristine headers + replayed body + inherited
 	// context stashes (route/model extraction ride the context, not the body).
@@ -346,6 +433,10 @@ func (p *Proxy) serveGroupAttempt(
 	// exit IP. serveRoute reads rc.EgressProxyURL to select a per-account egress
 	// transport (single-hop, or 2-hop chained through the node socks5 front proxy).
 	rc.EgressProxyURL = res.EgressProxyURL
+	// spec: R-codex-identity-rewrite-4 账号专属改写密钥跟着「这次用哪个账号」走。
+	// Per-request copy only — raw key material, never logged and never allowed
+	// onto an upstream request or a response header.
+	rc.IdentityKey = res.IdentityKey
 
 	// A group VK is bound to a oauth_group, NOT a single provider, so the VK-level
 	// ProviderCode is EMPTY — the provider lives per-account in group_accounts.
@@ -452,7 +543,24 @@ func (p *Proxy) serveGroupAttempt(
 			return groupAttemptResult{done: true}
 		}
 		rc.BaseURL, r = p.resolveOAuthUpstream(canonicalCode, protocolType, resolvedBase, r, logger)
-		oauthInject(r, res.OAuth, oauthCode)
+		// spec: R-codex-identity-rewrite-1 客户端原始标识不出 worker
+		// spec: R-codex-identity-rewrite-6 只对 Codex 号池生效（其他通道逐字节不变）
+		// spec: R-codex-identity-rewrite-7 改写失败不阻塞，红线不破
+		// roadmap20260320/技术实现/阶段9-商业化版本/codex-pool-anti-linkage/openspec/specs/codex-identity-rewrite/spec.md
+		//
+		// HERE, and not earlier or later: the account is chosen (so rc.IdentityKey
+		// is this account's key) and the credential is not injected yet. Running
+		// after resolveOAuthUpstream also means the shape normalizer has already
+		// had its say, so this is the last step to touch the outbound bytes.
+		// All gating lives inside — Codex persona + the per-pool switch — so every
+		// other lane reaches oauthInjectForLane with untouched bytes.
+		lane := oauthLaneClient
+		if applyCodexIdentityRewrite(r, oauthCode, &rc, res.AccountID, logger) {
+			// The rewrite ran ⇒ this request no longer carries the client's
+			// identity, so ChatGPT-Account-Id must be the serving account's too.
+			lane = oauthLaneRewrittenCodexPool
+		}
+		oauthInjectForLane(r, res.OAuth, oauthCode, lane)
 		// Stash the window cap so ModifyResponse can pre-cut this account when the
 		// upstream's unified-utilization crosses it (N10 防封).
 		if res.WindowMaxUtilPct != nil || res.Window7dMaxUtilPct != nil {
@@ -511,7 +619,12 @@ func (p *Proxy) serveGroupAttempt(
 	// (方案 20260819 P0-2 S4): engine_override = the engine deliberately
 	// redirected; local_fallback = rank-0 (and any override) was unusable
 	// (cooled / exhausted / expired / no material) and the ranked walk advanced.
-	if res.Primary != "" && res.Primary != res.AccountID {
+	// A device-routing token is excluded by the SAME field, not by a second
+	// condition: "off rank-0" is an anomaly only where local ranking was
+	// supposed to decide. Here the control plane's device ledger decided, so the
+	// pick sits wherever the hash put it — on every request. Logging it would
+	// bury the seat path's real ones (Ruling-24, 2026-09-22).
+	if res.Primary != "" && res.Primary != res.AccountID && res.PickSource != pickSourceDeviceLedger {
 		logger.Info("oauth-group account switched off rank-0",
 			"event.name", observability.EventProxyGroupAccountSwitched,
 			"oauth_group_id", rc.OauthGroupID,
@@ -541,7 +654,7 @@ func (p *Proxy) serveGroupAttempt(
 	// Unified scheduling log (master): one row per ROUTE CHANGE — first settle
 	// or switch — never per request (拍板 2026-08-17 #3).
 	p.noteSchedRouteSettled(rc.OauthGroupID, route.SeatID, res.AccountID, res.CredentialID,
-		observability.ExtractOrCreate(r).TraceID, res.PickSource)
+		observability.ExtractOrCreate(r).TraceID, res.PickSource, route.RouteKind)
 
 	// Group VKs leave rc.ProviderCode empty by design (the provider is per-account
 	// in group_accounts; the base URL above already used the resolved canonicalCode,
@@ -605,7 +718,7 @@ func (p *Proxy) serveGroupAttempt(
 			p.poolCooldown.markWithState(res.AccountID, until, cooldownRouteState(resp, now, until))
 		}
 	}
-	if attempt >= groupFailoverMaxSwitches {
+	if attempt >= maxSwitches {
 		if hardRevoked {
 			p.respondLoginRequired(w, logger, route, res.AccountID)
 		} else {

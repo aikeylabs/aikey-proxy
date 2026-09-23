@@ -204,7 +204,16 @@ func (c ChatCompletionsBridgeConfig) Validate() error {
 // unless Enabled is true, so existing single-node configs are unaffected.
 type ClusterConfig struct {
 	// HubURL is the aikey-hub name-service base, e.g. http://hub:27400.
+	// Legacy single-hub spelling; still valid and equal to a one-element HubURLs.
 	HubURL string `yaml:"hub_url,omitempty"`
+	// HubURLs lists EVERY aikey-hub this node registers with and heartbeats to.
+	// Each hub keeps its own in-memory node table, so a node that talks to only
+	// one of several hubs leaves the others with an empty table — the request
+	// path behind those hubs then finds no node. When set it is the whole list
+	// (HubURL is not merged in); read the effective set via AllHubURLs().
+	// Why: multi-hub fan-out registration so every hub's node table is identical
+	// (update: roadmap20260320/技术实现/update/20260922-集群入口高可用-hub多实例与两台入口机.md, DEC-cluster-ingress-ha-2).
+	HubURLs []string `yaml:"hub_urls,omitempty"`
 	// NodeID uniquely identifies this proxy node in the cluster.
 	NodeID string `yaml:"node_id,omitempty"`
 	// NodeAddr is the address clients connect to for this node (host:port),
@@ -245,6 +254,35 @@ type ClusterConfig struct {
 	// Weight scales this node's share of the consistent-hash ring (≥1).
 	Weight  int  `yaml:"weight,omitempty"`
 	Enabled bool `yaml:"enabled"`
+}
+
+// AllHubURLs returns the effective hub set: hub_urls when it is non-empty, else
+// the legacy hub_url as a one-element list. Entries are trimmed, stripped of a
+// trailing slash and de-duplicated (first occurrence wins, order kept); blank
+// entries are dropped. Empty means "no hub configured" — validate() rejects that
+// in cluster mode. This is the ONLY place precedence and normalization live;
+// callers must not read HubURL / HubURLs directly for dialing.
+// Why: multi-hub fan-out registration so every hub's node table is identical
+// (update: roadmap20260320/技术实现/update/20260922-集群入口高可用-hub多实例与两台入口机.md, DEC-cluster-ingress-ha-2).
+func (c ClusterConfig) AllHubURLs() []string {
+	candidates := c.HubURLs
+	if len(candidates) == 0 {
+		candidates = []string{c.HubURL}
+	}
+	seen := make(map[string]struct{}, len(candidates))
+	out := make([]string, 0, len(candidates))
+	for _, raw := range candidates {
+		u := strings.TrimRight(strings.TrimSpace(raw), "/")
+		if u == "" {
+			continue
+		}
+		if _, dup := seen[u]; dup {
+			continue
+		}
+		seen[u] = struct{}{}
+		out = append(out, u)
+	}
+	return out
 }
 
 type ListenConfig struct {
@@ -590,9 +628,11 @@ func (c *Config) validate() error {
 
 	// Cluster fields are required only when cluster mode is on (inert otherwise,
 	// so single-node configs never trip this).
+	// At least one hub must be configured, in either spelling (hub_urls list or
+	// legacy hub_url) — see ClusterConfig.AllHubURLs for precedence.
 	if c.Cluster.Enabled {
-		if c.Cluster.HubURL == "" || c.Cluster.NodeID == "" || c.Cluster.NodeAddr == "" {
-			return fmt.Errorf("cluster.enabled requires cluster.hub_url, cluster.node_id, and cluster.node_addr")
+		if len(c.Cluster.AllHubURLs()) == 0 || c.Cluster.NodeID == "" || c.Cluster.NodeAddr == "" {
+			return fmt.Errorf("cluster.enabled requires at least one hub (cluster.hub_urls or cluster.hub_url), cluster.node_id, and cluster.node_addr")
 		}
 	}
 

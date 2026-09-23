@@ -62,6 +62,21 @@ type GroupRuntimeAccount struct {
 	CredentialID     string `json:"credential_id,omitempty"`
 	SecretNonce      string `json:"secret_nonce"`      // base64(nonce)
 	SecretCiphertext string `json:"secret_ciphertext"` // base64(enc(access_token|key))
+	// IdentityKeyNonce / IdentityKeyCiphertext hold this ACCOUNT's Codex
+	// identity-rewrite key, encrypted with the SAME vault derivedKey and the
+	// same AES-GCM helper as the secret above (spec:
+	// R-codex-identity-rewrite-4). The control plane derives the key from
+	// MASTER_KEY + credential_id and ships it plaintext-over-TLS; the writer
+	// that lands the material here re-encrypts it before disk. Two writers, one
+	// format: supervisor.buildGroupRuntimeMap (member rail) and the cluster
+	// daemon's aikey-cli build_group_runtime_material (org rail).
+	//
+	// omitempty: an older control plane sends no key, so the material stays
+	// byte-identical to before these fields existed, and the resolver's
+	// documented degradation (a node-local derivation plus a CRIT counter) is
+	// what runs. Never delivered as empty-but-present.
+	IdentityKeyNonce      string `json:"identity_key_nonce,omitempty"`      // base64(nonce)
+	IdentityKeyCiphertext string `json:"identity_key_ciphertext,omitempty"` // base64(enc(32-byte key))
 	// Display meta (non-secret, 2026-07-01): identity/provider_code/priority carried on
 	// the fast rail so the client's candidate LIST membership refreshes here (a fast-rail-
 	// only account renders with its email/provider, not a bare UUID) — the CLI's

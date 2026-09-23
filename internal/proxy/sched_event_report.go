@@ -83,11 +83,40 @@ func (p *Proxy) reportSchedEvent(eventName, severity, origin, errorCode, groupID
 // pick_source (who decided: engine override vs local HRW floor) so the change
 // gate is effectively the (account, pick_source) pair — a floor→engine handover
 // on an unchanged account still leaves a trace.
-func (p *Proxy) noteSchedRouteSettled(groupID, seatID, accountID, credentialID, traceID, pickSource string) {
+//
+// routeKind splits the key into two shapes; see the block comment inside.
+func (p *Proxy) noteSchedRouteSettled(groupID, seatID, accountID, credentialID, traceID, pickSource, routeKind string) {
 	if p.signalReporter == nil || groupID == "" || accountID == "" {
 		return
 	}
 	key := groupID + "|" + seatID
+	// A device-routing token is ONE token — therefore ONE seat — shared by many
+	// devices, and the control plane pins each device to its OWN pool account
+	// (4.5's strict branch serves that account or refuses; it never picks
+	// locally). Under the seat-shaped key two devices alternating are
+	// indistinguishable from one seat flapping between accounts: a 100-request
+	// alternation emitted 99 account_switched WARNs, all false — and that WARN
+	// is what an operator reads to find REAL pool instability, so the fakes bury
+	// the real one. Giving this route kind a lane per account removes the
+	// ambiguity at its source instead of filtering rows downstream.
+	//
+	// Scoped to the route KIND, not to "the internal header was present": the
+	// header is the decision's carrier, the kind is the route's identity — the
+	// same discriminator deviceRoutingClassifyRequest already uses. The seat
+	// path keeps group|seat verbatim, where a changed account IS a switch
+	// (拍板 2026-08-17 #3).
+	//
+	// Lanes are bounded by the pool's ACCOUNTS, not by devices: every device
+	// pinned to account X shares the lane group|seat|X.
+	//
+	// spec: R-device-routing-token-dispatch-19.S5 worker 不因设备交替误报切号
+	// roadmap20260320/技术实现/阶段9-商业化版本/codex-pool-anti-linkage/openspec/specs/device-routing-token-dispatch/spec.md
+	// pickSource is READ, never rewritten here: it is written once at its source
+	// (resolveGroupCredential), so this row, the slog line and the off-rank-0
+	// audit cannot disagree about who decided (Ruling-24, 2026-09-22).
+	if routeKind == routeKindDeviceRoutingToken {
+		key += "|" + accountID
+	}
 	day := schedDay()
 	recovered := p.poolCooldown != nil && p.poolCooldown.consumeLapsed(accountID)
 	prevAny, hadPrev := p.schedRouted.Load(key)
