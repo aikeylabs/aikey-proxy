@@ -1061,6 +1061,8 @@ func cooldownDecisionWithTemporaryFallback(resp *http.Response, now time.Time, t
 		// treating every Codex reset header as that class bypassed the established
 		// safety cap and broke TestCooldownDecision_CodexRateLimit.
 		// Ref: workflow/CI/bugfix/2026-08-27-oauth-pool-quota-state-convergence.md.
+		// spec: R-oauth-account-pool-4 carries this Codex exception in its text
+		// since 2026-09-24 — a full Codex window still cools for at most one hour.
 		if !authoritativeWindowReset && d > poolCooldownMax {
 			d = poolCooldownMax
 		}
@@ -1239,9 +1241,22 @@ func anthropicExhaustedWindowResetDuration(h http.Header, now time.Time) time.Du
 // headers (ChatGPT backend; wire format verified live 2026-07-06, see
 // research/oauth-codex-ratelimit/). We cool for the LONGEST reset among the
 // EXHAUSTED (used_percent ≥ 100) windows, so we never un-cool the account into a
-// window that is still full and immediately re-429. Returns 0 when no codex reset
-// header is present (caller falls back to Retry-After / default). Anthropic
-// responses carry no x-codex-* headers, so this is a no-op on the claude path.
+// window that is still full and immediately re-429. Returns 0 when no window is
+// exhausted or no codex reset header is present (caller falls back to
+// Retry-After / the pool's temporary cooldown). Anthropic responses carry no
+// x-codex-* headers, so this is a no-op on the claude path.
+//
+// Why a 429 with NO exhausted window returns 0 (2026-09-24): that is a temporary
+// limit, and R-oauth-account-pool-4 gives it Retry-After or the pool's short
+// fallback — never a window reset. Both windows' resets ride on every codex
+// response, so the old "cool for the longer visible reset" branch turned any
+// throttle into ~1h (the weekly reset, capped), overrode Retry-After and the
+// pool setting, and on a device routing token (one account, no in-request
+// switch) meant an hour of 429s. Same over-cool the 2026-08-04 fix removed on
+// the anthropic path.
+// spec: R-oauth-account-pool-4 a 429 must tell window exhaustion from a temporary limit
+// (R4 in workflow/CI/requirements/2026-06-23-oauth-account-pool.md)
+// bugfix: workflow/CI/bugfix/2026-09-24-codex-sub100-429-overcool.md
 //
 // Why compare reset DURATIONS, not the primary/secondary NAME: the primary/
 // secondary label is NOT tied to a fixed 5h/7d window — a Plus account's primary
@@ -1264,14 +1279,6 @@ func codexRateLimitReset(h http.Header) time.Duration {
 	}
 	if secondaryUsed >= 100 && secondaryReset > best {
 		best = secondaryReset
-	}
-	if best == 0 {
-		// 429 with neither window flagged exhausted → cool for the longer reset we
-		// can see (both windows' resets ride on the response regardless).
-		best = primaryReset
-		if secondaryReset > best {
-			best = secondaryReset
-		}
 	}
 	if best > 0 {
 		return time.Duration(best) * time.Second

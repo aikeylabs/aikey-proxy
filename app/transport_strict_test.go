@@ -186,15 +186,28 @@ func TestBuildTransportStrict_EmptySpecIsDirectNotAnError(t *testing.T) {
 func TestBuildTransportStrict_InvalidURLNamesTheInput(t *testing.T) {
 	// A single-URL spec that won't parse must say WHICH value was rejected —
 	// "invalid url" alone sends the user hunting.
-	_, closer, err := buildTransportStrict("http://[::1", nil)
-	if closer != nil {
-		defer closer.Close()
-	}
-	if err == nil {
-		t.Fatal("an unparseable upstream URL must be an error under strict")
-	}
-	if !strings.Contains(err.Error(), "[::1") {
-		t.Errorf("error should quote the offending input so the user can see it; got %q", err)
+	//
+	// Tightened 2026-09-24 (TODO-17 甲, DEC-master-central-login-15): it quotes
+	// the input WITHOUT the proxy credentials. It used to quote the input
+	// verbatim, so a password typed into an address that did not parse was shown
+	// back and logged.
+	for _, spec := range []string{
+		"http://[::1",
+		"http://u-MARK7:p-MARK7@[::1",
+	} {
+		_, closer, err := buildTransportStrict(spec, nil)
+		if closer != nil {
+			defer closer.Close()
+		}
+		if err == nil {
+			t.Fatalf("an unparseable upstream URL must be an error under strict: %q", spec)
+		}
+		if !strings.Contains(err.Error(), "[::1") {
+			t.Errorf("error should quote the offending input so the user can see it; got %q", err)
+		}
+		if strings.Contains(err.Error(), "u-MARK7") || strings.Contains(err.Error(), "p-MARK7") {
+			t.Errorf("error must quote the input without its credentials; got %q", err)
+		}
 	}
 }
 

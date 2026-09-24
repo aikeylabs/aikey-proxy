@@ -744,10 +744,7 @@ func Run() {
 	// duplicate probeEgress must NOT come back). Stateless: one-shot, no health
 	// loop. Neutral echo — never claude.ai (§5.4 #2).
 	adminHandler.EgressSelfCheckFn = func(ctx context.Context, dial bool) []admin.EgressCheckResult {
-		return runEgressSelfCheck(ctx, sup.Registry().EgressSpecs(), dial,
-			func(ctx context.Context, spec string) (*egress.TestResult, error) {
-				return egress.TestDial(ctx, spec, egressSelfCheckEcho(), egressSelfCheckDialTimeout)
-			})
+		return runEgressSelfCheck(ctx, sup.Registry().EgressSpecs(), dial, egressSelfCheckProbe)
 	}
 
 	// Build the outbound transport for upstream providers. Always non-nil now:
@@ -1178,6 +1175,14 @@ func egressSelfCheckEcho() string {
 	return egress.DefaultEchoURL()
 }
 
+// egressSelfCheckProbe is the probe EgressSelfCheckFn hands runEgressSelfCheck:
+// one egress.TestDial through the account's egress to the neutral echo, bounded
+// by the per-account timeout. A named function rather than a closure inside Run
+// so a test runs the exact probe production runs.
+func egressSelfCheckProbe(ctx context.Context, spec string) (*egress.TestResult, error) {
+	return egress.TestDial(ctx, spec, egressSelfCheckEcho(), egressSelfCheckDialTimeout)
+}
+
 // buildTransport builds the egress transport for the LIVE request path. When the
 // spec cannot be honored it installs a REFUSING transport — external requests
 // fail with *proxy.NodeEgressUnavailableError; they are not dialed direct.
@@ -1293,7 +1298,18 @@ func buildTransportStrict(proxyURL string, sysProxy func(*http.Request) (*url.UR
 
 	parsed, err := url.Parse(spec)
 	if err != nil {
-		return nil, nil, fmt.Errorf("invalid upstream proxy URL %q: %w", proxyURL, err)
+		// Quote the input through egress.RedactSpec with the one shared reason
+		// (egress.ErrUnparseableProxyURL, Ruling-35), never url.Parse's error: the
+		// URL carries user:password, a *url.Error quotes it whole, and its inner
+		// reason can quote the password. DEC-master-central-login-15.
+		//
+		// Who sees it: only a spec config.ValidateUpstreamProxyURL never checked —
+		// a config file edited by hand, loaded at startup — reaches this line, so
+		// it shows in buildTransport's node-egress ERROR log and in `aikey env`.
+		// The settings page's save and Test connectivity stop at that validator
+		// first (review-2.4 I-1).
+		// bugfix: workflow/CI/bugfix/2026-09-24-egress-credentials-echoed-in-errors.md
+		return nil, nil, fmt.Errorf("invalid upstream proxy URL %q: %w", egress.RedactSpec(proxyURL), egress.ErrUnparseableProxyURL)
 	}
 	// Internal-destination bypass (option ②, 2026-07-16): even with an explicit
 	// single-URL upstream, loopback + NO_PROXY targets go DIRECT (a self-hosted /
@@ -1314,7 +1330,9 @@ func buildTransportStrict(proxyURL string, sysProxy func(*http.Request) (*url.UR
 		IdleConnTimeout:     90 * time.Second,
 		TLSHandshakeTimeout: 10 * time.Second,
 	}
-	slog.Info("upstream proxy configured", "url", proxyURL)
+	// Logged on every load of a working egress, so it goes through
+	// egress.RedactSpec: the raw URL is user:password@host (TODO-22).
+	slog.Info("upstream proxy configured", "url", egress.RedactSpec(proxyURL))
 	return t, nil, nil
 }
 

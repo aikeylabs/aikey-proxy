@@ -857,6 +857,14 @@ func (p *Proxy) serveRoute(w http.ResponseWriter, r *http.Request, route *vkeys.
 			// A genuine client-error 400 is forwarded byte for byte.
 			// spec: R-tokenhub-pool-fallback-7 池自身服务不了的请求 MUST NOT 以 400 出现
 			reclassifyCodexUpstream400(resp)
+			// Codex turn-state ledger (task 10.7, UD-96): this response is the ONLY
+			// place a turn-state's issuer is observed rather than guessed, so it is
+			// the ledger's only writer; the request-side guard just reads it. No-op
+			// unless the request went through the Codex rewrite lane —
+			// group_serve.go arms it (withCodexTurnStateIssuer) behind the same
+			// per-pool switch as the guard.
+			// spec: R-codex-identity-rewrite-5.S3 当前账号的响应签发的 turn-state 记在当前账号名下
+			recordCodexTurnStateIssued(resp)
 
 			// N8c reactive fallback: if a pool account's upstream says it is
 			// broken (401) or its window is exhausted (rate-limit-signal 429),

@@ -607,6 +607,21 @@ const (
 	// only; an identifier value must never be logged.
 	// spec: R-codex-identity-rewrite-7 改写失败不阻塞，红线不破
 	EventProxyCodexIdentityCarrierDropped = "proxy.codex_identity.carrier_dropped"
+	// The `reason` on EventProxyCodexIdentityCarrierDropped when the dropped
+	// carrier is x-codex-turn-state. A turn-state rides along only if this worker
+	// recorded it, from an upstream response, as issued to the account now
+	// serving (UD-96); the reason says which half failed, because an operator
+	// reads the two differently:
+	//   ReasonCodexTurnStateForeign    — recorded, but issued to ANOTHER account:
+	//     the device moved accounts mid-turn and the linkage guard fired.
+	//   ReasonCodexTurnStateUnrecorded — no record on this worker: issued through
+	//     another node, before this worker restarted, or evicted from its bounded
+	//     ledger. Expected in small numbers; the upstream re-issues one on the
+	//     same response.
+	// The values are log contract: keep them stable.
+	// spec: R-codex-identity-rewrite-5.S3 本 worker 没记过账的 turn-state 一律丢弃
+	ReasonCodexTurnStateForeign    = "minted_for_another_account"
+	ReasonCodexTurnStateUnrecorded = "not_recorded_by_this_worker"
 	// EventProxyGroupAccountSwitched (N9 #8): the seat's rank-0 (primary) account
 	// was unusable (cooled / exhausted / expired / no material) so the request
 	// fell back to a different candidate — an auditable account switch.

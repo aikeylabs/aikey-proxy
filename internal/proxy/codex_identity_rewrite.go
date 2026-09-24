@@ -61,6 +61,7 @@ package proxy
 import (
 	"bytes"
 	"container/list"
+	"context"
 	"crypto/hmac"
 	"crypto/sha256"
 	"encoding/binary"
@@ -675,17 +676,19 @@ func applyCodexIdentityRewrite(
 	}
 
 	// The one carrier that is dropped rather than aliased: upstream state that
-	// belongs to whichever account minted it (R-codex-identity-rewrite-5). It sits
-	// here, inside the lane's own gates, because "which account is serving" is
-	// exactly what this function already knows — and because a pool nobody opted
-	// in must stay byte-identical, switch included.
-	if dropForeignCodexTurnState(r, accountID) {
-		logger.Warn("dropped a codex turn-state minted while another account was serving",
+	// belongs to whichever account it was issued to (R-codex-identity-rewrite-5).
+	// It sits here, inside the lane's own gates, because "which account is
+	// serving" is exactly what this function already knows — and because a pool
+	// nobody opted in must stay byte-identical, switch included. The ledger it
+	// reads is written by the response direction only; the caller arms that half
+	// (withCodexTurnStateIssuer) when this function reports that the lane ran.
+	if reason := dropForeignCodexTurnState(r, accountID); reason != "" {
+		logger.Warn("dropped a codex turn-state this worker did not record as issued to the serving account",
 			"event.name", observability.EventProxyCodexIdentityCarrierDropped,
 			"oauth_group_id", route.OauthGroupID,
 			"account_id", accountID,
 			"dropped", []string{codexTurnStateHeader},
-			"reason", codexTurnStateReasonForeign)
+			"reason", reason)
 	}
 
 	var raw []byte
@@ -731,7 +734,7 @@ func applyCodexIdentityRewrite(
 	return true
 }
 
-// ── the turn-state guard (task 2.4) ─────────────────────────────────────────
+// ── the turn-state guard (task 2.4; response-direction ledger, task 10.7) ───
 //
 // x-codex-turn-state is the ONE carrier the rewrite above cannot alias: it is
 // opaque UPSTREAM state, minted by the account that served an earlier request
@@ -741,37 +744,57 @@ func applyCodexIdentityRewrite(
 // two accounts with one header, however well every identifier around it was
 // rewritten.
 //
-// So it is DROPPED when the account changed, and dropping it is safe by
-// MEASUREMENT rather than assumption: S0 attempt 2 (2026-09-21, real ChatGPT
-// Codex backend) sent a turn carrying no turn-state; the upstream answered 200,
-// re-issued one on the spot, and reported unchanged cache hits (11520 = 11520).
-// See tasks.md §1 出口门. The cost of a drop is therefore one re-issue, never
-// the request.
+// So the worker keeps a LEDGER of which account each turn-state was issued to,
+// written from the RESPONSE direction only (UD-96, 2026-09-24, option C): the
+// upstream's own response is the one place "this value belongs to this
+// account" is observed rather than guessed. The request direction only reads
+// the ledger — a turn-state rides along when this worker recorded it for the
+// account now serving, and is dropped otherwise, including one this worker has
+// never seen.
+//
+// Why the ledger is no longer learned from requests (task 2.4's first version):
+// the first request that CARRIES a value is no evidence of who was issued it.
+// A device rebound to an account on another node, or one whose only request
+// carrying the value was refused before the rewrite (its account cooling),
+// presented the old account's turn-state to the new account as a first
+// sighting — and it rode along on the new account's credential.
+//
+// Dropping is safe by MEASUREMENT rather than assumption: S0 attempt 2
+// (2026-09-21, real ChatGPT Codex backend) sent a turn carrying no turn-state;
+// the upstream answered 200, re-issued one on the spot, and reported unchanged
+// cache hits (11520 = 11520). See tasks.md §1 出口门. A drop therefore costs one
+// re-issue, never the request — and that is the price a worker restart, a full
+// ledger or a move to another node charges each turn in flight (UD-96).
 //
 // spec: R-codex-identity-rewrite-5 丢弃不是当前账号签发的 x-codex-turn-state
+// spec: R-codex-identity-rewrite-5.S3 只放行本 worker 从当前账号的上游响应里记下的 turn-state
 // roadmap20260320/技术实现/阶段9-商业化版本/codex-pool-anti-linkage/openspec/specs/codex-identity-rewrite/spec.md
 
-// codexTurnStateHeader is the header the Codex CLI echoes back on later
-// requests of one turn. net/http canonicalises header keys, so Get/Del below
-// match whatever casing the client used.
+// codexTurnStateHeader is the header the Codex backend issues on a response and
+// the Codex CLI echoes back on later requests of one turn. net/http
+// canonicalises header keys, so Get/Values/Del below match any casing.
 const codexTurnStateHeader = "x-codex-turn-state"
 
 // codexTurnStateMemoryCap is how many turn-states ONE worker remembers the
-// owner of. The map is fed by a client-supplied header, so an unbounded one
-// would be a memory leak any client could drive; 4096 is several thousand
-// concurrent turns, while the whole table costs well under a megabyte (a
-// 32-char digest plus an account id per entry). Eviction is least-recently-
-// used and completely benign: an evicted turn-state is simply learned again on
-// its next sighting.
+// issuer of. The ledger gains an entry for every response that issues a
+// turn-state, so unbounded it would grow with traffic for the worker's whole
+// life; 4096 is several thousand concurrent turns, while the whole table costs
+// well under a megabyte (a 32-char digest plus an account id per entry).
+// Eviction is least-recently-used — continuing a turn counts as a use — and
+// costs the evicted turn one re-issue: its next request is dropped, and the
+// response to it issues a turn-state that is recorded again.
 const codexTurnStateMemoryCap = 4096
 
-// turnStateOwners remembers which account each turn-state was first seen with.
+// turnStateOwners is the ledger: which account each turn-state was issued to on
+// this worker.
 //
 // Deliberately a plain LRU with a mutex: no goroutine and no timer, because a
 // side feature must not add a lifecycle the main path can outlive (a ticker
 // that dies leaves a table that grows forever, and this worker already has
 // enough moving parts). Entries need no TTL either — a turn-state nobody
-// mentions again is evicted by pressure alone.
+// mentions again is evicted by pressure alone. And deliberately not persisted:
+// a restart costing each turn in flight one re-issue is the price UD-96
+// accepted instead of a store that would have to be kept consistent.
 type turnStateOwners struct {
 	mu    sync.Mutex
 	limit int
@@ -796,34 +819,46 @@ func newTurnStateOwners(limit int) *turnStateOwners {
 	}
 }
 
-// codexTurnStateOwners is the worker-wide memory. Process-scoped on purpose:
-// "which account did this turn-state come from" is a property of THIS worker's
-// own traffic, and applyCodexIdentityRewrite is a free function on the serving
-// path with no per-request place to hang it. Two workers therefore learn
-// independently — see the known bound in the task report.
+// codexTurnStateOwners is the worker-wide ledger. Process-scoped on purpose:
+// "which account was this turn-state issued to" is a property of THIS worker's
+// own traffic, and neither applyCodexIdentityRewrite nor the response hook has
+// a narrower place to hang it. Two workers therefore keep independent ledgers —
+// which is exactly why a turn-state issued through another node is unknown
+// here, and dropped (R-codex-identity-rewrite-5.S2).
 var codexTurnStateOwners = newTurnStateOwners(codexTurnStateMemoryCap)
 
-// owner returns the account this turn-state already belongs to on this worker,
-// binding it to accountID the first time it is seen.
-//
-// The value is keyed by a digest, not stored verbatim: it is upstream state
-// worth no more exposure than it needs, and a fixed-width key keeps the memory
-// bound exact. A digest collision could only ever cause a DROP of a header
-// that would have been kept (one upstream re-issue), never a leak.
-func (o *turnStateOwners) owner(value, accountID string) string {
+// turnStateDigest keys the ledger. The value is not stored verbatim: it is
+// upstream state worth no more exposure than it needs, and a fixed-width key
+// keeps the memory bound exact. 128 bits of SHA-256 over at most
+// codexTurnStateMemoryCap live entries makes a collision negligible.
+func turnStateDigest(value string) string {
 	sum := sha256.Sum256([]byte(value))
-	digest := hex.EncodeToString(sum[:16])
+	return hex.EncodeToString(sum[:16])
+}
+
+// noteIssuer records that accountID's upstream issued this turn-state. It is
+// the ledger's ONLY writer, called from the response direction
+// (recordCodexTurnStateIssued). A value recorded again takes the latest issuer
+// and becomes the most recently used: the upstream's newest response is the
+// authority.
+//
+// Named uniquely on purpose: hotpath_callgraph_fence_test.go resolves method
+// calls by NAME, and a plain `record` would pull every other `record` in the
+// module — two of which persist to disk — onto the per-request path.
+func (o *turnStateOwners) noteIssuer(value, accountID string) {
+	digest := turnStateDigest(value)
 
 	o.mu.Lock()
 	defer o.mu.Unlock()
 	if element, ok := o.index[digest]; ok {
 		if entry, isEntry := element.Value.(*turnStateEntry); isEntry {
+			entry.accountID = accountID
 			o.order.MoveToFront(element)
-			return entry.accountID
+			return
 		}
 		// Unreachable: the list only ever holds *turnStateEntry (PushFront
-		// below). Drop the malformed element and re-record it rather than
-		// panic on the request path.
+		// below). Drop the malformed element and re-record rather than panic on
+		// the serving path.
 		o.order.Remove(element)
 		delete(o.index, digest)
 	}
@@ -838,7 +873,27 @@ func (o *turnStateOwners) owner(value, accountID string) string {
 			delete(o.index, entry.digest)
 		}
 	}
-	return accountID
+}
+
+// issuer returns the account this worker recorded as the issuer of value, and
+// whether it recorded one at all. It never writes an issuer — a request is not
+// evidence of one — but a read is a use: a turn that keeps continuing keeps its
+// entry away from the eviction end.
+func (o *turnStateOwners) issuer(value string) (string, bool) {
+	digest := turnStateDigest(value)
+
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	element, ok := o.index[digest]
+	if !ok {
+		return "", false
+	}
+	entry, isEntry := element.Value.(*turnStateEntry)
+	if !isEntry {
+		return "", false // unreachable, see noteIssuer: treated as unrecorded, i.e. dropped
+	}
+	o.order.MoveToFront(element)
+	return entry.accountID, true
 }
 
 func (o *turnStateOwners) len() int {
@@ -847,17 +902,57 @@ func (o *turnStateOwners) len() int {
 	return o.order.Len()
 }
 
-// dropForeignCodexTurnState removes an x-codex-turn-state that was minted while
-// a DIFFERENT account was serving, and reports whether it dropped one.
+// codexTurnStateIssuerKey carries, on a request served through the Codex
+// rewrite lane, the account the response direction records a turn-state for.
+type codexTurnStateIssuerKey struct{}
+
+// withCodexTurnStateIssuer marks r as served by accountID through the rewrite
+// lane, so the response hook records any turn-state the upstream issues on it.
 //
-// The first sighting of a turn-state binds it to the account serving that
-// request: the header is issued by the upstream mid-turn, so the first request
-// that carries it is the only place a request-direction guard can learn the
-// owner from, and refusing it there would drop every turn-state forever (the
-// re-issued one is just as unknown). What this cannot see is a turn-state
-// minted through ANOTHER worker — that one is kept once. Closing that window
-// means learning from the response direction; out of scope here and recorded as
-// a concern.
+// Its caller is the one place that knows the lane ran (group_serve.go, where
+// applyCodexIdentityRewrite reports true), so the ledger's writer sits behind
+// exactly the gates of the guard that reads it: a pool nobody opted in records
+// nothing. It rides the request context, like the window-cap stash
+// (stashWindowCaps), because the response hook sees only the response and the
+// request that produced it.
+func withCodexTurnStateIssuer(r *http.Request, accountID string) *http.Request {
+	if r == nil || accountID == "" {
+		return r
+	}
+	return r.WithContext(context.WithValue(r.Context(), codexTurnStateIssuerKey{}, accountID))
+}
+
+// recordCodexTurnStateIssued is the response half of the guard and the ledger's
+// only way in: it records every turn-state the upstream issued on a response to
+// a request marked by withCodexTurnStateIssuer. Any status counts — a value in
+// the response was issued to the account whose credential made the request.
+// httputil.ReverseProxy also hands a 101 here before switching protocols, so a
+// turn-state on a WebSocket handshake would be recorded; one sent inside an
+// upgraded connection would not (whether that transport reaches a worker at all
+// is recorded against R-codex-identity-rewrite-5.S2, task 10.7 step 0).
+//
+// spec: R-codex-identity-rewrite-5.S3 当前账号的响应签发新的 turn-state，worker 把它记在当前账号名下
+func recordCodexTurnStateIssued(resp *http.Response) {
+	if resp == nil || resp.Request == nil {
+		return
+	}
+	accountID, _ := resp.Request.Context().Value(codexTurnStateIssuerKey{}).(string)
+	if accountID == "" {
+		return
+	}
+	for _, value := range resp.Header.Values(codexTurnStateHeader) {
+		if value != "" {
+			codexTurnStateOwners.noteIssuer(value, accountID)
+		}
+	}
+}
+
+// dropForeignCodexTurnState removes an x-codex-turn-state this worker did not
+// record, from an upstream response, as issued to accountID — the account about
+// to serve — and returns why (one of the observability.ReasonCodexTurnState*
+// values), or "" when it rides along. Every value the client sent has to
+// qualify; one that does not drops the header whole, since the whole cost of a
+// drop is one re-issue.
 //
 // An empty accountID is treated as "cannot prove ownership" and drops: on this
 // lane the serving account is always known, so an empty one is a broken caller,
@@ -866,18 +961,35 @@ func (o *turnStateOwners) len() int {
 // It does not log: the caller owns the WARN, the way 2.1's pure function hands
 // its Dropped list up instead of logging it — only the caller has the request's
 // logger and the pool id the line needs.
-func dropForeignCodexTurnState(r *http.Request, accountID string) bool {
-	state := r.Header.Get(codexTurnStateHeader)
-	if state == "" {
-		return false
+//
+// spec: R-codex-identity-rewrite-5.S2 设备重绑后发往新账号的请求不带旧 turn-state（跨节点、同节点首次出现）
+// spec: R-codex-identity-rewrite-5.S3 本 worker 没记过账的 turn-state 一律丢弃
+func dropForeignCodexTurnState(r *http.Request, accountID string) string {
+	for _, value := range r.Header.Values(codexTurnStateHeader) {
+		if value == "" {
+			continue // an empty header carries no upstream state to leak
+		}
+		if reason := turnStateDropReason(value, accountID); reason != "" {
+			r.Header.Del(codexTurnStateHeader)
+			return reason
+		}
 	}
-	if accountID != "" && codexTurnStateOwners.owner(state, accountID) == accountID {
-		return false
-	}
-	r.Header.Del(codexTurnStateHeader)
-	return true
+	return ""
 }
 
-// codexTurnStateReasonForeign distinguishes this drop from the malformed-carrier
-// drops above: nothing is wrong with the request, the account simply changed.
-const codexTurnStateReasonForeign = "minted_for_another_account"
+// turnStateDropReason says why one turn-state may not ride along on accountID's
+// credential, or "" when it may. An empty accountID with a recorded value lands
+// in the "foreign" branch: the drop is right, only the label is approximate
+// (the true reason is "no serving account"). Unreachable on this lane — the
+// caller always has one — so it gets no reason value of its own.
+func turnStateDropReason(value, accountID string) string {
+	issuer, recorded := codexTurnStateOwners.issuer(value)
+	switch {
+	case !recorded:
+		return observability.ReasonCodexTurnStateUnrecorded
+	case accountID == "" || issuer != accountID:
+		return observability.ReasonCodexTurnStateForeign
+	default:
+		return ""
+	}
+}

@@ -152,3 +152,31 @@ func TestEgressTest_HTTPForwardProxyPath(t *testing.T) {
 		t.Fatal("forward proxy was not traversed")
 	}
 }
+
+// A socks5 CHAIN takes the comma branch of EgressTest's dispatch into
+// egress.TestDial, and every hop relays the probe. master-central-oauth-login
+// task 2.0 step 0: this endpoint passes TestDial only socks5 hops, socks5
+// chains and (on the enterprise build) fragments; a single http(s):// URL
+// goes to testThroughURLProxy instead, so the TestDial change must leave
+// every response here unchanged.
+func TestEgressTest_Socks5ChainDialsThroughEveryHop(t *testing.T) {
+	echo := newEchoServer(t, "203.0.113.9")
+	entry := egresstest.NewSocks5Server(t, "", "")
+	exit := egresstest.NewSocks5Server(t, "", "")
+
+	code, out := callEgressTest(t, &Handler{}, echo.URL,
+		fmt.Sprintf(`{"spec":"socks5://%s,socks5://%s"}`, entry.Addr(), exit.Addr()))
+	if code != http.StatusOK {
+		t.Fatalf("status = %d body = %v", code, out)
+	}
+	if out["ok"] != true || out["exit_ip"] != "203.0.113.9" || out["engine"] != "builtin-socks5" {
+		t.Fatalf("result = %v, want ok, exit_ip 203.0.113.9, engine builtin-socks5", out)
+	}
+	if n, last := entry.Stats(); n != 1 || last != exit.Addr() {
+		t.Fatalf("entry hop: %d CONNECTs, last %q; want 1 to the exit hop %s", n, last, exit.Addr())
+	}
+	echoAddr := strings.TrimPrefix(echo.URL, "http://")
+	if n, last := exit.Stats(); n != 1 || last != echoAddr {
+		t.Fatalf("exit hop: %d CONNECTs, last %q; want 1 to the echo %s", n, last, echoAddr)
+	}
+}

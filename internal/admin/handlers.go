@@ -1609,7 +1609,13 @@ func httpHeadViaTransport(targetURL string, rt http.RoundTripper, timeout time.D
 func httpHeadViaProxy(targetURL, proxyURL string, timeout time.Duration) error {
 	pURL, err := url.Parse(proxyURL)
 	if err != nil {
-		return fmt.Errorf("invalid proxy URL: %w", err)
+		// Never url.Parse's error: it quotes the URL with its user:password, and
+		// ProbePing hands this text to the caller (classifyNetError echoes any
+		// error it does not recognize). The "invalid proxy URL" prefix is kept:
+		// TestProbePing_EngineSpec* read it as "a spec went down this url.Parse
+		// path". DEC-master-central-login-15, Ruling-34.
+		// bugfix: workflow/CI/bugfix/2026-09-24-egress-credentials-echoed-in-errors.md
+		return fmt.Errorf("invalid proxy URL %q: %w", egress.RedactSpec(proxyURL), egress.ErrUnparseableProxyURL)
 	}
 	transport := &http.Transport{
 		Proxy: http.ProxyURL(pURL),

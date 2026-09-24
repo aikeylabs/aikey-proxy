@@ -56,7 +56,13 @@ func ValidateUpstreamProxyURL(raw string) error {
 	// Single URL (http/https/socks5).
 	u, err := url.Parse(s)
 	if err != nil {
-		return fmt.Errorf("not a valid URL: %w", err)
+		// Named through egress.RedactSpec with the one shared reason, never
+		// url.Parse's error: a *url.Error quotes the whole URL with its
+		// user:password, and this validator answers the settings page's save and
+		// Test-connectivity and POST /admin/egress-test before anything else runs
+		// (review-2.4 I-1; DEC-master-central-login-15; Ruling-32, Ruling-35).
+		// bugfix: workflow/CI/bugfix/2026-09-24-egress-credentials-echoed-in-errors.md
+		return fmt.Errorf("invalid proxy url %q: %w", egress.RedactSpec(s), egress.ErrUnparseableProxyURL)
 	}
 	switch u.Scheme {
 	case "http", "https", "socks5":

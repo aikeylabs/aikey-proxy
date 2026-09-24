@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/AiKeyLabs/aikey-proxy/internal/config"
+	"github.com/AiKeyLabs/pkg/egress"
 )
 
 // Tests for POST /admin/probe/ping.
@@ -347,7 +348,9 @@ func TestProbePing_EngineSpecFragment_NoSecretLeak(t *testing.T) {
 	if strings.Contains(body, "SECRETXYZ") || strings.Contains(body, "user1") {
 		t.Errorf("response leaked egress spec credentials: %q", body)
 	}
-	if strings.Contains(body, "invalid proxy URL") {
+	// The shared reason appears only when url.Parse refused the spec, whatever
+	// prefix or letter case the message around it uses (review-2.4 r1-m1).
+	if strings.Contains(body, egress.ErrUnparseableProxyURL.Error()) {
 		t.Errorf("fragment fed to url.Parse (mode-2 path) instead of the egress engine: %q", body)
 	}
 	var resp ProbePingResponse
@@ -448,7 +451,8 @@ func TestProbePing_EngineSpecChain_DeadHopFailsSanitized(t *testing.T) {
 	if resp.Error == "" {
 		t.Errorf("expected non-empty error when ok=false")
 	}
-	if strings.Contains(resp.Error, "invalid proxy URL") {
+	// See TestProbePing_EngineSpecFragment_NoSecretLeak (review-2.4 r1-m1).
+	if strings.Contains(resp.Error, egress.ErrUnparseableProxyURL.Error()) {
 		t.Errorf("chain fed to url.Parse instead of the egress engine: %q", resp.Error)
 	}
 }

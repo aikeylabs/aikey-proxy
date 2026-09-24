@@ -16,6 +16,7 @@ package admin
 
 import (
 	"encoding/json"
+	"fmt"
 	"io"
 	"net"
 	"net/http"
@@ -106,7 +107,10 @@ func (h *Handler) EgressTest(w http.ResponseWriter, r *http.Request) {
 func testThroughURLProxy(r *http.Request, rawURL string) egressTestResult {
 	u, err := url.Parse(rawURL)
 	if err != nil { // unreachable after ValidateUpstreamProxyURL; belt-and-braces
-		return egressTestResult{Ok: false, Error: "not a valid URL: " + err.Error()}
+		// Same wording as the validator, and never url.Parse's error: it quotes
+		// the URL with its user:password (DEC-master-central-login-15, Ruling-32).
+		// bugfix: workflow/CI/bugfix/2026-09-24-egress-credentials-echoed-in-errors.md
+		return egressTestResult{Ok: false, Error: fmt.Sprintf("invalid proxy url %q: %v", egress.RedactSpec(rawURL), egress.ErrUnparseableProxyURL)}
 	}
 	transport := &http.Transport{
 		Proxy:               http.ProxyURL(u),

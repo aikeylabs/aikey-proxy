@@ -360,15 +360,26 @@ func TestCooldownDecision_CodexRateLimit(t *testing.T) {
 		t.Fatalf("D9: both-exhausted must cool for the LONGER reset (1800s) regardless of primary/secondary name, got until=%v ok=%v", until, ok)
 	}
 
-	// 429 but neither window at 100% → cool for the larger visible reset.
+	// 429 but neither window at 100% → a TEMPORARY limit (R-oauth-account-pool-4): the
+	// window resets ride on every codex response and say nothing about how long
+	// this throttle lasts. Retry-After wins when present, otherwise the pool's
+	// short fallback. Until 2026-09-24 this case cooled for the larger visible
+	// reset (capped at 1h) — the same over-cool the 2026-08-04 fix removed on
+	// the anthropic path only.
+	// bugfix: workflow/CI/bugfix/2026-09-24-codex-sub100-429-overcool.md
 	partial := http.Header{
 		"X-Codex-Primary-Used-Percent":          {"80"},
 		"X-Codex-Primary-Reset-After-Seconds":   {"200"},
 		"X-Codex-Secondary-Used-Percent":        {"90"},
 		"X-Codex-Secondary-Reset-After-Seconds": {"50"},
 	}
-	if until, ok := cooldownDecision(resp(429, partial), now); !ok || until != now.Add(200*time.Second) {
-		t.Fatalf("codex sub-100%% 429 must cool for the larger reset (200s), got until=%v ok=%v", until, ok)
+	if until, ok := cooldownDecision(resp(429, partial), now); !ok || until != now.Add(poolCooldown429NoReset) { //nolint:bodyclose // synthetic response: no Body, no transport — nothing to close
+		t.Fatalf("codex sub-100%% 429 is a temporary limit and must use the short fallback (%v), got until=%v ok=%v", poolCooldown429NoReset, until, ok)
+	}
+	partialRetryAfter := partial.Clone()
+	partialRetryAfter.Set("Retry-After", "30")
+	if until, ok := cooldownDecision(resp(429, partialRetryAfter), now); !ok || until != now.Add(30*time.Second) { //nolint:bodyclose // synthetic response: no Body, no transport — nothing to close
+		t.Fatalf("codex sub-100%% 429 with Retry-After must honor it (30s), got until=%v ok=%v", until, ok)
 	}
 
 	// A codex 429 whose reset exceeds the cap is clamped.
@@ -378,6 +389,68 @@ func TestCooldownDecision_CodexRateLimit(t *testing.T) {
 	}
 	if until, _ := cooldownDecision(resp(429, huge), now); until != now.Add(poolCooldownMax) {
 		t.Fatalf("oversized codex reset must be capped at max, got %v", until)
+	}
+}
+
+// TestCooldownDecision_TemporaryVsWindowByProtocol pins R-oauth-account-pool-4
+// (R4 in workflow/CI/requirements/2026-06-23-oauth-account-pool.md: only a FULL
+// window earns a window-reset cooldown; a temporary limit honors Retry-After,
+// else the pool's short fallback)
+// for BOTH protocols in one table, so a future rule change cannot land on one
+// protocol only — the 2026-08-04 fix changed the anthropic branch and left the
+// codex branch over-cooling for a month. The pool fallback is passed explicitly
+// (20s) so the rows prove the pool setting is honored, not just the default.
+// bugfix: workflow/CI/bugfix/2026-09-24-codex-sub100-429-overcool.md
+func TestCooldownDecision_TemporaryVsWindowByProtocol(t *testing.T) {
+	now := time.Unix(1_750_000_000, 0)
+	const fallback = 20 * time.Second
+	anthropicNotFull := http.Header{
+		"Anthropic-Ratelimit-Unified-Status":         {"rate_limited"},
+		"Anthropic-Ratelimit-Unified-Reset":          {strconv.FormatInt(now.Add(3*time.Hour).Unix(), 10)},
+		"Anthropic-Ratelimit-Unified-5h-Status":      {"allowed"},
+		"Anthropic-Ratelimit-Unified-5h-Utilization": {"0.42"},
+		"Anthropic-Ratelimit-Unified-7d-Status":      {"allowed"},
+		"Anthropic-Ratelimit-Unified-7d-Utilization": {"0.57"},
+	}
+	codexNotFull := http.Header{
+		"X-Codex-Primary-Used-Percent":          {"80"},
+		"X-Codex-Primary-Reset-After-Seconds":   {"7200"},
+		"X-Codex-Secondary-Used-Percent":        {"40"},
+		"X-Codex-Secondary-Reset-After-Seconds": {"400000"},
+	}
+	withRetryAfter := func(h http.Header) http.Header {
+		c := h.Clone()
+		c.Set("Retry-After", "30")
+		return c
+	}
+	cases := []struct {
+		name   string
+		header http.Header
+		want   time.Duration
+	}{
+		{"anthropic/window-full", http.Header{
+			"Anthropic-Ratelimit-Unified-Status":         {"rate_limited"},
+			"Anthropic-Ratelimit-Unified-5h-Utilization": {"1.0"},
+			"Anthropic-Ratelimit-Unified-5h-Reset":       {strconv.FormatInt(now.Add(42*time.Minute).Unix(), 10)},
+		}, 42 * time.Minute},
+		{"anthropic/window-not-full/no-retry-after", anthropicNotFull, fallback},
+		{"anthropic/window-not-full/retry-after", withRetryAfter(anthropicNotFull), 30 * time.Second},
+		{"codex/window-full", http.Header{
+			"X-Codex-Primary-Used-Percent":          {"100"},
+			"X-Codex-Primary-Reset-After-Seconds":   {"600"},
+			"X-Codex-Secondary-Used-Percent":        {"40"},
+			"X-Codex-Secondary-Reset-After-Seconds": {"400000"},
+		}, 600 * time.Second},
+		{"codex/window-not-full/no-retry-after", codexNotFull, fallback},
+		{"codex/window-not-full/retry-after", withRetryAfter(codexNotFull), 30 * time.Second},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			until, ok := cooldownDecisionWithTemporaryFallback(resp(429, tc.header), now, fallback) //nolint:bodyclose // synthetic response, no body
+			if !ok || until != now.Add(tc.want) {
+				t.Fatalf("got cooldown %v (ok=%v), want %v", until.Sub(now), ok, tc.want)
+			}
+		})
 	}
 }
 

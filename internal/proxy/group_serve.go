@@ -559,6 +559,11 @@ func (p *Proxy) serveGroupAttempt(
 			// The rewrite ran ⇒ this request no longer carries the client's
 			// identity, so ChatGPT-Account-Id must be the serving account's too.
 			lane = oauthLaneRewrittenCodexPool
+			// …and any turn-state the upstream issues on its response belongs to
+			// THIS account: arm the response half of the turn-state guard here,
+			// behind exactly the gates its request half just ran behind.
+			// spec: R-codex-identity-rewrite-5.S3 记账只来自当前账号的上游响应
+			r = withCodexTurnStateIssuer(r, res.AccountID)
 		}
 		oauthInjectForLane(r, res.OAuth, oauthCode, lane)
 		// Stash the window cap so ModifyResponse can pre-cut this account when the
