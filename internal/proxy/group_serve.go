@@ -294,7 +294,7 @@ func (p *Proxy) handleOauthGroupRoute(
 			// this only when this request has no concrete upstream response to
 			// preserve verbatim.
 			if isGE && ge.Code == groupErrAllUnusable {
-				advice := p.setGroupCooldownRetryAfter(w, route, baseSkip)
+				advice := p.setGroupCooldownRetryAfter(w, route)
 				if code := p.groupUnavailableCooldownCode(route, baseSkip); code != "" {
 					p.degradeGroup(w, logger, route, code, groupDegradeMessage(code))
 					return
@@ -979,6 +979,23 @@ func humanDuration(secs int64) string {
 	}
 }
 
+// recoveryHint writes when an account is expected back, "about <duration>
+// (<UTC RFC3339>)", into the text of a 429 that already carries Retry-After and
+// retry_at — and it is exactly those two numbers, never derived again: the
+// duration is seconds, the Retry-After value (the remaining time rounded up);
+// the instant is retryAt, the deadline rounded down to the whole second the
+// per-account lines print too. A fresh clock read or one more rounding would let
+// the text drift a second from the header or from the lines (Ruling-76,
+// 2026-09-25). UTC with a Z: the proxy does not know the member's time zone.
+// Only the time, never a reason (R-oauth-account-pool-43). The device path's
+// refusal (task T3-1.4) reuses it.
+//
+// spec: R-oauth-account-pool-4.2 Retry-After, retry_at and the text name one time
+// scenario: roadmap20260320/技术实现/update/20260924-Codex冷却例外补全与提示显示恢复时间.md (rule: workflow/CI/requirements/2026-06-23-oauth-account-pool.md)
+func recoveryHint(seconds int, retryAt int64) string {
+	return "about " + humanDuration(int64(seconds)) + " (" + time.Unix(retryAt, 0).UTC().Format(time.RFC3339) + ")"
+}
+
 // groupLoginURL assembles the member-login page URL from the configured local
 // console base. "" when no console is co-installed (empty console_url).
 func (p *Proxy) groupLoginURL() string {
@@ -1071,21 +1088,35 @@ func groupRouteAccountIDs(route *vkeys.ResolvedRoute) map[string]bool {
 	return ids
 }
 
-// setGroupCooldownRetryAfter exposes the earliest route-account recovery to the
-// client when resolution is blocked by durable cooldown state. It is advisory:
-// routing still relies exclusively on the cooldown store and its clock-based
-// lazy re-entry, so a missing/malformed route payload never blocks the response.
+// setGroupCooldownRetryAfter exposes the pool's earliest recovery to the client
+// when resolution found no usable account: the Retry-After header here, the
+// same advice in the 429 body. The time is earliestRetryAdvice's — per account
+// the later of the local cooldown and the delivered window wall — so a pool held
+// only by the delivered state (every account used up by OTHER members, nothing
+// cooling on this Worker) still gets a time instead of the generic sentence.
+// It is advisory: routing still relies exclusively on the cooldown store and the
+// delivered material, so a missing/malformed route payload degrades to local
+// cooldowns only and never blocks the response.
 type groupRetryAdvice struct {
 	Seconds int
 	RetryAt int64
 	Reason  string
 }
 
-func (p *Proxy) setGroupCooldownRetryAfter(w http.ResponseWriter, route *vkeys.ResolvedRoute, skip map[string]bool) *groupRetryAdvice {
-	if route == nil || len(skip) == 0 {
+// spec: R-oauth-account-pool-4.2.S4 a pool held only by the delivered state still gets a time
+// scenario: roadmap20260320/技术实现/update/20260924-Codex冷却例外补全与提示显示恢复时间.md (rule: workflow/CI/requirements/2026-06-23-oauth-account-pool.md)
+// No "nothing cools locally → no advice" shortcut: that shortcut is what sent
+// such a member to an administrator with no time at all. The member's seat is
+// passed so an account whose token this seat already saw rejected never sets
+// the time (its line reads revoked_token).
+func (p *Proxy) setGroupCooldownRetryAfter(w http.ResponseWriter, route *vkeys.ResolvedRoute) *groupRetryAdvice {
+	if route == nil {
 		return nil
 	}
-	if seconds, retryAt, reason, ok := p.poolCooldown.earliestRetryAdvice(groupRouteAccountIDs(route), skip); ok {
+	// The resolver's own parse; on this path it has already succeeded (the
+	// resolver answers NO_MATERIAL / NO_CANDIDATES before an all-unusable 429).
+	_, material, _ := groupCandidates(route)
+	if seconds, retryAt, reason, ok := p.poolCooldown.earliestRetryAdvice(groupRouteAccountIDs(route), material, route.OauthGroupID, route.SeatID); ok {
 		w.Header().Set("Retry-After", strconv.Itoa(seconds))
 		return &groupRetryAdvice{Seconds: seconds, RetryAt: retryAt, Reason: reason}
 	}
@@ -1106,7 +1137,15 @@ func (p *Proxy) degradeGroupWithRetry(w http.ResponseWriter, logger *slog.Logger
 	// bugfix: workflow/CI/bugfix/2026-09-03-池全部不可用不说哪个账号为什么.md
 	accounts := p.poolCooldown.routeAccountStates(route, groupRouteAccountIDs(route))
 	if advice != nil {
-		message = fmt.Sprintf("All accounts in this credential-sharing group are currently unavailable. The earliest account will be retried in %d seconds.", advice.Seconds)
+		// spec: R-oauth-account-pool-4.2.S3 the 429 text names the time its header carries
+		// scenario: roadmap20260320/技术实现/update/20260924-Codex冷却例外补全与提示显示恢复时间.md (rule: workflow/CI/requirements/2026-06-23-oauth-account-pool.md)
+		// The time comes from advice alone, already judged for this group and
+		// seat: asking earliestRetryAdvice again without the seat would let a
+		// revoked account set it (T3-1.2 re-review NN3). A pool held only by the
+		// delivered state reaches here too (S4). Wording approved by the user
+		// (Ask-7 Q6, UD-100).
+		message = "All accounts in this credential-sharing group are currently unavailable. " +
+			"The earliest one is expected to be available again in " + recoveryHint(advice.Seconds, advice.RetryAt) + "."
 	}
 	if detail := describePoolAccountStates(accounts); detail != "" {
 		message += " " + detail
@@ -1155,7 +1194,7 @@ func describePoolAccountStates(states []poolAccountStateView) string {
 			who = st.AccountID
 		}
 		switch {
-		case st.Status == "revoked_token":
+		case st.Status == poolRouteRevokedToken:
 			parts = append(parts, who+": token rejected upstream — sign out of the provider and sign in again to get a NEW token")
 		case st.RetryAt > 0:
 			parts = append(parts, fmt.Sprintf("%s: %s (retry at %s)", who, st.Status, time.Unix(st.RetryAt, 0).UTC().Format(time.RFC3339)))

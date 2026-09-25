@@ -557,7 +557,7 @@ func TestPoolCooldownStore_EarliestRetryAfterSeconds(t *testing.T) {
 
 	seconds, ok := s.earliestRetryAfterSeconds(
 		map[string]bool{"route-later": true, "route-earlier": true},
-		map[string]bool{"route-later": true, "route-earlier": true, "other-route": true},
+		nil,
 	)
 	if !ok || seconds != 2 {
 		t.Fatalf("earliest route cooldown must round 1.5s up to 2s, got seconds=%d ok=%v", seconds, ok)

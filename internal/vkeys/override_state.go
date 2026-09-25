@@ -89,9 +89,7 @@ func ClassifyOverride(
 	if !candidate || !delivered {
 		return OverrideMaterialNotReady
 	}
-	// MaterialExpired is used rather than a bare ExpiresAt comparison so api_key
-	// material (no expiry in its contract) is not read as expired.
-	if authRevoked[override] || mat.NeedsLogin || MaterialExpired(mat, nowUnix) {
+	if CredentialUnusable(mat, authRevoked[override], nowUnix) {
 		return OverrideCredentialUnusable
 	}
 	// MaterialWindowBlockedAt, not MaterialWindowExhausted: past the
@@ -103,4 +101,23 @@ func ClassifyOverride(
 		return OverrideQuotaExhausted
 	}
 	return OverrideUsable
+}
+
+// CredentialUnusable reports whether an account's credential is dead for the
+// member asking: this worker already saw the upstream reject the exact token
+// the member holds (revoked — the caller resolves its own tombstones), the
+// member has no token for the account (NeedsLogin), or the access token is past
+// its expiry. Waiting fixes none of the three; only a new token does.
+//
+// It is the single definition behind ClassifyOverride's credential_unusable
+// and behind the proxy's pool recovery time, which must never promise a time
+// for an account that will not take the member back when that time comes
+// (spec R-oauth-account-pool-4.2: only a temporarily unavailable account
+// carries a time). A second copy of this predicate is how the two would drift.
+//
+// MaterialExpired rather than a bare ExpiresAt comparison, so api_key material
+// (no expiry in its contract) is never read as expired; the zero value (no
+// material delivered) is dead only when revoked.
+func CredentialUnusable(mat GroupRuntimeAccount, revoked bool, nowUnix int64) bool {
+	return revoked || mat.NeedsLogin || MaterialExpired(mat, nowUnix)
 }

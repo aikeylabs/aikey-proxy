@@ -46,11 +46,21 @@ const (
 // unparseableSingleURLs are single URLs url.Parse rejects, each with the
 // credentials in it; want is what the error must still name.
 var unparseableSingleURLs = []struct{ name, url, want string }{
-	{"http, port not a number", "http://" + echoCred + "proxy.example.test:abc", "http://proxy.example.test:abc"},
-	{"socks5, port not a number", "socks5://" + echoCred + "proxy.example.test:abc", "socks5://proxy.example.test:abc"},
+	// D2 甲 (2026-09-24): a port that is not a number shows "(unparseable)" and
+	// the shared hint only, never host:port.
+	{"http, port not a number", "http://" + echoCred + "proxy.example.test:abc", "(unparseable)"},
+	{"socks5, port not a number", "socks5://" + echoCred + "proxy.example.test:abc", "(unparseable)"},
+	// D2 甲 (review-2.4 I-2): written backwards, the part after '@' is the user
+	// name and password.
+	{"http, written backwards", "http://proxy.example.test:3128@" + echoUser + ":" + echoPass, "(unparseable)"},
 	// An unescaped '/' in the password ends Go's authority early, so even the
 	// parser's own reason quotes the password (`invalid port ":p-MARK7"`).
 	{"http, slash in the password", "http://" + echoUser + ":" + echoPass + "/x@proxy.example.test:3128", "http://proxy.example.test:3128"},
+	// D3 甲 (review-2.4 I-3): with digits before the '/', it parses cleanly
+	// into the wrong host ("u-MARK7:12") and used to be accepted. The shared
+	// reason it now carries tells the user to write '/' as %2F.
+	{"http, unescaped slash with digits before it", "http://" + echoUser + ":12/" + echoPass + "@proxy.example.test:3128", "http://proxy.example.test:3128"},
+	{"socks5, unescaped slash with digits before it", "socks5://" + echoUser + ":12/" + echoPass + "@proxy.example.test:1080", "socks5://proxy.example.test:1080"},
 }
 
 func assertNoEchoedCredentials(t *testing.T, where, got string) {

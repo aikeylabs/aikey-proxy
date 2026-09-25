@@ -1297,7 +1297,11 @@ func buildTransportStrict(proxyURL string, sysProxy func(*http.Request) (*url.UR
 	}
 
 	parsed, err := url.Parse(spec)
-	if err != nil {
+	// D3 甲 (2026-09-24, review-2.4 I-3): a path holding '@' means an unescaped
+	// '/' in the user name or password ended the authority early, so url.Parse
+	// found the wrong host. Refused with the same shared reason, which says to
+	// write '/' as %2F. DEC-master-central-login-15.
+	if err != nil || strings.Contains(parsed.Path, "@") {
 		// Quote the input through egress.RedactSpec with the one shared reason
 		// (egress.ErrUnparseableProxyURL, Ruling-35), never url.Parse's error: the
 		// URL carries user:password, a *url.Error quotes it whole, and its inner

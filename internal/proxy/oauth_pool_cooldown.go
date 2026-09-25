@@ -20,9 +20,11 @@ import (
 	"encoding/json"
 	"fmt"
 	"log/slog"
+	"maps"
 	"net/http"
 	"os"
 	"path/filepath"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -77,6 +79,11 @@ const (
 	poolRouteAuthFailed          = "auth_failed"
 	poolRouteUpstreamUnavailable = "upstream_unavailable"
 	windowStatusExhausted        = "exhausted_current_window"
+	// poolRouteRevokedToken labels an account whose CURRENT token this seat
+	// already saw the upstream reject (a hard-revoke tombstone). Display only —
+	// never a routing input — and it never carries a retry time: waiting does
+	// not fix a rejected token, a new one does.
+	poolRouteRevokedToken = "revoked_token"
 )
 
 // PoolAccountRouteState is the display-safe projection of one whole-account
@@ -830,35 +837,49 @@ func (s *poolCooldownStore) skipSet() map[string]bool {
 	return out
 }
 
-// earliestRetryAfterSeconds returns the first active cooldown deadline among
-// the route accounts currently skipped by the resolver. Round up so the client
-// never retries in the final fractional second before the account is eligible.
-// Expiry cleanup remains owned by skipSet; stale entries are simply ignored.
-func (s *poolCooldownStore) earliestRetryAfterSeconds(routeIDs, skip map[string]bool) (int, bool) {
-	seconds, _, _, ok := s.earliestRetryAdvice(routeIDs, skip)
+// earliestRetryAfterSeconds is earliestRetryAdvice's delay alone, asked without
+// a seat. Round up so the client never retries in the final fractional second
+// before the account is eligible. Expiry cleanup remains owned by skipSet;
+// stale entries are simply ignored.
+func (s *poolCooldownStore) earliestRetryAfterSeconds(routeIDs map[string]bool, material map[string]vkeys.GroupRuntimeAccount) (int, bool) {
+	seconds, _, _, ok := s.earliestRetryAdvice(routeIDs, material, "", "")
 	return seconds, ok
 }
 
-// earliestRetryAdvice returns the exact local routing deadline and display
-// classification for the first route account that will re-enter. The cooldown
-// deadline (not a database/window estimate) is authoritative for retry timing.
-func (s *poolCooldownStore) earliestRetryAdvice(routeIDs, skip map[string]bool) (seconds int, retryAt int64, reason string, ok bool) {
+// earliestRetryAdvice returns when the pool's first account re-enters routing
+// and why it was kept out: the EARLIEST accountRecovery among routeIDs, each of
+// which is already the later of that account's local cooldown and its delivered
+// window wall. An account with no time to promise never contributes one — a
+// delivered window exhausted without a reset, or a credential that is dead for
+// this member: no advice beats a false promise. material is the delivered group
+// runtime keyed by account id (nil leaves only the local cooldowns);
+// oauthGroupID and seatID name the member whose hard-revoke tombstones apply
+// ("" for a caller that judged the credential itself).
+//
+// The reason is the earliest account's own. An exact tie goes to
+// window_exhausted (the side accountRecovery gives a tie within one account),
+// and otherwise to the first account id in sorted order: the answer — and the
+// wire shape derived from its reason — never depends on map iteration order.
+//
+// Every route account takes part, not only the ones in the request's skip set:
+// an account the delivered state holds was never skipped locally, and it is
+// exactly the one a member who never hit it needs a time for
+// (R-oauth-account-pool-4.2.S4). The skip set added nothing for local cooldowns
+// either — skipSetFor already holds every live whole-account cooldown.
+func (s *poolCooldownStore) earliestRetryAdvice(routeIDs map[string]bool, material map[string]vkeys.GroupRuntimeAccount, oauthGroupID, seatID string) (seconds int, retryAt int64, reason string, ok bool) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	now := s.now()
 	var earliest time.Time
-	earliestID := ""
-	for id := range routeIDs {
-		if !skip[id] {
+	for _, id := range slices.Sorted(maps.Keys(routeIDs)) {
+		mat, hasMat := material[id]
+		at, why, known := s.accountRecoveryLocked(id, mat, hasMat, oauthGroupID, seatID, now)
+		if !known {
 			continue
 		}
-		until, ok := s.m[id]
-		if !ok || !now.Before(until) {
-			continue
-		}
-		if earliest.IsZero() || until.Before(earliest) {
-			earliest = until
-			earliestID = id
+		tieWon := at.Equal(earliest) && why == poolRouteWindowExhausted && reason != poolRouteWindowExhausted
+		if earliest.IsZero() || at.Before(earliest) || tieWon {
+			earliest, reason = at, why
 		}
 	}
 	if earliest.IsZero() {
@@ -869,10 +890,106 @@ func (s *poolCooldownStore) earliestRetryAdvice(routeIDs, skip map[string]bool) 
 	if seconds < 1 {
 		seconds = 1
 	}
-	if state, exists := s.meta[earliestID]; exists {
-		reason = state.Status
-	}
 	return seconds, earliest.Unix(), reason, true
+}
+
+// accountRecovery is the single exit for "until when is this pool account kept
+// out". The seat path already reads it for both of its answers
+// (earliestRetryAdvice, routeAccountStates); the device path
+// (deviceRoutingRetryHorizon, still on groupWindowResetAt) and the member-page
+// projection (routeStateSnapshot) join it in tasks T3-1.4 and T3-1.5. Deriving
+// the time a second way is how the told time drifted from the real release
+// before.
+//
+// Two gates keep an account out, and it re-enters only once BOTH have opened,
+// so the answer is the LATER of:
+//   - the local cooldown deadline — the store's avoid-until, the routing truth.
+//     Not meta.RetryAt: that is display-only and prefers the provider's raw
+//     reset even when routing capped the cooldown (a Codex window cools here
+//     for at most an hour, see cooldownDecision);
+//   - the delivered window wall — vkeys.MaterialWindowBlockedUntil, the
+//     picker's own judgment, consulted only when hasMat (the account's
+//     delivered runtime entry is at hand).
+//
+// Only a temporarily unavailable account has a time at all. When the
+// credential is dead for the member (vkeys.CredentialUnusable: the upstream
+// rejected this seat's token, the member has no token, or the access token
+// expired), a gate reopening re-admits nobody, so neither gate counts.
+// accountRecovery has no seat, so it judges the material's own credential and
+// cannot see a seat's tombstone; the device path that will call it refuses a
+// revoked pinned account (ClassifyOverride, credential_unusable) before it ever
+// asks for a time.
+//
+// Outcomes, told apart by ok and reason:
+//   - ok: kept out until at; reason names the later gate — window_exhausted
+//     for the delivered wall (which also wins a tie), else the local
+//     cooldown's display status (possibly "" for a cooldown recorded without
+//     one);
+//   - !ok, reason set: kept out with no time to promise — window_exhausted
+//     for a delivered window exhausted without a reset (the later of any local
+//     deadline and "unknown" is unknown), revoked_token for this seat's
+//     rejected token, or a dead credential's gate reason with its time
+//     withheld;
+//   - !ok, reason "": nothing to list.
+//
+// Rule R-oauth-account-pool-4.2: workflow/CI/requirements/2026-06-23-oauth-account-pool.md;
+// scenarios: roadmap20260320/技术实现/update/20260924-Codex冷却例外补全与提示显示恢复时间.md
+func (s *poolCooldownStore) accountRecovery(id string, mat vkeys.GroupRuntimeAccount, hasMat bool) (at time.Time, reason string, ok bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.accountRecoveryLocked(id, mat, hasMat, "", "", s.now())
+}
+
+// accountRecoveryLocked is accountRecovery with s.mu held, the clock read once
+// by the caller (a whole route is judged in one snapshot) and, when the caller
+// has one, the member's seat: oauthGroupID/seatID select the hard-revoke
+// tombstones that apply. "" means none — the caller judged the credential
+// itself; tombstones are only ever written with a group and a seat.
+func (s *poolCooldownStore) accountRecoveryLocked(id string, mat vkeys.GroupRuntimeAccount, hasMat bool, oauthGroupID, seatID string, now time.Time) (time.Time, string, bool) {
+	at, reason, ok := s.gateRecoveryLocked(id, mat, hasMat, now)
+	revoked := false
+	if oauthGroupID != "" {
+		_, revoked = s.authFailedTokens[authFailureRouteKey(oauthGroupID, seatID, id)]
+	}
+	// spec: R-oauth-account-pool-4.2 only a temporarily unavailable account carries a time
+	switch {
+	case !vkeys.CredentialUnusable(mat, revoked, now.Unix()):
+		return at, reason, ok
+	case revoked:
+		return time.Time{}, poolRouteRevokedToken, false
+	default:
+		return time.Time{}, reason, false
+	}
+}
+
+// gateRecoveryLocked is when the two self-healing gates have both reopened:
+// the later of the local cooldown and the delivered window wall. Only
+// accountRecoveryLocked may ask it — a reopened gate means nothing for a dead
+// credential, and skipping that check is exactly how a time nobody honors
+// reached members.
+func (s *poolCooldownStore) gateRecoveryLocked(id string, mat vkeys.GroupRuntimeAccount, hasMat bool, now time.Time) (time.Time, string, bool) {
+	local, cooling := s.m[id]
+	cooling = cooling && now.Before(local)
+	delivered := vkeys.QuotaVerdict{State: vkeys.QuotaAvailable}
+	if hasMat {
+		delivered = vkeys.MaterialWindowBlockedUntil(mat, now.Unix())
+	}
+	// spec: R-oauth-account-pool-4.2 the told recovery time is the time routing really releases the account
+	switch delivered.State {
+	case vkeys.QuotaResetUnknown:
+		return time.Time{}, poolRouteWindowExhausted, false
+	case vkeys.QuotaExhausted:
+		wall := time.Unix(delivered.RecoversAt, 0)
+		if !cooling || !local.After(wall) {
+			return wall, poolRouteWindowExhausted, true
+		}
+	case vkeys.QuotaAvailable:
+		// No delivered wall: only the local cooldown can keep it out.
+	}
+	if !cooling {
+		return time.Time{}, "", false
+	}
+	return local, s.meta[id].Status, true
 }
 
 // routeStateSnapshot returns the active whole-account display states. It uses
@@ -1332,36 +1449,45 @@ func (s *poolCooldownStore) consumeLapsed(accountID string) bool {
 }
 
 // routeAccountStates lists, for one route's candidate accounts, why each one is
-// currently not serving: the timed cooldown (status + retry_at from meta/m) or
-// a local auth tombstone ("revoked_token"). Accounts with no local verdict are
-// omitted — an absent line means "nothing local blocks it". Identity comes from
-// the delivered material so the member can act on a name, not a UUID.
-// Read-only; secrets never leave the material map.
+// currently not serving — accountRecovery's answer for this member's seat:
+// status + retry_at (the later of the local cooldown and the delivered window
+// wall, so a line never promises an earlier time than routing will honor), or a
+// status with no retry_at when no time can be promised: a delivered window
+// exhausted without a reset, this seat's rejected token ("revoked_token"), or
+// another dead credential (needs login, expired), which keeps its status.
+// Accounts with nothing to list are omitted. Identity comes from the delivered
+// material so the member can act on a name, not a UUID. Read-only; secrets
+// never leave the material map.
 func (s *poolCooldownStore) routeAccountStates(route *vkeys.ResolvedRoute, routeIDs map[string]bool) []poolAccountStateView {
 	if route == nil || len(routeIDs) == 0 {
 		return nil
 	}
-	tombPrefix := route.OauthGroupID + "|" + route.SeatID + "|"
+	// The resolver's own parse of the delivered runtime. Advisory: when it is
+	// missing or malformed every account keeps its local verdict only — this
+	// read never blocks the 429 it explains. On the 429 path it cannot fail:
+	// resolveGroupCredential runs the same parse first and answers NO_MATERIAL
+	// or NO_CANDIDATES instead.
+	_, material, _ := groupCandidates(route)
 	s.mu.Lock()
 	now := s.now()
 	out := make([]poolAccountStateView, 0, len(routeIDs))
 	for id := range routeIDs {
-		view := poolAccountStateView{AccountID: id}
-		if until, ok := s.m[id]; ok && now.Before(until) {
-			view.RetryAt = until.Unix()
-			if meta, ok := s.meta[id]; ok && meta.Status != "" {
-				view.Status = meta.Status
-			} else {
-				view.Status = "cooldown"
-			}
+		mat, hasMat := material[id]
+		// The seat's tombstone is judged inside the exit (revoked_token), the
+		// same place the pool's time is judged, so a rejected token can never
+		// set the headline time while its own line says "rejected".
+		at, reason, known := s.accountRecoveryLocked(id, mat, hasMat, route.OauthGroupID, route.SeatID, now)
+		if !known && reason == "" {
+			continue
 		}
-		if _, ok := s.authFailedTokens[tombPrefix+id]; ok {
-			view.Status = "revoked_token"
-			view.RetryAt = 0
+		view := poolAccountStateView{AccountID: id, Status: reason}
+		if view.Status == "" {
+			view.Status = "cooldown"
 		}
-		if view.Status != "" {
-			out = append(out, view)
+		if known {
+			view.RetryAt = at.Unix()
 		}
+		out = append(out, view)
 	}
 	s.mu.Unlock()
 	for i := range out {

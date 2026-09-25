@@ -1608,7 +1608,11 @@ func httpHeadViaTransport(targetURL string, rt http.RoundTripper, timeout time.D
 // never got a response.
 func httpHeadViaProxy(targetURL, proxyURL string, timeout time.Duration) error {
 	pURL, err := url.Parse(proxyURL)
-	if err != nil {
+	// D3 甲 (2026-09-24, review-2.4 I-3): a path holding '@' means an unescaped
+	// '/' in the user name or password ended the authority early, so url.Parse
+	// found the wrong host. Refused with the same shared reason, which says to
+	// write '/' as %2F. DEC-master-central-login-15.
+	if err != nil || strings.Contains(pURL.Path, "@") {
 		// Never url.Parse's error: it quotes the URL with its user:password, and
 		// ProbePing hands this text to the caller (classifyNetError echoes any
 		// error it does not recognize). The "invalid proxy URL" prefix is kept:

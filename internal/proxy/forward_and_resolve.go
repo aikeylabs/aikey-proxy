@@ -925,7 +925,11 @@ func (p *Proxy) serveRoute(w http.ResponseWriter, r *http.Request, route *vkeys.
 					// claimed by the cooldown decision before the WAF branch can see it).
 					switch {
 					case ok:
-						windows := windowStatusSampleForResets(route.CredentialID, exhaustedWindowResets(resp.Header, nowT))
+						// One observation feeds both the master's window state and the
+						// scheduling-log row, so the two cannot disagree on the reset
+						// (pinned end to end by TestAccountCooldownEvent_CarriesRawResetAt).
+						fullWindowResets := exhaustedWindowResets(resp.Header, nowT)
+						windows := windowStatusSampleForResets(route.CredentialID, fullWindowResets)
 						p.poolCooldown.markWithStateAndWindows(route.AccountID, until, cooldownRouteState(resp, nowT, until), windows)
 						logger.Warn("pool account cooled down after upstream failure",
 							"event.name", observability.EventProxyGroupAccountCooldown,
@@ -934,7 +938,7 @@ func (p *Proxy) serveRoute(w http.ResponseWriter, r *http.Request, route *vkeys.
 							"status", resp.StatusCode)
 						p.reportSchedEvent(observability.EventProxyGroupAccountCooldown, schedSeverityWarn, schedOriginProvider, "",
 							route.OauthGroupID, route.CredentialID, route.AccountID, route.SeatID, "",
-							map[string]any{"status": resp.StatusCode, "until": until.Unix()})
+							accountCooldownEventDetail(resp.StatusCode, until, fullWindowResets))
 					case resp.StatusCode >= 500:
 						// P0-B (2026-07-19): generic 5xx cools only after CONSECUTIVE
 						// repeats — a single transient 502/503 must not pull a good
@@ -1649,4 +1653,29 @@ func accountEgressErrorMessage(route *vkeys.ResolvedRoute, detail string) string
 		subject += " (" + strings.TrimSpace(route.OAuthIdentity) + ")"
 	}
 	return "AiKey: " + subject + " is signed in, but " + detail
+}
+
+// accountCooldownEventDetail builds the proxy.group.account_cooldown row's
+// detail. `until` is the Worker's LOCAL cooldown deadline; for a full Codex
+// window it is capped at one hour (the Codex exception in
+// R-oauth-account-pool-4), so on its own it hides when the account really
+// recovers. `reset_at` (epoch seconds) is therefore the latest reset among the
+// windows the upstream reported full, taken from the same exhaustedWindowResets
+// observation that feeds the window_statuses the master blocks the account on.
+// It is the upstream's raw reset whenever the upstream sent a readable one. For
+// a full Codex window with no usable reset header, codexWindowReset substitutes
+// now+poolCooldownDefault — a proxy fallback, not an upstream value — and that
+// same substitute is what the master is told, so this row records it as is.
+// No full window (a temporary limit) means no recovery wall to record, so the
+// key is omitted rather than guessed. Additive key only: the master stores
+// detail as raw JSON and the log pages print it verbatim, so older readers
+// simply ignore it.
+// spec: R-oauth-account-pool-4.3.S1 冷却调度事件同时记本地冷却截止和真实恢复时间
+// roadmap20260320/技术实现/update/20260924-Codex冷却例外补全与提示显示恢复时间.md
+func accountCooldownEventDetail(status int, until time.Time, fullWindowResets windowResetObservation) map[string]any {
+	detail := map[string]any{"status": status, "until": until.Unix()}
+	if resetAt := laterTime(fullWindowResets.FiveHour, fullWindowResets.SevenDay); !resetAt.IsZero() {
+		detail["reset_at"] = resetAt.Unix()
+	}
+	return detail
 }

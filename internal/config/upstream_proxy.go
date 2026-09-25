@@ -55,7 +55,11 @@ func ValidateUpstreamProxyURL(raw string) error {
 	}
 	// Single URL (http/https/socks5).
 	u, err := url.Parse(s)
-	if err != nil {
+	// D3 甲 (2026-09-24, review-2.4 I-3): a path holding '@' means an unescaped
+	// '/' in the user name or password ended the authority early, so url.Parse
+	// found the wrong host. Refused with the same shared reason, which says to
+	// write '/' as %2F. DEC-master-central-login-15.
+	if err != nil || strings.Contains(u.Path, "@") {
 		// Named through egress.RedactSpec with the one shared reason, never
 		// url.Parse's error: a *url.Error quotes the whole URL with its
 		// user:password, and this validator answers the settings page's save and

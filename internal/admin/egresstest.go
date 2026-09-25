@@ -106,7 +106,11 @@ func (h *Handler) EgressTest(w http.ResponseWriter, r *http.Request) {
 // the node transport uses it (http.ProxyURL), GETting the echo through it.
 func testThroughURLProxy(r *http.Request, rawURL string) egressTestResult {
 	u, err := url.Parse(rawURL)
-	if err != nil { // unreachable after ValidateUpstreamProxyURL; belt-and-braces
+	// D3 甲 (2026-09-24, review-2.4 I-3): a path holding '@' means an unescaped
+	// '/' in the user name or password ended the authority early, so url.Parse
+	// found the wrong host. Refused with the same shared reason, which says to
+	// write '/' as %2F. DEC-master-central-login-15.
+	if err != nil || strings.Contains(u.Path, "@") { // unreachable after ValidateUpstreamProxyURL; belt-and-braces
 		// Same wording as the validator, and never url.Parse's error: it quotes
 		// the URL with its user:password (DEC-master-central-login-15, Ruling-32).
 		// bugfix: workflow/CI/bugfix/2026-09-24-egress-credentials-echoed-in-errors.md

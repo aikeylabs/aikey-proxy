@@ -107,12 +107,16 @@ type GroupRuntimeAccount struct {
 	Window7dMaxUtilPct *int   `json:"window_7d_max_util_pct,omitempty"`
 	Window7dStatus     string `json:"window_7d_status,omitempty"`
 	Window7dResetAt    *int64 `json:"window_7d_reset_at,omitempty"`
-	// RouteStatus/RouteRetryAt are the proxy's DISPLAY projection of the local
-	// whole-account cooldown that the hot-path resolver already enforces. They
-	// deliberately stay separate from WindowStatus: the latter is master-owned
-	// material and participates in routing, while these fields describe the
-	// locally observed reason/expected recovery time without becoming a second
-	// routing gate. Model-tier cooldowns are never projected at account scope.
+	// RouteStatus/RouteRetryAt are the proxy's DISPLAY projection of why the
+	// hot-path resolver keeps this account out and when it is expected back:
+	// the local whole-account cooldown when there is one, otherwise the
+	// delivered window verdict (window_exhausted until its reset, with no time
+	// when the reset is unknown). One rule writes both fields: supervisor
+	// projectRouteStates (spec R-oauth-account-pool-4.2.S6). They deliberately
+	// stay separate from WindowStatus: the latter is master-owned material and
+	// participates in routing, while these fields only explain gates routing
+	// already applies, without becoming a second routing gate. Model-tier
+	// cooldowns are never projected at account scope.
 	RouteStatus  string `json:"route_status,omitempty"`
 	RouteRetryAt *int64 `json:"route_retry_at,omitempty"`
 	// Util5h/Util7d are the latest provider-reported utilization fractions

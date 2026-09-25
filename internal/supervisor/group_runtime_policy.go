@@ -25,6 +25,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"maps"
 	"net/http"
 	"runtime"
 	"sort"
@@ -180,9 +181,11 @@ func (s *Supervisor) writeGroupRuntimeSnapshot(gen *generation, mks []vault.Mana
 	// Same cooldown view the hot path uses, so is_current_routed reflects cooling failover.
 	var grSkip map[string]bool
 	var routeStates map[string]proxy.PoolAccountRouteState
+	var tombstones []proxy.PoolAuthFailureState
 	if gen.proxy != nil {
 		grSkip = gen.proxy.CooldownSkipSet()
 		routeStates = gen.proxy.CooldownRouteStateSnapshot()
+		tombstones = gen.proxy.AuthFailureRouteSnapshot()
 	}
 	return writeGroupRuntimeForGroupsWithRouteState(
 		s.cfg.Vault.Path,
@@ -192,6 +195,7 @@ func (s *Supervisor) writeGroupRuntimeSnapshot(gen *generation, mks []vault.Mana
 		s.routingOverrides.Assignment,
 		grSkip,
 		routeStates,
+		tombstones,
 	)
 }
 
@@ -380,9 +384,11 @@ func (s *Supervisor) restampCurrentRouted() {
 	// proxy actually forwards to (cooling-driven failover included).
 	var skip map[string]bool
 	var routeStates map[string]proxy.PoolAccountRouteState
+	var tombstones []proxy.PoolAuthFailureState
 	if gen.proxy != nil {
 		skip = gen.proxy.CooldownSkipSet()
 		routeStates = gen.proxy.CooldownRouteStateSnapshot()
+		tombstones = gen.proxy.AuthFailureRouteSnapshot()
 	}
 	nowUnix := time.Now().Unix()
 	for i := range mks {
@@ -397,7 +403,11 @@ func (s *Supervisor) restampCurrentRouted() {
 		newJSON, changed, err := stampGroupRuntimeProjectionJSON(
 			mk.GroupRuntime,
 			computeRoutedAccountID(mk, material, s.routingOverrides.Assignment, skip, nowUnix),
-			routeStates,
+			routeProjectionInput{
+				local:   routeStates,
+				revoked: seatRevokedAccounts(tombstones, mk.OauthGroupID, mk.SeatID),
+				nowUnix: nowUnix,
+			},
 		)
 		if err != nil {
 			slog.Warn("group_runtime restamp parse failed",
@@ -621,48 +631,38 @@ func computeRoutedAccountID(mk vault.ManagedKey, material map[string]vkeys.Group
 // changed=false when nothing moved (caller skips the write). Unparseable input is
 // returned unchanged with the error so a corrupt column can't crash the poll.
 func stampCurrentRoutedJSON(runtimeJSON, routedAccountID string) (string, bool, error) {
-	return stampGroupRuntimeJSON(runtimeJSON, routedAccountID, nil, false)
+	return stampGroupRuntimeJSON(runtimeJSON, routedAccountID, nil)
 }
 
 // stampGroupRuntimeProjectionJSON updates both display projections owned by the
-// local proxy: the selected account and each whole-account cooldown reason.
-// Secrets and master-owned material fields remain byte-equivalent values after
-// the JSON round trip. Missing route state actively clears a prior projection.
-func stampGroupRuntimeProjectionJSON(runtimeJSON, routedAccountID string, routeStates map[string]proxy.PoolAccountRouteState) (string, bool, error) {
-	return stampGroupRuntimeJSON(runtimeJSON, routedAccountID, routeStates, true)
+// local proxy: the selected account and each account's route state
+// (projectRouteStates). Secrets and master-owned material fields remain
+// byte-equivalent values after the JSON round trip. An account nothing keeps
+// out any more has its prior projection actively cleared.
+func stampGroupRuntimeProjectionJSON(runtimeJSON, routedAccountID string, input routeProjectionInput) (stamped string, changed bool, err error) {
+	return stampGroupRuntimeJSON(runtimeJSON, routedAccountID, &input)
 }
 
-func stampGroupRuntimeJSON(runtimeJSON, routedAccountID string, routeStates map[string]proxy.PoolAccountRouteState, projectRouteStates bool) (string, bool, error) {
+// stampGroupRuntimeJSON re-stamps IsCurrentRouted and, when input is non-nil,
+// the route projection; nil leaves route_status / route_retry_at as stored.
+func stampGroupRuntimeJSON(runtimeJSON, routedAccountID string, input *routeProjectionInput) (stamped string, changed bool, err error) {
 	if runtimeJSON == "" || runtimeJSON == "{}" {
 		return runtimeJSON, false, nil
 	}
 	var m map[string]vkeys.GroupRuntimeAccount
-	if err := json.Unmarshal([]byte(runtimeJSON), &m); err != nil {
+	err = json.Unmarshal([]byte(runtimeJSON), &m)
+	if err != nil {
 		return runtimeJSON, false, err
 	}
-	changed := false
 	for id, acc := range m {
-		want := id == routedAccountID
-		if acc.IsCurrentRouted != want {
+		if want := id == routedAccountID; acc.IsCurrentRouted != want {
 			acc.IsCurrentRouted = want
+			m[id] = acc
 			changed = true
 		}
-		if projectRouteStates {
-			state, cooling := routeStates[id]
-			if cooling {
-				if acc.RouteStatus != state.Status || acc.RouteRetryAt == nil || *acc.RouteRetryAt != state.RetryAt {
-					acc.RouteStatus = state.Status
-					retryAt := state.RetryAt
-					acc.RouteRetryAt = &retryAt
-					changed = true
-				}
-			} else if acc.RouteStatus != "" || acc.RouteRetryAt != nil {
-				acc.RouteStatus = ""
-				acc.RouteRetryAt = nil
-				changed = true
-			}
-		}
-		m[id] = acc
+	}
+	if input != nil && projectRouteStates(m, *input) {
+		changed = true
 	}
 	if !changed {
 		return runtimeJSON, false, nil
@@ -683,10 +683,14 @@ func stampGroupRuntimeJSON(runtimeJSON, routedAccountID string, routeStates map[
 // skip is the current cooldown view (proxy.CooldownSkipSet) so the routed stamp reflects
 // cooling-driven failover, matching the hot path (nil → no cooldown view).
 func writeGroupRuntimeForGroups(dbPath string, derivedKey []byte, mks []vault.ManagedKey, groups []grGroup, overrideFor func(seatID, groupID string) string, skip map[string]bool) error {
-	return writeGroupRuntimeForGroupsWithRouteState(dbPath, derivedKey, mks, groups, overrideFor, skip, nil)
+	return writeGroupRuntimeForGroupsWithRouteState(dbPath, derivedKey, mks, groups, overrideFor, skip, nil, nil)
 }
 
-func writeGroupRuntimeForGroupsWithRouteState(dbPath string, derivedKey []byte, mks []vault.ManagedKey, groups []grGroup, overrideFor func(seatID, groupID string) string, skip map[string]bool, routeStates map[string]proxy.PoolAccountRouteState) error {
+// writeGroupRuntimeForGroupsWithRouteState is writeGroupRuntimeForGroups plus the
+// route projection (projectRouteStates) each VK's column carries: routeStates are
+// the Worker's whole-account cooldowns, tombstones its member-scoped hard-revoke
+// records (proxy.AuthFailureRouteSnapshot).
+func writeGroupRuntimeForGroupsWithRouteState(dbPath string, derivedKey []byte, mks []vault.ManagedKey, groups []grGroup, overrideFor func(seatID, groupID string) string, skip map[string]bool, routeStates map[string]proxy.PoolAccountRouteState, tombstones []proxy.PoolAuthFailureState) error {
 	// group_id → its locally-known managed keys (need the whole mk for SeatID +
 	// GroupAccounts to compute the per-seat routed account, not just the VK id).
 	mksByGroup := make(map[string][]vault.ManagedKey)
@@ -707,10 +711,19 @@ func writeGroupRuntimeForGroupsWithRouteState(dbPath string, derivedKey []byte, 
 		// fed the FRESH material map being written (not the stale stored column) so the
 		// stamp's usability gates see exactly what the hot path will read next.
 		base := buildGroupRuntimeMap(derivedKey, g.Accounts)
-		applyPoolRouteStates(base, routeStates)
 		nowUnix := time.Now().Unix()
 		for _, mk := range groupMks {
-			jsonVal, err := marshalGroupRuntime(base, computeRoutedAccountID(mk, base, overrideFor, skip, nowUnix))
+			// The route projection is per seat too: whether an account's credential
+			// is dead depends on the token THIS member holds (hard-revoke tombstones
+			// are keyed by seat). It is the same rule the restamp applies, so the
+			// column reads the same after a material pull as after a cooldown change.
+			material := maps.Clone(base)
+			projectRouteStates(material, routeProjectionInput{
+				local:   routeStates,
+				revoked: seatRevokedAccounts(tombstones, mk.OauthGroupID, mk.SeatID),
+				nowUnix: nowUnix,
+			})
+			jsonVal, err := marshalGroupRuntime(material, computeRoutedAccountID(mk, material, overrideFor, skip, nowUnix))
 			if err != nil {
 				return err
 			}
@@ -741,17 +754,118 @@ func writeGroupRuntimeForGroupsWithRouteState(dbPath string, derivedKey []byte, 
 	return nil
 }
 
-func applyPoolRouteStates(material map[string]vkeys.GroupRuntimeAccount, routeStates map[string]proxy.PoolAccountRouteState) {
+// routeStatusWindowExhausted is the route_status word the member page renders
+// as "quota window exhausted" (aikey-control web
+// src/pages/user/_shared/PoolAccountList.tsx, case 'window_exhausted'). The
+// Worker's own cooldown writes the same word (poolRouteWindowExhausted in
+// package proxy); it is spelled again here only because that vocabulary is
+// private to package proxy. The page is the contract both copies answer to, so
+// the fence pins the literal, not this constant. Never string(verdict.State):
+// that is the verdict's own vocabulary ("exhausted"), which the page does not
+// show as exhausted.
+const routeStatusWindowExhausted = "window_exhausted"
+
+// routeProjectionInput is what the route projection reads for ONE seat's group
+// material, captured once per writer pass so every account in it is judged
+// against the same instant.
+type routeProjectionInput struct {
+	// local is the Worker's own whole-account cooldowns with their display
+	// reason and time (proxy.CooldownRouteStateSnapshot).
+	local map[string]proxy.PoolAccountRouteState
+	// revoked holds the accounts whose token THIS seat holds and the upstream
+	// already rejected (seatRevokedAccounts).
+	revoked map[string]bool
+	nowUnix int64
+}
+
+// projectRouteStates sets the member page's route projection (route_status,
+// route_retry_at) on every account of one seat's group material and reports
+// whether any account changed. It is the only rule for those two fields: the
+// material write and the reactive restamp both call it, so the page cannot
+// read one answer after a material pull and another after a cooldown change.
+func projectRouteStates(material map[string]vkeys.GroupRuntimeAccount, input routeProjectionInput) bool {
+	changed := false
 	for id, acc := range material {
-		state, ok := routeStates[id]
-		if !ok || state.Status == "" {
-			acc.RouteStatus = ""
-			acc.RouteRetryAt = nil
-		} else {
-			acc.RouteStatus = state.Status
-			retryAt := state.RetryAt
-			acc.RouteRetryAt = &retryAt
+		status, retryAt := input.routeProjection(id, acc)
+		if acc.RouteStatus == status && sameEpoch(acc.RouteRetryAt, retryAt) {
+			continue
 		}
+		acc.RouteStatus, acc.RouteRetryAt = status, retryAt
 		material[id] = acc
+		changed = true
 	}
+	return changed
+}
+
+// routeProjection is the (route_status, route_retry_at) the page shows for one
+// account; a nil retryAt means the key is absent.
+//
+//   - The Worker holds a whole-account cooldown on it: that cooldown's own
+//     reason and time, as before.
+//   - Otherwise, its credential is dead for this seat
+//     (vkeys.CredentialUnusable: a rejected token, no token, an expired
+//     token): nothing. No window reopening re-admits it, so "exhausted, back
+//     at X" would promise a return that never comes — the rule the pool's 429
+//     recovery time follows too (Ruling-70, Ruling-74).
+//   - Otherwise the delivered window verdict, through the exit the picker
+//     itself uses (vkeys.MaterialWindowBlockedUntil): exhausted →
+//     window_exhausted until that reset; reset unknown → window_exhausted with
+//     no time (absent, never 0, which a reader would show as 1970); available
+//     → nothing.
+//
+// A local cooldown that ends before a later delivered wall shows as the local
+// state until it lapses, then as the delivered one. Folding the two into the
+// later time is the pool recovery exit's job (accountRecovery in package
+// proxy); a second copy of that fold here is exactly what the single exit
+// forbids.
+//
+// spec: R-oauth-account-pool-4.2.S6 the page's exhausted mark follows the real release
+// roadmap20260320/技术实现/update/20260924-Codex冷却例外补全与提示显示恢复时间.md
+func (in routeProjectionInput) routeProjection(id string, acc vkeys.GroupRuntimeAccount) (status string, retryAt *int64) {
+	if local, cooling := in.local[id]; cooling {
+		at := local.RetryAt
+		return local.Status, &at
+	}
+	if vkeys.CredentialUnusable(acc, in.revoked[id], in.nowUnix) {
+		return "", nil
+	}
+	switch verdict := vkeys.MaterialWindowBlockedUntil(acc, in.nowUnix); verdict.State {
+	case vkeys.QuotaExhausted:
+		recoversAt := verdict.RecoversAt
+		return routeStatusWindowExhausted, &recoversAt
+	case vkeys.QuotaResetUnknown:
+		return routeStatusWindowExhausted, nil
+	case vkeys.QuotaAvailable:
+		// Nothing keeps it out.
+	}
+	return "", nil
+}
+
+// sameEpoch reports whether two optional unix times say the same thing: both
+// absent, or both present and equal.
+func sameEpoch(a, b *int64) bool {
+	if a == nil || b == nil {
+		return a == b
+	}
+	return *a == *b
+}
+
+// seatRevokedAccounts picks one seat's hard-revoke tombstones out of the
+// proxy's member-scoped snapshot: the accounts whose token THIS member holds
+// and the upstream already rejected. The key is the tombstone's own (group,
+// seat, account) — one Worker can hold several seats of the same pool, and
+// their tokens differ. A tombstone counts while it exists, exactly as the pool
+// recovery exit reads it (accountRecoveryLocked in package proxy).
+func seatRevokedAccounts(tombstones []proxy.PoolAuthFailureState, oauthGroupID, seatID string) map[string]bool {
+	var out map[string]bool
+	for _, ts := range tombstones {
+		if ts.OAuthGroupID != oauthGroupID || ts.SeatID != seatID {
+			continue
+		}
+		if out == nil {
+			out = make(map[string]bool)
+		}
+		out[ts.AccountID] = true
+	}
+	return out
 }

@@ -62,9 +62,18 @@ func TestBuildTransportStrict_ErrorsNeverEchoProxyCredentials(t *testing.T) {
 		want        []string // what the error must still name
 		unparseable bool     // must wrap egress.ErrUnparseableProxyURL (Ruling-35)
 	}{
+		// D2 甲: a port that is not a number hides host:port.
 		{"single URL with a port that is not a number",
 			"http://" + redactCred + "proxy.example.test:abc",
-			[]string{"http://proxy.example.test:abc"}, true},
+			[]string{"(unparseable)"}, true},
+		{"single URL written backwards (host:port@user:password)",
+			"http://proxy.example.test:3128@" + redactUser + ":" + redactPass,
+			[]string{"(unparseable)"}, true},
+		// D3 甲: parses into the wrong host "u-MARK7:12"; used to build a
+		// transport pointed at it, logged as http://proxy.example.test:3128.
+		{"single URL with an unescaped slash, digits before it",
+			"http://" + redactUser + ":12/" + redactPass + "@proxy.example.test:3128",
+			[]string{"http://proxy.example.test:3128", "%2F"}, true},
 		{"single URL with a slash in the password",
 			"http://" + redactUser + ":" + redactPass + "/x@proxy.example.test:3128",
 			[]string{"http://proxy.example.test:3128"}, true},

@@ -710,8 +710,10 @@ func TestGroupServe_TemporaryCooldownAdvertisesRetryAndAutoRecovers(t *testing.T
 	if errorBody.Error.RetryAfterSeconds != 2 || errorBody.Error.RetryAt != now.Add(2*time.Second).Unix() || errorBody.Error.RetryReason != poolRouteRateLimited {
 		t.Fatalf("all-cooldown retry details = %+v", errorBody.Error)
 	}
-	if !strings.Contains(errorBody.Error.Message, "retried in 2 seconds") {
-		t.Fatalf("all-cooldown message must expose recovery delay: %q", errorBody.Error.Message)
+	// The text names the recovery time, not a raw second count (UD-97, 2026-09-24;
+	// spec: R-oauth-account-pool-4.2.S3).
+	if !strings.Contains(errorBody.Error.Message, "The earliest one is expected to be available again in about 2 s (2025-06-15T15:06:42Z).") {
+		t.Fatalf("all-cooldown message must expose the recovery time: %q", errorBody.Error.Message)
 	}
 	if tr.calls != 0 {
 		t.Fatalf("cooling account must not reach upstream, calls=%d", tr.calls)

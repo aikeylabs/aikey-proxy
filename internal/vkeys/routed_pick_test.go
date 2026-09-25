@@ -168,6 +168,123 @@ func TestMaterialUsable_ExhaustedWindowResetBoundary(t *testing.T) {
 	}
 }
 
+// Fence for the ONE exit of "until when does the master-delivered window state
+// keep this account out" (spec: R-oauth-account-pool-4.2.S1 /
+// R-oauth-account-pool-4.2.S2; rule R4.2 in workflow/CI/requirements/
+// 2026-06-23-oauth-account-pool.md, scenarios in roadmap20260320/技术实现/update/
+// 20260924-Codex冷却例外补全与提示显示恢复时间.md). Each row pins the WHOLE
+// verdict — the state, and RecoversAt, which must stay 0 outside QuotaExhausted —
+// and asserts that the verdict's "blocked" equals MaterialWindowBlockedAt, the
+// picker's gate: the recovery time members are told must be the time the picker
+// releases the account. Combining with the Worker's local cooldown is the
+// proxy's job and is not covered here.
+func TestMaterialWindowBlockedUntil_LaterWallAndParity(t *testing.T) {
+	now := int64(1_000_000)
+	in1h := now + 3600
+	in3h := now + 3*3600
+	in3d := now + 3*24*3600
+	past := now - 1
+	zero := int64(0)
+	fresh := GroupRuntimeAccount{CredentialType: "oauth_account", ExpiresAt: in3d}
+	available := QuotaVerdict{State: QuotaAvailable}
+	resetUnknown := QuotaVerdict{State: QuotaResetUnknown}
+	exhaustedUntil := func(at int64) QuotaVerdict { return QuotaVerdict{State: QuotaExhausted, RecoversAt: at} }
+
+	tests := []struct {
+		name string
+		mat  GroupRuntimeAccount
+		want QuotaVerdict
+	}{
+		// One window exhausted.
+		{
+			name: "S1 delivered half: 5h exhausted, resets in 3 h -> blocked until that reset",
+			mat:  withWindowState(fresh, "exhausted_current_window", &in3h, "active", nil),
+			want: exhaustedUntil(in3h),
+		},
+		{
+			name: "7d exhausted alone -> blocked until its reset",
+			mat:  withWindowState(fresh, "active", nil, "exhausted_current_window", &in3d),
+			want: exhaustedUntil(in3d),
+		},
+		// Both exhausted: the later wall wins, whichever window it is.
+		{
+			name: "S2-1 5h resets in 1 h, 7d in 3 d -> 3 d, never 1 h",
+			mat:  withWindowState(fresh, "exhausted_current_window", &in1h, "exhausted_current_window", &in3d),
+			want: exhaustedUntil(in3d),
+		},
+		{
+			name: "both exhausted, 5h is the later wall -> 5h reset",
+			mat:  withWindowState(fresh, "exhausted_current_window", &in3h, "exhausted_current_window", &in1h),
+			want: exhaustedUntil(in3h),
+		},
+		// One exhausted, the other already past its reset.
+		{
+			name: "5h past its reset, 7d still exhausted -> 7d reset",
+			mat:  withWindowState(fresh, "exhausted_current_window", &past, "exhausted_current_window", &in3d),
+			want: exhaustedUntil(in3d),
+		},
+		{
+			name: "exactly at reset the half-open probe is admitted -> not blocked",
+			mat:  withWindowState(fresh, "exhausted_current_window", &now, "active", nil),
+			want: available,
+		},
+		// Exhausted without a reset: blocked, deadline unknown, never invented.
+		{
+			name: "S2-2 legacy exhausted without reset -> blocked, deadline unknown",
+			mat:  withWindowState(fresh, "exhausted", nil, "active", nil),
+			want: resetUnknown,
+		},
+		{
+			name: "non-positive reset counts as missing -> blocked, deadline unknown",
+			mat:  withWindowState(fresh, "exhausted_current_window", &zero, "active", nil),
+			want: resetUnknown,
+		},
+		{
+			// The reset-less window still blocks after the 7d reset passes (until
+			// the control plane delivers a new state), so "in 3 d" would promise a
+			// release the gate will not perform then.
+			name: "reset-less exhausted window outlasts a known wall -> deadline unknown",
+			mat:  withWindowState(fresh, "exhausted_current_window", nil, "exhausted_current_window", &in3d),
+			want: resetUnknown,
+		},
+		{
+			// Ruling-65 is symmetric: the same holds with the windows swapped.
+			name: "mirror: 7d reset-less outlasts a known 5h wall -> deadline unknown",
+			mat:  withWindowState(fresh, "exhausted_current_window", &in3h, "exhausted_current_window", nil),
+			want: resetUnknown,
+		},
+		{
+			// A recovered window carries its NEXT reset (Master active/R3, Worker
+			// vault R3), so this input is the common case, not a corner.
+			name: "an active window's later reset is not a wall -> exhausted 5h reset",
+			mat:  withWindowState(fresh, "exhausted_current_window", &in1h, "active", &in3d),
+			want: exhaustedUntil(in1h),
+		},
+		// Neither exhausted.
+		{
+			name: "neither window exhausted, resets present -> not blocked",
+			mat:  withWindowState(fresh, "active", &in1h, "active", &in3d),
+			want: available,
+		},
+		{
+			name: "no window state at all -> not blocked",
+			mat:  fresh,
+			want: available,
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			got := MaterialWindowBlockedUntil(tc.mat, now)
+			if got != tc.want {
+				t.Fatalf("MaterialWindowBlockedUntil()=%+v, want %+v", got, tc.want)
+			}
+			if gate := MaterialWindowBlockedAt(tc.mat, now); gate != (got.State != QuotaAvailable) {
+				t.Fatalf("parity broken: verdict %+v, MaterialWindowBlockedAt=%v", got, gate)
+			}
+		})
+	}
+}
+
 func withWindowState(mat GroupRuntimeAccount, status5h string, reset5h *int64, status7d string, reset7d *int64) GroupRuntimeAccount {
 	mat.WindowStatus = status5h
 	mat.WindowResetAt = reset5h

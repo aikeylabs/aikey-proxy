@@ -155,6 +155,44 @@ func MaterialWindowExhausted(mat GroupRuntimeAccount) bool {
 	return WindowExhausted(mat.WindowStatus) || WindowExhausted(mat.Window7dStatus)
 }
 
+// QuotaState is the verdict of MaterialWindowBlockedUntil — a closed set. The
+// names and strings are the control plane's devicerouting.QuotaState verbatim
+// (aikey-control-master service/internal/devicerouting/quota.go): both
+// processes judge the same two window columns, so they share one vocabulary and
+// one precedence, and a log line reads the same on either side.
+type QuotaState string
+
+const (
+	// QuotaAvailable — no delivered window blocks the account right now.
+	QuotaAvailable QuotaState = "available"
+	// QuotaExhausted — an exhausted window blocks it until
+	// QuotaVerdict.RecoversAt.
+	QuotaExhausted QuotaState = "exhausted"
+	// QuotaResetUnknown — an exhausted window blocks it and carries no reset
+	// time, so nobody can say when it recovers. Blocked (fail-closed), and
+	// never a time.
+	QuotaResetUnknown QuotaState = "reset_unknown"
+)
+
+// QuotaVerdict is one account's delivered-window verdict at one instant.
+//
+// Callers branch on State; State is the only answer to "is it blocked".
+// RecoversAt is 0 unless State is QuotaExhausted, so never test
+// RecoversAt == 0 to mean "not blocked" (QuotaResetUnknown is blocked with
+// RecoversAt 0), and never turn a 0 into a time. Combined with another
+// deadline (the Worker's local cooldown), unknown stays unknown: the later of
+// "in 1 h" and "unknown" is "unknown".
+//
+// Unlike the control plane's verdict it carries no UnknownWindows: no proxy
+// caller reports which window lacks a reset.
+type QuotaVerdict struct {
+	State QuotaState
+	// RecoversAt is unix seconds on the same clock as nowUnix, set only for
+	// QuotaExhausted: the moment every exhausted window has reset — the LATER
+	// reset when both are (R-oauth-account-pool-52.1).
+	RecoversAt int64
+}
+
 // MaterialWindowBlockedAt applies an exhausted status only until that same
 // window's authoritative reset. Master snapshots are eventually consistent:
 // after reset_at, the old exhausted value can still be present in a Worker's
@@ -162,17 +200,82 @@ func MaterialWindowExhausted(mat GroupRuntimeAccount) bool {
 // what observes the provider's new window and lets Path Z converge Master back
 // to active. A legacy exhausted value without a reset stays fail-closed.
 //
+// It delegates to MaterialWindowBlockedUntil so the picker's gate and the
+// recovery time members are told remain ONE judgment and cannot drift apart.
+//
 // Contract: workflow/CI/bugfix/2026-08-27-oauth-pool-quota-state-convergence.md
 func MaterialWindowBlockedAt(mat GroupRuntimeAccount, nowUnix int64) bool {
-	return exhaustedWindowBlocksAt(mat.WindowStatus, mat.WindowResetAt, nowUnix) ||
-		exhaustedWindowBlocksAt(mat.Window7dStatus, mat.Window7dResetAt, nowUnix)
+	return MaterialWindowBlockedUntil(mat, nowUnix).State != QuotaAvailable
 }
 
-func exhaustedWindowBlocksAt(status string, resetAt *int64, nowUnix int64) bool {
-	if !WindowExhausted(status) {
-		return false
+// MaterialWindowBlockedUntil is the single exit for "until when does the
+// master-delivered window state keep this account out". Every caller that
+// needs the recovery time must go through it; a second derivation is how the
+// device path came to report the EARLIER reset while the picker waited for the
+// later one.
+//
+// The verdict folds the two windows with the control plane's precedence
+// (devicerouting.PoolAccount.QuotaAt):
+//
+//   - an exhausted window with no reset → QuotaResetUnknown, even when the
+//     other window has a known reset: it keeps blocking after that reset
+//     passes, until the control plane delivers a new state, so a time would
+//     promise a release the gate will not perform then;
+//   - else an exhausted window before its reset → QuotaExhausted, RecoversAt =
+//     the LATEST such reset. A window that is not exhausted is no wall,
+//     however late its next reset;
+//   - else QuotaAvailable.
+//
+// MaterialWindowBlockedAt is exactly State != QuotaAvailable. The Worker's
+// local cooldown is not an input; QuotaVerdict says how a caller combines it.
+//
+// spec: R-oauth-account-pool-4.2.S1 the later wall wins (delivered half)
+// spec: R-oauth-account-pool-4.2.S2 a missing reset is never a made-up time
+// Rule R4.2: workflow/CI/requirements/2026-06-23-oauth-account-pool.md;
+// scenarios: roadmap20260320/技术实现/update/20260924-Codex冷却例外补全与提示显示恢复时间.md
+func MaterialWindowBlockedUntil(mat GroupRuntimeAccount, nowUnix int64) QuotaVerdict {
+	var recoversAt int64
+	var resetUnknown bool
+	for _, w := range [...]struct {
+		status  string
+		resetAt *int64
+	}{
+		{mat.WindowStatus, mat.WindowResetAt},
+		{mat.Window7dStatus, mat.Window7dResetAt},
+	} {
+		switch v := windowQuotaVerdict(w.status, w.resetAt, nowUnix); v.State {
+		case QuotaResetUnknown:
+			resetUnknown = true
+		case QuotaExhausted:
+			recoversAt = max(recoversAt, v.RecoversAt)
+		case QuotaAvailable:
+			// No wall, whatever reset the window carries.
+		}
 	}
-	return resetAt == nil || *resetAt <= 0 || nowUnix < *resetAt
+	switch {
+	case resetUnknown:
+		return QuotaVerdict{State: QuotaResetUnknown}
+	case recoversAt > 0:
+		return QuotaVerdict{State: QuotaExhausted, RecoversAt: recoversAt}
+	default:
+		return QuotaVerdict{State: QuotaAvailable}
+	}
+}
+
+// windowQuotaVerdict judges ONE window. An exhausted window blocks until its own
+// reset, exclusive: at the reset second the lazy half-open probe is admitted. A
+// reset-less (or non-positive) exhausted value blocks with no known end.
+func windowQuotaVerdict(status string, resetAt *int64, nowUnix int64) QuotaVerdict {
+	switch {
+	case !WindowExhausted(status):
+		return QuotaVerdict{State: QuotaAvailable}
+	case resetAt == nil || *resetAt <= 0:
+		return QuotaVerdict{State: QuotaResetUnknown}
+	case nowUnix < *resetAt:
+		return QuotaVerdict{State: QuotaExhausted, RecoversAt: *resetAt}
+	default:
+		return QuotaVerdict{State: QuotaAvailable}
+	}
 }
 
 // MaterialExpired reports whether an OAuth account's material is stale

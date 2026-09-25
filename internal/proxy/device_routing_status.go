@@ -363,7 +363,11 @@ func deviceRoutingAccountCode(state vkeys.OverrideState) string {
 // every relay guess, and guessing is what the pre-check exists to avoid.
 func (p *Proxy) deviceRoutingRetryHorizon(route *vkeys.ResolvedRoute, pinned string) (seconds int, retryAt int64, reason string) {
 	only := map[string]bool{pinned: true}
-	if s, at, why, ok := p.poolCooldown.earliestRetryAdvice(only, only); ok {
+	// nil material and no seat: this horizon reads the delivered window itself,
+	// below, and a dead pinned credential never gets here (ClassifyOverride
+	// answers credential_unusable first), so the store is asked for the local
+	// cooldown alone.
+	if s, at, why, ok := p.poolCooldown.earliestRetryAdvice(only, nil, "", ""); ok {
 		if why == "" {
 			why = poolRouteRateLimited
 		}

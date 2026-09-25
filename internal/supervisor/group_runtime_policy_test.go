@@ -8,6 +8,7 @@ import (
 	"errors"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -553,9 +554,9 @@ func TestStampCurrentRoutedJSON_FlipsFlagInPlace(t *testing.T) {
 func TestStampGroupRuntimeProjection_ProjectsAndClearsCooldownState(t *testing.T) {
 	orig := `{"a1":{"credential_type":"oauth_account","secret_ciphertext":"ZZ","is_current_routed":true},"a2":{"credential_type":"oauth_account","secret_ciphertext":"YY"}}`
 	resetAt := int64(1_750_003_600)
-	out, changed, err := stampGroupRuntimeProjectionJSON(orig, "a2", map[string]proxy.PoolAccountRouteState{
+	out, changed, err := stampGroupRuntimeProjectionJSON(orig, "a2", routeProjectionInput{local: map[string]proxy.PoolAccountRouteState{
 		"a1": {Status: "window_exhausted", RetryAt: resetAt},
-	})
+	}})
 	if err != nil || !changed {
 		t.Fatalf("project: changed=%v err=%v", changed, err)
 	}
@@ -573,7 +574,7 @@ func TestStampGroupRuntimeProjection_ProjectsAndClearsCooldownState(t *testing.T
 		t.Fatalf("projection must not alter secrets: %+v", projected["a1"])
 	}
 
-	cleared, changed, err := stampGroupRuntimeProjectionJSON(out, "a1", nil)
+	cleared, changed, err := stampGroupRuntimeProjectionJSON(out, "a1", routeProjectionInput{})
 	if err != nil || !changed {
 		t.Fatalf("clear: changed=%v err=%v", changed, err)
 	}
@@ -725,5 +726,227 @@ func TestWriteGroupRuntimeSnapshot_SerializesWithReactiveRestamp(t *testing.T) {
 	}
 	if !got["a2"].IsCurrentRouted || got["a1"].IsCurrentRouted {
 		t.Fatalf("material writer reverted newest route; runtime=%s", gotJSON)
+	}
+}
+
+// TestProjectRouteStates_DeliveredBlockedShowsExhausted fences
+// R-oauth-account-pool-4.2.S6: the member page's "quota window exhausted" mark
+// follows the time routing really releases an account.
+//
+// A Codex window cools on the Worker for at most an hour, while the delivered
+// window state keeps the account out until the real reset. The page took its
+// mark from the Worker's own cooldown alone, so the mark vanished after that
+// hour although routing still refused the account.
+//
+// Both writers of the column run through their production entry points: the
+// material write (writeGroupRuntimeSnapshot) and the reactive restamp
+// (restampCurrentRouted). They share a real vault and a real proxy whose
+// cooldowns and hard-revoke tombstones are hydrated from pool-cooldown.json,
+// the restart path the supervisor re-projects at startup. One table serves
+// both writers: the page must not see one rule after a material pull and
+// another after a cooldown change.
+//
+// The expected words are literals on purpose. "window_exhausted" is what the
+// page renders (aikey-control web PoolAccountList.tsx), so a projection that
+// wrote the verdict's own vocabulary ("exhausted") turns this red. "No time"
+// means the key is absent, never 0, which a reader would render as 1970.
+//
+// Rule R4.2: workflow/CI/requirements/2026-06-23-oauth-account-pool.md;
+// scenario S6: roadmap20260320/技术实现/update/20260924-Codex冷却例外补全与提示显示恢复时间.md
+func TestProjectRouteStates_DeliveredBlockedShowsExhausted(t *testing.T) {
+	const groupID, seatID, vkID = "grp-s6", "seat-s6", "vk-s6"
+	const exhausted = "window_exhausted"    // the page's word, see above
+	const full = "exhausted_current_window" // master's window status
+	now := time.Now().Unix()
+	at := func(v int64) *int64 { return &v }
+	inHour, in3h, in3d := now+3600, now+3*3600, now+3*24*3600
+	localUntil := now + 1800
+
+	// codex is one delivered account holding a live token; edit shapes it.
+	codex := func(edit func(*vkeys.GroupRuntimeAccount)) vkeys.GroupRuntimeAccount {
+		m := vkeys.GroupRuntimeAccount{CredentialType: "oauth_account", ExpiresAt: now + 24*3600}
+		edit(&m)
+		return m
+	}
+	fiveHourFull := func(reset *int64) func(*vkeys.GroupRuntimeAccount) {
+		return func(m *vkeys.GroupRuntimeAccount) { m.WindowStatus, m.WindowResetAt = full, reset }
+	}
+
+	type projection struct {
+		status  string
+		retryAt *int64 // nil: the key must be absent
+	}
+	rows := []struct {
+		id    string
+		mat   vkeys.GroupRuntimeAccount // delivered material (plaintext flags only)
+		stale projection                // the column before the restamp (restamp only)
+		want  projection
+	}{
+		// S6: the Worker's own cooldown lapsed (pool-cooldown.json still lists it
+		// with a past deadline) and the delivered window holds the account for
+		// 3 h more. The stale time is NOT the answer, so keeping it cannot pass.
+		{id: "acc-local-lapsed", mat: codex(fiveHourFull(at(in3h))),
+			stale: projection{exhausted, at(now - 60)}, want: projection{exhausted, at(in3h)}},
+		// Both windows full: the time is the LATER reset, from the single exit,
+		// not the 5h window_reset_at the page falls back to on its own.
+		{id: "acc-later-wall", mat: codex(func(m *vkeys.GroupRuntimeAccount) {
+			m.WindowStatus, m.WindowResetAt = full, at(inHour)
+			m.Window7dStatus, m.Window7dResetAt = full, at(in3d)
+		}), want: projection{exhausted, at(in3d)}},
+		// Full without a reset: exhausted, and no time at all.
+		{id: "acc-reset-unknown", mat: codex(fiveHourFull(nil)), want: projection{exhausted, nil}},
+		// A known reset on the OTHER window is still no time: that reset does
+		// not release the account (Ruling-65).
+		{id: "acc-reset-unknown-7d-known", mat: codex(func(m *vkeys.GroupRuntimeAccount) {
+			m.WindowStatus = full
+			m.Window7dStatus, m.Window7dResetAt = full, at(in3d)
+		}), want: projection{exhausted, nil}},
+		// Dead for this member (Ruling-74): no window reopening re-admits it, so
+		// it gets no delivered mark and keeps what it showed before — nothing,
+		// as it holds no local cooldown.
+		{id: "acc-needs-login", mat: codex(func(m *vkeys.GroupRuntimeAccount) {
+			fiveHourFull(at(in3h))(m)
+			m.NeedsLogin = true
+		}), stale: projection{exhausted, at(in3h)}, want: projection{}},
+		{id: "acc-token-expired", mat: codex(func(m *vkeys.GroupRuntimeAccount) {
+			fiveHourFull(at(in3h))(m)
+			m.ExpiresAt = now - 60
+		}), want: projection{}},
+		{id: "acc-revoked", mat: codex(fiveHourFull(at(in3h))), want: projection{}},
+		// A live cooldown of the Worker's own keeps its projection unchanged,
+		// even though the delivered wall is later: this task's ruling keeps the
+		// local branch as it was.
+		{id: "acc-local-cooling", mat: codex(fiveHourFull(at(in3h))),
+			want: projection{"rate_limited", at(localUntil)}},
+		// Nothing blocks it any more: an old mark is cleared.
+		{id: "acc-available", mat: codex(func(m *vkeys.GroupRuntimeAccount) {
+			m.WindowStatus, m.WindowResetAt = "active", at(now+7200)
+		}), stale: projection{exhausted, at(now + 600)}, want: projection{}},
+		// The reset has passed: routing lets one probe through, so the page
+		// must not keep "exhausted" either.
+		{id: "acc-reset-passed", mat: codex(fiveHourFull(at(now - 60))),
+			stale: projection{exhausted, at(now - 60)}, want: projection{}},
+	}
+
+	// The Worker's own truth, hydrated through the real restart path.
+	runDir := t.TempDir()
+	t.Setenv("AIKEY_RUN_DIR", runDir)
+	cooldowns, err := json.Marshal(map[string]any{
+		"accounts": map[string]int64{"acc-local-cooling": localUntil, "acc-local-lapsed": now - 60},
+		"account_states": map[string]proxy.PoolAccountRouteState{
+			"acc-local-cooling": {Status: "rate_limited", RetryAt: localUntil},
+			"acc-local-lapsed":  {Status: exhausted, RetryAt: now - 60},
+		},
+		// A fingerprint, not a token: the tombstone never stores token material.
+		"auth_failed_tokens": map[string]string{groupID + "|" + seatID + "|acc-revoked": strings.Repeat("ab", 32)},
+		"written_at":         time.Now().UnixMilli(),
+	})
+	if err != nil {
+		t.Fatalf("marshal pool-cooldown.json: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(runDir, "pool-cooldown.json"), cooldowns, 0o600); err != nil {
+		t.Fatalf("write pool-cooldown.json: %v", err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	poolState := proxy.NewOAuthPoolRuntimeState()
+	t.Cleanup(func() {
+		cancel()
+		_ = poolState.Shutdown()
+	})
+	worker := proxy.NewWithOAuthPoolRuntime(nil, nil, nil, nil, ctx, poolState)
+	// Preconditions: the projection reads exactly this truth, or the dead and
+	// local rows below would pass for the wrong reason.
+	if got := worker.CooldownRouteStateSnapshot(); len(got) != 1 || got["acc-local-cooling"].Status != "rate_limited" {
+		t.Fatalf("hydrated local cooldowns = %+v, want only acc-local-cooling", got)
+	}
+	if got := worker.AuthFailureRouteSnapshot(); len(got) != 1 || got[0].AccountID != "acc-revoked" {
+		t.Fatalf("hydrated tombstones = %+v, want only acc-revoked", got)
+	}
+
+	stored := make(map[string]vkeys.GroupRuntimeAccount, len(rows))
+	wires := make([]grAccount, 0, len(rows))
+	for _, r := range rows {
+		m := r.mat
+		m.RouteStatus, m.RouteRetryAt = r.stale.status, r.stale.retryAt
+		stored[r.id] = m
+		wires = append(wires, grAccount{
+			AccountID: r.id, CredentialType: r.mat.CredentialType, NeedsLogin: r.mat.NeedsLogin,
+			AccessToken: "tok-" + r.id, ExpiresAt: r.mat.ExpiresAt,
+			WindowStatus: r.mat.WindowStatus, WindowResetAt: r.mat.WindowResetAt,
+			Window7dStatus: r.mat.Window7dStatus, Window7dResetAt: r.mat.Window7dResetAt,
+		})
+	}
+	storedJSON, err := json.Marshal(stored)
+	if err != nil {
+		t.Fatalf("marshal stored material: %v", err)
+	}
+
+	writers := []struct {
+		name  string
+		write func(t *testing.T, s *Supervisor, dbPath string)
+	}{
+		{"material_write", func(t *testing.T, s *Supervisor, _ string) {
+			mks := []vault.ManagedKey{{VirtualKeyID: vkID, SeatID: seatID, OauthGroupID: groupID}}
+			groups := []grGroup{{OauthGroupID: groupID, Accounts: wires}}
+			if err := s.writeGroupRuntimeSnapshot(s.active.Load(), mks, groups); err != nil {
+				t.Fatalf("material write: %v", err)
+			}
+		}},
+		{"restamp", func(t *testing.T, s *Supervisor, dbPath string) {
+			db, err := sql.Open("sqlite", dbPath)
+			if err != nil {
+				t.Fatalf("open vault: %v", err)
+			}
+			_, err = db.Exec(`UPDATE managed_virtual_keys_cache SET group_runtime=? WHERE virtual_key_id=?`,
+				string(storedJSON), vkID)
+			db.Close()
+			if err != nil {
+				t.Fatalf("seed stored material: %v", err)
+			}
+			s.restampCurrentRouted()
+		}},
+	}
+	for _, w := range writers {
+		t.Run(w.name, func(t *testing.T) {
+			dbPath, reader := newOpenableVault(t, []map[string]string{
+				{"vk": vkID, "seat": seatID, "group": groupID, "override": ""},
+			})
+			s := newPersistSupervisor(dbPath, reader)
+			s.active.Store(&generation{vault: reader, proxy: worker})
+			w.write(t, s, dbPath)
+
+			db, err := sql.Open("sqlite", dbPath)
+			if err != nil {
+				t.Fatalf("open vault: %v", err)
+			}
+			var raw string
+			err = db.QueryRow(`SELECT group_runtime FROM managed_virtual_keys_cache WHERE virtual_key_id=?`, vkID).Scan(&raw)
+			db.Close()
+			if err != nil {
+				t.Fatalf("read group_runtime: %v", err)
+			}
+			var got map[string]vkeys.GroupRuntimeAccount
+			if err := json.Unmarshal([]byte(raw), &got); err != nil {
+				t.Fatalf("parse group_runtime: %v", err)
+			}
+			for _, r := range rows {
+				acc, ok := got[r.id]
+				if !ok {
+					t.Errorf("%s: missing from the written material", r.id)
+					continue
+				}
+				if acc.RouteStatus != r.want.status {
+					t.Errorf("%s: route_status = %q, want %q", r.id, acc.RouteStatus, r.want.status)
+				}
+				switch {
+				case r.want.retryAt == nil && acc.RouteRetryAt != nil:
+					t.Errorf("%s: route_retry_at = %d, want the key absent (no time; never 0)", r.id, *acc.RouteRetryAt)
+				case r.want.retryAt != nil && acc.RouteRetryAt == nil:
+					t.Errorf("%s: route_retry_at absent, want %d", r.id, *r.want.retryAt)
+				case r.want.retryAt != nil && *acc.RouteRetryAt != *r.want.retryAt:
+					t.Errorf("%s: route_retry_at = %d, want %d", r.id, *acc.RouteRetryAt, *r.want.retryAt)
+				}
+			}
+		})
 	}
 }
